@@ -202,7 +202,8 @@ pub struct ManifestDef {
     pub provides: Vec<EffectCapability>,
     pub supported_transports: Vec<Transport>,
     pub default_transport: Transport,
-    pub version: String,
+    /// Optimistic concurrency/config revision for this install template.
+    pub version: u64,
 }
 
 // ── pairing payload (§16.3.4) ────────────────────────────────────────

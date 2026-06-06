@@ -1237,6 +1237,8 @@ async fn write_string(state: &Backend, path: &str, value: String) -> Result<(), 
 fn root_grants() -> Vec<String> {
     vec![
         "perform://effect/kernel/**".into(),
+        "perform://effect/extension/**".into(),
+        "perform://effect/proc/**".into(),
         "read://state/kernel/**".into(),
         "write://state/kernel/**".into(),
         "subscribe://state/kernel/**".into(),
@@ -1582,6 +1584,15 @@ mod tests {
             principal
                 .grants
                 .contains("write", &Path::parse("state://kernel/x").unwrap())
+        );
+        assert!(principal.grants.contains(
+            "perform",
+            &Path::parse("effect://extension/pairing/create").unwrap()
+        ));
+        assert!(
+            principal
+                .grants
+                .contains("perform", &Path::parse("effect://proc/spawn").unwrap())
         );
         let events = audit_events(&boot);
         assert!(events.contains(&"console_bootstrap".into()));

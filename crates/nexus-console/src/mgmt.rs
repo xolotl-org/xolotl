@@ -15,7 +15,11 @@
 use crate::auth::{self, ConsolePrincipal};
 use crate::state::ConsoleState;
 use nexus_graph::{DoNode, OperationTemplate};
-use nexus_types::{IdentityRef, Outcome, OutputMode, Path, ResourceName, TaintSet, Value};
+use nexus_types::{
+    AuditRules, ExtensionDef, IdentityRef, ManifestDef, Outcome, OutputMode, Path, ResourceName,
+    Role, TaintSet, Value,
+};
+use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -30,6 +34,8 @@ pub enum MgmtError {
     Auth(#[from] auth::AuthError),
     #[error("version conflict (optimistic concurrency): expected {expected:?}")]
     Conflict { expected: Option<u64> },
+    #[error("config admission rejected: {0}")]
+    Admission(String),
     #[error("operation failed: {0}")]
     Operation(String),
 }
@@ -123,6 +129,7 @@ pub async fn write_config(
     // Bump the version on the new value so the next edit must match it.
     let next = expected_version.map(|v| v + 1).unwrap_or(1);
     set_version(&mut value, next);
+    admit_kernel_config(&p, &value)?;
 
     let mut cas = BTreeMap::new();
     cas.insert("cas".into(), Value::Bool(true));
@@ -201,12 +208,185 @@ fn set_version(v: &mut Value, version: u64) {
     }
 }
 
+fn admit_kernel_config(path: &Path, value: &Value) -> Result<(), MgmtError> {
+    let segs = path.segments();
+    if path.scheme() != "state" || segs.first().map(|s| s.as_str()) != Some("kernel") {
+        return Err(MgmtError::NotManageable(path.to_string()));
+    }
+
+    match segs {
+        s if is_path(s, &["kernel", "extensions"]) => {
+            let id = required_tail(s, "extension id")?;
+            admit_extension_def(id, value)
+        }
+        s if is_path(s, &["kernel", "manifests"]) => {
+            let platform = required_tail(s, "manifest platform")?;
+            admit_manifest_def(platform, value)
+        }
+        s if is_path(s, &["kernel", "console", "users"]) => {
+            let username = required_tail(s, "console username")?;
+            auth::validate_username(username)
+                .map_err(|e| MgmtError::Admission(format!("invalid console user path: {e}")))?;
+            require_map(value, "console user")
+        }
+        s if is_path(s, &["kernel", "console", "roles"]) => {
+            let role = required_tail(s, "console role")?;
+            auth::validate_username(role)
+                .map_err(|e| MgmtError::Admission(format!("invalid console role path: {e}")))?;
+            require_map(value, "console role")
+        }
+        s if is_exact_path(s, &["kernel", "audit", "rules"]) => {
+            let _: AuditRules = decode_config_value(value, "AuditRules")?;
+            Ok(())
+        }
+        _ => Err(MgmtError::Admission(format!(
+            "no console write admission rule for {path}"
+        ))),
+    }
+}
+
+fn is_path<S: AsRef<str>>(segs: &[S], prefix: &[&str]) -> bool {
+    segs.len() == prefix.len() + 1
+        && segs
+            .iter()
+            .take(prefix.len())
+            .zip(prefix.iter())
+            .all(|(actual, expected)| actual.as_ref() == *expected)
+}
+
+fn is_exact_path<S: AsRef<str>>(segs: &[S], expected: &[&str]) -> bool {
+    segs.len() == expected.len()
+        && segs
+            .iter()
+            .zip(expected.iter())
+            .all(|(actual, expected)| actual.as_ref() == *expected)
+}
+
+fn required_tail<'a, S: AsRef<str>>(segs: &'a [S], label: &str) -> Result<&'a str, MgmtError> {
+    segs.last()
+        .map(|s| s.as_ref())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| MgmtError::Admission(format!("missing {label}")))
+}
+
+fn require_map(value: &Value, label: &str) -> Result<(), MgmtError> {
+    if value.as_map().is_some() {
+        Ok(())
+    } else {
+        Err(MgmtError::Admission(format!("{label} must be an object")))
+    }
+}
+
+fn decode_config_value<T: DeserializeOwned>(value: &Value, label: &str) -> Result<T, MgmtError> {
+    let json = serde_json::to_value(value)
+        .map_err(|e| MgmtError::Admission(format!("{label} serialization failed: {e}")))?;
+    serde_json::from_value(json)
+        .map_err(|e| MgmtError::Admission(format!("{label} is malformed: {e}")))
+}
+
+fn admit_extension_def(path_id: &str, value: &Value) -> Result<(), MgmtError> {
+    let def: ExtensionDef = decode_config_value(value, "ExtensionDef")?;
+    if def.id != path_id {
+        return Err(MgmtError::Admission(format!(
+            "ExtensionDef.id {:?} does not match path id {:?}",
+            def.id, path_id
+        )));
+    }
+    admit_json_schema(&def.config_schema, "ExtensionDef.config_schema")?;
+    def.validate_admission()
+        .map_err(|e| MgmtError::Admission(format!("ExtensionDef admission failed: {e}")))
+}
+
+fn admit_manifest_def(path_platform: &str, value: &Value) -> Result<(), MgmtError> {
+    let def: ManifestDef = decode_config_value(value, "ManifestDef")?;
+    if def.platform != path_platform {
+        return Err(MgmtError::Admission(format!(
+            "ManifestDef.platform {:?} does not match path platform {:?}",
+            def.platform, path_platform
+        )));
+    }
+    if def.platform.trim().is_empty() {
+        return Err(MgmtError::Admission(
+            "ManifestDef.platform must not be empty".into(),
+        ));
+    }
+    if def.version == 0 {
+        return Err(MgmtError::Admission(
+            "ManifestDef.version must be a positive config revision".into(),
+        ));
+    }
+    admit_json_schema(&def.config_schema, "ManifestDef.config_schema")?;
+    if def.supported_transports.is_empty() {
+        return Err(MgmtError::Admission(
+            "ManifestDef.supported_transports must not be empty".into(),
+        ));
+    }
+    if !def
+        .supported_transports
+        .iter()
+        .any(|t| t == &def.default_transport)
+    {
+        return Err(MgmtError::Admission(
+            "ManifestDef.default_transport must be listed in supported_transports".into(),
+        ));
+    }
+    match def.role {
+        Role::Provider => {
+            if def.provides.is_empty() {
+                return Err(MgmtError::Admission(
+                    "provider ManifestDef must declare provided effects".into(),
+                ));
+            }
+            for cap in &def.provides {
+                admit_manifest_effect(&cap.effect_path)?;
+            }
+        }
+        Role::Source => {
+            if !def.provides.is_empty() {
+                return Err(MgmtError::Admission(
+                    "source ManifestDef must not declare provider effects".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn admit_json_schema(schema: &Value, label: &str) -> Result<(), MgmtError> {
+    match schema {
+        Value::Null | Value::Map(_) => Ok(()),
+        _ => Err(MgmtError::Admission(format!(
+            "{label} must be null or a JSON object"
+        ))),
+    }
+}
+
+fn admit_manifest_effect(effect_path: &str) -> Result<(), MgmtError> {
+    let effect = Path::parse(effect_path).map_err(|e| {
+        MgmtError::Admission(format!(
+            "ManifestDef.provides effect path is malformed: {e}"
+        ))
+    })?;
+    if effect.scheme() != "effect" || effect.segments().is_empty() {
+        return Err(MgmtError::Admission(
+            "ManifestDef.provides entries must be effect:// paths".into(),
+        ));
+    }
+    if effect.segments().first().map(|s| s.as_str()) == Some("kernel") {
+        return Err(MgmtError::Admission(
+            "ManifestDef.provides must not target effect://kernel/*".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::{BootstrapOutcome, LoginRequest, RootProvisioning, bootstrap_root_account};
     use nexus_actors::{StandardConfig, install_standard};
     use nexus_kernel::Bootstrap;
+    use nexus_types::{EffectCapability, Purity, Transport, TrustLevel};
     use std::collections::BTreeMap;
 
     fn console_state() -> Arc<ConsoleState> {
@@ -222,6 +402,28 @@ mod tests {
             m.insert("version".into(), Value::Int(v as i64));
         }
         Value::Map(m)
+    }
+
+    fn extension_def(id: &str, version: u64) -> Value {
+        let def = ExtensionDef {
+            id: id.into(),
+            role: Role::Provider,
+            transport: Transport::Stdio {
+                command: Some(format!("{id}-plugin")),
+                args: vec![],
+            },
+            trust: TrustLevel::Sandboxed,
+            provides: vec![EffectCapability::new(
+                format!("effect://plugin/{id}/search"),
+                Purity::Idempotent,
+            )],
+            emits: None,
+            namespace: Path::parse(&format!("effect://plugin/{id}")).unwrap(),
+            config_schema: Value::Null,
+            config: Value::Null,
+            version,
+        };
+        serde_json::from_value(serde_json::to_value(def).unwrap()).unwrap()
     }
 
     async fn root_principal(st: &Arc<ConsoleState>) -> ConsolePrincipal {
@@ -268,7 +470,7 @@ mod tests {
     async fn install_then_reconfigure_with_cas() {
         let st = console_state();
         let root = root_principal(&st).await;
-        let path = "state://kernel/extensions/telegram";
+        let path = "state://kernel/extensions/acme";
         let before = st
             .boot
             .kernel
@@ -278,7 +480,7 @@ mod tests {
             .map(|pid| st.boot.kernel.facts.facts_of(pid).len())
             .sum::<usize>();
         // install: expected None ⇒ creates version 1.
-        write_config(&st, &root, path, obj(None), None)
+        write_config(&st, &root, path, extension_def("acme", 0), None)
             .await
             .unwrap();
         let after = st
@@ -296,15 +498,25 @@ mod tests {
         let v = inspect(&st, &root, path).await.unwrap().unwrap();
         assert_eq!(value_version(&v), Some(1));
         // reconfigure: expected 1 ⇒ bumps to 2.
-        write_config(&st, &root, path, obj(Some(1)), Some(1))
+        write_config(&st, &root, path, extension_def("acme", 1), Some(1))
             .await
             .unwrap();
         let v = inspect(&st, &root, path).await.unwrap().unwrap();
         assert_eq!(value_version(&v), Some(2));
         // stale expected ⇒ conflict, no silent clobber.
         assert!(matches!(
-            write_config(&st, &root, path, obj(Some(1)), Some(1)).await,
+            write_config(&st, &root, path, extension_def("acme", 1), Some(1)).await,
             Err(MgmtError::Conflict { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn unknown_kernel_config_paths_are_rejected() {
+        let st = console_state();
+        let root = root_principal(&st).await;
+        assert!(matches!(
+            write_config(&st, &root, "state://kernel/unknown/x", obj(None), None).await,
+            Err(MgmtError::Admission(_))
         ));
     }
 }
