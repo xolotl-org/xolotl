@@ -14,13 +14,11 @@ Chinese documentation: [README.zh-CN.md](README.zh-CN.md)
 ## Status
 
 This repository is an early Rust workspace for the Nexus runtime and gateways.
-The implementation intentionally tracks the current design only. Old path
-parameters and older wire shortcuts are not compatibility surfaces:
+The implementation tracks the current design:
 
 - resource paths do not support `@param` suffixes such as
   `effect://memory/recall@scope=user`;
-- gRPC `GatewayService.Submit` accepts a structured protobuf `Program`, not a
-  JSON string;
+- gRPC `GatewayService.Submit` accepts a structured protobuf `Program`;
 - capability literals use the verb form, such as
   `perform://effect/inference/infer`, rather than resource paths.
 
@@ -64,7 +62,7 @@ compiled objects.
 | `nexus-gateway-websocket` | WebSocket gateway adapter. |
 | `nexus-gateway-mcp` | MCP server-side gateway adapter. |
 | `nexus-proto` | Protobuf schema and hand-vendored prost/tonic bindings. |
-| `nexus-console` | HTTP management gateway for the web console backend. |
+| `nexus-console` | Management-domain gateway for the web console backend. HTTP covers bootstrap/auth only; Console WS is the post-login management path. |
 | `nexus-daemon` | `nexusd`, the long-running host process. |
 | `nexus-sdk` | Convenience exports for embedding and tests. |
 | `nexus-plan`, `nexus-sim` | Planning and simulation scaffolding. |
@@ -115,43 +113,52 @@ gateway, not by daemon subcommands.
 
 Default addresses from `nexus.toml.example`:
 
-- Console HTTP: `127.0.0.1:9000`
+- Console listener: `127.0.0.1:9000`
 - gRPC gateway: `127.0.0.1:9100`
-- WebSocket gateway: `127.0.0.1:9200`
+- Program WebSocket gateway: `127.0.0.1:9200`
 
 On first boot, if no console root account exists and no bootstrap credentials
 are configured, `nexusd` prints a one-time root password to stderr.
 
 ## Configuration
 
-`nexus.toml` is bootstrap-only configuration. It controls storage and gateway
-listen addresses:
+`nexus.toml` is bootstrap-only configuration. It controls storage, gateway
+listen addresses, root bootstrap credentials, and bounded console resource
+limits:
 
 - `[storage]`: `redb` persistent storage or in-memory storage.
 - `[server]`: console, gRPC, and WebSocket bind addresses.
 - `[console.root]`: optional preseeded root credentials.
+- `[console.auth]`: session TTL, session count, and Argon2 verification
+  concurrency limits.
+- `[console.ws]`: Console WebSocket frame, connection, idle, rate,
+  subscription, result-size, and event backpressure limits.
 
 Runtime configuration, provider setup, model routing, groups, bindings, and
 policy-managed state belong in Nexus state and are managed through the console
-gateway.
+gateway. The console auth/WS settings are deployment capacity knobs only; they
+do not disable capability checks, step-up gates, Origin/Host validation,
+path-specific admission, action registry validation, or secret redaction.
 
 ## External Interfaces
 
 ### Console
 
-`nexus-console` exposes the management-domain HTTP gateway:
+`nexus-console` is the management-domain gateway for Web Console. It is not a
+privileged side channel: management actions still become capability-bound
+Operations with admission, authorization, CAS, and audit.
 
-- `GET /health`
-- `POST /api/auth/login`
-- `POST /api/auth/key/challenge`
-- `POST /api/auth/key/login`
-- `POST /api/auth/logout`
-- `GET /api/inspect?path=...`
-- `GET /api/inspect?path=...&prefix=true`
-- `POST /api/config`
+The current interface shape is:
 
-Console operations still go through capability-bound management paths. The
-console is not a privileged side channel.
+- HTTP: `GET /health`, `POST /api/auth/login`,
+  `POST /api/auth/key/challenge`, `POST /api/auth/key/login`, and
+  `POST /api/auth/step-up`.
+- Console WebSocket: the post-login management path for snapshot, config
+  read/write/CAS, runtime inspect, subscriptions, trace/fact streams, extension
+  lifecycle and pairing actions, logout, and console user/role/session
+  management.
+
+Post-login management features belong on Console WebSocket, not HTTP.
 
 ### gRPC And Proto
 
@@ -165,17 +172,17 @@ service GatewayService {
 }
 ```
 
-`SubmitRequest.program` is a structured protobuf `Program`. It is not a JSON
-blob and there is no `program_json` compatibility field.
+`SubmitRequest.program` is a structured protobuf `Program`.
 
 `nexus-proto` is the wire schema source for Rust gateway code and for generated
 clients such as mobile Kotlin/Swift packages.
 
 ### WebSocket
 
-`nexus-gateway-websocket` serves `/ws` and adapts WebSocket frames to the shared
-gateway abstraction. It is a protocol adapter over the same request process,
-taint, policy, fact, and handle path.
+`nexus-gateway-websocket` serves the program-submission WebSocket gateway and
+adapts WebSocket frames to the shared gateway abstraction. It is separate from
+the Console WebSocket described above, and it uses the same request process,
+taint, policy, fact, and handle path as other program gateways.
 
 ### MCP
 

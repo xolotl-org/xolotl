@@ -1,11 +1,11 @@
 # Nexus Configuration (Bootstrap Only)
 # Copy to `nexus.toml` in your working directory, or set NEXUS_CONFIG=/path/to/config.toml
 #
-# This file only configures the storage backend and server addresses.
+# This file configures bootstrap-only daemon settings: storage, listener
+# addresses, console root bootstrap credentials, and console resource limits.
 # Runtime config (backends, models, groups, routing, bindings) lives in state
-# and is managed via Console API; gRPC clients submit structured Program frames
-# through GatewayService. Only [storage] and [server] plus optional
-# [console.root] bootstrap credentials are read from this file.
+# and is managed via Console WebSocket. gRPC clients submit structured Program
+# frames through GatewayService.
 
 [storage]
 kind = "redb"           # "redb" (persistent) or "memory" (non-persistent)
@@ -22,3 +22,29 @@ ws_addr = "127.0.0.1:9200"
 [console.root]
 # password_hash = "$argon2id$v=19$m=65536,t=3,p=2$..."
 # pubkeys = ["ed25519:..."]
+
+# Optional console authentication/session limits. These are capacity and TTL
+# knobs only; capability checks, step-up gates, Origin/Host validation, and
+# secret redaction are not configurable bypasses.
+[console.auth]
+session_ttl_ms = 86400000          # 24h absolute session TTL
+idle_ttl_ms = 7200000              # 2h idle TTL
+max_sessions_per_user = 5
+global_session_limit = 10000
+# argon2_concurrency defaults to available CPU parallelism.
+# argon2_concurrency = 4
+
+# Optional Console WebSocket limits. Defaults favor one normal web console tab
+# plus modest multi-tab/admin use while bounding daemon memory and CPU.
+[console.ws]
+max_frame_bytes = 1048576          # 1 MiB; hard-capped by backend at 4 MiB
+max_connections_global = 256
+max_connections_per_source = 32
+max_connections_per_user = 8
+idle_timeout_secs = 7200           # 2h
+max_frames_per_second = 64
+max_bytes_per_second = 4194304     # 4 MiB/s
+max_subscriptions = 32
+max_fact_limit = 256
+max_trace_limit = 512
+event_send_timeout_ms = 5000

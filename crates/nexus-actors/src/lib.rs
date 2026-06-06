@@ -21,6 +21,7 @@ pub mod fetch;
 pub mod fs;
 pub mod index;
 pub mod inference;
+pub mod inspect;
 pub mod install;
 pub mod lock;
 pub mod mcp;
@@ -46,6 +47,7 @@ pub use index::{INDEX_METHODS, IndexDriver};
 pub use inference::{
     BASELINE_EMBEDDING_SPACE, EchoBackend, INFERENCE_METHODS, InferenceBackend, InferenceDriver,
 };
+pub use inspect::{INSPECT_METHODS, KernelInspectDriver};
 pub use install::{McpToolMount, StandardConfig, install_standard, register_mcp_tool};
 pub use lock::{LOCK_METHODS, LockDriver};
 pub use mcp::{
@@ -53,7 +55,7 @@ pub use mcp::{
     McpToolDriver, expose_as_mcp_tool,
 };
 pub use memory::{MEMORY_METHODS, MemoryDriver};
-pub use pairing::{PAIRING_METHODS, PairingDriver};
+pub use pairing::{PAIRING_METHODS, PairingDisplayEdge, PairingDriver};
 pub use proc::{PROC_METHODS, ProcDriver, reconcile};
 pub use rank::{RANK_METHODS, RankerDriver};
 pub use terminal::{TERMINAL_METHODS, TerminalDriver};

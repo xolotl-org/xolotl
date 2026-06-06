@@ -52,14 +52,35 @@ const STATE_REVOKED: &str = "revoked";
 /// display/transport edge.
 pub struct PairingDriver {
     state: Backend,
+    display_edge: PairingDisplayEdge,
+}
+
+#[derive(Clone, Default)]
+pub struct PairingDisplayEdge {
     pending_secrets: Arc<Mutex<BTreeMap<String, String>>>,
+}
+
+impl PairingDisplayEdge {
+    pub fn take_display_secret(&self, pairing_id: &str) -> Option<String> {
+        self.pending_secrets.lock().remove(pairing_id)
+    }
+
+    fn stage_display_secret(&self, pairing_id: &str, secret: String) {
+        self.pending_secrets
+            .lock()
+            .insert(pairing_id.to_string(), secret);
+    }
 }
 
 impl PairingDriver {
     pub fn new(state: Backend) -> Self {
+        Self::with_display_edge(state, PairingDisplayEdge::default())
+    }
+
+    pub fn with_display_edge(state: Backend, display_edge: PairingDisplayEdge) -> Self {
         Self {
             state,
-            pending_secrets: Arc::new(Mutex::new(BTreeMap::new())),
+            display_edge,
         }
     }
 
@@ -71,13 +92,11 @@ impl PairingDriver {
     /// `effect://extension/pairing/create|replace` Operation has recorded only
     /// the hash/checksum.
     pub fn take_display_secret(&self, pairing_id: &str) -> Option<String> {
-        self.pending_secrets.lock().remove(pairing_id)
+        self.display_edge.take_display_secret(pairing_id)
     }
 
     fn stage_display_secret(&self, pairing_id: &str, secret: String) {
-        self.pending_secrets
-            .lock()
-            .insert(pairing_id.to_string(), secret);
+        self.display_edge.stage_display_secret(pairing_id, secret);
     }
 
     fn pairing_path(id: &str) -> Result<Path, DriverError> {

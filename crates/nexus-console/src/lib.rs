@@ -1,19 +1,15 @@
 //! `nexus-console` — the Web Console backend: a management-domain Gateway
 //! (§18.4 / §24.3).
 //!
-//! It exposes runtime management over HTTP/WS, but every action is an ordinary
-//! capability-bound Operation on `state://kernel/*` (config write+CAS, inspect,
-//! subscribe) — there is no bespoke management wire protocol and no privileged
-//! backdoor. The web front-end (`nexus-web-console`, a Leptos/Wasm satellite
-//! repo) is embedded as static assets by the daemon; this crate is the
-//! engineering host.
+//! HTTP is limited to bootstrap/auth. Post-login management is carried by the
+//! Console WebSocket (`/ws`) as ordinary capability-bound Operations — no
+//! privileged backdoor.
 
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -21,14 +17,15 @@ use tower_http::trace::TraceLayer;
 pub mod auth;
 pub mod mgmt;
 pub mod state;
+pub mod ws;
 
 pub use auth::{
     AuthError, BootstrapOutcome, ConsoleAuthConfig, ConsolePrincipal, KeyChallengeRequest,
     KeyChallengeResponse, KeyLoginRequest, LoginRequest, LoginResponse, RootProvisioning,
-    bootstrap_root_account,
+    StepUpRequest, bootstrap_root_account,
 };
 pub use mgmt::MgmtError;
-pub use state::ConsoleState;
+pub use state::{ConsoleState, ConsoleWsConfig};
 
 /// Build the console router.
 pub fn router(state: Arc<ConsoleState>) -> Router {
@@ -37,9 +34,8 @@ pub fn router(state: Arc<ConsoleState>) -> Router {
         .route("/api/auth/login", post(api_login))
         .route("/api/auth/key/challenge", post(api_key_challenge))
         .route("/api/auth/key/login", post(api_key_login))
-        .route("/api/auth/logout", post(api_logout))
-        .route("/api/inspect", get(api_inspect))
-        .route("/api/config", post(api_write_config))
+        .route("/api/auth/step-up", post(api_step_up))
+        .route("/ws", get(ws::upgrade))
         .with_state(state)
         .layer(
             CorsLayer::new()
@@ -55,7 +51,11 @@ pub async fn serve(
     state: Arc<ConsoleState>,
 ) -> anyhow::Result<()> {
     let app = router(state);
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -65,10 +65,11 @@ async fn health() -> &'static str {
 
 async fn api_login(
     State(st): State<Arc<ConsoleState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, String)> {
-    let source = source_addr(&headers);
+    let source = source_addr(&headers, Some(peer));
     let response = st
         .auth
         .login(&st.boot, body, source)
@@ -91,10 +92,11 @@ async fn api_key_challenge(
 
 async fn api_key_login(
     State(st): State<Arc<ConsoleState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<KeyLoginRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, String)> {
-    let source = source_addr(&headers);
+    let source = source_addr(&headers, Some(peer));
     let response = st
         .auth
         .finish_key_login(&st.boot, body, source)
@@ -103,87 +105,26 @@ async fn api_key_login(
     Ok(Json(response))
 }
 
-async fn api_logout(
+async fn api_step_up(
     State(st): State<Arc<ConsoleState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-) -> Result<StatusCode, (StatusCode, String)> {
+    Json(body): Json<StepUpRequest>,
+) -> Result<Json<LoginResponse>, (StatusCode, String)> {
+    let source = source_addr(&headers, Some(peer));
     let bearer = auth::bearer_from_headers(&headers).map_err(auth_error)?;
-    st.auth.logout(&st.boot, bearer).await.map_err(auth_error)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Debug, Deserialize)]
-struct InspectQuery {
-    path: String,
-    #[serde(default)]
-    prefix: bool,
-}
-
-async fn api_inspect(
-    State(st): State<Arc<ConsoleState>>,
-    headers: HeaderMap,
-    Query(q): Query<InspectQuery>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let principal = authenticate(&st, &headers).await?;
-    if q.prefix {
-        let entries = mgmt::inspect_prefix(&st, &principal, &q.path)
-            .await
-            .map_err(bad_request)?;
-        let map: BTreeMap<String, nexus_types::Value> = entries.into_iter().collect();
-        Ok(Json(serde_json::to_value(map).unwrap_or_default()))
-    } else {
-        let v = mgmt::inspect(&st, &principal, &q.path)
-            .await
-            .map_err(bad_request)?;
-        Ok(Json(
-            serde_json::to_value(v).unwrap_or(serde_json::Value::Null),
-        ))
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct WriteConfigBody {
-    path: String,
-    value: nexus_types::Value,
-    #[serde(default)]
-    expected_version: Option<u64>,
-}
-
-async fn api_write_config(
-    State(st): State<Arc<ConsoleState>>,
-    headers: HeaderMap,
-    Json(body): Json<WriteConfigBody>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let principal = authenticate(&st, &headers).await?;
-    mgmt::write_config(
-        &st,
-        &principal,
-        &body.path,
-        body.value,
-        body.expected_version,
-    )
-    .await
-    .map_err(|e| match e {
-        MgmtError::Conflict { .. } => (StatusCode::CONFLICT, e.to_string()),
-        MgmtError::NotManageable(_) => (StatusCode::FORBIDDEN, e.to_string()),
-        MgmtError::Auth(e) => auth_error(e),
-        other => (StatusCode::BAD_REQUEST, other.to_string()),
-    })?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn authenticate(
-    st: &Arc<ConsoleState>,
-    headers: &HeaderMap,
-) -> Result<ConsolePrincipal, (StatusCode, String)> {
-    let bearer = auth::bearer_from_headers(headers).map_err(auth_error)?;
-    st.auth
-        .authenticate_token(&st.boot, bearer)
+    let response = st
+        .auth
+        .step_up(&st.boot, bearer, body, source)
         .await
-        .map_err(auth_error)
+        .map_err(auth_error)?;
+    Ok(Json(response))
 }
 
-fn source_addr(headers: &HeaderMap) -> String {
+pub(crate) fn source_addr(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    if let Some(peer) = peer {
+        return peer.ip().to_string();
+    }
     headers
         .get("x-forwarded-for")
         .or_else(|| headers.get("x-real-ip"))
@@ -195,7 +136,7 @@ fn source_addr(headers: &HeaderMap) -> String {
         .to_string()
 }
 
-fn auth_error(e: AuthError) -> (StatusCode, String) {
+pub(crate) fn auth_error(e: AuthError) -> (StatusCode, String) {
     let status = match e {
         AuthError::MissingBearer | AuthError::InvalidSession | AuthError::InvalidChallenge => {
             StatusCode::UNAUTHORIZED
@@ -209,19 +150,12 @@ fn auth_error(e: AuthError) -> (StatusCode, String) {
     (status, e.to_string())
 }
 
-fn bad_request(e: MgmtError) -> (StatusCode, String) {
-    match e {
-        MgmtError::NotManageable(_) => (StatusCode::FORBIDDEN, e.to_string()),
-        MgmtError::Auth(e) => auth_error(e),
-        other => (StatusCode::BAD_REQUEST, other.to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use nexus_actors::{StandardConfig, install_standard};
     use nexus_kernel::Bootstrap;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -230,5 +164,13 @@ mod tests {
         install_standard(&boot, &StandardConfig::default());
         let st = ConsoleState::shared(boot);
         let _ = router(st);
+    }
+
+    #[test]
+    fn source_addr_prefers_peer_over_forwarded_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.8".parse().unwrap());
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+        assert_eq!(source_addr(&headers, Some(peer)), "127.0.0.1");
     }
 }

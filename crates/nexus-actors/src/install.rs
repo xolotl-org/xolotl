@@ -14,10 +14,11 @@ use crate::{
     fact::{FACT_METHODS, FactDriver},
     index::{INDEX_METHODS, IndexDriver},
     inference::{EchoBackend, INFERENCE_METHODS, InferenceDriver},
+    inspect::{INSPECT_METHODS, KernelInspectDriver},
     lock::{LOCK_METHODS, LockDriver},
     mcp::{MCP_STREAM_TOOL_METHODS, MCP_TOOL_METHODS, McpToolDriver},
     memory::{MEMORY_METHODS, MemoryDriver},
-    pairing::{PAIRING_METHODS, PairingDriver},
+    pairing::{PAIRING_METHODS, PairingDisplayEdge, PairingDriver},
     rank::{RANK_METHODS, RankerDriver},
     time::{TIME_METHODS, TimeDriver},
 };
@@ -40,6 +41,9 @@ pub struct StandardConfig {
     /// MCP tools. The offline spine backs entries with deterministic echo
     /// clients; production can call `register_mcp_tool` with a stdio/SSE client.
     pub mcp_tools: Vec<McpToolMount>,
+    /// One-shot display edge for extension pairing secrets. The secret does not
+    /// enter Operation input/outcome, state, or Facts.
+    pub pairing_display: PairingDisplayEdge,
 }
 
 /// One MCP host-side tool mount (§18.2).
@@ -155,6 +159,15 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
         FACT_METHODS,
         Arc::new(FactDriver::new(boot.kernel.facts.store().clone())),
     );
+    register_single_effect(
+        boot,
+        "effect://kernel/process/inspect",
+        INSPECT_METHODS,
+        Arc::new(KernelInspectDriver::new(
+            boot.kernel.processes.clone(),
+            boot.kernel.facts.clone(),
+        )),
+    );
     // §17.2 retrieval stack: Vector Index (ANN) + pluggable Ranker.
     let index_driver: Arc<dyn Driver> = index.clone();
     for path in [
@@ -200,7 +213,10 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
         register_single_effect(boot, path, crate::proc::PROC_METHODS, proc.clone());
     }
     // §16.3.4 extension pairing management: ordinary capability-bound effects.
-    let pairing: Arc<dyn Driver> = Arc::new(PairingDriver::new(state.clone()));
+    let pairing: Arc<dyn Driver> = Arc::new(PairingDriver::with_display_edge(
+        state.clone(),
+        config.pairing_display.clone(),
+    ));
     for path in [
         "effect://extension/pairing/create",
         "effect://extension/pairing/approve",

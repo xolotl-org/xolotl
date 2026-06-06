@@ -23,7 +23,7 @@ mod config;
 
 use anyhow::Result;
 use config::NexusConfig;
-use nexus_actors::{StandardConfig, install_standard};
+use nexus_actors::{PairingDisplayEdge, StandardConfig, install_standard};
 use nexus_console::{BootstrapOutcome, ConsoleState, RootProvisioning};
 use nexus_gateway::InProcessGateway;
 use nexus_gateway_websocket::WsGateway;
@@ -120,12 +120,14 @@ async fn serve() -> Result<()> {
     // Phase 3-5: kernel, root Process, standard providers.
     let kernel = Kernel::with_backends(state, facts);
     let boot = Arc::new(Bootstrap::from_kernel(kernel));
+    let pairing_display = PairingDisplayEdge::default();
     install_standard(
         &boot,
         &StandardConfig {
             fs_root: None,
             terminal_allowlist: vec![],
             enable_fetch: false,
+            pairing_display: pairing_display.clone(),
             ..Default::default()
         },
     );
@@ -179,7 +181,12 @@ async fn serve() -> Result<()> {
         .or_else(|| std::env::var(CONSOLE_ADDR_ENV).ok())
     {
         let listener = TcpListener::bind(&addr).await?;
-        let state = ConsoleState::shared(boot.clone());
+        let state = ConsoleState::shared_with_pairing_display_and_config(
+            boot.clone(),
+            pairing_display.clone(),
+            cfg.console.auth.clone().into(),
+            cfg.console.ws.clone().into(),
+        );
         tracing::info!(%addr, "console (management Gateway) listening");
         handles.push(tokio::spawn(async move {
             if let Err(e) = nexus_console::serve(listener, state).await {

@@ -28,10 +28,29 @@ const SESSIONS_PREFIX: &str = "state://kernel/console/sessions";
 const CHALLENGES_PREFIX: &str = "state://kernel/console/challenges";
 const VAULT_PREFIX: &str = "state://vault/console";
 const ROOT_USERNAME: &str = "root";
-const DEFAULT_SESSION_TTL_MS: i64 = 24 * 60 * 60 * 1000;
-const DEFAULT_IDLE_TTL_MS: i64 = 2 * 60 * 60 * 1000;
+pub const DEFAULT_SESSION_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+pub const DEFAULT_IDLE_TTL_MS: i64 = 2 * 60 * 60 * 1000;
+pub const DEFAULT_MAX_SESSIONS_PER_USER: usize = 5;
+pub const DEFAULT_GLOBAL_SESSION_LIMIT: usize = 10_000;
+pub const MIN_SESSION_TTL_MS: i64 = 60 * 1000;
+pub const MAX_SESSION_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+pub const MIN_IDLE_TTL_MS: i64 = 60 * 1000;
+pub const MAX_IDLE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+pub const MIN_MAX_SESSIONS_PER_USER: usize = 1;
+pub const HARD_MAX_SESSIONS_PER_USER: usize = 1_000;
+pub const MIN_GLOBAL_SESSION_LIMIT: usize = 1;
+pub const HARD_GLOBAL_SESSION_LIMIT: usize = 100_000;
+pub const MIN_ARGON2_CONCURRENCY: usize = 1;
+pub const HARD_ARGON2_CONCURRENCY: usize = 256;
 const TOTP_PERIOD_SECS: i64 = 30;
 const KEY_CHALLENGE_TTL_MS: i64 = 60_000;
+
+pub fn default_argon2_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(MIN_ARGON2_CONCURRENCY)
+}
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -55,12 +74,34 @@ impl Default for ConsoleAuthConfig {
         Self {
             session_ttl_ms: DEFAULT_SESSION_TTL_MS,
             idle_ttl_ms: DEFAULT_IDLE_TTL_MS,
-            max_sessions_per_user: 5,
-            global_session_limit: 10_000,
-            argon2_concurrency: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .max(1),
+            max_sessions_per_user: DEFAULT_MAX_SESSIONS_PER_USER,
+            global_session_limit: DEFAULT_GLOBAL_SESSION_LIMIT,
+            argon2_concurrency: default_argon2_concurrency(),
+        }
+    }
+}
+
+impl ConsoleAuthConfig {
+    pub fn bounded(self) -> Self {
+        let session_ttl_ms = self
+            .session_ttl_ms
+            .clamp(MIN_SESSION_TTL_MS, MAX_SESSION_TTL_MS);
+        let idle_ttl_ms = self
+            .idle_ttl_ms
+            .clamp(MIN_IDLE_TTL_MS, MAX_IDLE_TTL_MS)
+            .min(session_ttl_ms);
+        Self {
+            session_ttl_ms,
+            idle_ttl_ms,
+            max_sessions_per_user: self
+                .max_sessions_per_user
+                .clamp(MIN_MAX_SESSIONS_PER_USER, HARD_MAX_SESSIONS_PER_USER),
+            global_session_limit: self
+                .global_session_limit
+                .clamp(MIN_GLOBAL_SESSION_LIMIT, HARD_GLOBAL_SESSION_LIMIT),
+            argon2_concurrency: self
+                .argon2_concurrency
+                .clamp(MIN_ARGON2_CONCURRENCY, HARD_ARGON2_CONCURRENCY),
         }
     }
 }
@@ -87,6 +128,14 @@ pub struct LoginResponse {
     pub expires_at: i64,
     pub idle_expires_at: i64,
     pub mfa_level: u8,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StepUpRequest {
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub totp_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +169,19 @@ pub struct ConsolePrincipal {
     pub identity_path: String,
     pub grants: CapSet,
     pub mfa_level: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub sid: String,
+    pub username: String,
+    pub identity_path: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub idle_expires_at: i64,
+    pub mfa_level: u8,
+    pub last_seen: i64,
+    pub source_addr: String,
 }
 
 #[derive(Debug, Error)]
@@ -187,6 +249,7 @@ impl Default for ConsoleAuth {
 
 impl ConsoleAuth {
     pub fn new(config: ConsoleAuthConfig) -> Self {
+        let config = config.bounded();
         let decoy_phc = hash_password_with_salt("invalid-password", &[0x42; 16])
             .expect("argon2 decoy hash can be created");
         Self {
@@ -414,6 +477,102 @@ impl ConsoleAuth {
         self.issue_session(state, &user, source_addr, 1).await
     }
 
+    pub async fn step_up(
+        &self,
+        boot: &Bootstrap,
+        bearer: &str,
+        req: StepUpRequest,
+        source_addr: String,
+    ) -> Result<LoginResponse, AuthError> {
+        let audit_username = self
+            .authenticate_token_inner(&boot.kernel.state, bearer)
+            .await
+            .ok()
+            .map(|p| p.username);
+        let result = self
+            .step_up_inner(&boot.kernel.state, bearer, req, source_addr.clone())
+            .await;
+        match &result {
+            Ok(response) => record_auth_audit(
+                boot,
+                "console_credential",
+                audit_username.as_deref(),
+                Some(&source_addr),
+                "step_up",
+                Some(response.mfa_level),
+            )?,
+            Err(err) => record_auth_audit(
+                boot,
+                "console_credential",
+                audit_username.as_deref(),
+                Some(&source_addr),
+                audit_outcome(err),
+                None,
+            )?,
+        }
+        result
+    }
+
+    async fn step_up_inner(
+        &self,
+        state: &Backend,
+        bearer: &str,
+        req: StepUpRequest,
+        source_addr: String,
+    ) -> Result<LoginResponse, AuthError> {
+        let principal = self.authenticate_token_inner(state, bearer).await?;
+        let mut user = read_user(state, &principal.username)
+            .await?
+            .ok_or(AuthError::InvalidSession)?;
+        if !matches!(user.status.as_str(), "active") {
+            return Err(AuthError::AccountUnavailable);
+        }
+
+        if user.totp_enabled {
+            let code = req
+                .totp_code
+                .as_deref()
+                .ok_or(AuthError::InvalidCredentials)?;
+            let seed_ref = user
+                .totp_seed_ref
+                .clone()
+                .ok_or(AuthError::InvalidCredentials)?;
+            let seed = read_string(state, &seed_ref)
+                .await?
+                .ok_or(AuthError::InvalidCredentials)?;
+            let step = verify_totp(&seed, code, user.totp_last_step, now_millis())
+                .ok_or(AuthError::InvalidCredentials)?;
+            user.totp_last_step = Some(step);
+            write_user(state, &user).await?;
+        } else {
+            let password = req
+                .password
+                .as_deref()
+                .ok_or(AuthError::InvalidCredentials)?;
+            self.check_rate_limits(&user.username, &source_addr, now_millis())?;
+            let phc = match user.password_hash_ref() {
+                Some(path) => read_string(state, &path)
+                    .await?
+                    .unwrap_or_else(|| self.decoy_phc.clone()),
+                None => self.decoy_phc.clone(),
+            };
+            let _permit = self
+                .argon2_slots
+                .acquire()
+                .await
+                .map_err(|_| AuthError::Crypto("argon2 semaphore closed".into()))?;
+            let ok = verify_password(&phc, password);
+            drop(_permit);
+            if !ok {
+                self.record_login_failure(&user.username, &source_addr, now_millis());
+                return Err(AuthError::InvalidCredentials);
+            }
+            self.clear_login_failures(&user.username, &source_addr, now_millis());
+        }
+
+        self.issue_session(state, &user, source_addr, 2).await
+    }
+
     pub async fn authenticate_token(
         &self,
         boot: &Bootstrap,
@@ -421,6 +580,43 @@ impl ConsoleAuth {
     ) -> Result<ConsolePrincipal, AuthError> {
         self.authenticate_token_inner(&boot.kernel.state, bearer)
             .await
+    }
+
+    pub async fn authenticate_sid(
+        &self,
+        boot: &Bootstrap,
+        sid: &str,
+    ) -> Result<ConsolePrincipal, AuthError> {
+        validate_session_id(sid)?;
+        let state = &boot.kernel.state;
+        let session_path = session_path(sid);
+        let Some(mut session) = read_session(state, &session_path).await? else {
+            return Err(AuthError::InvalidSession);
+        };
+        let now = now_millis();
+        if session.expires_at <= now || session.idle_expires_at <= now {
+            revoke_session(state, sid).await?;
+            return Err(AuthError::InvalidSession);
+        }
+
+        let user = read_user(state, &session.username)
+            .await?
+            .ok_or(AuthError::InvalidSession)?;
+        if !matches!(user.status.as_str(), "active") {
+            return Err(AuthError::AccountUnavailable);
+        }
+
+        session.last_seen = now;
+        session.idle_expires_at = now.saturating_add(self.config.idle_ttl_ms);
+        write_session(state, &session_path, &session).await?;
+
+        let grants = effective_grants(state, &user).await?;
+        Ok(ConsolePrincipal {
+            username: user.username,
+            identity_path: user.identity_path,
+            grants,
+            mfa_level: session.mfa_level,
+        })
     }
 
     async fn authenticate_token_inner(
@@ -492,6 +688,125 @@ impl ConsoleAuth {
             }
         }
         result
+    }
+
+    pub async fn logout_sid(&self, boot: &Bootstrap, sid: &str) -> Result<(), AuthError> {
+        validate_session_id(sid)?;
+        let result = revoke_session(&boot.kernel.state, sid).await;
+        match &result {
+            Ok(()) => {
+                record_auth_audit(boot, "console_credential", None, None, "logout", None)?;
+            }
+            Err(err) => {
+                record_auth_audit(
+                    boot,
+                    "console_credential",
+                    None,
+                    None,
+                    audit_outcome(err),
+                    None,
+                )?;
+            }
+        }
+        result
+    }
+
+    pub async fn list_sessions(
+        &self,
+        boot: &Bootstrap,
+        principal: &ConsolePrincipal,
+    ) -> Result<Vec<SessionSummary>, AuthError> {
+        let sessions_root = Path::parse(SESSIONS_PREFIX)?;
+        authorize_path(&boot.kernel.state, principal, "read", &sessions_root, None).await?;
+        let now = now_millis();
+        sweep_expired_sessions(&boot.kernel.state, now).await?;
+        let mut sessions: Vec<_> = boot
+            .kernel
+            .state
+            .read_prefix(&sessions_root)
+            .await?
+            .into_iter()
+            .filter_map(|(path, value)| {
+                let path_s = path.to_string();
+                let sid = path_s.rsplit('/').next()?.to_string();
+                SessionRecord::from_value(&sid, &value)
+                    .ok()
+                    .map(SessionSummary::from)
+            })
+            .collect();
+        sessions.sort_by_key(|s| (s.username.clone(), s.issued_at));
+        Ok(sessions)
+    }
+
+    pub async fn revoke_session_by_id(
+        &self,
+        boot: &Bootstrap,
+        principal: &ConsolePrincipal,
+        sid: &str,
+    ) -> Result<(), AuthError> {
+        validate_session_id(sid)?;
+        let path = Path::parse(&session_path(sid))?;
+        authorize_path(&boot.kernel.state, principal, "write", &path, None).await?;
+        let result = revoke_session(&boot.kernel.state, sid).await;
+        match &result {
+            Ok(()) => record_auth_audit(
+                boot,
+                "console_credential",
+                Some(&principal.username),
+                None,
+                "session_revoke",
+                Some(principal.mfa_level),
+            )?,
+            Err(err) => record_auth_audit(
+                boot,
+                "console_credential",
+                Some(&principal.username),
+                None,
+                audit_outcome(err),
+                Some(principal.mfa_level),
+            )?,
+        }
+        result
+    }
+
+    pub async fn revoke_user_sessions(
+        &self,
+        boot: &Bootstrap,
+        principal: &ConsolePrincipal,
+        username: &str,
+    ) -> Result<usize, AuthError> {
+        validate_username(username)?;
+        let user_path = Path::parse(&format!("{USERS_PREFIX}/{username}"))?;
+        authorize_path(&boot.kernel.state, principal, "write", &user_path, None).await?;
+        let sessions = boot
+            .kernel
+            .state
+            .read_prefix(&Path::parse(SESSIONS_PREFIX)?)
+            .await?;
+        let mut revoked = 0usize;
+        for (path, value) in sessions {
+            let sid = path
+                .to_string()
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if let Ok(session) = SessionRecord::from_value(&sid, &value)
+                && session.username == username
+            {
+                revoke_session(&boot.kernel.state, &sid).await?;
+                revoked += 1;
+            }
+        }
+        record_auth_audit(
+            boot,
+            "console_credential",
+            Some(&principal.username),
+            None,
+            "user_sessions_revoke",
+            Some(principal.mfa_level),
+        )?;
+        Ok(revoked)
     }
 
     async fn issue_session(
@@ -1027,6 +1342,22 @@ impl SessionRecord {
     }
 }
 
+impl From<SessionRecord> for SessionSummary {
+    fn from(s: SessionRecord) -> Self {
+        Self {
+            sid: s.sid,
+            username: s.username,
+            identity_path: s.identity_path,
+            issued_at: s.issued_at,
+            expires_at: s.expires_at,
+            idle_expires_at: s.idle_expires_at,
+            mfa_level: s.mfa_level,
+            last_seen: s.last_seen,
+            source_addr: s.source_addr,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct KeyChallengeRecord {
     challenge_id: String,
@@ -1242,6 +1573,7 @@ fn root_grants() -> Vec<String> {
         "read://state/kernel/**".into(),
         "write://state/kernel/**".into(),
         "subscribe://state/kernel/**".into(),
+        "read://state/fact/**".into(),
         "perform://effect/kernel/console/users/**".into(),
     ]
 }
@@ -1537,6 +1869,34 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn auth_config_is_bounded_by_backend() {
+        let cfg = ConsoleAuthConfig {
+            session_ttl_ms: i64::MAX,
+            idle_ttl_ms: i64::MAX,
+            max_sessions_per_user: 0,
+            global_session_limit: usize::MAX,
+            argon2_concurrency: 0,
+        }
+        .bounded();
+        assert_eq!(cfg.session_ttl_ms, MAX_SESSION_TTL_MS);
+        assert_eq!(cfg.idle_ttl_ms, MAX_IDLE_TTL_MS);
+        assert_eq!(cfg.max_sessions_per_user, 1);
+        assert_eq!(cfg.global_session_limit, HARD_GLOBAL_SESSION_LIMIT);
+        assert_eq!(cfg.argon2_concurrency, MIN_ARGON2_CONCURRENCY);
+
+        let cfg = ConsoleAuthConfig {
+            session_ttl_ms: 30_000,
+            idle_ttl_ms: MAX_SESSION_TTL_MS,
+            max_sessions_per_user: 10,
+            global_session_limit: 100,
+            argon2_concurrency: 2,
+        }
+        .bounded();
+        assert_eq!(cfg.session_ttl_ms, MIN_SESSION_TTL_MS);
+        assert_eq!(cfg.idle_ttl_ms, MIN_SESSION_TTL_MS);
+    }
+
     fn fact_contains_string(fact: &Fact, needle: &str) -> bool {
         serde_json::to_string(fact).unwrap().contains(needle)
     }
@@ -1646,6 +2006,170 @@ mod tests {
             Err(AuthError::InvalidSession)
         ));
         assert!(audit_events(&boot).contains(&"console_credential".into()));
+    }
+
+    #[tokio::test]
+    async fn step_up_issues_new_session_without_reusing_token() {
+        let boot = auth_boot();
+        let outcome = bootstrap_root_account(&boot, RootProvisioning::default())
+            .await
+            .unwrap();
+        let BootstrapOutcome::CreatedRandomPassword { password, .. } = outcome else {
+            panic!("expected generated password");
+        };
+        let auth = ConsoleAuth::default();
+        let login = auth
+            .login(
+                &boot,
+                LoginRequest {
+                    username: "root".into(),
+                    password: password.clone(),
+                    totp_code: None,
+                },
+                "test".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.mfa_level, 1);
+        let elevated = auth
+            .step_up(
+                &boot,
+                &login.token,
+                StepUpRequest {
+                    password: Some(password),
+                    totp_code: None,
+                },
+                "test".into(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(elevated.sid, login.sid);
+        assert_ne!(elevated.token, login.token);
+        assert_eq!(elevated.mfa_level, 2);
+        assert_eq!(
+            auth.authenticate_token(&boot, &login.token)
+                .await
+                .unwrap()
+                .mfa_level,
+            1
+        );
+        assert_eq!(
+            auth.authenticate_token(&boot, &elevated.token)
+                .await
+                .unwrap()
+                .mfa_level,
+            2
+        );
+        let facts = audit_facts(&boot);
+        assert!(
+            !facts
+                .iter()
+                .any(|fact| fact_contains_string(fact, &login.token))
+        );
+        assert!(
+            !facts
+                .iter()
+                .any(|fact| fact_contains_string(fact, &elevated.token))
+        );
+    }
+
+    #[tokio::test]
+    async fn root_can_list_and_revoke_console_sessions() {
+        let boot = auth_boot();
+        let outcome = bootstrap_root_account(&boot, RootProvisioning::default())
+            .await
+            .unwrap();
+        let BootstrapOutcome::CreatedRandomPassword { password, .. } = outcome else {
+            panic!("expected generated password");
+        };
+        let auth = ConsoleAuth::default();
+        let login1 = auth
+            .login(
+                &boot,
+                LoginRequest {
+                    username: "root".into(),
+                    password: password.clone(),
+                    totp_code: None,
+                },
+                "test-a".into(),
+            )
+            .await
+            .unwrap();
+        let login2 = auth
+            .login(
+                &boot,
+                LoginRequest {
+                    username: "root".into(),
+                    password,
+                    totp_code: None,
+                },
+                "test-b".into(),
+            )
+            .await
+            .unwrap();
+        let principal = auth.authenticate_token(&boot, &login1.token).await.unwrap();
+        let sessions = auth.list_sessions(&boot, &principal).await.unwrap();
+        assert!(sessions.iter().any(|s| s.sid == login1.sid));
+        assert!(sessions.iter().any(|s| s.sid == login2.sid));
+
+        auth.revoke_session_by_id(&boot, &principal, &login2.sid)
+            .await
+            .unwrap();
+        assert!(matches!(
+            auth.authenticate_token(&boot, &login2.token).await,
+            Err(AuthError::InvalidSession)
+        ));
+        assert!(audit_events(&boot).contains(&"console_credential".into()));
+    }
+
+    #[tokio::test]
+    async fn root_can_revoke_all_sessions_for_user() {
+        let boot = auth_boot();
+        let outcome = bootstrap_root_account(&boot, RootProvisioning::default())
+            .await
+            .unwrap();
+        let BootstrapOutcome::CreatedRandomPassword { password, .. } = outcome else {
+            panic!("expected generated password");
+        };
+        let auth = ConsoleAuth::default();
+        let login1 = auth
+            .login(
+                &boot,
+                LoginRequest {
+                    username: "root".into(),
+                    password: password.clone(),
+                    totp_code: None,
+                },
+                "test-a".into(),
+            )
+            .await
+            .unwrap();
+        let login2 = auth
+            .login(
+                &boot,
+                LoginRequest {
+                    username: "root".into(),
+                    password,
+                    totp_code: None,
+                },
+                "test-b".into(),
+            )
+            .await
+            .unwrap();
+        let principal = auth.authenticate_token(&boot, &login1.token).await.unwrap();
+        let revoked = auth
+            .revoke_user_sessions(&boot, &principal, "root")
+            .await
+            .unwrap();
+        assert!(revoked >= 2);
+        assert!(matches!(
+            auth.authenticate_token(&boot, &login1.token).await,
+            Err(AuthError::InvalidSession)
+        ));
+        assert!(matches!(
+            auth.authenticate_token(&boot, &login2.token).await,
+            Err(AuthError::InvalidSession)
+        ));
     }
 
     #[tokio::test]

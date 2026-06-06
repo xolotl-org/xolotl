@@ -8,11 +8,11 @@ Default English documentation: [README.md](README.md)
 
 ## 当前状态
 
-这个仓库是 Nexus runtime 与 gateway 的早期 Rust workspace。实现只跟随当前设计，不保留旧版兼容入口：
+这个仓库是 Nexus runtime 与 gateway 的早期 Rust workspace。实现跟随当前设计：
 
 - resource path 不支持 `@param` 后缀，例如
   `effect://memory/recall@scope=user`；
-- gRPC `GatewayService.Submit` 接收结构化 protobuf `Program`，不是 JSON 字符串；
+- gRPC `GatewayService.Submit` 接收结构化 protobuf `Program`；
 - capability 字面量使用动词形式，例如
   `perform://effect/inference/infer`，不是 resource path。
 
@@ -53,7 +53,7 @@ Process
 | `nexus-gateway-websocket` | WebSocket gateway 适配器。 |
 | `nexus-gateway-mcp` | MCP server-side gateway 适配器。 |
 | `nexus-proto` | Protobuf schema 和手工 vendored prost/tonic 绑定。 |
-| `nexus-console` | Web console backend 的 HTTP 管理 gateway。 |
+| `nexus-console` | Web console backend 的管理域 gateway。HTTP 只负责 bootstrap/auth；登录后的管理主路径是 Console WS。 |
 | `nexus-daemon` | 长期运行的宿主进程 `nexusd`。 |
 | `nexus-sdk` | 嵌入和测试用便捷导出。 |
 | `nexus-plan`, `nexus-sim` | 规划与仿真脚手架。 |
@@ -102,38 +102,47 @@ cargo run -p nexus-daemon -- up
 
 `nexus.toml.example` 默认地址：
 
-- Console HTTP：`127.0.0.1:9000`
+- Console listener：`127.0.0.1:9000`
 - gRPC gateway：`127.0.0.1:9100`
-- WebSocket gateway：`127.0.0.1:9200`
+- Program WebSocket gateway：`127.0.0.1:9200`
 
 首次启动时，如果 state 中没有 console root 账号，也没有配置预置凭据，`nexusd` 会把一次性 root 密码打印到 stderr。
 
 ## 配置
 
-`nexus.toml` 只用于 bootstrap 配置，控制存储和 gateway 监听地址：
+`nexus.toml` 只用于 bootstrap 配置，控制存储、gateway 监听地址、root
+引导凭据和有界的 console 资源限制：
 
 - `[storage]`：`redb` 持久存储或内存存储。
 - `[server]`：console、gRPC、WebSocket 绑定地址。
 - `[console.root]`：可选的预置 root 凭据。
+- `[console.auth]`：session TTL、session 数量和 Argon2 校验并发限制。
+- `[console.ws]`：Console WebSocket frame、连接、idle、速率、订阅、
+  结果大小和事件背压限制。
 
 运行时配置、provider 设置、模型路由、组、binding 和 policy 管理的状态，都属于 Nexus state，通过 console gateway 管理。
+console auth/WS 配置只是部署容量参数；它不能关闭 capability 检查、step-up
+门槛、Origin/Host 校验、path-specific admission、action registry 校验或
+secret redaction。
 
 ## 外部接口
 
 ### Console
 
-`nexus-console` 暴露管理域 HTTP gateway：
+`nexus-console` 是 Web Console 的管理域 gateway。它不是特权后门：
+管理动作仍然会变成 capability-bound Operation，并经过 admission、
+authorization、CAS 和 audit。
 
-- `GET /health`
-- `POST /api/auth/login`
-- `POST /api/auth/key/challenge`
-- `POST /api/auth/key/login`
-- `POST /api/auth/logout`
-- `GET /api/inspect?path=...`
-- `GET /api/inspect?path=...&prefix=true`
-- `POST /api/config`
+当前接口形态：
 
-Console 操作仍然走 capability-bound 管理路径。Console 不是特权后门。
+- HTTP：`GET /health`、`POST /api/auth/login`、
+  `POST /api/auth/key/challenge`、`POST /api/auth/key/login`、
+  `POST /api/auth/step-up`。
+- Console WebSocket：登录后的管理主路径，承载 snapshot、config
+  read/write/CAS、runtime inspect、订阅、trace/fact 流、extension lifecycle
+  与 pairing action、logout、console user/role/session 管理。
+
+登录后的管理功能属于 Console WebSocket，不加到 HTTP。
 
 ### gRPC 和 Proto
 
@@ -147,13 +156,15 @@ service GatewayService {
 }
 ```
 
-`SubmitRequest.program` 是结构化 protobuf `Program`。它不是 JSON blob，也没有 `program_json` 兼容字段。
+`SubmitRequest.program` 是结构化 protobuf `Program`。
 
 `nexus-proto` 是 Rust gateway 和移动端 Kotlin/Swift 等生成客户端的 wire schema 源头。
 
 ### WebSocket
 
-`nexus-gateway-websocket` 提供 `/ws`，把 WebSocket frame 适配到共享 gateway 抽象。它和其它 gateway 一样走 request process、taint、policy、fact、handle 路径。
+`nexus-gateway-websocket` 提供程序提交用的 WebSocket gateway，把 WebSocket
+frame 适配到共享 gateway 抽象。它和上面的 Console WebSocket 是不同通道，
+并且和其它程序 gateway 一样走 request process、taint、policy、fact、handle 路径。
 
 ### MCP
 
