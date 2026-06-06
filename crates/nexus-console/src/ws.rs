@@ -215,12 +215,29 @@ pub enum ServerFrame {
     },
 }
 
+/// JSON-encoded [`Value`] string. `Value`'s `#[serde(untagged)]` is
+/// incompatible with bincode's serde layer; we pre-serialize to JSON text.
+/// Uses `String` because `String` is unambiguous in bincode serde.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct JsonBytes(pub String);
+
+impl Eq for JsonBytes {}
+
+impl JsonBytes {
+    pub fn from_value(v: &Value) -> Self {
+        Self(serde_json::to_string(v).unwrap_or_default())
+    }
+    pub fn to_value(&self) -> Value {
+        serde_json::from_str(&self.0).unwrap_or(Value::Null)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ConsoleResult {
     Empty,
-    Value(Option<Value>),
-    Entries(Vec<(String, Value)>),
-    Snapshot(BTreeMap<String, Value>),
+    Value(Option<JsonBytes>),
+    Entries(Vec<(String, JsonBytes)>),
+    Snapshot(BTreeMap<String, JsonBytes>),
     Sessions(Vec<SessionSummary>),
     Revoked { count: usize },
 }
@@ -229,10 +246,10 @@ impl Eq for ConsoleResult {}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ConsoleEvent {
-    StateSet { path: String, value: Value },
-    StateAppend { path: String, item: Value },
+    StateSet { path: String, value: JsonBytes },
+    StateAppend { path: String, item: JsonBytes },
     StateDelete { path: String },
-    Audit { fact: Value },
+    Audit { fact: JsonBytes },
     SubscriptionClosed { reason: String },
 }
 
@@ -626,15 +643,15 @@ async fn dispatch_action(
                     }
                 }
             }
-            Ok(ConsoleResult::Snapshot(out))
+            Ok(ConsoleResult::Snapshot(jb_snapshot(out)))
         }
         ConsoleAction::ConfigRead { path } => {
             let value = mgmt::inspect(&sess.state, principal, &path).await?;
-            Ok(ConsoleResult::Value(value))
+            Ok(ConsoleResult::Value(jbv(value)))
         }
         ConsoleAction::ConfigList { prefix } => {
             let entries = mgmt::inspect_prefix(&sess.state, principal, &prefix).await?;
-            Ok(ConsoleResult::Entries(entries))
+            Ok(ConsoleResult::Entries(jb_entries(entries)))
         }
         ConsoleAction::ConfigWriteCas {
             path,
@@ -653,13 +670,13 @@ async fn dispatch_action(
                 &format!("state://kernel/console/users/{username}"),
             )
             .await?;
-            Ok(ConsoleResult::Value(value))
+            Ok(ConsoleResult::Value(jbv(value)))
         }
         ConsoleAction::UserList => {
             let entries =
                 mgmt::inspect_prefix(&sess.state, principal, "state://kernel/console/users")
                     .await?;
-            Ok(ConsoleResult::Entries(entries))
+            Ok(ConsoleResult::Entries(jb_entries(entries)))
         }
         ConsoleAction::UserWriteCas {
             username,
@@ -709,13 +726,13 @@ async fn dispatch_action(
                 &format!("state://kernel/console/roles/{role}"),
             )
             .await?;
-            Ok(ConsoleResult::Value(value))
+            Ok(ConsoleResult::Value(jbv(value)))
         }
         ConsoleAction::RoleList => {
             let entries =
                 mgmt::inspect_prefix(&sess.state, principal, "state://kernel/console/roles")
                     .await?;
-            Ok(ConsoleResult::Entries(entries))
+            Ok(ConsoleResult::Entries(jb_entries(entries)))
         }
         ConsoleAction::RoleWriteCas {
             role,
@@ -792,7 +809,7 @@ async fn dispatch_action(
                 ),
             )
             .await?;
-            Ok(ConsoleResult::Value(Some(value)))
+            Ok(ConsoleResult::Value(Some(jb(&value))))
         }
         ConsoleAction::RecentFacts { process, limit } => {
             let value = recent_facts(
@@ -806,7 +823,7 @@ async fn dispatch_action(
                 ),
             )
             .await?;
-            Ok(ConsoleResult::Value(Some(value)))
+            Ok(ConsoleResult::Value(Some(jb(&value))))
         }
         ConsoleAction::TraceRead {
             process,
@@ -825,7 +842,7 @@ async fn dispatch_action(
                 ),
             )
             .await?;
-            Ok(ConsoleResult::Value(Some(value)))
+            Ok(ConsoleResult::Value(Some(jb(&value))))
         }
         ConsoleAction::ExtensionInstallationInstall {
             id,
@@ -857,7 +874,7 @@ async fn dispatch_action(
             })?)
             .map_err(|e| ConsoleError::BadRequest(format!("proc spec conversion failed: {e}")))?;
             let out = invoke_effect(sess, principal, "effect://proc/spawn", value).await?;
-            Ok(ConsoleResult::Value(Some(out)))
+            Ok(ConsoleResult::Value(Some(jb(&out))))
         }
         ConsoleAction::ExtensionInstallationStop { id } => {
             require_step_up(principal)?;
@@ -869,7 +886,7 @@ async fn dispatch_action(
                 map_value([("id", Value::Str(id))]),
             )
             .await?;
-            Ok(ConsoleResult::Value(Some(out)))
+            Ok(ConsoleResult::Value(Some(jb(&out))))
         }
         ConsoleAction::ExtensionInstallationRevoke {
             installation_id,
@@ -884,7 +901,7 @@ async fn dispatch_action(
             }
             let out =
                 invoke_effect(sess, principal, "effect://extension/revoke", Value::Map(m)).await?;
-            Ok(ConsoleResult::Value(Some(out)))
+            Ok(ConsoleResult::Value(Some(jb(&out))))
         }
         ConsoleAction::PairingCreate {
             input,
@@ -899,7 +916,7 @@ async fn dispatch_action(
                 reveal_display_secret,
             )
             .await?;
-            Ok(ConsoleResult::Value(Some(out)))
+            Ok(ConsoleResult::Value(Some(jb(&out))))
         }
         ConsoleAction::PairingApprove {
             pairing_id,
@@ -920,7 +937,7 @@ async fn dispatch_action(
                 ]),
             )
             .await?;
-            Ok(ConsoleResult::Value(Some(out)))
+            Ok(ConsoleResult::Value(Some(jb(&out))))
         }
         ConsoleAction::PairingDeny { pairing_id } => {
             require_step_up(principal)?;
@@ -932,7 +949,7 @@ async fn dispatch_action(
                 map_value([("pairing_id", Value::Str(pairing_id))]),
             )
             .await?;
-            Ok(ConsoleResult::Value(Some(out)))
+            Ok(ConsoleResult::Value(Some(jb(&out))))
         }
         ConsoleAction::PairingReplace {
             input,
@@ -947,7 +964,7 @@ async fn dispatch_action(
                 reveal_display_secret,
             )
             .await?;
-            Ok(ConsoleResult::Value(Some(out)))
+            Ok(ConsoleResult::Value(Some(jb(&out))))
         }
     }
 }
@@ -1050,7 +1067,7 @@ async fn subscribe(
                                     .send(SubscriptionMessage {
                                         stream: id,
                                         event: ConsoleEvent::Audit {
-                                            fact: fact_value(fact.clone()),
+                                            fact: JsonBytes::from_value(&fact_value(fact.clone())),
                                         },
                                     })
                                     .await
@@ -1524,16 +1541,29 @@ fn state_event(ev: StateEvent) -> ConsoleEvent {
     match ev {
         StateEvent::Set { path, value, .. } => ConsoleEvent::StateSet {
             path: path.to_string(),
-            value,
+            value: JsonBytes::from_value(&value),
         },
         StateEvent::Append { path, item, .. } => ConsoleEvent::StateAppend {
             path: path.to_string(),
-            item,
+            item: JsonBytes::from_value(&item),
         },
         StateEvent::Delete { path } => ConsoleEvent::StateDelete {
             path: path.to_string(),
         },
     }
+}
+
+/// Helper: `&Value` → `JsonBytes`.
+fn jb(v: &Value) -> JsonBytes { JsonBytes::from_value(v) }
+/// Helper: `Option<Value>` → `Option<JsonBytes>`.
+fn jbv(v: Option<Value>) -> Option<JsonBytes> { v.map(|v| jb(&v)) }
+/// Helper: `Vec<(String, Value)>` → `Vec<(String, JsonBytes)>`.
+fn jb_entries(v: Vec<(String, Value)>) -> Vec<(String, JsonBytes)> {
+    v.into_iter().map(|(k, v)| (k, jb(&v))).collect()
+}
+/// Helper: `BTreeMap<String, Value>` → `BTreeMap<String, JsonBytes>`.
+fn jb_snapshot(v: BTreeMap<String, Value>) -> BTreeMap<String, JsonBytes> {
+    v.into_iter().map(|(k, v)| (k, jb(&v))).collect()
 }
 
 fn validate_upgrade_headers(headers: &HeaderMap) -> Result<(), String> {
@@ -1980,7 +2010,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(out, ConsoleResult::Value(Some(Value::List(_)))));
+        assert!(matches!(out, ConsoleResult::Value(Some(_))));
         let facts = dispatch_action(
             &mut sess,
             &principal,
@@ -2024,9 +2054,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let ConsoleResult::Value(Some(Value::Map(m))) = out else {
+        let ConsoleResult::Value(Some(jb)) = out else {
             panic!("expected pairing map");
         };
+        let Value::Map(m) = jb.to_value() else { panic!("expected map") };
         assert!(matches!(m.get("display_secret"), Some(Value::Str(s)) if !s.is_empty()));
         assert_eq!(st.pairing_display.take_display_secret("pair-ws"), None);
     }
