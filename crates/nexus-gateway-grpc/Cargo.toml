@@ -1,0 +1,21 @@
+[package]
+name = "nexus-gateway-grpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "gRPC protocol adapter (Gateway, §18.1) for Nexus"
+
+[dependencies]
+async-trait = "0.1.89"
+nexus-gateway = { version = "0.1.0", path = "../nexus-gateway" }
+nexus-graph = { version = "0.1.0", path = "../nexus-graph" }
+nexus-kernel = { version = "0.1.0", path = "../nexus-kernel" }
+nexus-proto = { version = "0.1.0", path = "../nexus-proto" }
+nexus-types = { version = "0.1.0", path = "../nexus-types" }
+tokio = { version = "1.52.3", features = ["rt", "sync"] }
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tracing = "0.1.44"
