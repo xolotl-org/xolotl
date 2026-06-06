@@ -255,6 +255,7 @@ async fn start_grpc(
     Ok(())
 }
 
+#[cfg(unix)]
 async fn wait_for_shutdown() -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigint = signal(SignalKind::interrupt())
@@ -265,6 +266,15 @@ async fn wait_for_shutdown() -> Result<()> {
         _ = sigint.recv() => tracing::info!("SIGINT received"),
         _ = sigterm.recv() => tracing::info!("SIGTERM received"),
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown() -> Result<()> {
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(|e| anyhow::anyhow!("install Ctrl-C handler: {e}"))?;
+    tracing::info!("Ctrl-C received");
     Ok(())
 }
 
