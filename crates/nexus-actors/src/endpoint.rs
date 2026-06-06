@@ -165,10 +165,9 @@ async fn admit_source_ingest<'a>(
         .context()
         .ok_or(SourceIngestError::Session(SessionReject::NotReady))?;
     if ctx.installation_id != req.installation_id || ctx.projection_id != req.projection.id {
-        return Err(SourceIngestError::ProjectionMismatch(source_projection_key(
-            req.installation_id,
-            &req.projection.id,
-        )));
+        return Err(SourceIngestError::ProjectionMismatch(
+            source_projection_key(req.installation_id, &req.projection.id),
+        ));
     }
     if ctx.role != Role::Source || req.projection.role != Role::Source {
         return Err(SourceIngestError::NotSource);

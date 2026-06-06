@@ -304,10 +304,7 @@ fn admit_extension_installation(path_id: &str, value: &Value) -> Result<(), Mgmt
             def.id, path_id
         )));
     }
-    admit_json_schema(
-        &def.config_schema,
-        "ExtensionInstallationDef.config_schema",
-    )?;
+    admit_json_schema(&def.config_schema, "ExtensionInstallationDef.config_schema")?;
     def.validate_admission().map_err(|e| {
         MgmtError::Admission(format!("ExtensionInstallationDef admission failed: {e}"))
     })
@@ -391,7 +388,7 @@ fn admit_manifest_def(path_platform: &str, value: &Value) -> Result<(), MgmtErro
                 MgmtError::Admission(format!("ManifestDef projection admission failed: {e}"))
             })?;
         for cap in &projection.provides {
-                admit_manifest_effect(&cap.effect_path)?;
+            admit_manifest_effect(&cap.effect_path)?;
         }
     }
     Ok(())
@@ -621,13 +618,13 @@ mod tests {
         };
         provider.insert(
             "provides".into(),
-            Value::List(vec![serde_json::from_value(
-                serde_json::json!({
+            Value::List(vec![
+                serde_json::from_value(serde_json::json!({
                     "effect_path": "effect://plugin/other/send_text",
                     "purity": "effectful"
-                }),
-            )
-            .unwrap()]),
+                }))
+                .unwrap(),
+            ]),
         );
         assert!(matches!(
             write_config(&st, &root, path, bad, Some(1)).await,

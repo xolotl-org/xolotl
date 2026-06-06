@@ -210,7 +210,9 @@ impl ExtensionInstallationDef {
     }
 
     pub fn projection(&self, id: &str) -> Option<&ExtensionProjectionDef> {
-        self.projections.iter().find(|projection| projection.id == id)
+        self.projections
+            .iter()
+            .find(|projection| projection.id == id)
     }
 }
 

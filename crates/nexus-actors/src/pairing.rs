@@ -20,8 +20,7 @@ use hkdf::Hkdf;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};
 use nexus_state::Backend;
 use nexus_types::{
-    ExtensionInstallationDef, ManifestDef, MethodId, Outcome, OutputMode, Path, Purity, Role,
-    Value,
+    ExtensionInstallationDef, ManifestDef, MethodId, Outcome, OutputMode, Path, Purity, Role, Value,
 };
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
@@ -323,7 +322,10 @@ impl Driver for PairingDriver {
                     .unwrap_or(0)
                     + 1;
                 record.insert("state".into(), Value::Str(STATE_APPROVED.into()));
-                record.insert("installation_id".into(), Value::Str(installation_id.clone()));
+                record.insert(
+                    "installation_id".into(),
+                    Value::Str(installation_id.clone()),
+                );
                 record.insert("approved_roles".into(), Value::List(roles.clone()));
                 record.insert("credential_generation".into(), Value::Int(generation));
                 record.insert(
@@ -337,13 +339,19 @@ impl Driver for PairingDriver {
                         _ => continue,
                     };
                     let mut ext = BTreeMap::new();
-                    ext.insert("installation_id".into(), Value::Str(installation_id.clone()));
+                    ext.insert(
+                        "installation_id".into(),
+                        Value::Str(installation_id.clone()),
+                    );
                     ext.insert("role".into(), Value::Str(role.into()));
                     ext.insert("pairing_id".into(), Value::Str(pairing_id.into()));
                     ext.insert("credential_generation".into(), Value::Int(generation));
                     ext.insert("state".into(), Value::Str("ready".into()));
                     self.state
-                        .write_set(&Self::session_path(&installation_id, suffix)?, Value::Map(ext))
+                        .write_set(
+                            &Self::session_path(&installation_id, suffix)?,
+                            Value::Map(ext),
+                        )
                         .await
                         .map_err(|e| DriverError::Other(e.to_string()))?;
                 }
@@ -731,8 +739,14 @@ fn validate_manifest_scope(def: &ManifestDef, platform: &str) -> Result<(), Driv
             )));
         }
         projection
-            .validate_admission(platform, nexus_types::TrustLevel::Sandboxed, &def.default_transport)
-            .map_err(|e| DriverError::Other(format!("ManifestDef projection admission failed: {e}")))?;
+            .validate_admission(
+                platform,
+                nexus_types::TrustLevel::Sandboxed,
+                &def.default_transport,
+            )
+            .map_err(|e| {
+                DriverError::Other(format!("ManifestDef projection admission failed: {e}"))
+            })?;
     }
     Ok(())
 }
@@ -1203,7 +1217,10 @@ mod tests {
         install_extension(&state, "ext-unknown-field", Role::Provider).await;
         let mut input = BTreeMap::new();
         input.insert("pairing_id".into(), Value::Str("pair-unknown-field".into()));
-        input.insert("installation_id".into(), Value::Str("ext-unknown-field".into()));
+        input.insert(
+            "installation_id".into(),
+            Value::Str("ext-unknown-field".into()),
+        );
         input.insert("connection_id".into(), Value::Str("transport-conn".into()));
         let err = driver
             .call(
@@ -1223,7 +1240,10 @@ mod tests {
         install_extension(&state, "ext-empty-role", Role::Provider).await;
         let mut input = BTreeMap::new();
         input.insert("pairing_id".into(), Value::Str("pair-empty-role".into()));
-        input.insert("installation_id".into(), Value::Str("ext-empty-role".into()));
+        input.insert(
+            "installation_id".into(),
+            Value::Str("ext-empty-role".into()),
+        );
         input.insert("allowed_roles".into(), Value::List(vec![]));
         let err = driver
             .call(

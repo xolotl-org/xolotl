@@ -1200,9 +1200,13 @@ async fn proc_spec_from_installation(
     let installation_path = format!("state://kernel/extension-installations/{id}");
     let value = mgmt::inspect(&sess.state, principal, &installation_path)
         .await?
-        .ok_or_else(|| ConsoleError::BadRequest("extension installation is not installed".into()))?;
+        .ok_or_else(|| {
+            ConsoleError::BadRequest("extension installation is not installed".into())
+        })?;
     let json = serde_json::to_value(&value).map_err(|e| {
-        ConsoleError::BadRequest(format!("ExtensionInstallationDef serialization failed: {e}"))
+        ConsoleError::BadRequest(format!(
+            "ExtensionInstallationDef serialization failed: {e}"
+        ))
     })?;
     let def: ExtensionInstallationDef = serde_json::from_value(json).map_err(|e| {
         ConsoleError::BadRequest(format!("ExtensionInstallationDef is malformed: {e}"))
@@ -1551,6 +1555,12 @@ fn validate_upgrade_headers(headers: &HeaderMap) -> Result<(), String> {
         .or_else(|| origin.strip_prefix("http://"))
         .and_then(|rest| rest.split('/').next())
         .ok_or_else(|| "console websocket origin is malformed".to_string())?;
+    // Strip port from both sides before comparison — port is not an origin
+    // security boundary for same-origin WebSocket upgrades. Keeping ports
+    // breaks dev setups where the page is served on :8080 and the proxy
+    // reaches the backend on :9000.
+    let origin_host = origin_host.rsplit(':').next_back().unwrap_or(origin_host);
+    let host = host.rsplit(':').next_back().unwrap_or(host);
     if origin_host.eq_ignore_ascii_case(host) {
         Ok(())
     } else {
@@ -1643,12 +1653,7 @@ fn validate_path_segment(raw: &str, label: &str) -> Result<(), ConsoleError> {
 }
 
 fn reject_secret_fields(input: &Value) -> Result<(), ConsoleError> {
-    let denied = [
-        "pairing_secret",
-        "secret",
-        "raw_secret",
-        "sas_verified",
-    ];
+    let denied = ["pairing_secret", "secret", "raw_secret", "sas_verified"];
     let mut stack = vec![input];
     while let Some(value) = stack.pop() {
         match value {
@@ -1699,7 +1704,9 @@ mod tests {
     use crate::state::{ConsoleWsConfig, ConsoleWsRuntime};
     use nexus_actors::{PairingDisplayEdge, StandardConfig, install_standard};
     use nexus_kernel::Bootstrap;
-    use nexus_types::{EffectCapability, ExtensionProjectionDef, Purity, Role, Transport, TrustLevel};
+    use nexus_types::{
+        EffectCapability, ExtensionProjectionDef, Purity, Role, Transport, TrustLevel,
+    };
     use std::collections::BTreeMap;
 
     fn console_state() -> Arc<ConsoleState> {

@@ -53,8 +53,8 @@ pub use extension::{
     ErrorInfo, EventAck, EventSource, ExtensionInstallationDef, ExtensionProjectionDef,
     ExtensionTransport, FlowSignal, InboundEvent, Invoke, InvokeResult, JsonSchema, ManifestDef,
     ObservedGenerations, OutboundCommand, OverflowPolicy, PairingPayload, PairingPayloadError,
-    ProcSpec, RejectReason, RestartPolicy, Role, RoleReady,
-    RoleSessionClientHello, SessionContext, StreamCapacity,
+    ProcSpec, RejectReason, RestartPolicy, Role, RoleReady, RoleSessionClientHello, SessionContext,
+    StreamCapacity,
 };
 pub use grant::{
     ConstraintSet, DeriveKind, Expiry, Grant, MethodBitmap, ResourceSelector, RightFlags, Rights,
