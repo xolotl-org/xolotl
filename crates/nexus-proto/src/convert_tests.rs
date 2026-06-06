@@ -239,6 +239,7 @@ fn extension_handshake_frames_survive_wire() {
             ext::RoleSessionClientHello {
                 role: ext::ExtensionRole::Source as i32,
                 installation_id: "install-1".into(),
+                projection_id: "source".into(),
                 registry_hash: "abc".into(),
                 observed: Some(ext::ObservedGenerations {
                     presentation_config_generation: 1,
@@ -253,14 +254,16 @@ fn extension_handshake_frames_survive_wire() {
     assert_eq!(hello, back);
 
     let context = ext::SessionContext {
-        extension_def_id: "ext-1".into(),
+        installation_id: "install-1".into(),
+        projection_id: "source".into(),
         role: ext::ExtensionRole::Source as i32,
         registry_hash: "abc".into(),
         credential_generation: 3,
         binding_generation: 4,
         extension_config_version: 5,
-        presentation_config_generation: 6,
-        alias_catalog_generation: 7,
+        projection_version: 6,
+        presentation_config_generation: 7,
+        alias_catalog_generation: 8,
     };
     let ready = ext::ExtensionFrame {
         frame: Some(ext::extension_frame::Frame::RoleReady(ext::RoleReady {

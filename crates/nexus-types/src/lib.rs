@@ -17,7 +17,7 @@
 //! - [`resource`] — `Resource`/`Interface`/`Method`/`Binding` descriptors (§4, §7).
 //! - [`operation`] — `Operation`/`OperationId`/`Fact` data-plane records (§6, §9).
 //! - [`process`]   — `Process`/lifecycle/`Outcome` (§3, §14).
-//! - [`extension`] — `ExtensionDef`/`ManifestDef`/wire frames (§16).
+//! - [`extension`] — extension installation/projection manifests and wire frames (§16).
 //! - [`device`]    — provider summary DTOs (`Transport`/`TrustLevel`/…).
 //! - [`chat`]      — chat message DTOs used by inference.
 //! - [`skill`]     — `Skill`/`SkillScope`: knowledge + procedure unit (§20.6).
@@ -50,10 +50,11 @@ pub use chat::{ChatMessage, ChatMetadata, ContentPart, MessageRole, estimate_tok
 pub use device::{EffectCapability, EffectProvider, ProviderStatus, Transport, TrustLevel};
 pub use extension::{
     AckStatus, ApplyStatus, Backoff, ConfigAxis, ControlFrame, DaemonContact, DaemonContacts,
-    ErrorInfo, EventAck, EventSource, ExtensionDef, ExtensionTransport, FlowSignal, InboundEvent,
-    Invoke, InvokeResult, JsonSchema, ManifestDef, ObservedGenerations, OutboundCommand,
-    OverflowPolicy, PairingPayload, PairingPayloadError, ProcSpec, RejectReason, RestartPolicy,
-    Role, RoleReady, RoleSessionClientHello, SessionContext, StreamCapacity,
+    ErrorInfo, EventAck, EventSource, ExtensionInstallationDef, ExtensionProjectionDef,
+    ExtensionTransport, FlowSignal, InboundEvent, Invoke, InvokeResult, JsonSchema, ManifestDef,
+    ObservedGenerations, OutboundCommand, OverflowPolicy, PairingPayload, PairingPayloadError,
+    ProcSpec, RejectReason, RestartPolicy, Role, RoleReady,
+    RoleSessionClientHello, SessionContext, StreamCapacity,
 };
 pub use grant::{
     ConstraintSet, DeriveKind, Expiry, Grant, MethodBitmap, ResourceSelector, RightFlags, Rights,

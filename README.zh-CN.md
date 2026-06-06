@@ -139,10 +139,35 @@ authorization、CAS 和 audit。
   `POST /api/auth/key/challenge`、`POST /api/auth/key/login`、
   `POST /api/auth/step-up`。
 - Console WebSocket：登录后的管理主路径，承载 snapshot、config
-  read/write/CAS、runtime inspect、订阅、trace/fact 流、extension lifecycle
-  与 pairing action、logout、console user/role/session 管理。
+  read/write/CAS、runtime inspect、订阅、trace/fact 流、
+  `ExtensionInstallation*` lifecycle action、pairing action、logout、
+  console user/role/session 管理。
 
 登录后的管理功能属于 Console WebSocket，不加到 HTTP。
+
+### Extension Protocol
+
+扩展由一个 `ExtensionInstallationDef` 加一个或多个单角色
+`ExtensionProjectionDef` 描述。installation 是生命周期、transport、pairing、
+credential 和共享配置单位。每个 projection 要么是 Provider，把
+`effect://...` 能力暴露为远端 Binding；要么是 Source，把入站事件写入声明的
+state stream。
+
+控制状态使用这些前缀：
+
+```text
+state://kernel/extension-installations/<installation_id>
+state://kernel/extension-projections/<installation_id>/<projection_id>
+state://kernel/extension-pairings/<pairing_id>
+state://kernel/extension-sessions/<installation_id>/<role>
+state://kernel/extension-revocations/<installation_id>
+```
+
+进程外扩展通过 extension gRPC/WebSocket 协议连接：
+`RoleSessionClientHello { installation_id, projection_id, ... }`、daemon
+裁定的 `SessionContext`、`RoleReady`、AEAD 保护的业务/控制帧，以及 Provider
+`Invoke` / Source `InboundEvent` 帧。Pairing input 使用 `installation_id`；
+secret 只走一次性 display edge，不进入 Operation input、state、Fact 或 trace。
 
 ### gRPC 和 Proto
 

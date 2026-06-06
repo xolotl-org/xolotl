@@ -16,8 +16,8 @@ use crate::auth::{self, ConsolePrincipal};
 use crate::state::ConsoleState;
 use nexus_graph::{DoNode, OperationTemplate};
 use nexus_types::{
-    AuditRules, ExtensionDef, IdentityRef, ManifestDef, Outcome, OutputMode, Path, ResourceName,
-    Role, TaintSet, Value,
+    AuditRules, ExtensionInstallationDef, ExtensionProjectionDef, IdentityRef, ManifestDef,
+    Outcome, OutputMode, Path, ResourceName, TaintSet, TrustLevel, Value,
 };
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
@@ -215,9 +215,12 @@ fn admit_kernel_config(path: &Path, value: &Value) -> Result<(), MgmtError> {
     }
 
     match segs {
-        s if is_path(s, &["kernel", "extensions"]) => {
-            let id = required_tail(s, "extension id")?;
-            admit_extension_def(id, value)
+        s if is_path(s, &["kernel", "extension-installations"]) => {
+            let id = required_tail(s, "extension installation id")?;
+            admit_extension_installation(id, value)
+        }
+        s if is_path_with_tail(s, &["kernel", "extension-projections"], 2) => {
+            admit_extension_projection(s, value)
         }
         s if is_path(s, &["kernel", "manifests"]) => {
             let platform = required_tail(s, "manifest platform")?;
@@ -247,6 +250,15 @@ fn admit_kernel_config(path: &Path, value: &Value) -> Result<(), MgmtError> {
 
 fn is_path<S: AsRef<str>>(segs: &[S], prefix: &[&str]) -> bool {
     segs.len() == prefix.len() + 1
+        && segs
+            .iter()
+            .take(prefix.len())
+            .zip(prefix.iter())
+            .all(|(actual, expected)| actual.as_ref() == *expected)
+}
+
+fn is_path_with_tail<S: AsRef<str>>(segs: &[S], prefix: &[&str], tail_len: usize) -> bool {
+    segs.len() == prefix.len() + tail_len
         && segs
             .iter()
             .take(prefix.len())
@@ -284,17 +296,47 @@ fn decode_config_value<T: DeserializeOwned>(value: &Value, label: &str) -> Resul
         .map_err(|e| MgmtError::Admission(format!("{label} is malformed: {e}")))
 }
 
-fn admit_extension_def(path_id: &str, value: &Value) -> Result<(), MgmtError> {
-    let def: ExtensionDef = decode_config_value(value, "ExtensionDef")?;
+fn admit_extension_installation(path_id: &str, value: &Value) -> Result<(), MgmtError> {
+    let def: ExtensionInstallationDef = decode_config_value(value, "ExtensionInstallationDef")?;
     if def.id != path_id {
         return Err(MgmtError::Admission(format!(
-            "ExtensionDef.id {:?} does not match path id {:?}",
+            "ExtensionInstallationDef.id {:?} does not match path id {:?}",
             def.id, path_id
         )));
     }
-    admit_json_schema(&def.config_schema, "ExtensionDef.config_schema")?;
-    def.validate_admission()
-        .map_err(|e| MgmtError::Admission(format!("ExtensionDef admission failed: {e}")))
+    admit_json_schema(
+        &def.config_schema,
+        "ExtensionInstallationDef.config_schema",
+    )?;
+    def.validate_admission().map_err(|e| {
+        MgmtError::Admission(format!("ExtensionInstallationDef admission failed: {e}"))
+    })
+}
+
+fn admit_extension_projection<S: AsRef<str>>(segs: &[S], value: &Value) -> Result<(), MgmtError> {
+    let installation_id = segs
+        .get(2)
+        .map(|s| s.as_ref())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| MgmtError::Admission("missing extension installation id".into()))?;
+    let projection_id = segs
+        .get(3)
+        .map(|s| s.as_ref())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| MgmtError::Admission("missing extension projection id".into()))?;
+    let def: ExtensionProjectionDef = decode_config_value(value, "ExtensionProjectionDef")?;
+    if def.id != projection_id {
+        return Err(MgmtError::Admission(format!(
+            "ExtensionProjectionDef.id {:?} does not match path projection {:?}",
+            def.id, projection_id
+        )));
+    }
+    def.validate_admission(
+        installation_id,
+        TrustLevel::Sandboxed,
+        &nexus_types::Transport::Grpc { endpoint: None },
+    )
+    .map_err(|e| MgmtError::Admission(format!("ExtensionProjectionDef admission failed: {e}")))
 }
 
 fn admit_manifest_def(path_platform: &str, value: &Value) -> Result<(), MgmtError> {
@@ -330,23 +372,26 @@ fn admit_manifest_def(path_platform: &str, value: &Value) -> Result<(), MgmtErro
             "ManifestDef.default_transport must be listed in supported_transports".into(),
         ));
     }
-    match def.role {
-        Role::Provider => {
-            if def.provides.is_empty() {
-                return Err(MgmtError::Admission(
-                    "provider ManifestDef must declare provided effects".into(),
-                ));
-            }
-            for cap in &def.provides {
-                admit_manifest_effect(&cap.effect_path)?;
-            }
+    if def.projections.is_empty() {
+        return Err(MgmtError::Admission(
+            "ManifestDef.projections must not be empty".into(),
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for projection in &def.projections {
+        if !seen.insert(projection.id.clone()) {
+            return Err(MgmtError::Admission(format!(
+                "ManifestDef contains duplicate projection id {:?}",
+                projection.id
+            )));
         }
-        Role::Source => {
-            if !def.provides.is_empty() {
-                return Err(MgmtError::Admission(
-                    "source ManifestDef must not declare provider effects".into(),
-                ));
-            }
+        projection
+            .validate_admission(&def.platform, TrustLevel::Sandboxed, &def.default_transport)
+            .map_err(|e| {
+                MgmtError::Admission(format!("ManifestDef projection admission failed: {e}"))
+            })?;
+        for cap in &projection.provides {
+                admit_manifest_effect(&cap.effect_path)?;
         }
     }
     Ok(())
@@ -364,17 +409,17 @@ fn admit_json_schema(schema: &Value, label: &str) -> Result<(), MgmtError> {
 fn admit_manifest_effect(effect_path: &str) -> Result<(), MgmtError> {
     let effect = Path::parse(effect_path).map_err(|e| {
         MgmtError::Admission(format!(
-            "ManifestDef.provides effect path is malformed: {e}"
+            "ManifestDef projection effect path is malformed: {e}"
         ))
     })?;
     if effect.scheme() != "effect" || effect.segments().is_empty() {
         return Err(MgmtError::Admission(
-            "ManifestDef.provides entries must be effect:// paths".into(),
+            "ManifestDef projection effects must be effect:// paths".into(),
         ));
     }
     if effect.segments().first().map(|s| s.as_str()) == Some("kernel") {
         return Err(MgmtError::Admission(
-            "ManifestDef.provides must not target effect://kernel/*".into(),
+            "ManifestDef projection effects must not target effect://kernel/*".into(),
         ));
     }
     Ok(())
@@ -386,7 +431,7 @@ mod tests {
     use crate::auth::{BootstrapOutcome, LoginRequest, RootProvisioning, bootstrap_root_account};
     use nexus_actors::{StandardConfig, install_standard};
     use nexus_kernel::Bootstrap;
-    use nexus_types::{EffectCapability, Purity, Transport, TrustLevel};
+    use nexus_types::{EffectCapability, Purity, Role, Transport, TrustLevel};
     use std::collections::BTreeMap;
 
     fn console_state() -> Arc<ConsoleState> {
@@ -404,23 +449,66 @@ mod tests {
         Value::Map(m)
     }
 
-    fn extension_def(id: &str, version: u64) -> Value {
-        let def = ExtensionDef {
+    fn extension_installation(id: &str, version: u64) -> Value {
+        let def = ExtensionInstallationDef {
             id: id.into(),
-            role: Role::Provider,
+            platform: id.into(),
             transport: Transport::Stdio {
                 command: Some(format!("{id}-plugin")),
                 args: vec![],
             },
             trust: TrustLevel::Sandboxed,
-            provides: vec![EffectCapability::new(
-                format!("effect://plugin/{id}/search"),
-                Purity::Idempotent,
-            )],
-            emits: None,
-            namespace: Path::parse(&format!("effect://plugin/{id}")).unwrap(),
             config_schema: Value::Null,
             config: Value::Null,
+            projections: vec![ExtensionProjectionDef {
+                id: "provider".into(),
+                role: Role::Provider,
+                namespace: Some(Path::parse(&format!("effect://plugin/{id}")).unwrap()),
+                provides: vec![EffectCapability::new(
+                    format!("effect://plugin/{id}/search"),
+                    Purity::Idempotent,
+                )],
+                emits: None,
+                version: 1,
+            }],
+            version,
+        };
+        serde_json::from_value(serde_json::to_value(def).unwrap()).unwrap()
+    }
+
+    fn wechat_installation(version: u64) -> Value {
+        let def = nexus_types::ExtensionInstallationDef {
+            id: "wechat".into(),
+            platform: "wechat".into(),
+            transport: Transport::Grpc { endpoint: None },
+            trust: TrustLevel::Sandboxed,
+            config_schema: Value::Null,
+            config: Value::Null,
+            projections: vec![
+                nexus_types::ExtensionProjectionDef {
+                    id: "source".into(),
+                    role: Role::Source,
+                    namespace: None,
+                    provides: vec![],
+                    emits: Some(nexus_types::EventSource {
+                        sink: Path::parse("state://wechat/events").unwrap(),
+                        purity: Purity::Effectful,
+                        event_schema: None,
+                    }),
+                    version: 1,
+                },
+                nexus_types::ExtensionProjectionDef {
+                    id: "provider".into(),
+                    role: Role::Provider,
+                    namespace: Some(Path::parse("effect://plugin/wechat").unwrap()),
+                    provides: vec![EffectCapability::new(
+                        "effect://plugin/wechat/send_text",
+                        Purity::Effectful,
+                    )],
+                    emits: None,
+                    version: 1,
+                },
+            ],
             version,
         };
         serde_json::from_value(serde_json::to_value(def).unwrap()).unwrap()
@@ -470,7 +558,7 @@ mod tests {
     async fn install_then_reconfigure_with_cas() {
         let st = console_state();
         let root = root_principal(&st).await;
-        let path = "state://kernel/extensions/acme";
+        let path = "state://kernel/extension-installations/acme";
         let before = st
             .boot
             .kernel
@@ -480,7 +568,7 @@ mod tests {
             .map(|pid| st.boot.kernel.facts.facts_of(pid).len())
             .sum::<usize>();
         // install: expected None ⇒ creates version 1.
-        write_config(&st, &root, path, extension_def("acme", 0), None)
+        write_config(&st, &root, path, extension_installation("acme", 0), None)
             .await
             .unwrap();
         let after = st
@@ -498,15 +586,69 @@ mod tests {
         let v = inspect(&st, &root, path).await.unwrap().unwrap();
         assert_eq!(value_version(&v), Some(1));
         // reconfigure: expected 1 ⇒ bumps to 2.
-        write_config(&st, &root, path, extension_def("acme", 1), Some(1))
+        write_config(&st, &root, path, extension_installation("acme", 1), Some(1))
             .await
             .unwrap();
         let v = inspect(&st, &root, path).await.unwrap().unwrap();
         assert_eq!(value_version(&v), Some(2));
         // stale expected ⇒ conflict, no silent clobber.
         assert!(matches!(
-            write_config(&st, &root, path, extension_def("acme", 1), Some(1)).await,
+            write_config(&st, &root, path, extension_installation("acme", 1), Some(1)).await,
             Err(MgmtError::Conflict { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn extension_installation_admission_supports_multi_projection_package() {
+        let st = console_state();
+        let root = root_principal(&st).await;
+        let path = "state://kernel/extension-installations/wechat";
+        write_config(&st, &root, path, wechat_installation(0), None)
+            .await
+            .unwrap();
+        let v = inspect(&st, &root, path).await.unwrap().unwrap();
+        assert_eq!(value_version(&v), Some(1));
+
+        let mut bad = wechat_installation(0);
+        let Value::Map(ref mut m) = bad else {
+            panic!("expected object");
+        };
+        let Value::List(projections) = m.get_mut("projections").unwrap() else {
+            panic!("expected projections");
+        };
+        let Value::Map(provider) = &mut projections[1] else {
+            panic!("expected provider projection");
+        };
+        provider.insert(
+            "provides".into(),
+            Value::List(vec![serde_json::from_value(
+                serde_json::json!({
+                    "effect_path": "effect://plugin/other/send_text",
+                    "purity": "effectful"
+                }),
+            )
+            .unwrap()]),
+        );
+        assert!(matches!(
+            write_config(&st, &root, path, bad, Some(1)).await,
+            Err(MgmtError::Admission(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn removed_extension_config_prefix_is_rejected() {
+        let st = console_state();
+        let root = root_principal(&st).await;
+        assert!(matches!(
+            write_config(
+                &st,
+                &root,
+                "state://kernel/extensions/acme",
+                extension_installation("acme", 0),
+                None,
+            )
+            .await,
+            Err(MgmtError::Admission(_))
         ));
     }
 

@@ -167,9 +167,9 @@ impl Gateway for InProcessGateway {
         let ex = self.executor_for(identity)?;
         // Externally-submitted programs carry Inbound taint: anything they read
         // from a protected source cannot flow back out (§21.5). The gateway is
-        // the source extension; `submit` is its event stream (§16.3.3).
+        // the source boundary; `submit` is its event stream (§16.3.3).
         let entry_taint = TaintSet::of(TaintSource::Inbound {
-            source_extension_id: self.source_label.as_str().into(),
+            source_projection_key: self.source_label.as_str().into(),
             event_stream: "submit".into(),
         });
         Ok(ex.eval_tainted(&program, entry_taint).await)

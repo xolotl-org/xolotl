@@ -18,8 +18,8 @@ use futures::{SinkExt, StreamExt};
 use nexus_graph::{DoNode, OperationTemplate};
 use nexus_state::StateEvent;
 use nexus_types::{
-    ExtensionDef, IdentityRef, Outcome, OutputMode, Path, ProcSpec, ResourceName, RestartPolicy,
-    TaintSet, Transport, Value,
+    ExtensionInstallationDef, IdentityRef, Outcome, OutputMode, Path, ProcSpec, ResourceName,
+    RestartPolicy, TaintSet, Transport, Value,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -140,24 +140,24 @@ pub enum ConsoleAction {
         from: usize,
         limit: usize,
     },
-    ExtensionInstall {
+    ExtensionInstallationInstall {
         id: String,
         def: Value,
         expected_version: Option<u64>,
     },
-    ExtensionUpdate {
+    ExtensionInstallationUpdate {
         id: String,
         def: Value,
         expected_version: Option<u64>,
     },
-    ExtensionStart {
+    ExtensionInstallationStart {
         id: String,
     },
-    ExtensionStop {
+    ExtensionInstallationStop {
         id: String,
     },
-    ExtensionRevoke {
-        extension_id: String,
+    ExtensionInstallationRevoke {
+        installation_id: String,
         credential_generation_floor: Option<i64>,
     },
     PairingCreate {
@@ -827,31 +827,31 @@ async fn dispatch_action(
             .await?;
             Ok(ConsoleResult::Value(Some(value)))
         }
-        ConsoleAction::ExtensionInstall {
+        ConsoleAction::ExtensionInstallationInstall {
             id,
             def,
             expected_version,
         }
-        | ConsoleAction::ExtensionUpdate {
+        | ConsoleAction::ExtensionInstallationUpdate {
             id,
             def,
             expected_version,
         } => {
             require_step_up(principal)?;
-            validate_path_segment(&id, "extension id")?;
+            validate_path_segment(&id, "extension installation id")?;
             mgmt::write_config(
                 &sess.state,
                 principal,
-                &format!("state://kernel/extensions/{id}"),
+                &format!("state://kernel/extension-installations/{id}"),
                 def,
                 expected_version,
             )
             .await?;
             Ok(ConsoleResult::Empty)
         }
-        ConsoleAction::ExtensionStart { id } => {
+        ConsoleAction::ExtensionInstallationStart { id } => {
             require_step_up(principal)?;
-            let spec = proc_spec_from_extension(sess, principal, &id).await?;
+            let spec = proc_spec_from_installation(sess, principal, &id).await?;
             let value = serde_json::from_value(serde_json::to_value(spec).map_err(|e| {
                 ConsoleError::BadRequest(format!("proc spec serialization failed: {e}"))
             })?)
@@ -859,9 +859,9 @@ async fn dispatch_action(
             let out = invoke_effect(sess, principal, "effect://proc/spawn", value).await?;
             Ok(ConsoleResult::Value(Some(out)))
         }
-        ConsoleAction::ExtensionStop { id } => {
+        ConsoleAction::ExtensionInstallationStop { id } => {
             require_step_up(principal)?;
-            validate_path_segment(&id, "extension id")?;
+            validate_path_segment(&id, "extension installation id")?;
             let out = invoke_effect(
                 sess,
                 principal,
@@ -871,14 +871,14 @@ async fn dispatch_action(
             .await?;
             Ok(ConsoleResult::Value(Some(out)))
         }
-        ConsoleAction::ExtensionRevoke {
-            extension_id,
+        ConsoleAction::ExtensionInstallationRevoke {
+            installation_id,
             credential_generation_floor,
         } => {
             require_step_up(principal)?;
-            validate_path_segment(&extension_id, "extension id")?;
+            validate_path_segment(&installation_id, "extension installation id")?;
             let mut m = BTreeMap::new();
-            m.insert("extension_id".into(), Value::Str(extension_id));
+            m.insert("installation_id".into(), Value::Str(installation_id));
             if let Some(floor) = credential_generation_floor {
                 m.insert("credential_generation_floor".into(), Value::Int(floor));
             }
@@ -1191,28 +1191,35 @@ async fn pairing_action(
     Ok(out)
 }
 
-async fn proc_spec_from_extension(
+async fn proc_spec_from_installation(
     sess: &WsSession,
     principal: &ConsolePrincipal,
     id: &str,
 ) -> Result<ProcSpec, ConsoleError> {
-    validate_path_segment(id, "extension id")?;
-    let path = format!("state://kernel/extensions/{id}");
-    let value = mgmt::inspect(&sess.state, principal, &path)
+    validate_path_segment(id, "extension installation id")?;
+    let installation_path = format!("state://kernel/extension-installations/{id}");
+    let value = mgmt::inspect(&sess.state, principal, &installation_path)
         .await?
-        .ok_or_else(|| ConsoleError::BadRequest("extension is not installed".into()))?;
-    let json = serde_json::to_value(&value)
-        .map_err(|e| ConsoleError::BadRequest(format!("ExtensionDef serialization failed: {e}")))?;
-    let def: ExtensionDef = serde_json::from_value(json)
-        .map_err(|e| ConsoleError::BadRequest(format!("ExtensionDef is malformed: {e}")))?;
+        .ok_or_else(|| ConsoleError::BadRequest("extension installation is not installed".into()))?;
+    let json = serde_json::to_value(&value).map_err(|e| {
+        ConsoleError::BadRequest(format!("ExtensionInstallationDef serialization failed: {e}"))
+    })?;
+    let def: ExtensionInstallationDef = serde_json::from_value(json).map_err(|e| {
+        ConsoleError::BadRequest(format!("ExtensionInstallationDef is malformed: {e}"))
+    })?;
     if def.id != id {
         return Err(ConsoleError::BadRequest(
-            "ExtensionDef id does not match requested extension id".into(),
+            "ExtensionInstallationDef id does not match requested installation id".into(),
         ));
     }
-    def.validate_admission()
-        .map_err(|e| ConsoleError::BadRequest(format!("ExtensionDef admission failed: {e}")))?;
-    let command = match &def.transport {
+    def.validate_admission().map_err(|e| {
+        ConsoleError::BadRequest(format!("ExtensionInstallationDef admission failed: {e}"))
+    })?;
+    Ok(proc_spec_from_transport(def.id, def.transport))
+}
+
+fn proc_spec_from_transport(id: String, transport: Transport) -> ProcSpec {
+    let command = match &transport {
         Transport::Stdio { command, args } => command.as_ref().map(|cmd| {
             std::iter::once(cmd.clone())
                 .chain(args.iter().cloned())
@@ -1220,14 +1227,14 @@ async fn proc_spec_from_extension(
         }),
         _ => None,
     };
-    Ok(ProcSpec {
-        id: def.id,
-        transport: def.transport,
+    ProcSpec {
+        id,
+        transport,
         command,
         env: BTreeMap::new(),
         cwd: None,
         restart: RestartPolicy::default(),
-    })
+    }
 }
 
 async fn invoke_effect(
@@ -1603,7 +1610,16 @@ fn require_config_write_safety(
         && segs.first().map(|s| s.as_str()) == Some("kernel")
         && matches!(
             segs.get(1).map(|s| s.as_str()),
-            Some("console" | "extensions" | "extension-pairings" | "procs")
+            Some(
+                "console"
+                    | "extensions"
+                    | "extension-installations"
+                    | "extension-projections"
+                    | "extension-pairings"
+                    | "extension-sessions"
+                    | "extension-revocations"
+                    | "procs"
+            )
         );
     if high_risk {
         require_step_up(principal)?;
@@ -1627,7 +1643,12 @@ fn validate_path_segment(raw: &str, label: &str) -> Result<(), ConsoleError> {
 }
 
 fn reject_secret_fields(input: &Value) -> Result<(), ConsoleError> {
-    let denied = ["pairing_secret", "secret", "raw_secret", "sas_verified"];
+    let denied = [
+        "pairing_secret",
+        "secret",
+        "raw_secret",
+        "sas_verified",
+    ];
     let mut stack = vec![input];
     while let Some(value) = stack.pop() {
         match value {
@@ -1678,7 +1699,7 @@ mod tests {
     use crate::state::{ConsoleWsConfig, ConsoleWsRuntime};
     use nexus_actors::{PairingDisplayEdge, StandardConfig, install_standard};
     use nexus_kernel::Bootstrap;
-    use nexus_types::{EffectCapability, Purity, Role, Transport, TrustLevel};
+    use nexus_types::{EffectCapability, ExtensionProjectionDef, Purity, Role, Transport, TrustLevel};
     use std::collections::BTreeMap;
 
     fn console_state() -> Arc<ConsoleState> {
@@ -1759,23 +1780,28 @@ mod tests {
             .unwrap()
     }
 
-    fn extension_def(id: &str, version: u64) -> Value {
-        let def = nexus_types::ExtensionDef {
+    fn extension_installation(id: &str, version: u64) -> Value {
+        let def = ExtensionInstallationDef {
             id: id.into(),
-            role: Role::Provider,
+            platform: id.into(),
             transport: Transport::Stdio {
                 command: Some(format!("{id}-plugin")),
                 args: vec![],
             },
             trust: TrustLevel::Sandboxed,
-            provides: vec![EffectCapability::new(
-                format!("effect://plugin/{id}/search"),
-                Purity::Idempotent,
-            )],
-            emits: None,
-            namespace: Path::parse(&format!("effect://plugin/{id}")).unwrap(),
             config_schema: Value::Null,
             config: Value::Null,
+            projections: vec![ExtensionProjectionDef {
+                id: "provider".into(),
+                role: Role::Provider,
+                namespace: Some(Path::parse(&format!("effect://plugin/{id}")).unwrap()),
+                provides: vec![EffectCapability::new(
+                    format!("effect://plugin/{id}/search"),
+                    Purity::Idempotent,
+                )],
+                emits: None,
+                version: 1,
+            }],
             version,
         };
         serde_json::from_value(serde_json::to_value(def).unwrap()).unwrap()
@@ -1826,6 +1852,15 @@ mod tests {
                 Value::Str("do-not-accept".into()),
             )])]),
         )])]);
+        assert!(matches!(
+            reject_secret_fields(&input),
+            Err(ConsoleError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn pairing_input_rejects_untrusted_claim_field() {
+        let input = map_value([("sas_verified", Value::Bool(true))]);
         assert!(matches!(
             reject_secret_fields(&input),
             Err(ConsoleError::BadRequest(_))
@@ -1884,7 +1919,7 @@ mod tests {
                 from: 0,
                 limit: 10,
             },
-            ConsoleAction::ExtensionStart { id: "acme".into() },
+            ConsoleAction::ExtensionInstallationStart { id: "acme".into() },
             ConsoleAction::PairingDeny {
                 pairing_id: "pair-a".into(),
             },
@@ -1919,9 +1954,9 @@ mod tests {
         dispatch_action(
             &mut sess,
             &principal,
-            ConsoleAction::ExtensionInstall {
+            ConsoleAction::ExtensionInstallationInstall {
                 id: "acme".into(),
-                def: extension_def("acme", 0),
+                def: extension_installation("acme", 0),
                 expected_version: None,
             },
         )
@@ -1961,9 +1996,9 @@ mod tests {
         dispatch_action(
             &mut sess,
             &principal,
-            ConsoleAction::ExtensionInstall {
+            ConsoleAction::ExtensionInstallationInstall {
                 id: "pairable".into(),
-                def: extension_def("pairable", 0),
+                def: extension_installation("pairable", 0),
                 expected_version: None,
             },
         )
@@ -1975,7 +2010,7 @@ mod tests {
             ConsoleAction::PairingCreate {
                 input: map_value([
                     ("pairing_id", Value::Str("pair-ws".into())),
-                    ("extension_id", Value::Str("pairable".into())),
+                    ("installation_id", Value::Str("pairable".into())),
                 ]),
                 reveal_display_secret: true,
             },
@@ -2018,8 +2053,8 @@ mod tests {
             &mut sess,
             &principal,
             ConsoleAction::ConfigWriteCas {
-                path: "state://kernel/extensions/acme".into(),
-                value: extension_def("acme", 0),
+                path: "state://kernel/extension-installations/acme".into(),
+                value: extension_installation("acme", 0),
                 expected_version: None,
             },
         )

@@ -5,8 +5,8 @@
 //! (§16.3): the external process becomes an Executor Resource (`proc://<id>`),
 //! each capability it provides becomes a remote `Binding`, and its
 //! configuration is plain state the console reads and writes. This module
-//! holds the *declarations* (`ExtensionDef`, `ManifestDef`) and the wire frames
-//! (`Invoke`, `ControlFrame`, …) — all wasm-safe data.
+//! holds the *declarations* (`ExtensionInstallationDef`, `ManifestDef`) and
+//! the wire frames (`Invoke`, `ControlFrame`, …) — all wasm-safe data.
 
 use crate::Timestamp;
 use crate::path::Path;
@@ -21,6 +21,58 @@ pub use crate::device::{EffectCapability, Transport, TrustLevel};
 /// A JSON Schema, modeled as a [`Value`] (object) to stay wasm-safe and avoid
 /// a schema-library dependency. Used as a config contract (§16.3.5).
 pub type JsonSchema = Value;
+
+/// One capability projection inside an installed extension package (§16.3).
+///
+/// A projection is deliberately single-role. A real connector may install
+/// several projections under one [`ExtensionInstallationDef`], but each
+/// projection still compiles to one Source stream or one set of Provider
+/// Bindings. This keeps source ingest, provider authorization, flow control,
+/// and binding generations independent.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionProjectionDef {
+    pub id: String,
+    pub role: Role,
+    /// Provider: every exposed effect must sit under this sandbox namespace.
+    /// Source projections usually leave this as `None`.
+    #[serde(default)]
+    pub namespace: Option<Path>,
+    /// Provider: each entry → one remote Binding.
+    #[serde(default)]
+    pub provides: Vec<EffectCapability>,
+    /// Source: which Sequence Resource inbound events write to.
+    #[serde(default)]
+    pub emits: Option<EventSource>,
+    /// Projection-level optimistic concurrency. Provider Binding generation and
+    /// Source schema changes derive from this, not from the installation's
+    /// shared runtime config.
+    #[serde(default)]
+    pub version: u64,
+}
+
+/// A real installed extension package/runtime (§16.3).
+///
+/// This is the lifecycle, pairing, process, and shared-configuration unit. It
+/// may contain multiple independent projections (for example a chat connector
+/// with one Source projection for inbound events and one Provider projection
+/// for send/media effects), all sharing one process and credential.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionInstallationDef {
+    pub id: String,
+    pub platform: String,
+    pub transport: Transport,
+    pub trust: TrustLevel,
+    /// Shared config contract for this installation. Projection-specific method
+    /// schemas stay in `provides` / `emits`.
+    pub config_schema: JsonSchema,
+    /// Current shared config values; secret fields are vault refs, not
+    /// plaintext.
+    pub config: Value,
+    /// The logical capabilities projected by this installation.
+    pub projections: Vec<ExtensionProjectionDef>,
+    /// Optimistic concurrency for shared runtime/config/code changes.
+    pub version: u64,
+}
 
 /// What role an extension plays (§16.2). A Provider exposes effects (each →
 /// a remote Binding); a Source emits an inbound event stream.
@@ -46,38 +98,20 @@ pub struct EventSource {
     pub event_schema: Option<JsonSchema>,
 }
 
-/// The declaration an extension makes about what it provides (§16.2 / §16.3.2).
-/// Admission (§10.3) verifies every `provides.effect_path` is under `namespace`
-/// (sandbox), the driver implements the effect's interface, and the
-/// trust×transport combo is legal.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ExtensionDef {
-    pub id: String,
-    pub role: Role,
-    pub transport: Transport,
-    pub trust: TrustLevel,
-    /// Provider: each entry → one remote Binding.
-    #[serde(default)]
-    pub provides: Vec<EffectCapability>,
-    /// Source: which Sequence Resource inbound events write to.
-    #[serde(default)]
-    pub emits: Option<EventSource>,
-    /// Sandbox: every binding selector must sit under this prefix.
-    pub namespace: Path,
-    /// Config contract for this instance: from a platform manifest template,
-    /// or self-reported by the extension at Ready (§16.3.5).
-    pub config_schema: JsonSchema,
-    /// Current config values, validated against `config_schema`. The console
-    /// reads it to render+prefill; changing it is one `Value.write + Cas`
-    /// (§18.4). Secret fields hold a vault reference, never plaintext (§21.6).
-    pub config: Value,
-    /// Optimistic concurrency (§24.3): any change to schema/config/code bumps
-    /// this by one.
-    pub version: u64,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum ExtensionAdmissionError {
+    #[error("extension installation id must not be empty")]
+    EmptyInstallationId,
+    #[error("extension installation id must contain only ASCII letters, digits, '_' or '-'")]
+    MalformedInstallationId,
+    #[error("extension projection id must not be empty")]
+    EmptyProjectionId,
+    #[error("extension projection id must contain only ASCII letters, digits, '_' or '-'")]
+    MalformedProjectionId,
+    #[error("extension installation must declare at least one projection")]
+    InstallationWithoutProjections,
+    #[error("extension projection id {0:?} is duplicated")]
+    DuplicateProjectionId(String),
     #[error("provider extension must declare at least one provided effect")]
     ProviderWithoutCapabilities,
     #[error("provider extension must not declare a source event stream")]
@@ -100,11 +134,19 @@ pub enum ExtensionAdmissionError {
     InProcessSandbox,
 }
 
-impl ExtensionDef {
-    /// Admission check for §16.3.2/§16.3.4 declarations. It is deliberately
-    /// fail-closed and structural: paths are parsed and compared as [`Path`]s, not
-    /// string prefixes, so sibling namespaces cannot escape a sandbox.
-    pub fn validate_admission(&self) -> Result<(), ExtensionAdmissionError> {
+impl ExtensionProjectionDef {
+    /// Admission check for one single-role projection. `installation_id`,
+    /// `transport`, and `trust` come from the owning installation.
+    pub fn validate_admission(
+        &self,
+        installation_id: &str,
+        trust: TrustLevel,
+        transport: &Transport,
+    ) -> Result<(), ExtensionAdmissionError> {
+        validate_installation_id(installation_id)?;
+        validate_projection_id(&self.id)?;
+        validate_trust_transport(trust, transport)?;
+
         match self.role {
             Role::Provider => {
                 if self.provides.is_empty() {
@@ -112,6 +154,24 @@ impl ExtensionDef {
                 }
                 if self.emits.is_some() {
                     return Err(ExtensionAdmissionError::ProviderWithEventSource);
+                }
+                let namespace = self
+                    .namespace
+                    .as_ref()
+                    .ok_or(ExtensionAdmissionError::BadSandboxNamespace)?;
+                if trust == TrustLevel::Sandboxed {
+                    validate_sandbox_namespace(installation_id, namespace)?;
+                }
+                for cap in &self.provides {
+                    let effect = Path::parse(&cap.effect_path).map_err(|_| {
+                        ExtensionAdmissionError::MalformedEffectPath(cap.effect_path.clone())
+                    })?;
+                    if !namespace.is_prefix_of(&effect) {
+                        return Err(ExtensionAdmissionError::NamespaceEscape {
+                            namespace: namespace.clone(),
+                            effect,
+                        });
+                    }
                 }
             }
             Role::Source => {
@@ -123,26 +183,62 @@ impl ExtensionDef {
                 }
             }
         }
-
-        validate_trust_transport(self.trust, &self.transport)?;
-        if self.trust == TrustLevel::Sandboxed {
-            validate_sandbox_namespace(&self.id, &self.namespace)?;
-        }
-
-        for cap in &self.provides {
-            let effect = Path::parse(&cap.effect_path).map_err(|_| {
-                ExtensionAdmissionError::MalformedEffectPath(cap.effect_path.clone())
-            })?;
-            if !self.namespace.is_prefix_of(&effect) {
-                return Err(ExtensionAdmissionError::NamespaceEscape {
-                    namespace: self.namespace.clone(),
-                    effect,
-                });
-            }
-        }
-
         Ok(())
     }
+}
+
+impl ExtensionInstallationDef {
+    /// Admission check for an installed runtime package and all of its
+    /// projections. This is control-plane-only; the data-plane still sees
+    /// ordinary Source ingest and Provider Bindings after reconcile.
+    pub fn validate_admission(&self) -> Result<(), ExtensionAdmissionError> {
+        validate_installation_id(&self.id)?;
+        validate_trust_transport(self.trust, &self.transport)?;
+        if self.projections.is_empty() {
+            return Err(ExtensionAdmissionError::InstallationWithoutProjections);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for projection in &self.projections {
+            if !seen.insert(projection.id.clone()) {
+                return Err(ExtensionAdmissionError::DuplicateProjectionId(
+                    projection.id.clone(),
+                ));
+            }
+            projection.validate_admission(&self.id, self.trust, &self.transport)?;
+        }
+        Ok(())
+    }
+
+    pub fn projection(&self, id: &str) -> Option<&ExtensionProjectionDef> {
+        self.projections.iter().find(|projection| projection.id == id)
+    }
+}
+
+fn validate_installation_id(id: &str) -> Result<(), ExtensionAdmissionError> {
+    if id.trim().is_empty() {
+        return Err(ExtensionAdmissionError::EmptyInstallationId);
+    }
+    if !is_safe_id_segment(id) {
+        return Err(ExtensionAdmissionError::MalformedInstallationId);
+    }
+    Ok(())
+}
+
+fn validate_projection_id(id: &str) -> Result<(), ExtensionAdmissionError> {
+    if id.trim().is_empty() {
+        return Err(ExtensionAdmissionError::EmptyProjectionId);
+    }
+    if !is_safe_id_segment(id) {
+        return Err(ExtensionAdmissionError::MalformedProjectionId);
+    }
+    Ok(())
+}
+
+fn is_safe_id_segment(id: &str) -> bool {
+    id.is_ascii()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn validate_trust_transport(
@@ -194,12 +290,10 @@ fn transport_name(t: &Transport) -> &'static str {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ManifestDef {
     pub platform: String,
-    pub role: Role,
-    /// Source of an instance's `ExtensionDef.config_schema`.
+    /// Source of an installation's shared config schema.
     pub config_schema: JsonSchema,
-    /// Effect templates this platform can provide.
-    #[serde(default)]
-    pub provides: Vec<EffectCapability>,
+    /// Projection templates this platform can install.
+    pub projections: Vec<ExtensionProjectionDef>,
     pub supported_transports: Vec<Transport>,
     pub default_transport: Transport,
     /// Optimistic concurrency/config revision for this install template.
@@ -394,6 +488,7 @@ pub struct ObservedGenerations {
 pub struct RoleSessionClientHello {
     pub role: Role,
     pub installation_id: String,
+    pub projection_id: String,
     pub registry_hash: String,
     #[serde(default)]
     pub observed: ObservedGenerations,
@@ -406,12 +501,14 @@ pub struct RoleSessionClientHello {
 /// never declares or guesses these.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionContext {
-    pub extension_def_id: String,
+    pub installation_id: String,
+    pub projection_id: String,
     pub role: Role,
     pub registry_hash: String,
     pub credential_generation: u64,
     pub binding_generation: u64,
     pub extension_config_version: u64,
+    pub projection_version: u64,
     pub presentation_config_generation: u64,
     pub alias_catalog_generation: u64,
 }
@@ -472,7 +569,7 @@ pub enum ControlFrame {
         profile: Value,
     },
     /// Authority axis: daemon → extension, via §18.4 Value.write+Cas; advances
-    /// `ExtensionDef.version` and may bump the Binding generation.
+    /// `ExtensionInstallationDef.version` and may bump the Binding generation.
     ExtensionConfigUpdate {
         config_version: u64,
         config: Value,
@@ -585,97 +682,154 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extension_def_roundtrip() {
-        let def = ExtensionDef {
-            id: "telegram-alice".into(),
-            role: Role::Source,
-            transport: Transport::Stdio {
-                command: Some("tg-bridge".into()),
-                args: vec![],
-            },
+    fn installation_with_source_and_provider_projections_is_admitted() {
+        let install = ExtensionInstallationDef {
+            id: "wechat".into(),
+            platform: "wechat".into(),
+            transport: Transport::Grpc { endpoint: None },
             trust: TrustLevel::Sandboxed,
-            provides: vec![],
-            emits: Some(EventSource {
-                sink: Path::parse("state://chat/telegram/events").unwrap(),
-                purity: Purity::Effectful,
-                event_schema: None,
-            }),
-            namespace: Path::parse("effect://plugin/telegram-alice").unwrap(),
             config_schema: Value::Null,
             config: Value::Null,
+            projections: vec![
+                ExtensionProjectionDef {
+                    id: "source".into(),
+                    role: Role::Source,
+                    namespace: None,
+                    provides: vec![],
+                    emits: Some(EventSource {
+                        sink: Path::parse("state://wechat/events").unwrap(),
+                        purity: Purity::Effectful,
+                        event_schema: None,
+                    }),
+                    version: 1,
+                },
+                ExtensionProjectionDef {
+                    id: "provider".into(),
+                    role: Role::Provider,
+                    namespace: Some(Path::parse("effect://plugin/wechat").unwrap()),
+                    provides: vec![EffectCapability::new(
+                        "effect://plugin/wechat/send_text",
+                        Purity::Effectful,
+                    )],
+                    emits: None,
+                    version: 1,
+                },
+            ],
             version: 1,
         };
-        let s = serde_json::to_string(&def).unwrap();
-        let back: ExtensionDef = serde_json::from_str(&s).unwrap();
-        assert_eq!(def, back);
+        assert_eq!(install.validate_admission(), Ok(()));
+    }
+
+    #[test]
+    fn installation_rejects_duplicate_projection_ids() {
+        let projection = ExtensionProjectionDef {
+            id: "provider".into(),
+            role: Role::Provider,
+            namespace: Some(Path::parse("effect://plugin/wechat").unwrap()),
+            provides: vec![EffectCapability::new(
+                "effect://plugin/wechat/send_text",
+                Purity::Effectful,
+            )],
+            emits: None,
+            version: 1,
+        };
+        let install = ExtensionInstallationDef {
+            id: "wechat".into(),
+            platform: "wechat".into(),
+            transport: Transport::Grpc { endpoint: None },
+            trust: TrustLevel::Sandboxed,
+            config_schema: Value::Null,
+            config: Value::Null,
+            projections: vec![projection.clone(), projection],
+            version: 1,
+        };
+        assert_eq!(
+            install.validate_admission(),
+            Err(ExtensionAdmissionError::DuplicateProjectionId(
+                "provider".into()
+            ))
+        );
     }
 
     #[test]
     fn sandbox_provider_admission_is_structural_and_fail_closed() {
-        let valid = ExtensionDef {
-            id: "acme".into(),
+        let valid = ExtensionProjectionDef {
+            id: "provider".into(),
             role: Role::Provider,
-            transport: Transport::Stdio {
-                command: Some("acme-plugin".into()),
-                args: vec![],
-            },
-            trust: TrustLevel::Sandboxed,
             provides: vec![EffectCapability::new(
                 "effect://plugin/acme/search",
                 Purity::Idempotent,
             )],
             emits: None,
-            namespace: Path::parse("effect://plugin/acme").unwrap(),
-            config_schema: Value::Null,
-            config: Value::Null,
+            namespace: Some(Path::parse("effect://plugin/acme").unwrap()),
             version: 1,
         };
-        assert_eq!(valid.validate_admission(), Ok(()));
+        assert_eq!(
+            valid.validate_admission(
+                "acme",
+                TrustLevel::Sandboxed,
+                &Transport::Stdio {
+                    command: Some("acme-plugin".into()),
+                    args: vec![]
+                }
+            ),
+            Ok(())
+        );
 
         let mut sibling_escape = valid.clone();
         sibling_escape.provides[0].effect_path = "effect://plugin/acmeevil/search".into();
         assert!(matches!(
-            sibling_escape.validate_admission(),
+            sibling_escape.validate_admission(
+                "acme",
+                TrustLevel::Sandboxed,
+                &Transport::Stdio {
+                    command: Some("acme-plugin".into()),
+                    args: vec![]
+                }
+            ),
             Err(ExtensionAdmissionError::NamespaceEscape { .. })
         ));
 
         let mut bad_namespace = valid.clone();
-        bad_namespace.namespace = Path::parse("effect://x/acme").unwrap();
+        bad_namespace.namespace = Some(Path::parse("effect://x/acme").unwrap());
         assert_eq!(
-            bad_namespace.validate_admission(),
+            bad_namespace.validate_admission(
+                "acme",
+                TrustLevel::Sandboxed,
+                &Transport::Stdio {
+                    command: Some("acme-plugin".into()),
+                    args: vec![]
+                }
+            ),
             Err(ExtensionAdmissionError::BadSandboxNamespace)
         );
     }
 
     #[test]
-    fn extension_role_shape_is_fail_closed() {
-        let provider_without_caps = ExtensionDef {
-            id: "acme".into(),
+    fn projection_role_shape_is_fail_closed() {
+        let provider_without_caps = ExtensionProjectionDef {
+            id: "provider".into(),
             role: Role::Provider,
-            transport: Transport::Stdio {
-                command: Some("acme-plugin".into()),
-                args: vec![],
-            },
-            trust: TrustLevel::Sandboxed,
             provides: vec![],
             emits: None,
-            namespace: Path::parse("effect://plugin/acme").unwrap(),
-            config_schema: Value::Null,
-            config: Value::Null,
+            namespace: Some(Path::parse("effect://plugin/acme").unwrap()),
             version: 1,
         };
         assert_eq!(
-            provider_without_caps.validate_admission(),
+            provider_without_caps.validate_admission(
+                "acme",
+                TrustLevel::Sandboxed,
+                &Transport::Stdio {
+                    command: Some("acme-plugin".into()),
+                    args: vec![]
+                }
+            ),
             Err(ExtensionAdmissionError::ProviderWithoutCapabilities)
         );
 
-        let source_with_caps = ExtensionDef {
-            id: "bridge".into(),
+        let source_with_caps = ExtensionProjectionDef {
+            id: "source".into(),
             role: Role::Source,
-            transport: Transport::WebSocket {
-                endpoint: Some("wss://example.test".into()),
-            },
-            trust: TrustLevel::Sandboxed,
             provides: vec![EffectCapability::new(
                 "effect://plugin/bridge/tool",
                 Purity::Effectful,
@@ -685,35 +839,44 @@ mod tests {
                 purity: Purity::Effectful,
                 event_schema: None,
             }),
-            namespace: Path::parse("effect://plugin/bridge").unwrap(),
-            config_schema: Value::Null,
-            config: Value::Null,
+            namespace: None,
             version: 1,
         };
         assert_eq!(
-            source_with_caps.validate_admission(),
+            source_with_caps.validate_admission(
+                "bridge",
+                TrustLevel::Sandboxed,
+                &Transport::WebSocket {
+                    endpoint: Some("wss://example.test".into())
+                }
+            ),
             Err(ExtensionAdmissionError::SourceWithCapabilities)
         );
     }
 
     #[test]
     fn trust_transport_combo_is_fail_closed() {
-        let full_stdio = ExtensionDef {
+        let full_stdio = ExtensionInstallationDef {
             id: "local-tool".into(),
-            role: Role::Provider,
+            platform: "local-tool".into(),
             transport: Transport::Stdio {
                 command: Some("tool".into()),
                 args: vec![],
             },
             trust: TrustLevel::Full,
-            provides: vec![EffectCapability::new(
-                "effect://local-tool/run",
-                Purity::Effectful,
-            )],
-            emits: None,
-            namespace: Path::parse("effect://local-tool").unwrap(),
             config_schema: Value::Null,
             config: Value::Null,
+            projections: vec![ExtensionProjectionDef {
+                id: "provider".into(),
+                role: Role::Provider,
+                namespace: Some(Path::parse("effect://local-tool").unwrap()),
+                provides: vec![EffectCapability::new(
+                    "effect://local-tool/run",
+                    Purity::Effectful,
+                )],
+                emits: None,
+                version: 1,
+            }],
             version: 1,
         };
         assert!(matches!(
@@ -725,8 +888,10 @@ mod tests {
         sandbox_in_process.id = "tool".into();
         sandbox_in_process.trust = TrustLevel::Sandboxed;
         sandbox_in_process.transport = Transport::InProcess;
-        sandbox_in_process.namespace = Path::parse("effect://plugin/tool").unwrap();
-        sandbox_in_process.provides[0].effect_path = "effect://plugin/tool/run".into();
+        sandbox_in_process.projections[0].namespace =
+            Some(Path::parse("effect://plugin/tool").unwrap());
+        sandbox_in_process.projections[0].provides[0].effect_path =
+            "effect://plugin/tool/run".into();
         assert_eq!(
             sandbox_in_process.validate_admission(),
             Err(ExtensionAdmissionError::InProcessSandbox)
@@ -752,17 +917,20 @@ mod tests {
         let hello = RoleSessionClientHello {
             role: Role::Provider,
             installation_id: "inst-1".into(),
+            projection_id: "provider".into(),
             registry_hash: "abc".into(),
             observed: ObservedGenerations::default(),
             config_schema: None,
         };
         let ctx = SessionContext {
-            extension_def_id: "ext-1".into(),
+            installation_id: "inst-1".into(),
+            projection_id: "provider".into(),
             role: Role::Provider,
             registry_hash: "abc".into(),
             credential_generation: 2,
             binding_generation: 3,
             extension_config_version: 1,
+            projection_version: 1,
             presentation_config_generation: 4,
             alias_catalog_generation: 5,
         };

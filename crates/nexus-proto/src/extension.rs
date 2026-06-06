@@ -44,30 +44,36 @@ pub struct RoleSessionClientHello {
     #[prost(string, tag = "2")]
     pub installation_id: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
+    pub projection_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
     pub registry_hash: ::prost::alloc::string::String,
-    #[prost(message, optional, tag = "4")]
-    pub observed: ::core::option::Option<ObservedGenerations>,
     #[prost(message, optional, tag = "5")]
+    pub observed: ::core::option::Option<ObservedGenerations>,
+    #[prost(message, optional, tag = "6")]
     pub config_schema: ::core::option::Option<super::Value>,
 }
 /// Stage 2: daemon adjudicates authoritative registry hash/generations.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SessionContext {
     #[prost(string, tag = "1")]
-    pub extension_def_id: ::prost::alloc::string::String,
-    #[prost(enumeration = "ExtensionRole", tag = "2")]
+    pub installation_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub projection_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "ExtensionRole", tag = "3")]
     pub role: i32,
-    #[prost(string, tag = "3")]
+    #[prost(string, tag = "4")]
     pub registry_hash: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "4")]
-    pub credential_generation: u64,
     #[prost(uint64, tag = "5")]
-    pub binding_generation: u64,
+    pub credential_generation: u64,
     #[prost(uint64, tag = "6")]
-    pub extension_config_version: u64,
+    pub binding_generation: u64,
     #[prost(uint64, tag = "7")]
-    pub presentation_config_generation: u64,
+    pub extension_config_version: u64,
     #[prost(uint64, tag = "8")]
+    pub projection_version: u64,
+    #[prost(uint64, tag = "9")]
+    pub presentation_config_generation: u64,
+    #[prost(uint64, tag = "10")]
     pub alias_catalog_generation: u64,
 }
 /// Stage 3: extension confirms it has aligned to the daemon-selected context.

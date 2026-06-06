@@ -154,11 +154,36 @@ The current interface shape is:
   `POST /api/auth/key/challenge`, `POST /api/auth/key/login`, and
   `POST /api/auth/step-up`.
 - Console WebSocket: the post-login management path for snapshot, config
-  read/write/CAS, runtime inspect, subscriptions, trace/fact streams, extension
-  lifecycle and pairing actions, logout, and console user/role/session
-  management.
+  read/write/CAS, runtime inspect, subscriptions, trace/fact streams,
+  `ExtensionInstallation*` lifecycle actions, pairing actions, logout, and
+  console user/role/session management.
 
 Post-login management features belong on Console WebSocket, not HTTP.
+
+### Extension Protocol
+
+Extensions are described as one `ExtensionInstallationDef` plus one or more
+single-role `ExtensionProjectionDef`s. The installation is the lifecycle,
+transport, pairing, credential, and shared-config unit. Each projection is
+either a Provider, which exposes `effect://...` capabilities through remote
+Bindings, or a Source, which emits inbound events into a declared state stream.
+
+Control state uses these prefixes:
+
+```text
+state://kernel/extension-installations/<installation_id>
+state://kernel/extension-projections/<installation_id>/<projection_id>
+state://kernel/extension-pairings/<pairing_id>
+state://kernel/extension-sessions/<installation_id>/<role>
+state://kernel/extension-revocations/<installation_id>
+```
+
+Out-of-process extensions connect with the extension gRPC/WebSocket protocol:
+`RoleSessionClientHello { installation_id, projection_id, ... }`,
+daemon-selected `SessionContext`, `RoleReady`, AEAD-protected business/control
+frames, and Provider `Invoke` / Source `InboundEvent` frames. Pairing inputs use
+`installation_id`; secrets stay on the one-shot display edge and do not enter
+Operation input, state, Facts, or traces.
 
 ### gRPC And Proto
 

@@ -33,21 +33,24 @@ message ExtensionFrame {
 message RoleSessionClientHello {
   ExtensionRole role = 1;
   string installation_id = 2;
-  string registry_hash = 3;
-  ObservedGenerations observed = 4;
-  optional nexus.v1.Value config_schema = 5;
+  string projection_id = 3;
+  string registry_hash = 4;
+  ObservedGenerations observed = 5;
+  optional nexus.v1.Value config_schema = 6;
 }
 
 // Stage 2: daemon adjudicates authoritative registry hash/generations.
 message SessionContext {
-  string extension_def_id = 1;
-  ExtensionRole role = 2;
-  string registry_hash = 3;
-  uint64 credential_generation = 4;
-  uint64 binding_generation = 5;
-  uint64 extension_config_version = 6;
-  uint64 presentation_config_generation = 7;
-  uint64 alias_catalog_generation = 8;
+  string installation_id = 1;
+  string projection_id = 2;
+  ExtensionRole role = 3;
+  string registry_hash = 4;
+  uint64 credential_generation = 5;
+  uint64 binding_generation = 6;
+  uint64 extension_config_version = 7;
+  uint64 projection_version = 8;
+  uint64 presentation_config_generation = 9;
+  uint64 alias_catalog_generation = 10;
 }
 
 // Stage 3: extension confirms it has aligned to the daemon-selected context.
@@ -167,7 +170,7 @@ message PresentationProfileUpdate {
 }
 
 // Daemon → extension: authority config update (§16.3.3), via §18.4 CAS;
-// advances ExtensionDef.version and may bump the Binding generation.
+// advances ExtensionInstallationDef.version and may bump the Binding generation.
 message ExtensionConfigUpdate {
   uint64 config_version = 1;
   nexus.v1.Value config = 2;

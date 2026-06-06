@@ -17,8 +17,8 @@
 use nexus_kernel::{CheckCtx, PolicyDecision, PolicySnapshot};
 use nexus_state::{Backend, StateError};
 use nexus_types::extension::{
-    AckStatus, EventAck, ExtensionDef, InboundEvent, JsonSchema, ObservedGenerations, Role,
-    RoleReady, RoleSessionClientHello, SessionContext,
+    AckStatus, EventAck, ExtensionProjectionDef, InboundEvent, JsonSchema, ObservedGenerations,
+    Role, RoleReady, RoleSessionClientHello, SessionContext,
 };
 use nexus_types::{IdentityRef, Path, ResourceId, TaintSet, TaintSource, Value};
 use std::collections::BTreeSet;
@@ -59,16 +59,18 @@ pub enum SessionReject {
 pub enum SourceIngestError {
     #[error("session rejected frame: {0:?}")]
     Session(SessionReject),
-    #[error("extension def {0} is not the ready session def")]
-    ExtensionDefMismatch(String),
+    #[error("source projection {0} is not the ready session projection")]
+    ProjectionMismatch(String),
     #[error("source session registry hash mismatch")]
     RegistryHashMismatch,
     #[error("source session credential generation mismatch")]
     CredentialGenerationMismatch,
     #[error("source session binding generation mismatch")]
     BindingGenerationMismatch,
-    #[error("source session config version mismatch")]
-    ConfigVersionMismatch,
+    #[error("source session installation config version mismatch")]
+    InstallationConfigVersionMismatch,
+    #[error("source session projection version mismatch")]
+    ProjectionVersionMismatch,
     #[error("extension is not a Source")]
     NotSource,
     #[error("source extension has no emits declaration")]
@@ -87,10 +89,12 @@ pub enum SourceIngestError {
 pub struct SourceIngest<'a> {
     pub state: Backend,
     pub session: &'a EndpointSession,
-    pub extension: &'a ExtensionDef,
+    pub installation_id: &'a str,
+    pub projection: &'a ExtensionProjectionDef,
     pub current_registry_hash: &'a str,
     pub credential_generation: u64,
     pub current_binding_generation: u64,
+    pub current_installation_config_version: u64,
     pub policy: &'a PolicySnapshot,
     pub acting: IdentityRef,
     /// Resource id for the declared event sink. Source policy uses this as the
@@ -109,7 +113,8 @@ pub async fn ingest_source_event(
     event: InboundEvent,
 ) -> Result<EventAck, SourceIngestError> {
     let emits = admit_source_ingest(&req, &event).await?;
-    let dedup = source_event_dedup_path(&req.extension.id, &event.id)?;
+    let source_key = source_projection_key(req.installation_id, &req.projection.id);
+    let dedup = source_event_dedup_path(req.installation_id, &req.projection.id, &event.id)?;
 
     match req
         .state
@@ -127,7 +132,7 @@ pub async fn ingest_source_event(
     }
 
     let taint = TaintSet::of(TaintSource::Inbound {
-        source_extension_id: req.extension.id.as_str().into(),
+        source_projection_key: source_key.into(),
         event_stream: emits.sink.to_string().into(),
     });
     if let Err(e) = req
@@ -159,12 +164,13 @@ async fn admit_source_ingest<'a>(
         .session
         .context()
         .ok_or(SourceIngestError::Session(SessionReject::NotReady))?;
-    if ctx.extension_def_id != req.extension.id {
-        return Err(SourceIngestError::ExtensionDefMismatch(
-            req.extension.id.clone(),
-        ));
+    if ctx.installation_id != req.installation_id || ctx.projection_id != req.projection.id {
+        return Err(SourceIngestError::ProjectionMismatch(source_projection_key(
+            req.installation_id,
+            &req.projection.id,
+        )));
     }
-    if ctx.role != Role::Source || req.extension.role != Role::Source {
+    if ctx.role != Role::Source || req.projection.role != Role::Source {
         return Err(SourceIngestError::NotSource);
     }
     if ctx.registry_hash != req.current_registry_hash {
@@ -176,11 +182,14 @@ async fn admit_source_ingest<'a>(
     if ctx.binding_generation != req.current_binding_generation {
         return Err(SourceIngestError::BindingGenerationMismatch);
     }
-    if ctx.extension_config_version != req.extension.version {
-        return Err(SourceIngestError::ConfigVersionMismatch);
+    if ctx.extension_config_version != req.current_installation_config_version {
+        return Err(SourceIngestError::InstallationConfigVersionMismatch);
+    }
+    if ctx.projection_version != req.projection.version {
+        return Err(SourceIngestError::ProjectionVersionMismatch);
     }
     let emits = req
-        .extension
+        .projection
         .emits
         .as_ref()
         .ok_or(SourceIngestError::MissingEmits)?;
@@ -203,17 +212,26 @@ async fn admit_source_ingest<'a>(
     }
 }
 
-fn source_event_dedup_path(extension_id: &str, event_id: &str) -> Result<Path, SourceIngestError> {
-    let extension_id = path_segment(extension_id);
+fn source_event_dedup_path(
+    installation_id: &str,
+    projection_id: &str,
+    event_id: &str,
+) -> Result<Path, SourceIngestError> {
+    let installation_id = path_segment(installation_id);
+    let projection_id = path_segment(projection_id);
     let event_id = path_segment(event_id);
-    if extension_id.is_empty() || event_id.is_empty() {
+    if installation_id.is_empty() || projection_id.is_empty() || event_id.is_empty() {
         return Err(SourceIngestError::InvalidEventId);
     }
     Path::parse(&format!(
-        "state://kernel/source-events/{}/{}",
-        extension_id, event_id
+        "state://kernel/source-events/{}/{}/{}",
+        installation_id, projection_id, event_id
     ))
     .map_err(|e| SourceIngestError::State(format!("invalid dedup path: {e}")))
+}
+
+fn source_projection_key(installation_id: &str, projection_id: &str) -> String {
+    format!("{installation_id}/{projection_id}")
 }
 
 fn path_segment(s: &str) -> String {
@@ -444,7 +462,7 @@ mod tests {
     use nexus_kernel::{CompiledCheck, PolicyDecision};
     use nexus_state::InMemoryBackend;
     use nexus_types::extension::{EventSource, Role};
-    use nexus_types::{FloatBits, Purity, TaintSource, Transport, TrustLevel};
+    use nexus_types::{FloatBits, Purity, TaintSource};
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -452,6 +470,7 @@ mod tests {
         RoleSessionClientHello {
             role: Role::Source,
             installation_id: "inst-1".into(),
+            projection_id: "source".into(),
             registry_hash: "h".into(),
             observed: ObservedGenerations::default(),
             config_schema: None,
@@ -460,12 +479,14 @@ mod tests {
 
     fn ctx() -> SessionContext {
         SessionContext {
-            extension_def_id: "ext-1".into(),
+            installation_id: "inst-1".into(),
+            projection_id: "source".into(),
             role: Role::Source,
             registry_hash: "h".into(),
             credential_generation: 3,
             binding_generation: 1,
             extension_config_version: 1,
+            projection_version: 1,
             presentation_config_generation: 2,
             alias_catalog_generation: 1,
         }
@@ -481,21 +502,17 @@ mod tests {
         s
     }
 
-    fn source_def(schema: Option<Value>) -> ExtensionDef {
-        ExtensionDef {
-            id: "ext-1".into(),
+    fn source_projection(schema: Option<Value>) -> ExtensionProjectionDef {
+        ExtensionProjectionDef {
+            id: "source".into(),
             role: Role::Source,
-            transport: Transport::Grpc { endpoint: None },
-            trust: TrustLevel::Full,
+            namespace: None,
             provides: vec![],
             emits: Some(EventSource {
                 sink: Path::parse("state://chat/source/events").unwrap(),
                 purity: Purity::Effectful,
                 event_schema: schema,
             }),
-            namespace: Path::parse("effect://plugin/ext-1").unwrap(),
-            config_schema: Value::Map(BTreeMap::new()),
-            config: Value::Map(BTreeMap::new()),
             version: 1,
         }
     }
@@ -515,16 +532,18 @@ mod tests {
     fn source_req<'a>(
         state: Backend,
         session: &'a EndpointSession,
-        extension: &'a ExtensionDef,
+        projection: &'a ExtensionProjectionDef,
         policy: &'a PolicySnapshot,
     ) -> SourceIngest<'a> {
         SourceIngest {
             state,
             session,
-            extension,
+            installation_id: "inst-1",
+            projection,
             current_registry_hash: "h",
             credential_generation: 3,
             current_binding_generation: 1,
+            current_installation_config_version: 1,
             policy,
             acting: IdentityRef::ROOT,
             target: ResourceId::new(1),
@@ -649,7 +668,7 @@ mod tests {
         let mut s = EndpointSession::new();
         s.on_hello(&hello(), |_| ctx()).unwrap();
         let state: Backend = Arc::new(InMemoryBackend::new());
-        let def = source_def(None);
+        let def = source_projection(None);
         let policy = PolicySnapshot::empty();
         let err = ingest_source_event(
             source_req(state.clone(), &s, &def, &policy),
@@ -672,7 +691,7 @@ mod tests {
     async fn source_ingest_accepts_taints_and_dedupes_event_id() {
         let s = complete_handshake();
         let state: Backend = Arc::new(InMemoryBackend::new());
-        let def = source_def(None);
+        let def = source_projection(None);
         let policy = PolicySnapshot::empty();
         let first = ingest_source_event(
             source_req(state.clone(), &s, &def, &policy),
@@ -696,9 +715,9 @@ mod tests {
             matches!(
                 source,
                 TaintSource::Inbound {
-                    source_extension_id,
+                    source_projection_key,
                     event_stream
-                } if source_extension_id.as_str() == "ext-1"
+                } if source_projection_key.as_str() == "inst-1/source"
                     && event_stream.as_str() == "state://chat/source/events"
             )
         }));
@@ -708,7 +727,7 @@ mod tests {
     async fn source_ingest_rejects_schema_mismatch_and_policy_deny() {
         let s = complete_handshake();
         let state: Backend = Arc::new(InMemoryBackend::new());
-        let def = source_def(Some(message_schema()));
+        let def = source_projection(Some(message_schema()));
         let policy = PolicySnapshot::empty();
         let err = ingest_source_event(
             source_req(state.clone(), &s, &def, &policy),
@@ -739,7 +758,7 @@ mod tests {
     async fn source_ingest_rejects_generation_mismatches() {
         let s = complete_handshake();
         let state: Backend = Arc::new(InMemoryBackend::new());
-        let def = source_def(None);
+        let def = source_projection(None);
         let policy = PolicySnapshot::empty();
         let mut req = source_req(state, &s, &def, &policy);
         req.current_registry_hash = "other";
@@ -763,5 +782,22 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, SourceIngestError::BindingGenerationMismatch);
+
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let mut req = source_req(state, &s, &def, &policy);
+        req.current_installation_config_version = 2;
+        let err = ingest_source_event(req, event("evt-config", message_payload("hello")))
+            .await
+            .unwrap_err();
+        assert_eq!(err, SourceIngestError::InstallationConfigVersionMismatch);
+
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let mut projection = source_projection(None);
+        projection.version = 2;
+        let req = source_req(state, &s, &projection, &policy);
+        let err = ingest_source_event(req, event("evt-projection", message_payload("hello")))
+            .await
+            .unwrap_err();
+        assert_eq!(err, SourceIngestError::ProjectionVersionMismatch);
     }
 }

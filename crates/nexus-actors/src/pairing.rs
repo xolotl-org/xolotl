@@ -20,7 +20,8 @@ use hkdf::Hkdf;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};
 use nexus_state::Backend;
 use nexus_types::{
-    ExtensionDef, ManifestDef, MethodId, Outcome, OutputMode, Path, Purity, Role, Value,
+    ExtensionInstallationDef, ManifestDef, MethodId, Outcome, OutputMode, Path, Purity, Role,
+    Value,
 };
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
@@ -100,28 +101,34 @@ impl PairingDriver {
     }
 
     fn pairing_path(id: &str) -> Result<Path, DriverError> {
+        validate_id_segment(id, "pairing_id")?;
         Path::parse(&format!("state://kernel/extension-pairings/{id}"))
             .map_err(|e| DriverError::Other(format!("invalid pairing id {id:?}: {e}")))
     }
 
-    fn extension_path(id: &str, suffix: &str) -> Result<Path, DriverError> {
-        Path::parse(&format!("state://kernel/extensions/{id}-{suffix}"))
-            .map_err(|e| DriverError::Other(format!("invalid extension id {id:?}: {e}")))
+    fn session_path(id: &str, role: &str) -> Result<Path, DriverError> {
+        validate_id_segment(id, "installation_id")?;
+        validate_id_segment(role, "role")?;
+        Path::parse(&format!("state://kernel/extension-sessions/{id}/{role}"))
+            .map_err(|e| DriverError::Other(format!("invalid installation id {id:?}: {e}")))
     }
 
-    fn extension_def_path(id: &str) -> Result<Path, DriverError> {
-        Path::parse(&format!("state://kernel/extensions/{id}"))
-            .map_err(|e| DriverError::Other(format!("invalid extension id {id:?}: {e}")))
+    fn installation_path(id: &str) -> Result<Path, DriverError> {
+        validate_id_segment(id, "installation_id")?;
+        Path::parse(&format!("state://kernel/extension-installations/{id}"))
+            .map_err(|e| DriverError::Other(format!("invalid installation id {id:?}: {e}")))
     }
 
     fn manifest_path(platform: &str) -> Result<Path, DriverError> {
+        validate_id_segment(platform, "manifest_platform")?;
         Path::parse(&format!("state://kernel/manifests/{platform}"))
             .map_err(|e| DriverError::Other(format!("invalid manifest platform {platform:?}: {e}")))
     }
 
     fn revoke_path(id: &str) -> Result<Path, DriverError> {
-        Path::parse(&format!("state://kernel/extensions/{id}/revoked"))
-            .map_err(|e| DriverError::Other(format!("invalid extension id {id:?}: {e}")))
+        validate_id_segment(id, "installation_id")?;
+        Path::parse(&format!("state://kernel/extension-revocations/{id}"))
+            .map_err(|e| DriverError::Other(format!("invalid installation id {id:?}: {e}")))
     }
 
     async fn read_record(&self, id: &str) -> Result<BTreeMap<String, Value>, DriverError> {
@@ -152,35 +159,35 @@ impl PairingDriver {
 
     async fn load_pairing_scope(
         &self,
-        extension_id: &str,
+        installation_id: &str,
         manifest_platform: Option<&str>,
     ) -> Result<PairingScope, DriverError> {
-        if extension_id.is_empty() {
-            return Err(DriverError::Other("extension_id must not be empty".into()));
-        }
+        validate_id_segment(installation_id, "installation_id")?;
 
         if let Some(value) = self
             .state
-            .read(&Self::extension_def_path(extension_id)?)
+            .read(&Self::installation_path(installation_id)?)
             .await
             .map_err(|e| DriverError::Other(e.to_string()))?
         {
-            let def: ExtensionDef = decode_state_value(&value, "ExtensionDef")?;
-            if def.id != extension_id {
+            let def: ExtensionInstallationDef =
+                decode_state_value(&value, "ExtensionInstallationDef")?;
+            if def.id != installation_id {
                 return Err(DriverError::Other(format!(
-                    "ExtensionDef.id {:?} does not match extension_id {:?}",
-                    def.id, extension_id
+                    "ExtensionInstallationDef.id {:?} does not match installation_id {:?}",
+                    def.id, installation_id
                 )));
             }
-            def.validate_admission()
-                .map_err(|e| DriverError::Other(format!("ExtensionDef admission failed: {e}")))?;
+            def.validate_admission().map_err(|e| {
+                DriverError::Other(format!("ExtensionInstallationDef admission failed: {e}"))
+            })?;
             return Ok(PairingScope {
-                roles: vec![role_name(def.role).into()],
+                roles: installation_roles(&def)?,
                 manifest_platform: None,
             });
         }
 
-        let platform = manifest_platform.unwrap_or(extension_id);
+        let platform = manifest_platform.unwrap_or(installation_id);
         if let Some(value) = self
             .state
             .read(&Self::manifest_path(platform)?)
@@ -190,15 +197,15 @@ impl PairingDriver {
             let def: ManifestDef = decode_state_value(&value, "ManifestDef")?;
             validate_manifest_scope(&def, platform)?;
             return Ok(PairingScope {
-                roles: vec![role_name(def.role).into()],
+                roles: manifest_roles(&def)?,
                 manifest_platform: Some(platform.to_string()),
             });
         }
 
         Err(DriverError::Other(format!(
-            "pairing requires an installed ExtensionDef state://kernel/extensions/{extension_id} \
+            "pairing requires an installed ExtensionInstallationDef state://kernel/extension-installations/{installation_id} \
              or ManifestDef state://kernel/manifests/{}",
-            manifest_platform.unwrap_or(extension_id)
+            manifest_platform.unwrap_or(installation_id)
         )))
     }
 }
@@ -223,17 +230,26 @@ impl Driver for PairingDriver {
             // create: allocate a pairing intent and persist only a secret hash.
             0 => {
                 reject_inline_secret(&m)?;
+                reject_unknown_fields(
+                    &m,
+                    "pairing.create",
+                    &[
+                        "pairing_id",
+                        "installation_id",
+                        "manifest_platform",
+                        "allowed_roles",
+                        "expires_at",
+                    ],
+                )?;
                 reject_inline_install_fields(&m, "pairing.create")?;
                 reject_pairing_claim_fields(&m, "pairing.create")?;
                 let pairing_id = match field_str(&m, "pairing_id") {
                     Some(id) => id.to_string(),
                     None => random_id()?,
                 };
-                let extension_id = field_str(&m, "extension_id")
-                    .map(str::to_string)
-                    .unwrap_or_else(|| pairing_id.clone());
+                let installation_id = required_str(&m, "installation_id")?.to_string();
                 let scope = self
-                    .load_pairing_scope(&extension_id, field_str(&m, "manifest_platform"))
+                    .load_pairing_scope(&installation_id, field_str(&m, "manifest_platform"))
                     .await?;
                 let requested_allowed = role_values(m.get("allowed_roles"), "allowed_roles")?;
                 let allowed_roles = if m.contains_key("allowed_roles") {
@@ -246,7 +262,7 @@ impl Driver for PairingDriver {
                 let expires_at = m.get("expires_at").and_then(|v| v.as_int()).unwrap_or(0);
                 let mut record = BTreeMap::new();
                 record.insert("pairing_id".into(), Value::Str(pairing_id.clone()));
-                record.insert("extension_id".into(), Value::Str(extension_id));
+                record.insert("installation_id".into(), Value::Str(installation_id));
                 record.insert("state".into(), Value::Str(STATE_CREATED.into()));
                 record.insert("allowed_roles".into(), string_list(allowed_roles));
                 if let Some(platform) = scope.manifest_platform {
@@ -264,7 +280,7 @@ impl Driver for PairingDriver {
                 Ok(out)
             }
             // approve: terminally approve the intent and project provider/source
-            // role state under state://kernel/extensions/*.
+            // role state under state://kernel/extension-sessions/*.
             1 => {
                 let pairing_id = required_str(&m, "pairing_id")?;
                 let mut record = self.read_record(pairing_id).await?;
@@ -275,12 +291,13 @@ impl Driver for PairingDriver {
                     return Err(err);
                 }
                 reject_approve_claim_fields(&m)?;
+                reject_unknown_fields(&m, "pairing.approve", &["pairing_id", "approved_roles"])?;
                 ensure_record_sas_verified(&record)?;
-                let extension_id = field_str(&record, "extension_id")
-                    .ok_or_else(|| DriverError::Other("approve requires extension_id".into()))?
+                let installation_id = field_str(&record, "installation_id")
+                    .ok_or_else(|| DriverError::Other("approve requires installation_id".into()))?
                     .to_string();
                 let scope = self
-                    .load_pairing_scope(&extension_id, field_str(&record, "manifest_platform"))
+                    .load_pairing_scope(&installation_id, field_str(&record, "manifest_platform"))
                     .await?;
                 let allowed_roles =
                     role_values(record.get("allowed_roles"), "record.allowed_roles")?;
@@ -306,12 +323,12 @@ impl Driver for PairingDriver {
                     .unwrap_or(0)
                     + 1;
                 record.insert("state".into(), Value::Str(STATE_APPROVED.into()));
-                record.insert("extension_id".into(), Value::Str(extension_id.clone()));
+                record.insert("installation_id".into(), Value::Str(installation_id.clone()));
                 record.insert("approved_roles".into(), Value::List(roles.clone()));
                 record.insert("credential_generation".into(), Value::Int(generation));
                 record.insert(
                     "credential_hash".into(),
-                    Value::Str(credential_hash(&extension_id, pairing_id, generation)),
+                    Value::Str(credential_hash(&installation_id, pairing_id, generation)),
                 );
                 for role in roles.iter().filter_map(Value::as_str) {
                     let suffix = match role {
@@ -320,16 +337,13 @@ impl Driver for PairingDriver {
                         _ => continue,
                     };
                     let mut ext = BTreeMap::new();
-                    ext.insert("extension_id".into(), Value::Str(extension_id.clone()));
+                    ext.insert("installation_id".into(), Value::Str(installation_id.clone()));
                     ext.insert("role".into(), Value::Str(role.into()));
                     ext.insert("pairing_id".into(), Value::Str(pairing_id.into()));
                     ext.insert("credential_generation".into(), Value::Int(generation));
                     ext.insert("state".into(), Value::Str("ready".into()));
                     self.state
-                        .write_set(
-                            &Self::extension_path(&extension_id, suffix)?,
-                            Value::Map(ext),
-                        )
+                        .write_set(&Self::session_path(&installation_id, suffix)?, Value::Map(ext))
                         .await
                         .map_err(|e| DriverError::Other(e.to_string()))?;
                 }
@@ -337,6 +351,7 @@ impl Driver for PairingDriver {
             }
             // deny: terminally deny an intent.
             2 => {
+                reject_unknown_fields(&m, "pairing.deny", &["pairing_id"])?;
                 let pairing_id = required_str(&m, "pairing_id")?;
                 let mut record = self.read_record(pairing_id).await?;
                 ensure_not_terminal(&record)?;
@@ -346,6 +361,18 @@ impl Driver for PairingDriver {
             // replace: mark the old intent replaced and create a fresh intent.
             3 => {
                 reject_inline_secret(&m)?;
+                reject_unknown_fields(
+                    &m,
+                    "pairing.replace",
+                    &[
+                        "pairing_id",
+                        "replacement_pairing_id",
+                        "installation_id",
+                        "manifest_platform",
+                        "allowed_roles",
+                        "expires_at",
+                    ],
+                )?;
                 reject_inline_install_fields(&m, "pairing.replace")?;
                 reject_pairing_claim_fields(&m, "pairing.replace")?;
                 let pairing_id = required_str(&m, "pairing_id")?;
@@ -365,14 +392,14 @@ impl Driver for PairingDriver {
                     .await
                     .map_err(|e| DriverError::Other(e.to_string()))?;
 
-                let extension_id = field_str(&m, "extension_id")
-                    .or_else(|| field_str(&old, "extension_id"))
-                    .unwrap_or(&replacement_id)
+                let installation_id = field_str(&m, "installation_id")
+                    .or_else(|| field_str(&old, "installation_id"))
+                    .ok_or_else(|| DriverError::Other("replace requires installation_id".into()))?
                     .to_string();
                 let manifest_platform = field_str(&m, "manifest_platform")
                     .or_else(|| field_str(&old, "manifest_platform"));
                 let scope = self
-                    .load_pairing_scope(&extension_id, manifest_platform)
+                    .load_pairing_scope(&installation_id, manifest_platform)
                     .await?;
                 let requested_allowed = if m.contains_key("allowed_roles") {
                     role_values(m.get("allowed_roles"), "allowed_roles")?
@@ -390,7 +417,7 @@ impl Driver for PairingDriver {
                 let expires_at = m.get("expires_at").and_then(|v| v.as_int()).unwrap_or(0);
                 let mut replacement = BTreeMap::new();
                 replacement.insert("pairing_id".into(), Value::Str(replacement_id.clone()));
-                replacement.insert("extension_id".into(), Value::Str(extension_id));
+                replacement.insert("installation_id".into(), Value::Str(installation_id));
                 replacement.insert("state".into(), Value::Str(STATE_CREATED.into()));
                 replacement.insert("allowed_roles".into(), string_list(allowed_roles));
                 if let Some(platform) = scope.manifest_platform {
@@ -410,14 +437,19 @@ impl Driver for PairingDriver {
             }
             // revoke: invalidate an extension installation.
             4 => {
-                let extension_id = required_str(&m, "extension_id")?;
+                reject_unknown_fields(
+                    &m,
+                    "extension.revoke",
+                    &["installation_id", "credential_generation_floor"],
+                )?;
+                let installation_id = required_str(&m, "installation_id")?;
                 let generation_floor = m
                     .get("credential_generation_floor")
                     .and_then(|v| v.as_int())
                     .unwrap_or(1)
                     .max(1);
                 let mut record = BTreeMap::new();
-                record.insert("extension_id".into(), Value::Str(extension_id.into()));
+                record.insert("installation_id".into(), Value::Str(installation_id.into()));
                 record.insert("state".into(), Value::Str(STATE_REVOKED.into()));
                 record.insert(
                     "credential_generation_floor".into(),
@@ -425,7 +457,7 @@ impl Driver for PairingDriver {
                 );
                 self.state
                     .write_set(
-                        &Self::revoke_path(extension_id)?,
+                        &Self::revoke_path(installation_id)?,
                         Value::Map(record.clone()),
                     )
                     .await
@@ -443,6 +475,20 @@ fn field_str<'a>(m: &'a BTreeMap<String, Value>, key: &str) -> Option<&'a str> {
 
 fn required_str<'a>(m: &'a BTreeMap<String, Value>, key: &str) -> Result<&'a str, DriverError> {
     field_str(m, key).ok_or_else(|| DriverError::Other(format!("{key} is required")))
+}
+
+fn validate_id_segment(id: &str, label: &str) -> Result<(), DriverError> {
+    if id.is_empty()
+        || !id.is_ascii()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(DriverError::Other(format!(
+            "{label} must contain only ASCII letters, digits, '_' or '-'"
+        )));
+    }
+    Ok(())
 }
 
 fn string_list(values: Vec<String>) -> Value {
@@ -558,6 +604,21 @@ fn reject_inline_secret(m: &BTreeMap<String, Value>) -> Result<(), DriverError> 
     Ok(())
 }
 
+fn reject_unknown_fields(
+    m: &BTreeMap<String, Value>,
+    method: &str,
+    allowed: &[&str],
+) -> Result<(), DriverError> {
+    for key in m.keys() {
+        if !allowed.iter().any(|allowed| allowed == key) {
+            return Err(DriverError::Other(format!(
+                "{method} does not accept field {key:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn reject_inline_install_fields(
     m: &BTreeMap<String, Value>,
     method: &str,
@@ -574,7 +635,7 @@ fn reject_inline_install_fields(
     ] {
         if m.contains_key(key) {
             return Err(DriverError::Other(format!(
-                "{method} must reference an existing ExtensionDef or ManifestDef; field {key:?} is not accepted"
+                "{method} must reference an existing ExtensionInstallationDef or ManifestDef; field {key:?} is not accepted"
             )));
         }
     }
@@ -609,7 +670,7 @@ fn reject_approve_claim_fields(m: &BTreeMap<String, Value>) -> Result<(), Driver
         "requested_roles",
         "roles",
         "allowed_roles",
-        "extension_id",
+        "installation_id",
         "manifest_platform",
         "claim",
         "registry_hash",
@@ -656,14 +717,57 @@ fn validate_manifest_scope(def: &ManifestDef, platform: &str) -> Result<(), Driv
             "ManifestDef.default_transport must be listed in supported_transports".into(),
         ));
     }
-    match def.role {
-        Role::Provider if def.provides.is_empty() => Err(DriverError::Other(
-            "provider ManifestDef must declare provided effects".into(),
-        )),
-        Role::Source if !def.provides.is_empty() => Err(DriverError::Other(
-            "source ManifestDef must not declare provider effects".into(),
-        )),
-        _ => Ok(()),
+    if def.projections.is_empty() {
+        return Err(DriverError::Other(
+            "ManifestDef.projections must not be empty".into(),
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for projection in &def.projections {
+        if !seen.insert(projection.id.clone()) {
+            return Err(DriverError::Other(format!(
+                "ManifestDef contains duplicate projection id {:?}",
+                projection.id
+            )));
+        }
+        projection
+            .validate_admission(platform, nexus_types::TrustLevel::Sandboxed, &def.default_transport)
+            .map_err(|e| DriverError::Other(format!("ManifestDef projection admission failed: {e}")))?;
+    }
+    Ok(())
+}
+
+fn manifest_roles(def: &ManifestDef) -> Result<Vec<String>, DriverError> {
+    let mut roles = Vec::new();
+    for projection in &def.projections {
+        let role = role_name(projection.role).to_string();
+        if !roles.iter().any(|seen| seen == &role) {
+            roles.push(role);
+        }
+    }
+    if roles.is_empty() {
+        Err(DriverError::Other(
+            "ManifestDef must declare at least one projection role".into(),
+        ))
+    } else {
+        Ok(roles)
+    }
+}
+
+fn installation_roles(def: &ExtensionInstallationDef) -> Result<Vec<String>, DriverError> {
+    let mut roles = Vec::new();
+    for projection in &def.projections {
+        let role = role_name(projection.role).to_string();
+        if !roles.iter().any(|seen| seen == &role) {
+            roles.push(role);
+        }
+    }
+    if roles.is_empty() {
+        Err(DriverError::Other(
+            "ExtensionInstallationDef must declare at least one projection role".into(),
+        ))
+    } else {
+        Ok(roles)
     }
 }
 
@@ -713,10 +817,10 @@ fn display_checksum(secret: &str) -> String {
     hash_secret(secret).chars().take(8).collect()
 }
 
-fn credential_hash(extension_id: &str, pairing_id: &str, generation: i64) -> String {
+fn credential_hash(installation_id: &str, pairing_id: &str, generation: i64) -> String {
     let mut h = Hasher::new();
     h.update(b"nexus-extension-credential-record-v1");
-    h.update(extension_id.as_bytes());
+    h.update(installation_id.as_bytes());
     h.update(pairing_id.as_bytes());
     h.update(&generation.to_le_bytes());
     h.finalize().to_hex().to_string()
@@ -849,7 +953,7 @@ impl ExtensionCredential {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnvelopeAad {
     pub version: u32,
-    pub extension_def_id: String,
+    pub projection_id: String,
     pub role: String,
     pub session_id: String,
     pub seq: u64,
@@ -862,7 +966,7 @@ impl Default for EnvelopeAad {
     fn default() -> Self {
         Self {
             version: 1,
-            extension_def_id: String::new(),
+            projection_id: String::new(),
             role: String::new(),
             session_id: String::new(),
             seq: 0,
@@ -904,7 +1008,7 @@ fn aad_bytes(installation_id: &str, generation: u64, aad: &EnvelopeAad) -> Vec<u
         installation_id.as_bytes(),
         &generation.to_le_bytes(),
         &aad.version.to_le_bytes(),
-        aad.extension_def_id.as_bytes(),
+        aad.projection_id.as_bytes(),
         aad.role.as_bytes(),
         aad.session_id.as_bytes(),
         &aad.seq.to_le_bytes(),
@@ -939,47 +1043,53 @@ mod tests {
         (PairingDriver::new(state.clone()), state)
     }
 
-    fn extension_def(id: &str, role: Role) -> Value {
-        let (provides, emits) = match role {
-            Role::Provider => (
-                vec![EffectCapability::new(
+    fn extension_installation(id: &str, role: Role) -> Value {
+        let projection = match role {
+            Role::Provider => nexus_types::ExtensionProjectionDef {
+                id: "provider".into(),
+                role,
+                namespace: Some(Path::parse(&format!("effect://plugin/{id}")).unwrap()),
+                provides: vec![EffectCapability::new(
                     format!("effect://plugin/{id}/search"),
                     Purity::Idempotent,
                 )],
-                None,
-            ),
-            Role::Source => (
-                vec![],
-                Some(nexus_types::EventSource {
+                emits: None,
+                version: 1,
+            },
+            Role::Source => nexus_types::ExtensionProjectionDef {
+                id: "source".into(),
+                role,
+                namespace: None,
+                provides: vec![],
+                emits: Some(nexus_types::EventSource {
                     sink: Path::parse(&format!("state://plugin/{id}/events")).unwrap(),
                     purity: Purity::Effectful,
                     event_schema: None,
                 }),
-            ),
+                version: 1,
+            },
         };
-        let def = ExtensionDef {
+        let def = ExtensionInstallationDef {
             id: id.into(),
-            role,
+            platform: id.into(),
             transport: Transport::Stdio {
                 command: Some(format!("{id}-plugin")),
                 args: vec![],
             },
             trust: TrustLevel::Sandboxed,
-            provides,
-            emits,
-            namespace: Path::parse(&format!("effect://plugin/{id}")).unwrap(),
             config_schema: Value::Null,
             config: Value::Null,
+            projections: vec![projection],
             version: 1,
         };
         serde_json::from_value(serde_json::to_value(def).unwrap()).unwrap()
     }
 
-    async fn install_extension_def(state: &Backend, id: &str, role: Role) {
+    async fn install_extension(state: &Backend, id: &str, role: Role) {
         state
             .write_set(
-                &Path::parse(&format!("state://kernel/extensions/{id}")).unwrap(),
-                extension_def(id, role),
+                &Path::parse(&format!("state://kernel/extension-installations/{id}")).unwrap(),
+                extension_installation(id, role),
             )
             .await
             .unwrap();
@@ -1016,10 +1126,10 @@ mod tests {
     #[tokio::test]
     async fn pairing_create_persists_hash_without_secret() {
         let (driver, state) = driver();
-        install_extension_def(&state, "ext-1", Role::Provider).await;
+        install_extension(&state, "ext-1", Role::Provider).await;
         let mut input = BTreeMap::new();
         input.insert("pairing_id".into(), Value::Str("pair-1".into()));
-        input.insert("extension_id".into(), Value::Str("ext-1".into()));
+        input.insert("installation_id".into(), Value::Str("ext-1".into()));
         input.insert(
             "allowed_roles".into(),
             Value::List(vec![Value::Str("provider".into())]),
@@ -1074,7 +1184,27 @@ mod tests {
         let (driver, _) = driver();
         let mut input = BTreeMap::new();
         input.insert("pairing_id".into(), Value::Str("pair-missing".into()));
-        input.insert("extension_id".into(), Value::Str("missing-ext".into()));
+        input.insert("installation_id".into(), Value::Str("missing-ext".into()));
+        let err = driver
+            .call(
+                MethodId::new(0),
+                Value::Map(input),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::Other(_)));
+    }
+
+    #[tokio::test]
+    async fn pairing_create_rejects_unknown_identity_field() {
+        let (driver, state) = driver();
+        install_extension(&state, "ext-unknown-field", Role::Provider).await;
+        let mut input = BTreeMap::new();
+        input.insert("pairing_id".into(), Value::Str("pair-unknown-field".into()));
+        input.insert("installation_id".into(), Value::Str("ext-unknown-field".into()));
+        input.insert("connection_id".into(), Value::Str("transport-conn".into()));
         let err = driver
             .call(
                 MethodId::new(0),
@@ -1090,10 +1220,10 @@ mod tests {
     #[tokio::test]
     async fn pairing_create_rejects_explicit_empty_allowed_roles() {
         let (driver, state) = driver();
-        install_extension_def(&state, "ext-empty-role", Role::Provider).await;
+        install_extension(&state, "ext-empty-role", Role::Provider).await;
         let mut input = BTreeMap::new();
         input.insert("pairing_id".into(), Value::Str("pair-empty-role".into()));
-        input.insert("extension_id".into(), Value::Str("ext-empty-role".into()));
+        input.insert("installation_id".into(), Value::Str("ext-empty-role".into()));
         input.insert("allowed_roles".into(), Value::List(vec![]));
         let err = driver
             .call(
@@ -1110,10 +1240,10 @@ mod tests {
     #[tokio::test]
     async fn approve_projects_provider_extension_state() {
         let (driver, state) = driver();
-        install_extension_def(&state, "ext-2", Role::Provider).await;
+        install_extension(&state, "ext-2", Role::Provider).await;
         let mut create = BTreeMap::new();
         create.insert("pairing_id".into(), Value::Str("pair-2".into()));
-        create.insert("extension_id".into(), Value::Str("ext-2".into()));
+        create.insert("installation_id".into(), Value::Str("ext-2".into()));
         create.insert(
             "allowed_roles".into(),
             Value::List(vec![Value::Str("provider".into())]),
@@ -1140,7 +1270,7 @@ mod tests {
             .await
             .unwrap();
         let ext = state
-            .read(&Path::parse("state://kernel/extensions/ext-2-provider").unwrap())
+            .read(&Path::parse("state://kernel/extension-sessions/ext-2/provider").unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -1150,12 +1280,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pairing_scope_can_come_from_multi_projection_installation() {
+        let (driver, state) = driver();
+        let install = nexus_types::ExtensionInstallationDef {
+            id: "wechat".into(),
+            platform: "wechat".into(),
+            transport: Transport::Grpc { endpoint: None },
+            trust: TrustLevel::Sandboxed,
+            config_schema: Value::Null,
+            config: Value::Null,
+            projections: vec![
+                nexus_types::ExtensionProjectionDef {
+                    id: "source".into(),
+                    role: Role::Source,
+                    namespace: None,
+                    provides: vec![],
+                    emits: Some(nexus_types::EventSource {
+                        sink: Path::parse("state://wechat/events").unwrap(),
+                        purity: Purity::Effectful,
+                        event_schema: None,
+                    }),
+                    version: 1,
+                },
+                nexus_types::ExtensionProjectionDef {
+                    id: "provider".into(),
+                    role: Role::Provider,
+                    namespace: Some(Path::parse("effect://plugin/wechat").unwrap()),
+                    provides: vec![EffectCapability::new(
+                        "effect://plugin/wechat/send_text",
+                        Purity::Effectful,
+                    )],
+                    emits: None,
+                    version: 1,
+                },
+            ],
+            version: 1,
+        };
+        state
+            .write_set(
+                &Path::parse("state://kernel/extension-installations/wechat").unwrap(),
+                serde_json::from_value(serde_json::to_value(install).unwrap()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut create = BTreeMap::new();
+        create.insert("pairing_id".into(), Value::Str("pair-wechat".into()));
+        create.insert("installation_id".into(), Value::Str("wechat".into()));
+        create.insert(
+            "allowed_roles".into(),
+            Value::List(vec![
+                Value::Str("source".into()),
+                Value::Str("provider".into()),
+            ]),
+        );
+        driver
+            .call(
+                MethodId::new(0),
+                Value::Map(create),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        lock_pairing_claim(&state, "pair-wechat", &["source", "provider"], true).await;
+        let mut approve = BTreeMap::new();
+        approve.insert("pairing_id".into(), Value::Str("pair-wechat".into()));
+        driver
+            .call(
+                MethodId::new(1),
+                Value::Map(approve),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            state
+                .read(&Path::parse("state://kernel/extension-sessions/wechat/source").unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            state
+                .read(&Path::parse("state://kernel/extension-sessions/wechat/provider").unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn approve_requires_sas_verified() {
         let (driver, state) = driver();
-        install_extension_def(&state, "ext-sas", Role::Provider).await;
+        install_extension(&state, "ext-sas", Role::Provider).await;
         let mut create = BTreeMap::new();
         create.insert("pairing_id".into(), Value::Str("pair-sas".into()));
-        create.insert("extension_id".into(), Value::Str("ext-sas".into()));
+        create.insert("installation_id".into(), Value::Str("ext-sas".into()));
         create.insert(
             "allowed_roles".into(),
             Value::List(vec![Value::Str("provider".into())]),
@@ -1187,10 +1409,10 @@ mod tests {
     #[tokio::test]
     async fn approve_rejects_frontend_claim_fields() {
         let (driver, state) = driver();
-        install_extension_def(&state, "ext-claim", Role::Provider).await;
+        install_extension(&state, "ext-claim", Role::Provider).await;
         let mut create = BTreeMap::new();
         create.insert("pairing_id".into(), Value::Str("pair-claim".into()));
-        create.insert("extension_id".into(), Value::Str("ext-claim".into()));
+        create.insert("installation_id".into(), Value::Str("ext-claim".into()));
         driver
             .call(
                 MethodId::new(0),
@@ -1219,10 +1441,10 @@ mod tests {
     #[tokio::test]
     async fn approve_rejects_roles_outside_allowed_set() {
         let (driver, state) = driver();
-        install_extension_def(&state, "ext-role", Role::Provider).await;
+        install_extension(&state, "ext-role", Role::Provider).await;
         let mut create = BTreeMap::new();
         create.insert("pairing_id".into(), Value::Str("pair-role".into()));
-        create.insert("extension_id".into(), Value::Str("ext-role".into()));
+        create.insert("installation_id".into(), Value::Str("ext-role".into()));
         create.insert(
             "allowed_roles".into(),
             Value::List(vec![Value::Str("provider".into())]),
@@ -1254,10 +1476,10 @@ mod tests {
     #[tokio::test]
     async fn approve_terminalizes_expired_intent() {
         let (driver, state) = driver();
-        install_extension_def(&state, "ext-exp", Role::Provider).await;
+        install_extension(&state, "ext-exp", Role::Provider).await;
         let mut create = BTreeMap::new();
         create.insert("pairing_id".into(), Value::Str("pair-exp".into()));
-        create.insert("extension_id".into(), Value::Str("ext-exp".into()));
+        create.insert("installation_id".into(), Value::Str("ext-exp".into()));
         create.insert("expires_at".into(), Value::Int(1));
         create.insert(
             "allowed_roles".into(),
@@ -1298,10 +1520,10 @@ mod tests {
     #[tokio::test]
     async fn replace_terminalizes_old_intent_and_creates_new_one() {
         let (driver, state) = driver();
-        install_extension_def(&state, "ext-3", Role::Provider).await;
+        install_extension(&state, "ext-3", Role::Provider).await;
         let mut create = BTreeMap::new();
         create.insert("pairing_id".into(), Value::Str("pair-3".into()));
-        create.insert("extension_id".into(), Value::Str("ext-3".into()));
+        create.insert("installation_id".into(), Value::Str("ext-3".into()));
         driver
             .call(
                 MethodId::new(0),
@@ -1350,7 +1572,7 @@ mod tests {
     async fn revoke_writes_generation_floor() {
         let (driver, state) = driver();
         let mut input = BTreeMap::new();
-        input.insert("extension_id".into(), Value::Str("ext-4".into()));
+        input.insert("installation_id".into(), Value::Str("ext-4".into()));
         input.insert("credential_generation_floor".into(), Value::Int(7));
         driver
             .call(
@@ -1362,7 +1584,7 @@ mod tests {
             .await
             .unwrap();
         let revoked = state
-            .read(&Path::parse("state://kernel/extensions/ext-4/revoked").unwrap())
+            .read(&Path::parse("state://kernel/extension-revocations/ext-4").unwrap())
             .await
             .unwrap()
             .unwrap();

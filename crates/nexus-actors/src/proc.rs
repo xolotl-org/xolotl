@@ -11,8 +11,9 @@
 //! supervisor and are tracked as `starting` until that layer reports readiness.
 //!
 //! `ExtensionManager` (§16.3.4) is an ordinary supervision routine: it compares
-//! the desired set of extensions (`state://kernel/extensions/*`) against the
-//! live process states and drives them toward the desired phase.
+//! the desired set of extension installations
+//! (`state://kernel/extension-installations/*`) against the live process states
+//! and drives them toward the desired phase.
 
 use async_trait::async_trait;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};
