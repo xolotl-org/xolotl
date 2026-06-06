@@ -1,0 +1,16 @@
+[package]
+name = "nexus-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Nexus single execution IR (ExecutionGraph) + Do<A> front-end + Do→Graph compiler"
+
+[dependencies]
+nexus-types = { path = "../nexus-types" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+blake3 = "1.5"
+thiserror = "2.0.18"

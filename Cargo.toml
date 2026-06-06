@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+# All crates build without `protoc`: `nexus-proto` ships hand-vendored prost/
+# tonic bindings (crates/nexus-proto/src/{common,gateway,extension}.rs), so the
+# whole workspace — proto and the gRPC gateway included — is one default build
+# set. No `default-members` carve-out is needed.
+members = [
+    "crates/nexus-types",
+    "crates/nexus-graph",
+    "crates/nexus-state",
+    "crates/nexus-kernel",
+    "crates/nexus-storage-redb",
+    "crates/nexus-plan",
+    "crates/nexus-actors",
+    "crates/nexus-gateway",
+    "crates/nexus-proto",
+    "crates/nexus-gateway-grpc",
+    "crates/nexus-gateway-mcp",
+    "crates/nexus-sim",
+    "crates/nexus-sdk",
+    "crates/nexus-daemon",
+    "crates/nexus-console",
+    "crates/nexus-gateway-websocket",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.95"
+license      = "MIT"
+authors      = ["noctiro"]
+repository   = "https://github.com/noctiro/nexus"
+description  = "Nexus — AI Identity Runtime (microkernel + algebraic effects + actor system)"
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+strip         = "symbols"
+
+[profile.dev]
+opt-level = 1

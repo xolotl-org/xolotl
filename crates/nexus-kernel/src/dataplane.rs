@@ -1,0 +1,1826 @@
+//! The data plane (§6, §11): fixed-cost operation execution.
+//!
+//! `execute` is the hot path of §2.3: generational handle lookup → owner check
+//! → active check → rights bitmap → (Conditional only) residual policy → driver
+//! dispatch → Fact append. `Unconditional` handles skip the policy step
+//! entirely — that is a structural fact, not a runtime branch on an empty list
+//! (§5.5). The data plane never touches the Registry or parses anything (§11).
+
+use crate::driver::{DriverContext, DriverError};
+use crate::fact::FactSink;
+use crate::handle::{FastPath, HandleTable};
+use crate::open::derive_handle;
+use crate::policy::{CheckCtx, PolicyDecision};
+use crate::process::ProcessEntry;
+use nexus_types::{
+    DecisionTag, Fact, Failure, Operation, Outcome, OutcomeRef, OutputMode, OutputModeSet, Path,
+    Timestamp, Value, ValueRef,
+};
+use parking_lot::RwLock;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+/// Result of executing one operation: the outcome plus the recorded decision
+/// tag (so the executor can drive control flow and the Fact is consistent).
+pub struct ExecOutput {
+    pub outcome: Outcome,
+}
+
+/// The data plane: a handle table and a fact sink (§11). Shared behind a lock;
+/// the lock is held only for the table lookup, released before the (async)
+/// driver call.
+#[derive(Clone)]
+pub struct DataPlane {
+    pub handles: Arc<RwLock<HandleTable>>,
+    pub facts: FactSink,
+    /// Idempotency dedup store (§21.3): effective-key → cached outcome for
+    /// `IdempotentEffect` ops. Records are stored under `state://idemp/<hash>`,
+    /// where the hash is over the authenticated-context-bound key
+    /// (`idempotency::derive_key`), so an injected Plan cannot forge or collide
+    /// another identity's records.
+    state: nexus_state::Backend,
+    /// Optional process table for the `AsyncProcess` adapter (§4.3).
+    processes: Option<crate::process::ProcessTable>,
+}
+
+impl DataPlane {
+    pub fn new(
+        handles: Arc<RwLock<HandleTable>>,
+        facts: FactSink,
+        state: nexus_state::Backend,
+    ) -> Self {
+        Self {
+            handles,
+            facts,
+            state,
+            processes: None,
+        }
+    }
+
+    pub fn with_processes(mut self, processes: crate::process::ProcessTable) -> Self {
+        self.processes = Some(processes);
+        self
+    }
+
+    /// Execute one operation (§6). `method_index` is the bit position of the
+    /// method within the resource's interface (for the rights bitmap);
+    /// `replay` is the operation's derived [`ReplayClass`] used for the Fact
+    /// barrier. `now_millis` stamps the Fact and feeds residual checks.
+    /// `record` gates Fact creation (§9.2): side effects, observations that feed
+    /// control flow, and denials always record; a pure-deterministic read whose
+    /// output nothing consumes may skip (recovery recomputes it).
+    pub async fn execute(
+        &self,
+        op: &Operation,
+        method_index: u32,
+        replay: nexus_types::ReplayClass,
+        supports: OutputModeSet,
+        now_millis: i64,
+        record: bool,
+    ) -> ExecOutput {
+        self.execute_batchable(
+            op,
+            method_index,
+            replay,
+            supports,
+            false,
+            now_millis,
+            record,
+        )
+        .await
+    }
+
+    pub async fn execute_batchable(
+        &self,
+        op: &Operation,
+        method_index: u32,
+        replay: nexus_types::ReplayClass,
+        supports: OutputModeSet,
+        batchable: bool,
+        now_millis: i64,
+        record: bool,
+    ) -> ExecOutput {
+        self.execute_inner(
+            op,
+            method_index,
+            replay,
+            supports,
+            batchable,
+            now_millis,
+            record,
+            false,
+        )
+        .await
+    }
+
+    async fn execute_inner(
+        &self,
+        op: &Operation,
+        method_index: u32,
+        replay: nexus_types::ReplayClass,
+        supports: OutputModeSet,
+        batchable: bool,
+        now_millis: i64,
+        record: bool,
+        async_child: bool,
+    ) -> ExecOutput {
+        // Resolve the handle, clone the dispatch plan + fast-path, and capture
+        // the resource id — all under a short read lock. The driver call
+        // happens after the lock is dropped so concurrent ops on other handles
+        // overlap (Both/Race async I/O, §13.4).
+        let resolved = {
+            let table = self.handles.read();
+            let Some(h) = table.get(op.handle) else {
+                return self.deny(
+                    op,
+                    None,
+                    replay,
+                    now_millis,
+                    DecisionTag::Denied,
+                    Failure::policy("handle", "stale or unknown handle"),
+                );
+            };
+            // owner check (pointer-cheap), active check, rights bitmap.
+            if !h.check_owner(op.process) {
+                return self.deny(
+                    op,
+                    Some(h.resource),
+                    replay,
+                    now_millis,
+                    DecisionTag::Denied,
+                    Failure::policy("owner", "handle not owned by caller"),
+                );
+            }
+            if !h.is_active() {
+                return self.deny(
+                    op,
+                    Some(h.resource),
+                    replay,
+                    now_millis,
+                    DecisionTag::Denied,
+                    Failure::policy("state", "handle not active"),
+                );
+            }
+            if !h.allows_method(method_index) {
+                return self.deny(
+                    op,
+                    Some(h.resource),
+                    replay,
+                    now_millis,
+                    DecisionTag::Denied,
+                    Failure::PermissionDenied {
+                        required: vec![],
+                        actual: vec![],
+                    },
+                );
+            }
+            Resolved {
+                resource: h.resource,
+                plan: h.driver_plan.clone(),
+                fast_path: h.fast_path.clone(),
+                bound_path: h.bound_path.clone(),
+            }
+        };
+
+        // The driver receives the full input value. Large modality values
+        // (Blob/Tensor/Frame) are already out-of-line refs, so this is cheap;
+        // the Fact records the fixed-size `ValueRef` projection (§4.4).
+        let input = op.input.clone();
+
+        // Pairing display secrets are generated inside PairingDriver and handed
+        // to the Console/transport edge through a non-Operation channel. If an
+        // malformed caller sends `pairing_secret` as input, reject before
+        // policy/driver dispatch and record only a redacted Fact.
+        if pairing_secret_in_operation_input(resolved.bound_path.as_ref(), &input) {
+            let mut redacted = op.clone();
+            redacted.input = redact_pairing_secret_input(&input);
+            return self.deny(
+                &redacted,
+                Some(resolved.resource),
+                replay,
+                now_millis,
+                DecisionTag::RejectedByPolicy,
+                Failure::InvalidInput {
+                    reason: "pairing_secret is not an Operation input".into(),
+                },
+            );
+        }
+
+        if !op.output.is_supported_by(supports) {
+            return self.deny(
+                op,
+                Some(resolved.resource),
+                replay,
+                now_millis,
+                DecisionTag::Denied,
+                Failure::InvalidInput {
+                    reason: format!(
+                        "method {:?} does not support output mode {:?}",
+                        op.method, op.output
+                    ),
+                },
+            );
+        }
+
+        // Conditional handles run residual policy; Unconditional skip it (§5.5).
+        if let FastPath::Conditional(snapshot) = &resolved.fast_path {
+            let ctx = CheckCtx {
+                input: &input,
+                acting: op.acting,
+                now_millis,
+                target: resolved.resource,
+            };
+            match snapshot.check(&ctx).await {
+                PolicyDecision::Allow => {}
+                PolicyDecision::Deny { reason } => {
+                    return self.deny(
+                        op,
+                        Some(resolved.resource),
+                        replay,
+                        now_millis,
+                        DecisionTag::RejectedByPolicy,
+                        Failure::policy("residual", reason),
+                    );
+                }
+                PolicyDecision::Ask {
+                    approval_key,
+                    reason,
+                } => {
+                    // §8 / §17.4: not a hard denial — the operation is *suspended*
+                    // pending human approval. It records as RejectedByPolicy (the
+                    // effect did not happen) but returns the retryable
+                    // `ApprovalPending` failure, so once the broker approves the
+                    // key a re-execution passes the same residual check.
+                    return self.deny(
+                        op,
+                        Some(resolved.resource),
+                        replay,
+                        now_millis,
+                        DecisionTag::RejectedByPolicy,
+                        Failure::ApprovalPending {
+                            approval_key,
+                            reason,
+                        },
+                    );
+                }
+            }
+        }
+
+        // Idempotency dedup (§21.3): an `IdempotentEffect` op is keyed by its
+        // authenticated-context-bound idempotency key. A second op with the same
+        // effective key short-circuits to the cached outcome instead of
+        // re-issuing the effect — this is what makes crash-replay and explicit
+        // outbox retries safe. Non-idempotent ops are never deduped here (their
+        // safety comes from the write-ahead barrier + quarantine instead).
+        let idem_key = if matches!(replay, nexus_types::ReplayClass::IdempotentEffect) {
+            let key = nexus_types::idempotency::derive_key(op.id, op.acting, &input);
+            match self.read_idempotent_outcome(&key).await {
+                Ok(Some(cached)) => {
+                    // A duplicate: replay the prior result as a Short-circuit
+                    // (the driver is not called again). Still recorded so the
+                    // Fact log reflects the (deduped) attempt.
+                    let short = match cached {
+                        Outcome::Done(v) | Outcome::Short(v) => Outcome::Short(v),
+                        Outcome::Fail(f) => Outcome::Fail(f),
+                    };
+                    if (record || replay.needs_write_ahead_barrier())
+                        && let Err(e) = self.facts.complete(self.completed_fact(
+                            op,
+                            resolved.resource,
+                            replay,
+                            now_millis,
+                            DecisionTag::Ok,
+                            &short,
+                            batchable,
+                        ))
+                    {
+                        tracing::error!(?e, op = ?op.id, "idempotent-dedup fact record failed");
+                    }
+                    return ExecOutput { outcome: short };
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(?e, op = ?op.id, "idempotency state read failed; denying op");
+                    return self.deny(
+                        op,
+                        Some(resolved.resource),
+                        replay,
+                        now_millis,
+                        DecisionTag::RejectedByPolicy,
+                        Failure::policy("idempotency", format!("state read failed: {e}")),
+                    );
+                }
+            }
+            Some(key)
+        } else {
+            None
+        };
+
+        // Begin the Fact *before* the effect (write-ahead barrier for
+        // NonIdempotentEffect, §15.1). Only Deterministic/Observation reads may
+        // skip when their output is not consumed (§9.2). IdempotentEffect and
+        // NonIdempotentEffect are external side effects and must record even
+        // when their result is ignored.
+        let do_record = record
+            || matches!(
+                replay,
+                nexus_types::ReplayClass::IdempotentEffect
+                    | nexus_types::ReplayClass::NonIdempotentEffect
+            )
+            || matches!(op.output, OutputMode::AsyncProcess);
+        if do_record {
+            let pending = self.pending_fact(op, resolved.resource, replay, now_millis);
+            // Fail-closed: if we cannot durably record the intent, we must NOT
+            // issue the effect (§9.3 — the write-ahead barrier exists precisely
+            // to prevent an "already happened, never recorded" effect).
+            if let Err(e) = self.facts.begin(pending) {
+                tracing::error!(?e, op = ?op.id, "write-ahead fact append failed; denying op");
+                return ExecOutput {
+                    outcome: Outcome::Fail(Failure::policy(
+                        "durability",
+                        format!("write-ahead barrier failed: {e}"),
+                    )),
+                };
+            }
+        }
+
+        // Dispatch through the frozen plan (§6 step driver_plan.call). The
+        // operation's own `method` id is authoritative. The op's input taint and
+        // the handle's bound path are handed to the driver so persistence
+        // drivers derive provenance (§21.5) and state drivers reach the concrete
+        // path (§12) without a path ever entering the Operation/Fact.
+        let mut ctx = DriverContext::new(op.acting, op.process)
+            .with_operation_id(op.id)
+            .with_taint(op.taint.clone());
+        if let Some(p) = &resolved.bound_path {
+            ctx = ctx.with_target_path(p.clone());
+        }
+        let mut dispatch_output = op.output;
+        let mut stream_task = None;
+        let mut collect_task = None;
+        match op.output {
+            OutputMode::Stream => {
+                stream_task = self.attach_stream_sink(op, &mut ctx);
+            }
+            OutputMode::Collect { limit } => {
+                if supports.contains(OutputModeSet::STREAM) {
+                    dispatch_output = OutputMode::Stream;
+                    collect_task = Some(self.attach_collect_sink(&mut ctx, limit));
+                } else {
+                    dispatch_output = OutputMode::Unary;
+                }
+            }
+            _ => {}
+        };
+        let async_result = if matches!(op.output, OutputMode::AsyncProcess) && !async_child {
+            Some(self.start_async_process(
+                op,
+                method_index,
+                replay,
+                supports,
+                batchable,
+                record,
+                &resolved,
+            ))
+        } else {
+            None
+        };
+        let result = match &async_result {
+            Some(_) => Ok(Outcome::Done(Value::Null)),
+            None => {
+                resolved
+                    .plan
+                    .call(op.method, input, dispatch_output, &ctx)
+                    .await
+            }
+        };
+        if matches!(op.output, OutputMode::Stream) {
+            match &result {
+                Ok(_) => {
+                    let _ = ctx.emit(Value::StreamEnd(nexus_types::StreamMarker::Done));
+                }
+                Err(e) => {
+                    let _ = ctx.emit(Value::StreamEnd(nexus_types::StreamMarker::Error {
+                        message: e.to_string(),
+                    }));
+                }
+            }
+        }
+        drop(ctx);
+        if let Some(task) = stream_task {
+            let _ = task.await;
+        }
+        let collected = match collect_task {
+            Some(task) => Some(task.await.unwrap_or_default()),
+            None => None,
+        };
+
+        let (decision, outcome) = match async_result {
+            Some(out) => (
+                if out.is_success() {
+                    DecisionTag::Ok
+                } else {
+                    DecisionTag::Denied
+                },
+                out,
+            ),
+            None => match result {
+                Ok(out) => {
+                    let out = match op.output {
+                        OutputMode::Collect { .. } => {
+                            collect_outcome(out, collected.unwrap_or_default(), op.output)
+                        }
+                        OutputMode::SinkOnly => sink_outcome(out),
+                        _ => out,
+                    };
+                    (
+                        if out.is_success() {
+                            DecisionTag::Ok
+                        } else {
+                            DecisionTag::DriverError
+                        },
+                        out,
+                    )
+                }
+                Err(e) => (
+                    DecisionTag::DriverError,
+                    Outcome::Fail(driver_err_to_failure(e)),
+                ),
+            },
+        };
+
+        // Complete the Fact with the outcome (only if we began one). The effect
+        // has already been issued, so a completion-write failure cannot un-issue
+        // it: log it and let crash recovery reconcile from the begun (fsync'd)
+        // pending record (§15.1). The caller still gets the real outcome.
+        if do_record
+            && let Err(e) = self.facts.complete(self.completed_fact(
+                op,
+                resolved.resource,
+                replay,
+                now_millis,
+                decision,
+                &outcome,
+                batchable,
+            ))
+        {
+            tracing::error!(?e, op = ?op.id, "post-effect fact completion failed; recovery will reconcile");
+        }
+
+        // Cache a successful IdempotentEffect outcome under its key so a later
+        // op with the same key dedupes to it (§21.3). Failures are not cached —
+        // a retry of a failed idempotent op should re-attempt.
+        if let Some(key) = idem_key
+            && outcome.is_success()
+        {
+            if let Err(e) = self.write_idempotent_outcome(&key, &outcome).await {
+                tracing::error!(?e, op = ?op.id, "idempotency state write failed");
+            }
+        }
+        ExecOutput { outcome }
+    }
+
+    async fn read_idempotent_outcome(
+        &self,
+        key: &str,
+    ) -> nexus_state::StateResult<Option<Outcome>> {
+        let path = idempotency_path(key).map_err(|e| {
+            nexus_state::StateError::Backend(format!("invalid idempotency path: {e}"))
+        })?;
+        match self.state.read(&path).await? {
+            Some(value) => outcome_from_value(value)
+                .map(Some)
+                .map_err(nexus_state::StateError::Backend),
+            None => Ok(None),
+        }
+    }
+
+    async fn write_idempotent_outcome(
+        &self,
+        key: &str,
+        outcome: &Outcome,
+    ) -> nexus_state::StateResult<()> {
+        let path = idempotency_path(key).map_err(|e| {
+            nexus_state::StateError::Backend(format!("invalid idempotency path: {e}"))
+        })?;
+        self.state.write_set(&path, outcome_to_value(outcome)).await
+    }
+
+    fn deny(
+        &self,
+        op: &Operation,
+        resource: Option<nexus_types::ResourceId>,
+        replay: nexus_types::ReplayClass,
+        now_millis: i64,
+        tag: DecisionTag,
+        failure: Failure,
+    ) -> ExecOutput {
+        // A denied/rejected effect attempt is still recorded (§6: failures
+        // must record a Fact for why-not / retry decisions). A record failure on
+        // the deny path is logged — the effect was never issued, so there is
+        // nothing unsafe to reconcile; the caller still gets the denial outcome.
+        let fact = self.completed_fact(
+            op,
+            resource.unwrap_or_else(|| nexus_types::ResourceId::new(0)),
+            replay,
+            now_millis,
+            tag,
+            &Outcome::Fail(failure.clone()),
+            false,
+        );
+        if let Err(e) = self.facts.complete(fact) {
+            tracing::error!(?e, op = ?op.id, "deny-path fact record failed");
+        }
+        ExecOutput {
+            outcome: Outcome::Fail(failure),
+        }
+    }
+
+    fn pending_fact(
+        &self,
+        op: &Operation,
+        resource: nexus_types::ResourceId,
+        replay: nexus_types::ReplayClass,
+        now_millis: i64,
+    ) -> Fact {
+        Fact {
+            id: op.id,
+            schema_version: Fact::SCHEMA_VERSION,
+            caller: op.process,
+            acting: op.acting,
+            handle: op.handle,
+            resource,
+            method: op.method,
+            input_ref: ValueRef::of(op.input.clone()),
+            taint: op.taint.clone(),
+            decision: DecisionTag::Ok, // provisional; set on complete
+            outcome_ref: OutcomeRef::None,
+            batch: None,
+            replay,
+            timestamp: Timestamp::millis(now_millis),
+        }
+    }
+
+    fn completed_fact(
+        &self,
+        op: &Operation,
+        resource: nexus_types::ResourceId,
+        replay: nexus_types::ReplayClass,
+        now_millis: i64,
+        decision: DecisionTag,
+        outcome: &Outcome,
+        batchable: bool,
+    ) -> Fact {
+        let outcome_ref = match outcome {
+            Outcome::Done(v) | Outcome::Short(v) => OutcomeRef::of(v.clone()),
+            Outcome::Fail(_) => OutcomeRef::None,
+        };
+        let batch = if batchable {
+            nexus_types::BatchSummary::new(&op.input, Some(&outcome_ref))
+        } else {
+            None
+        };
+        Fact {
+            id: op.id,
+            schema_version: Fact::SCHEMA_VERSION,
+            caller: op.process,
+            acting: op.acting,
+            handle: op.handle,
+            resource,
+            method: op.method,
+            input_ref: ValueRef::of(op.input.clone()),
+            taint: op.taint.clone(),
+            decision,
+            outcome_ref,
+            batch,
+            replay,
+            timestamp: Timestamp::millis(now_millis),
+        }
+    }
+
+    fn attach_stream_sink(
+        &self,
+        op: &Operation,
+        ctx: &mut DriverContext,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let state = self.state.clone();
+        let path = stream_path(op).ok()?;
+        let taint = op.taint.clone();
+        let append_path = path.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let previous = std::mem::replace(
+            ctx,
+            DriverContext::new(op.acting, op.process).with_operation_id(op.id),
+        );
+        *ctx = previous.with_stream(path, tx);
+        Some(tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if let Err(e) = state
+                    .write_append_tainted(&append_path, chunk, taint.clone())
+                    .await
+                {
+                    tracing::error!(?e, path = %append_path, "stream append failed");
+                    break;
+                }
+            }
+        }))
+    }
+
+    fn attach_collect_sink(
+        &self,
+        ctx: &mut DriverContext,
+        limit: usize,
+    ) -> tokio::task::JoinHandle<Vec<Value>> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let acting = ctx.acting;
+        let caller = ctx.caller;
+        let previous = std::mem::replace(ctx, DriverContext::new(acting, caller));
+        *ctx = previous.with_stream(
+            Path::parse("state://stream/collect").expect("collect stream path parses"),
+            tx,
+        );
+        tokio::spawn(async move {
+            let mut chunks = Vec::new();
+            while chunks.len() < limit {
+                match rx.recv().await {
+                    Some(chunk) => chunks.push(chunk),
+                    None => break,
+                }
+            }
+            chunks
+        })
+    }
+
+    fn start_async_process(
+        &self,
+        op: &Operation,
+        method_index: u32,
+        replay: nexus_types::ReplayClass,
+        supports: OutputModeSet,
+        batchable: bool,
+        _record: bool,
+        resolved: &Resolved,
+    ) -> Outcome {
+        let Some(processes) = self.processes.clone() else {
+            return Outcome::Fail(Failure::policy(
+                "async-process",
+                "AsyncProcess requires a process table",
+            ));
+        };
+        let state = self.state.clone();
+
+        let child = processes.fresh_id();
+        let child_handle = {
+            let mut handles = self.handles.write();
+            match derive_handle(
+                &mut handles,
+                op.handle,
+                nexus_types::Rights::new(
+                    nexus_types::MethodBitmap::method(method_index),
+                    nexus_types::RightFlags::empty(),
+                ),
+                nexus_types::DeriveKind::SpawnWith,
+                child,
+            ) {
+                Ok(id) => id,
+                Err(_) => {
+                    return Outcome::Fail(Failure::PermissionDenied {
+                        required: vec!["SPAWN_WITH".into()],
+                        actual: vec![],
+                    });
+                }
+            }
+        };
+
+        let mut entry = ProcessEntry::new(child, Some(op.process), op.acting);
+        entry.status = nexus_types::ProcessStatus::Running;
+        processes.insert(entry);
+
+        let proc_path = async_proc_path(child);
+        let status_path = async_status_path(child);
+        let outcome_path = async_outcome_path(child);
+        let child_op = Operation {
+            id: nexus_types::OperationId::new(child, nexus_types::NodeId::ROOT, 0),
+            process: child,
+            acting: op.acting,
+            handle: child_handle,
+            method: op.method,
+            input: op.input.clone(),
+            taint: op.taint.clone(),
+            // The child is the actual Executor Resource. It calls the driver in
+            // the same mode, but `async_child=true` below prevents another
+            // wrapper spawn.
+            output: OutputMode::AsyncProcess,
+        };
+        let child_dp = self.clone();
+        let child_state = state.clone();
+        let child_processes = processes.clone();
+        let parent = op.process;
+        let child_taint = op.taint.clone();
+        let child_status_path = status_path.clone();
+        let child_outcome_path = outcome_path.clone();
+        let child_proc_path = proc_path.clone();
+        tokio::spawn(async move {
+            let started = async_status_value(
+                "running",
+                parent,
+                child,
+                &child_proc_path,
+                &child_outcome_path,
+                None,
+            );
+            if let Err(e) = child_state
+                .write_set_tainted(&child_status_path, started, child_taint.clone())
+                .await
+            {
+                tracing::error!(?e, child = ?child, "async process status write failed");
+            }
+            let outcome = Box::pin(child_dp.execute_inner(
+                &child_op,
+                method_index,
+                replay,
+                supports,
+                batchable,
+                crate::executor::now_millis(),
+                true,
+                true,
+            ))
+            .await
+            .outcome;
+            let terminal = if outcome.is_success() {
+                nexus_types::ProcessStatus::Completed
+            } else {
+                nexus_types::ProcessStatus::Failed
+            };
+            child_processes.set_status(child, terminal);
+            if let Err(e) = child_state
+                .write_set_tainted(
+                    &child_outcome_path,
+                    outcome_to_value(&outcome),
+                    child_taint.clone(),
+                )
+                .await
+            {
+                tracing::error!(?e, child = ?child, "async process outcome write failed");
+            }
+            let phase = if outcome.is_success() {
+                "completed"
+            } else {
+                "failed"
+            };
+            let status = async_status_value(
+                phase,
+                parent,
+                child,
+                &child_proc_path,
+                &child_outcome_path,
+                Some(&outcome),
+            );
+            if let Err(e) = child_state
+                .write_set_tainted(&child_status_path, status, child_taint)
+                .await
+            {
+                tracing::error!(?e, child = ?child, "async process terminal status write failed");
+            }
+        });
+
+        Outcome::Done(async_ref_value(
+            op.process,
+            child,
+            resolved.resource,
+            op.method,
+            child_handle,
+            &proc_path,
+            &status_path,
+            &outcome_path,
+        ))
+    }
+}
+
+fn stream_path(op: &Operation) -> Result<Path, nexus_types::PathError> {
+    Path::parse(&format!(
+        "state://stream/{}/{}",
+        op.process.get(),
+        op.id.position.get()
+    ))
+}
+
+fn idempotency_path(key: &str) -> Result<Path, nexus_types::PathError> {
+    let hash = blake3::hash(key.as_bytes());
+    Path::parse(&format!("state://idemp/{}", hash.to_hex()))
+}
+
+fn async_proc_path(process: nexus_types::ProcessId) -> Path {
+    Path::parse(&format!("proc://async/{}", process.get())).expect("async proc path parses")
+}
+
+fn async_status_path(process: nexus_types::ProcessId) -> Path {
+    Path::parse(&format!("state://kernel/async/{}/status", process.get()))
+        .expect("async status path parses")
+}
+
+fn async_outcome_path(process: nexus_types::ProcessId) -> Path {
+    Path::parse(&format!("state://kernel/async/{}/outcome", process.get()))
+        .expect("async outcome path parses")
+}
+
+fn async_ref_value(
+    parent: nexus_types::ProcessId,
+    child: nexus_types::ProcessId,
+    resource: nexus_types::ResourceId,
+    method: nexus_types::MethodId,
+    handle: nexus_types::HandleId,
+    proc_path: &Path,
+    status_path: &Path,
+    outcome_path: &Path,
+) -> Value {
+    let mut m = BTreeMap::new();
+    m.insert("kind".into(), Value::Str("executor_resource".into()));
+    m.insert("path".into(), Value::Str(proc_path.to_string()));
+    m.insert("parent_process".into(), Value::Int(parent.get() as i64));
+    m.insert("process".into(), Value::Int(child.get() as i64));
+    m.insert("resource".into(), Value::Int(resource.get() as i64));
+    m.insert("method".into(), Value::Int(method.get() as i64));
+    m.insert(
+        "handle".into(),
+        Value::Str(format!("{}.{}", handle.index, handle.generation)),
+    );
+    m.insert("status_path".into(), Value::Str(status_path.to_string()));
+    m.insert("outcome_path".into(), Value::Str(outcome_path.to_string()));
+    Value::Map(m)
+}
+
+fn async_status_value(
+    phase: &str,
+    parent: nexus_types::ProcessId,
+    child: nexus_types::ProcessId,
+    proc_path: &Path,
+    outcome_path: &Path,
+    outcome: Option<&Outcome>,
+) -> Value {
+    let mut m = BTreeMap::new();
+    m.insert("phase".into(), Value::Str(phase.into()));
+    m.insert("path".into(), Value::Str(proc_path.to_string()));
+    m.insert("parent_process".into(), Value::Int(parent.get() as i64));
+    m.insert("process".into(), Value::Int(child.get() as i64));
+    m.insert("outcome_path".into(), Value::Str(outcome_path.to_string()));
+    if let Some(outcome) = outcome {
+        m.insert("outcome".into(), outcome_to_value(outcome));
+    }
+    Value::Map(m)
+}
+
+fn outcome_to_value(outcome: &Outcome) -> Value {
+    let mut m = BTreeMap::new();
+    match outcome {
+        Outcome::Done(v) => {
+            m.insert("status".into(), Value::Str("done".into()));
+            m.insert("value".into(), v.clone());
+        }
+        Outcome::Short(v) => {
+            m.insert("status".into(), Value::Str("short".into()));
+            m.insert("value".into(), v.clone());
+        }
+        Outcome::Fail(f) => {
+            m.insert("status".into(), Value::Str("fail".into()));
+            m.insert("failure".into(), Value::Str(f.to_string()));
+        }
+    }
+    Value::Map(m)
+}
+
+fn outcome_from_value(value: Value) -> Result<Outcome, String> {
+    let mut m = match value {
+        Value::Map(m) => m,
+        other => return Err(format!("expected outcome map, found {other:?}")),
+    };
+    let status = match m.remove("status") {
+        Some(Value::Str(status)) => status,
+        Some(other) => return Err(format!("outcome status must be a string, found {other:?}")),
+        None => return Err("missing outcome status".into()),
+    };
+    match status.as_str() {
+        "done" => m
+            .remove("value")
+            .map(Outcome::Done)
+            .ok_or_else(|| "missing done value".into()),
+        "short" => m
+            .remove("value")
+            .map(Outcome::Short)
+            .ok_or_else(|| "missing short value".into()),
+        "fail" => Err("failed outcomes are not idempotency cache entries".into()),
+        other => Err(format!("unknown outcome status `{other}`")),
+    }
+}
+
+fn collect_outcome(outcome: Outcome, chunks: Vec<Value>, requested: OutputMode) -> Outcome {
+    let OutputMode::Collect { limit } = requested else {
+        return outcome;
+    };
+    match outcome {
+        Outcome::Done(v) | Outcome::Short(v) => {
+            if chunks.is_empty() && limit > 0 {
+                Outcome::Done(Value::List(vec![v]))
+            } else {
+                Outcome::Done(Value::List(chunks))
+            }
+        }
+        Outcome::Fail(f) => Outcome::Fail(f),
+    }
+}
+
+fn sink_outcome(outcome: Outcome) -> Outcome {
+    match outcome {
+        Outcome::Done(_) | Outcome::Short(_) => Outcome::Done(Value::Null),
+        Outcome::Fail(f) => Outcome::Fail(f),
+    }
+}
+
+fn pairing_secret_in_operation_input(path: Option<&Path>, input: &Value) -> bool {
+    is_pairing_secret_generation_path(path)
+        && matches!(input, Value::Map(m) if m.contains_key("pairing_secret"))
+}
+
+fn is_pairing_secret_generation_path(path: Option<&Path>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let segments = path.segments();
+    path.scheme() == "effect"
+        && segments.len() == 3
+        && segments[0].as_str() == "extension"
+        && segments[1].as_str() == "pairing"
+        && matches!(segments[2].as_str(), "create" | "replace")
+}
+
+fn redact_pairing_secret_input(input: &Value) -> Value {
+    let Value::Map(fields) = input else {
+        return input.clone();
+    };
+    let mut redacted = fields.clone();
+    if redacted.contains_key("pairing_secret") {
+        redacted.insert("pairing_secret".into(), Value::Str("<redacted>".into()));
+    }
+    Value::Map(redacted)
+}
+
+struct Resolved {
+    resource: nexus_types::ResourceId,
+    plan: crate::driver::DriverPlan,
+    fast_path: FastPath,
+    bound_path: Option<nexus_types::Path>,
+}
+
+fn driver_err_to_failure(e: DriverError) -> Failure {
+    match e {
+        DriverError::NoSuchMethod(_) => Failure::policy("driver", "no such method"),
+        DriverError::UnsupportedOutput(_) => Failure::InvalidInput {
+            reason: "unsupported output mode".into(),
+        },
+        DriverError::Transport(m) => Failure::HandlerError {
+            kind: "transport".into(),
+            message: m,
+        },
+        DriverError::Other(m) => Failure::HandlerError {
+            kind: "driver".into(),
+            message: m,
+        },
+    }
+}
+
+// Small helpers used above to keep the hot path readable.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::{Driver, DriverContext, DriverPlan, EchoDriver, FnDriver};
+    use crate::fact::FactStore;
+    use crate::handle::{Handle, HandleState};
+    use nexus_state::{Backend, InMemoryBackend};
+    use nexus_types::{
+        DriverId, HandleId, IdentityRef, MethodBitmap, MethodId, NodeId, OperationId, OutputMode,
+        OutputModeSet, ProcessId, ReplayClass, ResourceId, RightFlags, Rights, Value,
+    };
+
+    const SUPPORTS_UNARY: OutputModeSet = OutputModeSet::UNARY;
+    const SUPPORTS_STREAM: OutputModeSet = OutputModeSet::STREAM;
+    const SUPPORTS_ASYNC: OutputModeSet = OutputModeSet::ASYNC_PROCESS;
+
+    fn test_state() -> Backend {
+        Arc::new(InMemoryBackend::new())
+    }
+
+    fn dataplane_with_handle(rights: Rights, fast_path: FastPath) -> (DataPlane, HandleId) {
+        let mut table = HandleTable::new();
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        plan.insert(MethodId::new(7), Arc::new(EchoDriver));
+        let id = table.insert(Handle {
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            resource: ResourceId::new(5),
+            rights,
+            driver_plan: plan,
+            fast_path,
+            state: HandleState::Active,
+            bound_path: None,
+        });
+        let (facts, _) = FactSink::in_memory();
+        (
+            DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state()),
+            id,
+        )
+    }
+
+    fn op(handle: HandleId, method: u64, input: Value) -> Operation {
+        Operation {
+            id: OperationId::new(ProcessId::new(1), NodeId::new(0), 0),
+            process: ProcessId::new(1),
+            acting: IdentityRef::ROOT,
+            handle,
+            method: MethodId::new(method),
+            input,
+            taint: nexus_types::TaintSet::pristine(),
+            output: OutputMode::Unary,
+        }
+    }
+
+    #[tokio::test]
+    async fn unconditional_executes_and_records_ok() {
+        let (dp, id) = dataplane_with_handle(
+            Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            FastPath::Unconditional,
+        );
+        let out = dp
+            .execute(
+                &op(id, 7, Value::Int(9)),
+                0,
+                ReplayClass::Deterministic,
+                SUPPORTS_UNARY,
+                0,
+                true,
+            )
+            .await;
+        assert_eq!(out.outcome, Outcome::Done(Value::Int(9)));
+    }
+
+    #[tokio::test]
+    async fn large_modality_input_reaches_driver_intact() {
+        // Regression: a Blob/Tensor/Frame input must reach the driver as the
+        // full value (it used to be silently dropped to Null because the Fact
+        // projection leaked onto the dispatch path). The Fact still records a
+        // fixed-size ValueRef::External (§4.4).
+        use nexus_types::BlobRef;
+        let (dp, id) = dataplane_with_handle(
+            Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            FastPath::Unconditional,
+        );
+        let blob = Value::Blob(BlobRef {
+            hash: "deadbeef".into(),
+            size: 4096,
+            mime: None,
+        });
+        let out = dp
+            .execute(
+                &op(id, 7, blob.clone()),
+                0,
+                ReplayClass::Deterministic,
+                SUPPORTS_UNARY,
+                0,
+                true,
+            )
+            .await;
+        // EchoDriver returns its input — the driver saw the real Blob, not Null.
+        assert_eq!(out.outcome, Outcome::Done(blob));
+    }
+
+    #[tokio::test]
+    async fn batchable_list_records_single_fact_with_batch_summary() {
+        let mut table = HandleTable::new();
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        plan.insert(MethodId::new(7), Arc::new(EchoDriver));
+        let id = table.insert(Handle {
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            resource: ResourceId::new(5),
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            driver_plan: plan,
+            fast_path: FastPath::Unconditional,
+            state: HandleState::Active,
+            bound_path: None,
+        });
+        let (facts, store) = FactSink::in_memory();
+        let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
+        let input = Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]);
+        let out = dp
+            .execute_batchable(
+                &op(id, 7, input),
+                0,
+                ReplayClass::Deterministic,
+                SUPPORTS_UNARY,
+                true,
+                0,
+                true,
+            )
+            .await;
+        assert!(matches!(out.outcome, Outcome::Done(Value::List(_))));
+        let facts = store.facts_of(ProcessId::new(1));
+        assert_eq!(facts.len(), 1, "batchable call records one Fact");
+        let batch = facts[0].batch.as_ref().expect("batch summary present");
+        assert_eq!(batch.elements, 2);
+        assert!(matches!(
+            facts[0].outcome_ref,
+            OutcomeRef::Inline(Value::List(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_right_is_denied() {
+        let (dp, id) = dataplane_with_handle(
+            Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            FastPath::Unconditional,
+        );
+        // method_index 3 is not in the bitmap.
+        let out = dp
+            .execute(
+                &op(id, 7, Value::Null),
+                3,
+                ReplayClass::Deterministic,
+                SUPPORTS_UNARY,
+                0,
+                true,
+            )
+            .await;
+        assert!(matches!(
+            out.outcome,
+            Outcome::Fail(Failure::PermissionDenied { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn wrong_owner_is_denied() {
+        let (dp, id) = dataplane_with_handle(
+            Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            FastPath::Unconditional,
+        );
+        let mut o = op(id, 7, Value::Null);
+        o.process = ProcessId::new(999);
+        let out = dp
+            .execute(&o, 0, ReplayClass::Deterministic, SUPPORTS_UNARY, 0, true)
+            .await;
+        assert!(matches!(out.outcome, Outcome::Fail(_)));
+    }
+
+    #[tokio::test]
+    async fn driver_failure_records_driver_error() {
+        let mut table = HandleTable::new();
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        plan.insert(
+            MethodId::new(7),
+            Arc::new(FnDriver(|_, _| Err(DriverError::Other("boom".into())))),
+        );
+        let id = table.insert(Handle {
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            resource: ResourceId::new(5),
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            driver_plan: plan,
+            fast_path: FastPath::Unconditional,
+            state: HandleState::Active,
+            bound_path: None,
+        });
+        let (facts, store) = FactSink::in_memory();
+        let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
+        // record=false, but a NonIdempotentEffect is always recorded (§9.2) so
+        // the write-ahead barrier still fires.
+        let out = dp
+            .execute(
+                &op(id, 7, Value::Null),
+                0,
+                ReplayClass::NonIdempotentEffect,
+                SUPPORTS_UNARY,
+                0,
+                false,
+            )
+            .await;
+        assert!(matches!(
+            out.outcome,
+            Outcome::Fail(Failure::HandlerError { .. })
+        ));
+        // NonIdempotentEffect ⇒ write-ahead barrier fired at begin.
+        assert!(store.sync_count() >= 1);
+    }
+
+    #[tokio::test]
+    async fn unconsumed_deterministic_read_skips_fact() {
+        // §9.2: with record=false and a Deterministic class, no Fact is written
+        // (recovery recomputes the read). The store stays empty.
+        let (dp, id) = dataplane_with_handle(
+            Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            FastPath::Unconditional,
+        );
+        // dataplane_with_handle's FactSink store is dropped; rebuild one we keep.
+        let mut table = HandleTable::new();
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        plan.insert(MethodId::new(7), Arc::new(EchoDriver));
+        let id2 = table.insert(Handle {
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            resource: ResourceId::new(5),
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            driver_plan: plan,
+            fast_path: FastPath::Unconditional,
+            state: HandleState::Active,
+            bound_path: None,
+        });
+        let (facts, store) = FactSink::in_memory();
+        let dp2 = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
+        let _ = (dp, id);
+        let out = dp2
+            .execute(
+                &op(id2, 7, Value::Int(1)),
+                0,
+                ReplayClass::Deterministic,
+                SUPPORTS_UNARY,
+                0,
+                false,
+            )
+            .await;
+        assert_eq!(out.outcome, Outcome::Done(Value::Int(1)));
+        assert_eq!(
+            store.len(),
+            0,
+            "unconsumed deterministic read writes no Fact"
+        );
+    }
+
+    #[tokio::test]
+    async fn unconsumed_idempotent_effect_still_records_fact() {
+        // §9.2: Effectful / IdempotentEffect operations are external side
+        // effects, so recovery must know they happened even if the result is
+        // not consumed by later graph nodes.
+        let mut table = HandleTable::new();
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        plan.insert(MethodId::new(7), Arc::new(EchoDriver));
+        let id = table.insert(Handle {
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            resource: ResourceId::new(5),
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            driver_plan: plan,
+            fast_path: FastPath::Unconditional,
+            state: HandleState::Active,
+            bound_path: None,
+        });
+        let (facts, store) = FactSink::in_memory();
+        let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
+        let out = dp
+            .execute(
+                &op(id, 7, Value::Int(1)),
+                0,
+                ReplayClass::IdempotentEffect,
+                SUPPORTS_UNARY,
+                0,
+                false,
+            )
+            .await;
+        assert_eq!(out.outcome, Outcome::Done(Value::Int(1)));
+        assert_eq!(store.len(), 1, "idempotent effect writes a Fact");
+    }
+
+    #[tokio::test]
+    async fn idempotent_effect_dedupes_by_business_key() {
+        // §21.3: two IdempotentEffect ops carrying the same `_idem_key` run the
+        // driver only once; the second short-circuits to the cached outcome.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+
+        let mut table = HandleTable::new();
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        plan.insert(
+            MethodId::new(7),
+            Arc::new(FnDriver(|_m: MethodId, _in: Value| {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                Ok(Value::Int(100))
+            })),
+        );
+        let id = table.insert(Handle {
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            resource: ResourceId::new(5),
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            driver_plan: plan,
+            fast_path: FastPath::Unconditional,
+            state: HandleState::Active,
+            bound_path: None,
+        });
+        let (facts, _store) = FactSink::in_memory();
+        let state = test_state();
+        let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, state.clone());
+
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("_idem_key".to_string(), Value::Str("order-1".into()));
+        let input = Value::Map(m);
+        let o = op(id, 7, input);
+
+        let first = dp
+            .execute(
+                &o,
+                0,
+                ReplayClass::IdempotentEffect,
+                SUPPORTS_UNARY,
+                0,
+                true,
+            )
+            .await;
+        let second = dp
+            .execute(
+                &o,
+                0,
+                ReplayClass::IdempotentEffect,
+                SUPPORTS_UNARY,
+                0,
+                true,
+            )
+            .await;
+
+        assert_eq!(first.outcome, Outcome::Done(Value::Int(100)));
+        // Second deduped → Short with the same value, driver NOT called again.
+        assert_eq!(second.outcome, Outcome::Short(Value::Int(100)));
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            1,
+            "driver runs once; the dup is deduped"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_effect_dedupes_across_data_plane_instances() {
+        // §21.3: idempotency records live in state://idemp/*, so a restarted
+        // DataPlane sharing the backend still dedupes the same effective key.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+
+        let mk_table = || {
+            let mut table = HandleTable::new();
+            let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+            plan.insert(
+                MethodId::new(7),
+                Arc::new(FnDriver(|_m: MethodId, _in: Value| {
+                    CALLS.fetch_add(1, Ordering::SeqCst);
+                    Ok(Value::Int(100))
+                })),
+            );
+            let id = table.insert(Handle {
+                id: HandleId::new(0, 0),
+                process: ProcessId::new(1),
+                resource: ResourceId::new(5),
+                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+                driver_plan: plan,
+                fast_path: FastPath::Unconditional,
+                state: HandleState::Active,
+                bound_path: None,
+            });
+            (table, id)
+        };
+
+        let state = test_state();
+        let (table1, id1) = mk_table();
+        let (facts1, _) = FactSink::in_memory();
+        let dp1 = DataPlane::new(Arc::new(RwLock::new(table1)), facts1, state.clone());
+        let (table2, id2) = mk_table();
+        let (facts2, _) = FactSink::in_memory();
+        let dp2 = DataPlane::new(Arc::new(RwLock::new(table2)), facts2, state.clone());
+
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("_idem_key".to_string(), Value::Str("order-1".into()));
+        let first = dp1
+            .execute(
+                &op(id1, 7, Value::Map(m.clone())),
+                0,
+                ReplayClass::IdempotentEffect,
+                SUPPORTS_UNARY,
+                0,
+                true,
+            )
+            .await;
+        let second = dp2
+            .execute(
+                &op(id2, 7, Value::Map(m)),
+                0,
+                ReplayClass::IdempotentEffect,
+                SUPPORTS_UNARY,
+                0,
+                true,
+            )
+            .await;
+
+        assert_eq!(first.outcome, Outcome::Done(Value::Int(100)));
+        assert_eq!(second.outcome, Outcome::Short(Value::Int(100)));
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        assert!(
+            state
+                .read_prefix(&Path::parse("state://idemp").unwrap())
+                .await
+                .unwrap()
+                .len()
+                >= 1
+        );
+    }
+
+    /// A FactStore whose writes always fail — to exercise the §9.3 fail-closed
+    /// write-ahead path without needing a real disk fault.
+    struct FailingFactStore;
+    impl crate::fact::FactStore for FailingFactStore {
+        fn append(&self, _fact: Fact) -> Result<u64, crate::fact::FactError> {
+            Err(crate::fact::FactError("simulated disk failure".into()))
+        }
+        fn complete(&self, _fact: Fact) -> Result<(), crate::fact::FactError> {
+            Err(crate::fact::FactError("simulated disk failure".into()))
+        }
+        fn sync(&self) -> Result<(), crate::fact::FactError> {
+            Err(crate::fact::FactError("simulated disk failure".into()))
+        }
+        fn facts_of(&self, _process: ProcessId) -> Vec<Fact> {
+            Vec::new()
+        }
+        fn all_facts(&self) -> Vec<Fact> {
+            Vec::new()
+        }
+        fn cursor(&self) -> u64 {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn write_ahead_failure_denies_effect_fail_closed() {
+        // §9.3: a NonIdempotentEffect must write-ahead BEFORE the effect is
+        // issued. If that durable append fails, the op is denied and the driver
+        // is never called — no "happened but unrecorded" effect.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static CALLED: AtomicBool = AtomicBool::new(false);
+        CALLED.store(false, Ordering::SeqCst);
+
+        let mut table = HandleTable::new();
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        plan.insert(
+            MethodId::new(7),
+            Arc::new(FnDriver(|_m: MethodId, _in: Value| {
+                CALLED.store(true, Ordering::SeqCst);
+                Ok(Value::Int(1))
+            })),
+        );
+        let id = table.insert(Handle {
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            resource: ResourceId::new(5),
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            driver_plan: plan,
+            fast_path: FastPath::Unconditional,
+            state: HandleState::Active,
+            bound_path: None,
+        });
+        let facts = FactSink::new(Arc::new(FailingFactStore));
+        let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
+
+        let out = dp
+            .execute(
+                &op(id, 7, Value::Int(9)),
+                0,
+                ReplayClass::NonIdempotentEffect,
+                SUPPORTS_UNARY,
+                0,
+                true,
+            )
+            .await;
+
+        assert!(matches!(out.outcome, Outcome::Fail(_)), "op must be denied");
+        assert!(
+            !CALLED.load(Ordering::SeqCst),
+            "driver must NOT run when the write-ahead barrier fails (fail-closed)"
+        );
+    }
+
+    struct StreamingDriver;
+
+    #[async_trait::async_trait]
+    impl Driver for StreamingDriver {
+        async fn call(
+            &self,
+            _method: MethodId,
+            _input: Value,
+            output: OutputMode,
+            ctx: &DriverContext,
+        ) -> Result<Outcome, DriverError> {
+            assert_eq!(output, OutputMode::Stream);
+            assert!(ctx.emit(Value::Str("chunk-1".into())));
+            assert!(ctx.emit(Value::Str("chunk-2".into())));
+            Ok(Outcome::Done(Value::Int(2)))
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chunks_append_to_state_with_one_fact() {
+        let mut table = HandleTable::new();
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        plan.insert(MethodId::new(7), Arc::new(StreamingDriver));
+        let id = table.insert(Handle {
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            resource: ResourceId::new(5),
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            driver_plan: plan,
+            fast_path: FastPath::Unconditional,
+            state: HandleState::Active,
+            bound_path: None,
+        });
+        let (facts, store) = FactSink::in_memory();
+        let state: nexus_state::Backend = Arc::new(nexus_state::InMemoryBackend::new());
+        let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, state.clone());
+
+        let mut o = op(id, 7, Value::Null);
+        o.output = OutputMode::Stream;
+        let out = dp
+            .execute(&o, 0, ReplayClass::Deterministic, SUPPORTS_STREAM, 0, true)
+            .await;
+        assert_eq!(out.outcome, Outcome::Done(Value::Int(2)));
+
+        let stream = state
+            .read(&Path::parse("state://stream/1/0").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            stream,
+            Some(Value::List(vec![
+                Value::Str("chunk-1".into()),
+                Value::Str("chunk-2".into()),
+                Value::StreamEnd(nexus_types::StreamMarker::Done),
+            ]))
+        );
+        assert_eq!(
+            store.len(),
+            1,
+            "streaming chunks append to state, not one Fact per chunk"
+        );
+    }
+
+    struct CollectDriver;
+
+    #[async_trait::async_trait]
+    impl Driver for CollectDriver {
+        async fn call(
+            &self,
+            _method: MethodId,
+            _input: Value,
+            output: OutputMode,
+            ctx: &DriverContext,
+        ) -> Result<Outcome, DriverError> {
+            assert_eq!(output, OutputMode::Stream);
+            let _ = ctx.emit(Value::Str("a".into()));
+            let _ = ctx.emit(Value::Str("b".into()));
+            Ok(Outcome::Done(Value::Int(2)))
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_aggregates_stream_chunks_up_to_limit() {
+        let mut table = HandleTable::new();
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        plan.insert(MethodId::new(7), Arc::new(CollectDriver));
+        let id = table.insert(Handle {
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            resource: ResourceId::new(5),
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            driver_plan: plan,
+            fast_path: FastPath::Unconditional,
+            state: HandleState::Active,
+            bound_path: None,
+        });
+        let (facts, store) = FactSink::in_memory();
+        let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
+        let mut o = op(id, 7, Value::Null);
+        o.output = OutputMode::Collect { limit: 1 };
+
+        let out = dp
+            .execute(&o, 0, ReplayClass::Deterministic, SUPPORTS_STREAM, 0, true)
+            .await;
+        assert_eq!(
+            out.outcome,
+            Outcome::Done(Value::List(vec![Value::Str("a".into())]))
+        );
+        assert_eq!(store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn collect_wraps_unary_result_when_no_chunks_are_emitted() {
+        struct UnaryOnlyCollectDriver;
+
+        #[async_trait::async_trait]
+        impl Driver for UnaryOnlyCollectDriver {
+            async fn call(
+                &self,
+                _method: MethodId,
+                input: Value,
+                output: OutputMode,
+                ctx: &DriverContext,
+            ) -> Result<Outcome, DriverError> {
+                assert_eq!(output, OutputMode::Unary);
+                assert!(ctx.stream_to.is_none());
+                Ok(Outcome::Done(input))
+            }
+        }
+
+        let mut table = HandleTable::new();
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        plan.insert(MethodId::new(7), Arc::new(UnaryOnlyCollectDriver));
+        let id = table.insert(Handle {
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            resource: ResourceId::new(5),
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            driver_plan: plan,
+            fast_path: FastPath::Unconditional,
+            state: HandleState::Active,
+            bound_path: None,
+        });
+        let (facts, _) = FactSink::in_memory();
+        let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
+        let mut o = op(id, 7, Value::Int(9));
+        o.output = OutputMode::Collect { limit: 8 };
+        let out = dp
+            .execute(&o, 0, ReplayClass::Deterministic, SUPPORTS_UNARY, 0, true)
+            .await;
+        assert_eq!(out.outcome, Outcome::Done(Value::List(vec![Value::Int(9)])));
+    }
+
+    #[tokio::test]
+    async fn sink_only_suppresses_response_body() {
+        let mut table = HandleTable::new();
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        plan.insert(MethodId::new(7), Arc::new(EchoDriver));
+        let id = table.insert(Handle {
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            resource: ResourceId::new(5),
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            driver_plan: plan,
+            fast_path: FastPath::Unconditional,
+            state: HandleState::Active,
+            bound_path: None,
+        });
+        let (facts, store) = FactSink::in_memory();
+        let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
+        let mut o = op(id, 7, Value::Str("response-body".into()));
+        o.output = OutputMode::SinkOnly;
+        let out = dp
+            .execute(
+                &o,
+                0,
+                ReplayClass::NonIdempotentEffect,
+                OutputModeSet::SINK_ONLY,
+                0,
+                true,
+            )
+            .await;
+        assert_eq!(out.outcome, Outcome::Done(Value::Null));
+        let facts = store.facts_of(ProcessId::new(1));
+        assert_eq!(facts.len(), 1);
+        assert!(matches!(
+            facts[0].outcome_ref,
+            nexus_types::OutcomeRef::Inline(Value::Null)
+        ));
+    }
+
+    struct AsyncDriver;
+
+    #[async_trait::async_trait]
+    impl Driver for AsyncDriver {
+        async fn call(
+            &self,
+            _method: MethodId,
+            input: Value,
+            output: OutputMode,
+            _ctx: &DriverContext,
+        ) -> Result<Outcome, DriverError> {
+            assert_eq!(output, OutputMode::AsyncProcess);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            Ok(Outcome::Done(input))
+        }
+    }
+
+    fn async_dataplane(
+        rights: Rights,
+    ) -> (
+        DataPlane,
+        HandleId,
+        nexus_state::Backend,
+        Arc<crate::fact::InMemoryFactStore>,
+        crate::process::ProcessTable,
+    ) {
+        let mut table = HandleTable::new();
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        plan.insert(MethodId::new(7), Arc::new(AsyncDriver));
+        let id = table.insert(Handle {
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            resource: ResourceId::new(5),
+            rights,
+            driver_plan: plan,
+            fast_path: FastPath::Unconditional,
+            state: HandleState::Active,
+            bound_path: None,
+        });
+        let (facts, store) = FactSink::in_memory();
+        let state: nexus_state::Backend = Arc::new(nexus_state::InMemoryBackend::new());
+        let processes = crate::process::ProcessTable::new();
+        let parent = processes.fresh_id();
+        assert_eq!(parent, ProcessId::new(1));
+        let mut entry = ProcessEntry::new(parent, None, IdentityRef::ROOT);
+        entry.status = nexus_types::ProcessStatus::Running;
+        processes.insert(entry);
+        let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, state.clone())
+            .with_processes(processes.clone());
+        (dp, id, state, store, processes)
+    }
+
+    #[tokio::test]
+    async fn async_process_requires_spawn_with_right() {
+        let (dp, id, _state, _store, _processes) =
+            async_dataplane(Rights::new(MethodBitmap::method(0), RightFlags::empty()));
+        let mut o = op(id, 7, Value::Str("work".into()));
+        o.output = OutputMode::AsyncProcess;
+
+        let out = dp
+            .execute(&o, 0, ReplayClass::Deterministic, SUPPORTS_ASYNC, 0, true)
+            .await;
+        assert!(matches!(
+            out.outcome,
+            Outcome::Fail(Failure::PermissionDenied { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_process_returns_pollable_resource_and_records_child_fact() {
+        let (dp, id, state, store, processes) =
+            async_dataplane(Rights::new(MethodBitmap::method(0), RightFlags::SPAWN_WITH));
+        let mut o = op(id, 7, Value::Str("work".into()));
+        o.output = OutputMode::AsyncProcess;
+
+        let out = dp
+            .execute(&o, 0, ReplayClass::Deterministic, SUPPORTS_ASYNC, 0, false)
+            .await;
+        let (child, status_path, outcome_path) = match out.outcome {
+            Outcome::Done(Value::Map(m)) => {
+                assert_eq!(m.get("kind"), Some(&Value::Str("executor_resource".into())));
+                assert_eq!(m.get("path"), Some(&Value::Str("proc://async/2".into())));
+                let child = match m.get("process") {
+                    Some(Value::Int(n)) => ProcessId::new(*n as u64),
+                    other => panic!("expected child process id, got {other:?}"),
+                };
+                let status_path = match m.get("status_path") {
+                    Some(Value::Str(s)) => Path::parse(s).unwrap(),
+                    other => panic!("expected status path, got {other:?}"),
+                };
+                let outcome_path = match m.get("outcome_path") {
+                    Some(Value::Str(s)) => Path::parse(s).unwrap(),
+                    other => panic!("expected outcome path, got {other:?}"),
+                };
+                (child, status_path, outcome_path)
+            }
+            other => panic!("expected async resource map, got {other:?}"),
+        };
+        assert_eq!(child, ProcessId::new(2));
+        assert!(processes.exists(child));
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(v) = state.read(&outcome_path).await.unwrap() {
+                    break v;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("async child writes outcome");
+        let mut expected = BTreeMap::new();
+        expected.insert("status".into(), Value::Str("done".into()));
+        expected.insert("value".into(), Value::Str("work".into()));
+        assert_eq!(outcome, Value::Map(expected));
+        assert_eq!(
+            processes.status(child),
+            Some(nexus_types::ProcessStatus::Completed)
+        );
+        let status = state.read(&status_path).await.unwrap().unwrap();
+        match status {
+            Value::Map(m) => assert_eq!(m.get("phase"), Some(&Value::Str("completed".into()))),
+            other => panic!("expected status map, got {other:?}"),
+        }
+        assert_eq!(
+            store.len(),
+            2,
+            "parent spawn and child execution each record one Fact"
+        );
+    }
+}

@@ -1,0 +1,237 @@
+syntax = "proto3";
+package nexus.v1.extension;
+
+import "nexus/v1/common.proto";
+
+// ExtensionService — daemon-side gRPC service.
+// Out-of-process Sources (chat bridges) and Providers (plugins / MCP) connect TO this service.
+// Communication uses a single bidirectional stream of ExtensionFrame messages.
+service ExtensionService {
+  rpc Session(stream ExtensionFrame) returns (stream ExtensionFrame);
+}
+
+// Top-level frame envelope.
+message ExtensionFrame {
+  oneof frame {
+    RoleSessionClientHello role_session_client_hello = 1;
+    SessionContext session_context = 2;
+    RoleReady role_ready = 3;
+    InboundEvent inbound_event = 4;
+    OutboundCommand outbound_command = 5;
+    CommandResult command_result = 6;
+    EventAck event_ack = 7;
+    Invoke invoke = 8;
+    InvokeResult invoke_result = 9;
+    PluginReady plugin_ready = 10;
+    ControlFrame control = 11;
+  }
+}
+
+// ─── Three-stage session handshake (§16.3.3) ───────────────────────────────
+
+// Stage 1: extension reports identity plus locally observed generations/hash.
+message RoleSessionClientHello {
+  ExtensionRole role = 1;
+  string installation_id = 2;
+  string registry_hash = 3;
+  ObservedGenerations observed = 4;
+  optional nexus.v1.Value config_schema = 5;
+}
+
+// Stage 2: daemon adjudicates authoritative registry hash/generations.
+message SessionContext {
+  string extension_def_id = 1;
+  ExtensionRole role = 2;
+  string registry_hash = 3;
+  uint64 credential_generation = 4;
+  uint64 binding_generation = 5;
+  uint64 extension_config_version = 6;
+  uint64 presentation_config_generation = 7;
+  uint64 alias_catalog_generation = 8;
+}
+
+// Stage 3: extension confirms it has aligned to the daemon-selected context.
+message RoleReady {
+  SessionContext accepted_context = 1;
+}
+
+// Role = which primitive the extension projects (orthogonal to transport/trust).
+// See design §25-A.2.
+enum ExtensionRole {
+  EXTENSION_ROLE_UNSPECIFIED = 0;
+  // Source: provides a state:// inbound event stream (chat bridge, webhook).
+  EXTENSION_ROLE_SOURCE = 1;
+  // Provider: registers effect:// handlers (plugin, MCP server, remote device).
+  EXTENSION_ROLE_PROVIDER = 2;
+}
+
+// ─── Source role (chat bridge) frames ───────────────────────────────────────
+
+// Bridge → Daemon: platform event occurred.
+message InboundEvent {
+  string id = 1;
+  nexus.v1.Value payload = 2;
+  int64 timestamp_ms = 3;
+  // Lightweight presentation/alias generation tags (§16.3.3).
+  ObservedGenerations observed = 4;
+}
+
+// Daemon → Bridge: execute this action on the platform.
+message OutboundCommand {
+  string id = 1;
+  nexus.v1.Value action = 2;
+  ObservedGenerations observed = 3;
+}
+
+// The two lightweight generation axes carried on each Source frame (§16.3.3).
+// Session-level generations live in SessionContext instead.
+message ObservedGenerations {
+  uint64 presentation_config_generation = 1;
+  uint64 alias_catalog_generation = 2;
+}
+
+// Bridge → Daemon: command execution result.
+message CommandResult {
+  string id = 1;
+  oneof outcome {
+    nexus.v1.Value success = 2;
+    ErrorInfo error = 3;
+  }
+}
+
+// Daemon → Bridge: event acknowledgment.
+message EventAck {
+  string id = 1;
+  AckStatus status = 2;
+  optional string reject_reason = 3;
+}
+
+enum AckStatus {
+  ACK_STATUS_UNSPECIFIED = 0;
+  ACK_STATUS_ACCEPTED = 1;
+  ACK_STATUS_DUPLICATE = 2;
+  ACK_STATUS_REJECTED = 3;
+}
+
+// ─── Provider role (plugin / MCP) frames ────────────────────────────────────
+
+// Daemon → Plugin: invoke an effect.
+message Invoke {
+  string invocation_id = 1;
+  nexus.v1.Path effect_path = 2;
+  nexus.v1.Value input = 3;
+  optional int64 deadline_ms = 4;
+  optional string output_stream_to = 5;
+}
+
+// Plugin → Daemon: invocation result.
+message InvokeResult {
+  string invocation_id = 1;
+  oneof outcome {
+    nexus.v1.Value success = 2;
+    ErrorInfo error = 3;
+  }
+}
+
+// Plugin → Daemon: initialization complete, declare capabilities.
+message PluginReady {
+  repeated EffectHandlerSpec provides = 1;
+}
+
+message EffectHandlerSpec {
+  string path = 1;
+  nexus.v1.Purity purity = 2;
+  optional string description = 3;
+}
+
+// ─── Control frames (bidirectional) ─────────────────────────────────────────
+
+message ControlFrame {
+  oneof kind {
+    Heartbeat heartbeat = 1;
+    Shutdown shutdown = 2;
+    FlowControl flow_control = 3;
+    PresentationProfileUpdate presentation_profile_update = 4;
+    ExtensionConfigUpdate extension_config_update = 5;
+    PresentationConfigUpdate presentation_config_update = 6;
+    ConfigAck config_ack = 7;
+  }
+}
+
+// Extension → daemon: report what this end can render (§16.3.3). The profile
+// body is opaque here; the platform docs (Web/Mobile) define its schema.
+message PresentationProfileUpdate {
+  uint64 profile_generation = 1;
+  string profile_hash = 2;
+  nexus.v1.Value profile = 3;
+}
+
+// Daemon → extension: authority config update (§16.3.3), via §18.4 CAS;
+// advances ExtensionDef.version and may bump the Binding generation.
+message ExtensionConfigUpdate {
+  uint64 config_version = 1;
+  nexus.v1.Value config = 2;
+}
+
+// Daemon → extension: presentation-only config (§16.3.3). Never grants
+// capability; bounded by profile_hash and local overrides.
+message PresentationConfigUpdate {
+  uint64 generation = 1;
+  string profile_hash = 2;
+  nexus.v1.Value config = 3;
+}
+
+// Extension → daemon: how a config/presentation update was applied (§16.3.3).
+message ConfigAck {
+  ConfigAxis axis = 1;
+  uint64 version = 2;
+  ApplyStatus status = 3;
+  optional RejectReason reject_reason = 4;  // set only when status == REJECTED
+}
+
+enum ConfigAxis {
+  CONFIG_AXIS_UNSPECIFIED = 0;
+  CONFIG_AXIS_EXTENSION_CONFIG = 1;
+  CONFIG_AXIS_PRESENTATION_CONFIG = 2;
+}
+
+enum ApplyStatus {
+  APPLY_STATUS_UNSPECIFIED = 0;
+  APPLY_STATUS_APPLIED = 1;
+  APPLY_STATUS_REJECTED = 2;
+}
+
+enum RejectReason {
+  REJECT_REASON_UNSPECIFIED = 0;
+  REJECT_REASON_PROFILE_MISMATCH = 1;
+  REJECT_REASON_SCHEMA_INVALID = 2;
+  REJECT_REASON_GENERATION_STALE = 3;
+  REJECT_REASON_UNSUPPORTED = 4;
+}
+
+message Heartbeat {
+  int64 timestamp_ms = 1;
+}
+
+message Shutdown {
+  bool graceful = 1;
+  uint64 timeout_ms = 2;
+}
+
+message FlowControl {
+  FlowSignal signal = 1;
+}
+
+enum FlowSignal {
+  FLOW_SIGNAL_UNSPECIFIED = 0;
+  FLOW_SIGNAL_PAUSE = 1;
+  FLOW_SIGNAL_RESUME = 2;
+}
+
+// ─── Shared ─────────────────────────────────────────────────────────────────
+
+message ErrorInfo {
+  string code = 1;
+  string message = 2;
+  map<string, string> details = 3;
+}

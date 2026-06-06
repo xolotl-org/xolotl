@@ -1,0 +1,23 @@
+[package]
+name = "nexus-storage-redb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "redb-backed persistent storage adapters for Nexus state and the FactStore"
+
+[dependencies]
+async-trait = "0.1.89"
+nexus-kernel = { version = "0.1.0", path = "../nexus-kernel" }
+nexus-state = { version = "0.1.0", path = "../nexus-state" }
+nexus-types = { version = "0.1.0", path = "../nexus-types" }
+parking_lot = "0.12.5"
+redb = "4"
+serde_json = "1.0.149"
+tokio = { version = "1.52.3", features = ["sync"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.52.3", features = ["rt", "sync", "macros", "time", "test-util"] }

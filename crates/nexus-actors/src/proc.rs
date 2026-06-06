@@ -1,0 +1,737 @@
+//! Process / Extension runtime (§16.3): `effect://proc/spawn`,
+//! `effect://proc/kill`, `effect://proc/signal`, `effect://proc/status`,
+//! `effect://proc/heartbeat`, and the ExtensionManager reconcile loop.
+//!
+//! `ProcDriver` is the privileged Driver that manages out-of-process extension
+//! instances (§16.3.1). Each action it takes is an Operation (records a Fact)
+//! and the live process state is an ordinary State Resource at
+//! `state://kernel/procs/<id>/status` — there is no kernel special case. In the
+//! standard in-process implementation Stdio specs really fork/exec a child
+//! process; Grpc/WebSocket/Http specs are connection targets for the endpoint
+//! supervisor and are tracked as `starting` until that layer reports readiness.
+//!
+//! `ExtensionManager` (§16.3.4) is an ordinary supervision routine: it compares
+//! the desired set of extensions (`state://kernel/extensions/*`) against the
+//! live process states and drives them toward the desired phase.
+
+use async_trait::async_trait;
+use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};
+use nexus_state::Backend;
+use nexus_types::{MethodId, Outcome, OutputMode, Path, ProcSpec, Purity, Transport, Value};
+use parking_lot::Mutex;
+use std::collections::BTreeMap;
+use std::process::Stdio;
+use std::sync::Arc;
+use tokio::process::{Child, Command};
+
+/// Internal method names in registration order. `install_standard` exposes each
+/// one as a separate `effect://proc/<method>` Resource with public method
+/// `invoke`. All lifecycle mutations are Effectful (§16.3.1); `status` is a
+/// pure read of external process state.
+pub const PROC_METHODS: &[MethodSpec] = &[
+    MethodSpec::new("spawn", Purity::Effectful, MethodSpec::UNARY_ASYNC),
+    MethodSpec::new("kill", Purity::Effectful, MethodSpec::UNARY_ASYNC),
+    MethodSpec::new("signal", Purity::Effectful, MethodSpec::UNARY_ASYNC),
+    MethodSpec::new("status", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external(),
+    MethodSpec::new("heartbeat", Purity::Effectful, MethodSpec::UNARY_ASYNC),
+];
+
+/// Process lifecycle phases (§16.3.1).
+pub const PHASE_STARTING: &str = "starting";
+pub const PHASE_READY: &str = "ready";
+pub const PHASE_DRAINING: &str = "draining";
+pub const PHASE_DEAD: &str = "dead";
+
+/// The privileged Driver that manages external extension processes (§16.3.1).
+pub struct ProcDriver {
+    state: Backend,
+    children: Arc<Mutex<BTreeMap<String, LiveChild>>>,
+}
+
+#[derive(Clone)]
+struct LiveChild {
+    pid: u32,
+    child: Arc<tokio::sync::Mutex<Child>>,
+}
+
+impl ProcDriver {
+    pub fn new(state: Backend) -> Self {
+        Self {
+            state,
+            children: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// Build a process's status path. `id` arrives from Operation input, so an
+    /// illegal path segment is a caller error (returned as `DriverError`), never
+    /// a panic.
+    fn status_path(id: &str) -> Result<Path, DriverError> {
+        Path::parse(&format!("state://kernel/procs/{id}/status"))
+            .map_err(|e| DriverError::Other(format!("invalid proc id {id:?}: {e}")))
+    }
+
+    /// Build a process's health path (§16.3.1): `last_heartbeat`, `rtt_ms`,
+    /// `inflight` live here, updated on each heartbeat.
+    fn health_path(id: &str) -> Result<Path, DriverError> {
+        Path::parse(&format!("state://kernel/procs/{id}/health"))
+            .map_err(|e| DriverError::Other(format!("invalid proc id {id:?}: {e}")))
+    }
+
+    fn status_value(
+        phase: &str,
+        restarts: i64,
+        transport: Option<&Transport>,
+        pid: Option<u32>,
+        exit_code: Option<i32>,
+    ) -> Value {
+        let mut m = BTreeMap::new();
+        m.insert("phase".into(), Value::Str(phase.into()));
+        m.insert("restarts".into(), Value::Int(restarts));
+        m.insert("started_at".into(), Value::Int(nexus_kernel::now_millis()));
+        if let Some(transport) = transport {
+            m.insert(
+                "transport".into(),
+                Value::Str(transport_name(transport).into()),
+            );
+        }
+        if let Some(pid) = pid {
+            m.insert("pid".into(), Value::Int(pid as i64));
+        }
+        if let Some(exit_code) = exit_code {
+            m.insert("exit_code".into(), Value::Int(exit_code as i64));
+        }
+        Value::Map(m)
+    }
+
+    async fn read_status(&self, id: &str) -> Result<Option<Value>, DriverError> {
+        let path = Self::status_path(id)?;
+        self.state
+            .read(&path)
+            .await
+            .map_err(|e| DriverError::Other(e.to_string()))
+    }
+
+    async fn write_status(&self, id: &str, status: Value) -> Result<Outcome, DriverError> {
+        self.state
+            .write_set(&Self::status_path(id)?, status.clone())
+            .await
+            .map_err(|e| DriverError::Other(e.to_string()))?;
+        Ok(Outcome::Done(status))
+    }
+
+    fn live_child(&self, id: &str) -> Option<LiveChild> {
+        self.children.lock().get(id).cloned()
+    }
+
+    async fn refresh_child_status(&self, id: &str) -> Result<Option<Value>, DriverError> {
+        let Some(live) = self.live_child(id) else {
+            return Ok(None);
+        };
+        let exit = {
+            let mut child = live.child.lock().await;
+            child
+                .try_wait()
+                .map_err(|e| DriverError::Other(format!("proc status failed for {id:?}: {e}")))?
+        };
+        let Some(exit) = exit else {
+            return Ok(None);
+        };
+        self.children.lock().remove(id);
+        let status = Self::status_value(PHASE_DEAD, 0, None, Some(live.pid), exit.code());
+        self.state
+            .write_set(&Self::status_path(id)?, status.clone())
+            .await
+            .map_err(|e| DriverError::Other(e.to_string()))?;
+        Ok(Some(status))
+    }
+
+    async fn ensure_not_running(&self, id: &str) -> Result<(), DriverError> {
+        if self.refresh_child_status(id).await?.is_none() && self.live_child(id).is_some() {
+            return Err(DriverError::Other(format!(
+                "proc {id:?} is already running"
+            )));
+        }
+        if let Some(Value::Map(status)) = self.read_status(id).await? {
+            match status.get("phase").and_then(Value::as_str) {
+                Some(PHASE_STARTING | PHASE_READY | PHASE_DRAINING) => {
+                    return Err(DriverError::Other(format!(
+                        "proc {id:?} is already in phase {:?}",
+                        status.get("phase").and_then(Value::as_str)
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn spawn_stdio_child(&self, spec: &ProcSpec) -> Result<(u32, LiveChild), DriverError> {
+        let argv = spec.command.as_ref().ok_or_else(|| {
+            DriverError::Other("stdio proc.spawn requires ProcSpec.command argv".into())
+        })?;
+        let program = argv
+            .first()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DriverError::Other("stdio proc.spawn command argv is empty".into()))?;
+        let mut cmd = Command::new(program);
+        cmd.args(argv.iter().skip(1));
+        cmd.envs(spec.env.iter());
+        if let Some(cwd) = &spec.cwd {
+            cmd.current_dir(cwd);
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let child = cmd
+            .spawn()
+            .map_err(|e| DriverError::Other(format!("spawn {program:?} failed: {e}")))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| DriverError::Other("spawned child did not expose a pid".into()))?;
+        let live = LiveChild {
+            pid,
+            child: Arc::new(tokio::sync::Mutex::new(child)),
+        };
+        Ok((pid, live))
+    }
+
+    async fn kill_child(&self, id: &str) -> Result<Option<u32>, DriverError> {
+        let live = self.children.lock().remove(id);
+        let Some(live) = live else {
+            return Ok(None);
+        };
+        let mut child = live.child.lock().await;
+        child
+            .kill()
+            .await
+            .map_err(|e| DriverError::Other(format!("kill proc {id:?} failed: {e}")))?;
+        Ok(Some(live.pid))
+    }
+}
+
+#[async_trait]
+impl Driver for ProcDriver {
+    async fn call(
+        &self,
+        method: MethodId,
+        input: Value,
+        _output: OutputMode,
+        _ctx: &DriverContext,
+    ) -> Result<Outcome, DriverError> {
+        let m = input.as_map().cloned().unwrap_or_default();
+        match method.get() {
+            // spawn: bring up (or connect to) the extension process. Stdio
+            // specs fork/exec here; endpoint transports are tracked as
+            // Starting until EndpointSupervisor reports readiness.
+            0 => {
+                let spec = parse_proc_spec(input)?;
+                self.ensure_not_running(&spec.id).await?;
+                let restarts = m.get("restarts").and_then(|v| v.as_int()).unwrap_or(0);
+                let pid = match &spec.transport {
+                    Transport::Stdio { .. } => {
+                        let (pid, live) = self.spawn_stdio_child(&spec)?;
+                        self.children.lock().insert(spec.id.clone(), live);
+                        Some(pid)
+                    }
+                    _ => None,
+                };
+                let status =
+                    Self::status_value(PHASE_STARTING, restarts, Some(&spec.transport), pid, None);
+                self.write_status(&spec.id, status).await
+            }
+            // kill: drain then mark dead.
+            1 => {
+                let id = required_id(&m)?;
+                let had_status = self.read_status(&id).await?.is_some();
+                let pid = self.kill_child(&id).await?;
+                if pid.is_none() && !had_status {
+                    return Err(DriverError::Other(format!("unknown proc id {id:?}")));
+                }
+                let status = Self::status_value(PHASE_DEAD, 0, None, pid, None);
+                self.write_status(&id, status).await
+            }
+            // signal: deliver a signal to a managed Stdio child.
+            2 => {
+                let id = required_id(&m)?;
+                let sig = m
+                    .get("signal")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("TERM")
+                    .to_string();
+                let live = self.live_child(&id).ok_or_else(|| {
+                    DriverError::Other(format!("proc {id:?} has no managed child to signal"))
+                })?;
+                send_signal(live.pid, &sig).await?;
+                Ok(Outcome::Done(Value::Str(sig)))
+            }
+            // status: read the current lifecycle state.
+            3 => {
+                let id = required_id(&m)?;
+                if let Some(status) = self.refresh_child_status(&id).await? {
+                    return Ok(Outcome::Done(status));
+                }
+                Ok(Outcome::Done(
+                    self.read_status(&id).await?.unwrap_or(Value::Null),
+                ))
+            }
+            // heartbeat: record liveness to the health path (§16.3.1). Input may
+            // carry `rtt_ms` / `inflight`; we stamp `last_heartbeat` from the
+            // clock so a supervisor can detect a silent (hung) process.
+            4 => {
+                let id = required_id(&m)?;
+                let rtt = m.get("rtt_ms").and_then(|v| v.as_int()).unwrap_or(0);
+                let inflight = m.get("inflight").and_then(|v| v.as_int()).unwrap_or(0);
+                let mut health = BTreeMap::new();
+                health.insert(
+                    "last_heartbeat".into(),
+                    Value::Int(nexus_kernel::now_millis()),
+                );
+                health.insert("rtt_ms".into(), Value::Int(rtt));
+                health.insert("inflight".into(), Value::Int(inflight));
+                self.state
+                    .write_set(&Self::health_path(&id)?, Value::Map(health))
+                    .await
+                    .map_err(|e| DriverError::Other(e.to_string()))?;
+                if let Some(Value::Map(status)) = self.read_status(&id).await?
+                    && status.get("phase").and_then(Value::as_str) == Some(PHASE_STARTING)
+                {
+                    let restarts = status.get("restarts").and_then(Value::as_int).unwrap_or(0);
+                    let pid = status
+                        .get("pid")
+                        .and_then(Value::as_int)
+                        .and_then(|pid| u32::try_from(pid).ok());
+                    let promoted = Self::status_value(PHASE_READY, restarts, None, pid, None);
+                    self.state
+                        .write_set(&Self::status_path(&id)?, promoted)
+                        .await
+                        .map_err(|e| DriverError::Other(e.to_string()))?;
+                }
+                Ok(Outcome::Done(Value::Bool(true)))
+            }
+            _ => Err(DriverError::Other(format!(
+                "unknown proc method {}",
+                method.get()
+            ))),
+        }
+    }
+}
+
+fn parse_proc_spec(input: Value) -> Result<ProcSpec, DriverError> {
+    let json = serde_json::to_value(&input)
+        .map_err(|e| DriverError::Other(format!("proc spec serialization failed: {e}")))?;
+    let spec: ProcSpec = serde_json::from_value(json)
+        .map_err(|e| DriverError::Other(format!("proc.spawn requires ProcSpec input: {e}")))?;
+    if spec.id.is_empty() {
+        return Err(DriverError::Other("proc id must not be empty".into()));
+    }
+    if let Transport::Stdio { .. } = &spec.transport
+        && spec.command.as_ref().is_none_or(Vec::is_empty)
+    {
+        return Err(DriverError::Other(
+            "stdio proc.spawn requires non-empty ProcSpec.command argv".into(),
+        ));
+    }
+    Ok(spec)
+}
+
+fn required_id(m: &BTreeMap<String, Value>) -> Result<String, DriverError> {
+    m.get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| DriverError::Other("proc op requires id".into()))
+}
+
+fn transport_name(t: &Transport) -> &'static str {
+    match t {
+        Transport::InProcess => "in_process",
+        Transport::Grpc { .. } => "grpc",
+        Transport::Stdio { .. } => "stdio",
+        Transport::WebSocket { .. } => "websocket",
+        Transport::Http { .. } => "http",
+    }
+}
+
+#[cfg(unix)]
+async fn send_signal(pid: u32, sig: &str) -> Result<(), DriverError> {
+    if sig.is_empty() || !sig.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(DriverError::Other(format!("invalid signal name {sig:?}")));
+    }
+    let status = Command::new("kill")
+        .arg(format!("-{sig}"))
+        .arg(pid.to_string())
+        .status()
+        .await
+        .map_err(|e| DriverError::Other(format!("signal {sig} to pid {pid} failed: {e}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(DriverError::Other(format!(
+            "signal {sig} to pid {pid} exited with {status}"
+        )))
+    }
+}
+
+#[cfg(not(unix))]
+async fn send_signal(_pid: u32, sig: &str) -> Result<(), DriverError> {
+    Err(DriverError::Other(format!(
+        "signal {sig:?} is unsupported on this platform"
+    )))
+}
+
+/// Reconcile the desired extension set against live process states (§16.3.4).
+/// For each desired extension whose process is absent or `dead`, this returns
+/// the `id`s that need (re)starting. A supervision Process calls `proc/spawn`
+/// on each. Pure over its inputs (no I/O) so it is easy to test and replay.
+pub fn reconcile(desired_ids: &[String], live: &BTreeMap<String, String>) -> Vec<String> {
+    desired_ids
+        .iter()
+        .filter(|id| match live.get(*id) {
+            None => true,                       // not started yet
+            Some(phase) => phase == PHASE_DEAD, // crashed → restart (RestartPolicy)
+        })
+        .cloned()
+        .collect()
+}
+
+/// What a [`RestartPolicy`] decides for a crashed process (§16.3.1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SuperviseDecision {
+    /// Restart now (no delay).
+    Restart,
+    /// Restart after `delay_ms` (backoff).
+    RestartAfter { delay_ms: u64 },
+    /// Stop at Dead and alarm — the crash budget is exhausted (§16.3.1).
+    GiveUp,
+}
+
+/// Evaluate a [`RestartPolicy`] for a process that has crashed (§16.3.1). Given
+/// the number of failures already seen *within the policy window* and the
+/// current attempt's backoff index, decide whether to restart (and how long to
+/// wait) or stop at Dead. Pure → testable; the supervision Process applies it.
+///
+/// `failures_in_window` counts crashes inside the policy's window so far
+/// (including this one). `attempt` is the 0-based restart attempt, used to scale
+/// exponential backoff.
+pub fn supervise(
+    policy: &nexus_types::extension::RestartPolicy,
+    failures_in_window: u32,
+    attempt: u32,
+) -> SuperviseDecision {
+    use nexus_types::extension::{Backoff, RestartPolicy};
+    match policy {
+        RestartPolicy::Never => SuperviseDecision::GiveUp,
+        RestartPolicy::OnFailure { max, .. } => {
+            if failures_in_window > *max {
+                // Exceeded the crash budget in the window → stop + alarm.
+                SuperviseDecision::GiveUp
+            } else {
+                SuperviseDecision::Restart
+            }
+        }
+        RestartPolicy::Always { backoff } => {
+            let delay_ms = match backoff {
+                Backoff::Fixed { ms } => *ms,
+                Backoff::Exp {
+                    base_ms, cap_ms, ..
+                } => {
+                    // base * 2^attempt, capped. Jitter is applied by the caller
+                    // (it needs a clock/RNG); the policy yields the deterministic
+                    // bound here.
+                    let shifted = base_ms.saturating_mul(1u64 << attempt.min(20));
+                    shifted.min(*cap_ms)
+                }
+            };
+            if delay_ms == 0 {
+                SuperviseDecision::Restart
+            } else {
+                SuperviseDecision::RestartAfter { delay_ms }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexus_state::InMemoryBackend;
+    use nexus_types::{IdentityRef, ProcessId};
+    use std::sync::Arc;
+
+    fn ctx() -> DriverContext {
+        DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
+    }
+
+    fn id_input(id: &str) -> Value {
+        let mut m = BTreeMap::new();
+        m.insert("id".into(), Value::Str(id.into()));
+        Value::Map(m)
+    }
+
+    fn stdio_spec_input(id: &str, command: Vec<&str>) -> Value {
+        let spec = ProcSpec {
+            id: id.into(),
+            transport: Transport::Stdio {
+                command: Some(command[0].into()),
+                args: command.iter().skip(1).map(|arg| (*arg).into()).collect(),
+            },
+            command: Some(command.into_iter().map(str::to_string).collect()),
+            env: BTreeMap::new(),
+            cwd: None,
+            restart: nexus_types::RestartPolicy::Never,
+        };
+        serde_json::from_value(serde_json::to_value(spec).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn spawn_requires_proc_spec_not_id_shorthand() {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = ProcDriver::new(state);
+        let out = d
+            .call(
+                MethodId::new(0),
+                id_input("id-only-ext"),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await;
+        assert!(out.is_err());
+    }
+
+    #[tokio::test]
+    async fn stdio_spawn_then_status_reports_starting_with_pid() {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = ProcDriver::new(state);
+        let out = d
+            .call(
+                MethodId::new(0),
+                stdio_spec_input("ext-a", vec!["/bin/sh", "-c", "sleep 1"]),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        match out {
+            Outcome::Done(Value::Map(m)) => {
+                assert_eq!(
+                    m.get("phase").and_then(|v| v.as_str()),
+                    Some(PHASE_STARTING)
+                );
+                assert_eq!(m.get("transport").and_then(|v| v.as_str()), Some("stdio"));
+                assert!(matches!(m.get("pid"), Some(Value::Int(pid)) if *pid > 0));
+            }
+            _ => panic!("expected status map"),
+        }
+        let out = d
+            .call(
+                MethodId::new(3),
+                id_input("ext-a"),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        match out {
+            Outcome::Done(Value::Map(m)) => {
+                assert_eq!(
+                    m.get("phase").and_then(|v| v.as_str()),
+                    Some(PHASE_STARTING)
+                );
+            }
+            _ => panic!("expected status map"),
+        }
+        d.call(
+            MethodId::new(1),
+            id_input("ext-a"),
+            OutputMode::Unary,
+            &ctx(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_promotes_starting_child_to_ready() {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = ProcDriver::new(state);
+        d.call(
+            MethodId::new(0),
+            stdio_spec_input("ext-ready", vec!["/bin/sh", "-c", "sleep 1"]),
+            OutputMode::Unary,
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        let mut hb = BTreeMap::new();
+        hb.insert("id".into(), Value::Str("ext-ready".into()));
+        d.call(MethodId::new(4), Value::Map(hb), OutputMode::Unary, &ctx())
+            .await
+            .unwrap();
+        let out = d
+            .call(
+                MethodId::new(3),
+                id_input("ext-ready"),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        match out {
+            Outcome::Done(Value::Map(m)) => {
+                assert_eq!(m.get("phase").and_then(|v| v.as_str()), Some(PHASE_READY));
+            }
+            _ => panic!("expected status map"),
+        }
+        d.call(
+            MethodId::new(1),
+            id_input("ext-ready"),
+            OutputMode::Unary,
+            &ctx(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn kill_marks_dead() {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = ProcDriver::new(state);
+        d.call(
+            MethodId::new(0),
+            stdio_spec_input("ext-b", vec!["/bin/sh", "-c", "sleep 10"]),
+            OutputMode::Unary,
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        let out = d
+            .call(
+                MethodId::new(1),
+                id_input("ext-b"),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        match out {
+            Outcome::Done(Value::Map(m)) => {
+                assert_eq!(m.get("phase").and_then(|v| v.as_str()), Some(PHASE_DEAD));
+                assert!(matches!(m.get("pid"), Some(Value::Int(pid)) if *pid > 0));
+            }
+            _ => panic!("expected status map"),
+        }
+    }
+
+    #[tokio::test]
+    async fn status_terminalizes_exited_stdio_child() {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = ProcDriver::new(state);
+        d.call(
+            MethodId::new(0),
+            stdio_spec_input("ext-exit", vec!["/bin/sh", "-c", "exit 7"]),
+            OutputMode::Unary,
+            &ctx(),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let out = d
+            .call(
+                MethodId::new(3),
+                id_input("ext-exit"),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        match out {
+            Outcome::Done(Value::Map(m)) => {
+                assert_eq!(m.get("phase").and_then(|v| v.as_str()), Some(PHASE_DEAD));
+                assert_eq!(m.get("exit_code"), Some(&Value::Int(7)));
+            }
+            _ => panic!("expected status map"),
+        }
+    }
+
+    #[test]
+    fn reconcile_restarts_absent_and_dead() {
+        let desired = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut live = BTreeMap::new();
+        live.insert("a".into(), PHASE_READY.to_string());
+        live.insert("b".into(), PHASE_DEAD.to_string());
+        // c is absent.
+        let need = reconcile(&desired, &live);
+        assert_eq!(need, vec!["b".to_string(), "c".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_writes_health() {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = ProcDriver::new(state.clone());
+        let mut m = BTreeMap::new();
+        m.insert("id".into(), Value::Str("ext-h".into()));
+        m.insert("rtt_ms".into(), Value::Int(12));
+        m.insert("inflight".into(), Value::Int(3));
+        d.call(MethodId::new(4), Value::Map(m), OutputMode::Unary, &ctx())
+            .await
+            .unwrap();
+        let health = state
+            .read(&nexus_types::Path::parse("state://kernel/procs/ext-h/health").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let hm = health.as_map().unwrap();
+        assert_eq!(hm.get("rtt_ms"), Some(&Value::Int(12)));
+        assert_eq!(hm.get("inflight"), Some(&Value::Int(3)));
+        assert!(matches!(hm.get("last_heartbeat"), Some(Value::Int(_))));
+    }
+
+    #[test]
+    fn supervise_on_failure_gives_up_past_budget() {
+        use nexus_types::extension::RestartPolicy;
+        let policy = RestartPolicy::OnFailure {
+            max: 3,
+            window_ms: 60_000,
+        };
+        // Within budget → restart.
+        assert_eq!(supervise(&policy, 2, 1), SuperviseDecision::Restart);
+        assert_eq!(supervise(&policy, 3, 2), SuperviseDecision::Restart);
+        // Exceeds budget → give up + alarm.
+        assert_eq!(supervise(&policy, 4, 3), SuperviseDecision::GiveUp);
+    }
+
+    #[test]
+    fn supervise_never_gives_up_immediately() {
+        use nexus_types::extension::RestartPolicy;
+        assert_eq!(
+            supervise(&RestartPolicy::Never, 0, 0),
+            SuperviseDecision::GiveUp
+        );
+    }
+
+    #[test]
+    fn supervise_always_applies_exponential_backoff() {
+        use nexus_types::extension::{Backoff, RestartPolicy};
+        let policy = RestartPolicy::Always {
+            backoff: Backoff::Exp {
+                base_ms: 100,
+                cap_ms: 1000,
+                jitter: false,
+            },
+        };
+        // 100 * 2^0 = 100, 2^1=200, 2^4=1600 capped to 1000.
+        assert_eq!(
+            supervise(&policy, 1, 0),
+            SuperviseDecision::RestartAfter { delay_ms: 100 }
+        );
+        assert_eq!(
+            supervise(&policy, 2, 1),
+            SuperviseDecision::RestartAfter { delay_ms: 200 }
+        );
+        assert_eq!(
+            supervise(&policy, 5, 4),
+            SuperviseDecision::RestartAfter { delay_ms: 1000 }
+        );
+    }
+}

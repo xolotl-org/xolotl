@@ -1,0 +1,44 @@
+# Build
+/target/
+
+# Environment
+.env
+.env.*
+
+# Configuration
+nexus.toml
+
+# Runtime state / local databases
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.redb
+*.redb-*
+
+# Logs
+*.log
+logs/
+
+# Design drafts
+design/
+
+# Local sync metadata
+.stfolder/
+.stignore
+
+# Local assistant/tool metadata
+.claude/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,22 @@
+[package]
+name = "nexus-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+
+# NOTE: no `protoc` build step. The Rust bindings are hand-vendored in
+# `src/{common,gateway,extension}.rs` (faithful to tonic-prost-build 0.14
+# output) so this crate builds anywhere prost/tonic resolve. The `.proto` files
+# under `proto/` remain the canonical wire schema; keep the two in sync.
+
+[dependencies]
+nexus-graph = { version = "0.1.0", path = "../nexus-graph" }
+nexus-types = { version = "0.1.0", path = "../nexus-types" }
+prost = "0.14.3"
+thiserror = "2.0.18"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"

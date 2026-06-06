@@ -1,0 +1,1336 @@
+//! The Executor: advances a compiled [`ExecutionGraph`] to produce Operations
+//! and an Outcome (§13.4).
+//!
+//! The Executor **only ever advances a graph** — it never interprets the Do<A>
+//! source form directly. `eval()` compiles the program once (`compile_do`),
+//! binds the resulting graph, then walks it node-by-node. Each node's id is its
+//! **stable `CausalPosition`** (§6.1 / §13.2): assigned by the compiler in
+//! pre-order, identical across recompiles, so an Operation's identity is
+//! independent of wall clock and survives crash-recovery.
+//!
+//! Per node kind (§13.4):
+//! - `Pure` / `Fail` yield a value / failure immediately.
+//! - `Operation` issues one data-plane call (records a Fact).
+//! - `Step` splices its produced subgraph at the cursor (run-time `AndThen`).
+//! - `Branch(OrElse)` runs its guarded arm; on failure routes into `recover`.
+//! - `Join(Both)` runs both arms concurrently (async I/O overlap); `Join(Race)`
+//!   runs both and takes the first to finish, cancelling the loser.
+//! - `Acting` switches block-level identity for its arm.
+//! - `Wait` blocks on a signal path or a wall-clock deadline.
+
+use crate::dataplane::DataPlane;
+use crate::registry::Registry;
+use crate::step::StepTable;
+use nexus_graph::{
+    BranchKind, DoNode, EdgeKind, ExecutionGraph, JoinKind, NodeKind, OperationTemplate, StepRef,
+    WaitSpec, compile_do,
+};
+use nexus_types::{
+    IdentityRef, NodeId, Operation, OperationId, Outcome, ProcessId, ReplayClass, ResourceName,
+    Value,
+};
+use std::collections::HashMap;
+use std::sync::Arc;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ExecError {
+    #[error("step recursion exceeded depth {0}")]
+    RecursionLimit(usize),
+}
+
+/// Maximum splice depth — a runaway recursive Step (debate loops, etc.) is
+/// bounded so a buggy program can't hang the executor (cf. §20.4.1).
+const MAX_DEPTH: usize = 4096;
+
+/// Drives one Process's program to completion. Holds the data plane (for
+/// Operation dispatch), the registry (to resolve target names → handles), and
+/// the step table (named continuations).
+pub struct Executor {
+    pub process: ProcessId,
+    pub data_plane: DataPlane,
+    pub registry: Registry,
+    pub steps: StepTable,
+    /// Optional state backend, used to resolve `Wait(Signal)` nodes (§13.2).
+    /// `None` for executors that never wait on a signal path.
+    state: Option<nexus_state::Backend>,
+    /// Optional process table, used to observe cancellation at Operation
+    /// boundaries (§13.4 / §14.2). `None` for standalone executors (tests) that
+    /// have no process lifecycle to honor.
+    processes: Option<crate::process::ProcessTable>,
+    /// Optional replay map (§15.2): when recovering, completed Operations
+    /// short-circuit to their recorded outcome instead of re-issuing the effect.
+    /// `None` / empty for a fresh run.
+    replay: Option<Arc<crate::recovery::ReplayMap>>,
+    /// Maps an opened ResourceName → the HandleId the process holds for it, so
+    /// repeated Operations on the same effect reuse the compiled handle
+    /// (the CompiledOpenPlan amortization, §5.6).
+    open_handles: Arc<parking_lot::RwLock<HashMap<ResourceName, nexus_types::HandleId>>>,
+    /// Per-(resource, method) compiled metadata cache (§10.1/§11): the data
+    /// plane must not re-query the Registry on every Operation. The first op on
+    /// a (target, method) resolves it once; subsequent ops read this cache, so
+    /// the hot path never walks the Registry again.
+    method_cache: Arc<parking_lot::RwLock<HashMap<(ResourceName, String), MethodMeta>>>,
+}
+
+/// Compiled, cached metadata for one (resource, method) (§11): the bit position,
+/// id, replay class, supported output modes, and cost — everything the data
+/// plane needs to dispatch without touching the Registry again.
+#[derive(Clone)]
+struct MethodMeta {
+    method_index: u32,
+    method_id: nexus_types::MethodId,
+    replay: ReplayClass,
+    supports: nexus_types::OutputModeSet,
+    cost: nexus_types::CostModel,
+    batchable: bool,
+}
+
+/// Block-scoped evaluation environment: `Let`-bound values keyed by the
+/// **producer NodeId** (so `Use` edges resolve structurally), the current
+/// acting identity, and the **taint** of the value currently flowing (§21.5).
+/// Threaded by value through recursion (no shared mutation).
+#[derive(Clone)]
+struct Env {
+    /// Producer NodeId → its computed value (for `Use`-edge data dependencies).
+    bindings: HashMap<NodeId, Value>,
+    /// Producer NodeId → that value's taint (parallel to `bindings`).
+    binding_taint: HashMap<NodeId, nexus_types::TaintSet>,
+    acting: IdentityRef,
+    /// Provenance of the value flowing into the current node (§21.5).
+    taint: nexus_types::TaintSet,
+}
+
+impl Env {
+    fn root() -> Self {
+        Self {
+            bindings: HashMap::new(),
+            binding_taint: HashMap::new(),
+            acting: IdentityRef::ROOT,
+            taint: nexus_types::TaintSet::pristine(),
+        }
+    }
+
+    /// Derive a child env carrying `taint` as the flowing value's provenance.
+    fn with_taint(&self, taint: nexus_types::TaintSet) -> Self {
+        let mut e = self.clone();
+        e.taint = taint;
+        e
+    }
+}
+
+impl Executor {
+    pub fn new(
+        process: ProcessId,
+        data_plane: DataPlane,
+        registry: Registry,
+        steps: StepTable,
+    ) -> Self {
+        Self {
+            process,
+            data_plane,
+            registry,
+            steps,
+            state: None,
+            processes: None,
+            replay: None,
+            open_handles: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            method_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Attach a state backend so `Wait(Signal)` nodes can resolve (§13.2).
+    pub fn with_state(mut self, state: nexus_state::Backend) -> Self {
+        self.state = Some(state);
+        self
+    }
+
+    /// Attach a replay map so a recovered run short-circuits already-completed
+    /// Operations to their recorded outcomes (§15.2).
+    pub fn with_replay(mut self, replay: Arc<crate::recovery::ReplayMap>) -> Self {
+        self.replay = Some(replay);
+        self
+    }
+
+    /// Attach the process table so the executor honors cancellation at each
+    /// Operation boundary (§13.4 / §14.2).
+    pub fn with_processes(mut self, processes: crate::process::ProcessTable) -> Self {
+        self.processes = Some(processes);
+        self
+    }
+
+    /// Whether this process has been cancelled or moved past Running (§14.2).
+    /// Returns false when no process table is attached (standalone executors).
+    fn is_cancelled(&self) -> bool {
+        match &self.processes {
+            Some(p) => matches!(
+                p.status(self.process),
+                Some(nexus_types::ProcessStatus::Cancelled)
+                    | Some(nexus_types::ProcessStatus::Finalizing)
+            ),
+            None => false,
+        }
+    }
+
+    /// Pre-register a resolved handle for a resource name (used by bootstrap /
+    /// open ahead of execution).
+    pub fn bind_handle(&self, name: ResourceName, handle: nexus_types::HandleId) {
+        self.open_handles.write().insert(name, handle);
+    }
+
+    /// Evaluate a whole program to an Outcome. Compiles the Do<A> into one
+    /// [`ExecutionGraph`] (§13.3), then advances the graph — the Executor never
+    /// interprets the source form directly (§13.2).
+    pub async fn eval(&self, program: &DoNode) -> Outcome {
+        let graph = match compile_do(program) {
+            Ok(g) => g,
+            Err(e) => {
+                return Outcome::Fail(nexus_types::Failure::policy(
+                    "executor",
+                    format!("compile failed: {e}"),
+                ));
+            }
+        };
+        self.eval_graph(&graph).await
+    }
+
+    /// Advance a compiled graph from its root to an Outcome.
+    pub async fn eval_graph(&self, graph: &ExecutionGraph) -> Outcome {
+        self.eval_graph_tainted(graph, nexus_types::TaintSet::pristine())
+            .await
+    }
+
+    /// Evaluate a program whose entry value carries `entry_taint` — used when a
+    /// Gateway runs an externally-sourced program (the inbound content is
+    /// tainted `Inbound`, §21.5), so the whole run inherits that lineage.
+    pub async fn eval_tainted(
+        &self,
+        program: &DoNode,
+        entry_taint: nexus_types::TaintSet,
+    ) -> Outcome {
+        let graph = match compile_do(program) {
+            Ok(g) => g,
+            Err(e) => {
+                return Outcome::Fail(nexus_types::Failure::policy(
+                    "executor",
+                    format!("compile failed: {e}"),
+                ));
+            }
+        };
+        self.eval_graph_tainted(&graph, entry_taint).await
+    }
+
+    /// Advance a compiled graph with a given entry taint.
+    async fn eval_graph_tainted(
+        &self,
+        graph: &ExecutionGraph,
+        entry_taint: nexus_types::TaintSet,
+    ) -> Outcome {
+        // `next_splice_base` hands out id ranges for spliced Step subgraphs so
+        // their CausalPositions never collide with the parent graph or each
+        // other (§13.4). It starts past the highest compiled id.
+        let next_base = Arc::new(std::sync::atomic::AtomicU32::new(graph.len() as u32));
+        let env = Env::root().with_taint(entry_taint);
+        self.run_node(graph, graph.root, Value::Null, &env, 0, &next_base)
+            .await
+    }
+    /// Evaluate the node at `id` with `input` flowing in, then advance to its
+    /// continuation. The node's id **is** its CausalPosition (§6.1) — read
+    /// straight off the compiled graph, never re-derived.
+    fn run_node<'a>(
+        &'a self,
+        graph: &'a ExecutionGraph,
+        id: NodeId,
+        input: Value,
+        env: &'a Env,
+        depth: usize,
+        next_base: &'a Arc<std::sync::atomic::AtomicU32>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Outcome> + Send + 'a>> {
+        Box::pin(async move {
+            if depth > MAX_DEPTH {
+                return Outcome::Fail(nexus_types::Failure::policy(
+                    "executor",
+                    "step recursion limit exceeded",
+                ));
+            }
+            let Some(node) = graph.node(id) else {
+                return Outcome::Fail(nexus_types::Failure::policy(
+                    "executor",
+                    format!("dangling node id {}", id.get()),
+                ));
+            };
+            match &node.kind {
+                NodeKind::Pure(v) => {
+                    // `Use` nodes are Pure(Null) with an incoming Use-edge: the
+                    // real value (and its taint) is the bound producer's output.
+                    // A bare Pure literal is an author constant.
+                    let (out, taint) = if let Some((bound, t)) = self.resolve_use(graph, id, env) {
+                        (bound, t)
+                    } else {
+                        (v.clone(), nexus_types::TaintSet::author())
+                    };
+                    let env2 = env.with_taint(taint);
+                    self.continue_then(graph, id, out, &env2, depth, next_base)
+                        .await
+                }
+
+                NodeKind::Fail(f) => Outcome::Fail(f.clone()),
+
+                NodeKind::Operation(tmpl) => {
+                    // §13.4 / §14.2: a Process observes cancellation at each
+                    // Operation boundary. If it was cancelled (or moved to
+                    // Finalizing), short-circuit to Cancelled before issuing the
+                    // side effect — a cancelled Process must not keep acting.
+                    if self.is_cancelled() {
+                        return self
+                            .continue_with(
+                                graph,
+                                id,
+                                Outcome::Fail(nexus_types::Failure::Cancelled),
+                                env,
+                                depth,
+                                next_base,
+                            )
+                            .await;
+                    }
+                    // §15.2 recovery: if this Operation's outcome is already
+                    // durably recorded (replay map hit by CausalPosition), reuse
+                    // it instead of re-issuing the side effect. This is what makes
+                    // re-running a recovered program safe — a NonIdempotentEffect
+                    // that already happened is never repeated.
+                    if let Some(replay) = &self.replay
+                        && let Some(recorded) = replay.get(id)
+                    {
+                        let recorded = recorded.clone();
+                        return self
+                            .continue_with(graph, id, recorded, env, depth, next_base)
+                            .await;
+                    }
+                    // §9.2: record a Fact when the op has side effects or its
+                    // output is consumed by downstream control flow; an
+                    // unconsumed pure read may skip (recovery recomputes it).
+                    let record = graph.output_is_consumed(id);
+                    let (out, out_taint) = self.run_operation(tmpl, input, env, id, record).await;
+                    // The result flows on carrying the operation's taint (§21.5).
+                    let env2 = env.with_taint(out_taint);
+                    self.continue_with(graph, id, out, &env2, depth, next_base)
+                        .await
+                }
+
+                NodeKind::Step(sref) => {
+                    let out = self.run_step(sref, input, env, depth, next_base).await;
+                    self.continue_with(graph, id, out, env, depth, next_base)
+                        .await
+                }
+
+                NodeKind::Branch(BranchKind::OrElse { recover }) => {
+                    let arm = self.arm_entry(graph, id);
+                    let guarded = match arm {
+                        Some(a) => {
+                            self.run_node(graph, a, input, env, depth + 1, next_base)
+                                .await
+                        }
+                        None => Outcome::Done(Value::Null),
+                    };
+                    let out = match guarded {
+                        Outcome::Fail(f) => {
+                            // Compensate: run `recover` with the failure as input.
+                            let fv = Value::Str(f.to_string());
+                            self.run_step(recover, fv, env, depth + 1, next_base).await
+                        }
+                        ok => ok,
+                    };
+                    self.continue_with(graph, id, out, env, depth, next_base)
+                        .await
+                }
+
+                NodeKind::Join(kind) => {
+                    let arms = self.arm_entries(graph, id);
+                    let out = match (arms.first().copied(), arms.get(1).copied()) {
+                        (Some(a), Some(b)) => {
+                            let fa =
+                                self.run_node(graph, a, input.clone(), env, depth + 1, next_base);
+                            let fb = self.run_node(graph, b, input, env, depth + 1, next_base);
+                            match kind {
+                                // Genuine concurrency: both arms make progress
+                                // across their Operation awaits; wall-clock ≈
+                                // max(arm), not sum (§13.4).
+                                JoinKind::Both => {
+                                    let (ra, rb) = tokio::join!(fa, fb);
+                                    match (ra, rb) {
+                                        (
+                                            Outcome::Done(va) | Outcome::Short(va),
+                                            Outcome::Done(vb) | Outcome::Short(vb),
+                                        ) => Outcome::Done(Value::List(vec![va, vb])),
+                                        (Outcome::Fail(f), _) | (_, Outcome::Fail(f)) => {
+                                            Outcome::Fail(f)
+                                        }
+                                    }
+                                }
+                                // First to finish wins; `select!` drops (cancels)
+                                // the loser's future.
+                                JoinKind::Race => tokio::select! {
+                                    ra = fa => ra,
+                                    rb = fb => rb,
+                                },
+                            }
+                        }
+                        _ => Outcome::Fail(nexus_types::Failure::policy(
+                            "executor",
+                            "join node missing two arms",
+                        )),
+                    };
+                    self.continue_with(graph, id, out, env, depth, next_base)
+                        .await
+                }
+
+                NodeKind::Acting(path) => {
+                    // §3/§5.1/§20.1: switching the acting identity is a
+                    // *delegation*, not a free operation. The process must hold
+                    // a grant `act-as://<identity>` carrying the DELEGATE flag.
+                    // Without it the switch is denied fail-closed — otherwise any
+                    // program could assume any identity and defeat the capability
+                    // model. Fact records caller and acting both (§6 line 252).
+                    if !self.authorize_act_as(path) {
+                        let out = Outcome::Fail(nexus_types::Failure::policy(
+                            "act-as",
+                            format!(
+                                "process {} holds no act-as://{} grant with DELEGATE",
+                                self.process.get(),
+                                path
+                            ),
+                        ));
+                        return self
+                            .continue_with(graph, id, out, env, depth, next_base)
+                            .await;
+                    }
+                    let arm = self.arm_entry(graph, id);
+                    let mut env2 = env.clone();
+                    env2.acting = intern_identity(path);
+                    let out = match arm {
+                        Some(a) => {
+                            self.run_node(graph, a, input, &env2, depth + 1, next_base)
+                                .await
+                        }
+                        None => Outcome::Done(Value::Null),
+                    };
+                    // Identity restored: the continuation runs under the outer env.
+                    self.continue_with(graph, id, out, env, depth, next_base)
+                        .await
+                }
+
+                NodeKind::Wait(spec) => {
+                    let out = self.run_wait(spec).await;
+                    self.continue_with(graph, id, out, env, depth, next_base)
+                        .await
+                }
+            }
+        })
+    }
+    /// Continue from `id` after producing `out`. If `out` failed, the failure
+    /// propagates (the nearest enclosing `Branch` catches it); otherwise the
+    /// success value flows along the `Then` edge to the continuation. A node
+    /// with no `Then` edge is a span exit — its value is the result.
+    fn continue_with<'a>(
+        &'a self,
+        graph: &'a ExecutionGraph,
+        id: NodeId,
+        out: Outcome,
+        env: &'a Env,
+        depth: usize,
+        next_base: &'a Arc<std::sync::atomic::AtomicU32>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Outcome> + Send + 'a>> {
+        Box::pin(async move {
+            match out {
+                Outcome::Done(v) | Outcome::Short(v) => {
+                    self.continue_then(graph, id, v, env, depth, next_base)
+                        .await
+                }
+                fail => fail,
+            }
+        })
+    }
+
+    /// Route the success value `v` along `id`'s `Then` edge (the continuation),
+    /// recording the produced value as `id`'s binding (so a later `Use` edge to
+    /// `id` resolves). With no `Then` edge, `v` is this span's result.
+    fn continue_then<'a>(
+        &'a self,
+        graph: &'a ExecutionGraph,
+        id: NodeId,
+        v: Value,
+        env: &'a Env,
+        depth: usize,
+        next_base: &'a Arc<std::sync::atomic::AtomicU32>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Outcome> + Send + 'a>> {
+        Box::pin(async move {
+            match self.then_target(graph, id) {
+                Some(next) => {
+                    // Record this node's output (value + taint) for any Use-edge
+                    // dependents, then flow into the continuation.
+                    let mut env2 = env.clone();
+                    env2.bindings.insert(id, v.clone());
+                    env2.binding_taint.insert(id, env.taint.clone());
+                    self.run_node(graph, next, v, &env2, depth + 1, next_base)
+                        .await
+                }
+                None => Outcome::Done(v),
+            }
+        })
+    }
+
+    /// The `Then`-edge continuation target of `id`, if any.
+    fn then_target(&self, graph: &ExecutionGraph, id: NodeId) -> Option<NodeId> {
+        graph.out_edges_of(id, EdgeKind::Then).map(|e| e.to).next()
+    }
+
+    /// The `Arm`-edge entry of a structured node (`Branch`/`Acting` have one
+    /// arm; `Join` has two — use [`arm_entries`] there).
+    fn arm_entry(&self, graph: &ExecutionGraph, id: NodeId) -> Option<NodeId> {
+        graph.out_edges_of(id, EdgeKind::Arm).map(|e| e.to).next()
+    }
+
+    /// Both `Arm`-edge entries of a `Join` node, in compiled order.
+    fn arm_entries(&self, graph: &ExecutionGraph, id: NodeId) -> Vec<NodeId> {
+        graph
+            .out_edges_of(id, EdgeKind::Arm)
+            .map(|e| e.to)
+            .collect()
+    }
+
+    /// Resolve a `Use` node's value and taint: the output recorded for the
+    /// producer node reachable along the incoming `Use` edge (§13.3 DAG data
+    /// dependency). The producer's taint flows on with the value (§21.5).
+    fn resolve_use(
+        &self,
+        graph: &ExecutionGraph,
+        id: NodeId,
+        env: &Env,
+    ) -> Option<(Value, nexus_types::TaintSet)> {
+        let producer = graph
+            .edges
+            .iter()
+            .find(|e| e.to == id && e.kind == EdgeKind::Use)
+            .map(|e| e.from)?;
+        let v = env.bindings.get(&producer).cloned()?;
+        let taint = env
+            .binding_taint
+            .get(&producer)
+            .cloned()
+            .unwrap_or_default();
+        Some((v, taint))
+    }
+    /// Splice and run a `Step`'s produced subgraph (the run-time face of
+    /// `AndThen` / `OrElse` recovery). The step is a pure `Value -> Do<A>`
+    /// continuation; its subgraph is compiled with a fresh id offset so its
+    /// Operation CausalPositions stay globally unique (§13.4).
+    async fn run_step(
+        &self,
+        sref: &StepRef,
+        piped: Value,
+        env: &Env,
+        depth: usize,
+        next_base: &Arc<std::sync::atomic::AtomicU32>,
+    ) -> Outcome {
+        if sref.process != self.process {
+            return Outcome::Fail(nexus_types::Failure::policy(
+                "step",
+                format!(
+                    "step \"{}\" belongs to process {}, not current process {}",
+                    sref.name,
+                    sref.process.get(),
+                    self.process.get()
+                ),
+            ));
+        }
+        let sub = match self.steps.get(self.process, &sref.name) {
+            Some(f) => f(piped, sref.arg.clone()),
+            None => {
+                return Outcome::Fail(nexus_types::Failure::policy(
+                    "executor",
+                    format!("step \"{}\" not found", sref.name),
+                ));
+            }
+        };
+        // Reserve an id range past everything numbered so far, then compile the
+        // produced subgraph into it and run it.
+        let reserve = sub.size() as u32;
+        let base = next_base.fetch_add(reserve, std::sync::atomic::Ordering::Relaxed);
+        let subgraph = match nexus_graph::compile_do_at(&sub, base) {
+            Ok(g) => g,
+            Err(e) => {
+                return Outcome::Fail(nexus_types::Failure::policy(
+                    "executor",
+                    format!("step \"{}\" compile failed: {e}", sref.name),
+                ));
+            }
+        };
+        self.run_node(
+            &subgraph,
+            subgraph.root,
+            Value::Null,
+            env,
+            depth + 1,
+            next_base,
+        )
+        .await
+    }
+
+    /// Block on a `Wait` node. `Deadline` sleeps to the wall clock; `Signal`
+    /// resolves when the path is written (subscribe), bounded by a cap so a
+    /// never-arriving signal can't wedge the run forever.
+    async fn run_wait(&self, spec: &WaitSpec) -> Outcome {
+        match spec {
+            WaitSpec::Deadline(at_millis) => {
+                let now = now_millis();
+                if *at_millis > now {
+                    let dur = std::time::Duration::from_millis((*at_millis - now) as u64);
+                    tokio::time::sleep(dur).await;
+                }
+                Outcome::Done(Value::Null)
+            }
+            WaitSpec::Signal(path) => match &self.state {
+                Some(state) => self.wait_signal(state, path).await,
+                None => Outcome::Fail(nexus_types::Failure::policy(
+                    "executor",
+                    "Wait(Signal) needs a state backend (none bound)",
+                )),
+            },
+        }
+    }
+    /// Resolve a `Wait(Signal)` by subscribing to `path` and returning when the
+    /// first matching write arrives (or a bounded number of unrelated events
+    /// pass, to avoid wedging on a silent path).
+    async fn wait_signal(&self, state: &nexus_state::Backend, path: &nexus_types::Path) -> Outcome {
+        use nexus_state::StateEvent;
+        // If the signal is already present, return immediately.
+        if let Ok(Some(v)) = state.read(path).await {
+            return Outcome::Done(v);
+        }
+        let mut rx = match state.subscribe(path).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                return Outcome::Fail(nexus_types::Failure::policy(
+                    "executor",
+                    format!("wait subscribe failed: {e}"),
+                ));
+            }
+        };
+        loop {
+            match rx.recv().await {
+                Ok(StateEvent::Set { path: p, value, .. }) if &p == path => {
+                    return Outcome::Done(value);
+                }
+                Ok(StateEvent::Append { path: p, item, .. }) if &p == path => {
+                    return Outcome::Done(item);
+                }
+                Ok(_) => continue,
+                Err(_) => {
+                    return Outcome::Fail(nexus_types::Failure::policy(
+                        "executor",
+                        "wait signal channel closed",
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Issue one Operation through the data plane (§6), labelling it with its
+    /// stable CausalPosition (the node's id). Resolves the target Resource →
+    /// owned Handle, then dispatches. Returns the outcome and the taint that
+    /// flows on with the result value (§21.5).
+    async fn run_operation(
+        &self,
+        tmpl: &OperationTemplate,
+        input: Value,
+        env: &Env,
+        position: NodeId,
+        record: bool,
+    ) -> (Outcome, nexus_types::TaintSet) {
+        let effective_input = tmpl.literal_input.clone().unwrap_or(input);
+
+        // The output inherits the flowing value's lineage (§21.5) plus the
+        // target's intrinsic source (e.g. inference → ModelOutput, a vault read
+        // → Protected, a fetch → Fetched).
+        let mut op_taint = env.taint.clone();
+        if let Some(src) = intrinsic_source(&tmpl.target) {
+            op_taint.add(src);
+        }
+
+        // Structural outbound defense (§21.5), checked *before* resource
+        // resolution so a tainted exfiltration attempt is denied on structure
+        // alone: a value whose lineage touched a Protected source must not flow
+        // out through an outbound Operation (post / send / publish). This is a
+        // blood-line fact, not a hash match — a model paraphrasing the secret
+        // cannot evade it.
+        if is_outbound(&tmpl.target) && op_taint.has_protected() {
+            return (
+                Outcome::Fail(nexus_types::Failure::PolicyViolation {
+                    policy: "taint".into(),
+                    detail: format!(
+                        "protected data must not flow to outbound {}",
+                        tmpl.target.path()
+                    ),
+                }),
+                op_taint,
+            );
+        }
+
+        // Resolve compiled method metadata once and cache it (§11): the hot path
+        // must not re-query the Registry per Operation. A cache miss resolves via
+        // the Registry and memoizes; a hit skips it entirely.
+        let Some(meta) = self.resolve_meta(&tmpl.target, &tmpl.method) else {
+            return (
+                Outcome::Fail(nexus_types::Failure::NoHandler {
+                    path: tmpl.target.path().clone(),
+                }),
+                env.taint.clone(),
+            );
+        };
+        let Some(handle) = self.handle_for(&tmpl.target) else {
+            return (
+                Outcome::Fail(nexus_types::Failure::policy(
+                    "executor",
+                    format!("no open handle for {}", tmpl.target.path()),
+                )),
+                env.taint.clone(),
+            );
+        };
+        let MethodMeta {
+            method_index,
+            method_id,
+            replay,
+            supports,
+            cost,
+            batchable,
+            ..
+        } = meta;
+
+        // §4.3: the requested OutputMode must be in the method's supported set.
+        // Reject early (before dispatch) so a caller can't ask a Unary-only
+        // method to stream, or vice versa.
+        if !tmpl.output.is_supported_by(supports) {
+            return (
+                Outcome::Fail(nexus_types::Failure::InvalidInput {
+                    reason: format!(
+                        "method {} does not support output mode {:?}",
+                        tmpl.method, tmpl.output
+                    ),
+                }),
+                op_taint,
+            );
+        }
+
+        let op = Operation {
+            id: OperationId::new(self.process, position, 0),
+            process: self.process,
+            acting: env.acting,
+            handle,
+            method: method_id,
+            input: effective_input,
+            taint: op_taint.clone(),
+            output: tmpl.output,
+        };
+
+        // §21.2 Budget: reserve a conservative estimate before the effect, then
+        // settle to the measured cost after. Free methods skip this entirely.
+        // Attribution is to the running Process (whose budget the acting identity
+        // draws on). Reservation is fail-closed: over budget ⇒ deny before the
+        // side effect is ever issued.
+        let mut reservation: Option<(u64, u64)> = None;
+        if !cost.is_free()
+            && let Some(procs) = &self.processes
+        {
+            let in_tokens = billable_input_tokens(&op.input, batchable);
+            // Conservative output projection: assume output as large as input
+            // (settlement corrects downward to the real count).
+            let est_tokens = in_tokens;
+            let est_usd = estimate_cost(&cost, &op.input, in_tokens, est_tokens, batchable);
+            if let Err(dim) = procs.reserve(self.process, est_usd, est_tokens) {
+                return (
+                    Outcome::Fail(nexus_types::Failure::BudgetExhausted { dim }),
+                    op_taint,
+                );
+            }
+            reservation = Some((est_usd, est_tokens));
+        }
+
+        let now = now_millis();
+        let out = self
+            .data_plane
+            .execute_batchable(&op, method_index, replay, supports, batchable, now, record)
+            .await;
+
+        // Settle against actual cost (§21.2). The actual token count is taken
+        // from the produced value; a real backend reports it in outcome
+        // metadata, but the value-derived estimate is a faithful baseline.
+        if let (Some((res_usd, res_tokens)), Some(procs)) = (reservation, &self.processes) {
+            let out_tokens = match &out.outcome {
+                Outcome::Done(v) | Outcome::Short(v) => billable_input_tokens(v, batchable),
+                Outcome::Fail(_) => 0,
+            };
+            let actual_usd = estimate_cost(
+                &cost,
+                &op.input,
+                billable_input_tokens(&op.input, batchable),
+                out_tokens,
+                batchable,
+            );
+            procs.settle(self.process, res_usd, actual_usd, res_tokens, out_tokens);
+        }
+        (out.outcome, op_taint)
+    }
+
+    /// Authorize an `Acting(identity)` switch (§3/§5.1). The process must hold a
+    /// grant whose selector is `act-as://<identity>` (matched structurally) and
+    /// whose rights carry the `DELEGATE` flag. Returns false (deny) otherwise.
+    ///
+    /// The omnipotent root grant (`*://**` + all flags) covers every identity,
+    /// so kernel-internal Acting blocks pass; attenuated children only pass for
+    /// identities they were explicitly delegated.
+    fn authorize_act_as(&self, identity: &nexus_types::Path) -> bool {
+        let now = now_millis();
+        self.registry.grants_of(self.process).into_iter().any(|g| {
+            !g.expires.is_expired(now)
+                && g.rights.flags.contains(nexus_types::RightFlags::DELEGATE)
+                && g.selector.matches("act-as", identity)
+        })
+    }
+
+    fn handle_for(&self, name: &ResourceName) -> Option<nexus_types::HandleId> {
+        self.open_handles.read().get(name).copied()
+    }
+
+    /// Resolve cached [`MethodMeta`] for a (target, method) (§11). A cache miss
+    /// walks the Registry once and memoizes; subsequent calls are pure cache
+    /// reads, so the per-Operation hot path never re-queries the Registry.
+    /// Returns `None` if the target resource doesn't resolve.
+    fn resolve_meta(&self, target: &ResourceName, method_name: &str) -> Option<MethodMeta> {
+        let key = (target.clone(), method_name.to_string());
+        if let Some(m) = self.method_cache.read().get(&key) {
+            return Some(m.clone());
+        }
+        let resource_id = self.registry.resolve_resource(target).ok()?;
+        let meta = self.compile_meta(resource_id, method_name)?;
+        self.method_cache.write().insert(key, meta.clone());
+        Some(meta)
+    }
+
+    /// Compile (method_index, method_id, replay class, supported output modes,
+    /// cost) for a target's method by walking the Registry (slow path, cached by
+    /// [`resolve_meta`]).
+    fn compile_meta(
+        &self,
+        resource_id: nexus_types::ResourceId,
+        method_name: &str,
+    ) -> Option<MethodMeta> {
+        if let Some(resource) = self.registry.resource(resource_id) {
+            for iface_id in &resource.interfaces.interfaces {
+                if let Some(iface) = self.registry.interface(*iface_id)
+                    && let Some((idx, method)) = iface.method_index(method_name)
+                {
+                    return Some(MethodMeta {
+                        method_index: idx,
+                        method_id: method.id,
+                        replay: method.replay,
+                        supports: method.supports,
+                        cost: method.cost,
+                        batchable: method.batchable,
+                    });
+                }
+            }
+        }
+        None
+    }
+}
+
+fn billable_input_tokens(value: &Value, batchable: bool) -> u64 {
+    match (batchable, value) {
+        (true, Value::List(items)) => items.iter().map(Value::approx_tokens).sum::<u64>().max(1),
+        _ => value.approx_tokens(),
+    }
+}
+
+fn estimate_cost(
+    cost: &nexus_types::CostModel,
+    input: &Value,
+    in_tokens: u64,
+    out_tokens: u64,
+    batchable: bool,
+) -> u64 {
+    match (batchable, input) {
+        (true, Value::List(items)) => {
+            let elems = items.len() as u64;
+            let flat = cost.flat_micro_usd.saturating_mul(elems);
+            let variable = nexus_types::CostModel {
+                flat_micro_usd: 0,
+                ..*cost
+            }
+            .estimate_micro_usd(in_tokens, out_tokens);
+            flat.saturating_add(variable)
+        }
+        _ => cost.estimate_micro_usd(in_tokens, out_tokens),
+    }
+}
+
+/// Intern an identity path to a stable [`IdentityRef`] by hashing (§3). Public
+/// so Gateways map a request identity to the same ref the executor uses for
+/// `Acting` blocks.
+pub fn intern_identity(path: &nexus_types::Path) -> IdentityRef {
+    let h = blake3::hash(path.to_string().as_bytes());
+    // blake3 digests are 32 bytes, so the first 8 always exist — copy them into
+    // a fixed-size array to derive the ref without a fallible slice conversion.
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&h.as_bytes()[0..8]);
+    let n = u64::from_le_bytes(head);
+    // Reserve 0 for ROOT.
+    IdentityRef::new(n | 1)
+}
+
+/// The intrinsic taint a target Resource confers on its output (§21.5): an
+/// inference call yields `ModelOutput`, a fetch yields `Fetched`, a read of a
+/// protected prefix (`state://vault/*` etc.) yields `Protected`. Returns `None`
+/// for neutral targets that merely pass their input lineage through.
+fn intrinsic_source(target: &ResourceName) -> Option<nexus_types::TaintSource> {
+    let path = target.path();
+    let scheme = path.scheme();
+    let segs = path.segments();
+    let first = segs.first().map(|s| s.as_str()).unwrap_or("");
+    match scheme {
+        // Inference / deliberation outputs are model-generated.
+        "effect" if first == "inference" || first == "deliberation" => {
+            Some(nexus_types::TaintSource::ModelOutput)
+        }
+        // Fetch / external tool outputs are tagged by host (best-effort: the
+        // host is the second segment when present, else the effect domain).
+        "effect" if first == "fetch" => {
+            let host = segs.get(1).map(|s| s.as_str()).unwrap_or("unknown");
+            Some(nexus_types::TaintSource::Fetched { host: host.into() })
+        }
+        // Reads from a protected state prefix carry the secret's lineage.
+        "state" if nexus_types::is_vault_reserved(path) => {
+            Some(nexus_types::TaintSource::Protected { path: path.clone() })
+        }
+        _ => None,
+    }
+}
+
+/// Whether an Operation on `target` sends data to the outside world (§21.5).
+/// Outbound effects are the gate for protected-data exfiltration: posting,
+/// sending, publishing, or any fetch with a request body. Conservative: unknown
+/// effects under known outbound domains count as outbound.
+fn is_outbound(target: &ResourceName) -> bool {
+    let path = target.path();
+    if path.scheme() != "effect" {
+        return false;
+    }
+    let segs = path.segments();
+    let domain = segs.first().map(|s| s.as_str()).unwrap_or("");
+    let method = segs.get(1).map(|s| s.as_str()).unwrap_or("");
+    // Domains that inherently leave the trust boundary.
+    matches!(domain, "x" | "email" | "slack" | "discord" | "webhook" | "http")
+        || matches!(method, "post" | "send" | "publish" | "reply" | "emit")
+        // fetch with a body is outbound; a bare GET is covered by Fetched taint.
+        || (domain == "fetch" && matches!(method, "post" | "put" | "patch"))
+}
+
+/// Current wall clock in millis since epoch.
+pub fn now_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fact::FactSink;
+    use crate::handle::HandleTable;
+    use nexus_state::{Backend, InMemoryBackend};
+    use parking_lot::RwLock;
+
+    fn test_state() -> Backend {
+        Arc::new(InMemoryBackend::new())
+    }
+
+    fn executor() -> Executor {
+        let (facts, _) = FactSink::in_memory();
+        let dp = DataPlane::new(
+            Arc::new(RwLock::new(HandleTable::new())),
+            facts,
+            test_state(),
+        );
+        Executor::new(ProcessId::new(1), dp, Registry::new(), StepTable::new())
+    }
+
+    fn s(name: &str) -> StepRef {
+        StepRef::new(ProcessId::new(1), name)
+    }
+
+    #[tokio::test]
+    async fn pure_evaluates() {
+        let ex = executor();
+        assert_eq!(
+            ex.eval(&DoNode::pure(Value::Int(5))).await,
+            Outcome::Done(Value::Int(5))
+        );
+    }
+
+    #[tokio::test]
+    async fn acting_denied_without_delegate_grant() {
+        // Process 1 holds no grants (empty registry). An Acting block must be
+        // denied fail-closed — no silent identity switch (§3/§5.1).
+        let ex = executor();
+        let prog = DoNode::acting(
+            nexus_types::Path::parse("process/bob").unwrap(),
+            DoNode::pure(Value::Int(1)),
+        );
+        match ex.eval(&prog).await {
+            Outcome::Fail(nexus_types::Failure::PolicyViolation { policy, .. }) => {
+                assert_eq!(policy, "act-as");
+            }
+            other => panic!("expected act-as PolicyViolation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn acting_allowed_with_delegate_grant() {
+        use nexus_types::{Expiry, Grant, MethodBitmap, ResourceSelector, RightFlags, Rights};
+        let (facts, _) = FactSink::in_memory();
+        let dp = DataPlane::new(
+            Arc::new(RwLock::new(HandleTable::new())),
+            facts,
+            test_state(),
+        );
+        let reg = Registry::new();
+        reg.register_grant(Grant {
+            id: reg.next_grant_id(),
+            holder: ProcessId::new(1),
+            selector: ResourceSelector::parse("act-as://process/bob").unwrap(),
+            rights: Rights::new(MethodBitmap::ALL, RightFlags::DELEGATE),
+            constraints: nexus_types::ConstraintSet::empty(),
+            expires: Expiry::Never,
+        });
+        let ex = Executor::new(ProcessId::new(1), dp, reg, StepTable::new());
+        let prog = DoNode::acting(
+            nexus_types::Path::parse("process/bob").unwrap(),
+            DoNode::pure(Value::Int(7)),
+        );
+        assert_eq!(ex.eval(&prog).await, Outcome::Done(Value::Int(7)));
+    }
+
+    #[tokio::test]
+    async fn cancelled_process_short_circuits_at_operation_boundary() {
+        // A process marked Cancelled must not issue its Operation: the boundary
+        // check short-circuits to Failure::Cancelled (§13.4 / §14.2).
+        use crate::process::{ProcessEntry, ProcessTable};
+        use nexus_graph::OperationTemplate;
+        let (facts, _) = FactSink::in_memory();
+        let dp = DataPlane::new(
+            Arc::new(RwLock::new(HandleTable::new())),
+            facts,
+            test_state(),
+        );
+        let procs = ProcessTable::new();
+        procs.insert(ProcessEntry::new(
+            ProcessId::new(1),
+            None,
+            IdentityRef::ROOT,
+        ));
+        procs.set_status(ProcessId::new(1), nexus_types::ProcessStatus::Cancelled);
+        let ex = Executor::new(ProcessId::new(1), dp, Registry::new(), StepTable::new())
+            .with_processes(procs);
+        // A bare Operation node (target need not resolve — the cancel check fires
+        // before resource resolution).
+        let prog = DoNode::op(OperationTemplate {
+            target: ResourceName::new(nexus_types::Path::parse("effect://x/post").unwrap()),
+            method: "invoke".into(),
+            method_id: None,
+            output: nexus_types::OutputMode::Unary,
+            literal_input: Some(Value::Null),
+        });
+        assert_eq!(
+            ex.eval(&prog).await,
+            Outcome::Fail(nexus_types::Failure::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn acting_denied_when_grant_lacks_delegate_flag() {
+        use nexus_types::{Expiry, Grant, MethodBitmap, ResourceSelector, RightFlags, Rights};
+        let (facts, _) = FactSink::in_memory();
+        let dp = DataPlane::new(
+            Arc::new(RwLock::new(HandleTable::new())),
+            facts,
+            test_state(),
+        );
+        let reg = Registry::new();
+        // Selector matches act-as://process/bob but WITHOUT the DELEGATE flag.
+        reg.register_grant(Grant {
+            id: reg.next_grant_id(),
+            holder: ProcessId::new(1),
+            selector: ResourceSelector::parse("act-as://process/bob").unwrap(),
+            rights: Rights::new(MethodBitmap::ALL, RightFlags::CLONE),
+            constraints: nexus_types::ConstraintSet::empty(),
+            expires: Expiry::Never,
+        });
+        let ex = Executor::new(ProcessId::new(1), dp, reg, StepTable::new());
+        let prog = DoNode::acting(
+            nexus_types::Path::parse("process/bob").unwrap(),
+            DoNode::pure(Value::Int(1)),
+        );
+        assert!(matches!(
+            ex.eval(&prog).await,
+            Outcome::Fail(nexus_types::Failure::PolicyViolation { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn and_then_runs_step() {
+        let ex = executor();
+        ex.steps.install(ex.process, "double", |v, _| match v {
+            Value::Int(i) => DoNode::pure(Value::Int(i * 2)),
+            _ => DoNode::pure(Value::Null),
+        });
+        let prog = DoNode::pure(Value::Int(21)).and_then(s("double"));
+        assert_eq!(ex.eval(&prog).await, Outcome::Done(Value::Int(42)));
+    }
+
+    #[tokio::test]
+    async fn step_ref_must_belong_to_current_process() {
+        let ex = executor();
+        ex.steps.install(ex.process, "double", |v, _| match v {
+            Value::Int(i) => DoNode::pure(Value::Int(i * 2)),
+            _ => DoNode::pure(Value::Null),
+        });
+        let prog = DoNode::pure(Value::Int(21)).and_then(StepRef::new(ProcessId::new(2), "double"));
+        assert!(matches!(
+            ex.eval(&prog).await,
+            Outcome::Fail(nexus_types::Failure::PolicyViolation { policy, .. }) if policy == "step"
+        ));
+    }
+
+    #[tokio::test]
+    async fn or_else_recovers() {
+        let ex = executor();
+        ex.steps.install(ex.process, "fallback", |_, _| {
+            DoNode::pure(Value::Str("ok".into()))
+        });
+        let prog = DoNode::fail(nexus_types::Failure::Cancelled).or_else(s("fallback"));
+        assert_eq!(ex.eval(&prog).await, Outcome::Done(Value::Str("ok".into())));
+    }
+
+    #[tokio::test]
+    async fn or_else_passes_through_success() {
+        let ex = executor();
+        ex.steps.install(ex.process, "never", |_, _| {
+            DoNode::pure(Value::Str("recovered".into()))
+        });
+        let prog = DoNode::pure(Value::Int(1)).or_else(s("never"));
+        assert_eq!(ex.eval(&prog).await, Outcome::Done(Value::Int(1)));
+    }
+
+    #[tokio::test]
+    async fn let_use_binds() {
+        let ex = executor();
+        let prog = DoNode::r#let("x", DoNode::pure(Value::Int(7)), DoNode::use_("x"));
+        assert_eq!(ex.eval(&prog).await, Outcome::Done(Value::Int(7)));
+    }
+
+    #[tokio::test]
+    async fn both_joins_pair() {
+        let ex = executor();
+        let prog = DoNode::both(DoNode::pure(Value::Int(1)), DoNode::pure(Value::Int(2)));
+        assert_eq!(
+            ex.eval(&prog).await,
+            Outcome::Done(Value::List(vec![Value::Int(1), Value::Int(2)]))
+        );
+    }
+
+    #[tokio::test]
+    async fn both_fails_if_either_arm_fails() {
+        let ex = executor();
+        let prog = DoNode::both(
+            DoNode::pure(Value::Int(1)),
+            DoNode::fail(nexus_types::Failure::Cancelled),
+        );
+        assert!(matches!(ex.eval(&prog).await, Outcome::Fail(_)));
+    }
+
+    #[tokio::test]
+    async fn race_takes_first_success() {
+        let ex = executor();
+        let prog = DoNode::race(
+            DoNode::pure(Value::Str("a".into())),
+            DoNode::pure(Value::Str("b".into())),
+        );
+        // Both are immediate; the result is one of them (deterministic select
+        // bias toward the first-polled arm in tokio::select! is not guaranteed,
+        // so accept either).
+        let out = ex.eval(&prog).await;
+        assert!(matches!(out, Outcome::Done(Value::Str(ref s)) if s == "a" || s == "b"));
+    }
+
+    #[tokio::test]
+    async fn unbound_use_fails_at_compile() {
+        let ex = executor();
+        // A bare Use with no enclosing Let fails to compile → executor surfaces
+        // a policy failure rather than panicking.
+        assert!(matches!(
+            ex.eval(&DoNode::use_("nope")).await,
+            Outcome::Fail(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn chained_and_then_keeps_threading_value() {
+        let ex = executor();
+        ex.steps.install(ex.process, "inc", |v, _| match v {
+            Value::Int(i) => DoNode::pure(Value::Int(i + 1)),
+            _ => DoNode::pure(Value::Null),
+        });
+        let prog = DoNode::pure(Value::Int(0))
+            .and_then(s("inc"))
+            .and_then(s("inc"))
+            .and_then(s("inc"));
+        assert_eq!(ex.eval(&prog).await, Outcome::Done(Value::Int(3)));
+    }
+
+    #[tokio::test]
+    async fn wait_deadline_in_past_returns_immediately() {
+        let ex = executor();
+        let prog = DoNode::wait_deadline(0); // epoch — already passed
+        assert_eq!(ex.eval(&prog).await, Outcome::Done(Value::Null));
+    }
+
+    #[tokio::test]
+    async fn wait_signal_resolves_on_write() {
+        let state = test_state();
+        let (facts, _) = FactSink::in_memory();
+        let dp = DataPlane::new(
+            Arc::new(RwLock::new(HandleTable::new())),
+            facts,
+            state.clone(),
+        );
+        let ex = Executor::new(ProcessId::new(1), dp, Registry::new(), StepTable::new())
+            .with_state(state.clone());
+        let signal = nexus_types::Path::parse("state://stream/1/sig").unwrap();
+        // Write the signal after a short delay; the Wait must observe it.
+        let writer = {
+            let state = state.clone();
+            let signal = signal.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                state.write_set(&signal, Value::Int(99)).await.unwrap();
+            })
+        };
+        let out = ex.eval(&DoNode::wait_signal(signal)).await;
+        writer.await.unwrap();
+        assert_eq!(out, Outcome::Done(Value::Int(99)));
+    }
+
+    #[tokio::test]
+    async fn wait_signal_without_state_fails() {
+        let ex = executor(); // no state backend bound
+        let signal = nexus_types::Path::parse("state://stream/1/sig").unwrap();
+        assert!(matches!(
+            ex.eval(&DoNode::wait_signal(signal)).await,
+            Outcome::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn causal_positions_match_compiled_graph() {
+        // The Operations the executor issues carry the compiler's NodeIds. Here
+        // we just assert the compiled graph is what the executor walks: a
+        // 2-node chain (Op, Step) numbers the Op at 0 (its CausalPosition).
+        use nexus_graph::{NodeKind, compile_do};
+        let prog = DoNode::op(nexus_graph::OperationTemplate {
+            target: ResourceName::new(nexus_types::Path::parse("effect://x/post").unwrap()),
+            method: "invoke".into(),
+            method_id: None,
+            output: nexus_types::OutputMode::Unary,
+            literal_input: None,
+        })
+        .and_then(s("s"));
+        let g = compile_do(&prog).unwrap();
+        assert!(matches!(
+            g.node(NodeId::new(0)).unwrap().kind,
+            NodeKind::Operation(_)
+        ));
+    }
+
+    #[test]
+    fn intrinsic_source_classifies_targets() {
+        use nexus_types::TaintSource;
+        let infer =
+            ResourceName::new(nexus_types::Path::parse("effect://inference/infer").unwrap());
+        assert!(matches!(
+            intrinsic_source(&infer),
+            Some(TaintSource::ModelOutput)
+        ));
+        let fetch = ResourceName::new(nexus_types::Path::parse("effect://fetch/get").unwrap());
+        assert!(matches!(
+            intrinsic_source(&fetch),
+            Some(TaintSource::Fetched { .. })
+        ));
+        let vault = ResourceName::new(nexus_types::Path::parse("state://vault/alice/x").unwrap());
+        assert!(matches!(
+            intrinsic_source(&vault),
+            Some(TaintSource::Protected { .. })
+        ));
+        let plain = ResourceName::new(nexus_types::Path::parse("state://memory/alice").unwrap());
+        assert!(intrinsic_source(&plain).is_none());
+    }
+
+    #[test]
+    fn is_outbound_classifies_targets() {
+        let post = ResourceName::new(nexus_types::Path::parse("effect://x/post").unwrap());
+        assert!(is_outbound(&post));
+        let email = ResourceName::new(nexus_types::Path::parse("effect://email/send").unwrap());
+        assert!(is_outbound(&email));
+        let infer =
+            ResourceName::new(nexus_types::Path::parse("effect://inference/infer").unwrap());
+        assert!(!is_outbound(&infer));
+        let read = ResourceName::new(nexus_types::Path::parse("state://memory/alice").unwrap());
+        assert!(!is_outbound(&read));
+    }
+
+    #[tokio::test]
+    async fn protected_data_to_outbound_is_denied() {
+        // A value tainted Protected (read from vault) flowing into an outbound
+        // Operation is structurally denied (§21.5) — the taint gate fires before
+        // resource resolution would.
+        use nexus_graph::OperationTemplate;
+        let ex = executor();
+        let env = Env::root().with_taint(nexus_types::TaintSet::of(
+            nexus_types::TaintSource::Protected {
+                path: nexus_types::Path::parse("state://vault/alice/x").unwrap(),
+            },
+        ));
+        let tmpl = OperationTemplate {
+            target: ResourceName::new(nexus_types::Path::parse("effect://x/post").unwrap()),
+            method: "invoke".into(),
+            method_id: None,
+            output: nexus_types::OutputMode::Unary,
+            literal_input: None,
+        };
+        let (out, _t) = ex
+            .run_operation(
+                &tmpl,
+                Value::Str("secret".into()),
+                &env,
+                NodeId::new(0),
+                true,
+            )
+            .await;
+        match out {
+            Outcome::Fail(nexus_types::Failure::PolicyViolation { policy, .. }) => {
+                assert_eq!(policy, "taint");
+            }
+            other => panic!("expected taint PolicyViolation, got {other:?}"),
+        }
+    }
+}

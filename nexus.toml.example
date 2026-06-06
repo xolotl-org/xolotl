@@ -1,0 +1,24 @@
+# Nexus Configuration (Bootstrap Only)
+# Copy to `nexus.toml` in your working directory, or set NEXUS_CONFIG=/path/to/config.toml
+#
+# This file only configures the storage backend and server addresses.
+# Runtime config (backends, models, groups, routing, bindings) lives in state
+# and is managed via Console API; gRPC clients submit structured Program frames
+# through GatewayService. Only [storage] and [server] plus optional
+# [console.root] bootstrap credentials are read from this file.
+
+[storage]
+kind = "redb"           # "redb" (persistent) or "memory" (non-persistent)
+path = "nexus.db"       # single redb file for state + FactStore tables
+
+[server]
+console_addr = "127.0.0.1:9000"
+grpc_addr = "127.0.0.1:9100"
+ws_addr = "127.0.0.1:9200"
+
+# Optional deployment automation:
+# If omitted and state://kernel/console/users/* is empty, nexusd creates root
+# with a random one-time password printed to stderr.
+[console.root]
+# password_hash = "$argon2id$v=19$m=65536,t=3,p=2$..."
+# pubkeys = ["ed25519:..."]
