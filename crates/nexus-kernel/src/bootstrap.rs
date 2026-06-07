@@ -39,6 +39,7 @@ pub struct GatewayAudit<'a> {
     pub source_addr: Option<&'a str>,
     pub outcome: &'a str,
     pub mfa_level: Option<u8>,
+    pub details: Option<nexus_types::Value>,
 }
 
 /// Assembly-time method descriptor. Output support is explicit (§4.3): no
@@ -444,6 +445,9 @@ impl Bootstrap {
                 "mfa_level".into(),
                 nexus_types::Value::Int(i64::from(mfa_level)),
             );
+        }
+        if let Some(details) = audit.details {
+            outcome.insert("details".into(), details);
         }
 
         self.kernel.facts.complete(Fact {

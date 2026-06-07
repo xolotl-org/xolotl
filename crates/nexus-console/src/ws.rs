@@ -1,14 +1,35 @@
-//! Console WebSocket management RPC (§24.3).
+//! Console WebSocket protocol endpoint (§24.3).
 //!
-//! This is the post-login management path. Frames are fixed bincode DTOs and
-//! actions dispatch through the kernel/auth management surfaces, not through a
-//! raw `{target, method, input}` shell.
+//! This is the post-login control path. Frames carry descriptor-named protocol
+//! actions (`ActionCall`) and streams (`StreamCall`). Dispatch goes through
+//! kernel/auth management surfaces and ordinary Operation/Fact paths, not
+//! through a raw `{target, method, input}` shell.
 
 use crate::auth::{self, ConsolePrincipal, SessionSummary};
 use crate::mgmt::{self, MgmtError};
+use crate::protocol::{
+    self, ACTION_ACCESS_ROLE_LIST, ACTION_ACCESS_ROLE_READ, ACTION_ACCESS_ROLE_WRITE_CAS,
+    ACTION_ACCESS_SESSION_CURRENT_LOGOUT, ACTION_ACCESS_SESSION_LIST, ACTION_ACCESS_SESSION_REVOKE,
+    ACTION_ACCESS_SESSION_REVOKE_USER, ACTION_ACCESS_USER_DISABLE, ACTION_ACCESS_USER_LIST,
+    ACTION_ACCESS_USER_READ, ACTION_ACCESS_USER_WRITE_CAS, ACTION_AUDIT_FACTS_RECENT,
+    ACTION_AUTHORITY_ACTION_MATRIX, ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE,
+    ACTION_AUTHORITY_RESOURCE_ACCESS, ACTION_AUTHORITY_WHY_DENIED, ACTION_CONFIG_LIST,
+    ACTION_CONFIG_READ, ACTION_CONFIG_WRITE_CAS, ACTION_EXTENSIONS_INSTALLATION_INSTALL,
+    ACTION_EXTENSIONS_INSTALLATION_REVOKE, ACTION_EXTENSIONS_INSTALLATION_START,
+    ACTION_EXTENSIONS_INSTALLATION_STOP, ACTION_EXTENSIONS_INSTALLATION_UPDATE,
+    ACTION_HEALTH_SUMMARY, ACTION_LINEAGE_FACT_BY_OPERATION, ACTION_LINEAGE_FACT_READ,
+    ACTION_LINEAGE_TRACE_READ, ACTION_PAIRING_APPROVE, ACTION_PAIRING_CREATE, ACTION_PAIRING_DENY,
+    ACTION_PAIRING_REPLACE, ACTION_PROTOCOL_DESCRIBE, ACTION_PROTOCOL_REGISTRY_SNAPSHOT,
+    ACTION_PROTOCOL_SCHEMA_GET, ACTION_REGISTRY_COVERAGE_REPORT, ACTION_RUNTIME_PROCESS_INSPECT,
+    ACTION_SECRET_CATALOG, ACTION_SECRET_REVEAL, ACTION_STATE_SNAPSHOT,
+    ACTION_VISIBILITY_AUTHORITY_DESCRIBE, ACTION_VISIBILITY_STATE_LIST,
+    ACTION_VISIBILITY_STATE_READ, ActionCall, ActionDescriptor, ActionResult, ClientFrame,
+    ConsoleErrorCode, ConsoleEvent, JsonBytes, PrincipalSummary, RequiredAuthority,
+    STREAM_AUDIT_FACTS, STREAM_STATE_WATCH, ServerFrame, StreamCall,
+};
 use crate::state::{
     ConsoleState, ConsoleWsLimit, HARD_MAX_WS_FACT_LIMIT, HARD_MAX_WS_FRAME_BYTES,
-    HARD_MAX_WS_SUBSCRIPTIONS, HARD_MAX_WS_TRACE_LIMIT,
+    HARD_MAX_WS_STATE_LIST_LIMIT, HARD_MAX_WS_SUBSCRIPTIONS, HARD_MAX_WS_TRACE_LIMIT,
 };
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
@@ -18,19 +39,17 @@ use futures::{SinkExt, StreamExt};
 use nexus_graph::{DoNode, OperationTemplate};
 use nexus_state::StateEvent;
 use nexus_types::{
-    ExtensionInstallationDef, IdentityRef, Outcome, OutputMode, Path, ProcSpec, ResourceName,
-    RestartPolicy, TaintSet, Transport, Value,
+    Capability, ExtensionInstallationDef, IdentityRef, NodeId, OperationId, Outcome, OutputMode,
+    Path, ProcSpec, ProcessId, ResourceName, RestartPolicy, TaintSet, Transport, Value,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard()
-    .with_little_endian()
-    .with_variable_int_encoding();
+const MAX_VISIBILITY_TTL_MS: u64 = 10 * 60 * 1000;
 
 pub async fn upgrade(
     ws: WebSocketUpgrade,
@@ -53,13 +72,6 @@ pub async fn upgrade(
         .on_upgrade(move |socket| session(socket, st, source_addr))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PrincipalSummary {
-    pub username: String,
-    pub identity_path: String,
-    pub mfa_level: u8,
-}
-
 impl From<&ConsolePrincipal> for PrincipalSummary {
     fn from(p: &ConsolePrincipal) -> Self {
         Self {
@@ -68,203 +80,6 @@ impl From<&ConsolePrincipal> for PrincipalSummary {
             mfa_level: p.mfa_level,
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ClientFrame {
-    Auth { token: String },
-    Rpc { id: u64, action: ConsoleAction },
-    Subscribe { id: u64, stream: ConsoleStream },
-    Unsubscribe { id: u64 },
-    Ping { nonce: u64 },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ConsoleAction {
-    Snapshot {
-        sections: Vec<SnapshotSection>,
-        since_rev: Option<u64>,
-    },
-    ConfigRead {
-        path: String,
-    },
-    ConfigList {
-        prefix: String,
-    },
-    ConfigWriteCas {
-        path: String,
-        value: Value,
-        expected_version: Option<u64>,
-    },
-    UserRead {
-        username: String,
-    },
-    UserList,
-    UserWriteCas {
-        username: String,
-        value: Value,
-        expected_version: Option<u64>,
-    },
-    UserDisable {
-        username: String,
-        expected_version: Option<u64>,
-    },
-    RoleRead {
-        role: String,
-    },
-    RoleList,
-    RoleWriteCas {
-        role: String,
-        value: Value,
-        expected_version: Option<u64>,
-    },
-    CurrentSessionLogout,
-    SessionList,
-    SessionRevoke {
-        sid: String,
-    },
-    SessionRevokeUser {
-        username: String,
-    },
-    ProcessInspect {
-        process: Option<u64>,
-        include_recent_facts: bool,
-        limit: usize,
-    },
-    RecentFacts {
-        process: Option<u64>,
-        limit: usize,
-    },
-    TraceRead {
-        process: u64,
-        from: usize,
-        limit: usize,
-    },
-    ExtensionInstallationInstall {
-        id: String,
-        def: Value,
-        expected_version: Option<u64>,
-    },
-    ExtensionInstallationUpdate {
-        id: String,
-        def: Value,
-        expected_version: Option<u64>,
-    },
-    ExtensionInstallationStart {
-        id: String,
-    },
-    ExtensionInstallationStop {
-        id: String,
-    },
-    ExtensionInstallationRevoke {
-        installation_id: String,
-        credential_generation_floor: Option<i64>,
-    },
-    PairingCreate {
-        input: Value,
-        reveal_display_secret: bool,
-    },
-    PairingApprove {
-        pairing_id: String,
-        approved_roles: Vec<String>,
-    },
-    PairingDeny {
-        pairing_id: String,
-    },
-    PairingReplace {
-        input: Value,
-        reveal_display_secret: bool,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-pub enum SnapshotSection {
-    KernelConfig { prefix: String },
-    Sessions,
-    Runtime { limit: usize },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ConsoleStream {
-    Config { pattern: String },
-    Runtime { pattern: String },
-    Audit { process: Option<u64> },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ServerFrame {
-    Authenticated {
-        principal: PrincipalSummary,
-        server_rev: u64,
-    },
-    Reply {
-        id: u64,
-        result: ConsoleResult,
-    },
-    Event {
-        stream: u64,
-        event: ConsoleEvent,
-    },
-    Pong {
-        nonce: u64,
-    },
-    Error {
-        id: Option<u64>,
-        code: ConsoleErrorCode,
-        message: String,
-    },
-}
-
-/// JSON-encoded [`Value`] string. `Value`'s `#[serde(untagged)]` is
-/// incompatible with bincode's serde layer; we pre-serialize to JSON text.
-/// Uses `String` because `String` is unambiguous in bincode serde.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct JsonBytes(pub String);
-
-impl Eq for JsonBytes {}
-
-impl JsonBytes {
-    pub fn from_value(v: &Value) -> Self {
-        Self(serde_json::to_string(v).unwrap_or_default())
-    }
-    pub fn to_value(&self) -> Value {
-        serde_json::from_str(&self.0).unwrap_or(Value::Null)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum ConsoleResult {
-    Empty,
-    Value(Option<JsonBytes>),
-    Entries(Vec<(String, JsonBytes)>),
-    Snapshot(BTreeMap<String, JsonBytes>),
-    Sessions(Vec<SessionSummary>),
-    Revoked { count: usize },
-}
-
-impl Eq for ConsoleResult {}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum ConsoleEvent {
-    StateSet { path: String, value: JsonBytes },
-    StateAppend { path: String, item: JsonBytes },
-    StateDelete { path: String },
-    Audit { fact: JsonBytes },
-    SubscriptionClosed { reason: String },
-}
-
-impl Eq for ConsoleEvent {}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ConsoleErrorCode {
-    BadFrame,
-    NotAuthenticated,
-    Unauthorized,
-    Forbidden,
-    Conflict,
-    BadRequest,
-    RateLimited,
-    Internal,
 }
 
 struct WsSession {
@@ -434,7 +249,7 @@ async fn receive_client_message(sess: &mut WsSession, msg: Message) -> Option<Se
             return Some(ServerFrame::Error {
                 id: None,
                 code: ConsoleErrorCode::BadFrame,
-                message: "console websocket only accepts binary bincode frames".into(),
+                message: "console websocket only accepts binary MessagePack frames".into(),
             });
         }
     };
@@ -463,7 +278,7 @@ fn should_close_after_reply(sess: &WsSession, reply: &ServerFrame) -> bool {
             || matches!(
                 reply,
                 ServerFrame::Reply {
-                    result: ConsoleResult::Empty,
+                    result: ActionResult { output: None, .. },
                     ..
                 } | ServerFrame::Error {
                     code: ConsoleErrorCode::Unauthorized | ConsoleErrorCode::Forbidden,
@@ -474,6 +289,36 @@ fn should_close_after_reply(sess: &WsSession, reply: &ServerFrame) -> bool {
 
 async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
     match frame {
+        ClientFrame::Hello { hello } => {
+            if hello.protocol_version != protocol::PROTOCOL_VERSION {
+                return ServerFrame::Error {
+                    id: None,
+                    code: ConsoleErrorCode::BadRequest,
+                    message: format!(
+                        "unsupported console protocol version {}; expected {}",
+                        hello.protocol_version,
+                        protocol::PROTOCOL_VERSION
+                    ),
+                };
+            }
+            if !hello
+                .accepted_encodings
+                .iter()
+                .any(|encoding| encoding == protocol::WIRE_ENCODING)
+            {
+                return ServerFrame::Error {
+                    id: None,
+                    code: ConsoleErrorCode::BadRequest,
+                    message: format!(
+                        "unsupported console wire encoding; expected {}",
+                        protocol::WIRE_ENCODING
+                    ),
+                };
+            }
+            ServerFrame::HelloAccepted {
+                metadata: protocol_metadata(sess),
+            }
+        }
         ClientFrame::Auth { token } => match sess
             .state
             .auth
@@ -511,7 +356,7 @@ async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
                 sess.sid = Some(sid);
                 ServerFrame::Authenticated {
                     principal: summary,
-                    server_rev: sess.state.boot.kernel.facts.cursor(),
+                    metadata: protocol_metadata(sess),
                 }
             }
             Err(e) => {
@@ -520,12 +365,12 @@ async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
             }
         },
         ClientFrame::Ping { nonce } => ServerFrame::Pong { nonce },
-        ClientFrame::Rpc { id, action } => {
+        ClientFrame::Call { id, call } => {
             let principal = match authenticated_principal(sess, Some(id)).await {
                 Ok(p) => p,
                 Err(frame) => return frame,
             };
-            match dispatch_action(sess, &principal, action).await {
+            match dispatch_call(sess, &principal, call).await {
                 Ok(result) => ServerFrame::Reply { id, result },
                 Err(e) => {
                     record_console_error_audit(
@@ -546,7 +391,7 @@ async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
             match subscribe(sess, &principal, id, stream).await {
                 Ok(()) => ServerFrame::Reply {
                     id,
-                    result: ConsoleResult::Empty,
+                    result: ActionResult::empty(server_rev(sess)),
                 },
                 Err(e) => {
                     record_console_error_audit(
@@ -560,12 +405,15 @@ async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
             }
         }
         ClientFrame::Unsubscribe { id } => {
+            if let Err(frame) = authenticated_principal(sess, Some(id)).await {
+                return frame;
+            }
             if let Some(handle) = sess.subscriptions.remove(&id) {
                 let _ = handle.shutdown.send(());
             }
             ServerFrame::Reply {
                 id,
-                result: ConsoleResult::Empty,
+                result: ActionResult::empty(server_rev(sess)),
             }
         }
     }
@@ -604,65 +452,111 @@ async fn authenticated_principal(
     }
 }
 
-async fn dispatch_action(
+async fn dispatch_call(
     sess: &mut WsSession,
     principal: &ConsolePrincipal,
-    action: ConsoleAction,
-) -> Result<ConsoleResult, ConsoleError> {
-    match action {
-        ConsoleAction::Snapshot {
-            sections,
-            since_rev,
-        } => {
-            let mut out = BTreeMap::new();
-            out.insert(
-                "server_rev".into(),
-                Value::Int(sess.state.boot.kernel.facts.cursor() as i64),
+    call: ActionCall,
+) -> Result<ActionResult, ConsoleError> {
+    let action = call.action.clone();
+    let out = match action.as_str() {
+        ACTION_PROTOCOL_DESCRIBE | ACTION_PROTOCOL_REGISTRY_SNAPSHOT => {
+            protocol::protocol_metadata_value(server_rev(sess), registry_rev(sess))
+        }
+        ACTION_PROTOCOL_SCHEMA_GET => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let action_id = string_arg(&mut input, "action")?;
+            protocol::descriptor_value(&action_id).ok_or_else(|| {
+                ConsoleError::BadRequest(format!("unknown action descriptor: {action_id}"))
+            })?
+        }
+        ACTION_REGISTRY_COVERAGE_REPORT => {
+            protocol::coverage_report_value(server_rev(sess), registry_rev(sess))
+        }
+        ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE => authority_principal_effective(principal),
+        ACTION_AUTHORITY_ACTION_MATRIX => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let domain = optional_string_arg(&mut input, "domain")?;
+            authority_action_matrix(principal, domain.as_deref())
+        }
+        ACTION_AUTHORITY_RESOURCE_ACCESS => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let target = string_arg(&mut input, "target")?;
+            let verb = string_arg(&mut input, "verb")?;
+            authority_resource_access(sess, principal, &target, &verb).await?
+        }
+        ACTION_AUTHORITY_WHY_DENIED => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let action_id = string_arg(&mut input, "action")?;
+            authority_why_denied(principal, &action_id)?
+        }
+        ACTION_VISIBILITY_AUTHORITY_DESCRIBE => protocol::visibility_authority_value(),
+        ACTION_SECRET_CATALOG => protocol::secret_catalog_value(),
+        ACTION_SECRET_REVEAL => {
+            require_visibility_access(principal, &call)?;
+            return Err(ConsoleError::BadRequest(
+                "no revealable secret custody backend is registered; non-recoverable and one-time secrets must be reset, rotated, or recreated".into(),
+            ));
+        }
+        ACTION_VISIBILITY_STATE_READ => {
+            require_visibility_access(principal, &call)?;
+            let mut input = input_map(input_value(&call.input)?)?;
+            let path = string_arg(&mut input, "path")?;
+            let out = visibility_state_read(sess, principal, &path).await?;
+            record_visibility_audit(
+                &sess.state,
+                principal,
+                Some(&sess.source_addr),
+                "state_read",
+                call.scope.as_deref(),
+                call.justification.as_deref(),
+                call.ttl_ms,
+                Some(&path),
             );
-            if let Some(since_rev) = since_rev {
-                out.insert("since_rev".into(), Value::Int(since_rev as i64));
-            }
-            for section in sections {
-                match section {
-                    SnapshotSection::KernelConfig { prefix } => {
-                        let entries = mgmt::inspect_prefix(&sess.state, principal, &prefix).await?;
-                        out.insert(prefix, entries_value(entries));
-                    }
-                    SnapshotSection::Sessions => {
-                        let sessions = sess
-                            .state
-                            .auth
-                            .list_sessions(&sess.state.boot, principal)
-                            .await?;
-                        out.insert("sessions".into(), sessions_value(&sessions));
-                    }
-                    SnapshotSection::Runtime { limit } => {
-                        let runtime =
-                            process_inspect(sess, principal, None, true, limit.min(64)).await?;
-                        out.insert("runtime".into(), runtime);
-                    }
-                }
-            }
-            Ok(ConsoleResult::Snapshot(jb_snapshot(out)))
+            out
         }
-        ConsoleAction::ConfigRead { path } => {
+        ACTION_VISIBILITY_STATE_LIST => {
+            require_visibility_access(principal, &call)?;
+            let mut input = input_map(input_value(&call.input)?)?;
+            let prefix = string_arg(&mut input, "prefix")?;
+            let limit = optional_usize_arg(&mut input, "limit")?.unwrap_or(256);
+            let out = visibility_state_list(sess, principal, &prefix, limit).await?;
+            record_visibility_audit(
+                &sess.state,
+                principal,
+                Some(&sess.source_addr),
+                "state_list",
+                call.scope.as_deref(),
+                call.justification.as_deref(),
+                call.ttl_ms,
+                Some(&prefix),
+            );
+            out
+        }
+        ACTION_STATE_SNAPSHOT => snapshot(sess, principal, &call).await?,
+        ACTION_CONFIG_READ => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let path = string_arg(&mut input, "path")?;
             let value = mgmt::inspect(&sess.state, principal, &path).await?;
-            Ok(ConsoleResult::Value(jbv(value)))
+            value.unwrap_or(Value::Null)
         }
-        ConsoleAction::ConfigList { prefix } => {
+        ACTION_CONFIG_LIST => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let prefix = string_arg(&mut input, "prefix")?;
             let entries = mgmt::inspect_prefix(&sess.state, principal, &prefix).await?;
-            Ok(ConsoleResult::Entries(jb_entries(entries)))
+            entries_value(entries)
         }
-        ConsoleAction::ConfigWriteCas {
-            path,
-            value,
-            expected_version,
-        } => {
+        ACTION_CONFIG_WRITE_CAS => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let path = string_arg(&mut input, "path")?;
+            let value = value_arg(&mut input, "value")?;
+            let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_config_write_safety(principal, &path)?;
             mgmt::write_config(&sess.state, principal, &path, value, expected_version).await?;
-            Ok(ConsoleResult::Empty)
+            return Ok(ActionResult::empty(server_rev(sess)));
         }
-        ConsoleAction::UserRead { username } => {
+        ACTION_ACCESS_USER_READ => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let username = string_arg(&mut input, "username")?;
             auth::validate_username(&username)?;
             let value = mgmt::inspect(
                 &sess.state,
@@ -670,19 +564,19 @@ async fn dispatch_action(
                 &format!("state://kernel/console/users/{username}"),
             )
             .await?;
-            Ok(ConsoleResult::Value(jbv(value)))
+            value.unwrap_or(Value::Null)
         }
-        ConsoleAction::UserList => {
+        ACTION_ACCESS_USER_LIST => {
             let entries =
                 mgmt::inspect_prefix(&sess.state, principal, "state://kernel/console/users")
                     .await?;
-            Ok(ConsoleResult::Entries(jb_entries(entries)))
+            entries_value(entries)
         }
-        ConsoleAction::UserWriteCas {
-            username,
-            value,
-            expected_version,
-        } => {
+        ACTION_ACCESS_USER_WRITE_CAS => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let username = string_arg(&mut input, "username")?;
+            let value = value_arg(&mut input, "value")?;
+            let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
             auth::validate_username(&username)?;
             mgmt::write_config(
@@ -693,12 +587,12 @@ async fn dispatch_action(
                 expected_version,
             )
             .await?;
-            Ok(ConsoleResult::Empty)
+            return Ok(ActionResult::empty(server_rev(sess)));
         }
-        ConsoleAction::UserDisable {
-            username,
-            expected_version,
-        } => {
+        ACTION_ACCESS_USER_DISABLE => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let username = string_arg(&mut input, "username")?;
+            let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
             auth::validate_username(&username)?;
             let path = format!("state://kernel/console/users/{username}");
@@ -716,9 +610,11 @@ async fn dispatch_action(
                 }
             }
             mgmt::write_config(&sess.state, principal, &path, value, expected_version).await?;
-            Ok(ConsoleResult::Empty)
+            return Ok(ActionResult::empty(server_rev(sess)));
         }
-        ConsoleAction::RoleRead { role } => {
+        ACTION_ACCESS_ROLE_READ => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let role = string_arg(&mut input, "role")?;
             auth::validate_username(&role)?;
             let value = mgmt::inspect(
                 &sess.state,
@@ -726,19 +622,19 @@ async fn dispatch_action(
                 &format!("state://kernel/console/roles/{role}"),
             )
             .await?;
-            Ok(ConsoleResult::Value(jbv(value)))
+            value.unwrap_or(Value::Null)
         }
-        ConsoleAction::RoleList => {
+        ACTION_ACCESS_ROLE_LIST => {
             let entries =
                 mgmt::inspect_prefix(&sess.state, principal, "state://kernel/console/roles")
                     .await?;
-            Ok(ConsoleResult::Entries(jb_entries(entries)))
+            entries_value(entries)
         }
-        ConsoleAction::RoleWriteCas {
-            role,
-            value,
-            expected_version,
-        } => {
+        ACTION_ACCESS_ROLE_WRITE_CAS => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let role = string_arg(&mut input, "role")?;
+            let value = value_arg(&mut input, "value")?;
+            let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
             auth::validate_username(&role)?;
             mgmt::write_config(
@@ -749,25 +645,27 @@ async fn dispatch_action(
                 expected_version,
             )
             .await?;
-            Ok(ConsoleResult::Empty)
+            return Ok(ActionResult::empty(server_rev(sess)));
         }
-        ConsoleAction::CurrentSessionLogout => {
+        ACTION_ACCESS_SESSION_CURRENT_LOGOUT => {
             let Some(sid) = sess.sid.take() else {
                 return Err(ConsoleError::NotAuthenticated);
             };
             sess.state.auth.logout_sid(&sess.state.boot, &sid).await?;
             sess.principal = None;
-            Ok(ConsoleResult::Empty)
+            return Ok(ActionResult::empty(server_rev(sess)));
         }
-        ConsoleAction::SessionList => {
+        ACTION_ACCESS_SESSION_LIST => {
             let sessions = sess
                 .state
                 .auth
                 .list_sessions(&sess.state.boot, principal)
                 .await?;
-            Ok(ConsoleResult::Sessions(sessions))
+            sessions_value(&sessions)
         }
-        ConsoleAction::SessionRevoke { sid } => {
+        ACTION_ACCESS_SESSION_REVOKE => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let sid = string_arg(&mut input, "sid")?;
             require_step_up(principal)?;
             sess.state
                 .auth
@@ -777,9 +675,11 @@ async fn dispatch_action(
                 sess.sid = None;
                 sess.principal = None;
             }
-            Ok(ConsoleResult::Revoked { count: 1 })
+            map_value([("count", Value::Int(1))])
         }
-        ConsoleAction::SessionRevokeUser { username } => {
+        ACTION_ACCESS_SESSION_REVOKE_USER => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let username = string_arg(&mut input, "username")?;
             require_step_up(principal)?;
             let count = sess
                 .state
@@ -790,14 +690,16 @@ async fn dispatch_action(
                 sess.sid = None;
                 sess.principal = None;
             }
-            Ok(ConsoleResult::Revoked { count })
+            map_value([("count", Value::Int(count as i64))])
         }
-        ConsoleAction::ProcessInspect {
-            process,
-            include_recent_facts,
-            limit,
-        } => {
-            let value = process_inspect(
+        ACTION_RUNTIME_PROCESS_INSPECT => {
+            require_visibility_access(principal, &call)?;
+            let mut input = input_map(input_value(&call.input)?)?;
+            let process = optional_u64_arg(&mut input, "process")?;
+            let include_recent_facts =
+                optional_bool_arg(&mut input, "include_recent_facts")?.unwrap_or(true);
+            let limit = optional_usize_arg(&mut input, "limit")?.unwrap_or(64);
+            let out = process_inspect(
                 sess,
                 principal,
                 process,
@@ -809,10 +711,25 @@ async fn dispatch_action(
                 ),
             )
             .await?;
-            Ok(ConsoleResult::Value(Some(jb(&value))))
+            let target = process.map(|pid| format!("process:{pid}"));
+            record_visibility_audit(
+                &sess.state,
+                principal,
+                Some(&sess.source_addr),
+                "runtime_process_inspect",
+                call.scope.as_deref(),
+                call.justification.as_deref(),
+                call.ttl_ms,
+                target.as_deref(),
+            );
+            out
         }
-        ConsoleAction::RecentFacts { process, limit } => {
-            let value = recent_facts(
+        ACTION_AUDIT_FACTS_RECENT => {
+            require_visibility_access(principal, &call)?;
+            let mut input = input_map(input_value(&call.input)?)?;
+            let process = optional_u64_arg(&mut input, "process")?;
+            let limit = optional_usize_arg(&mut input, "limit")?.unwrap_or(64);
+            let out = recent_facts(
                 sess,
                 principal,
                 process,
@@ -823,14 +740,28 @@ async fn dispatch_action(
                 ),
             )
             .await?;
-            Ok(ConsoleResult::Value(Some(jb(&value))))
+            let target = process
+                .map(|pid| format!("state://fact/{pid}"))
+                .unwrap_or_else(|| "state://fact".into());
+            record_visibility_audit(
+                &sess.state,
+                principal,
+                Some(&sess.source_addr),
+                "audit_facts_recent",
+                call.scope.as_deref(),
+                call.justification.as_deref(),
+                call.ttl_ms,
+                Some(&target),
+            );
+            out
         }
-        ConsoleAction::TraceRead {
-            process,
-            from,
-            limit,
-        } => {
-            let value = trace_read(
+        ACTION_LINEAGE_TRACE_READ => {
+            require_visibility_access(principal, &call)?;
+            let mut input = input_map(input_value(&call.input)?)?;
+            let process = u64_arg(&mut input, "process")?;
+            let from = optional_usize_arg(&mut input, "from")?.unwrap_or(0);
+            let limit = optional_usize_arg(&mut input, "limit")?.unwrap_or(128);
+            let out = trace_read(
                 sess,
                 principal,
                 process,
@@ -842,18 +773,42 @@ async fn dispatch_action(
                 ),
             )
             .await?;
-            Ok(ConsoleResult::Value(Some(jb(&value))))
+            let target = format!("state://fact/{process}");
+            record_visibility_audit(
+                &sess.state,
+                principal,
+                Some(&sess.source_addr),
+                "lineage_trace_read",
+                call.scope.as_deref(),
+                call.justification.as_deref(),
+                call.ttl_ms,
+                Some(&target),
+            );
+            out
         }
-        ConsoleAction::ExtensionInstallationInstall {
-            id,
-            def,
-            expected_version,
+        ACTION_LINEAGE_FACT_READ | ACTION_LINEAGE_FACT_BY_OPERATION => {
+            require_visibility_access(principal, &call)?;
+            let mut input = input_map(input_value(&call.input)?)?;
+            let op_id = parse_operation_id(&string_arg(&mut input, "op_id")?)?;
+            let out = lineage_fact_read(sess, principal, op_id).await?;
+            record_visibility_audit(
+                &sess.state,
+                principal,
+                Some(&sess.source_addr),
+                "lineage_fact_read",
+                call.scope.as_deref(),
+                call.justification.as_deref(),
+                call.ttl_ms,
+                Some(&format!("operation:{op_id}")),
+            );
+            out
         }
-        | ConsoleAction::ExtensionInstallationUpdate {
-            id,
-            def,
-            expected_version,
-        } => {
+        ACTION_HEALTH_SUMMARY => health_summary(sess, principal).await?,
+        ACTION_EXTENSIONS_INSTALLATION_INSTALL | ACTION_EXTENSIONS_INSTALLATION_UPDATE => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let id = string_arg(&mut input, "id")?;
+            let def = value_arg(&mut input, "def")?;
+            let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
             validate_path_segment(&id, "extension installation id")?;
             mgmt::write_config(
@@ -864,34 +819,37 @@ async fn dispatch_action(
                 expected_version,
             )
             .await?;
-            Ok(ConsoleResult::Empty)
+            return Ok(ActionResult::empty(server_rev(sess)));
         }
-        ConsoleAction::ExtensionInstallationStart { id } => {
+        ACTION_EXTENSIONS_INSTALLATION_START => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let id = string_arg(&mut input, "id")?;
             require_step_up(principal)?;
             let spec = proc_spec_from_installation(sess, principal, &id).await?;
             let value = serde_json::from_value(serde_json::to_value(spec).map_err(|e| {
                 ConsoleError::BadRequest(format!("proc spec serialization failed: {e}"))
             })?)
             .map_err(|e| ConsoleError::BadRequest(format!("proc spec conversion failed: {e}")))?;
-            let out = invoke_effect(sess, principal, "effect://proc/spawn", value).await?;
-            Ok(ConsoleResult::Value(Some(jb(&out))))
+            invoke_effect(sess, principal, "effect://proc/spawn", value).await?
         }
-        ConsoleAction::ExtensionInstallationStop { id } => {
+        ACTION_EXTENSIONS_INSTALLATION_STOP => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let id = string_arg(&mut input, "id")?;
             require_step_up(principal)?;
             validate_path_segment(&id, "extension installation id")?;
-            let out = invoke_effect(
+            invoke_effect(
                 sess,
                 principal,
                 "effect://proc/kill",
                 map_value([("id", Value::Str(id))]),
             )
-            .await?;
-            Ok(ConsoleResult::Value(Some(jb(&out))))
+            .await?
         }
-        ConsoleAction::ExtensionInstallationRevoke {
-            installation_id,
-            credential_generation_floor,
-        } => {
+        ACTION_EXTENSIONS_INSTALLATION_REVOKE => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let installation_id = string_arg(&mut input, "installation_id")?;
+            let credential_generation_floor =
+                optional_i64_arg(&mut input, "credential_generation_floor")?;
             require_step_up(principal)?;
             validate_path_segment(&installation_id, "extension installation id")?;
             let mut m = BTreeMap::new();
@@ -899,32 +857,30 @@ async fn dispatch_action(
             if let Some(floor) = credential_generation_floor {
                 m.insert("credential_generation_floor".into(), Value::Int(floor));
             }
-            let out =
-                invoke_effect(sess, principal, "effect://extension/revoke", Value::Map(m)).await?;
-            Ok(ConsoleResult::Value(Some(jb(&out))))
+            invoke_effect(sess, principal, "effect://extension/revoke", Value::Map(m)).await?
         }
-        ConsoleAction::PairingCreate {
-            input,
-            reveal_display_secret,
-        } => {
+        ACTION_PAIRING_CREATE => {
+            let mut input_map = input_map(input_value(&call.input)?)?;
+            let input = value_arg(&mut input_map, "input")?;
+            let reveal_display_secret =
+                optional_bool_arg(&mut input_map, "reveal_display_secret")?.unwrap_or(false);
             require_step_up(principal)?;
-            let out = pairing_action(
+            pairing_action(
                 sess,
                 principal,
                 "effect://extension/pairing/create",
                 input,
                 reveal_display_secret,
             )
-            .await?;
-            Ok(ConsoleResult::Value(Some(jb(&out))))
+            .await?
         }
-        ConsoleAction::PairingApprove {
-            pairing_id,
-            approved_roles,
-        } => {
+        ACTION_PAIRING_APPROVE => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let pairing_id = string_arg(&mut input, "pairing_id")?;
+            let approved_roles = string_list_arg(&mut input, "approved_roles")?;
             require_step_up(principal)?;
             validate_path_segment(&pairing_id, "pairing id")?;
-            let out = invoke_effect(
+            invoke_effect(
                 sess,
                 principal,
                 "effect://extension/pairing/approve",
@@ -936,44 +892,50 @@ async fn dispatch_action(
                     ),
                 ]),
             )
-            .await?;
-            Ok(ConsoleResult::Value(Some(jb(&out))))
+            .await?
         }
-        ConsoleAction::PairingDeny { pairing_id } => {
+        ACTION_PAIRING_DENY => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let pairing_id = string_arg(&mut input, "pairing_id")?;
             require_step_up(principal)?;
             validate_path_segment(&pairing_id, "pairing id")?;
-            let out = invoke_effect(
+            invoke_effect(
                 sess,
                 principal,
                 "effect://extension/pairing/deny",
                 map_value([("pairing_id", Value::Str(pairing_id))]),
             )
-            .await?;
-            Ok(ConsoleResult::Value(Some(jb(&out))))
+            .await?
         }
-        ConsoleAction::PairingReplace {
-            input,
-            reveal_display_secret,
-        } => {
+        ACTION_PAIRING_REPLACE => {
+            let mut input_map = input_map(input_value(&call.input)?)?;
+            let input = value_arg(&mut input_map, "input")?;
+            let reveal_display_secret =
+                optional_bool_arg(&mut input_map, "reveal_display_secret")?.unwrap_or(false);
             require_step_up(principal)?;
-            let out = pairing_action(
+            pairing_action(
                 sess,
                 principal,
                 "effect://extension/pairing/replace",
                 input,
                 reveal_display_secret,
             )
-            .await?;
-            Ok(ConsoleResult::Value(Some(jb(&out))))
+            .await?
         }
-    }
+        other => {
+            return Err(ConsoleError::BadRequest(format!(
+                "unknown console action: {other}"
+            )));
+        }
+    };
+    Ok(ActionResult::value(out, server_rev(sess)))
 }
 
 async fn subscribe(
     sess: &mut WsSession,
     principal: &ConsolePrincipal,
     id: u64,
-    stream: ConsoleStream,
+    stream: StreamCall,
 ) -> Result<(), ConsoleError> {
     let max_subscriptions = sess
         .state
@@ -984,18 +946,25 @@ async fn subscribe(
     if sess.subscriptions.len() >= max_subscriptions && !sess.subscriptions.contains_key(&id) {
         return Err(ConsoleError::RateLimited);
     }
-    if let Some(handle) = sess.subscriptions.remove(&id) {
-        let _ = handle.shutdown.send(());
+    if stream.since_rev.is_some() {
+        return Err(ConsoleError::BadRequest(
+            "stream resume via since_rev is not supported by live-only console streams yet".into(),
+        ));
     }
 
-    match stream {
-        ConsoleStream::Config { pattern } => {
-            let pattern = Path::parse(&pattern)?;
-            ensure_kernel_pattern(&pattern)?;
+    match stream.stream.as_str() {
+        STREAM_STATE_WATCH => {
+            require_stream_visibility_access(principal, &stream)?;
+            let mut input = input_map(input_value(&stream.input)?)?;
+            let pattern = Path::parse(&string_arg(&mut input, "pattern")?)?;
+            ensure_observable_state_path(&pattern)?;
             auth::authorize_path(&sess.state.state, principal, "subscribe", &pattern, None).await?;
             let mut rx = sess.state.state.subscribe(&pattern).await?;
             let event_tx = sess.event_tx.clone();
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+            if let Some(handle) = sess.subscriptions.remove(&id) {
+                let _ = handle.shutdown.send(());
+            }
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -1016,42 +985,29 @@ async fn subscribe(
                     shutdown: shutdown_tx,
                 },
             );
-            Ok(())
-        }
-        ConsoleStream::Runtime { pattern } => {
-            let pattern = Path::parse(&pattern)?;
-            ensure_kernel_pattern(&pattern)?;
-            auth::authorize_path(&sess.state.state, principal, "subscribe", &pattern, None).await?;
-            let mut rx = sess.state.state.subscribe(&pattern).await?;
-            let event_tx = sess.event_tx.clone();
-            let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = &mut shutdown_rx => break,
-                        ev = rx.recv() => {
-                            let Ok(ev) = ev else { break };
-                            let event = state_event(ev);
-                            if event_tx.send(SubscriptionMessage { stream: id, event }).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-            sess.subscriptions.insert(
-                id,
-                SubscriptionHandle {
-                    shutdown: shutdown_tx,
-                },
+            record_visibility_audit(
+                &sess.state,
+                principal,
+                Some(&sess.source_addr),
+                "state_watch",
+                stream.scope.as_deref(),
+                stream.justification.as_deref(),
+                stream.ttl_ms,
+                Some(&pattern.to_string()),
             );
             Ok(())
         }
-        ConsoleStream::Audit { process } => {
+        STREAM_AUDIT_FACTS => {
+            require_stream_visibility_access(principal, &stream)?;
+            let mut input = input_map(input_value(&stream.input)?)?;
+            let process = optional_u64_arg(&mut input, "process")?;
             authorize_fact_read(principal, process)?;
             let event_tx = sess.event_tx.clone();
             let state = sess.state.clone();
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+            if let Some(handle) = sess.subscriptions.remove(&id) {
+                let _ = handle.shutdown.send(());
+            }
             tokio::spawn(async move {
                 let mut seen = 0usize;
                 let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -1087,8 +1043,179 @@ async fn subscribe(
                     shutdown: shutdown_tx,
                 },
             );
+            let target = process
+                .map(|pid| format!("state://fact/{pid}"))
+                .unwrap_or_else(|| "state://fact".into());
+            record_visibility_audit(
+                &sess.state,
+                principal,
+                Some(&sess.source_addr),
+                "audit_facts_stream",
+                stream.scope.as_deref(),
+                stream.justification.as_deref(),
+                stream.ttl_ms,
+                Some(&target),
+            );
             Ok(())
         }
+        other => Err(ConsoleError::BadRequest(format!(
+            "unknown console stream: {other}"
+        ))),
+    }
+}
+
+async fn snapshot(
+    sess: &WsSession,
+    principal: &ConsolePrincipal,
+    call: &ActionCall,
+) -> Result<Value, ConsoleError> {
+    let mut input = input_map(input_value(&call.input)?)?;
+    let since_rev = optional_u64_arg(&mut input, "since_rev")?;
+    let sections = match input.remove("sections") {
+        Some(Value::List(items)) => items,
+        Some(_) => {
+            return Err(ConsoleError::BadRequest(
+                "sections must be a list of section maps".into(),
+            ));
+        }
+        None => vec![
+            map_value([
+                ("kind", Value::Str("kernel_config".into())),
+                ("prefix", Value::Str("state://kernel".into())),
+            ]),
+            map_value([("kind", Value::Str("sessions".into()))]),
+            map_value([
+                ("kind", Value::Str("runtime".into())),
+                ("limit", Value::Int(64)),
+            ]),
+        ],
+    };
+
+    let mut out = BTreeMap::new();
+    out.insert("server_rev".into(), Value::Int(server_rev(sess) as i64));
+    out.insert("registry_rev".into(), Value::Int(registry_rev(sess) as i64));
+    out.insert(
+        "fact_cursor".into(),
+        Value::Int(sess.state.boot.kernel.facts.cursor() as i64),
+    );
+    out.insert("truncated".into(), Value::List(Vec::new()));
+    if let Some(since_rev) = since_rev {
+        out.insert("since_rev".into(), Value::Int(since_rev as i64));
+    }
+    for section in sections {
+        let mut section = input_map(section)?;
+        let kind = string_arg(&mut section, "kind")?;
+        match kind.as_str() {
+            "kernel_config" => {
+                let prefix = string_arg(&mut section, "prefix")?;
+                let entries = mgmt::inspect_prefix(&sess.state, principal, &prefix).await?;
+                out.insert(prefix, entries_value(entries));
+            }
+            "sessions" => {
+                let sessions = sess
+                    .state
+                    .auth
+                    .list_sessions(&sess.state.boot, principal)
+                    .await?;
+                out.insert("sessions".into(), sessions_value(&sessions));
+            }
+            "runtime" => {
+                let include_recent_facts =
+                    optional_bool_arg(&mut section, "include_recent_facts")?.unwrap_or(false);
+                if include_recent_facts {
+                    require_visibility_access(principal, call)?;
+                }
+                let limit = optional_usize_arg(&mut section, "limit")?.unwrap_or(64);
+                let runtime =
+                    process_inspect(sess, principal, None, include_recent_facts, limit).await?;
+                if include_recent_facts {
+                    record_visibility_audit(
+                        &sess.state,
+                        principal,
+                        Some(&sess.source_addr),
+                        "state_snapshot_runtime_facts",
+                        call.scope.as_deref(),
+                        call.justification.as_deref(),
+                        call.ttl_ms,
+                        Some("runtime.processes"),
+                    );
+                }
+                out.insert("runtime".into(), runtime);
+            }
+            other => {
+                return Err(ConsoleError::BadRequest(format!(
+                    "unknown snapshot section kind: {other}"
+                )));
+            }
+        }
+    }
+    Ok(Value::Map(out))
+}
+
+async fn visibility_state_read(
+    sess: &WsSession,
+    principal: &ConsolePrincipal,
+    path: &str,
+) -> Result<Value, ConsoleError> {
+    let path = Path::parse(path)?;
+    ensure_observable_state_path(&path)?;
+    auth::authorize_path(&sess.state.state, principal, "read", &path, None).await?;
+    run_state_op(sess, principal, path, "read", Value::Null).await
+}
+
+async fn visibility_state_list(
+    sess: &WsSession,
+    principal: &ConsolePrincipal,
+    prefix: &str,
+    limit: usize,
+) -> Result<Value, ConsoleError> {
+    let prefix = Path::parse(prefix)?;
+    ensure_observable_state_path(&prefix)?;
+    auth::authorize_path(&sess.state.state, principal, "read", &prefix, None).await?;
+    let mut out = run_state_op(sess, principal, prefix, "list", Value::Null).await?;
+    if let Value::List(items) = &mut out {
+        let max = bounded_limit(
+            limit,
+            sess.state.ws.config().max_state_list_limit,
+            HARD_MAX_WS_STATE_LIST_LIMIT,
+        );
+        items.truncate(max);
+    }
+    Ok(out)
+}
+
+async fn run_state_op(
+    sess: &WsSession,
+    principal: &ConsolePrincipal,
+    path: Path,
+    method: &str,
+    input: Value,
+) -> Result<Value, ConsoleError> {
+    let target = ResourceName::new(path.clone());
+    let identity = Path::parse(&principal.identity_path)
+        .ok()
+        .map(|p| nexus_kernel::intern_identity(&p))
+        .unwrap_or(IdentityRef::ROOT);
+    let verb = capability_verb_for_state_method(method);
+    let cap = format!("{verb}://{}", capability_target(&path));
+    let process = sess.state.boot.spawn_request_process(identity, &[&cap]);
+    let handle = sess
+        .state
+        .boot
+        .open_for(process, &target, verb)
+        .map_err(|e| ConsoleError::Operation(e.to_string()))?;
+    let ex = sess.state.boot.kernel.executor_for(process);
+    ex.bind_handle(target.clone(), handle);
+    let op = DoNode::Op(OperationTemplate {
+        target,
+        method: method.into(),
+        method_id: None,
+        output: OutputMode::Unary,
+        literal_input: Some(input),
+    });
+    match ex.eval_tainted(&op, TaintSet::author()).await {
+        Outcome::Done(v) | Outcome::Short(v) => Ok(v),
+        Outcome::Fail(f) => Err(ConsoleError::Operation(f.to_string())),
     }
 }
 
@@ -1174,6 +1301,293 @@ async fn trace_read(
         ))
         .collect();
     Ok(facts_value(rows))
+}
+
+async fn lineage_fact_read(
+    sess: &WsSession,
+    principal: &ConsolePrincipal,
+    op_id: OperationId,
+) -> Result<Value, ConsoleError> {
+    authorize_fact_read(principal, Some(op_id.process.get()))?;
+    let fact = sess
+        .state
+        .boot
+        .kernel
+        .facts
+        .all_facts()
+        .into_iter()
+        .find(|fact| fact.id == op_id)
+        .ok_or_else(|| ConsoleError::BadRequest(format!("unknown operation id: {op_id}")))?;
+    Ok(fact_detail_value(fact))
+}
+
+async fn health_summary(
+    sess: &WsSession,
+    principal: &ConsolePrincipal,
+) -> Result<Value, ConsoleError> {
+    let kernel_path = Path::parse("state://kernel")?;
+    auth::authorize_path(&sess.state.state, principal, "read", &kernel_path, None).await?;
+
+    let process_ids = sess.state.boot.kernel.processes.all_ids();
+    let mut process_status = BTreeMap::new();
+    for pid in &process_ids {
+        let status = sess
+            .state
+            .boot
+            .kernel
+            .processes
+            .status(*pid)
+            .map(|s| format!("{s:?}"))
+            .unwrap_or_else(|| "Unknown".into());
+        let next = process_status
+            .get(&status)
+            .and_then(Value::as_int)
+            .unwrap_or(0)
+            + 1;
+        process_status.insert(status, Value::Int(next));
+    }
+
+    let facts = sess.state.boot.kernel.facts.all_facts();
+    let mut decisions = BTreeMap::new();
+    for fact in &facts {
+        let key = format!("{:?}", fact.decision);
+        let next = decisions.get(&key).and_then(Value::as_int).unwrap_or(0) + 1;
+        decisions.insert(key, Value::Int(next));
+    }
+
+    let registry = registry_counts_value(sess.state.boot.kernel.registry.counts());
+    let cfg = sess.state.ws.config();
+    Ok(map_value([
+        ("status", Value::Str("ok".into())),
+        ("server_rev", Value::Int(server_rev(sess) as i64)),
+        ("registry_rev", Value::Int(registry_rev(sess) as i64)),
+        ("process_count", Value::Int(process_ids.len() as i64)),
+        ("process_status", Value::Map(process_status)),
+        ("fact_count", Value::Int(facts.len() as i64)),
+        (
+            "fact_cursor",
+            Value::Int(sess.state.boot.kernel.facts.cursor() as i64),
+        ),
+        ("fact_decisions", Value::Map(decisions)),
+        ("registry", registry),
+        (
+            "ws_limits",
+            map_value([
+                ("max_frame_bytes", Value::Int(cfg.max_frame_bytes as i64)),
+                (
+                    "max_connections_global",
+                    Value::Int(cfg.max_connections_global as i64),
+                ),
+                (
+                    "max_connections_per_source",
+                    Value::Int(cfg.max_connections_per_source as i64),
+                ),
+                (
+                    "max_connections_per_user",
+                    Value::Int(cfg.max_connections_per_user as i64),
+                ),
+                (
+                    "max_subscriptions",
+                    Value::Int(cfg.max_subscriptions as i64),
+                ),
+                (
+                    "max_state_list_limit",
+                    Value::Int(cfg.max_state_list_limit as i64),
+                ),
+                ("max_fact_limit", Value::Int(cfg.max_fact_limit as i64)),
+                ("max_trace_limit", Value::Int(cfg.max_trace_limit as i64)),
+            ]),
+        ),
+    ]))
+}
+
+fn authority_principal_effective(principal: &ConsolePrincipal) -> Value {
+    let grants = principal
+        .grants
+        .iter()
+        .map(|cap| Value::Str(cap.to_string()))
+        .collect::<Vec<_>>();
+    map_value([
+        ("username", Value::Str(principal.username.clone())),
+        ("identity_path", Value::Str(principal.identity_path.clone())),
+        ("mfa_level", Value::Int(i64::from(principal.mfa_level))),
+        ("grant_count", Value::Int(grants.len() as i64)),
+        ("grants", Value::List(grants)),
+        (
+            "root_data_authority",
+            serde_value(protocol::protocol_metadata(0, 0).root_data_authority),
+        ),
+    ])
+}
+
+fn authority_action_matrix(principal: &ConsolePrincipal, domain: Option<&str>) -> Value {
+    let rows = protocol::action_descriptors()
+        .into_iter()
+        .filter(|descriptor| domain.is_none_or(|d| descriptor.domain == d))
+        .map(|descriptor| authority_action_row(principal, &descriptor))
+        .collect();
+    Value::List(rows)
+}
+
+fn authority_why_denied(
+    principal: &ConsolePrincipal,
+    action_id: &str,
+) -> Result<Value, ConsoleError> {
+    let descriptor = protocol::action_descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.id == action_id)
+        .ok_or_else(|| {
+            ConsoleError::BadRequest(format!("unknown action descriptor: {action_id}"))
+        })?;
+    Ok(authority_action_row(principal, &descriptor))
+}
+
+fn authority_action_row(principal: &ConsolePrincipal, descriptor: &ActionDescriptor) -> Value {
+    let checks = descriptor
+        .required_authority
+        .iter()
+        .map(|required| authority_required_check(principal, required))
+        .collect::<Vec<_>>();
+    let authority_ok = checks
+        .iter()
+        .all(|check| map_bool(check, "allowed").unwrap_or(false));
+    let conditional_authority = !authority_ok
+        && checks
+            .iter()
+            .any(|check| map_bool(check, "conditional").unwrap_or(false));
+    let visibility_gate = action_needs_visibility_gate(descriptor);
+    let status = if descriptor.status == protocol::ImplementationStatus::BlockedByCustody {
+        "blocked_by_custody"
+    } else if descriptor.status != protocol::ImplementationStatus::Implemented {
+        "declared"
+    } else if !authority_ok {
+        if conditional_authority {
+            "conditional_authority"
+        } else {
+            "denied"
+        }
+    } else if descriptor.requires_step_up && principal.mfa_level < 2 {
+        "step_up_required"
+    } else if visibility_gate {
+        "visibility_gate_required"
+    } else {
+        "available"
+    };
+    let why = authority_why(status, descriptor, authority_ok, conditional_authority);
+    map_value([
+        ("action", Value::Str(descriptor.id.clone())),
+        ("domain", Value::Str(descriptor.domain.clone())),
+        ("status", Value::Str(status.into())),
+        ("risk", serde_value(&descriptor.risk)),
+        ("visibility", serde_value(&descriptor.visibility)),
+        ("implementation_status", serde_value(&descriptor.status)),
+        ("authority_ok", Value::Bool(authority_ok)),
+        ("requires_step_up", Value::Bool(descriptor.requires_step_up)),
+        ("mfa_level", Value::Int(i64::from(principal.mfa_level))),
+        ("requires_visibility_gate", Value::Bool(visibility_gate)),
+        ("authority", Value::List(checks)),
+        (
+            "why",
+            Value::List(why.into_iter().map(Value::Str).collect()),
+        ),
+    ])
+}
+
+fn authority_required_check(principal: &ConsolePrincipal, required: &RequiredAuthority) -> Value {
+    let mut row = BTreeMap::new();
+    row.insert("verb".into(), Value::Str(required.verb.clone()));
+    row.insert("target".into(), Value::Str(required.target.clone()));
+    match required_capability(required) {
+        Ok(required_cap) => {
+            let allowed = principal
+                .grants
+                .iter()
+                .any(|grant| grant.predicate.is_none() && grant.covers_cap(&required_cap));
+            let conditional = !allowed
+                && principal
+                    .grants
+                    .iter()
+                    .any(|grant| grant.predicate.is_some() && grant.covers_cap(&required_cap));
+            row.insert("allowed".into(), Value::Bool(allowed));
+            row.insert("conditional".into(), Value::Bool(conditional));
+            if !allowed {
+                row.insert(
+                    "why_not".into(),
+                    Value::Str(
+                        if conditional {
+                            "matching grant is predicate-bound; action input is required"
+                        } else {
+                            "missing grant"
+                        }
+                        .into(),
+                    ),
+                );
+            }
+        }
+        Err(e) => {
+            row.insert("allowed".into(), Value::Bool(false));
+            row.insert("conditional".into(), Value::Bool(false));
+            row.insert(
+                "why_not".into(),
+                Value::Str(format!("descriptor authority is malformed: {e:?}")),
+            );
+        }
+    }
+    Value::Map(row)
+}
+
+async fn authority_resource_access(
+    sess: &WsSession,
+    principal: &ConsolePrincipal,
+    target: &str,
+    verb: &str,
+) -> Result<Value, ConsoleError> {
+    validate_authority_verb(verb)?;
+    let path = Path::parse(target)?;
+    if path
+        .segments()
+        .iter()
+        .any(|seg| matches!(seg.as_str(), "*" | "**"))
+    {
+        return Err(ConsoleError::BadRequest(
+            "authority.resource.access requires a concrete target path".into(),
+        ));
+    }
+    if path.scheme() == "state" && nexus_types::is_vault_reserved(&path) {
+        return Ok(map_value([
+            ("target", Value::Str(path.to_string())),
+            ("verb", Value::Str(verb.to_string())),
+            ("allowed", Value::Bool(false)),
+            ("why_not", Value::Str("secret_custody_required".into())),
+        ]));
+    }
+
+    let result = if matches!(verb, "read" | "write" | "subscribe") && path.scheme() == "state" {
+        auth::authorize_path(&sess.state.state, principal, verb, &path, None)
+            .await
+            .map(|_| "auth.authorize_path")
+    } else {
+        let allowed = principal.grants.contains(verb, &path);
+        if allowed {
+            Ok("capset.contains")
+        } else {
+            Err(auth::AuthError::PermissionDenied)
+        }
+    };
+    let mut row = BTreeMap::new();
+    row.insert("target".into(), Value::Str(path.to_string()));
+    row.insert("verb".into(), Value::Str(verb.to_string()));
+    match result {
+        Ok(via) => {
+            row.insert("allowed".into(), Value::Bool(true));
+            row.insert("via".into(), Value::Str(via.into()));
+        }
+        Err(e) => {
+            row.insert("allowed".into(), Value::Bool(false));
+            row.insert("why_not".into(), Value::Str(e.to_string()));
+        }
+    }
+    Ok(Value::Map(row))
 }
 
 async fn pairing_action(
@@ -1300,12 +1714,7 @@ fn decode_frame(bytes: &[u8], configured_max_frame_bytes: usize) -> Result<Clien
     if bytes.len() > max_frame_bytes {
         return Err("frame exceeds console websocket limit".into());
     }
-    let (frame, used) = bincode::serde::decode_from_slice(bytes, BINCODE_CONFIG)
-        .map_err(|e| format!("bad bincode frame: {e}"))?;
-    if used != bytes.len() {
-        return Err("bad bincode frame: trailing bytes".into());
-    }
-    Ok(frame)
+    rmp_serde::from_slice(bytes).map_err(|e| format!("bad MessagePack frame: {e}"))
 }
 
 fn bounded_limit(requested: usize, configured: usize, hard: usize) -> usize {
@@ -1316,7 +1725,7 @@ async fn send<S>(tx: &mut S, frame: ServerFrame) -> Result<(), ()>
 where
     S: SinkExt<Message> + Unpin,
 {
-    let bytes = bincode::serde::encode_to_vec(&frame, BINCODE_CONFIG).map_err(|_| ())?;
+    let bytes = encode_frame(&frame).map_err(|_| ())?;
     tx.send(Message::Binary(bytes.into())).await.map_err(|_| ())
 }
 
@@ -1336,6 +1745,10 @@ fn message_len(msg: &Message) -> usize {
         Message::Ping(bytes) | Message::Pong(bytes) => bytes.len(),
         Message::Close(_) => 0,
     }
+}
+
+fn encode_frame<T: Serialize>(frame: &T) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    rmp_serde::to_vec_named(frame)
 }
 
 #[derive(Debug)]
@@ -1465,6 +1878,43 @@ fn record_ws_audit(
         source_addr,
         outcome,
         mfa_level: principal.map(|p| p.mfa_level),
+        details: None,
+    });
+}
+
+fn record_visibility_audit(
+    state: &Arc<ConsoleState>,
+    principal: &ConsolePrincipal,
+    source_addr: Option<&str>,
+    outcome: &'static str,
+    scope: Option<&str>,
+    justification: Option<&str>,
+    ttl_ms: Option<u64>,
+    target: Option<&str>,
+) {
+    let mut details = BTreeMap::new();
+    if let Some(scope) = scope {
+        details.insert("scope".into(), Value::Str(scope.to_string()));
+    }
+    if let Some(justification) = justification {
+        details.insert(
+            "justification".into(),
+            Value::Str(justification.to_string()),
+        );
+    }
+    if let Some(ttl_ms) = ttl_ms {
+        details.insert("ttl_ms".into(), Value::Int(ttl_ms as i64));
+    }
+    if let Some(target) = target {
+        details.insert("target".into(), Value::Str(target.to_string()));
+    }
+    let _ = state.boot.record_gateway_audit(nexus_kernel::GatewayAudit {
+        event: "console_visibility",
+        username: Some(principal.username.as_str()),
+        source_addr,
+        outcome,
+        mfa_level: Some(principal.mfa_level),
+        details: Some(Value::Map(details)),
     });
 }
 
@@ -1537,6 +1987,40 @@ fn fact_value(f: nexus_types::Fact) -> Value {
     Value::Map(m)
 }
 
+fn fact_detail_value(f: nexus_types::Fact) -> Value {
+    let mut m = match fact_value(f.clone()) {
+        Value::Map(m) => m,
+        _ => BTreeMap::new(),
+    };
+    m.insert("schema_version".into(), Value::Int(f.schema_version as i64));
+    m.insert("handle".into(), Value::Str(f.handle.to_string()));
+    m.insert("input_ref".into(), serde_value(&f.input_ref));
+    m.insert("outcome_ref".into(), serde_value(&f.outcome_ref));
+    Value::Map(m)
+}
+
+fn registry_counts_value(counts: nexus_kernel::registry::RegistryCounts) -> Value {
+    map_value([
+        ("resources", Value::Int(counts.resources as i64)),
+        ("interfaces", Value::Int(counts.interfaces as i64)),
+        ("drivers", Value::Int(counts.drivers as i64)),
+        ("endpoints", Value::Int(counts.endpoints as i64)),
+        ("bindings", Value::Int(counts.bindings as i64)),
+        ("grants", Value::Int(counts.grants as i64)),
+        ("policies", Value::Int(counts.policies as i64)),
+        ("names", Value::Int(counts.names as i64)),
+        (
+            "open_cache_entries",
+            Value::Int(counts.open_cache_entries as i64),
+        ),
+        ("open_cache_hits", Value::Int(counts.open_cache_hits as i64)),
+        (
+            "open_cache_misses",
+            Value::Int(counts.open_cache_misses as i64),
+        ),
+    ])
+}
+
 fn state_event(ev: StateEvent) -> ConsoleEvent {
     match ev {
         StateEvent::Set { path, value, .. } => ConsoleEvent::StateSet {
@@ -1551,19 +2035,6 @@ fn state_event(ev: StateEvent) -> ConsoleEvent {
             path: path.to_string(),
         },
     }
-}
-
-/// Helper: `&Value` → `JsonBytes`.
-fn jb(v: &Value) -> JsonBytes { JsonBytes::from_value(v) }
-/// Helper: `Option<Value>` → `Option<JsonBytes>`.
-fn jbv(v: Option<Value>) -> Option<JsonBytes> { v.map(|v| jb(&v)) }
-/// Helper: `Vec<(String, Value)>` → `Vec<(String, JsonBytes)>`.
-fn jb_entries(v: Vec<(String, Value)>) -> Vec<(String, JsonBytes)> {
-    v.into_iter().map(|(k, v)| (k, jb(&v))).collect()
-}
-/// Helper: `BTreeMap<String, Value>` → `BTreeMap<String, JsonBytes>`.
-fn jb_snapshot(v: BTreeMap<String, Value>) -> BTreeMap<String, JsonBytes> {
-    v.into_iter().map(|(k, v)| (k, jb(&v))).collect()
 }
 
 fn validate_upgrade_headers(headers: &HeaderMap) -> Result<(), String> {
@@ -1598,11 +2069,37 @@ fn validate_upgrade_headers(headers: &HeaderMap) -> Result<(), String> {
     }
 }
 
-fn ensure_kernel_pattern(path: &Path) -> Result<(), ConsoleError> {
-    let segs = path.segments();
-    if path.scheme() != "state" || segs.first().map(|s| s.as_str()) != Some("kernel") {
+fn server_rev(sess: &WsSession) -> u64 {
+    sess.state.boot.kernel.facts.cursor()
+}
+
+fn registry_rev(_sess: &WsSession) -> u64 {
+    protocol::PROTOCOL_VERSION as u64
+}
+
+fn protocol_metadata(sess: &WsSession) -> protocol::ProtocolMetadata {
+    protocol::protocol_metadata(server_rev(sess), registry_rev(sess))
+}
+
+fn ensure_observable_state_path(path: &Path) -> Result<(), ConsoleError> {
+    if path.scheme() != "state" {
         return Err(ConsoleError::BadRequest(
-            "console subscriptions are limited to state://kernel/*".into(),
+            "visibility.state actions require state:// paths".into(),
+        ));
+    }
+    if nexus_types::is_vault_reserved(path) {
+        return Err(ConsoleError::BadRequest(
+            "state://vault/* is governed by secret.* custody actions".into(),
+        ));
+    }
+    let first = path
+        .segments()
+        .first()
+        .map(|s| s.as_str())
+        .ok_or_else(|| ConsoleError::BadRequest("state path must name a subtree".into()))?;
+    if matches!(first, "*" | "**") {
+        return Err(ConsoleError::BadRequest(
+            "wildcard first-segment visibility reads could include state://vault; use concrete business prefixes".into(),
         ));
     }
     Ok(())
@@ -1638,6 +2135,70 @@ fn require_step_up(principal: &ConsolePrincipal) -> Result<(), ConsoleError> {
     } else {
         Err(ConsoleError::Auth(auth::AuthError::PermissionDenied))
     }
+}
+
+fn require_visibility_access(
+    principal: &ConsolePrincipal,
+    call: &ActionCall,
+) -> Result<(), ConsoleError> {
+    require_visibility_gate(
+        principal,
+        call.scope.as_deref(),
+        call.justification.as_deref(),
+        call.ttl_ms,
+    )
+}
+
+fn require_stream_visibility_access(
+    principal: &ConsolePrincipal,
+    stream: &StreamCall,
+) -> Result<(), ConsoleError> {
+    require_visibility_gate(
+        principal,
+        stream.scope.as_deref(),
+        stream.justification.as_deref(),
+        stream.ttl_ms,
+    )
+}
+
+fn require_visibility_gate(
+    principal: &ConsolePrincipal,
+    scope: Option<&str>,
+    justification: Option<&str>,
+    ttl_ms: Option<u64>,
+) -> Result<(), ConsoleError> {
+    require_step_up(principal)?;
+    let Some(scope) = scope.map(str::trim) else {
+        return Err(ConsoleError::BadRequest(
+            "visibility access requires a scope".into(),
+        ));
+    };
+    if scope.is_empty() {
+        return Err(ConsoleError::BadRequest(
+            "visibility access requires a scope".into(),
+        ));
+    }
+    let Some(justification) = justification.map(str::trim) else {
+        return Err(ConsoleError::BadRequest(
+            "visibility access requires a justification".into(),
+        ));
+    };
+    if justification.is_empty() {
+        return Err(ConsoleError::BadRequest(
+            "visibility access requires a justification".into(),
+        ));
+    }
+    let Some(ttl_ms) = ttl_ms else {
+        return Err(ConsoleError::BadRequest(
+            "visibility access requires ttl_ms".into(),
+        ));
+    };
+    if ttl_ms == 0 || ttl_ms > MAX_VISIBILITY_TTL_MS {
+        return Err(ConsoleError::BadRequest(format!(
+            "visibility ttl_ms must be between 1 and {MAX_VISIBILITY_TTL_MS}"
+        )));
+    }
+    Ok(())
 }
 
 fn require_config_write_safety(
@@ -1717,8 +2278,228 @@ fn map_value(items: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
     )
 }
 
+fn serde_value<T: Serialize>(value: T) -> Value {
+    serde_json::from_value(serde_json::to_value(value).unwrap_or(serde_json::Value::Null))
+        .unwrap_or(Value::Null)
+}
+
+fn map_bool(value: &Value, key: &str) -> Option<bool> {
+    value.as_map()?.get(key)?.as_bool()
+}
+
+fn action_needs_visibility_gate(descriptor: &ActionDescriptor) -> bool {
+    matches!(
+        descriptor.visibility,
+        protocol::VisibilityTier::BusinessData
+            | protocol::VisibilityTier::ProtectedPayload
+            | protocol::VisibilityTier::SecretPlaintext
+    )
+}
+
+fn authority_why(
+    status: &str,
+    descriptor: &ActionDescriptor,
+    authority_ok: bool,
+    conditional_authority: bool,
+) -> Vec<String> {
+    let mut why = Vec::new();
+    match status {
+        "blocked_by_custody" => why.push("secret custody backend is not registered".into()),
+        "declared" => why.push("descriptor is declared but not implemented".into()),
+        "denied" if !authority_ok => why.push("principal lacks required authority".into()),
+        "conditional_authority" if conditional_authority => {
+            why.push("matching grant is predicate-bound and needs concrete action input".into())
+        }
+        "step_up_required" => why.push("mfa_level >= 2 is required".into()),
+        "visibility_gate_required" => {
+            why.push("scope, justification, and ttl_ms are required per call".into())
+        }
+        _ => {}
+    }
+    if descriptor.requires_step_up {
+        why.push("action is marked step-up sensitive".into());
+    }
+    why
+}
+
+fn required_capability(required: &RequiredAuthority) -> Result<Capability, ConsoleError> {
+    let path = Path::parse(&required.target)?;
+    Ok(Capability {
+        verb: required.verb.clone(),
+        scheme: path.scheme().to_string(),
+        segments: path.segments().to_vec(),
+        predicate: None,
+    })
+}
+
+fn validate_authority_verb(verb: &str) -> Result<(), ConsoleError> {
+    if matches!(
+        verb,
+        "perform" | "read" | "write" | "subscribe" | "spawn" | "act-as" | "delegate"
+    ) {
+        Ok(())
+    } else {
+        Err(ConsoleError::BadRequest(format!(
+            "unsupported authority verb: {verb}"
+        )))
+    }
+}
+
+fn input_value(input: &JsonBytes) -> Result<Value, ConsoleError> {
+    input
+        .try_to_value()
+        .map_err(|e| ConsoleError::BadRequest(format!("invalid JSON Value envelope: {e}")))
+}
+
+fn input_map(input: Value) -> Result<BTreeMap<String, Value>, ConsoleError> {
+    match input {
+        Value::Null => Ok(BTreeMap::new()),
+        Value::Map(m) => Ok(m),
+        _ => Err(ConsoleError::BadRequest(
+            "console action input must be a map".into(),
+        )),
+    }
+}
+
+fn string_arg(input: &mut BTreeMap<String, Value>, name: &str) -> Result<String, ConsoleError> {
+    match input.remove(name) {
+        Some(Value::Str(s)) if !s.is_empty() => Ok(s),
+        Some(_) => Err(ConsoleError::BadRequest(format!(
+            "{name} must be a non-empty string"
+        ))),
+        None => Err(ConsoleError::BadRequest(format!("{name} is required"))),
+    }
+}
+
+fn optional_string_arg(
+    input: &mut BTreeMap<String, Value>,
+    name: &str,
+) -> Result<Option<String>, ConsoleError> {
+    match input.remove(name) {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Str(s)) if !s.is_empty() => Ok(Some(s)),
+        Some(_) => Err(ConsoleError::BadRequest(format!(
+            "{name} must be a non-empty string"
+        ))),
+    }
+}
+
+fn value_arg(input: &mut BTreeMap<String, Value>, name: &str) -> Result<Value, ConsoleError> {
+    input
+        .remove(name)
+        .ok_or_else(|| ConsoleError::BadRequest(format!("{name} is required")))
+}
+
+fn parse_operation_id(raw: &str) -> Result<OperationId, ConsoleError> {
+    let mut parts = raw.split('/');
+    let process = parts
+        .next()
+        .ok_or_else(|| ConsoleError::BadRequest("op_id must be process/position/attempt".into()))?
+        .parse::<u64>()
+        .map_err(|_| ConsoleError::BadRequest("op_id process must be u64".into()))?;
+    let position = parts
+        .next()
+        .ok_or_else(|| ConsoleError::BadRequest("op_id must be process/position/attempt".into()))?
+        .parse::<u32>()
+        .map_err(|_| ConsoleError::BadRequest("op_id position must be u32".into()))?;
+    let attempt = parts
+        .next()
+        .ok_or_else(|| ConsoleError::BadRequest("op_id must be process/position/attempt".into()))?
+        .parse::<u32>()
+        .map_err(|_| ConsoleError::BadRequest("op_id attempt must be u32".into()))?;
+    if parts.next().is_some() {
+        return Err(ConsoleError::BadRequest(
+            "op_id must be process/position/attempt".into(),
+        ));
+    }
+    Ok(OperationId::new(
+        ProcessId::new(process),
+        NodeId::new(position),
+        attempt,
+    ))
+}
+
+fn u64_arg(input: &mut BTreeMap<String, Value>, name: &str) -> Result<u64, ConsoleError> {
+    optional_u64_arg(input, name)?
+        .ok_or_else(|| ConsoleError::BadRequest(format!("{name} is required")))
+}
+
+fn optional_u64_arg(
+    input: &mut BTreeMap<String, Value>,
+    name: &str,
+) -> Result<Option<u64>, ConsoleError> {
+    match input.remove(name) {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Int(i)) if i >= 0 => Ok(Some(i as u64)),
+        Some(_) => Err(ConsoleError::BadRequest(format!(
+            "{name} must be a non-negative integer"
+        ))),
+    }
+}
+
+fn optional_i64_arg(
+    input: &mut BTreeMap<String, Value>,
+    name: &str,
+) -> Result<Option<i64>, ConsoleError> {
+    match input.remove(name) {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Int(i)) => Ok(Some(i)),
+        Some(_) => Err(ConsoleError::BadRequest(format!(
+            "{name} must be an integer"
+        ))),
+    }
+}
+
+fn optional_usize_arg(
+    input: &mut BTreeMap<String, Value>,
+    name: &str,
+) -> Result<Option<usize>, ConsoleError> {
+    Ok(optional_u64_arg(input, name)?.map(|v| v as usize))
+}
+
+fn optional_bool_arg(
+    input: &mut BTreeMap<String, Value>,
+    name: &str,
+) -> Result<Option<bool>, ConsoleError> {
+    match input.remove(name) {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(b)),
+        Some(_) => Err(ConsoleError::BadRequest(format!("{name} must be a bool"))),
+    }
+}
+
+fn string_list_arg(
+    input: &mut BTreeMap<String, Value>,
+    name: &str,
+) -> Result<Vec<String>, ConsoleError> {
+    match input.remove(name) {
+        Some(Value::List(items)) => items
+            .into_iter()
+            .map(|item| match item {
+                Value::Str(s) if !s.is_empty() => Ok(s),
+                _ => Err(ConsoleError::BadRequest(format!(
+                    "{name} must be a list of non-empty strings"
+                ))),
+            })
+            .collect(),
+        Some(_) => Err(ConsoleError::BadRequest(format!(
+            "{name} must be a list of strings"
+        ))),
+        None => Err(ConsoleError::BadRequest(format!("{name} is required"))),
+    }
+}
+
 fn capability_target(path: &Path) -> String {
     path.to_string().replacen("://", "/", 1)
+}
+
+fn capability_verb_for_state_method(method: &str) -> &'static str {
+    match method {
+        "read" | "list" => "read",
+        "write" | "append" | "delete" => "write",
+        "subscribe" => "subscribe",
+        _ => "perform",
+    }
 }
 
 fn bearer_sid(bearer: Option<&str>) -> Option<&str> {
@@ -1731,6 +2512,7 @@ mod tests {
     use crate::auth::{
         BootstrapOutcome, LoginRequest, RootProvisioning, StepUpRequest, bootstrap_root_account,
     };
+    use crate::protocol::*;
     use crate::state::{ConsoleWsConfig, ConsoleWsRuntime};
     use nexus_actors::{PairingDisplayEdge, StandardConfig, install_standard};
     use nexus_kernel::Bootstrap;
@@ -1761,6 +2543,20 @@ mod tests {
             counted_user: None,
             subscriptions: BTreeMap::new(),
             event_tx: mpsc::channel(1).0,
+            rate: FrameRate::default(),
+        }
+    }
+
+    fn unauth_session(st: Arc<ConsoleState>) -> WsSession {
+        let (tx, _rx) = mpsc::channel(1);
+        WsSession {
+            state: st,
+            principal: None,
+            sid: None,
+            source_addr: "test".into(),
+            counted_user: None,
+            subscriptions: BTreeMap::new(),
+            event_tx: tx,
             rate: FrameRate::default(),
         }
     }
@@ -1844,6 +2640,40 @@ mod tests {
         serde_json::from_value(serde_json::to_value(def).unwrap()).unwrap()
     }
 
+    fn call(action: &str, input: Value) -> ActionCall {
+        ActionCall {
+            action: action.into(),
+            input: JsonBytes::from_value(&input),
+            scope: None,
+            justification: None,
+            ttl_ms: None,
+        }
+    }
+
+    fn visibility_call(action: &str, input: Value) -> ActionCall {
+        ActionCall {
+            action: action.into(),
+            input: JsonBytes::from_value(&input),
+            scope: Some("test".into()),
+            justification: Some("test visibility inspection".into()),
+            ttl_ms: Some(60_000),
+        }
+    }
+
+    fn output_value(result: ActionResult) -> Value {
+        result.output.expect("expected action output").to_value()
+    }
+
+    fn fact_count(st: &ConsoleState) -> usize {
+        st.boot
+            .kernel
+            .processes
+            .all_ids()
+            .into_iter()
+            .map(|pid| st.boot.kernel.facts.facts_of(pid).len())
+            .sum()
+    }
+
     #[test]
     fn frame_rate_limits_frames_and_bytes_per_second() {
         let mut rate = FrameRate::default();
@@ -1905,22 +2735,81 @@ mod tests {
     }
 
     #[test]
-    fn console_frame_roundtrips_with_bincode() {
-        let frame = ClientFrame::Rpc {
+    fn console_frame_roundtrips_with_msgpack() {
+        let frame = ClientFrame::Call {
             id: 7,
-            action: ConsoleAction::Snapshot {
-                sections: vec![
-                    SnapshotSection::KernelConfig {
-                        prefix: "state://kernel/audit".into(),
-                    },
-                    SnapshotSection::Runtime { limit: 8 },
-                ],
-                since_rev: Some(3),
-            },
+            call: call(
+                ACTION_STATE_SNAPSHOT,
+                map_value([
+                    (
+                        "sections",
+                        Value::List(vec![
+                            map_value([
+                                ("kind", Value::Str("kernel_config".into())),
+                                ("prefix", Value::Str("state://kernel/audit".into())),
+                            ]),
+                            map_value([
+                                ("kind", Value::Str("runtime".into())),
+                                ("limit", Value::Int(8)),
+                            ]),
+                        ]),
+                    ),
+                    ("since_rev", Value::Int(3)),
+                ]),
+            ),
         };
-        let bytes = bincode::serde::encode_to_vec(&frame, BINCODE_CONFIG).unwrap();
+        let bytes = encode_frame(&frame).unwrap();
         let decoded = decode_frame(&bytes, HARD_MAX_WS_FRAME_BYTES).unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    #[tokio::test]
+    async fn hello_rejects_unsupported_wire_encoding() {
+        let st = console_state();
+        let mut sess = unauth_session(st);
+        let reply = handle_frame(
+            &mut sess,
+            ClientFrame::Hello {
+                hello: ClientHello {
+                    protocol_version: PROTOCOL_VERSION,
+                    client_name: Some("test-client".into()),
+                    accepted_encodings: vec!["json".into()],
+                },
+            },
+        )
+        .await;
+        assert!(matches!(
+            reply,
+            ServerFrame::Error {
+                id: None,
+                code: ConsoleErrorCode::BadRequest,
+                ..
+            }
+        ));
+
+        let reply = handle_frame(
+            &mut sess,
+            ClientFrame::Hello {
+                hello: ClientHello::default(),
+            },
+        )
+        .await;
+        assert!(matches!(reply, ServerFrame::HelloAccepted { .. }));
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_requires_authenticated_session() {
+        let st = console_state();
+        let mut sess = unauth_session(st);
+        let reply = handle_frame(&mut sess, ClientFrame::Unsubscribe { id: 99 }).await;
+        assert!(matches!(
+            reply,
+            ServerFrame::Error {
+                id: Some(99),
+                code: ConsoleErrorCode::NotAuthenticated,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1936,37 +2825,55 @@ mod tests {
         assert_eq!(bounded_limit(100, 12, HARD_MAX_WS_FACT_LIMIT), 12);
 
         let frame = ClientFrame::Ping { nonce: 9 };
-        let bytes = bincode::serde::encode_to_vec(&frame, BINCODE_CONFIG).unwrap();
+        let bytes = encode_frame(&frame).unwrap();
         assert!(decode_frame(&bytes, bytes.len()).is_ok());
         assert!(decode_frame(&bytes, bytes.len().saturating_sub(1)).is_err());
     }
 
     #[test]
-    fn all_action_variants_are_bincode_frames() {
+    fn protocol_action_calls_are_msgpack_frames() {
         let actions = vec![
-            ConsoleAction::UserList,
-            ConsoleAction::RoleList,
-            ConsoleAction::SessionList,
-            ConsoleAction::RecentFacts {
-                process: None,
-                limit: 10,
-            },
-            ConsoleAction::TraceRead {
-                process: 1,
-                from: 0,
-                limit: 10,
-            },
-            ConsoleAction::ExtensionInstallationStart { id: "acme".into() },
-            ConsoleAction::PairingDeny {
-                pairing_id: "pair-a".into(),
-            },
+            call(ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE, Value::Null),
+            call(ACTION_AUTHORITY_ACTION_MATRIX, Value::Null),
+            call(
+                ACTION_AUTHORITY_WHY_DENIED,
+                map_value([("action", Value::Str(ACTION_CONFIG_WRITE_CAS.into()))]),
+            ),
+            call(ACTION_ACCESS_USER_LIST, Value::Null),
+            call(ACTION_ACCESS_ROLE_LIST, Value::Null),
+            call(ACTION_ACCESS_SESSION_LIST, Value::Null),
+            call(
+                ACTION_AUDIT_FACTS_RECENT,
+                map_value([("limit", Value::Int(10))]),
+            ),
+            call(
+                ACTION_LINEAGE_TRACE_READ,
+                map_value([
+                    ("process", Value::Int(1)),
+                    ("from", Value::Int(0)),
+                    ("limit", Value::Int(10)),
+                ]),
+            ),
+            call(
+                ACTION_LINEAGE_FACT_READ,
+                map_value([("op_id", Value::Str("1/0/0".into()))]),
+            ),
+            call(ACTION_HEALTH_SUMMARY, Value::Null),
+            call(
+                ACTION_EXTENSIONS_INSTALLATION_START,
+                map_value([("id", Value::Str("acme".into()))]),
+            ),
+            call(
+                ACTION_PAIRING_DENY,
+                map_value([("pairing_id", Value::Str("pair-a".into()))]),
+            ),
         ];
-        for (idx, action) in actions.into_iter().enumerate() {
-            let frame = ClientFrame::Rpc {
+        for (idx, call) in actions.into_iter().enumerate() {
+            let frame = ClientFrame::Call {
                 id: idx as u64,
-                action,
+                call,
             };
-            let bytes = bincode::serde::encode_to_vec(&frame, BINCODE_CONFIG).unwrap();
+            let bytes = encode_frame(&frame).unwrap();
             assert_eq!(
                 decode_frame(&bytes, HARD_MAX_WS_FRAME_BYTES).unwrap(),
                 frame
@@ -1974,11 +2881,19 @@ mod tests {
         }
         let sub = ClientFrame::Subscribe {
             id: 1,
-            stream: ConsoleStream::Config {
-                pattern: "state://kernel/**".into(),
+            stream: StreamCall {
+                stream: STREAM_STATE_WATCH.into(),
+                input: JsonBytes::from_value(&map_value([(
+                    "pattern",
+                    Value::Str("state://kernel/**".into()),
+                )])),
+                scope: Some("test".into()),
+                justification: Some("test stream".into()),
+                ttl_ms: Some(60_000),
+                since_rev: None,
             },
         };
-        let bytes = bincode::serde::encode_to_vec(&sub, BINCODE_CONFIG).unwrap();
+        let bytes = encode_frame(&sub).unwrap();
         assert_eq!(decode_frame(&bytes, HARD_MAX_WS_FRAME_BYTES).unwrap(), sub);
     }
 
@@ -1988,40 +2903,254 @@ mod tests {
         let (token, _principal, password) = root_login(&st).await;
         let principal = step_up_principal(&st, &token, password).await;
         let mut sess = test_session(st, principal.clone());
-        dispatch_action(
+        dispatch_call(
             &mut sess,
             &principal,
-            ConsoleAction::ExtensionInstallationInstall {
-                id: "acme".into(),
-                def: extension_installation("acme", 0),
-                expected_version: None,
-            },
+            call(
+                ACTION_EXTENSIONS_INSTALLATION_INSTALL,
+                map_value([
+                    ("id", Value::Str("acme".into())),
+                    ("def", extension_installation("acme", 0)),
+                    ("expected_version", Value::Null),
+                ]),
+            ),
         )
         .await
         .unwrap();
-        let out = dispatch_action(
+        let out = dispatch_call(
             &mut sess,
             &principal,
-            ConsoleAction::ProcessInspect {
-                process: None,
-                include_recent_facts: true,
-                limit: 8,
-            },
+            visibility_call(
+                ACTION_RUNTIME_PROCESS_INSPECT,
+                map_value([
+                    ("include_recent_facts", Value::Bool(true)),
+                    ("limit", Value::Int(8)),
+                ]),
+            ),
         )
         .await
         .unwrap();
-        assert!(matches!(out, ConsoleResult::Value(Some(_))));
-        let facts = dispatch_action(
+        assert!(out.output.is_some());
+        let facts = dispatch_call(
             &mut sess,
             &principal,
-            ConsoleAction::RecentFacts {
-                process: None,
-                limit: 16,
-            },
+            visibility_call(
+                ACTION_AUDIT_FACTS_RECENT,
+                map_value([("limit", Value::Int(16))]),
+            ),
         )
         .await
         .unwrap();
-        assert!(matches!(facts, ConsoleResult::Value(Some(Value::List(_)))));
+        assert!(matches!(output_value(facts), Value::List(_)));
+    }
+
+    #[tokio::test]
+    async fn authority_matrix_explains_step_up_and_visibility_gate() {
+        let st = console_state();
+        let (token, principal, password) = root_login(&st).await;
+        let mut sess = test_session(st.clone(), principal.clone());
+        let out = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_AUTHORITY_ACTION_MATRIX,
+                map_value([("domain", Value::Str("visibility".into()))]),
+            ),
+        )
+        .await
+        .unwrap();
+        let Value::List(rows) = output_value(out) else {
+            panic!("expected matrix rows")
+        };
+        assert!(rows.iter().any(|row| {
+            row.as_map().is_some_and(
+                |m| matches!(m.get("status"), Some(Value::Str(s)) if s == "step_up_required"),
+            )
+        }));
+
+        let principal = step_up_principal(&st, &token, password).await;
+        let mut sess = test_session(st, principal.clone());
+        let out = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_AUTHORITY_ACTION_MATRIX,
+                map_value([("domain", Value::Str("visibility".into()))]),
+            ),
+        )
+        .await
+        .unwrap();
+        let Value::List(rows) = output_value(out) else {
+            panic!("expected matrix rows")
+        };
+        assert!(rows.iter().any(|row| {
+            row.as_map().is_some_and(|m| {
+                matches!(m.get("action"), Some(Value::Str(a)) if a == ACTION_VISIBILITY_STATE_READ)
+                    && matches!(m.get("status"), Some(Value::Str(s)) if s == "visibility_gate_required")
+            })
+        }));
+    }
+
+    #[tokio::test]
+    async fn authority_resource_access_keeps_vault_on_secret_custody_path() {
+        let st = console_state();
+        let (_token, principal, _password) = root_login(&st).await;
+        let mut sess = test_session(st, principal.clone());
+        let out = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_AUTHORITY_RESOURCE_ACCESS,
+                map_value([
+                    (
+                        "target",
+                        Value::Str("state://chat/source/messages/1".into()),
+                    ),
+                    ("verb", Value::Str("read".into())),
+                ]),
+            ),
+        )
+        .await
+        .unwrap();
+        let Value::Map(row) = output_value(out) else {
+            panic!("expected map")
+        };
+        assert_eq!(row.get("allowed"), Some(&Value::Bool(true)));
+
+        let out = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_AUTHORITY_RESOURCE_ACCESS,
+                map_value([
+                    (
+                        "target",
+                        Value::Str("state://vault/console/root/password".into()),
+                    ),
+                    ("verb", Value::Str("read".into())),
+                ]),
+            ),
+        )
+        .await
+        .unwrap();
+        let Value::Map(row) = output_value(out) else {
+            panic!("expected map")
+        };
+        assert_eq!(row.get("allowed"), Some(&Value::Bool(false)));
+        assert_eq!(
+            row.get("why_not"),
+            Some(&Value::Str("secret_custody_required".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_why_denied_explains_single_action_gate() {
+        let st = console_state();
+        let (_token, principal, _password) = root_login(&st).await;
+        let mut sess = test_session(st, principal.clone());
+        let out = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_AUTHORITY_WHY_DENIED,
+                map_value([("action", Value::Str(ACTION_PAIRING_DENY.into()))]),
+            ),
+        )
+        .await
+        .unwrap();
+        let Value::Map(row) = output_value(out) else {
+            panic!("expected map")
+        };
+        assert_eq!(
+            row.get("status"),
+            Some(&Value::Str("step_up_required".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn health_summary_reports_kernel_registry_and_fact_status() {
+        let st = console_state();
+        let (_token, principal, _password) = root_login(&st).await;
+        let mut sess = test_session(st, principal.clone());
+        let out = dispatch_call(
+            &mut sess,
+            &principal,
+            call(ACTION_HEALTH_SUMMARY, Value::Null),
+        )
+        .await
+        .unwrap();
+        let Value::Map(row) = output_value(out) else {
+            panic!("expected map")
+        };
+        assert_eq!(row.get("status"), Some(&Value::Str("ok".into())));
+        assert!(matches!(row.get("registry"), Some(Value::Map(_))));
+        assert!(matches!(row.get("process_status"), Some(Value::Map(_))));
+        assert!(matches!(row.get("fact_cursor"), Some(Value::Int(_))));
+    }
+
+    #[tokio::test]
+    async fn lineage_fact_read_uses_visibility_gate_and_operation_id() {
+        let st = console_state();
+        let (token, _principal, password) = root_login(&st).await;
+        let principal = step_up_principal(&st, &token, password).await;
+        st.state
+            .write_set(
+                &Path::parse("state://chat/source/messages/lineage").unwrap(),
+                Value::Str("lineage fact source".into()),
+            )
+            .await
+            .unwrap();
+        let mut sess = test_session(st.clone(), principal.clone());
+        dispatch_call(
+            &mut sess,
+            &principal,
+            visibility_call(
+                ACTION_VISIBILITY_STATE_READ,
+                map_value([(
+                    "path",
+                    Value::Str("state://chat/source/messages/lineage".into()),
+                )]),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let op_id = st
+            .boot
+            .kernel
+            .facts
+            .all_facts()
+            .last()
+            .map(|fact| fact.id.to_string())
+            .expect("expected at least one fact");
+        let err = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_LINEAGE_FACT_READ,
+                map_value([("op_id", Value::Str(op_id.clone()))]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ConsoleError::BadRequest(_)));
+
+        let out = dispatch_call(
+            &mut sess,
+            &principal,
+            visibility_call(
+                ACTION_LINEAGE_FACT_BY_OPERATION,
+                map_value([("op_id", Value::Str(op_id.clone()))]),
+            ),
+        )
+        .await
+        .unwrap();
+        let Value::Map(row) = output_value(out) else {
+            panic!("expected map")
+        };
+        assert_eq!(row.get("op_id"), Some(&Value::Str(op_id)));
+        assert!(matches!(row.get("input_ref"), Some(Value::Map(_))));
+        assert!(matches!(row.get("outcome_ref"), Some(Value::Map(_))));
     }
 
     #[tokio::test]
@@ -2030,34 +3159,42 @@ mod tests {
         let (token, _principal, password) = root_login(&st).await;
         let principal = step_up_principal(&st, &token, password).await;
         let mut sess = test_session(st.clone(), principal.clone());
-        dispatch_action(
+        dispatch_call(
             &mut sess,
             &principal,
-            ConsoleAction::ExtensionInstallationInstall {
-                id: "pairable".into(),
-                def: extension_installation("pairable", 0),
-                expected_version: None,
-            },
-        )
-        .await
-        .unwrap();
-        let out = dispatch_action(
-            &mut sess,
-            &principal,
-            ConsoleAction::PairingCreate {
-                input: map_value([
-                    ("pairing_id", Value::Str("pair-ws".into())),
-                    ("installation_id", Value::Str("pairable".into())),
+            call(
+                ACTION_EXTENSIONS_INSTALLATION_INSTALL,
+                map_value([
+                    ("id", Value::Str("pairable".into())),
+                    ("def", extension_installation("pairable", 0)),
+                    ("expected_version", Value::Null),
                 ]),
-                reveal_display_secret: true,
-            },
+            ),
         )
         .await
         .unwrap();
-        let ConsoleResult::Value(Some(jb)) = out else {
-            panic!("expected pairing map");
+        let out = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_PAIRING_CREATE,
+                map_value([
+                    (
+                        "input",
+                        map_value([
+                            ("pairing_id", Value::Str("pair-ws".into())),
+                            ("installation_id", Value::Str("pairable".into())),
+                        ]),
+                    ),
+                    ("reveal_display_secret", Value::Bool(true)),
+                ]),
+            ),
+        )
+        .await
+        .unwrap();
+        let Value::Map(m) = output_value(out) else {
+            panic!("expected map")
         };
-        let Value::Map(m) = jb.to_value() else { panic!("expected map") };
         assert!(matches!(m.get("display_secret"), Some(Value::Str(s)) if !s.is_empty()));
         assert_eq!(st.pairing_display.take_display_secret("pair-ws"), None);
     }
@@ -2067,12 +3204,13 @@ mod tests {
         let st = console_state();
         let (_token, principal, _password) = root_login(&st).await;
         let mut sess = test_session(st, principal.clone());
-        let err = dispatch_action(
+        let err = dispatch_call(
             &mut sess,
             &principal,
-            ConsoleAction::PairingDeny {
-                pairing_id: "pair-ws".into(),
-            },
+            call(
+                ACTION_PAIRING_DENY,
+                map_value([("pairing_id", Value::Str("pair-ws".into()))]),
+            ),
         )
         .await
         .unwrap_err();
@@ -2087,14 +3225,20 @@ mod tests {
         let st = console_state();
         let (_token, principal, _password) = root_login(&st).await;
         let mut sess = test_session(st, principal.clone());
-        let err = dispatch_action(
+        let err = dispatch_call(
             &mut sess,
             &principal,
-            ConsoleAction::ConfigWriteCas {
-                path: "state://kernel/extension-installations/acme".into(),
-                value: extension_installation("acme", 0),
-                expected_version: None,
-            },
+            call(
+                ACTION_CONFIG_WRITE_CAS,
+                map_value([
+                    (
+                        "path",
+                        Value::Str("state://kernel/extension-installations/acme".into()),
+                    ),
+                    ("value", extension_installation("acme", 0)),
+                    ("expected_version", Value::Null),
+                ]),
+            ),
         )
         .await
         .unwrap_err();
@@ -2105,9 +3249,186 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscription_rejects_non_kernel_patterns() {
+    async fn visibility_read_allows_root_business_state_after_step_up() {
+        let st = console_state();
+        let (token, _principal, password) = root_login(&st).await;
+        let principal = step_up_principal(&st, &token, password).await;
+        st.state
+            .write_set(
+                &Path::parse("state://chat/source/messages/1").unwrap(),
+                Value::Str("hello from chat".into()),
+            )
+            .await
+            .unwrap();
+        let before = fact_count(&st);
+        let mut sess = test_session(st.clone(), principal.clone());
+        let out = dispatch_call(
+            &mut sess,
+            &principal,
+            visibility_call(
+                ACTION_VISIBILITY_STATE_READ,
+                map_value([("path", Value::Str("state://chat/source/messages/1".into()))]),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output_value(out), Value::Str("hello from chat".into()));
+        let after = fact_count(&st);
+        assert!(
+            after > before,
+            "visibility read must execute through Operation/Fact, not backend side channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn visibility_rejects_vault_and_requires_justification() {
+        let st = console_state();
+        let (token, _principal, password) = root_login(&st).await;
+        let principal = step_up_principal(&st, &token, password).await;
+        let mut sess = test_session(st, principal.clone());
+        let err = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_VISIBILITY_STATE_READ,
+                map_value([("path", Value::Str("state://chat/source/messages/1".into()))]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ConsoleError::BadRequest(_)));
+
+        let err = dispatch_call(
+            &mut sess,
+            &principal,
+            visibility_call(
+                ACTION_VISIBILITY_STATE_READ,
+                map_value([(
+                    "path",
+                    Value::Str("state://vault/console/root/password".into()),
+                )]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ConsoleError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_json_envelope_is_rejected() {
         let st = console_state();
         let (_token, principal, _password) = root_login(&st).await;
+        let mut sess = test_session(st, principal.clone());
+        let err = dispatch_call(
+            &mut sess,
+            &principal,
+            ActionCall {
+                action: ACTION_CONFIG_READ.into(),
+                input: JsonBytes("{".into()),
+                scope: None,
+                justification: None,
+                ttl_ms: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ConsoleError::BadRequest(message) if message.contains("invalid JSON Value envelope")
+        ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_runtime_facts_require_visibility_gate() {
+        let st = console_state();
+        let (token, principal, password) = root_login(&st).await;
+        let mut sess = test_session(st.clone(), principal.clone());
+        let out = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_STATE_SNAPSHOT,
+                map_value([(
+                    "sections",
+                    Value::List(vec![map_value([("kind", Value::Str("runtime".into()))])]),
+                )]),
+            ),
+        )
+        .await
+        .unwrap();
+        let Value::Map(row) = output_value(out) else {
+            panic!("expected map")
+        };
+        assert!(matches!(row.get("server_rev"), Some(Value::Int(_))));
+        assert!(matches!(row.get("registry_rev"), Some(Value::Int(_))));
+        assert!(matches!(row.get("fact_cursor"), Some(Value::Int(_))));
+        assert!(matches!(row.get("truncated"), Some(Value::List(_))));
+
+        let principal = step_up_principal(&st, &token, password).await;
+        let mut sess = test_session(st, principal.clone());
+        let input = map_value([(
+            "sections",
+            Value::List(vec![map_value([
+                ("kind", Value::Str("runtime".into())),
+                ("include_recent_facts", Value::Bool(true)),
+            ])]),
+        )]);
+        let err = dispatch_call(
+            &mut sess,
+            &principal,
+            call(ACTION_STATE_SNAPSHOT, input.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ConsoleError::BadRequest(_)));
+
+        let out = dispatch_call(
+            &mut sess,
+            &principal,
+            visibility_call(ACTION_STATE_SNAPSHOT, input),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(output_value(out), Value::Map(_)));
+    }
+
+    #[tokio::test]
+    async fn subscription_rejects_resume_without_replacing_existing_subscription() {
+        let st = console_state();
+        let (token, _principal, password) = root_login(&st).await;
+        let principal = step_up_principal(&st, &token, password).await;
+        let mut sess = test_session(st, principal.clone());
+        let (shutdown, _rx) = tokio::sync::oneshot::channel();
+        sess.subscriptions
+            .insert(7, SubscriptionHandle { shutdown });
+
+        let err = subscribe(
+            &mut sess,
+            &principal,
+            7,
+            StreamCall {
+                stream: STREAM_STATE_WATCH.into(),
+                input: JsonBytes::from_value(&map_value([(
+                    "pattern",
+                    Value::Str("state://kernel/**".into()),
+                )])),
+                scope: Some("test".into()),
+                justification: Some("test stream".into()),
+                ttl_ms: Some(60_000),
+                since_rev: Some(1),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ConsoleError::BadRequest(_)));
+        assert!(sess.subscriptions.contains_key(&7));
+    }
+
+    #[tokio::test]
+    async fn subscription_rejects_vault_or_global_state_patterns() {
+        let st = console_state();
+        let (token, _principal, password) = root_login(&st).await;
+        let principal = step_up_principal(&st, &token, password).await;
         let (tx, _rx) = mpsc::channel(1);
         let mut sess = WsSession {
             state: st,
@@ -2123,8 +3444,36 @@ mod tests {
             &mut sess,
             &principal,
             1,
-            ConsoleStream::Config {
-                pattern: "state://fact/**".into(),
+            StreamCall {
+                stream: STREAM_STATE_WATCH.into(),
+                input: JsonBytes::from_value(&map_value([(
+                    "pattern",
+                    Value::Str("state://vault/**".into()),
+                )])),
+                scope: Some("test".into()),
+                justification: Some("test stream".into()),
+                ttl_ms: Some(60_000),
+                since_rev: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ConsoleError::BadRequest(_)));
+
+        let err = subscribe(
+            &mut sess,
+            &principal,
+            2,
+            StreamCall {
+                stream: STREAM_STATE_WATCH.into(),
+                input: JsonBytes::from_value(&map_value([(
+                    "pattern",
+                    Value::Str("state://**".into()),
+                )])),
+                scope: Some("test".into()),
+                justification: Some("test stream".into()),
+                ttl_ms: Some(60_000),
+                since_rev: None,
             },
         )
         .await

@@ -119,6 +119,21 @@ pub struct CompiledOpenPlan {
     pub fast_path: FastPath,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegistryCounts {
+    pub resources: usize,
+    pub interfaces: usize,
+    pub drivers: usize,
+    pub endpoints: usize,
+    pub bindings: usize,
+    pub grants: usize,
+    pub policies: usize,
+    pub names: usize,
+    pub open_cache_entries: usize,
+    pub open_cache_hits: u64,
+    pub open_cache_misses: u64,
+}
+
 /// Shared, lockable registry handle.
 #[derive(Clone, Default)]
 pub struct Registry {
@@ -356,6 +371,23 @@ impl Registry {
 
     pub fn resource_count(&self) -> usize {
         self.inner.read().resources.len()
+    }
+
+    pub fn counts(&self) -> RegistryCounts {
+        let inner = self.inner.read();
+        RegistryCounts {
+            resources: inner.resources.len(),
+            interfaces: inner.interfaces.len(),
+            drivers: inner.drivers.len(),
+            endpoints: inner.endpoints.len(),
+            bindings: inner.bindings.len(),
+            grants: inner.grants.len(),
+            policies: inner.policies.len(),
+            names: inner.names.len(),
+            open_cache_entries: inner.open_cache.len(),
+            open_cache_hits: inner.open_cache_hits,
+            open_cache_misses: inner.open_cache_misses,
+        }
     }
 
     pub fn cached_open_plan(&self, key: &OpenCacheKey) -> Option<CompiledOpenPlan> {

@@ -1,16 +1,11 @@
-//! Management operations (§18.4): the three actions the Web Console performs,
-//! all as ordinary capability-bound Operations — no privileged backdoor.
+//! Kernel management helpers used by the Console Protocol host (§18.4).
 //!
-//! | console action      | operation                                            |
-//! |---------------------|------------------------------------------------------|
-//! | change config       | `Value.write` + `Cas` on `state://kernel/*`          |
-//! | inspect runtime     | read `state://kernel/*` / process inspect            |
-//! | subscribe to changes| `Sequence.subscribe` on a `state://kernel/*` stream  |
-//!
-//! Three iron rules (§18.4): no dedicated wire protocol; no non-privileged
-//! backdoor (config writes go through CAS so concurrent edits don't silently
-//! clobber); the console cannot grant itself an acting identity it wasn't
-//! given.
+//! These functions are the read/write projection for manageable
+//! `state://kernel/*` configuration. They are ordinary capability-bound
+//! Operations with CAS admission, not a privileged storage backdoor. Broader
+//! protocol actions such as visibility, authority inspection, lineage, health,
+//! pairing, and stream dispatch live in `ws`/`protocol` and call into this
+//! module only for kernel management state.
 
 use crate::auth::{self, ConsolePrincipal};
 use crate::state::ConsoleState;

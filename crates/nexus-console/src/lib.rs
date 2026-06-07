@@ -1,9 +1,10 @@
-//! `nexus-console` — the Web Console backend: a management-domain Gateway
+//! `nexus-console` — the Console Protocol host and management-domain Gateway
 //! (§18.4 / §24.3).
 //!
-//! HTTP is limited to bootstrap/auth. Post-login management is carried by the
-//! Console WebSocket (`/ws`) as ordinary capability-bound Operations — no
-//! privileged backdoor.
+//! HTTP is limited to bootstrap/auth. Post-login control is carried by the
+//! Console WebSocket (`/ws`) using descriptor-named protocol actions. Every
+//! action runs as an ordinary capability-bound Operation or read-side
+//! projection — no privileged backend handle and no raw shell.
 
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
@@ -16,6 +17,7 @@ use tower_http::trace::TraceLayer;
 
 pub mod auth;
 pub mod mgmt;
+pub mod protocol;
 pub mod state;
 pub mod ws;
 
@@ -25,6 +27,10 @@ pub use auth::{
     StepUpRequest, bootstrap_root_account,
 };
 pub use mgmt::MgmtError;
+pub use protocol::{
+    ActionCall, ActionResult, ClientFrame, ClientHello, ConsoleErrorCode, ConsoleEvent,
+    PrincipalSummary, ProtocolMetadata, ServerFrame, StreamCall,
+};
 pub use state::{ConsoleState, ConsoleWsConfig};
 
 /// Build the console router.

@@ -1,10 +1,10 @@
-//! Console state: the kernel handle and the management-domain identity (§18.4).
+//! Console state: kernel handles, auth state, and WebSocket runtime limits.
 //!
-//! The Web Console is a **management-domain Gateway**: it maps authenticated
-//! console users to a management identity and runs their actions as ordinary
-//! capability-bound Operations. There is no privileged backdoor and no bespoke
-//! wire protocol — every action is a `Value.write`+Cas, an inspect read, or a
-//! subscribe on a `state://kernel/*` Resource (§18.4).
+//! The Console Protocol host maps authenticated console users to management
+//! identities and then dispatches descriptor-named actions through ordinary
+//! capability-bound Operations and audited visibility gates. This state object
+//! owns only shared execution state; it does not expose a privileged raw
+//! storage channel.
 
 use nexus_kernel::Bootstrap;
 use nexus_state::Backend;
@@ -23,6 +23,7 @@ pub const DEFAULT_WS_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 pub const DEFAULT_WS_MAX_FRAMES_PER_SECOND: usize = 64;
 pub const DEFAULT_WS_MAX_BYTES_PER_SECOND: usize = 4 * 1024 * 1024;
 pub const DEFAULT_WS_MAX_SUBSCRIPTIONS: usize = 32;
+pub const DEFAULT_WS_MAX_STATE_LIST_LIMIT: usize = 512;
 pub const DEFAULT_WS_MAX_FACT_LIMIT: usize = 256;
 pub const DEFAULT_WS_MAX_TRACE_LIMIT: usize = 512;
 pub const DEFAULT_WS_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -43,6 +44,8 @@ pub const MIN_WS_MAX_BYTES_PER_SECOND: usize = 16 * 1024;
 pub const HARD_MAX_WS_BYTES_PER_SECOND: usize = 64 * 1024 * 1024;
 pub const MIN_WS_MAX_SUBSCRIPTIONS: usize = 1;
 pub const HARD_MAX_WS_SUBSCRIPTIONS: usize = 256;
+pub const MIN_WS_MAX_STATE_LIST_LIMIT: usize = 1;
+pub const HARD_MAX_WS_STATE_LIST_LIMIT: usize = 16_384;
 pub const MIN_WS_MAX_FACT_LIMIT: usize = 1;
 pub const HARD_MAX_WS_FACT_LIMIT: usize = 4_096;
 pub const MIN_WS_MAX_TRACE_LIMIT: usize = 1;
@@ -132,6 +135,7 @@ pub struct ConsoleWsConfig {
     pub max_frames_per_second: usize,
     pub max_bytes_per_second: usize,
     pub max_subscriptions: usize,
+    pub max_state_list_limit: usize,
     pub max_fact_limit: usize,
     pub max_trace_limit: usize,
     pub event_send_timeout: Duration,
@@ -148,6 +152,7 @@ impl Default for ConsoleWsConfig {
             max_frames_per_second: DEFAULT_WS_MAX_FRAMES_PER_SECOND,
             max_bytes_per_second: DEFAULT_WS_MAX_BYTES_PER_SECOND,
             max_subscriptions: DEFAULT_WS_MAX_SUBSCRIPTIONS,
+            max_state_list_limit: DEFAULT_WS_MAX_STATE_LIST_LIMIT,
             max_fact_limit: DEFAULT_WS_MAX_FACT_LIMIT,
             max_trace_limit: DEFAULT_WS_MAX_TRACE_LIMIT,
             event_send_timeout: DEFAULT_WS_EVENT_SEND_TIMEOUT,
@@ -186,6 +191,9 @@ impl ConsoleWsConfig {
             max_subscriptions: self
                 .max_subscriptions
                 .clamp(MIN_WS_MAX_SUBSCRIPTIONS, HARD_MAX_WS_SUBSCRIPTIONS),
+            max_state_list_limit: self
+                .max_state_list_limit
+                .clamp(MIN_WS_MAX_STATE_LIST_LIMIT, HARD_MAX_WS_STATE_LIST_LIMIT),
             max_fact_limit: self
                 .max_fact_limit
                 .clamp(MIN_WS_MAX_FACT_LIMIT, HARD_MAX_WS_FACT_LIMIT),
@@ -320,6 +328,7 @@ mod tests {
             max_frames_per_second: usize::MAX,
             max_bytes_per_second: 1,
             max_subscriptions: usize::MAX,
+            max_state_list_limit: 0,
             max_fact_limit: 0,
             max_trace_limit: usize::MAX,
             event_send_timeout: Duration::ZERO,
@@ -336,6 +345,7 @@ mod tests {
         assert_eq!(cfg.max_frames_per_second, HARD_MAX_WS_FRAMES_PER_SECOND);
         assert_eq!(cfg.max_bytes_per_second, MIN_WS_MAX_BYTES_PER_SECOND);
         assert_eq!(cfg.max_subscriptions, HARD_MAX_WS_SUBSCRIPTIONS);
+        assert_eq!(cfg.max_state_list_limit, MIN_WS_MAX_STATE_LIST_LIMIT);
         assert_eq!(cfg.max_fact_limit, MIN_WS_MAX_FACT_LIMIT);
         assert_eq!(cfg.max_trace_limit, HARD_MAX_WS_TRACE_LIMIT);
         assert_eq!(cfg.event_send_timeout, MIN_WS_EVENT_SEND_TIMEOUT);

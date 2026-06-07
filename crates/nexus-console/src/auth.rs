@@ -1570,9 +1570,9 @@ fn root_grants() -> Vec<String> {
         "perform://effect/kernel/**".into(),
         "perform://effect/extension/**".into(),
         "perform://effect/proc/**".into(),
-        "read://state/kernel/**".into(),
+        "read://state/**".into(),
         "write://state/kernel/**".into(),
-        "subscribe://state/kernel/**".into(),
+        "subscribe://state/**".into(),
         "read://state/fact/**".into(),
         "perform://effect/kernel/console/users/**".into(),
     ]
@@ -1814,6 +1814,7 @@ fn record_auth_audit(
         source_addr,
         outcome,
         mfa_level,
+        details: None,
     })
     .map_err(|e| AuthError::State(e.to_string()))
 }

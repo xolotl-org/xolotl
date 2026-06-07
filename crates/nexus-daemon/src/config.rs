@@ -7,7 +7,8 @@ use nexus_console::state::{
     DEFAULT_WS_EVENT_SEND_TIMEOUT, DEFAULT_WS_IDLE_TIMEOUT, DEFAULT_WS_MAX_BYTES_PER_SECOND,
     DEFAULT_WS_MAX_CONNECTIONS_GLOBAL, DEFAULT_WS_MAX_CONNECTIONS_PER_SOURCE,
     DEFAULT_WS_MAX_CONNECTIONS_PER_USER, DEFAULT_WS_MAX_FACT_LIMIT, DEFAULT_WS_MAX_FRAME_BYTES,
-    DEFAULT_WS_MAX_FRAMES_PER_SECOND, DEFAULT_WS_MAX_SUBSCRIPTIONS, DEFAULT_WS_MAX_TRACE_LIMIT,
+    DEFAULT_WS_MAX_FRAMES_PER_SECOND, DEFAULT_WS_MAX_STATE_LIST_LIMIT,
+    DEFAULT_WS_MAX_SUBSCRIPTIONS, DEFAULT_WS_MAX_TRACE_LIMIT,
 };
 use nexus_console::{ConsoleAuthConfig, ConsoleWsConfig};
 use serde::Deserialize;
@@ -140,6 +141,8 @@ pub struct ConsoleWsTuning {
     pub max_bytes_per_second: usize,
     #[serde(default = "default_ws_max_subscriptions")]
     pub max_subscriptions: usize,
+    #[serde(default = "default_ws_max_state_list_limit")]
+    pub max_state_list_limit: usize,
     #[serde(default = "default_ws_max_fact_limit")]
     pub max_fact_limit: usize,
     #[serde(default = "default_ws_max_trace_limit")]
@@ -159,6 +162,7 @@ impl Default for ConsoleWsTuning {
             max_frames_per_second: default_ws_max_frames_per_second(),
             max_bytes_per_second: default_ws_max_bytes_per_second(),
             max_subscriptions: default_ws_max_subscriptions(),
+            max_state_list_limit: default_ws_max_state_list_limit(),
             max_fact_limit: default_ws_max_fact_limit(),
             max_trace_limit: default_ws_max_trace_limit(),
             event_send_timeout_ms: default_ws_event_send_timeout_ms(),
@@ -177,6 +181,7 @@ impl From<ConsoleWsTuning> for ConsoleWsConfig {
             max_frames_per_second: value.max_frames_per_second,
             max_bytes_per_second: value.max_bytes_per_second,
             max_subscriptions: value.max_subscriptions,
+            max_state_list_limit: value.max_state_list_limit,
             max_fact_limit: value.max_fact_limit,
             max_trace_limit: value.max_trace_limit,
             event_send_timeout: Duration::from_millis(value.event_send_timeout_ms),
@@ -233,6 +238,10 @@ fn default_ws_max_subscriptions() -> usize {
     DEFAULT_WS_MAX_SUBSCRIPTIONS
 }
 
+fn default_ws_max_state_list_limit() -> usize {
+    DEFAULT_WS_MAX_STATE_LIST_LIMIT
+}
+
 fn default_ws_max_fact_limit() -> usize {
     DEFAULT_WS_MAX_FACT_LIMIT
 }
@@ -275,7 +284,7 @@ mod tests {
         HARD_MAX_WS_CONNECTIONS_PER_SOURCE, HARD_MAX_WS_FRAME_BYTES, HARD_MAX_WS_FRAMES_PER_SECOND,
         HARD_MAX_WS_SUBSCRIPTIONS, HARD_MAX_WS_TRACE_LIMIT, MIN_WS_CONNECTIONS_GLOBAL,
         MIN_WS_CONNECTIONS_PER_USER, MIN_WS_EVENT_SEND_TIMEOUT, MIN_WS_IDLE_TIMEOUT,
-        MIN_WS_MAX_BYTES_PER_SECOND, MIN_WS_MAX_FACT_LIMIT,
+        MIN_WS_MAX_BYTES_PER_SECOND, MIN_WS_MAX_FACT_LIMIT, MIN_WS_MAX_STATE_LIST_LIMIT,
     };
 
     #[test]
@@ -337,6 +346,7 @@ mod tests {
             max_frames_per_second: usize::MAX,
             max_bytes_per_second: 1,
             max_subscriptions: usize::MAX,
+            max_state_list_limit: 0,
             max_fact_limit: 0,
             max_trace_limit: usize::MAX,
             event_send_timeout_ms: 1,
@@ -353,6 +363,7 @@ mod tests {
         assert_eq!(ws.max_frames_per_second, HARD_MAX_WS_FRAMES_PER_SECOND);
         assert_eq!(ws.max_bytes_per_second, MIN_WS_MAX_BYTES_PER_SECOND);
         assert_eq!(ws.max_subscriptions, HARD_MAX_WS_SUBSCRIPTIONS);
+        assert_eq!(ws.max_state_list_limit, MIN_WS_MAX_STATE_LIST_LIMIT);
         assert_eq!(ws.max_fact_limit, MIN_WS_MAX_FACT_LIMIT);
         assert_eq!(ws.max_trace_limit, HARD_MAX_WS_TRACE_LIMIT);
         assert_eq!(ws.event_send_timeout, MIN_WS_EVENT_SEND_TIMEOUT);
@@ -378,6 +389,7 @@ idle_timeout_secs = 60
 max_frames_per_second = 16
 max_bytes_per_second = 65536
 max_subscriptions = 4
+max_state_list_limit = 48
 max_fact_limit = 32
 max_trace_limit = 64
 event_send_timeout_ms = 250

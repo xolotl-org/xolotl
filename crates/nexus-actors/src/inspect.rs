@@ -139,6 +139,7 @@ mod tests {
             source_addr: None,
             outcome: "ok",
             mfa_level: None,
+            details: None,
         })
         .unwrap();
         let d = KernelInspectDriver::new(boot.kernel.processes.clone(), boot.kernel.facts.clone());
