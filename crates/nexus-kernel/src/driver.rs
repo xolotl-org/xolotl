@@ -239,7 +239,11 @@ pub struct DriverPlan {
     pub driver_id: DriverId,
     pub endpoint: Option<nexus_types::EndpointId>,
     /// method id → live driver. Local inline or a remote RPC stub driver.
-    table: HashMap<MethodId, DynDriver>,
+    ///
+    /// Handles, the open-plan cache, and the data plane all clone DriverPlan.
+    /// Keep the frozen dispatch table shared so those clones stay O(1) Arc
+    /// bumps instead of duplicating the HashMap on every operation.
+    table: Arc<HashMap<MethodId, DynDriver>>,
     pub generation: u64,
 }
 
@@ -252,13 +256,13 @@ impl DriverPlan {
         Self {
             driver_id,
             endpoint,
-            table: HashMap::new(),
+            table: Arc::new(HashMap::new()),
             generation,
         }
     }
 
     pub fn insert(&mut self, method: MethodId, driver: DynDriver) {
-        self.table.insert(method, driver);
+        Arc::make_mut(&mut self.table).insert(method, driver);
     }
 
     /// Dispatch `method`. The data plane has already checked rights and policy

@@ -90,6 +90,27 @@ impl ValueRef {
         }
     }
 
+    /// Project a borrowed value into the fixed-size Fact representation.
+    /// Inline values are cloned because Facts own their replay/audit snapshot;
+    /// out-of-line values only copy the content-address metadata.
+    pub fn of_ref(v: &Value) -> Self {
+        match v {
+            Value::Blob(b) => ValueRef::External {
+                hash: b.hash.clone(),
+                size: b.size,
+            },
+            Value::Tensor(t) => ValueRef::External {
+                hash: t.blob.hash.clone(),
+                size: t.blob.size,
+            },
+            Value::Frame(fr) => ValueRef::External {
+                hash: fr.blob.hash.clone(),
+                size: fr.blob.size,
+            },
+            _ => ValueRef::Inline(v.clone()),
+        }
+    }
+
     pub fn as_inline(&self) -> Option<&Value> {
         match self {
             ValueRef::Inline(v) => Some(v),
@@ -178,6 +199,27 @@ impl OutcomeRef {
                 size: fr.blob.size,
             },
             _ => OutcomeRef::Inline(v),
+        }
+    }
+
+    /// Project a borrowed success body into the Fact outcome representation.
+    /// Like [`ValueRef::of_ref`], this avoids cloning tensor/blob/frame wrapper
+    /// fields that are not stored in the hot record.
+    pub fn of_ref(v: &Value) -> Self {
+        match v {
+            Value::Blob(b) => OutcomeRef::External {
+                hash: b.hash.clone(),
+                size: b.size,
+            },
+            Value::Tensor(t) => OutcomeRef::External {
+                hash: t.blob.hash.clone(),
+                size: t.blob.size,
+            },
+            Value::Frame(fr) => OutcomeRef::External {
+                hash: fr.blob.hash.clone(),
+                size: fr.blob.size,
+            },
+            _ => OutcomeRef::Inline(v.clone()),
         }
     }
 
@@ -378,6 +420,34 @@ mod tests {
             _ => panic!("large blob must be externalized, never inlined into a Fact"),
         }
         assert!(matches!(ValueRef::of(Value::Int(3)), ValueRef::Inline(_)));
+    }
+
+    #[test]
+    fn borrowed_refs_externalize_large_payloads_without_owned_value() {
+        let blob = Value::Blob(BlobRef {
+            hash: "abc".into(),
+            size: 1_000_000,
+            mime: None,
+        });
+
+        assert_eq!(
+            ValueRef::of_ref(&blob),
+            ValueRef::External {
+                hash: "abc".into(),
+                size: 1_000_000
+            }
+        );
+        assert_eq!(
+            OutcomeRef::of_ref(&blob),
+            OutcomeRef::External {
+                hash: "abc".into(),
+                size: 1_000_000
+            }
+        );
+        assert_eq!(
+            ValueRef::of_ref(&Value::Int(3)),
+            ValueRef::Inline(Value::Int(3))
+        );
     }
 
     #[test]

@@ -619,7 +619,7 @@ impl DataPlane {
             handle: op.handle,
             resource,
             method: op.method,
-            input_ref: ValueRef::of(op.input.clone()),
+            input_ref: ValueRef::of_ref(&op.input),
             taint: op.taint.clone(),
             decision: DecisionTag::Ok, // provisional; set on complete
             outcome_ref: OutcomeRef::None,
@@ -641,7 +641,7 @@ impl DataPlane {
         batchable: bool,
     ) -> Fact {
         let outcome_ref = match outcome {
-            Outcome::Done(v) | Outcome::Short(v) => OutcomeRef::of(v.clone()),
+            Outcome::Done(v) | Outcome::Short(v) => OutcomeRef::of_ref(v),
             Outcome::Fail(_) => OutcomeRef::None,
         };
         let batch = if batchable {
@@ -657,7 +657,7 @@ impl DataPlane {
             handle: op.handle,
             resource,
             method: op.method,
-            input_ref: ValueRef::of(op.input.clone()),
+            input_ref: ValueRef::of_ref(&op.input),
             taint: taint.clone(),
             decision,
             outcome_ref,
