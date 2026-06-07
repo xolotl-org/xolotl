@@ -13,10 +13,10 @@
 use async_trait::async_trait;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};
 use nexus_types::{FloatBits, MethodId, Outcome, OutputMode, Purity, Value};
-use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use parking_lot::{Mutex, RwLock};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -37,6 +37,44 @@ const LSH_TABLES: usize = 16;
 const LSH_BITS: usize = 6;
 const ANN_CANDIDATE_FLOOR: usize = 128;
 const ANN_CANDIDATE_MULTIPLIER: usize = 32;
+const HYPERPLANE_CACHE_LIMIT: usize = 16;
+const HYPERPLANE_CACHE_MAX_DIMS: usize = 8192;
+type Hyperplanes = Vec<[[f32; LSH_BITS]; LSH_TABLES]>;
+
+struct HyperplaneCache {
+    entries: HashMap<usize, Arc<Hyperplanes>>,
+    insertion_order: VecDeque<usize>,
+}
+
+impl HyperplaneCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, dims: usize) -> Option<Arc<Hyperplanes>> {
+        self.entries.get(&dims).cloned()
+    }
+
+    fn insert(&mut self, dims: usize, hyperplanes: Arc<Hyperplanes>) -> Arc<Hyperplanes> {
+        if let Some(cached) = self.get(dims) {
+            return cached;
+        }
+        while self.entries.len() >= HYPERPLANE_CACHE_LIMIT {
+            let Some(evict) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&evict);
+        }
+        self.insertion_order.push_back(dims);
+        self.entries.insert(dims, hyperplanes.clone());
+        hyperplanes
+    }
+}
+
+static HYPERPLANE_CACHE: OnceLock<RwLock<HyperplaneCache>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SpaceShape {
@@ -294,13 +332,14 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn lsh_signatures(vector: &[f32]) -> [u64; LSH_TABLES] {
+    let hyperplanes = hyperplanes_for_dims(vector.len());
     let mut signatures = [0u64; LSH_TABLES];
     for (table, signature) in signatures.iter_mut().enumerate() {
         let mut sig = 0u64;
         for bit in 0..LSH_BITS {
             let mut dot = 0.0f32;
             for (dim, value) in vector.iter().enumerate() {
-                dot += *value * hyperplane_component(table, bit, dim);
+                dot += *value * hyperplanes[dim][table][bit];
             }
             if dot >= 0.0 {
                 sig |= 1u64 << bit;
@@ -309,6 +348,32 @@ fn lsh_signatures(vector: &[f32]) -> [u64; LSH_TABLES] {
         *signature = sig;
     }
     signatures
+}
+
+fn hyperplanes_for_dims(dims: usize) -> Arc<Hyperplanes> {
+    if dims > HYPERPLANE_CACHE_MAX_DIMS {
+        return compute_hyperplanes(dims);
+    }
+
+    let cache = HYPERPLANE_CACHE.get_or_init(|| RwLock::new(HyperplaneCache::new()));
+    if let Some(cached) = cache.read().get(dims) {
+        return cached;
+    }
+
+    let computed = compute_hyperplanes(dims);
+    cache.write().insert(dims, computed)
+}
+
+fn compute_hyperplanes(dims: usize) -> Arc<Hyperplanes> {
+    Arc::new(
+        (0..dims)
+            .map(|dim| {
+                std::array::from_fn(|table| {
+                    std::array::from_fn(|bit| hyperplane_component(table, bit, dim))
+                })
+            })
+            .collect(),
+    )
 }
 
 fn hyperplane_component(table: usize, bit: usize, dim: usize) -> f32 {

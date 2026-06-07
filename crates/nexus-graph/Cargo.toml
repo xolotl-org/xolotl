@@ -14,3 +14,10 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 blake3 = "1.8.5"
 thiserror = "2.0.18"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "graph_hot_paths"
+harness = false

@@ -6,7 +6,10 @@ use nexus_state::{
 use nexus_types::{MergeRule, Path, TaintSet, Value};
 use parking_lot::Mutex;
 use redb::{Database, ReadableDatabase, ReadableTable};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicI64, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
@@ -18,14 +21,31 @@ struct Subscriber {
 
 pub struct RedbStateBackend {
     db: Arc<Database>,
+    history_clock: Arc<AtomicI64>,
     subs: Mutex<Vec<Subscriber>>,
 }
 
 impl RedbStateBackend {
-    pub(crate) fn new(db: Arc<Database>) -> Self {
+    pub(crate) fn new(db: Arc<Database>, history_clock: Arc<AtomicI64>) -> Self {
         Self {
             db,
+            history_clock,
             subs: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn next_millis(&self) -> i64 {
+        loop {
+            let observed = self.history_clock.load(Ordering::Relaxed);
+            let wall = now_millis();
+            let next = if wall > observed { wall } else { observed + 1 };
+            if self
+                .history_clock
+                .compare_exchange(observed, next, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return next;
+            }
         }
     }
 
@@ -39,13 +59,22 @@ impl RedbStateBackend {
         }
     }
 
-    // StateError::CasFailed carries the prior/expected Values, making the
-    // error sizable; boxing the shared error type isn't worth it for an
-    // internal helper.
     #[allow(clippy::result_large_err)]
-    fn record_history(&self, event: &StateEvent) -> StateResult<()> {
+    fn record_history_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        event: &StateEvent,
+    ) -> StateResult<()> {
+        Self::record_history_at_millis_in_txn(txn, event, self.next_millis())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn record_history_at_millis_in_txn(
+        txn: &redb::WriteTransaction,
+        event: &StateEvent,
+        ts: i64,
+    ) -> StateResult<()> {
         let path = event.path();
-        let ts = now_millis();
         let entry = StateHistoryEntry {
             at_millis: ts,
             event: event.clone(),
@@ -53,23 +82,34 @@ impl RedbStateBackend {
         let entry_bytes =
             serde_json::to_vec(&serialize_history_entry(&entry)?).map_err(StateError::Serde)?;
 
-        let mut key = path.to_string().into_bytes();
-        key.push(0xFF);
-        key.extend_from_slice(&ts.to_be_bytes());
+        let mut base_key = path.to_string().into_bytes();
+        base_key.push(0xFF);
+        base_key.extend_from_slice(&ts.to_be_bytes());
 
-        let txn = self
-            .db
-            .begin_write()
+        let mut table = txn
+            .open_table(STATE_HISTORY_TABLE)
             .map_err(|e| StateError::Backend(e.to_string()))?;
+        let mut key = base_key.clone();
+        if table
+            .get(key.as_slice())
+            .map_err(|e| StateError::Backend(e.to_string()))?
+            .is_some()
         {
-            let mut table = txn
-                .open_table(STATE_HISTORY_TABLE)
-                .map_err(|e| StateError::Backend(e.to_string()))?;
-            table
-                .insert(key.as_slice(), entry_bytes.as_slice())
-                .map_err(|e| StateError::Backend(e.to_string()))?;
+            for seq in 0u64.. {
+                key.clear();
+                key.extend_from_slice(&base_key);
+                key.extend_from_slice(&seq.to_be_bytes());
+                if table
+                    .get(key.as_slice())
+                    .map_err(|e| StateError::Backend(e.to_string()))?
+                    .is_none()
+                {
+                    break;
+                }
+            }
         }
-        txn.commit()
+        table
+            .insert(key.as_slice(), entry_bytes.as_slice())
             .map_err(|e| StateError::Backend(e.to_string()))?;
         Ok(())
     }
@@ -124,6 +164,36 @@ fn value_to_json(v: &Value) -> StateResult<serde_json::Value> {
 
 fn json_to_value(j: &serde_json::Value) -> StateResult<Value> {
     serde_json::from_value(j.clone()).map_err(StateError::Serde)
+}
+
+fn history_scan_end(path: &Path) -> Vec<u8> {
+    let mut end = path.to_string().into_bytes();
+    end.push(0xFF);
+    end.push(0xFF);
+    end
+}
+
+fn history_key_parts(key: &[u8]) -> StateResult<(Path, i64)> {
+    let separator = key
+        .iter()
+        .position(|byte| *byte == 0xFF)
+        .ok_or_else(|| StateError::Backend("history key missing path separator".into()))?;
+    let path = std::str::from_utf8(&key[..separator])
+        .map_err(|e| StateError::Backend(format!("history key path is invalid UTF-8: {e}")))
+        .and_then(|path| {
+            Path::parse(path)
+                .map_err(|e| StateError::Backend(format!("history key path is invalid: {e}")))
+        })?;
+    let ts_start = separator + 1;
+    let ts_end = ts_start + 8;
+    if key.len() < ts_end {
+        return Err(StateError::Backend(
+            "history key missing timestamp bytes".into(),
+        ));
+    }
+    let mut ts = [0u8; 8];
+    ts.copy_from_slice(&key[ts_start..ts_end]);
+    Ok((path, i64::from_be_bytes(ts)))
 }
 
 /// On-disk envelope persisting a value with its taint (§4.4/§12). Stored as JSON
@@ -189,6 +259,11 @@ impl StateBackend for RedbStateBackend {
     ) -> StateResult<()> {
         let key = path.to_string();
         let bytes = encode_envelope(&value, &taint)?;
+        let ev = StateEvent::Set {
+            path: path.clone(),
+            value,
+            taint,
+        };
         let txn = self
             .db
             .begin_write()
@@ -201,15 +276,10 @@ impl StateBackend for RedbStateBackend {
                 .insert(key.as_str(), bytes.as_slice())
                 .map_err(|e| StateError::Backend(e.to_string()))?;
         }
+        self.record_history_in_txn(&txn, &ev)?;
         txn.commit()
             .map_err(|e| StateError::Backend(e.to_string()))?;
 
-        let ev = StateEvent::Set {
-            path: path.clone(),
-            value,
-            taint,
-        };
-        let _ = self.record_history(&ev);
         self.notify(ev);
         Ok(())
     }
@@ -221,6 +291,11 @@ impl StateBackend for RedbStateBackend {
         taint: TaintSet,
     ) -> StateResult<()> {
         let key = path.to_string();
+        let ev = StateEvent::Append {
+            path: path.clone(),
+            item: item.clone(),
+            taint: taint.clone(),
+        };
         let txn = self
             .db
             .begin_write()
@@ -252,15 +327,10 @@ impl StateBackend for RedbStateBackend {
                 }
             }
         }
+        self.record_history_in_txn(&txn, &ev)?;
         txn.commit()
             .map_err(|e| StateError::Backend(e.to_string()))?;
 
-        let ev = StateEvent::Append {
-            path: path.clone(),
-            item,
-            taint,
-        };
-        let _ = self.record_history(&ev);
         self.notify(ev);
         Ok(())
     }
@@ -273,6 +343,11 @@ impl StateBackend for RedbStateBackend {
         taint: TaintSet,
     ) -> StateResult<()> {
         let key = path.to_string();
+        let ev = StateEvent::Set {
+            path: path.clone(),
+            value: new.clone(),
+            taint: taint.clone(),
+        };
         let txn = self
             .db
             .begin_write()
@@ -298,15 +373,10 @@ impl StateBackend for RedbStateBackend {
                 .insert(key.as_str(), bytes.as_slice())
                 .map_err(|e| StateError::Backend(e.to_string()))?;
         }
+        self.record_history_in_txn(&txn, &ev)?;
         txn.commit()
             .map_err(|e| StateError::Backend(e.to_string()))?;
 
-        let ev = StateEvent::Set {
-            path: path.clone(),
-            value: new,
-            taint,
-        };
-        let _ = self.record_history(&ev);
         self.notify(ev);
         Ok(())
     }
@@ -327,12 +397,14 @@ impl StateBackend for RedbStateBackend {
                 .map_err(|e| StateError::Backend(e.to_string()))?
                 .is_some();
         }
+        let ev = StateEvent::Delete { path: path.clone() };
+        if existed {
+            self.record_history_in_txn(&txn, &ev)?;
+        }
         txn.commit()
             .map_err(|e| StateError::Backend(e.to_string()))?;
 
         if existed {
-            let ev = StateEvent::Delete { path: path.clone() };
-            let _ = self.record_history(&ev);
             self.notify(ev);
         }
         Ok(())
@@ -379,6 +451,9 @@ impl StateBackend for RedbStateBackend {
             }
             let path = Path::parse(key_str)
                 .map_err(|e| StateError::Backend(format!("invalid path in db: {e}")))?;
+            if path != *prefix && !prefix.is_prefix_of(&path) {
+                continue;
+            }
             let val = decode_envelope(val_guard.value())?;
             results.push((path, val));
         }
@@ -392,13 +467,8 @@ impl StateBackend for RedbStateBackend {
         to_millis: i64,
     ) -> StateResult<Vec<StateHistoryEntry>> {
         let path_str = path.to_string();
-        let mut prefix_start = path_str.clone().into_bytes();
-        prefix_start.push(0xFF);
-        prefix_start.extend_from_slice(&from_millis.to_be_bytes());
-
-        let mut prefix_end = path_str.into_bytes();
-        prefix_end.push(0xFF);
-        prefix_end.extend_from_slice(&to_millis.to_be_bytes());
+        let prefix_start = path_str.clone().into_bytes();
+        let prefix_end = history_scan_end(path);
 
         let txn = self
             .db
@@ -414,11 +484,19 @@ impl StateBackend for RedbStateBackend {
             .map_err(|e| StateError::Backend(e.to_string()))?;
 
         for entry in range {
-            let (_key, val_guard) = entry.map_err(|e| StateError::Backend(e.to_string()))?;
+            let (key_guard, val_guard) = entry.map_err(|e| StateError::Backend(e.to_string()))?;
+            let (event_path, at_millis) = history_key_parts(key_guard.value())?;
+            if event_path != *path && !path.is_prefix_of(&event_path) {
+                continue;
+            }
+            if at_millis < from_millis || at_millis >= to_millis {
+                continue;
+            }
             let json: serde_json::Value =
                 serde_json::from_slice(val_guard.value()).map_err(StateError::Serde)?;
             results.push(deserialize_history_entry(&json)?);
         }
+        results.sort_by_key(|entry| entry.at_millis);
         Ok(results)
     }
 
@@ -562,6 +640,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_keeps_multiple_events_for_same_path_in_one_millisecond() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.keep().join("test.redb");
+        let store = RedbStore::open(path).unwrap();
+        let state_path = p("state://history/collide");
+        let txn = store
+            .db
+            .begin_write()
+            .map_err(|e| StateError::Backend(e.to_string()))
+            .unwrap();
+        RedbStateBackend::record_history_at_millis_in_txn(
+            &txn,
+            &StateEvent::Set {
+                path: state_path.clone(),
+                value: Value::Int(1),
+                taint: TaintSet::pristine(),
+            },
+            1_700_000_000_000,
+        )
+        .unwrap();
+        RedbStateBackend::record_history_at_millis_in_txn(
+            &txn,
+            &StateEvent::Set {
+                path: state_path.clone(),
+                value: Value::Int(2),
+                taint: TaintSet::pristine(),
+            },
+            1_700_000_000_000,
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let backend = store.state_backend();
+        let entries = backend.read_range(&state_path, 0, i64::MAX).await.unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn history_clock_is_shared_across_state_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.keep().join("test.redb");
+        let store = RedbStore::open(path).unwrap();
+        let first = store.state_backend();
+        let second = store.state_backend();
+        let state_path = p("state://history/shared-clock");
+
+        first.write_set(&state_path, Value::Int(1)).await.unwrap();
+        second.write_set(&state_path, Value::Int(2)).await.unwrap();
+
+        let entries = first.read_range(&state_path, 0, i64::MAX).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries[0].at_millis < entries[1].at_millis,
+            "history timestamps must preserve write order across backends"
+        );
+    }
+
+    #[tokio::test]
     async fn cas_success_and_failure() {
         let b = tmp_backend();
         b.write_set(&p("state://k"), Value::Int(1)).await.unwrap();
@@ -619,6 +755,58 @@ mod tests {
                 .iter()
                 .all(|(p, _)| p.to_string().starts_with("state://memory/alice"))
         );
+    }
+
+    #[tokio::test]
+    async fn prefix_scan_is_segment_aware() {
+        let b = tmp_backend();
+        b.write_set(&p("state://memory/alice"), Value::Int(1))
+            .await
+            .unwrap();
+        b.write_set(&p("state://memory/aliceevil"), Value::Int(2))
+            .await
+            .unwrap();
+        b.write_set(&p("state://memory/alice/prefs"), Value::Int(3))
+            .await
+            .unwrap();
+
+        let results = b.read_prefix(&p("state://memory/alice")).await.unwrap();
+        let paths: Vec<String> = results
+            .into_iter()
+            .map(|(path, _)| path.to_string())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["state://memory/alice", "state://memory/alice/prefs"]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_range_includes_descendants_but_not_string_prefix_siblings() {
+        let b = tmp_backend();
+        b.write_set(&p("state://memory"), Value::Int(1))
+            .await
+            .unwrap();
+        b.write_set(&p("state://memory/alice"), Value::Int(2))
+            .await
+            .unwrap();
+        b.write_set(&p("state://memoryevil"), Value::Int(3))
+            .await
+            .unwrap();
+
+        let entries = b
+            .read_range(&p("state://memory"), 0, i64::MAX)
+            .await
+            .unwrap();
+        let paths: Vec<String> = entries
+            .into_iter()
+            .map(|entry| match entry.event {
+                StateEvent::Set { path, .. } => path.to_string(),
+                StateEvent::Append { path, .. } => path.to_string(),
+                StateEvent::Delete { path } => path.to_string(),
+            })
+            .collect();
+        assert_eq!(paths, vec!["state://memory", "state://memory/alice"]);
     }
 
     #[tokio::test]

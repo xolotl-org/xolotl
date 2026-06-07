@@ -19,5 +19,10 @@ serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["sync"] }
 
 [dev-dependencies]
+criterion = "0.8.2"
 tempfile = "3.27.0"
 tokio = { version = "1.52.3", features = ["rt", "sync", "macros", "time", "test-util"] }
+
+[[bench]]
+name = "redb_storage"
+harness = false

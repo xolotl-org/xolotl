@@ -18,4 +18,9 @@ thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt", "sync", "macros"] }
 
 [dev-dependencies]
+criterion = "0.8.2"
 tokio = { version = "1.52.3", features = ["rt", "sync", "macros", "time", "test-util"] }
+
+[[bench]]
+name = "in_memory_state"
+harness = false

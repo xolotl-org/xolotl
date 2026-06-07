@@ -104,7 +104,7 @@ pub fn open_resource(
     // `req.rights ⊆ g.rights` as part of selection, and only surface
     // `RightsNotSubset` when a selector matched but no grant covered the rights.
     let matching: Vec<_> = registry
-        .grants_of(req.process)
+        .candidate_grants(req.process, &req.verb, &resource_name)
         .into_iter()
         .filter(|g| {
             !g.expires.is_expired(req.now_millis) && g.selector.matches(&req.verb, &resource_name)

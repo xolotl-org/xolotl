@@ -29,4 +29,9 @@ tokio = { version = "1.52.3", features = ["rt", "sync", "macros", "time", "fs", 
 url = "2.5.8"
 
 [dev-dependencies]
+criterion = "0.8.2"
 tempfile = "3.27.0"
+
+[[bench]]
+name = "standard_drivers"
+harness = false

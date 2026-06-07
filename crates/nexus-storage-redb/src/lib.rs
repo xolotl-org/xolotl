@@ -13,7 +13,7 @@ pub use fact::RedbFactStore;
 use redb::{Database, TableDefinition};
 pub use state::RedbStateBackend;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicI64};
 
 const STATE_VALUES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("state_values");
 const STATE_HISTORY_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state_history");
@@ -21,11 +21,16 @@ const STATE_HISTORY_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new(
 const FACTS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("facts");
 /// OperationId key → cursor slot, so `complete` updates the begun fact.
 const FACT_INDEX_TABLE: TableDefinition<&str, u64> = TableDefinition::new("fact_index");
+/// `(caller process, cursor slot)` → cursor slot, so `facts_of(process)` is a
+/// bounded range scan instead of a full fact-log decode.
+const FACT_PROCESS_INDEX_TABLE: TableDefinition<&str, u64> =
+    TableDefinition::new("fact_process_index");
 const FACT_META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("fact_meta");
 
 #[derive(Clone)]
 pub struct RedbStore {
     db: Arc<Database>,
+    state_history_clock: Arc<AtomicI64>,
 }
 
 impl RedbStore {
@@ -37,14 +42,18 @@ impl RedbStore {
             let _ = txn.open_table(STATE_HISTORY_TABLE);
             let _ = txn.open_table(FACTS_TABLE);
             let _ = txn.open_table(FACT_INDEX_TABLE);
+            let _ = txn.open_table(FACT_PROCESS_INDEX_TABLE);
             let _ = txn.open_table(FACT_META_TABLE);
             txn.commit().map_err(map_db_error)?;
         }
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            state_history_clock: Arc::new(AtomicI64::new(0)),
+        })
     }
 
     pub fn state_backend(&self) -> RedbStateBackend {
-        RedbStateBackend::new(self.db.clone())
+        RedbStateBackend::new(self.db.clone(), self.state_history_clock.clone())
     }
 
     /// The durable fact store (§9).

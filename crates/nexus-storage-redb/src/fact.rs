@@ -3,7 +3,9 @@
 //! maps each fact's [`OperationId`] to its cursor slot so `complete` can update
 //! the pending record in place.
 
-use crate::{FACT_INDEX_TABLE, FACT_META_TABLE, FACTS_TABLE, map_db_error};
+use crate::{
+    FACT_INDEX_TABLE, FACT_META_TABLE, FACT_PROCESS_INDEX_TABLE, FACTS_TABLE, map_db_error,
+};
 use nexus_kernel::{FactError, FactStore};
 use nexus_types::{Fact, OperationId, ProcessId};
 use parking_lot::Mutex;
@@ -47,23 +49,59 @@ impl RedbFactStore {
         format!("{}/{}/{}", id.process.get(), id.position.get(), id.attempt)
     }
 
+    fn process_prefix(process: ProcessId) -> String {
+        format!("{:020}/", process.get())
+    }
+
+    fn process_key(process: ProcessId, slot: u64) -> String {
+        format!("{}{:020}", Self::process_prefix(process), slot)
+    }
+
     fn store_fact(
         &self,
         txn: &redb::WriteTransaction,
         slot: u64,
         fact: &Fact,
+        old_caller: Option<ProcessId>,
     ) -> Result<(), FactError> {
         ensure_fact_schema(fact)?;
         let bytes = serde_json::to_vec(fact).map_err(fact_err)?;
         {
             let mut table = txn.open_table(FACTS_TABLE).map_err(fact_err)?;
             table.insert(slot, bytes.as_slice()).map_err(fact_err)?;
+        };
+        {
+            let mut index = txn.open_table(FACT_INDEX_TABLE).map_err(fact_err)?;
+            index
+                .insert(Self::op_key(&fact.id).as_str(), slot)
+                .map_err(fact_err)?;
         }
-        let mut index = txn.open_table(FACT_INDEX_TABLE).map_err(fact_err)?;
-        index
-            .insert(Self::op_key(&fact.id).as_str(), slot)
-            .map_err(fact_err)?;
+        {
+            let mut index = txn.open_table(FACT_PROCESS_INDEX_TABLE).map_err(fact_err)?;
+            if let Some(old) = old_caller
+                && old != fact.caller
+            {
+                let old_key = Self::process_key(old, slot);
+                index.remove(old_key.as_str()).map_err(fact_err)?;
+            }
+            let process_key = Self::process_key(fact.caller, slot);
+            index.insert(process_key.as_str(), slot).map_err(fact_err)?;
+        }
         Ok(())
+    }
+
+    fn caller_at_slot(
+        &self,
+        txn: &redb::WriteTransaction,
+        slot: u64,
+    ) -> Result<Option<ProcessId>, FactError> {
+        let table = txn.open_table(FACTS_TABLE).map_err(fact_err)?;
+        table
+            .get(slot)
+            .map_err(fact_err)?
+            .map(|bytes| serde_json::from_slice::<Fact>(bytes.value()).map(|f| f.caller))
+            .transpose()
+            .map_err(fact_err)
     }
 
     fn slot_of(&self, id: &OperationId) -> Result<Option<u64>, FactError> {
@@ -73,6 +111,13 @@ impl RedbFactStore {
             .get(Self::op_key(id).as_str())
             .map_err(fact_err)?
             .map(|slot| slot.value()))
+    }
+
+    fn update_existing_slot(&self, slot: u64, fact: &Fact) -> Result<(), FactError> {
+        let txn = self.db.begin_write().map_err(fact_err)?;
+        let old_caller = self.caller_at_slot(&txn, slot)?;
+        self.store_fact(&txn, slot, fact, old_caller)?;
+        txn.commit().map_err(fact_err)
     }
 }
 
@@ -85,7 +130,7 @@ impl FactStore for RedbFactStore {
             .ok_or_else(|| FactError("fact cursor overflow".into()))?;
 
         let txn = self.db.begin_write().map_err(fact_err)?;
-        self.store_fact(&txn, slot, &fact)?;
+        self.store_fact(&txn, slot, &fact, None)?;
         {
             let mut meta = txn.open_table(FACT_META_TABLE).map_err(fact_err)?;
             meta.insert(NEXT_CURSOR_KEY, next).map_err(fact_err)?;
@@ -99,20 +144,24 @@ impl FactStore for RedbFactStore {
 
     fn complete(&self, fact: Fact) -> Result<(), FactError> {
         // Update the existing slot if the fact was begun; else append fresh.
+        if let Some(slot) = self.slot_of(&fact.id)? {
+            return self.update_existing_slot(slot, &fact);
+        }
+
+        // Serialize only the append decision. A second lookup under the cursor
+        // lock closes the race where concurrent completes for the same new
+        // OperationId would both observe no index entry and append duplicates.
+        let mut cursor = self.cursor.lock();
         let slot = self.slot_of(&fact.id)?;
-        let txn = self.db.begin_write().map_err(fact_err)?;
         match slot {
-            Some(slot) => {
-                self.store_fact(&txn, slot, &fact)?;
-                txn.commit().map_err(fact_err)?;
-            }
+            Some(slot) => self.update_existing_slot(slot, &fact)?,
             None => {
-                let mut cursor = self.cursor.lock();
+                let txn = self.db.begin_write().map_err(fact_err)?;
                 let slot = *cursor;
                 let next = slot
                     .checked_add(1)
                     .ok_or_else(|| FactError("fact cursor overflow".into()))?;
-                self.store_fact(&txn, slot, &fact)?;
+                self.store_fact(&txn, slot, &fact, None)?;
                 {
                     let mut meta = txn.open_table(FACT_META_TABLE).map_err(fact_err)?;
                     meta.insert(NEXT_CURSOR_KEY, next).map_err(fact_err)?;
@@ -133,13 +182,25 @@ impl FactStore for RedbFactStore {
 
     fn facts_of(&self, process: ProcessId) -> Result<Vec<Fact>, FactError> {
         let txn = self.db.begin_read().map_err(fact_err)?;
-        let table = txn.open_table(FACTS_TABLE).map_err(fact_err)?;
-        let mut facts = Vec::new();
-        for item in table.iter().map_err(fact_err)? {
-            let (_slot, bytes) = item.map_err(fact_err)?;
-            let fact = serde_json::from_slice::<Fact>(bytes.value()).map_err(fact_err)?;
-            if fact.caller == process {
-                facts.push(fact);
+        let slots = {
+            let process_index = txn.open_table(FACT_PROCESS_INDEX_TABLE).map_err(fact_err)?;
+            let prefix = Self::process_prefix(process);
+            let mut slots = Vec::new();
+            for item in process_index.range(prefix.as_str()..).map_err(fact_err)? {
+                let (key, slot) = item.map_err(fact_err)?;
+                if !key.value().starts_with(prefix.as_str()) {
+                    break;
+                }
+                slots.push(slot.value());
+            }
+            slots
+        };
+
+        let facts_table = txn.open_table(FACTS_TABLE).map_err(fact_err)?;
+        let mut facts = Vec::with_capacity(slots.len());
+        for slot in slots {
+            if let Some(bytes) = facts_table.get(slot).map_err(fact_err)? {
+                facts.push(serde_json::from_slice::<Fact>(bytes.value()).map_err(fact_err)?);
             }
         }
         Ok(facts)
@@ -220,6 +281,32 @@ mod tests {
             "complete updates the begun slot, not a new one"
         );
         assert!(facts[0].is_complete());
+    }
+
+    #[test]
+    fn concurrent_complete_same_new_operation_is_single_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facts.redb");
+        let store = RedbStore::open(&path).unwrap();
+        let fs = Arc::new(store.fact_store().unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut threads = Vec::new();
+
+        for _ in 0..8 {
+            let fs = fs.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                fs.complete(fact(1, 0, true)).unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let facts = fs.facts_of(ProcessId::new(1)).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(fs.all_facts().unwrap().len(), 1);
     }
 
     #[test]

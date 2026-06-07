@@ -19,3 +19,10 @@ serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt", "sync", "macros", "time", "rt-multi-thread"] }
 tracing = "0.1.44"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "kernel_hot_paths"
+harness = false

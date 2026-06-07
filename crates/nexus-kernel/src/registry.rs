@@ -8,12 +8,14 @@ use crate::driver::{DriverDescriptor, DriverPlan, DynDriver, DynRemoteEndpoint};
 use crate::handle::FastPath;
 use nexus_types::{
     Binding, BindingId, DriverId, EndpointId, Grant, GrantId, Interface, InterfaceId, MethodId,
-    ProcessId, Resource, ResourceId, ResourceName, Rights,
+    Path, ProcessId, Resource, ResourceId, ResourceName, Rights,
 };
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
+
+const SMALL_HOLDER_GRANT_SCAN_LIMIT: usize = 8;
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ResolveError {
@@ -33,6 +35,13 @@ pub enum AdmissionError {
     Rejected(String),
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct GrantSelectorKey {
+    pub holder: ProcessId,
+    pub verb: String,
+    pub path: Path,
+}
+
 /// The six control-plane registries (§10.1). Behind a single lock for
 /// simplicity; the data plane never touches this, so contention is confined to
 /// the slow path.
@@ -44,6 +53,9 @@ pub struct RegistryInner {
     pub endpoints: HashMap<EndpointId, DynRemoteEndpoint>,
     pub bindings: HashMap<BindingId, Binding>,
     pub grants: HashMap<GrantId, Grant>,
+    pub grants_by_holder: HashMap<ProcessId, Vec<GrantId>>,
+    pub exact_grants: HashMap<GrantSelectorKey, Vec<GrantId>>,
+    pub wildcard_grants_by_holder: HashMap<ProcessId, Vec<GrantId>>,
     /// Source policies (§8 / §10.1), consulted at `open()`. Held as trait
     /// objects so any `PolicySource` can register.
     pub policies: Vec<Arc<dyn crate::policy::PolicySource>>,
@@ -66,6 +78,78 @@ impl RegistryInner {
 
     fn invalidate_open_cache(&mut self) {
         self.open_cache.clear();
+    }
+
+    fn index_grant(&mut self, id: GrantId, grant: &Grant) {
+        self.grants_by_holder
+            .entry(grant.holder)
+            .or_default()
+            .push(id);
+        if let Some(key) = exact_selector_key(grant) {
+            self.exact_grants.entry(key).or_default().push(id);
+        } else {
+            self.wildcard_grants_by_holder
+                .entry(grant.holder)
+                .or_default()
+                .push(id);
+        }
+    }
+
+    fn unindex_grant(&mut self, id: GrantId, grant: &Grant) {
+        remove_indexed_id(&mut self.grants_by_holder, &grant.holder, id);
+        if let Some(key) = exact_selector_key(grant) {
+            remove_indexed_id(&mut self.exact_grants, &key, id);
+        } else {
+            remove_indexed_id(&mut self.wildcard_grants_by_holder, &grant.holder, id);
+        }
+    }
+}
+
+fn remove_indexed_id<K>(index: &mut HashMap<K, Vec<GrantId>>, key: &K, id: GrantId)
+where
+    K: Eq + std::hash::Hash,
+{
+    if let Some(ids) = index.get_mut(key) {
+        ids.retain(|candidate| *candidate != id);
+        if ids.is_empty() {
+            index.remove(key);
+        }
+    }
+}
+
+fn exact_selector_key(grant: &Grant) -> Option<GrantSelectorKey> {
+    let pattern = &grant.selector.pattern;
+    if pattern.verb == "*"
+        || pattern.scheme == "*"
+        || pattern.scheme == "**"
+        || pattern
+            .segments
+            .iter()
+            .any(|segment| segment.as_str() == "*" || segment.as_str() == "**")
+    {
+        return None;
+    }
+
+    let mut path = Path::new(pattern.scheme.as_str());
+    for segment in &pattern.segments {
+        path = path.push(segment.clone());
+    }
+    Some(GrantSelectorKey {
+        holder: grant.holder,
+        verb: pattern.verb.clone(),
+        path,
+    })
+}
+
+fn target_selector_key(process: ProcessId, verb: &str, target: &Path) -> GrantSelectorKey {
+    let mut path = Path::new(target.scheme());
+    for segment in target.segments() {
+        path = path.push(segment.clone());
+    }
+    GrantSelectorKey {
+        holder: process,
+        verb: verb.to_string(),
+        path,
     }
 }
 
@@ -266,6 +350,11 @@ impl Registry {
     pub fn register_grant(&self, grant: Grant) -> GrantId {
         let id = grant.id;
         let mut inner = self.inner.write();
+        let old = inner.grants.get(&id).cloned();
+        if let Some(old) = old {
+            inner.unindex_grant(id, &old);
+        }
+        inner.index_grant(id, &grant);
         inner.grants.insert(id, grant);
         inner.invalidate_open_cache();
         id
@@ -352,12 +441,49 @@ impl Registry {
 
     /// All grants held by `process` (slow path; `open()` step 1, §5.2).
     pub fn grants_of(&self, process: ProcessId) -> Vec<Grant> {
-        self.inner
-            .read()
-            .grants
-            .values()
-            .filter(|g| g.holder == process)
-            .cloned()
+        let inner = self.inner.read();
+        inner
+            .grants_by_holder
+            .get(&process)
+            .into_iter()
+            .flat_map(|ids| ids.iter())
+            .filter_map(|id| inner.grants.get(id).cloned())
+            .collect()
+    }
+
+    /// Candidate grants for `open()` selector matching. Exact, non-wildcard
+    /// selectors are addressed directly by `(holder, verb, path)`; wildcard
+    /// selectors stay in a small per-holder fallback set and are still matched
+    /// structurally by `open()`.
+    pub fn candidate_grants(&self, process: ProcessId, verb: &str, target: &Path) -> Vec<Grant> {
+        let inner = self.inner.read();
+        let Some(holder_ids) = inner.grants_by_holder.get(&process) else {
+            return Vec::new();
+        };
+        if holder_ids.len() <= SMALL_HOLDER_GRANT_SCAN_LIMIT {
+            return holder_ids
+                .iter()
+                .filter_map(|id| inner.grants.get(id).cloned())
+                .collect();
+        }
+        // Capability selectors do not carry Path::cluster and ResourceSelector
+        // matching is defined over verb + scheme + segments. Keep the exact
+        // index key on the same structural surface so clustered targets do not
+        // miss grants that would match through ResourceSelector::matches.
+        let key = target_selector_key(process, verb, target);
+        inner
+            .exact_grants
+            .get(&key)
+            .into_iter()
+            .flat_map(|ids| ids.iter())
+            .chain(
+                inner
+                    .wildcard_grants_by_holder
+                    .get(&process)
+                    .into_iter()
+                    .flat_map(|ids| ids.iter()),
+            )
+            .filter_map(|id| inner.grants.get(id).cloned())
             .collect()
     }
 
@@ -418,7 +544,10 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexus_types::{InterfaceSet, Metadata, Path, ResourceDescriptor, ResourceKind};
+    use nexus_types::{
+        ConstraintSet, Expiry, InterfaceSet, Metadata, MethodBitmap, Path, ResourceDescriptor,
+        ResourceKind, ResourceSelector, RightFlags,
+    };
 
     fn name(s: &str) -> ResourceName {
         ResourceName::new(Path::parse(s).unwrap())
@@ -567,5 +696,106 @@ mod tests {
         reg.register_grant(g(2, 12));
         assert_eq!(reg.grants_of(ProcessId::new(1)).len(), 2);
         assert_eq!(reg.grants_of(ProcessId::new(2)).len(), 1);
+    }
+
+    #[test]
+    fn candidate_grants_use_exact_selector_index() {
+        let reg = Registry::new();
+        let holder = ProcessId::new(7);
+        for i in 0..128 {
+            reg.register_grant(Grant {
+                id: reg.next_grant_id(),
+                holder,
+                selector: ResourceSelector::parse(&format!("perform://effect/irrelevant/g{i}"))
+                    .unwrap(),
+                rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
+                constraints: ConstraintSet::empty(),
+                expires: Expiry::Never,
+            });
+        }
+        reg.register_grant(Grant {
+            id: reg.next_grant_id(),
+            holder,
+            selector: ResourceSelector::parse("perform://effect/target").unwrap(),
+            rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
+            constraints: ConstraintSet::empty(),
+            expires: Expiry::Never,
+        });
+
+        let candidates =
+            reg.candidate_grants(holder, "perform", &Path::parse("effect://target").unwrap());
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            candidates[0]
+                .selector
+                .matches("perform", &Path::parse("effect://target").unwrap())
+        );
+    }
+
+    #[test]
+    fn candidate_grants_exact_index_matches_clustered_targets_structurally() {
+        let reg = Registry::new();
+        let holder = ProcessId::new(7);
+        for i in 0..SMALL_HOLDER_GRANT_SCAN_LIMIT {
+            reg.register_grant(Grant {
+                id: reg.next_grant_id(),
+                holder,
+                selector: ResourceSelector::parse(&format!("perform://effect/irrelevant/g{i}"))
+                    .unwrap(),
+                rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
+                constraints: ConstraintSet::empty(),
+                expires: Expiry::Never,
+            });
+        }
+        reg.register_grant(Grant {
+            id: reg.next_grant_id(),
+            holder,
+            selector: ResourceSelector::parse("perform://effect/target").unwrap(),
+            rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
+            constraints: ConstraintSet::empty(),
+            expires: Expiry::Never,
+        });
+
+        let target = Path::parse("path://phone/effect/target").unwrap();
+        let candidates = reg.candidate_grants(holder, "perform", &target);
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].selector.matches("perform", &target));
+    }
+
+    #[test]
+    fn replacing_grant_updates_selector_indexes() {
+        let reg = Registry::new();
+        let holder = ProcessId::new(7);
+        for i in 0..SMALL_HOLDER_GRANT_SCAN_LIMIT {
+            reg.register_grant(Grant {
+                id: reg.next_grant_id(),
+                holder,
+                selector: ResourceSelector::parse(&format!("perform://effect/irrelevant/g{i}"))
+                    .unwrap(),
+                rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
+                constraints: ConstraintSet::empty(),
+                expires: Expiry::Never,
+            });
+        }
+        let id = reg.next_grant_id();
+        let grant = |selector: &str| Grant {
+            id,
+            holder,
+            selector: ResourceSelector::parse(selector).unwrap(),
+            rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
+            constraints: ConstraintSet::empty(),
+            expires: Expiry::Never,
+        };
+
+        reg.register_grant(grant("perform://effect/old"));
+        reg.register_grant(grant("perform://effect/new"));
+
+        assert!(
+            reg.candidate_grants(holder, "perform", &Path::parse("effect://old").unwrap())
+                .is_empty()
+        );
+        let candidates =
+            reg.candidate_grants(holder, "perform", &Path::parse("effect://new").unwrap());
+        assert_eq!(candidates.len(), 1);
     }
 }

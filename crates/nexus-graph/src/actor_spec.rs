@@ -20,9 +20,9 @@
 //! capability literals.
 
 use crate::r#do::DoNode;
-use crate::graph::OperationTemplate;
 use nexus_types::{BudgetSpec, CapSet, Capability};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// The lintable declaration around an Actor's `Do<()>` body (§20.2). Standard
 /// Actors ship unprivileged and version-aligned with the runtime; this spec is
@@ -70,9 +70,13 @@ impl ActorSpec {
 
     /// Whether `(verb, target)` is covered by any declared capability literal.
     pub fn declares_capability(&self, verb: &str, target: &str) -> bool {
+        let Ok(path) = nexus_types::Path::parse(target) else {
+            return false;
+        };
         self.declared_capabilities
             .iter()
-            .any(|literal| capability_covers(literal, verb, target))
+            .filter_map(|literal| Capability::parse(literal).ok())
+            .any(|cap| cap.covers(verb, &path))
     }
 }
 
@@ -115,18 +119,23 @@ pub struct LintFinding {
 /// over-declaring only widens the ceiling, a separate (advisory) concern.
 pub fn lint(spec: &ActorSpec, program: &DoNode) -> Vec<LintFinding> {
     let mut findings = Vec::new();
-    let mut seen: Vec<(String, String)> = Vec::new();
+    let declared: Vec<_> = spec
+        .declared_capabilities
+        .iter()
+        .filter_map(|literal| Capability::parse(literal).ok())
+        .collect();
+    let mut seen = HashSet::new();
     for op in program.ops() {
-        let target = op_target(op);
+        let target_path = op.target.path();
+        let target = target_path.to_string();
         let verb = capability_verb_for_method(&op.method);
-        if spec.declares_capability(verb, &target) {
+        if declared.iter().any(|cap| cap.covers(verb, target_path)) {
             continue;
         }
         let key = (target.clone(), op.method.clone());
-        if seen.contains(&key) {
+        if !seen.insert(key) {
             continue;
         }
-        seen.push(key);
         findings.push(LintFinding {
             severity: LintSeverity::Error,
             target: target.clone(),
@@ -141,11 +150,6 @@ pub fn lint(spec: &ActorSpec, program: &DoNode) -> Vec<LintFinding> {
         });
     }
     findings
-}
-
-/// The target path string of an Operation template.
-fn op_target(op: &OperationTemplate) -> String {
-    op.target.path().to_string()
 }
 
 /// Whether a declared capability literal covers the required `(verb, target)`.
