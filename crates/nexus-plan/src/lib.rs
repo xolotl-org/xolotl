@@ -898,7 +898,7 @@ mod tests {
     #[test]
     fn subscribe_carries_step_in_input() {
         let node = compile_test(&plan(vec![Step::Subscribe {
-            path: "state://chat/events".into(),
+            path: "state://events/chat".into(),
             step: StepRefSpec {
                 name: "react".into(),
                 arg: None,

@@ -41,8 +41,7 @@ impl EventBusDriver {
     }
 
     fn topic_path(topic: &str) -> Result<Path, DriverError> {
-        // Topics live under state://chat or a dedicated events tree; we route
-        // them under state://events/<topic> as a Sequence Resource.
+        // Topics live under state://events/<topic> as Sequence Resources.
         Path::parse(&format!("state://events/{topic}"))
             .map_err(|e| DriverError::Other(e.to_string()))
     }

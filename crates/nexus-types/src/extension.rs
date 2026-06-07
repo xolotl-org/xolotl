@@ -88,8 +88,8 @@ pub enum Role {
 /// downstream Processes subscribe to.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EventSource {
-    /// The Sequence Resource path inbound events are appended to, e.g.
-    /// `state://chat/telegram/events`.
+    /// The Sequence Resource path inbound events are appended to. Sandboxed
+    /// Sources must use `state://events/extensions/<installation>/<projection>`.
     pub sink: Path,
     /// Declared purity of inbound events (usually `Effectful`).
     #[serde(default)]
@@ -103,11 +103,15 @@ pub struct EventSource {
 pub enum ExtensionAdmissionError {
     #[error("extension installation id must not be empty")]
     EmptyInstallationId,
-    #[error("extension installation id must contain only ASCII letters, digits, '_' or '-'")]
+    #[error(
+        "extension installation id must start with an ASCII letter or digit and contain only ASCII letters, digits, '_' or '-'"
+    )]
     MalformedInstallationId,
     #[error("extension projection id must not be empty")]
     EmptyProjectionId,
-    #[error("extension projection id must contain only ASCII letters, digits, '_' or '-'")]
+    #[error(
+        "extension projection id must start with an ASCII letter or digit and contain only ASCII letters, digits, '_' or '-'"
+    )]
     MalformedProjectionId,
     #[error("extension installation must declare at least one projection")]
     InstallationWithoutProjections,
@@ -121,6 +125,10 @@ pub enum ExtensionAdmissionError {
     SourceWithoutEventStream,
     #[error("source extension must not declare provider capabilities")]
     SourceWithCapabilities,
+    #[error("source event sink must be a concrete state:// path: {actual}")]
+    BadSourceEventSink { actual: Path },
+    #[error("sandboxed source event sink must be {expected}, got {actual}")]
+    BadSandboxEventSink { expected: Path, actual: Path },
     #[error("provider effect path is malformed: {0}")]
     MalformedEffectPath(String),
     #[error("provider effect {effect} escapes namespace {namespace}")]
@@ -176,11 +184,22 @@ impl ExtensionProjectionDef {
                 }
             }
             Role::Source => {
-                if self.emits.is_none() {
-                    return Err(ExtensionAdmissionError::SourceWithoutEventStream);
-                }
+                let emits = self
+                    .emits
+                    .as_ref()
+                    .ok_or(ExtensionAdmissionError::SourceWithoutEventStream)?;
                 if !self.provides.is_empty() {
                     return Err(ExtensionAdmissionError::SourceWithCapabilities);
+                }
+                validate_source_event_sink(&emits.sink)?;
+                if trust == TrustLevel::Sandboxed {
+                    let expected = sandboxed_source_event_sink_path(installation_id, &self.id)?;
+                    if emits.sink != expected {
+                        return Err(ExtensionAdmissionError::BadSandboxEventSink {
+                            expected,
+                            actual: emits.sink.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -238,10 +257,12 @@ fn validate_projection_id(id: &str) -> Result<(), ExtensionAdmissionError> {
 }
 
 fn is_safe_id_segment(id: &str) -> bool {
-    id.is_ascii()
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    let mut chars = id.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn validate_trust_transport(
@@ -275,6 +296,38 @@ fn validate_sandbox_namespace(id: &str, namespace: &Path) -> Result<(), Extensio
         return Err(ExtensionAdmissionError::SandboxIdMismatch);
     }
     Ok(())
+}
+
+fn validate_source_event_sink(path: &Path) -> Result<(), ExtensionAdmissionError> {
+    let concrete = path
+        .segments()
+        .iter()
+        .all(|seg| !matches!(seg.as_str(), "*" | "**"));
+    if path.scheme() == "state" && !path.segments().is_empty() && concrete {
+        Ok(())
+    } else {
+        Err(ExtensionAdmissionError::BadSourceEventSink {
+            actual: path.clone(),
+        })
+    }
+}
+
+pub fn sandboxed_source_event_sink_path(
+    installation_id: &str,
+    projection_id: &str,
+) -> Result<Path, ExtensionAdmissionError> {
+    validate_installation_id(installation_id)?;
+    validate_projection_id(projection_id)?;
+    Ok(Path::try_new("state")
+        .expect("static scheme is valid")
+        .try_push("events")
+        .expect("static segment is valid")
+        .try_push("extensions")
+        .expect("static segment is valid")
+        .try_push(installation_id)
+        .expect("validated installation id is a valid path segment")
+        .try_push(projection_id)
+        .expect("validated projection id is a valid path segment"))
 }
 
 fn transport_name(t: &Transport) -> &'static str {
@@ -703,7 +756,11 @@ mod tests {
                     namespace: None,
                     provides: vec![],
                     emits: Some(EventSource {
-                        sink: Path::parse("state://instant_messaging_platform/events").unwrap(),
+                        sink: sandboxed_source_event_sink_path(
+                            "instant_messaging_platform",
+                            "source",
+                        )
+                        .unwrap(),
                         purity: Purity::Effectful,
                         event_schema: None,
                     }),
@@ -843,7 +900,7 @@ mod tests {
                 Purity::Effectful,
             )],
             emits: Some(EventSource {
-                sink: Path::parse("state://chat/bridge/events").unwrap(),
+                sink: sandboxed_source_event_sink_path("bridge", "source").unwrap(),
                 purity: Purity::Effectful,
                 event_schema: None,
             }),
@@ -860,6 +917,45 @@ mod tests {
             ),
             Err(ExtensionAdmissionError::SourceWithCapabilities)
         );
+    }
+
+    #[test]
+    fn sandbox_source_event_sink_is_canonical_and_fail_closed() {
+        let valid = ExtensionProjectionDef {
+            id: "source".into(),
+            role: Role::Source,
+            provides: vec![],
+            emits: Some(EventSource {
+                sink: sandboxed_source_event_sink_path("bridge", "source").unwrap(),
+                purity: Purity::Effectful,
+                event_schema: None,
+            }),
+            namespace: None,
+            version: 1,
+        };
+        assert_eq!(
+            valid.validate_admission(
+                "bridge",
+                TrustLevel::Sandboxed,
+                &Transport::WebSocket {
+                    endpoint: Some("wss://example.test".into())
+                }
+            ),
+            Ok(())
+        );
+
+        let mut bad = valid.clone();
+        bad.emits.as_mut().unwrap().sink = Path::parse("state://chat/bridge/events").unwrap();
+        assert!(matches!(
+            bad.validate_admission(
+                "bridge",
+                TrustLevel::Sandboxed,
+                &Transport::WebSocket {
+                    endpoint: Some("wss://example.test".into())
+                }
+            ),
+            Err(ExtensionAdmissionError::BadSandboxEventSink { .. })
+        ));
     }
 
     #[test]

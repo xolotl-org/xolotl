@@ -56,7 +56,7 @@ pub use extension::{
     ExtensionTransport, FlowSignal, InboundEvent, Invoke, InvokeResult, JsonSchema, ManifestDef,
     ObservedGenerations, OutboundCommand, OverflowPolicy, PairingPayload, PairingPayloadError,
     ProcSpec, RejectReason, RestartPolicy, Role, RoleReady, RoleSessionClientHello, SessionContext,
-    StreamCapacity,
+    StreamCapacity, sandboxed_source_event_sink_path,
 };
 pub use grant::{
     ConstraintSet, DeriveKind, Expiry, Grant, MethodBitmap, ResourceSelector, RightFlags, Rights,

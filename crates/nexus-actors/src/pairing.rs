@@ -1075,7 +1075,7 @@ mod tests {
                 namespace: None,
                 provides: vec![],
                 emits: Some(nexus_types::EventSource {
-                    sink: Path::parse(&format!("state://plugin/{id}/events")).unwrap(),
+                    sink: nexus_types::sandboxed_source_event_sink_path(id, "source").unwrap(),
                     purity: Purity::Effectful,
                     event_schema: None,
                 }),
@@ -1315,7 +1315,11 @@ mod tests {
                     namespace: None,
                     provides: vec![],
                     emits: Some(nexus_types::EventSource {
-                        sink: Path::parse("state://instant_messaging_platform/events").unwrap(),
+                        sink: nexus_types::sandboxed_source_event_sink_path(
+                            "instant_messaging_platform",
+                            "source",
+                        )
+                        .unwrap(),
                         purity: Purity::Effectful,
                         event_schema: None,
                     }),

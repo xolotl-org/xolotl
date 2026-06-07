@@ -508,12 +508,16 @@ mod tests {
             namespace: None,
             provides: vec![],
             emits: Some(EventSource {
-                sink: Path::parse("state://chat/source/events").unwrap(),
+                sink: source_event_sink(),
                 purity: Purity::Effectful,
                 event_schema: schema,
             }),
             version: 1,
         }
+    }
+
+    fn source_event_sink() -> Path {
+        nexus_types::sandboxed_source_event_sink_path("inst-1", "source").unwrap()
     }
 
     fn event(id: &str, payload: Value) -> InboundEvent {
@@ -677,13 +681,7 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err, SourceIngestError::Session(SessionReject::NotReady));
-        assert_eq!(
-            state
-                .read(&Path::parse("state://chat/source/events").unwrap())
-                .await
-                .unwrap(),
-            None
-        );
+        assert_eq!(state.read(&source_event_sink()).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -707,7 +705,7 @@ mod tests {
 
         assert_eq!(first.status, AckStatus::Accepted);
         assert_eq!(second.status, AckStatus::Duplicate);
-        let sink = Path::parse("state://chat/source/events").unwrap();
+        let sink = source_event_sink();
         let tv = state.read_tainted(&sink).await.unwrap().unwrap();
         assert_eq!(tv.value, Value::List(vec![message_payload("hello")]));
         assert!(tv.taint.sources().iter().any(|source| {
@@ -717,7 +715,7 @@ mod tests {
                     source_projection_key,
                     event_stream
                 } if source_projection_key.as_str() == "inst-1/source"
-                    && event_stream.as_str() == "state://chat/source/events"
+                    && event_stream.as_str() == "state://events/extensions/inst-1/source"
             )
         }));
     }
@@ -744,13 +742,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err, SourceIngestError::Policy("blocked".into()));
-        assert_eq!(
-            state
-                .read(&Path::parse("state://chat/source/events").unwrap())
-                .await
-                .unwrap(),
-            None
-        );
+        assert_eq!(state.read(&source_event_sink()).await.unwrap(), None);
     }
 
     #[tokio::test]
