@@ -88,8 +88,9 @@ pub enum Role {
 /// downstream Processes subscribe to.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EventSource {
-    /// The Sequence Resource path inbound events are appended to. Sandboxed
-    /// Sources must use `state://events/extensions/<installation>/<projection>`.
+    /// The local Sequence Resource path inbound events are appended to.
+    /// Sandboxed Sources must use
+    /// `state://events/extensions/<installation>/<projection>`.
     pub sink: Path,
     /// Declared purity of inbound events (usually `Effectful`).
     #[serde(default)]
@@ -125,7 +126,7 @@ pub enum ExtensionAdmissionError {
     SourceWithoutEventStream,
     #[error("source extension must not declare provider capabilities")]
     SourceWithCapabilities,
-    #[error("source event sink must be a concrete state:// path: {actual}")]
+    #[error("source event sink must be a concrete local state:// path: {actual}")]
     BadSourceEventSink { actual: Path },
     #[error("sandboxed source event sink must be {expected}, got {actual}")]
     BadSandboxEventSink { expected: Path, actual: Path },
@@ -303,7 +304,11 @@ fn validate_source_event_sink(path: &Path) -> Result<(), ExtensionAdmissionError
         .segments()
         .iter()
         .all(|seg| !matches!(seg.as_str(), "*" | "**"));
-    if path.scheme() == "state" && !path.segments().is_empty() && concrete {
+    if path.cluster().is_none()
+        && path.scheme() == "state"
+        && !path.segments().is_empty()
+        && concrete
+    {
         Ok(())
     } else {
         Err(ExtensionAdmissionError::BadSourceEventSink {
@@ -955,6 +960,53 @@ mod tests {
                 }
             ),
             Err(ExtensionAdmissionError::BadSandboxEventSink { .. })
+        ));
+    }
+
+    #[test]
+    fn source_event_sink_must_be_local_concrete_state_path() {
+        let source = ExtensionProjectionDef {
+            id: "source".into(),
+            role: Role::Source,
+            provides: vec![],
+            emits: Some(EventSource {
+                sink: Path::parse("state://events/full/source").unwrap(),
+                purity: Purity::Effectful,
+                event_schema: None,
+            }),
+            namespace: None,
+            version: 1,
+        };
+        assert_eq!(
+            source.validate_admission(
+                "bridge",
+                TrustLevel::Full,
+                &Transport::Grpc { endpoint: None }
+            ),
+            Ok(())
+        );
+
+        let mut wildcard = source.clone();
+        wildcard.emits.as_mut().unwrap().sink = Path::parse("state://events/**").unwrap();
+        assert!(matches!(
+            wildcard.validate_admission(
+                "bridge",
+                TrustLevel::Full,
+                &Transport::Grpc { endpoint: None }
+            ),
+            Err(ExtensionAdmissionError::BadSourceEventSink { .. })
+        ));
+
+        let mut clustered = source.clone();
+        clustered.emits.as_mut().unwrap().sink =
+            Path::parse("path://phone/state/events/full/source").unwrap();
+        assert!(matches!(
+            clustered.validate_admission(
+                "bridge",
+                TrustLevel::Full,
+                &Transport::Grpc { endpoint: None }
+            ),
+            Err(ExtensionAdmissionError::BadSourceEventSink { .. })
         ));
     }
 
