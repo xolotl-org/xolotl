@@ -10,12 +10,10 @@ description.workspace = true
 
 [dependencies]
 async-trait = "0.1.89"
-bytes = "1.11.1"
 dashmap = "6.2.1"
 nexus-types = { version = "0.1.0", path = "../nexus-types" }
 parking_lot = "0.12.5"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt", "sync", "macros"] }
 

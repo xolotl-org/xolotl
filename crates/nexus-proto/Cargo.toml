@@ -16,7 +16,7 @@ description.workspace = true
 [dependencies]
 nexus-graph = { version = "0.1.0", path = "../nexus-graph" }
 nexus-types = { version = "0.1.0", path = "../nexus-types" }
-prost = "0.14.3"
+prost = "0.14.4"
 thiserror = "2.0.18"
-tonic = "0.14.6"
+tonic = { version = "0.14.6", default-features = false, features = ["codegen", "router", "transport"] }
 tonic-prost = "0.14.6"

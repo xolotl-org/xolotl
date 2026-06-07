@@ -645,7 +645,7 @@ fn json_to_value(j: &JsonValue) -> Value {
 }
 
 pub fn parse_yaml(src: &str) -> Result<Plan, PlanError> {
-    serde_yaml::from_str(src).map_err(|e| PlanError::Yaml(e.to_string()))
+    yaml_serde::from_str(src).map_err(|e| PlanError::Yaml(e.to_string()))
 }
 
 pub fn parse_json(src: &str) -> Result<Plan, PlanError> {

@@ -20,7 +20,6 @@ grpc = ["dep:nexus-gateway-grpc", "dep:tonic"]
 
 [dependencies]
 anyhow = "1.0.102"
-axum = "0.8.9"
 dotenvy = "0.15.7"
 nexus-actors = { version = "0.1.0", path = "../nexus-actors" }
 nexus-console = { version = "0.1.0", path = "../nexus-console" }
@@ -31,7 +30,7 @@ nexus-sdk = { version = "0.1.0", path = "../nexus-sdk" }
 nexus-storage-redb = { version = "0.1.0", path = "../nexus-storage-redb" }
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.52.3", features = ["rt", "sync", "macros", "rt-multi-thread", "signal"] }
-toml = "0.8"
-tonic = { version = "0.14.6", features = ["server", "transport"], optional = true }
+toml = "1.1.2"
+tonic = { version = "0.14.6", default-features = false, features = ["server"], optional = true }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }

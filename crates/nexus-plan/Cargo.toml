@@ -12,6 +12,6 @@ description.workspace = true
 nexus-graph = { version = "0.1.0", path = "../nexus-graph" }
 nexus-types = { version = "0.1.0", path = "../nexus-types" }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-serde_yaml = "0.9.34"
+serde_json = "1.0.150"
 thiserror = "2.0.18"
+yaml_serde = "0.10.4"

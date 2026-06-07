@@ -12,7 +12,6 @@ description.workspace = true
 async-trait = "0.1.89"
 nexus-graph = { version = "0.1.0", path = "../nexus-graph" }
 nexus-kernel = { version = "0.1.0", path = "../nexus-kernel" }
-nexus-state = { version = "0.1.0", path = "../nexus-state" }
 nexus-types = { version = "0.1.0", path = "../nexus-types" }
 parking_lot = "0.12.5"
 tokio = { version = "1.52.3", features = ["rt", "sync", "macros", "time"] }

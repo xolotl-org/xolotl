@@ -11,14 +11,11 @@ description.workspace = true
 [dependencies]
 async-trait = "0.1.89"
 blake3 = "1.8.5"
-futures = "0.3.32"
 nexus-graph = { version = "0.1.0", path = "../nexus-graph" }
 nexus-state = { version = "0.1.0", path = "../nexus-state" }
 nexus-types = { version = "0.1.0", path = "../nexus-types" }
 parking_lot = "0.12.5"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt", "sync", "macros", "time", "rt-multi-thread"] }
 tracing = "0.1.44"
-uuid = { version = "1.23.1", features = ["v4", "serde"] }
