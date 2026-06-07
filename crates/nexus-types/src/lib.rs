@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Public types for the Nexus runtime (Direction C).
 //!
 //! This crate is leaf-level and **wasm-safe** (§24.1): no async / IO, no
@@ -66,7 +68,9 @@ pub use ids::{
 pub use operation::{
     BatchSummary, DecisionTag, Fact, Operation, OperationId, OutcomeRef, ValueRef,
 };
-pub use path::{Path, PathError, p};
+#[cfg(test)]
+pub use path::p;
+pub use path::{Path, PathError};
 pub use process::{
     BudgetSpec, BudgetState, CompiledProgramRef, ExpireRule, GrantAttenuation, Outcome, Process,
     ProcessStatus, ProgramRef, Recoverability, SpawnRequest, StartRecord,
@@ -126,4 +130,121 @@ pub fn is_vault_reserved(path: &Path) -> bool {
 pub fn is_fact_reserved(path: &Path) -> bool {
     let s = path.to_string();
     s == "state://fact" || s.starts_with(FACT_PREFIX)
+}
+
+#[cfg(test)]
+mod workspace_design_guard_tests {
+    use std::path::{Path as FsPath, PathBuf};
+
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(FsPath::parent)
+            .map(FsPath::to_path_buf)
+            .expect("nexus-types must live under crates/nexus-types")
+    }
+
+    fn collect_rust_sources(dir: &FsPath, out: &mut Vec<PathBuf>) {
+        let entries = std::fs::read_dir(dir).expect("source directory must be readable");
+        for entry in entries {
+            let entry = entry.expect("source directory entry must be readable");
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_sources(&path, out);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    fn rust_sources() -> Vec<PathBuf> {
+        let mut sources = Vec::new();
+        collect_rust_sources(&workspace_root().join("crates"), &mut sources);
+        sources
+    }
+
+    #[test]
+    fn crate_roots_forbid_unsafe_code() {
+        let crates_dir = workspace_root().join("crates");
+        let mut missing = Vec::new();
+        for entry in std::fs::read_dir(&crates_dir).expect("crates directory must be readable") {
+            let entry = entry.expect("crate directory entry must be readable");
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            for root in [path.join("src/lib.rs"), path.join("src/main.rs")] {
+                if !root.exists() {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&root).expect("crate root must be UTF-8");
+                if !text.contains("#![forbid(unsafe_code)]") {
+                    missing.push(root.display().to_string());
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "crate roots must opt into the design safety baseline:\n{}",
+            missing.join("\n")
+        );
+    }
+
+    #[test]
+    fn workspace_sources_have_no_placeholder_macros_or_unsafe_markers() {
+        let forbidden = [
+            ["todo", "!"].concat(),
+            ["unimplemented", "!"].concat(),
+            ["unreachable", "!"].concat(),
+            ["unsafe", " {"].concat(),
+            ["unsafe", " fn"].concat(),
+            ["unsafe", " impl"].concat(),
+            ["extern", " \""].concat(),
+            ["allow", "(unsafe_code)"].concat(),
+        ];
+        let mut hits = Vec::new();
+        for path in rust_sources() {
+            let text = std::fs::read_to_string(&path).expect("Rust source must be UTF-8");
+            for pattern in &forbidden {
+                if text.contains(pattern) {
+                    hits.push(format!("{} contains {pattern:?}", path.display()));
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "workspace sources must keep the §0.1 safety baseline:\n{}",
+            hits.join("\n")
+        );
+    }
+
+    #[test]
+    fn data_plane_hot_path_has_no_control_plane_lookups_or_path_parsing() {
+        let path = workspace_root().join("crates/nexus-kernel/src/dataplane.rs");
+        let text = std::fs::read_to_string(&path).expect("dataplane source must be UTF-8");
+        let production = text.split("#[cfg(test)]").next().unwrap_or(&text);
+        let forbidden = [
+            "Path::parse",
+            "ResourceName",
+            "crate::registry",
+            "Registry::",
+            "resolve_resource",
+            "register_resource",
+            "register_driver",
+            "register_binding",
+            "admit_resource",
+            "admit_binding",
+            "PolicySource",
+        ];
+        let hits = forbidden
+            .iter()
+            .filter(|pattern| production.contains(**pattern))
+            .map(|pattern| format!("{} contains {pattern:?}", path.display()))
+            .collect::<Vec<_>>();
+        assert!(
+            hits.is_empty(),
+            "data-plane production code must keep §2.3/§28 hot-path inputs precompiled:\n{}",
+            hits.join("\n")
+        );
+    }
 }

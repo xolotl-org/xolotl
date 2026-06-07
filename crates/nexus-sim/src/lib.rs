@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `nexus-sim` — deterministic simulation harness for tests and replay (§23).
 //!
 //! - [`ScriptedDriver`]: a programmable [`Driver`] whose responses are queued
@@ -249,7 +251,7 @@ impl Sim {
         &self,
         path: &str,
         driver: Arc<ScriptedDriver>,
-    ) -> nexus_types::ResourceName {
+    ) -> Result<nexus_types::ResourceName, nexus_kernel::BootstrapError> {
         self.boot.register_effect(
             path,
             &[nexus_kernel::MethodSpec::new(
@@ -264,8 +266,11 @@ impl Sim {
 
 /// Replay classification of a Process's recorded facts (§15.1). Mirrors what
 /// recovery would decide; useful to assert determinism in tests.
-pub fn replay_report(facts: &FactSink, process: ProcessId) -> nexus_kernel::RecoveryReport {
-    nexus_kernel::recover_process(facts, process).0
+pub fn replay_report(
+    facts: &FactSink,
+    process: ProcessId,
+) -> Result<nexus_kernel::RecoveryReport, nexus_kernel::FactError> {
+    nexus_kernel::recover_process(facts, process).map(|(report, _, _)| report)
 }
 
 /// The "why-not" explanation for one Operation (§23). A pure projection over the
@@ -356,16 +361,20 @@ pub fn why_not(facts: &[nexus_types::Fact], op: nexus_types::OperationId) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexus_graph::{DoNode, OperationTemplate};
+    use nexus_graph::{DoNode, OperationTemplate, StepRef};
     use nexus_types::OutputMode;
 
     fn run_prog(name: nexus_types::ResourceName) -> DoNode {
+        run_prog_with(name, Value::Null)
+    }
+
+    fn run_prog_with(name: nexus_types::ResourceName, input: Value) -> DoNode {
         DoNode::Op(OperationTemplate {
             target: name,
             method: "invoke".into(),
             method_id: None,
             output: OutputMode::Unary,
-            literal_input: Some(Value::Null),
+            literal_input: Some(input),
         })
     }
 
@@ -374,7 +383,9 @@ mod tests {
         let sim = Sim::new();
         let driver = Arc::new(ScriptedDriver::new("model"));
         driver.enqueue_done(Value::Str("first".into()));
-        let name = sim.scripted_effect("effect://model/x", driver.clone());
+        let name = sim
+            .scripted_effect("effect://model/x", driver.clone())
+            .unwrap();
         let handle = sim.boot.open_for(sim.boot.root, &name, "perform").unwrap();
         let ex = sim.boot.kernel.executor_for(sim.boot.root);
         ex.bind_handle(name.clone(), handle);
@@ -384,20 +395,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn injected_failure_routes_through_or_else_recovery_step() {
+        let sim = Sim::new();
+        let driver = Arc::new(ScriptedDriver::new("primary"));
+        driver.enqueue(Outcome::Fail(nexus_types::Failure::Cancelled));
+        let name = sim
+            .scripted_effect("effect://primary/fallible", driver.clone())
+            .unwrap();
+        let handle = sim.boot.open_for(sim.boot.root, &name, "perform").unwrap();
+        let ex = sim.boot.kernel.executor_for(sim.boot.root);
+        ex.bind_handle(name.clone(), handle);
+        ex.steps.install(sim.boot.root, "fallback", |v, _| match v {
+            Value::Str(reason) if reason.contains("cancelled") => {
+                DoNode::pure(Value::Str("fallback".into()))
+            }
+            other => DoNode::pure(Value::Str(format!("unexpected recovery input: {other:?}"))),
+        });
+
+        let prog = run_prog(name).or_else(StepRef::new(sim.boot.root, "fallback"));
+        let out = ex.eval(&prog).await;
+
+        assert_eq!(out, Outcome::Done(Value::Str("fallback".into())));
+        assert_eq!(driver.calls().len(), 1);
+        let facts = sim.boot.kernel.facts.facts_of(sim.boot.root).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].decision, nexus_types::DecisionTag::DriverError);
+    }
+
+    #[tokio::test]
     async fn replay_report_counts_recorded_facts() {
         let sim = Sim::new();
         let driver = Arc::new(ScriptedDriver::new("m"));
         driver.enqueue_done(Value::Int(1));
-        let name = sim.scripted_effect("effect://m/x", driver);
+        let name = sim.scripted_effect("effect://m/x", driver).unwrap();
         let handle = sim.boot.open_for(sim.boot.root, &name, "perform").unwrap();
         let ex = sim.boot.kernel.executor_for(sim.boot.root);
         ex.bind_handle(name.clone(), handle);
         ex.eval(&run_prog(name)).await;
-        let report = replay_report(&sim.boot.kernel.facts, sim.boot.root);
+        let report = replay_report(&sim.boot.kernel.facts, sim.boot.root).unwrap();
         assert_eq!(
             report.skipped, 1,
             "one completed effect ⇒ skipped on replay"
         );
+    }
+
+    #[tokio::test]
+    async fn budget_denial_records_fact_without_calling_scripted_driver() {
+        let sim = Sim::new();
+        let driver = Arc::new(ScriptedDriver::new("costly"));
+        driver.enqueue_done(Value::Int(99));
+        let name = sim
+            .boot
+            .register_effect_with_cost(
+                "effect://costly/call",
+                &[nexus_kernel::MethodSpec::new(
+                    "invoke",
+                    nexus_types::Purity::Effectful,
+                    nexus_kernel::MethodSpec::UNARY_ASYNC,
+                )],
+                driver.clone(),
+                nexus_types::CostModel {
+                    flat_micro_usd: 1_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sim.boot.kernel.processes.set_budget_spec(
+            sim.boot.root,
+            nexus_types::BudgetSpec {
+                daily_micro_usd: Some(999),
+                ..Default::default()
+            },
+        );
+        let handle = sim.boot.open_for(sim.boot.root, &name, "perform").unwrap();
+        let ex = sim.boot.kernel.executor_for(sim.boot.root);
+        ex.bind_handle(name.clone(), handle);
+
+        let out = ex
+            .eval(&run_prog_with(name, Value::Str("pay".into())))
+            .await;
+
+        match out {
+            Outcome::Fail(nexus_types::Failure::BudgetExhausted { dim }) => {
+                assert_eq!(dim, "daily_micro_usd");
+            }
+            other => panic!("expected budget denial, got {other:?}"),
+        }
+        assert!(
+            driver.calls().is_empty(),
+            "budget denial must happen before the scripted driver is invoked"
+        );
+        let facts = sim.boot.kernel.facts.facts_of(sim.boot.root).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(
+            facts[0].decision,
+            nexus_types::DecisionTag::RejectedByPolicy
+        );
+        assert_eq!(facts[0].handle, handle);
+        assert_ne!(facts[0].resource, nexus_types::ResourceId::new(0));
+        assert_eq!(
+            facts[0].replay,
+            nexus_types::ReplayClass::NonIdempotentEffect
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_duplicate_short_circuits_driver_and_records_attempt() {
+        let sim = Sim::new();
+        let driver = Arc::new(ScriptedDriver::new("idempotent"));
+        driver.enqueue_done(Value::Str("created".into()));
+        let name = sim
+            .boot
+            .register_effect(
+                "effect://orders/create",
+                &[nexus_kernel::MethodSpec::new(
+                    "invoke",
+                    nexus_types::Purity::Idempotent,
+                    nexus_kernel::MethodSpec::UNARY_ASYNC,
+                )],
+                driver.clone(),
+            )
+            .unwrap();
+        let handle = sim.boot.open_for(sim.boot.root, &name, "perform").unwrap();
+        let ex = sim.boot.kernel.executor_for(sim.boot.root);
+        ex.bind_handle(name.clone(), handle);
+        let mut input = std::collections::BTreeMap::new();
+        input.insert("_idem_key".into(), Value::Str("order-42".into()));
+        let prog = run_prog_with(name, Value::Map(input));
+
+        let first = ex.eval(&prog).await;
+        let second = ex.eval(&prog).await;
+
+        assert_eq!(first, Outcome::Done(Value::Str("created".into())));
+        assert_eq!(second, Outcome::Done(Value::Str("created".into())));
+        assert_eq!(
+            driver.calls().len(),
+            1,
+            "the replayed node must use the idempotency cache"
+        );
+        let facts = sim.boot.kernel.facts.facts_of(sim.boot.root).unwrap();
+        assert_eq!(facts.len(), 1, "same OperationId updates the same Fact");
+        assert_eq!(facts[0].decision, nexus_types::DecisionTag::Ok);
+        assert_eq!(facts[0].replay, nexus_types::ReplayClass::IdempotentEffect);
     }
 
     #[tokio::test]

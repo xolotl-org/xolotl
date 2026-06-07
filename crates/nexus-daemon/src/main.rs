@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `nexusd` — the long-running Nexus host process, and the Layer-0 command
 //! line (§24.1).
 //!
@@ -130,7 +132,7 @@ async fn serve() -> Result<()> {
             pairing_display: pairing_display.clone(),
             ..Default::default()
         },
-    );
+    )?;
     tracing::info!(
         resources = boot.kernel.registry.resource_count(),
         "kernel ready"
@@ -161,12 +163,13 @@ async fn serve() -> Result<()> {
 
     // Phase 6: recover any unfinished Processes from their Fact streams,
     // quarantining unsafe non-idempotent replays (§14.1 / §15.2).
-    let recovery = boot.recover_all().await;
+    let recovery = boot.recover_all().await?;
     if recovery.skipped + recovery.retried + recovery.quarantined > 0 {
         tracing::info!(
             skipped = recovery.skipped,
             retried = recovery.retried,
             quarantined = recovery.quarantined,
+            schema_mismatched = recovery.schema_mismatched,
             "recovery complete"
         );
     }
@@ -292,7 +295,7 @@ mod tests {
     #[tokio::test]
     async fn kernel_boots_with_standard_providers() {
         let boot = Arc::new(Bootstrap::in_memory());
-        install_standard(&boot, &StandardConfig::default());
+        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
         assert!(boot.kernel.registry.resource_count() >= 5);
     }
 }

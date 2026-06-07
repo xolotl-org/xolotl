@@ -883,9 +883,8 @@ impl ExtensionCredential {
 
     /// Seal `payload` into an AEAD envelope (§16.3.4). Convenience form for
     /// tests and callers that do not need to override the default AAD.
-    pub fn seal(&self, payload: &[u8]) -> SecureExtensionEnvelope {
+    pub fn seal(&self, payload: &[u8]) -> Result<SecureExtensionEnvelope, EnvelopeError> {
         self.seal_with_aad(payload, EnvelopeAad::default())
-            .expect("default AEAD seal succeeds with fixed-size derived key")
     }
 
     /// Seal `payload` into an AEAD envelope (§16.3.4): ciphertext hides the
@@ -901,7 +900,7 @@ impl ExtensionCredential {
         getrandom::fill(&mut nonce_prefix).map_err(|_| EnvelopeError::Crypto)?;
         let seq = aad.seq;
         let ciphertext = self
-            .cipher(&aad)
+            .cipher(&aad)?
             .encrypt(
                 Nonce::from_slice(&nonce_bytes(&nonce_prefix, seq)),
                 Payload {
@@ -936,7 +935,7 @@ impl ExtensionCredential {
         if env.generation != self.generation {
             return Err(EnvelopeError::BadAead);
         }
-        self.cipher(&env.aad)
+        self.cipher(&env.aad)?
             .decrypt(
                 Nonce::from_slice(&nonce_bytes(&env.nonce_prefix, env.aad.seq)),
                 Payload {
@@ -947,7 +946,7 @@ impl ExtensionCredential {
             .map_err(|_| EnvelopeError::BadAead)
     }
 
-    fn cipher(&self, aad: &EnvelopeAad) -> ChaCha20Poly1305 {
+    fn cipher(&self, aad: &EnvelopeAad) -> Result<ChaCha20Poly1305, EnvelopeError> {
         let hk = Hkdf::<Sha256>::new(
             Some(b"nexus/extension/session-envelope/chacha20poly1305/v1"),
             &self.psk,
@@ -957,8 +956,8 @@ impl ExtensionCredential {
             &aad_bytes(&self.installation_id, self.generation, aad),
             &mut key,
         )
-        .expect("HKDF output length is valid");
-        ChaCha20Poly1305::new((&key).into())
+        .map_err(|_| EnvelopeError::Crypto)?;
+        Ok(ChaCha20Poly1305::new((&key).into()))
     }
 }
 
@@ -1303,8 +1302,8 @@ mod tests {
     async fn pairing_scope_can_come_from_multi_projection_installation() {
         let (driver, state) = driver();
         let install = nexus_types::ExtensionInstallationDef {
-            id: "wechat".into(),
-            platform: "wechat".into(),
+            id: "instant_messaging_platform".into(),
+            platform: "instant_messaging_platform".into(),
             transport: Transport::Grpc { endpoint: None },
             trust: TrustLevel::Sandboxed,
             config_schema: Value::Null,
@@ -1316,7 +1315,7 @@ mod tests {
                     namespace: None,
                     provides: vec![],
                     emits: Some(nexus_types::EventSource {
-                        sink: Path::parse("state://wechat/events").unwrap(),
+                        sink: Path::parse("state://instant_messaging_platform/events").unwrap(),
                         purity: Purity::Effectful,
                         event_schema: None,
                     }),
@@ -1325,9 +1324,11 @@ mod tests {
                 nexus_types::ExtensionProjectionDef {
                     id: "provider".into(),
                     role: Role::Provider,
-                    namespace: Some(Path::parse("effect://plugin/wechat").unwrap()),
+                    namespace: Some(
+                        Path::parse("effect://plugin/instant_messaging_platform").unwrap(),
+                    ),
                     provides: vec![EffectCapability::new(
-                        "effect://plugin/wechat/send_text",
+                        "effect://plugin/instant_messaging_platform/send_text",
                         Purity::Effectful,
                     )],
                     emits: None,
@@ -1338,15 +1339,22 @@ mod tests {
         };
         state
             .write_set(
-                &Path::parse("state://kernel/extension-installations/wechat").unwrap(),
+                &Path::parse("state://kernel/extension-installations/instant_messaging_platform")
+                    .unwrap(),
                 serde_json::from_value(serde_json::to_value(install).unwrap()).unwrap(),
             )
             .await
             .unwrap();
 
         let mut create = BTreeMap::new();
-        create.insert("pairing_id".into(), Value::Str("pair-wechat".into()));
-        create.insert("installation_id".into(), Value::Str("wechat".into()));
+        create.insert(
+            "pairing_id".into(),
+            Value::Str("pair-instant_messaging_platform".into()),
+        );
+        create.insert(
+            "installation_id".into(),
+            Value::Str("instant_messaging_platform".into()),
+        );
         create.insert(
             "allowed_roles".into(),
             Value::List(vec![
@@ -1363,9 +1371,18 @@ mod tests {
             )
             .await
             .unwrap();
-        lock_pairing_claim(&state, "pair-wechat", &["source", "provider"], true).await;
+        lock_pairing_claim(
+            &state,
+            "pair-instant_messaging_platform",
+            &["source", "provider"],
+            true,
+        )
+        .await;
         let mut approve = BTreeMap::new();
-        approve.insert("pairing_id".into(), Value::Str("pair-wechat".into()));
+        approve.insert(
+            "pairing_id".into(),
+            Value::Str("pair-instant_messaging_platform".into()),
+        );
         driver
             .call(
                 MethodId::new(1),
@@ -1377,14 +1394,24 @@ mod tests {
             .unwrap();
         assert!(
             state
-                .read(&Path::parse("state://kernel/extension-sessions/wechat/source").unwrap())
+                .read(
+                    &Path::parse(
+                        "state://kernel/extension-sessions/instant_messaging_platform/source",
+                    )
+                    .unwrap(),
+                )
                 .await
                 .unwrap()
                 .is_some()
         );
         assert!(
             state
-                .read(&Path::parse("state://kernel/extension-sessions/wechat/provider").unwrap())
+                .read(
+                    &Path::parse(
+                        "state://kernel/extension-sessions/instant_messaging_platform/provider",
+                    )
+                    .unwrap(),
+                )
                 .await
                 .unwrap()
                 .is_some()
@@ -1616,7 +1643,7 @@ mod tests {
     #[test]
     fn seal_then_open_roundtrips() {
         let cred = ExtensionCredential::from_pairing("inst-1", "hunter2", 1);
-        let env = cred.seal(b"hello frame");
+        let env = cred.seal(b"hello frame").unwrap();
         assert_ne!(env.ciphertext, b"hello frame");
         assert_eq!(cred.open(&env, 0).unwrap(), b"hello frame");
     }
@@ -1624,7 +1651,7 @@ mod tests {
     #[test]
     fn tampered_ciphertext_fails_aead() {
         let cred = ExtensionCredential::from_pairing("inst-1", "hunter2", 1);
-        let mut env = cred.seal(b"transfer $10");
+        let mut env = cred.seal(b"transfer $10").unwrap();
         env.ciphertext[0] ^= 0x01;
         assert_eq!(cred.open(&env, 0), Err(EnvelopeError::BadAead));
     }
@@ -1653,14 +1680,14 @@ mod tests {
     fn wrong_psk_fails_aead() {
         let real = ExtensionCredential::from_pairing("inst-1", "secret", 1);
         let attacker = ExtensionCredential::from_pairing("inst-1", "guess", 1);
-        let env = attacker.seal(b"frame");
+        let env = attacker.seal(b"frame").unwrap();
         assert_eq!(real.open(&env, 0), Err(EnvelopeError::BadAead));
     }
 
     #[test]
     fn revoked_generation_is_rejected() {
         let cred = ExtensionCredential::from_pairing("inst-1", "s", 2);
-        let env = cred.seal(b"frame");
+        let env = cred.seal(b"frame").unwrap();
         // Valid floor raised to 5 (after a revoke) → gen-2 envelope refused.
         assert_eq!(cred.open(&env, 5), Err(EnvelopeError::RevokedGeneration));
     }
@@ -1671,7 +1698,7 @@ mod tests {
         // generation field to dodge the floor — the AEAD AAD/key binds the
         // generation.
         let cred = ExtensionCredential::from_pairing("inst-1", "s", 1);
-        let mut env = cred.seal(b"frame");
+        let mut env = cred.seal(b"frame").unwrap();
         env.generation = 9; // forge a higher generation
         assert_eq!(cred.open(&env, 5), Err(EnvelopeError::BadAead));
     }
@@ -1679,7 +1706,7 @@ mod tests {
     #[test]
     fn wrong_installation_is_rejected() {
         let cred = ExtensionCredential::from_pairing("inst-1", "s", 1);
-        let mut env = cred.seal(b"frame");
+        let mut env = cred.seal(b"frame").unwrap();
         env.installation_id = "inst-2".into();
         assert_eq!(cred.open(&env, 0), Err(EnvelopeError::WrongInstallation));
     }

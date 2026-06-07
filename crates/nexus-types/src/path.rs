@@ -90,6 +90,30 @@ pub enum PathError {
 }
 
 impl Path {
+    /// Construct an empty path from a validated scheme without parsing a full
+    /// path string. Use this for generated/internal paths whose segments are
+    /// already structured data.
+    pub fn try_new(scheme: impl AsRef<str>) -> Result<Self, PathError> {
+        let scheme = scheme.as_ref();
+        if scheme.is_empty() {
+            return Err(PathError::MissingScheme);
+        }
+        if !scheme.is_ascii() {
+            return Err(PathError::NonAscii);
+        }
+        if scheme.contains('/') {
+            return Err(PathError::BadScheme);
+        }
+        if !is_scheme_ident(scheme) {
+            return Err(PathError::BadSchemeChar(scheme.into()));
+        }
+        Ok(Self {
+            cluster: None,
+            scheme: SmolStr::from(scheme),
+            segments: Vec::new(),
+        })
+    }
+
     pub fn new(scheme: impl Into<SmolStr>) -> Self {
         let s = scheme.into();
         debug_assert!(is_ident(&s), "scheme must be a valid identifier: {s}");
@@ -174,6 +198,23 @@ impl Path {
     pub fn push(mut self, seg: impl Into<SmolStr>) -> Self {
         self.segments.push(seg.into());
         self
+    }
+
+    /// Append one validated path segment without reparsing a complete path
+    /// string. This rejects the same segment character set as [`Path::parse`].
+    pub fn try_push(mut self, seg: impl AsRef<str>) -> Result<Self, PathError> {
+        let seg = seg.as_ref();
+        if seg.is_empty() {
+            return Err(PathError::EmptySegment);
+        }
+        if !seg.is_ascii() {
+            return Err(PathError::NonAscii);
+        }
+        if !is_segment_ident(seg) {
+            return Err(PathError::BadSegmentChar(seg.into()));
+        }
+        self.segments.push(SmolStr::from(seg));
+        Ok(self)
     }
 
     pub fn with_cluster(mut self, c: impl Into<SmolStr>) -> Self {
@@ -331,6 +372,7 @@ impl fmt::Display for Path {
 }
 
 /// Convenience constructor used throughout the workspace and tests.
+#[cfg(test)]
 pub fn p(s: &str) -> Path {
     Path::parse(s).expect("invalid path literal")
 }
@@ -355,6 +397,26 @@ mod tests {
         let p = Path::parse("path://state/memory/alice/persona").unwrap();
         assert_eq!(p.scheme(), "state");
         assert_eq!(p.segments().len(), 3);
+    }
+
+    #[test]
+    fn checked_builder_matches_parse_validation() {
+        let path = Path::try_new("state")
+            .unwrap()
+            .try_push("kernel")
+            .unwrap()
+            .try_push("async")
+            .unwrap()
+            .try_push("42")
+            .unwrap();
+        assert_eq!(path.to_string(), "state://kernel/async/42");
+        assert_eq!(
+            Path::try_new("state")
+                .unwrap()
+                .try_push("bad/slash")
+                .unwrap_err(),
+            PathError::BadSegmentChar("bad/slash".into())
+        );
     }
 
     #[test]

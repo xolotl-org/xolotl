@@ -34,6 +34,8 @@ pub enum CompileError {
     UnboundName(String),
     #[error("graph exceeded the maximum of {max} nodes")]
     TooLarge { max: usize },
+    #[error("graph hash serialization failed: {message}")]
+    GraphHash { message: String },
 }
 
 /// Maximum nodes in one compiled graph (admission bound; prevents unbounded
@@ -243,7 +245,7 @@ pub fn compile_do(program: &DoNode) -> Result<ExecutionGraph, CompileError> {
         root: span.entry,
         graph_hash: [0u8; 32],
     };
-    graph.graph_hash = hash_graph(&graph);
+    graph.graph_hash = hash_graph(&graph)?;
     Ok(graph)
 }
 
@@ -266,13 +268,16 @@ pub fn compile_do_at(program: &DoNode, base: u32) -> Result<ExecutionGraph, Comp
 
 /// Content hash over the graph structure (nodes + edges + root), independent of
 /// the zeroed `graph_hash` field. Two structurally identical graphs hash equal.
-fn hash_graph(graph: &ExecutionGraph) -> [u8; 32] {
+fn hash_graph(graph: &ExecutionGraph) -> Result<[u8; 32], CompileError> {
     let mut hasher = blake3::Hasher::new();
     // Serialize a structural view with graph_hash zeroed (it already is here).
-    let bytes = serde_json::to_vec(&(&graph.nodes, &graph.edges, graph.root))
-        .expect("graph is serializable");
+    let bytes = serde_json::to_vec(&(&graph.nodes, &graph.edges, graph.root)).map_err(|e| {
+        CompileError::GraphHash {
+            message: e.to_string(),
+        }
+    })?;
     hasher.update(&bytes);
-    *hasher.finalize().as_bytes()
+    Ok(*hasher.finalize().as_bytes())
 }
 
 #[cfg(test)]

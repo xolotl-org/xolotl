@@ -23,9 +23,10 @@ use crate::{
     time::{TIME_METHODS, TimeDriver},
 };
 use async_trait::async_trait;
-use nexus_kernel::{Bootstrap, Driver, DriverContext, DriverError, MethodSpec};
+use nexus_kernel::{Bootstrap, BootstrapError, Driver, DriverContext, DriverError, MethodSpec};
 use nexus_types::{MethodId, Outcome, OutputMode, Value};
 use std::sync::Arc;
+use thiserror::Error;
 
 /// Configuration for the standard provider set.
 #[derive(Default)]
@@ -54,6 +55,19 @@ pub struct McpToolMount {
     pub streaming: bool,
 }
 
+#[derive(Debug, Error)]
+pub enum InstallError {
+    #[error("bootstrap registration failed: {0}")]
+    Bootstrap(#[from] BootstrapError),
+    #[error("standard effect path {path:?} has no matching method")]
+    MethodNotFound { path: String },
+    #[error("invalid MCP {label} path segment: {segment:?}")]
+    InvalidMcpPathSegment {
+        label: &'static str,
+        segment: String,
+    },
+}
+
 impl McpToolMount {
     pub fn new(server: impl Into<String>, tool: impl Into<String>) -> Self {
         Self {
@@ -70,8 +84,8 @@ impl McpToolMount {
 }
 
 /// Install the core in-process providers (§17) on `boot`, sharing its kernel's
-/// state backend. Returns `boot` for chaining.
-pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
+/// state backend.
+pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(), InstallError> {
     let state = boot.kernel.state.clone();
 
     // Inference carries a modeled cost so the §21.2 budget reserve/settle has a
@@ -94,7 +108,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
                 per_1k_out_micro_usd: 15000,
                 ..Default::default()
             },
-        );
+        )?;
     }
     // §17.2 retrieval stack: Vector Index (ANN) + pluggable Ranker. Memory uses
     // these exact instances, and they are also exposed as ordinary effect
@@ -111,7 +125,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
         "effect://memory/commit",
         "effect://memory/consolidate",
     ] {
-        register_single_effect(boot, path, MEMORY_METHODS, memory.clone());
+        register_single_effect(boot, path, MEMORY_METHODS, memory.clone())?;
     }
     let blob: Arc<dyn Driver> = Arc::new(BlobDriver::new(state.clone()));
     for path in [
@@ -119,7 +133,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
         "effect://blob/read",
         "effect://blob/delete",
     ] {
-        register_single_effect(boot, path, BLOB_METHODS, blob.clone());
+        register_single_effect(boot, path, BLOB_METHODS, blob.clone())?;
     }
     let time: Arc<dyn Driver> = Arc::new(TimeDriver);
     for path in [
@@ -127,7 +141,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
         "effect://time/sleep",
         "effect://time/cron",
     ] {
-        register_single_effect(boot, path, TIME_METHODS, time.clone());
+        register_single_effect(boot, path, TIME_METHODS, time.clone())?;
     }
     let approval: Arc<dyn Driver> = Arc::new(ApprovalDriver::new(state.clone()));
     for path in [
@@ -135,22 +149,22 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
         "effect://approval/check",
         "effect://approval/respond",
     ] {
-        register_single_effect(boot, path, APPROVAL_METHODS, approval.clone());
+        register_single_effect(boot, path, APPROVAL_METHODS, approval.clone())?;
     }
     let events: Arc<dyn Driver> = Arc::new(EventBusDriver::new(state.clone()));
     for path in ["effect://events/publish", "effect://events/subscribe"] {
-        register_single_effect(boot, path, EVENTS_METHODS, events.clone());
+        register_single_effect(boot, path, EVENTS_METHODS, events.clone())?;
     }
     let lock: Arc<dyn Driver> = Arc::new(LockDriver::new(state.clone()));
     for path in ["effect://lock/acquire", "effect://lock/release"] {
-        register_single_effect(boot, path, LOCK_METHODS, lock.clone());
+        register_single_effect(boot, path, LOCK_METHODS, lock.clone())?;
     }
     register_single_effect(
         boot,
         "effect://deliberation/run",
         DELIBERATION_METHODS,
         Arc::new(DeliberationDriver::new(Arc::new(EchoBackend))),
-    );
+    )?;
     // §9.4 read-side: capability-gated, read-only state://fact/* projection.
     boot.register_subtree_resource_at(
         "state://fact",
@@ -158,7 +172,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
         nexus_types::InterfaceFamily::Sequence,
         FACT_METHODS,
         Arc::new(FactDriver::new(boot.kernel.facts.store().clone())),
-    );
+    )?;
     register_single_effect(
         boot,
         "effect://kernel/process/inspect",
@@ -167,7 +181,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
             boot.kernel.processes.clone(),
             boot.kernel.facts.clone(),
         )),
-    );
+    )?;
     // §17.2 retrieval stack: Vector Index (ANN) + pluggable Ranker.
     let index_driver: Arc<dyn Driver> = index.clone();
     for path in [
@@ -175,11 +189,11 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
         "effect://index/search",
         "effect://index/delete",
     ] {
-        register_single_effect(boot, path, INDEX_METHODS, index_driver.clone());
+        register_single_effect(boot, path, INDEX_METHODS, index_driver.clone())?;
     }
     let rank_driver: Arc<dyn Driver> = rank.clone();
     for path in ["effect://rank/score", "effect://rank/fuse"] {
-        register_single_effect(boot, path, RANK_METHODS, rank_driver.clone());
+        register_single_effect(boot, path, RANK_METHODS, rank_driver.clone())?;
     }
     // §17/§19.1 Token Compressor: model-backed summarize + structural plan trim.
     let compress: Arc<dyn Driver> =
@@ -190,7 +204,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
             path,
             crate::compress::COMPRESS_METHODS,
             compress.clone(),
-        );
+        )?;
     }
     // §17.4 Tensor store: content-addressed tensor persistence.
     let tensor: Arc<dyn Driver> = Arc::new(crate::tensor::TensorDriver::new(state.clone()));
@@ -199,7 +213,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
         "effect://tensor/read",
         "effect://tensor/delete",
     ] {
-        register_single_effect(boot, path, crate::tensor::TENSOR_METHODS, tensor.clone());
+        register_single_effect(boot, path, crate::tensor::TENSOR_METHODS, tensor.clone())?;
     }
     // §16.3.1 extension runtime: privileged process-lifecycle Driver.
     let proc: Arc<dyn Driver> = Arc::new(crate::proc::ProcDriver::new(state.clone()));
@@ -210,7 +224,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
         "effect://proc/status",
         "effect://proc/heartbeat",
     ] {
-        register_single_effect(boot, path, crate::proc::PROC_METHODS, proc.clone());
+        register_single_effect(boot, path, crate::proc::PROC_METHODS, proc.clone())?;
     }
     // §16.3.4 extension pairing management: ordinary capability-bound effects.
     let pairing: Arc<dyn Driver> = Arc::new(PairingDriver::with_display_edge(
@@ -224,7 +238,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
         "effect://extension/pairing/replace",
         "effect://extension/revoke",
     ] {
-        register_single_effect(boot, path, PAIRING_METHODS, pairing.clone());
+        register_single_effect(boot, path, PAIRING_METHODS, pairing.clone())?;
     }
     // §20.5 Context Assembly: layered prompt assembly under a token budget.
     register_single_effect(
@@ -232,7 +246,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
         "effect://context/assemble",
         crate::context::CONTEXT_METHODS,
         Arc::new(crate::context::ContextDriver::new()),
-    );
+    )?;
 
     // §12 state-as-Operation: expose `state://**` as one Resource so a Process
     // reads/writes durable state through ordinary Value/Sequence Operations,
@@ -242,7 +256,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
         nexus_types::InterfaceFamily::Value,
         crate::state::STATE_METHODS,
         Arc::new(crate::state::StateDriver::new(state.clone())),
-    );
+    )?;
 
     if let Some(root) = &config.fs_root {
         let fs: Arc<dyn Driver> = Arc::new(crate::fs::FsDriver::new(root.clone(), state.clone()));
@@ -253,7 +267,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
             "effect://fs/delete",
             "effect://fs/glob",
         ] {
-            register_single_effect(boot, path, crate::fs::FS_METHODS, fs.clone());
+            register_single_effect(boot, path, crate::fs::FS_METHODS, fs.clone())?;
         }
     }
     if !config.terminal_allowlist.is_empty() {
@@ -264,7 +278,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
             Arc::new(crate::terminal::TerminalDriver::new(
                 config.terminal_allowlist.clone(),
             )),
-        );
+        )?;
     }
     if config.enable_fetch {
         register_single_effect(
@@ -272,7 +286,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
             "effect://fetch/get",
             crate::fetch::FETCH_METHODS,
             Arc::new(crate::fetch::FetchDriver::new(state.clone())),
-        );
+        )?;
     }
     // §18.2 Nexus-as-host: mount each configured MCP tool as a sandboxed
     // Provider at `effect://mcp-tool/<server>/<tool>`.
@@ -283,9 +297,9 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) {
             &mount.tool,
             mount.streaming,
             Arc::new(crate::mcp::EchoMcpClient),
-        )
-        .expect("standard MCP tool mount must use valid path segments");
+        )?;
     }
+    Ok(())
 }
 
 fn register_single_effect(
@@ -293,19 +307,19 @@ fn register_single_effect(
     path: &str,
     methods: &[MethodSpec],
     driver: Arc<dyn Driver>,
-) -> nexus_types::ResourceName {
-    boot.register_effect(
+) -> Result<nexus_types::ResourceName, InstallError> {
+    let spec = invoke_spec_for_path(path, methods).ok_or_else(|| InstallError::MethodNotFound {
+        path: path.to_string(),
+    })?;
+    let inner_method =
+        method_index_for_path(path, methods).ok_or_else(|| InstallError::MethodNotFound {
+            path: path.to_string(),
+        })?;
+    Ok(boot.register_effect(
         path,
-        &[
-            invoke_spec_for_path(path, methods)
-                .expect("standard effect path has a matching method"),
-        ],
-        Arc::new(SingleMethodDriver::new(
-            driver,
-            method_index_for_path(path, methods)
-                .expect("standard effect path has a matching method"),
-        )),
-    )
+        &[spec],
+        Arc::new(SingleMethodDriver::new(driver, inner_method)),
+    )?)
 }
 
 fn register_single_effect_with_cost(
@@ -314,20 +328,20 @@ fn register_single_effect_with_cost(
     methods: &[MethodSpec],
     driver: Arc<dyn Driver>,
     cost: nexus_types::CostModel,
-) -> nexus_types::ResourceName {
-    boot.register_effect_with_cost(
+) -> Result<nexus_types::ResourceName, InstallError> {
+    let spec = invoke_spec_for_path(path, methods).ok_or_else(|| InstallError::MethodNotFound {
+        path: path.to_string(),
+    })?;
+    let inner_method =
+        method_index_for_path(path, methods).ok_or_else(|| InstallError::MethodNotFound {
+            path: path.to_string(),
+        })?;
+    Ok(boot.register_effect_with_cost(
         path,
-        &[
-            invoke_spec_for_path(path, methods)
-                .expect("standard effect path has a matching method"),
-        ],
-        Arc::new(SingleMethodDriver::new(
-            driver,
-            method_index_for_path(path, methods)
-                .expect("standard effect path has a matching method"),
-        )),
+        &[spec],
+        Arc::new(SingleMethodDriver::new(driver, inner_method)),
         cost,
-    )
+    )?)
 }
 
 fn invoke_spec_for_path(path: &str, methods: &[MethodSpec]) -> Option<MethodSpec> {
@@ -384,7 +398,7 @@ pub fn register_mcp_tool(
     tool: &str,
     streaming: bool,
     client: Arc<dyn crate::mcp::McpClient>,
-) -> Result<nexus_types::ResourceName, String> {
+) -> Result<nexus_types::ResourceName, InstallError> {
     validate_mcp_path_segment("server", server)?;
     validate_mcp_path_segment("tool", tool)?;
     // §10.3 sandbox prefix: every MCP effect lives under `effect://mcp-tool/<id>/*`.
@@ -397,12 +411,15 @@ pub fn register_mcp_tool(
             MCP_TOOL_METHODS
         },
         Arc::new(McpToolDriver::new(tool, client)),
-    ))
+    )?)
 }
 
-fn validate_mcp_path_segment(label: &str, segment: &str) -> Result<(), String> {
+fn validate_mcp_path_segment(label: &'static str, segment: &str) -> Result<(), InstallError> {
     if segment.is_empty() || segment.contains('/') || segment.contains('@') {
-        return Err(format!("invalid MCP {label} path segment: {segment:?}"));
+        return Err(InstallError::InvalidMcpPathSegment {
+            label,
+            segment: segment.to_string(),
+        });
     }
     Ok(())
 }
@@ -416,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn standard_inference_runs_end_to_end() {
         let boot = Bootstrap::in_memory();
-        install_standard(&boot, &StandardConfig::default());
+        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
 
         let name = boot
             .kernel
@@ -450,7 +467,7 @@ mod tests {
         // §12: a Process writes then reads `state://memory/note` through ordinary
         // Operations against the prefix-resolved state Resource.
         let boot = Bootstrap::in_memory();
-        install_standard(&boot, &StandardConfig::default());
+        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
 
         let target = nexus_types::ResourceName::new(
             nexus_types::Path::parse("state://scratch/note").unwrap(),
@@ -494,7 +511,7 @@ mod tests {
         // taint in the backend envelope — provenance is not dropped at the
         // state boundary.
         let boot = Bootstrap::in_memory();
-        install_standard(&boot, &StandardConfig::default());
+        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
 
         let target = nexus_types::ResourceName::new(
             nexus_types::Path::parse("state://scratch/tainted").unwrap(),
@@ -535,7 +552,7 @@ mod tests {
     #[tokio::test]
     async fn state_read_handle_cannot_write() {
         let boot = Bootstrap::in_memory();
-        install_standard(&boot, &StandardConfig::default());
+        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
 
         let target = nexus_types::ResourceName::new(
             nexus_types::Path::parse("state://scratch/read-only").unwrap(),
@@ -562,7 +579,7 @@ mod tests {
         // §9.4: Fact read side is a capability-gated state://fact/* projection,
         // not a callable effect alias.
         let boot = Bootstrap::in_memory();
-        install_standard(&boot, &StandardConfig::default());
+        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
 
         let fact_effect =
             nexus_types::ResourceName::new(nexus_types::Path::parse("effect://fact/read").unwrap());
@@ -618,7 +635,7 @@ mod tests {
         // §18.2 opt-in: with no `mcp_tools`, no `effect://mcp-tool/*` resource
         // is registered — existing assemblies are unaffected.
         let boot = Bootstrap::in_memory();
-        install_standard(&boot, &StandardConfig::default());
+        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
         let name = nexus_types::ResourceName::new(
             nexus_types::Path::parse("effect://mcp-tool/files/list_dir").unwrap(),
         );
@@ -637,7 +654,7 @@ mod tests {
             mcp_tools: vec![McpToolMount::new("files", "list_dir")],
             ..Default::default()
         };
-        install_standard(&boot, &config);
+        assert!(install_standard(&boot, &config).is_ok());
 
         let name = nexus_types::ResourceName::new(
             nexus_types::Path::parse("effect://mcp-tool/files/list_dir").unwrap(),
@@ -708,7 +725,7 @@ mod tests {
     #[test]
     fn batchable_methods_are_registered_as_metadata() {
         let boot = Bootstrap::in_memory();
-        install_standard(&boot, &StandardConfig::default());
+        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
 
         assert_method_batchable(&boot, "effect://inference/infer", "invoke", false);
         assert_method_batchable(&boot, "effect://inference/embed", "invoke", true);
@@ -719,7 +736,7 @@ mod tests {
     #[test]
     fn external_observation_methods_are_registered_as_observation_replay() {
         let boot = Bootstrap::in_memory();
-        install_standard(&boot, &StandardConfig::default());
+        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
 
         assert_method_replay(
             &boot,
@@ -768,7 +785,7 @@ mod tests {
     #[test]
     fn extension_pairing_effects_are_registered_as_distinct_resources() {
         let boot = Bootstrap::in_memory();
-        install_standard(&boot, &StandardConfig::default());
+        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
 
         for path in [
             "effect://extension/pairing/create",
@@ -794,7 +811,7 @@ mod tests {
     #[tokio::test]
     async fn standard_effect_paths_do_not_accept_sibling_methods() {
         let boot = Bootstrap::in_memory();
-        install_standard(&boot, &StandardConfig::default());
+        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
 
         let name = nexus_types::ResourceName::new(
             nexus_types::Path::parse("effect://approval/ask").unwrap(),
@@ -827,7 +844,7 @@ mod tests {
     #[tokio::test]
     async fn pairing_secret_is_not_an_operation_input() {
         let boot = Bootstrap::in_memory();
-        install_standard(&boot, &StandardConfig::default());
+        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
 
         let name = nexus_types::ResourceName::new(
             nexus_types::Path::parse("effect://extension/pairing/create").unwrap(),
@@ -852,7 +869,7 @@ mod tests {
             Outcome::Fail(nexus_types::Failure::InvalidInput { .. })
         ));
 
-        let facts = boot.kernel.facts.all_facts();
+        let facts = boot.kernel.facts.all_facts().unwrap();
         assert_eq!(facts.len(), 1);
         let Some(Value::Map(input)) = facts[0].input_ref.as_inline() else {
             panic!("expected inline redacted input");

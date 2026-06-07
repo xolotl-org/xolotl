@@ -11,8 +11,8 @@ use crate::auth::{self, ConsolePrincipal};
 use crate::state::ConsoleState;
 use nexus_graph::{DoNode, OperationTemplate};
 use nexus_types::{
-    AuditRules, ExtensionInstallationDef, ExtensionProjectionDef, IdentityRef, ManifestDef,
-    Outcome, OutputMode, Path, ResourceName, TaintSet, TrustLevel, Value,
+    AuditRules, ExtensionInstallationDef, ExtensionProjectionDef, ManifestDef, Outcome, OutputMode,
+    Path, ResourceName, TaintSet, TrustLevel, Value,
 };
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
@@ -122,8 +122,13 @@ pub async fn write_config(
     }
 
     // Bump the version on the new value so the next edit must match it.
-    let next = expected_version.map(|v| v + 1).unwrap_or(1);
-    set_version(&mut value, next);
+    let next = match expected_version {
+        Some(v) => v
+            .checked_add(1)
+            .ok_or_else(|| MgmtError::Admission("config version overflow".into()))?,
+        None => 1,
+    };
+    set_version(&mut value, next)?;
     admit_kernel_config(&p, &value)?;
 
     let mut cas = BTreeMap::new();
@@ -150,13 +155,21 @@ async fn run_state_op(
     input: Value,
 ) -> Result<Value, MgmtError> {
     let target = ResourceName::new(path.clone());
-    let identity = Path::parse(&principal.identity_path)
-        .ok()
-        .map(|p| nexus_kernel::intern_identity(&p))
-        .unwrap_or(IdentityRef::ROOT);
+    let identity_path = Path::parse(&principal.identity_path)
+        .map_err(|e| MgmtError::Operation(format!("invalid principal identity path: {e}")))?;
+    if identity_path.segments().is_empty() {
+        return Err(MgmtError::Operation(
+            "invalid principal identity path: identity path must include at least one segment"
+                .into(),
+        ));
+    }
+    let identity = nexus_kernel::intern_identity(&identity_path);
     let verb = capability_verb_for_state_method(method);
     let cap = format!("{verb}://{}", capability_target(&path));
-    let process = state.boot.spawn_request_process(identity, &[&cap]);
+    let process = state
+        .boot
+        .spawn_request_process(identity, &[&cap])
+        .map_err(|e| MgmtError::Operation(e.to_string()))?;
     let handle = state
         .boot
         .open_for(process, &target, verb)
@@ -194,13 +207,16 @@ fn value_version(v: &Value) -> Option<u64> {
     v.as_map()
         .and_then(|m| m.get("version"))
         .and_then(|x| x.as_int())
-        .map(|i| i as u64)
+        .and_then(|i| u64::try_from(i).ok())
 }
 
-fn set_version(v: &mut Value, version: u64) {
+fn set_version(v: &mut Value, version: u64) -> Result<(), MgmtError> {
     if let Value::Map(m) = v {
-        m.insert("version".into(), Value::Int(version as i64));
+        let version = i64::try_from(version)
+            .map_err(|_| MgmtError::Admission("config version exceeds i64".into()))?;
+        m.insert("version".into(), Value::Int(version));
     }
+    Ok(())
 }
 
 fn admit_kernel_config(path: &Path, value: &Value) -> Result<(), MgmtError> {
@@ -428,7 +444,7 @@ mod tests {
 
     fn console_state() -> Arc<ConsoleState> {
         let boot = Arc::new(Bootstrap::in_memory());
-        install_standard(&boot, &StandardConfig::default());
+        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
         ConsoleState::shared(boot)
     }
 
@@ -468,10 +484,10 @@ mod tests {
         serde_json::from_value(serde_json::to_value(def).unwrap()).unwrap()
     }
 
-    fn wechat_installation(version: u64) -> Value {
+    fn instant_messaging_platform_installation(version: u64) -> Value {
         let def = nexus_types::ExtensionInstallationDef {
-            id: "wechat".into(),
-            platform: "wechat".into(),
+            id: "instant_messaging_platform".into(),
+            platform: "instant_messaging_platform".into(),
             transport: Transport::Grpc { endpoint: None },
             trust: TrustLevel::Sandboxed,
             config_schema: Value::Null,
@@ -483,7 +499,7 @@ mod tests {
                     namespace: None,
                     provides: vec![],
                     emits: Some(nexus_types::EventSource {
-                        sink: Path::parse("state://wechat/events").unwrap(),
+                        sink: Path::parse("state://instant_messaging_platform/events").unwrap(),
                         purity: Purity::Effectful,
                         event_schema: None,
                     }),
@@ -492,9 +508,11 @@ mod tests {
                 nexus_types::ExtensionProjectionDef {
                     id: "provider".into(),
                     role: Role::Provider,
-                    namespace: Some(Path::parse("effect://plugin/wechat").unwrap()),
+                    namespace: Some(
+                        Path::parse("effect://plugin/instant_messaging_platform").unwrap(),
+                    ),
                     provides: vec![EffectCapability::new(
-                        "effect://plugin/wechat/send_text",
+                        "effect://plugin/instant_messaging_platform/send_text",
                         Purity::Effectful,
                     )],
                     emits: None,
@@ -557,7 +575,7 @@ mod tests {
             .processes
             .all_ids()
             .into_iter()
-            .map(|pid| st.boot.kernel.facts.facts_of(pid).len())
+            .map(|pid| st.boot.kernel.facts.facts_of(pid).unwrap().len())
             .sum::<usize>();
         // install: expected None ⇒ creates version 1.
         write_config(&st, &root, path, extension_installation("acme", 0), None)
@@ -569,7 +587,7 @@ mod tests {
             .processes
             .all_ids()
             .into_iter()
-            .map(|pid| st.boot.kernel.facts.facts_of(pid).len())
+            .map(|pid| st.boot.kernel.facts.facts_of(pid).unwrap().len())
             .sum::<usize>();
         assert!(
             after > before,
@@ -594,14 +612,20 @@ mod tests {
     async fn extension_installation_admission_supports_multi_projection_package() {
         let st = console_state();
         let root = root_principal(&st).await;
-        let path = "state://kernel/extension-installations/wechat";
-        write_config(&st, &root, path, wechat_installation(0), None)
-            .await
-            .unwrap();
+        let path = "state://kernel/extension-installations/instant_messaging_platform";
+        write_config(
+            &st,
+            &root,
+            path,
+            instant_messaging_platform_installation(0),
+            None,
+        )
+        .await
+        .unwrap();
         let v = inspect(&st, &root, path).await.unwrap().unwrap();
         assert_eq!(value_version(&v), Some(1));
 
-        let mut bad = wechat_installation(0);
+        let mut bad = instant_messaging_platform_installation(0);
         let Value::Map(ref mut m) = bad else {
             panic!("expected object");
         };

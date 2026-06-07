@@ -326,12 +326,43 @@ fn parse_proc_spec(input: Value) -> Result<ProcSpec, DriverError> {
     if spec.id.is_empty() {
         return Err(DriverError::Other("proc id must not be empty".into()));
     }
-    if let Transport::Stdio { .. } = &spec.transport
-        && spec.command.as_ref().is_none_or(Vec::is_empty)
-    {
-        return Err(DriverError::Other(
-            "stdio proc.spawn requires non-empty ProcSpec.command argv".into(),
-        ));
+    match &spec.transport {
+        Transport::Stdio { command, args } => {
+            let argv = spec.command.as_ref().ok_or_else(|| {
+                DriverError::Other("stdio proc.spawn requires ProcSpec.command argv".into())
+            })?;
+            if argv.is_empty() {
+                return Err(DriverError::Other(
+                    "stdio proc.spawn requires non-empty ProcSpec.command argv".into(),
+                ));
+            }
+            let Some(program) = command.as_ref().filter(|program| !program.is_empty()) else {
+                return Err(DriverError::Other(
+                    "stdio proc.spawn requires Transport::Stdio.command".into(),
+                ));
+            };
+            let transport_argv = std::iter::once(program)
+                .chain(args.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            if argv != &transport_argv {
+                return Err(DriverError::Other(
+                    "ProcSpec.command must match Transport::Stdio command/args".into(),
+                ));
+            }
+        }
+        _ => {
+            if spec.command.is_some() {
+                return Err(DriverError::Other(
+                    "non-stdio proc.spawn must not carry ProcSpec.command argv".into(),
+                ));
+            }
+            if !spec.env.is_empty() || spec.cwd.is_some() {
+                return Err(DriverError::Other(
+                    "non-stdio proc.spawn must not carry env or cwd".into(),
+                ));
+            }
+        }
     }
     Ok(spec)
 }
@@ -498,6 +529,51 @@ mod tests {
             )
             .await;
         assert!(out.is_err());
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_inconsistent_stdio_argv() {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = ProcDriver::new(state);
+        let spec = ProcSpec {
+            id: "ext-argv".into(),
+            transport: Transport::Stdio {
+                command: Some("/bin/sh".into()),
+                args: vec!["-c".into(), "sleep 1".into()],
+            },
+            command: Some(vec!["/bin/echo".into(), "mismatch".into()]),
+            env: BTreeMap::new(),
+            cwd: None,
+            restart: nexus_types::RestartPolicy::Never,
+        };
+        let input = serde_json::from_value(serde_json::to_value(spec).unwrap()).unwrap();
+
+        let out = d
+            .call(MethodId::new(0), input, OutputMode::Unary, &ctx())
+            .await;
+        assert!(matches!(out, Err(DriverError::Other(message)) if message.contains("must match")));
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_command_fields_for_endpoint_transports() {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = ProcDriver::new(state);
+        let spec = ProcSpec {
+            id: "ext-ws".into(),
+            transport: Transport::WebSocket {
+                endpoint: Some("wss://example.test/ext".into()),
+            },
+            command: Some(vec!["/bin/echo".into()]),
+            env: BTreeMap::new(),
+            cwd: None,
+            restart: nexus_types::RestartPolicy::Never,
+        };
+        let input = serde_json::from_value(serde_json::to_value(spec).unwrap()).unwrap();
+
+        let out = d
+            .call(MethodId::new(0), input, OutputMode::Unary, &ctx())
+            .await;
+        assert!(matches!(out, Err(DriverError::Other(message)) if message.contains("non-stdio")));
     }
 
     #[tokio::test]

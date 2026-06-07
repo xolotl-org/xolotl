@@ -26,8 +26,8 @@ use nexus_graph::{
     WaitSpec, compile_do,
 };
 use nexus_types::{
-    IdentityRef, NodeId, Operation, OperationId, Outcome, ProcessId, ReplayClass, ResourceName,
-    Value,
+    DecisionTag, IdentityRef, NodeId, Operation, OperationId, Outcome, ProcessId, ReplayClass,
+    ResourceName, Value,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -738,6 +738,7 @@ impl Executor {
         // draws on). Reservation is fail-closed: over budget ⇒ deny before the
         // side effect is ever issued.
         let mut reservation: Option<(u64, u64)> = None;
+        let now = now_millis();
         if !cost.is_free()
             && let Some(procs) = &self.processes
         {
@@ -747,15 +748,18 @@ impl Executor {
             let est_tokens = in_tokens;
             let est_usd = estimate_cost(&cost, &op.input, in_tokens, est_tokens, batchable);
             if let Err(dim) = procs.reserve(self.process, est_usd, est_tokens) {
-                return (
-                    Outcome::Fail(nexus_types::Failure::BudgetExhausted { dim }),
-                    op_taint,
+                let out = self.data_plane.record_pre_dispatch_denial(
+                    &op,
+                    replay,
+                    now,
+                    DecisionTag::RejectedByPolicy,
+                    nexus_types::Failure::BudgetExhausted { dim },
                 );
+                return (out.outcome, out.output_taint);
             }
             reservation = Some((est_usd, est_tokens));
         }
 
-        let now = now_millis();
         let out = self
             .data_plane
             .execute_batchable(&op, method_index, replay, supports, batchable, now, record)
@@ -778,6 +782,7 @@ impl Executor {
             );
             procs.settle(self.process, res_usd, actual_usd, res_tokens, out_tokens);
         }
+        op_taint.union(&out.output_taint);
         (out.outcome, op_taint)
     }
 
@@ -928,7 +933,10 @@ fn is_outbound(target: &ResourceName) -> bool {
     let domain = segs.first().map(|s| s.as_str()).unwrap_or("");
     let method = segs.get(1).map(|s| s.as_str()).unwrap_or("");
     // Domains that inherently leave the trust boundary.
-    matches!(domain, "x" | "email" | "slack" | "discord" | "webhook" | "http")
+    matches!(
+        domain,
+        "email" | "chat_platform" | "instant_messaging_platform" | "webhook" | "http"
+    )
         || matches!(method, "post" | "send" | "publish" | "reply" | "emit")
         // fetch with a body is outbound; a bare GET is covered by Fetched taint.
         || (domain == "fetch" && matches!(method, "post" | "put" | "patch"))
@@ -946,9 +954,17 @@ pub fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::{Driver, DriverContext, DriverDescriptor, DriverError, EchoDriver};
     use crate::fact::FactSink;
     use crate::handle::HandleTable;
+    use crate::open::{OpenRequest, open_resource};
     use nexus_state::{Backend, InMemoryBackend};
+    use nexus_types::{
+        Binding, ConstraintSet, DriverRef, Expiry, Grant, Interface, InterfaceFamily, InterfaceSet,
+        Metadata, Method, MethodBitmap, MethodId, ModalitySet, OutputModeSet, Path, Purity,
+        Resource, ResourceDescriptor, ResourceId, ResourceKind, ResourceSelector, RightFlags,
+        Rights, SchemaId, TaintSet, TaintSource, Transport,
+    };
     use parking_lot::RwLock;
 
     fn test_state() -> Backend {
@@ -967,6 +983,117 @@ mod tests {
 
     fn s(name: &str) -> StepRef {
         StepRef::new(ProcessId::new(1), name)
+    }
+
+    #[derive(Clone)]
+    struct TestStateReadDriver {
+        state: Backend,
+    }
+
+    #[async_trait::async_trait]
+    impl Driver for TestStateReadDriver {
+        async fn call(
+            &self,
+            method: MethodId,
+            _input: Value,
+            _output: nexus_types::OutputMode,
+            ctx: &DriverContext,
+        ) -> Result<Outcome, DriverError> {
+            if method.get() != 0 {
+                return Err(DriverError::NoSuchMethod(method));
+            }
+            let path = ctx
+                .target_path
+                .clone()
+                .ok_or_else(|| DriverError::Other("state read has no bound path".into()))?;
+            let tv = self
+                .state
+                .read_tainted(&path)
+                .await
+                .map_err(|e| DriverError::Other(e.to_string()))?;
+            match tv {
+                Some(tv) => {
+                    ctx.set_output_taint(tv.taint);
+                    Ok(Outcome::Done(tv.value))
+                }
+                None => Ok(Outcome::Done(Value::Null)),
+            }
+        }
+    }
+
+    struct TestResourceSpec {
+        path: &'static str,
+        kind: ResourceKind,
+        family: InterfaceFamily,
+        method_name: &'static str,
+        method_id: u64,
+        purity: Purity,
+        replay: ReplayClass,
+        driver_name: &'static str,
+        selector: &'static str,
+    }
+
+    fn register_test_resource(
+        reg: &Registry,
+        spec: TestResourceSpec,
+        driver: Arc<dyn Driver>,
+    ) -> (ResourceId, ResourceName) {
+        let iface_id = reg.next_interface_id();
+        reg.register_interface(Interface {
+            id: iface_id,
+            family: spec.family,
+            methods: vec![Method {
+                id: MethodId::new(spec.method_id),
+                name: spec.method_name.into(),
+                input: SchemaId::new(0),
+                output: SchemaId::new(0),
+                modality: ModalitySet::TEXT,
+                purity: spec.purity,
+                replay: spec.replay,
+                supports: OutputModeSet::UNARY,
+                cost: Default::default(),
+                batchable: false,
+            }],
+            laws: Vec::new(),
+        });
+        let driver_id = reg.next_driver_id();
+        reg.register_driver(DriverDescriptor {
+            id: driver_id,
+            name: spec.driver_name.into(),
+            implements: InterfaceSet::new(vec![iface_id]),
+            transport: Transport::InProcess,
+            driver,
+        });
+        let binding_id = reg.next_binding_id();
+        reg.admit_binding(Binding {
+            id: binding_id,
+            selector: ResourceSelector::parse(spec.selector).unwrap(),
+            interfaces: InterfaceSet::new(vec![iface_id]),
+            driver: DriverRef {
+                id: driver_id,
+                name: spec.driver_name.into(),
+            },
+            endpoint: None,
+            generation: 1,
+        })
+        .unwrap();
+        let name = ResourceName::new(Path::parse(spec.path).unwrap());
+        let rid = reg.next_resource_id();
+        reg.admit_resource(
+            Resource {
+                id: rid,
+                descriptor: ResourceDescriptor {
+                    name: name.clone(),
+                    kind: spec.kind,
+                    metadata: Metadata::default(),
+                },
+                interfaces: InterfaceSet::new(vec![iface_id]),
+                binding: binding_id,
+            },
+            true,
+        )
+        .unwrap();
+        (rid, name)
     }
 
     #[tokio::test]
@@ -1287,8 +1414,13 @@ mod tests {
 
     #[test]
     fn is_outbound_classifies_targets() {
-        let post = ResourceName::new(nexus_types::Path::parse("effect://x/post").unwrap());
+        let post =
+            ResourceName::new(nexus_types::Path::parse("effect://chat_platform/post").unwrap());
         assert!(is_outbound(&post));
+        let instant_messaging_platform = ResourceName::new(
+            nexus_types::Path::parse("effect://instant_messaging_platform/notify").unwrap(),
+        );
+        assert!(is_outbound(&instant_messaging_platform));
         let email = ResourceName::new(nexus_types::Path::parse("effect://email/send").unwrap());
         assert!(is_outbound(&email));
         let infer =
@@ -1311,7 +1443,9 @@ mod tests {
             },
         ));
         let tmpl = OperationTemplate {
-            target: ResourceName::new(nexus_types::Path::parse("effect://x/post").unwrap()),
+            target: ResourceName::new(
+                nexus_types::Path::parse("effect://chat_platform/post").unwrap(),
+            ),
             method: "invoke".into(),
             method_id: None,
             output: nexus_types::OutputMode::Unary,
@@ -1327,6 +1461,132 @@ mod tests {
             )
             .await;
         match out {
+            Outcome::Fail(nexus_types::Failure::PolicyViolation { policy, .. }) => {
+                assert_eq!(policy, "taint");
+            }
+            other => panic!("expected taint PolicyViolation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_protected_state_taint_blocks_later_outbound_op() {
+        let state = test_state();
+        let secret_path = Path::parse("state://memory/private").unwrap();
+        let protected = TaintSet::of(TaintSource::Protected {
+            path: secret_path.clone(),
+        });
+        state
+            .write_set_tainted(&secret_path, Value::Str("secret".into()), protected)
+            .await
+            .unwrap();
+
+        let reg = Registry::new();
+        reg.register_grant(Grant {
+            id: reg.next_grant_id(),
+            holder: ProcessId::new(1),
+            selector: ResourceSelector::all(),
+            rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
+            constraints: ConstraintSet::empty(),
+            expires: Expiry::Never,
+        });
+        let (state_resource, _) = register_test_resource(
+            &reg,
+            TestResourceSpec {
+                path: "state://memory",
+                kind: ResourceKind::State,
+                family: InterfaceFamily::Value,
+                method_name: "read",
+                method_id: 0,
+                purity: Purity::Pure,
+                replay: ReplayClass::Observation,
+                driver_name: "state-read",
+                selector: "read://state/memory/**",
+            },
+            Arc::new(TestStateReadDriver {
+                state: state.clone(),
+            }),
+        );
+        let (post_resource, post_name) = register_test_resource(
+            &reg,
+            TestResourceSpec {
+                path: "effect://chat_platform/post",
+                kind: ResourceKind::Effect,
+                family: InterfaceFamily::Callable,
+                method_name: "invoke",
+                method_id: 0,
+                purity: Purity::Effectful,
+                replay: ReplayClass::NonIdempotentEffect,
+                driver_name: "post",
+                selector: "perform://effect/chat_platform/post",
+            },
+            Arc::new(EchoDriver),
+        );
+
+        let (facts, _) = FactSink::in_memory();
+        let handles = Arc::new(RwLock::new(HandleTable::new()));
+        let dp = DataPlane::new(handles.clone(), facts, state);
+        let ex = Executor::new(ProcessId::new(1), dp, reg.clone(), StepTable::new());
+
+        let read_target = ResourceName::new(secret_path.clone());
+        let read_handle = {
+            let mut table = handles.write();
+            open_resource(
+                &reg,
+                &mut table,
+                OpenRequest {
+                    process: ProcessId::new(1),
+                    resource: state_resource,
+                    verb: "read".into(),
+                    rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+                    acting: IdentityRef::ROOT,
+                    requested_path: Some(secret_path.clone()),
+                    now_millis: 0,
+                },
+            )
+            .unwrap()
+        };
+        ex.bind_handle(read_target.clone(), read_handle);
+
+        let post_handle = {
+            let mut table = handles.write();
+            open_resource(
+                &reg,
+                &mut table,
+                OpenRequest {
+                    process: ProcessId::new(1),
+                    resource: post_resource,
+                    verb: "perform".into(),
+                    rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+                    acting: IdentityRef::ROOT,
+                    requested_path: None,
+                    now_millis: 0,
+                },
+            )
+            .unwrap()
+        };
+        ex.bind_handle(post_name.clone(), post_handle);
+
+        let post_step_target = post_name;
+        ex.steps.install(ex.process, "post", move |_, _| {
+            DoNode::op(OperationTemplate {
+                target: post_step_target.clone(),
+                method: "invoke".into(),
+                method_id: None,
+                output: nexus_types::OutputMode::Unary,
+                literal_input: None,
+            })
+        });
+
+        let prog = DoNode::op(OperationTemplate {
+            target: read_target,
+            method: "read".into(),
+            method_id: None,
+            output: nexus_types::OutputMode::Unary,
+            literal_input: None,
+        })
+        .and_then(s("post"));
+
+        match ex.eval(&prog).await {
             Outcome::Fail(nexus_types::Failure::PolicyViolation { policy, .. }) => {
                 assert_eq!(policy, "taint");
             }

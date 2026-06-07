@@ -263,10 +263,19 @@ impl StateBackend for InMemoryBackend {
     }
 
     async fn read_prefix(&self, prefix: &Path) -> StateResult<Vec<(Path, Value)>> {
+        Ok(self
+            .read_prefix_tainted(prefix)
+            .await?
+            .into_iter()
+            .map(|(path, tv)| (path, tv.value))
+            .collect())
+    }
+
+    async fn read_prefix_tainted(&self, prefix: &Path) -> StateResult<Vec<(Path, TaintedValue)>> {
         let mut results = Vec::new();
         for entry in self.map.iter() {
             if prefix.is_prefix_of(entry.key()) || entry.key() == prefix {
-                results.push((entry.key().clone(), entry.value().value.clone()));
+                results.push((entry.key().clone(), entry.value().clone()));
             }
         }
         results.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -277,7 +286,11 @@ impl StateBackend for InMemoryBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexus_types::p;
+    use nexus_types::Path;
+
+    fn p(s: &str) -> Path {
+        Path::parse(s).unwrap()
+    }
 
     #[tokio::test]
     async fn set_and_read() {

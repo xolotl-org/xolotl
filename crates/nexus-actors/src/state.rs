@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};
 use nexus_state::Backend;
-use nexus_types::{MethodId, Outcome, OutputMode, Purity, Value};
+use nexus_types::{MethodId, Outcome, OutputMode, Purity, TaintSet, Value};
 
 /// Method names in registration order for `state://**`. The kernel derives the
 /// rights-bitmap bit and ReplayClass from each; `read` is an Observation,
@@ -59,13 +59,17 @@ impl Driver for StateDriver {
         match method.get() {
             // read: return the current value (None → Null).
             0 => {
-                let v = self
+                let tv = self
                     .state
-                    .read(&path)
+                    .read_tainted(&path)
                     .await
-                    .map_err(|e| DriverError::Other(e.to_string()))?
-                    .unwrap_or(Value::Null);
-                Ok(Outcome::Done(v))
+                    .map_err(|e| DriverError::Other(e.to_string()))?;
+                let (value, taint) = match tv {
+                    Some(tv) => (tv.value, tv.taint),
+                    None => (Value::Null, TaintSet::pristine()),
+                };
+                ctx.set_output_taint(taint);
+                Ok(Outcome::Done(value))
             }
             // write: set the value, persisting the operation's input taint
             // alongside it (§4.4/§21.5) — provenance is never dropped here.
@@ -103,18 +107,21 @@ impl Driver for StateDriver {
             4 => {
                 let rows = self
                     .state
-                    .read_prefix(&path)
+                    .read_prefix_tainted(&path)
                     .await
                     .map_err(|e| DriverError::Other(e.to_string()))?;
+                let mut taint = TaintSet::pristine();
                 let values = rows
                     .into_iter()
-                    .map(|(p, v)| {
+                    .map(|(p, tv)| {
+                        taint.union(&tv.taint);
                         let mut m = std::collections::BTreeMap::new();
                         m.insert("path".into(), Value::Str(p.to_string()));
-                        m.insert("value".into(), v);
+                        m.insert("value".into(), tv.value);
                         Value::Map(m)
                     })
                     .collect();
+                ctx.set_output_taint(taint);
                 Ok(Outcome::Done(Value::List(values)))
             }
             _ => Err(DriverError::NoSuchMethod(method)),

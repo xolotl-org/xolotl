@@ -5,7 +5,7 @@
 //! Routes inference requests to a model backend. This crate ships an
 //! [`EchoBackend`] — a fully deterministic, offline backend so the kernel is
 //! runnable and replay-testable without a network. Production registers a real
-//! backend (Anthropic/OpenAI/local) implementing the same [`InferenceBackend`]
+//! backend (hosted model or local) implementing the same [`InferenceBackend`]
 //! trait. Multimodal is first-class: `infer` accepts mixed parts; `embed`
 //! returns a `Tensor`.
 
@@ -24,7 +24,7 @@ pub const INFERENCE_METHODS: &[MethodSpec] = &[
     MethodSpec::new("plan", Purity::Effectful, MethodSpec::STREAM_ASYNC),
 ];
 
-/// A pluggable model backend. Real backends (Anthropic/OpenAI/local) implement
+/// A pluggable model backend. Real hosted or local backends implement
 /// this; the default is [`EchoBackend`].
 #[async_trait]
 pub trait InferenceBackend: Send + Sync + 'static {

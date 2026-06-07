@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `nexus-kernel` — the Direction-C kernel (syscall + ExecutionGraph).
 //!
 //! The control plane is a compiler: `open()` compiles a Grant against a
@@ -39,7 +41,7 @@ pub mod registry;
 pub mod scheduler;
 pub mod step;
 
-pub use bootstrap::{Bootstrap, GatewayAudit, MethodSpec};
+pub use bootstrap::{Bootstrap, BootstrapError, GatewayAudit, MethodSpec};
 pub use dataplane::{DataPlane, ExecOutput};
 pub use driver::{
     DispatchEntry, Driver, DriverContext, DriverDescriptor, DriverError, DriverPlan, DynDriver,

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `nexus-actors` — the standard in-process Drivers / Providers (§17).
 //!
 //! Each module is a [`Driver`](nexus_kernel::Driver) implementing one
@@ -48,7 +50,9 @@ pub use inference::{
     BASELINE_EMBEDDING_SPACE, EchoBackend, INFERENCE_METHODS, InferenceBackend, InferenceDriver,
 };
 pub use inspect::{INSPECT_METHODS, KernelInspectDriver};
-pub use install::{McpToolMount, StandardConfig, install_standard, register_mcp_tool};
+pub use install::{
+    InstallError, McpToolMount, StandardConfig, install_standard, register_mcp_tool,
+};
 pub use lock::{LOCK_METHODS, LockDriver};
 pub use mcp::{
     EchoMcpClient, MCP_STREAM_TOOL_METHODS, MCP_TOOL_METHODS, McpClient, McpToolDescriptor,

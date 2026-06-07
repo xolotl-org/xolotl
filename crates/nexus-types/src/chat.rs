@@ -1,6 +1,6 @@
 //! Standard conversation message schema.
 //!
-//! All chat channels (Slack, CLI, Web, X, etc.) serialise their messages
+//! All chat channels (team chat, CLI, web, etc.) serialise their messages
 //! into this unified format so that Memory, TokenCompressor, and
 //! AutoContext can operate on a single representation.
 //!
@@ -168,13 +168,13 @@ mod tests {
 
     #[test]
     fn chat_message_roundtrip() {
-        let msg = ChatMessage::user("slack", "C42", "hello world");
+        let msg = ChatMessage::user("chat_platform", "C42", "hello world");
         let json = serde_json::to_string(&msg).unwrap();
         let back: ChatMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back.role, MessageRole::User);
         assert_eq!(back.text_concat(), "hello world");
         let meta = back.metadata.unwrap();
-        assert_eq!(meta.platform, "slack");
+        assert_eq!(meta.platform, "chat_platform");
         assert_eq!(meta.conversation_id.as_deref(), Some("C42"));
     }
 
@@ -201,8 +201,8 @@ mod tests {
     #[test]
     fn estimate_tokens_approximate() {
         let msgs = vec![
-            ChatMessage::user("slack", "c1", "hello world"), // 11 chars
-            ChatMessage::assistant("hi there"),              // 8 chars
+            ChatMessage::user("chat_platform", "c1", "hello world"), // 11 chars
+            ChatMessage::assistant("hi there"),                      // 8 chars
         ];
         let tokens = estimate_tokens(&msgs);
         // 19 chars / 4 ≈ 4
@@ -216,7 +216,10 @@ mod tests {
             name: "fetch".into(),
             arguments: crate::Value::Map({
                 let mut m = std::collections::BTreeMap::new();
-                m.insert("url".into(), crate::Value::Str("https://ex.com".into()));
+                m.insert(
+                    "url".into(),
+                    crate::Value::Str("https://example.invalid".into()),
+                );
                 m
             }),
         };

@@ -15,6 +15,7 @@ use crate::cap::Capability;
 use crate::ids::{GrantId, ProcessId};
 use crate::value::Value;
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 
 /// Implements `Serialize`/`Deserialize` for a `bitflags`-generated type by
 /// (de)serializing its raw integer bits. Used for bitflag sets whose bits are
@@ -144,6 +145,17 @@ pub struct ResourceSelector {
 }
 
 impl ResourceSelector {
+    pub fn all() -> Self {
+        Self {
+            pattern: Capability {
+                verb: "*".to_string(),
+                scheme: "**".to_string(),
+                segments: vec![SmolStr::from("**")],
+                predicate: None,
+            },
+        }
+    }
+
     pub fn parse(literal: &str) -> Result<Self, crate::cap::CapError> {
         Ok(Self {
             pattern: Capability::parse(literal)?,

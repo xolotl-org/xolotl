@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `nexus-gateway-grpc` — gRPC protocol adapter (Gateway, §18.1).
 //!
 //! A thin tonic service over the shared [`Gateway`](nexus_gateway::Gateway):

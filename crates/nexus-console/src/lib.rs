@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `nexus-console` — the Console Protocol host and management-domain Gateway
 //! (§18.4 / §24.3).
 //!
@@ -167,7 +169,7 @@ mod tests {
     #[tokio::test]
     async fn router_builds() {
         let boot = Arc::new(Bootstrap::in_memory());
-        install_standard(&boot, &StandardConfig::default());
+        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
         let st = ConsoleState::shared(boot);
         let _ = router(st);
     }

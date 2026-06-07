@@ -326,10 +326,11 @@ fn invoke_frame_types_roundtrip_through_pb() {
     // §16.3.3: the Invoke business frame maps losslessly types ⇄ proto.
     use crate::convert::{invoke_from_pb, invoke_to_pb};
     use nexus_types::extension::Invoke;
-    use nexus_types::{Path, Value};
+    use nexus_types::{MethodId, Path, Value};
     let inv = Invoke {
         invocation_id: "inv-1".into(),
         effect_path: Path::parse("effect://x/post").unwrap(),
+        method_id: MethodId::new(7),
         input: Value::Str("hello".into()),
         deadline_ms: Some(5000),
         output_stream_to: Some(Path::parse("state://chat/out").unwrap()),
@@ -337,6 +338,7 @@ fn invoke_frame_types_roundtrip_through_pb() {
     let back = invoke_from_pb(&invoke_to_pb(&inv)).unwrap();
     assert_eq!(back.invocation_id, inv.invocation_id);
     assert_eq!(back.effect_path, inv.effect_path);
+    assert_eq!(back.method_id, inv.method_id);
     assert_eq!(back.input, inv.input);
     assert_eq!(back.deadline_ms, inv.deadline_ms);
     assert_eq!(back.output_stream_to, inv.output_stream_to);
@@ -369,8 +371,21 @@ fn malformed_wire_paths_and_capabilities_fail_closed() {
         input: Some(crate::convert::value_to_pb(&Value::Null)),
         deadline_ms: None,
         output_stream_to: None,
+        method_id: Some(0),
     };
     assert!(invoke_from_pb(&missing_effect_path).is_err());
+
+    let missing_method = ext::Invoke {
+        invocation_id: "inv-1".into(),
+        effect_path: Some(crate::convert::path_to_pb(
+            &Path::parse("effect://x/post").unwrap(),
+        )),
+        input: Some(crate::convert::value_to_pb(&Value::Null)),
+        deadline_ms: None,
+        output_stream_to: None,
+        method_id: None,
+    };
+    assert!(invoke_from_pb(&missing_method).is_err());
 }
 
 #[test]

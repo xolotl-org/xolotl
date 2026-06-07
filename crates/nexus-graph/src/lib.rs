@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `nexus-graph` — the single execution IR and its front-ends.
 //!
 //! Every Program format (Do<A>, model plan, native) compiles to one

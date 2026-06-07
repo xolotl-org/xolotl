@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `nexus-state` — backend trait and in-process implementation for the
 //! Nexus state plane (`state://`).
 //!
@@ -21,8 +23,12 @@ pub type Backend = std::sync::Arc<dyn StateBackend>;
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use nexus_types::{Value, p};
+    use nexus_types::{Path, Value};
     use std::sync::Arc;
+
+    fn p(s: &str) -> Path {
+        Path::parse(s).unwrap()
+    }
 
     /// End-to-end check: backend behind a trait object behaves as expected.
     #[tokio::test]

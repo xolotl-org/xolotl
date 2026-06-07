@@ -25,7 +25,9 @@ use thiserror::Error;
 pub struct FactError(pub String);
 
 /// Pluggable durable sink. The in-memory impl is the default; redb provides a
-/// persistent one (§24.1). The kernel speaks only this trait.
+/// persistent one (§24.1). The kernel speaks only this trait. Read failures are
+/// explicit so recovery/audit do not silently treat corrupted Fact storage as
+/// an empty stream (§0.1 / §15).
 pub trait FactStore: Send + Sync + 'static {
     /// Append a (possibly pending) fact. Returns the append cursor position.
     /// Errors before the cursor advances, so a retry reuses the same slot.
@@ -36,9 +38,9 @@ pub trait FactStore: Send + Sync + 'static {
     /// write-ahead barriers.
     fn sync(&self) -> Result<(), FactError>;
     /// All facts for one process, in append order (recovery, §15.2).
-    fn facts_of(&self, process: nexus_types::ProcessId) -> Vec<Fact>;
+    fn facts_of(&self, process: nexus_types::ProcessId) -> Result<Vec<Fact>, FactError>;
     /// All facts, in append order (audit / billing / trace projection, §9.1).
-    fn all_facts(&self) -> Vec<Fact>;
+    fn all_facts(&self) -> Result<Vec<Fact>, FactError>;
     /// The current monotonic append cursor (snapshot cut-point, §9).
     fn cursor(&self) -> u64;
 }
@@ -82,7 +84,10 @@ impl FactStore for InMemoryFactStore {
     fn append(&self, fact: Fact) -> Result<u64, FactError> {
         let mut inner = self.inner.lock();
         let pos = inner.cursor;
-        inner.cursor += 1;
+        inner.cursor = inner
+            .cursor
+            .checked_add(1)
+            .ok_or_else(|| FactError("fact cursor overflow".into()))?;
         let idx = inner.facts.len();
         inner.index.insert(fact.id, idx);
         inner.facts.push(fact);
@@ -106,18 +111,19 @@ impl FactStore for InMemoryFactStore {
         Ok(())
     }
 
-    fn facts_of(&self, process: nexus_types::ProcessId) -> Vec<Fact> {
-        self.inner
+    fn facts_of(&self, process: nexus_types::ProcessId) -> Result<Vec<Fact>, FactError> {
+        Ok(self
+            .inner
             .lock()
             .facts
             .iter()
             .filter(|f| f.caller == process)
             .cloned()
-            .collect()
+            .collect())
     }
 
-    fn all_facts(&self) -> Vec<Fact> {
-        self.inner.lock().facts.clone()
+    fn all_facts(&self) -> Result<Vec<Fact>, FactError> {
+        Ok(self.inner.lock().facts.clone())
     }
 
     fn cursor(&self) -> u64 {
@@ -155,6 +161,7 @@ impl FactSink {
     /// that does); other classes append in memory. A failure here is reported to
     /// the caller, which **must not** issue the effect (§9.3 fail-closed).
     pub fn begin(&self, pending: Fact) -> Result<(), FactError> {
+        validate_fact_schema(&pending)?;
         let needs_barrier = pending.replay.needs_write_ahead_barrier();
         self.store.append(pending)?;
         if needs_barrier {
@@ -166,6 +173,7 @@ impl FactSink {
     /// Complete an operation's record after the driver returns (§15.1 step 3).
     /// `NonIdempotentEffect` fsyncs again; others ride group commit.
     pub fn complete(&self, fact: Fact) -> Result<(), FactError> {
+        validate_fact_schema(&fact)?;
         let needs_barrier = fact.replay.needs_write_ahead_barrier();
         self.store.complete(fact)?;
         if needs_barrier {
@@ -178,16 +186,28 @@ impl FactSink {
         &self.store
     }
 
-    pub fn facts_of(&self, process: nexus_types::ProcessId) -> Vec<Fact> {
+    pub fn facts_of(&self, process: nexus_types::ProcessId) -> Result<Vec<Fact>, FactError> {
         self.store.facts_of(process)
     }
 
-    pub fn all_facts(&self) -> Vec<Fact> {
+    pub fn all_facts(&self) -> Result<Vec<Fact>, FactError> {
         self.store.all_facts()
     }
 
     pub fn cursor(&self) -> u64 {
         self.store.cursor()
+    }
+}
+
+fn validate_fact_schema(fact: &Fact) -> Result<(), FactError> {
+    if fact.schema_version == Fact::SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(FactError(format!(
+            "unsupported Fact schema_version {} (current {})",
+            fact.schema_version,
+            Fact::SCHEMA_VERSION
+        )))
     }
 }
 
@@ -246,6 +266,15 @@ mod tests {
         let (sink, _) = FactSink::in_memory();
         sink.begin(fact(1, 0, ReplayClass::Deterministic)).unwrap();
         sink.begin(fact(2, 0, ReplayClass::Deterministic)).unwrap();
-        assert_eq!(sink.facts_of(ProcessId::new(1)).len(), 1);
+        assert_eq!(sink.facts_of(ProcessId::new(1)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fact_sink_rejects_unknown_schema_version() {
+        let (sink, _) = FactSink::in_memory();
+        let mut f = fact(1, 0, ReplayClass::Deterministic);
+        f.schema_version = Fact::SCHEMA_VERSION + 1;
+        let err = sink.begin(f).unwrap_err();
+        assert!(err.0.contains("unsupported Fact schema_version"));
     }
 }

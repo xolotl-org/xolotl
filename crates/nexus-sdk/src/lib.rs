@@ -1,10 +1,12 @@
+#![forbid(unsafe_code)]
+
 //! `nexus-sdk` — embedded façade.
 //!
 //! Re-exports the public surface and provides a one-call [`nexus`] constructor
 //! for applications embedding the kernel in-process, plus [`Nexus`] — a thin
 //! wrapper that opens a resource, binds it, and runs a program.
 
-pub use nexus_actors::{StandardConfig, install_standard};
+pub use nexus_actors::{InstallError, StandardConfig, install_standard};
 pub use nexus_gateway::{AuthToken, Gateway, GatewayError, InProcessGateway, RequestIdentity};
 pub use nexus_graph::{
     DoNode, ExecutionGraph, GraphCursor, NodeKind, OperationTemplate, StepRef, compile_do,
@@ -20,7 +22,7 @@ pub use nexus_state::{
 pub use nexus_types::{
     BlobRef, BudgetSpec, CapSet, Capability, ConstraintSet, Expiry, Fact, Failure, Grant,
     MergeRule, Operation, OperationId, Outcome, Path, PathError, Purity, ReplayClass, Resource,
-    ResourceName, Rights, Value, ValueError, p,
+    ResourceName, Rights, Value, ValueError,
 };
 
 use std::sync::Arc;
@@ -28,10 +30,10 @@ use std::sync::Arc;
 /// One-call constructor: a [`Bootstrap`] with the standard provider set
 /// installed (inference, memory, time, blob, approval, events, lock,
 /// deliberation). fs/terminal/fetch are opt-in via [`StandardConfig`].
-pub fn nexus() -> Bootstrap {
+pub fn nexus() -> Result<Bootstrap, InstallError> {
     let boot = Bootstrap::in_memory();
-    install_standard(&boot, &StandardConfig::default());
-    boot
+    install_standard(&boot, &StandardConfig::default())?;
+    Ok(boot)
 }
 
 /// A convenience handle that runs programs against an embedded kernel. Opens
@@ -40,18 +42,12 @@ pub struct Nexus {
     boot: Arc<Bootstrap>,
 }
 
-impl Default for Nexus {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Nexus {
     /// Build with the standard provider set installed.
-    pub fn new() -> Self {
-        Self {
-            boot: Arc::new(nexus()),
-        }
+    pub fn new() -> Result<Self, InstallError> {
+        Ok(Self {
+            boot: Arc::new(nexus()?),
+        })
     }
 
     pub fn bootstrap(&self) -> &Bootstrap {
@@ -65,7 +61,11 @@ impl Nexus {
         for r in resources {
             let name = ResourceName::new(match Path::parse(r) {
                 Ok(p) => p,
-                Err(e) => return Outcome::Fail(Failure::path_invalid(p(r), e.to_string())),
+                Err(e) => {
+                    return Outcome::Fail(Failure::InvalidInput {
+                        reason: format!("invalid resource path {r:?}: {e}"),
+                    });
+                }
             });
             if let Ok(handle) = self.boot.open_for(self.boot.root, &name, "perform") {
                 ex.bind_handle(name, handle);
@@ -87,7 +87,9 @@ mod tests {
 
     #[tokio::test]
     async fn one_call_constructor_has_standard_providers() {
-        let nx = Nexus::new();
+        let Ok(nx) = Nexus::new() else {
+            panic!("Nexus::new should install standard providers");
+        };
         let prog = DoNode::Op(OperationTemplate {
             target: ResourceName::new(Path::parse("effect://inference/infer").unwrap()),
             method: "invoke".into(),
@@ -101,7 +103,9 @@ mod tests {
 
     #[tokio::test]
     async fn plan_compiles_and_runs() {
-        let nx = Nexus::new();
+        let Ok(nx) = Nexus::new() else {
+            panic!("Nexus::new should install standard providers");
+        };
         let plan = Plan {
             id: "p".into(),
             version: 1,

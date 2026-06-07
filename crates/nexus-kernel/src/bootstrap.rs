@@ -16,12 +16,14 @@ use crate::driver::{DriverDescriptor, DynDriver};
 use crate::kernel::Kernel;
 use crate::open::{OpenError, OpenRequest, open_resource};
 use crate::process::ProcessEntry;
+use crate::registry::AdmissionError;
 use nexus_types::{
-    Binding, ConstraintSet, DriverRef, Expiry, Fact, Grant, HandleId, IdentityRef, Interface,
-    InterfaceFamily, InterfaceSet, Metadata, Method, MethodBitmap, ModalitySet, OutputModeSet,
-    Path, ProcessId, ProcessStatus, Purity, Resource, ResourceDescriptor, ResourceKind,
-    ResourceName, ResourceSelector, RightFlags, Rights, SchemaId, Transport,
+    Binding, CapError, ConstraintSet, DriverRef, Expiry, Fact, Grant, HandleId, IdentityRef,
+    Interface, InterfaceFamily, InterfaceSet, Metadata, Method, MethodBitmap, ModalitySet,
+    OutputModeSet, Path, PathError, ProcessId, ProcessStatus, Purity, Resource, ResourceDescriptor,
+    ResourceKind, ResourceName, ResourceSelector, RightFlags, Rights, SchemaId, Transport,
 };
+use thiserror::Error;
 
 /// A ready kernel plus the root Process id (§14.1). The root holds an
 /// omnipotent grant; everything else is attenuated from it.
@@ -40,6 +42,30 @@ pub struct GatewayAudit<'a> {
     pub outcome: &'a str,
     pub mfa_level: Option<u8>,
     pub details: Option<nexus_types::Value>,
+}
+
+#[derive(Debug, Error)]
+pub enum BootstrapError {
+    #[error("invalid method spec for {resource}: {reason}")]
+    InvalidMethodSpec { resource: String, reason: String },
+    #[error("invalid selector {literal:?}: {source}")]
+    Selector {
+        literal: String,
+        #[source]
+        source: CapError,
+    },
+    #[error("invalid path {literal:?}: {source}")]
+    Path {
+        literal: String,
+        #[source]
+        source: PathError,
+    },
+    #[error("admission failed: {0}")]
+    Admission(#[from] AdmissionError),
+    #[error("fact write failed: {0}")]
+    Fact(#[from] crate::FactError),
+    #[error("state write failed: {0}")]
+    State(#[from] nexus_state::StateError),
 }
 
 /// Assembly-time method descriptor. Output support is explicit (§4.3): no
@@ -128,7 +154,7 @@ impl Bootstrap {
         let grant = Grant {
             id: kernel.registry.next_grant_id(),
             holder: root,
-            selector: ResourceSelector::parse("*://**").expect("omnipotent selector parses"),
+            selector: ResourceSelector::all(),
             rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
@@ -147,7 +173,7 @@ impl Bootstrap {
         path: &str,
         methods: &[MethodSpec],
         driver: DynDriver,
-    ) -> ResourceName {
+    ) -> Result<ResourceName, BootstrapError> {
         self.register_effect_with_cost(path, methods, driver, nexus_types::CostModel::default())
     }
 
@@ -160,11 +186,14 @@ impl Bootstrap {
         methods: &[MethodSpec],
         driver: DynDriver,
         cost: nexus_types::CostModel,
-    ) -> ResourceName {
-        assert!(
-            methods.len() == 1 && methods[0].name == "invoke",
-            "Callable effect resources expose exactly one public `invoke` method"
-        );
+    ) -> Result<ResourceName, BootstrapError> {
+        if methods.len() != 1 || methods[0].name != "invoke" {
+            return Err(BootstrapError::InvalidMethodSpec {
+                resource: path.to_string(),
+                reason: "Callable effect resources expose exactly one public `invoke` method"
+                    .into(),
+            });
+        }
         let reg = &self.kernel.registry;
         let iface_id = reg.next_interface_id();
         let method_descs = build_methods(methods, cost, false);
@@ -189,8 +218,13 @@ impl Bootstrap {
         // A parse failure here is an assembly-time programmer error (the path is
         // a static literal), so fail fast — never silently broaden the selector
         // to a wildcard, which would over-grant authority.
-        let selector = ResourceSelector::parse(&format!("perform://{}", strip_scheme(path)))
-            .expect("effect selector parses");
+        let selector_literal = format!("perform://{}", strip_scheme(path));
+        let selector = ResourceSelector::parse(&selector_literal).map_err(|source| {
+            BootstrapError::Selector {
+                literal: selector_literal,
+                source,
+            }
+        })?;
         // Admit (not bare-register) so the §7.2 invariant — the bound Driver
         // implements every Interface the Binding declares — is enforced even for
         // built-ins. The driver registered just above implements `iface_id`, so
@@ -205,11 +239,13 @@ impl Bootstrap {
             },
             endpoint: None,
             generation: 1,
-        })
-        .expect("built-in binding's driver implements its interface");
+        })?;
 
         let rid = reg.next_resource_id();
-        let name = ResourceName::new(Path::parse(path).expect("effect path parses"));
+        let name = ResourceName::new(Path::parse(path).map_err(|source| BootstrapError::Path {
+            literal: path.to_string(),
+            source,
+        })?);
         reg.admit_resource(
             Resource {
                 id: rid,
@@ -222,9 +258,8 @@ impl Bootstrap {
                 binding: binding_id,
             },
             true,
-        )
-        .expect("kernel may admit effect resources");
-        name
+        )?;
+        Ok(name)
     }
 
     /// Register a single Resource serving an entire `<scheme>://` subtree
@@ -239,7 +274,7 @@ impl Bootstrap {
         family: InterfaceFamily,
         methods: &[MethodSpec],
         driver: DynDriver,
-    ) -> ResourceName {
+    ) -> Result<ResourceName, BootstrapError> {
         self.register_subtree_resource_at(
             &format!("{scheme}://"),
             &format!("*://{scheme}/**"),
@@ -260,7 +295,7 @@ impl Bootstrap {
         family: InterfaceFamily,
         methods: &[MethodSpec],
         driver: DynDriver,
-    ) -> ResourceName {
+    ) -> Result<ResourceName, BootstrapError> {
         let reg = &self.kernel.registry;
         let iface_id = reg.next_interface_id();
         let method_descs = build_methods(methods, Default::default(), true);
@@ -281,7 +316,12 @@ impl Bootstrap {
         });
 
         let binding_id = reg.next_binding_id();
-        let selector = ResourceSelector::parse(selector_pattern).expect("subtree selector parses");
+        let selector = ResourceSelector::parse(selector_pattern).map_err(|source| {
+            BootstrapError::Selector {
+                literal: selector_pattern.to_string(),
+                source,
+            }
+        })?;
         reg.admit_binding(Binding {
             id: binding_id,
             selector,
@@ -292,11 +332,16 @@ impl Bootstrap {
             },
             endpoint: None,
             generation: 1,
-        })
-        .expect("subtree binding's driver implements its interface");
+        })?;
 
         let rid = reg.next_resource_id();
-        let name = ResourceName::new(Path::parse(root_path).expect("subtree root parses"));
+        let name =
+            ResourceName::new(
+                Path::parse(root_path).map_err(|source| BootstrapError::Path {
+                    literal: root_path.to_string(),
+                    source,
+                })?,
+            );
         reg.admit_resource(
             Resource {
                 id: rid,
@@ -309,9 +354,8 @@ impl Bootstrap {
                 binding: binding_id,
             },
             true,
-        )
-        .expect("kernel may admit the state subtree resource");
-        name
+        )?;
+        Ok(name)
     }
 
     /// Open a handle for `process` against a registered resource and bind it on
@@ -369,7 +413,17 @@ impl Bootstrap {
         &self,
         identity: IdentityRef,
         declared_capabilities: &[&str],
-    ) -> ProcessId {
+    ) -> Result<ProcessId, BootstrapError> {
+        let selectors = declared_capabilities
+            .iter()
+            .map(|declared| {
+                ResourceSelector::parse(declared).map_err(|source| BootstrapError::Selector {
+                    literal: (*declared).to_string(),
+                    source,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         let child = self.kernel.processes.fresh_id();
         let mut entry = ProcessEntry::new(child, Some(self.root), identity);
         entry.status = ProcessStatus::Running;
@@ -378,12 +432,8 @@ impl Bootstrap {
         // One attenuated grant per declared capability literal — the runtime
         // ceiling. The caller must pass the canonical capability grammar
         // (`perform://effect/...`, `read://state/...`, etc.); malformed entries
-        // are fail-closed by omission.
-        for declared in declared_capabilities {
-            let selector = match ResourceSelector::parse(declared) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
+        // reject the request so bad task ceilings are explicit and fail closed.
+        for selector in selectors {
             let grant = Grant {
                 id: self.kernel.registry.next_grant_id(),
                 holder: child,
@@ -394,13 +444,13 @@ impl Bootstrap {
             };
             self.kernel.registry.register_grant(grant);
         }
-        child
+        Ok(child)
     }
 
     /// Phase 6 (§14.1): recover every unfinished Process from its Fact stream,
     /// persisting any quarantine entries to `state://quarantine/*` (§15.2/§15.3).
     /// Returns the aggregate recovery report. Called by the daemon on boot.
-    pub async fn recover_all(&self) -> crate::recovery::RecoveryReport {
+    pub async fn recover_all(&self) -> Result<crate::recovery::RecoveryReport, crate::FactError> {
         let mut agg = crate::recovery::RecoveryReport::default();
         for pid in self.kernel.processes.all_ids() {
             let report = crate::recovery::recover_process_persisting(
@@ -408,12 +458,13 @@ impl Bootstrap {
                 &self.kernel.state,
                 pid,
             )
-            .await;
+            .await?;
             agg.skipped += report.skipped;
             agg.retried += report.retried;
             agg.quarantined += report.quarantined;
+            agg.schema_mismatched += report.schema_mismatched;
         }
-        agg
+        Ok(agg)
     }
 
     /// Record a Gateway-layer audit Fact for pre-Operation events such as
@@ -423,7 +474,6 @@ impl Bootstrap {
         let process = self.kernel.processes.fresh_id();
         let mut entry = ProcessEntry::new(process, None, IdentityRef::ROOT);
         entry.status = ProcessStatus::Completed;
-        self.kernel.processes.insert(entry);
 
         let mut outcome = std::collections::BTreeMap::new();
         outcome.insert("event".into(), nexus_types::Value::Str(audit.event.into()));
@@ -465,7 +515,9 @@ impl Bootstrap {
             batch: None,
             replay: nexus_types::ReplayClass::Observation,
             timestamp: nexus_types::Timestamp::millis(crate::executor::now_millis()),
-        })
+        })?;
+        self.kernel.processes.insert(entry);
+        Ok(())
     }
 
     /// Finalize a Process (§14.2): the ordered teardown sequence. Mutating the
@@ -477,7 +529,7 @@ impl Bootstrap {
     /// 3. run the process's finalizers in reverse order
     /// 4. revoke all handles owned by the process (ABA-safe generation bump)
     /// 5. mark `Done` and record a `ProcessFinalized` Fact-like state marker
-    pub async fn finalize_process(&self, process: ProcessId) {
+    pub async fn finalize_process(&self, process: ProcessId) -> Result<(), BootstrapError> {
         let procs = &self.kernel.processes;
         // 1. mark Finalizing.
         procs.set_status(process, ProcessStatus::Finalizing);
@@ -499,11 +551,11 @@ impl Bootstrap {
         // 4. revoke handles owned by the process.
         let revoked = self.kernel.handles.write().revoke_owned_by(process);
 
-        // 5. mark Completed, write a ProcessFinalized Fact to the Fact stream
-        // (§14.2 step 6 — the authoritative lifecycle record), and a state marker
-        // for quick lookup. The Fact uses a reserved high CausalPosition so it
-        // never collides with a program node's id.
-        procs.set_status(process, ProcessStatus::Completed);
+        // 5. write a ProcessFinalized Fact to the Fact stream (§14.2 step 6 — the
+        // authoritative lifecycle record), mark Completed, and write a state
+        // marker for quick lookup. The Fact uses a reserved high CausalPosition so
+        // it never collides with a program node's id. If the Fact cannot be
+        // recorded, leave the Process in Finalizing instead of silently terminal.
         let finalized = Fact {
             id: nexus_types::OperationId::new(process, FINALIZED_NODE, 0),
             schema_version: Fact::SCHEMA_VERSION,
@@ -531,17 +583,17 @@ impl Bootstrap {
             replay: nexus_types::ReplayClass::Observation,
             timestamp: nexus_types::Timestamp::millis(crate::executor::now_millis()),
         };
-        let _ = self.kernel.facts.complete(finalized);
-        if let Ok(path) = nexus_types::Path::parse(&format!(
-            "state://kernel/process/{}/finalized",
-            process.get()
-        )) {
-            let _ = self
-                .kernel
-                .state
-                .write_set(&path, nexus_types::Value::Int(revoked as i64))
-                .await;
-        }
+        self.kernel.facts.complete(finalized)?;
+        procs.set_status(process, ProcessStatus::Completed);
+        let path = finalized_marker_path(process).map_err(|source| BootstrapError::Path {
+            literal: format!("state://kernel/process/{}/finalized", process.get()),
+            source,
+        })?;
+        self.kernel
+            .state
+            .write_set(&path, nexus_types::Value::Int(revoked as i64))
+            .await?;
+        Ok(())
     }
 }
 
@@ -549,6 +601,14 @@ impl Bootstrap {
 /// (§14.2). Far above any compiled program's node ids so it never collides.
 const FINALIZED_NODE: nexus_types::NodeId = nexus_types::NodeId::new(u32::MAX);
 const GATEWAY_AUDIT_NODE: nexus_types::NodeId = nexus_types::NodeId::new(u32::MAX - 1);
+
+fn finalized_marker_path(process: ProcessId) -> Result<Path, PathError> {
+    Path::try_new("state")?
+        .try_push("kernel")?
+        .try_push("process")?
+        .try_push(process.get().to_string())?
+        .try_push("finalized")
+}
 
 fn method_bitmap_for_verb(
     registry: &crate::registry::Registry,
@@ -633,15 +693,17 @@ mod tests {
     async fn end_to_end_operation_flows_through_resolved_handle() {
         let boot = Bootstrap::in_memory();
         // Register an echo effect and open a handle for the root process.
-        let name = boot.register_effect(
-            "effect://echo/say",
-            &[MethodSpec::new(
-                "invoke",
-                Purity::Pure,
-                MethodSpec::UNARY_ASYNC,
-            )],
-            Arc::new(EchoDriver),
-        );
+        let name = boot
+            .register_effect(
+                "effect://echo/say",
+                &[MethodSpec::new(
+                    "invoke",
+                    Purity::Pure,
+                    MethodSpec::UNARY_ASYNC,
+                )],
+                Arc::new(EchoDriver),
+            )
+            .unwrap();
         let handle = boot.open_for(boot.root, &name, "perform").unwrap();
 
         // Build an executor, bind the handle, run a one-Operation program.
@@ -660,21 +722,23 @@ mod tests {
         // §9.2: a single unconsumed pure-Deterministic read need not record a
         // Fact — recovery can recompute it. The EchoDriver method is Pure, the
         // op's output flows nowhere, so no Fact is written.
-        assert_eq!(boot.kernel.facts.facts_of(boot.root).len(), 0);
+        assert_eq!(boot.kernel.facts.facts_of(boot.root).unwrap().len(), 0);
     }
 
     #[tokio::test]
     async fn unary_only_method_rejects_stream_request() {
         let boot = Bootstrap::in_memory();
-        let name = boot.register_effect(
-            "effect://echo/unary",
-            &[MethodSpec::new(
-                "invoke",
-                Purity::Pure,
-                MethodSpec::UNARY_ASYNC,
-            )],
-            Arc::new(EchoDriver),
-        );
+        let name = boot
+            .register_effect(
+                "effect://echo/unary",
+                &[MethodSpec::new(
+                    "invoke",
+                    Purity::Pure,
+                    MethodSpec::UNARY_ASYNC,
+                )],
+                Arc::new(EchoDriver),
+            )
+            .unwrap();
         let handle = boot.open_for(boot.root, &name, "perform").unwrap();
         let ex = boot.kernel.executor_for(boot.root);
         ex.bind_handle(name.clone(), handle);
@@ -701,20 +765,22 @@ mod tests {
         // §21.2: a process with a tiny daily budget running a costed effect is
         // denied with BudgetExhausted — the reservation fires before dispatch.
         let boot = Bootstrap::in_memory();
-        let name = boot.register_effect_with_cost(
-            "effect://pricey/call",
-            &[MethodSpec::new(
-                "invoke",
-                Purity::Effectful,
-                MethodSpec::UNARY_ASYNC,
-            )],
-            Arc::new(EchoDriver),
-            // 1 USD flat per call = 1_000_000 micro-USD.
-            nexus_types::CostModel {
-                flat_micro_usd: 1_000_000,
-                ..Default::default()
-            },
-        );
+        let name = boot
+            .register_effect_with_cost(
+                "effect://pricey/call",
+                &[MethodSpec::new(
+                    "invoke",
+                    Purity::Effectful,
+                    MethodSpec::UNARY_ASYNC,
+                )],
+                Arc::new(EchoDriver),
+                // 1 USD flat per call = 1_000_000 micro-USD.
+                nexus_types::CostModel {
+                    flat_micro_usd: 1_000_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         // Root's daily budget is only 500_000 micro-USD — below one call.
         boot.kernel.processes.set_budget_spec(
             boot.root,
@@ -746,15 +812,20 @@ mod tests {
         // §17.5: batchable methods apply CostModel per element. A 3-element batch
         // with flat=100 reserves 300 before dispatch, so a 250 budget denies.
         let boot = Bootstrap::in_memory();
-        let name = boot.register_effect_with_cost(
-            "effect://batch/embed",
-            &[MethodSpec::new("invoke", Purity::Idempotent, MethodSpec::UNARY_ASYNC).batchable()],
-            Arc::new(EchoDriver),
-            nexus_types::CostModel {
-                flat_micro_usd: 100,
-                ..Default::default()
-            },
-        );
+        let name = boot
+            .register_effect_with_cost(
+                "effect://batch/embed",
+                &[
+                    MethodSpec::new("invoke", Purity::Idempotent, MethodSpec::UNARY_ASYNC)
+                        .batchable(),
+                ],
+                Arc::new(EchoDriver),
+                nexus_types::CostModel {
+                    flat_micro_usd: 100,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         boot.kernel.processes.set_budget_spec(
             boot.root,
             nexus_types::BudgetSpec {
@@ -785,38 +856,40 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "Callable effect resources expose exactly one public `invoke` method"
-    )]
     fn effect_registration_rejects_sibling_methods() {
         let boot = Bootstrap::in_memory();
-        boot.register_effect(
-            "effect://approval/ask",
-            &[
-                MethodSpec::new("invoke", Purity::Effectful, MethodSpec::UNARY_ASYNC),
-                MethodSpec::new("check", Purity::Idempotent, MethodSpec::UNARY_ASYNC),
-            ],
-            Arc::new(EchoDriver),
-        );
+        assert!(matches!(
+            boot.register_effect(
+                "effect://approval/ask",
+                &[
+                    MethodSpec::new("invoke", Purity::Effectful, MethodSpec::UNARY_ASYNC),
+                    MethodSpec::new("check", Purity::Idempotent, MethodSpec::UNARY_ASYNC),
+                ],
+                Arc::new(EchoDriver),
+            ),
+            Err(BootstrapError::InvalidMethodSpec { .. })
+        ));
     }
 
     #[tokio::test]
     async fn budget_settles_and_allows_within_limit() {
         // A costed op within budget runs, and settlement leaves inflight at 0.
         let boot = Bootstrap::in_memory();
-        let name = boot.register_effect_with_cost(
-            "effect://cheap/call",
-            &[MethodSpec::new(
-                "invoke",
-                Purity::Pure,
-                MethodSpec::UNARY_ASYNC,
-            )],
-            Arc::new(EchoDriver),
-            nexus_types::CostModel {
-                flat_micro_usd: 100,
-                ..Default::default()
-            },
-        );
+        let name = boot
+            .register_effect_with_cost(
+                "effect://cheap/call",
+                &[MethodSpec::new(
+                    "invoke",
+                    Purity::Pure,
+                    MethodSpec::UNARY_ASYNC,
+                )],
+                Arc::new(EchoDriver),
+                nexus_types::CostModel {
+                    flat_micro_usd: 100,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         boot.kernel.processes.set_budget_spec(
             boot.root,
             nexus_types::BudgetSpec {
@@ -858,15 +931,17 @@ mod tests {
         // When the operation's output is consumed downstream (§9.2), a Fact is
         // recorded so recovery can reuse it.
         let boot = Bootstrap::in_memory();
-        let name = boot.register_effect(
-            "effect://echo2/say",
-            &[MethodSpec::new(
-                "invoke",
-                Purity::Pure,
-                MethodSpec::UNARY_ASYNC,
-            )],
-            Arc::new(EchoDriver),
-        );
+        let name = boot
+            .register_effect(
+                "effect://echo2/say",
+                &[MethodSpec::new(
+                    "invoke",
+                    Purity::Pure,
+                    MethodSpec::UNARY_ASYNC,
+                )],
+                Arc::new(EchoDriver),
+            )
+            .unwrap();
         let handle = boot.open_for(boot.root, &name, "perform").unwrap();
         let ex = boot.kernel.executor_for(boot.root);
         ex.bind_handle(name.clone(), handle);
@@ -882,14 +957,14 @@ mod tests {
         .and_then(nexus_graph::StepRef::new(boot.root, "echo_back"));
         let out = ex.eval(&prog).await;
         assert_eq!(out, nexus_types::Outcome::Done(Value::Str("hi".into())));
-        assert_eq!(boot.kernel.facts.facts_of(boot.root).len(), 1);
+        assert_eq!(boot.kernel.facts.facts_of(boot.root).unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn recover_all_runs_clean_on_fresh_boot() {
         // A freshly-booted kernel has no pending Facts → nothing to recover.
         let boot = Bootstrap::in_memory();
-        let report = boot.recover_all().await;
+        let report = boot.recover_all().await.unwrap();
         assert_eq!(report.skipped + report.retried + report.quarantined, 0);
     }
 
@@ -897,20 +972,20 @@ mod tests {
     async fn finalize_marks_completed_and_writes_marker() {
         let boot = Bootstrap::in_memory();
         // Spawn a child request Process, then finalize it (§14.2).
-        let child = boot.spawn_request_process(nexus_types::IdentityRef::ROOT, &[]);
-        boot.finalize_process(child).await;
+        let child = boot
+            .spawn_request_process(nexus_types::IdentityRef::ROOT, &[])
+            .unwrap();
+        boot.finalize_process(child).await.unwrap();
         assert_eq!(
             boot.kernel.processes.status(child),
             Some(nexus_types::ProcessStatus::Completed)
         );
         // The finalize marker is written to state.
-        let path =
-            nexus_types::Path::parse(&format!("state://kernel/process/{}/finalized", child.get()))
-                .unwrap();
+        let path = finalized_marker_path(child).unwrap();
         let marker = boot.kernel.state.read(&path).await.unwrap();
         assert!(marker.is_some());
         // §14.2 step 6: a ProcessFinalized Fact is appended to the Fact stream.
-        let facts = boot.kernel.facts.facts_of(child);
+        let facts = boot.kernel.facts.facts_of(child).unwrap();
         assert!(
             facts.iter().any(|f| {
                 f.id.position == nexus_types::NodeId::new(u32::MAX)
@@ -918,6 +993,96 @@ mod tests {
                         if m.get("event").and_then(|v| v.as_str()) == Some("ProcessFinalized"))
             }),
             "finalize records a ProcessFinalized Fact"
+        );
+    }
+
+    struct FailingFinalizeFactStore;
+
+    impl crate::fact::FactStore for FailingFinalizeFactStore {
+        fn append(&self, _fact: Fact) -> Result<u64, crate::fact::FactError> {
+            Err(crate::fact::FactError("simulated append failure".into()))
+        }
+
+        fn complete(&self, _fact: Fact) -> Result<(), crate::fact::FactError> {
+            Err(crate::fact::FactError("simulated complete failure".into()))
+        }
+
+        fn sync(&self) -> Result<(), crate::fact::FactError> {
+            Ok(())
+        }
+
+        fn facts_of(
+            &self,
+            _process: nexus_types::ProcessId,
+        ) -> Result<Vec<Fact>, crate::fact::FactError> {
+            Ok(Vec::new())
+        }
+
+        fn all_facts(&self) -> Result<Vec<Fact>, crate::fact::FactError> {
+            Ok(Vec::new())
+        }
+
+        fn cursor(&self) -> u64 {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_fact_failure_keeps_process_finalizing() {
+        let facts = crate::fact::FactSink::new(Arc::new(FailingFinalizeFactStore));
+        let state: nexus_state::Backend = Arc::new(nexus_state::InMemoryBackend::new());
+        let boot = Bootstrap::from_kernel(crate::Kernel::with_backends(state, facts));
+        let child = boot
+            .spawn_request_process(nexus_types::IdentityRef::ROOT, &[])
+            .unwrap();
+
+        let err = boot.finalize_process(child).await.unwrap_err();
+        assert!(matches!(err, BootstrapError::Fact(_)));
+        assert_eq!(
+            boot.kernel.processes.status(child),
+            Some(nexus_types::ProcessStatus::Finalizing),
+            "a terminal status requires the authoritative finalization Fact"
+        );
+    }
+
+    #[test]
+    fn gateway_audit_fact_failure_does_not_insert_audit_process() {
+        let facts = crate::fact::FactSink::new(Arc::new(FailingFinalizeFactStore));
+        let state: nexus_state::Backend = Arc::new(nexus_state::InMemoryBackend::new());
+        let boot = Bootstrap::from_kernel(crate::Kernel::with_backends(state, facts));
+        let before = boot.kernel.processes.all_ids().len();
+
+        let err = boot
+            .record_gateway_audit(GatewayAudit {
+                event: "login",
+                username: Some("alice"),
+                source_addr: Some("127.0.0.1"),
+                outcome: "denied",
+                mfa_level: None,
+                details: None,
+            })
+            .unwrap_err();
+
+        assert!(err.to_string().contains("simulated complete failure"));
+        assert_eq!(
+            boot.kernel.processes.all_ids().len(),
+            before,
+            "pre-operation audit events must not create process rows without audit Facts"
+        );
+    }
+
+    #[test]
+    fn request_process_rejects_malformed_declared_capability_before_insert() {
+        let boot = Bootstrap::in_memory();
+        let before = boot.kernel.processes.all_ids().len();
+        let err = boot
+            .spawn_request_process(nexus_types::IdentityRef::ROOT, &["effect://x/post"])
+            .unwrap_err();
+        assert!(matches!(err, BootstrapError::Selector { .. }));
+        assert_eq!(
+            boot.kernel.processes.all_ids().len(),
+            before,
+            "malformed task ceilings must not leave a child process behind"
         );
     }
 
@@ -935,18 +1100,20 @@ mod tests {
         CALLS.store(0, Ordering::SeqCst);
 
         let boot = Bootstrap::in_memory();
-        let name = boot.register_effect(
-            "effect://counter/tick",
-            &[MethodSpec::new(
-                "invoke",
-                Purity::Effectful,
-                MethodSpec::UNARY_ASYNC,
-            )],
-            StdArc::new(FnDriver(|_m: nexus_types::MethodId, _in: Value| {
-                CALLS.fetch_add(1, Ordering::SeqCst);
-                Ok(Value::Int(7))
-            })),
-        );
+        let name = boot
+            .register_effect(
+                "effect://counter/tick",
+                &[MethodSpec::new(
+                    "invoke",
+                    Purity::Effectful,
+                    MethodSpec::UNARY_ASYNC,
+                )],
+                StdArc::new(FnDriver(|_m: nexus_types::MethodId, _in: Value| {
+                    CALLS.fetch_add(1, Ordering::SeqCst);
+                    Ok(Value::Int(7))
+                })),
+            )
+            .unwrap();
         let handle = boot.open_for(boot.root, &name, "perform").unwrap();
 
         // A program whose Operation output is consumed (so a Fact is recorded).
@@ -973,7 +1140,7 @@ mod tests {
 
         // Build a replay map from the recorded facts and re-run.
         let replay = StdArc::new(crate::recovery::ReplayMap::from_facts(
-            &boot.kernel.facts.facts_of(boot.root),
+            &boot.kernel.facts.facts_of(boot.root).unwrap(),
         ));
         assert!(!replay.is_empty(), "the completed effect was recorded");
         let handle2 = boot.open_for(boot.root, &name, "perform").unwrap();

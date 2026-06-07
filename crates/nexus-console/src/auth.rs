@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -250,8 +250,10 @@ impl Default for ConsoleAuth {
 impl ConsoleAuth {
     pub fn new(config: ConsoleAuthConfig) -> Self {
         let config = config.bounded();
-        let decoy_phc = hash_password_with_salt("invalid-password", &[0x42; 16])
-            .expect("argon2 decoy hash can be created");
+        let decoy_phc = match hash_password_with_salt("invalid-password", &[0x42; 16]) {
+            Ok(phc) => phc,
+            Err(_) => String::new(),
+        };
         Self {
             argon2_slots: Semaphore::new(config.argon2_concurrency),
             config,
@@ -860,7 +862,7 @@ impl ConsoleAuth {
         source_addr: &str,
         now: i64,
     ) -> Result<(), AuthError> {
-        let mut rate = self.rate.lock().expect("rate mutex poisoned");
+        let mut rate = self.rate();
         prune_bucket(&mut rate.global, now);
         if let Some(retry) = retry_after(rate.global, now) {
             return Err(AuthError::RateLimited {
@@ -885,7 +887,7 @@ impl ConsoleAuth {
     }
 
     fn record_login_failure(&self, username: &str, source_addr: &str, now: i64) {
-        let mut rate = self.rate.lock().expect("rate mutex poisoned");
+        let mut rate = self.rate();
         mark_failure(rate.by_user.entry(username.to_string()).or_default(), now);
         mark_failure(
             rate.by_source.entry(source_addr.to_string()).or_default(),
@@ -895,7 +897,7 @@ impl ConsoleAuth {
     }
 
     fn clear_login_failures(&self, username: &str, source_addr: &str, now: i64) {
-        let mut rate = self.rate.lock().expect("rate mutex poisoned");
+        let mut rate = self.rate();
         rate.by_user.insert(
             username.to_string(),
             FailureBucket {
@@ -910,6 +912,13 @@ impl ConsoleAuth {
                 ..Default::default()
             },
         );
+    }
+
+    fn rate(&self) -> MutexGuard<'_, RateState> {
+        match self.rate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 }
 
@@ -1850,7 +1859,7 @@ mod tests {
             .processes
             .all_ids()
             .into_iter()
-            .flat_map(|pid| boot.kernel.facts.facts_of(pid))
+            .flat_map(|pid| boot.kernel.facts.facts_of(pid).unwrap())
             .filter(|fact| match &fact.outcome_ref {
                 OutcomeRef::Inline(Value::Map(m)) => m.contains_key("event"),
                 _ => false,

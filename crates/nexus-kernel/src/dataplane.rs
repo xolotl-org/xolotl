@@ -14,7 +14,7 @@ use crate::policy::{CheckCtx, PolicyDecision};
 use crate::process::ProcessEntry;
 use nexus_types::{
     DecisionTag, Fact, Failure, Operation, Outcome, OutcomeRef, OutputMode, OutputModeSet, Path,
-    Timestamp, Value, ValueRef,
+    TaintSet, Timestamp, Value, ValueRef,
 };
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
@@ -24,6 +24,7 @@ use std::sync::Arc;
 /// tag (so the executor can drive control flow and the Fact is consistent).
 pub struct ExecOutput {
     pub outcome: Outcome,
+    pub output_taint: TaintSet,
 }
 
 /// The data plane: a handle table and a fact sink (§11). Shared behind a lock;
@@ -111,6 +112,23 @@ impl DataPlane {
             false,
         )
         .await
+    }
+
+    /// Record a pre-dispatch denial for an Operation that has already resolved
+    /// to a handle but must fail before issuing the driver call. This covers
+    /// executor-level checks such as budget reservation (§9.2 / §21.2): the
+    /// effect is never sent, but the rejected attempt still appears in the Fact
+    /// stream for recovery, why-not, audit, and accounting projections.
+    pub fn record_pre_dispatch_denial(
+        &self,
+        op: &Operation,
+        replay: nexus_types::ReplayClass,
+        now_millis: i64,
+        tag: DecisionTag,
+        failure: Failure,
+    ) -> ExecOutput {
+        let resource = self.handles.read().get(op.handle).map(|h| h.resource);
+        self.deny(op, resource, replay, now_millis, tag, failure)
     }
 
     async fn execute_inner(
@@ -283,7 +301,12 @@ impl DataPlane {
                         Outcome::Done(v) | Outcome::Short(v) => Outcome::Short(v),
                         Outcome::Fail(f) => Outcome::Fail(f),
                     };
-                    if (record || replay.needs_write_ahead_barrier())
+                    if (record
+                        || matches!(
+                            replay,
+                            nexus_types::ReplayClass::IdempotentEffect
+                                | nexus_types::ReplayClass::NonIdempotentEffect
+                        ))
                         && let Err(e) = self.facts.complete(self.completed_fact(
                             op,
                             resolved.resource,
@@ -291,12 +314,16 @@ impl DataPlane {
                             now_millis,
                             DecisionTag::Ok,
                             &short,
+                            &op.taint,
                             batchable,
                         ))
                     {
                         tracing::error!(?e, op = ?op.id, "idempotent-dedup fact record failed");
                     }
-                    return ExecOutput { outcome: short };
+                    return ExecOutput {
+                        outcome: short,
+                        output_taint: TaintSet::pristine(),
+                    };
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -340,6 +367,7 @@ impl DataPlane {
                         "durability",
                         format!("write-ahead barrier failed: {e}"),
                     )),
+                    output_taint: TaintSet::pristine(),
                 };
             }
         }
@@ -365,7 +393,19 @@ impl DataPlane {
             OutputMode::Collect { limit } => {
                 if supports.contains(OutputModeSet::STREAM) {
                     dispatch_output = OutputMode::Stream;
-                    collect_task = Some(self.attach_collect_sink(&mut ctx, limit));
+                    let Some(task) = self.attach_collect_sink(&mut ctx, limit) else {
+                        return self.deny(
+                            op,
+                            Some(resolved.resource),
+                            replay,
+                            now_millis,
+                            DecisionTag::DriverError,
+                            Failure::InvalidInput {
+                                reason: "failed to construct collect stream sink".into(),
+                            },
+                        );
+                    };
+                    collect_task = Some(task);
                 } else {
                     dispatch_output = OutputMode::Unary;
                 }
@@ -385,7 +425,7 @@ impl DataPlane {
         } else {
             None
         };
-        let result = match &async_result {
+        let mut result = match &async_result {
             Some(_) => Ok(Outcome::Done(Value::Null)),
             None => {
                 resolved
@@ -406,12 +446,27 @@ impl DataPlane {
                 }
             }
         }
+        let driver_output_taint = ctx.output_taint();
         drop(ctx);
         if let Some(task) = stream_task {
-            let _ = task.await;
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    result = Err(DriverError::Other(format!("stream sink failed: {e}")));
+                }
+                Err(e) => {
+                    result = Err(DriverError::Other(format!("stream sink task failed: {e}")));
+                }
+            }
         }
         let collected = match collect_task {
-            Some(task) => Some(task.await.unwrap_or_default()),
+            Some(task) => match task.await {
+                Ok(chunks) => Some(chunks),
+                Err(e) => {
+                    result = Err(DriverError::Other(format!("collect sink task failed: {e}")));
+                    None
+                }
+            },
             None => None,
         };
 
@@ -449,6 +504,14 @@ impl DataPlane {
             },
         };
 
+        let output_taint = if outcome.is_success() {
+            driver_output_taint
+        } else {
+            TaintSet::pristine()
+        };
+        let mut fact_taint = op.taint.clone();
+        fact_taint.union(&output_taint);
+
         // Complete the Fact with the outcome (only if we began one). The effect
         // has already been issued, so a completion-write failure cannot un-issue
         // it: log it and let crash recovery reconcile from the begun (fsync'd)
@@ -461,6 +524,7 @@ impl DataPlane {
                 now_millis,
                 decision,
                 &outcome,
+                &fact_taint,
                 batchable,
             ))
         {
@@ -472,12 +536,14 @@ impl DataPlane {
         // a retry of a failed idempotent op should re-attempt.
         if let Some(key) = idem_key
             && outcome.is_success()
+            && let Err(e) = self.write_idempotent_outcome(&key, &outcome).await
         {
-            if let Err(e) = self.write_idempotent_outcome(&key, &outcome).await {
-                tracing::error!(?e, op = ?op.id, "idempotency state write failed");
-            }
+            tracing::error!(?e, op = ?op.id, "idempotency state write failed");
         }
-        ExecOutput { outcome }
+        ExecOutput {
+            outcome,
+            output_taint,
+        }
     }
 
     async fn read_idempotent_outcome(
@@ -526,6 +592,7 @@ impl DataPlane {
             now_millis,
             tag,
             &Outcome::Fail(failure.clone()),
+            &op.taint,
             false,
         );
         if let Err(e) = self.facts.complete(fact) {
@@ -533,6 +600,7 @@ impl DataPlane {
         }
         ExecOutput {
             outcome: Outcome::Fail(failure),
+            output_taint: TaintSet::pristine(),
         }
     }
 
@@ -569,6 +637,7 @@ impl DataPlane {
         now_millis: i64,
         decision: DecisionTag,
         outcome: &Outcome,
+        taint: &TaintSet,
         batchable: bool,
     ) -> Fact {
         let outcome_ref = match outcome {
@@ -589,7 +658,7 @@ impl DataPlane {
             resource,
             method: op.method,
             input_ref: ValueRef::of(op.input.clone()),
-            taint: op.taint.clone(),
+            taint: taint.clone(),
             decision,
             outcome_ref,
             batch,
@@ -602,7 +671,7 @@ impl DataPlane {
         &self,
         op: &Operation,
         ctx: &mut DriverContext,
-    ) -> Option<tokio::task::JoinHandle<()>> {
+    ) -> Option<tokio::task::JoinHandle<Result<(), String>>> {
         let state = self.state.clone();
         let path = stream_path(op).ok()?;
         let taint = op.taint.clone();
@@ -620,9 +689,10 @@ impl DataPlane {
                     .await
                 {
                     tracing::error!(?e, path = %append_path, "stream append failed");
-                    break;
+                    return Err(format!("append to {append_path} failed: {e}"));
                 }
             }
+            Ok(())
         }))
     }
 
@@ -630,16 +700,20 @@ impl DataPlane {
         &self,
         ctx: &mut DriverContext,
         limit: usize,
-    ) -> tokio::task::JoinHandle<Vec<Value>> {
+    ) -> Option<tokio::task::JoinHandle<Vec<Value>>> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let acting = ctx.acting;
         let caller = ctx.caller;
         let previous = std::mem::replace(ctx, DriverContext::new(acting, caller));
-        *ctx = previous.with_stream(
-            Path::parse("state://stream/collect").expect("collect stream path parses"),
-            tx,
-        );
-        tokio::spawn(async move {
+        let collect_path = match collect_stream_path() {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::error!(?e, "collect stream path construction failed");
+                return None;
+            }
+        };
+        *ctx = previous.with_stream(collect_path, tx);
+        Some(tokio::spawn(async move {
             let mut chunks = Vec::new();
             while chunks.len() < limit {
                 match rx.recv().await {
@@ -648,7 +722,7 @@ impl DataPlane {
                 }
             }
             chunks
-        })
+        }))
     }
 
     fn start_async_process(
@@ -696,9 +770,33 @@ impl DataPlane {
         entry.status = nexus_types::ProcessStatus::Running;
         processes.insert(entry);
 
-        let proc_path = async_proc_path(child);
-        let status_path = async_status_path(child);
-        let outcome_path = async_outcome_path(child);
+        let (proc_path, status_path, outcome_path) = match (
+            async_proc_path(child),
+            async_status_path(child),
+            async_outcome_path(child),
+        ) {
+            (Ok(proc_path), Ok(status_path), Ok(outcome_path)) => {
+                (proc_path, status_path, outcome_path)
+            }
+            (proc_path, status_path, outcome_path) => {
+                let mut errors = Vec::new();
+                if let Err(e) = proc_path {
+                    errors.push(format!("proc path: {e}"));
+                }
+                if let Err(e) = status_path {
+                    errors.push(format!("status path: {e}"));
+                }
+                if let Err(e) = outcome_path {
+                    errors.push(format!("outcome path: {e}"));
+                }
+                return Outcome::Fail(Failure::InvalidInput {
+                    reason: format!(
+                        "failed to construct async process resource paths: {}",
+                        errors.join(", ")
+                    ),
+                });
+            }
+        };
         let child_op = Operation {
             id: nexus_types::OperationId::new(child, nexus_types::NodeId::ROOT, 0),
             process: child,
@@ -798,30 +896,45 @@ impl DataPlane {
 }
 
 fn stream_path(op: &Operation) -> Result<Path, nexus_types::PathError> {
-    Path::parse(&format!(
-        "state://stream/{}/{}",
-        op.process.get(),
-        op.id.position.get()
-    ))
+    Path::try_new("state")?
+        .try_push("stream")?
+        .try_push(op.process.get().to_string())?
+        .try_push(op.id.position.get().to_string())
+}
+
+fn collect_stream_path() -> Result<Path, nexus_types::PathError> {
+    Path::try_new("state")?
+        .try_push("stream")?
+        .try_push("collect")
 }
 
 fn idempotency_path(key: &str) -> Result<Path, nexus_types::PathError> {
     let hash = blake3::hash(key.as_bytes());
-    Path::parse(&format!("state://idemp/{}", hash.to_hex()))
+    Path::try_new("state")?
+        .try_push("idemp")?
+        .try_push(hash.to_hex())
 }
 
-fn async_proc_path(process: nexus_types::ProcessId) -> Path {
-    Path::parse(&format!("proc://async/{}", process.get())).expect("async proc path parses")
+fn async_proc_path(process: nexus_types::ProcessId) -> Result<Path, nexus_types::PathError> {
+    Path::try_new("proc")?
+        .try_push("async")?
+        .try_push(process.get().to_string())
 }
 
-fn async_status_path(process: nexus_types::ProcessId) -> Path {
-    Path::parse(&format!("state://kernel/async/{}/status", process.get()))
-        .expect("async status path parses")
+fn async_status_path(process: nexus_types::ProcessId) -> Result<Path, nexus_types::PathError> {
+    Path::try_new("state")?
+        .try_push("kernel")?
+        .try_push("async")?
+        .try_push(process.get().to_string())?
+        .try_push("status")
 }
 
-fn async_outcome_path(process: nexus_types::ProcessId) -> Path {
-    Path::parse(&format!("state://kernel/async/{}/outcome", process.get()))
-        .expect("async outcome path parses")
+fn async_outcome_path(process: nexus_types::ProcessId) -> Result<Path, nexus_types::PathError> {
+    Path::try_new("state")?
+        .try_push("kernel")?
+        .try_push("async")?
+        .try_push(process.get().to_string())?
+        .try_push("outcome")
 }
 
 fn async_ref_value(
@@ -996,7 +1109,7 @@ mod tests {
     use crate::driver::{Driver, DriverContext, DriverPlan, EchoDriver, FnDriver};
     use crate::fact::FactStore;
     use crate::handle::{Handle, HandleState};
-    use nexus_state::{Backend, InMemoryBackend};
+    use nexus_state::{Backend, InMemoryBackend, StateError, StateResult, StateStream};
     use nexus_types::{
         DriverId, HandleId, IdentityRef, MethodBitmap, MethodId, NodeId, OperationId, OutputMode,
         OutputModeSet, ProcessId, ReplayClass, ResourceId, RightFlags, Rights, Value,
@@ -1031,6 +1144,94 @@ mod tests {
         )
     }
 
+    struct TaintReportingStateDriver {
+        state: Backend,
+    }
+
+    #[async_trait::async_trait]
+    impl Driver for TaintReportingStateDriver {
+        async fn call(
+            &self,
+            method: MethodId,
+            _input: Value,
+            _output: OutputMode,
+            ctx: &DriverContext,
+        ) -> Result<Outcome, DriverError> {
+            let path = ctx
+                .target_path
+                .clone()
+                .ok_or_else(|| DriverError::Other("state test driver has no bound path".into()))?;
+            match method.get() {
+                0 => {
+                    let tv = self
+                        .state
+                        .read_tainted(&path)
+                        .await
+                        .map_err(|e| DriverError::Other(e.to_string()))?;
+                    match tv {
+                        Some(tv) => {
+                            ctx.set_output_taint(tv.taint);
+                            Ok(Outcome::Done(tv.value))
+                        }
+                        None => Ok(Outcome::Done(Value::Null)),
+                    }
+                }
+                4 => {
+                    let rows = self
+                        .state
+                        .read_prefix_tainted(&path)
+                        .await
+                        .map_err(|e| DriverError::Other(e.to_string()))?;
+                    let mut taint = nexus_types::TaintSet::pristine();
+                    let values = rows
+                        .into_iter()
+                        .map(|(p, tv)| {
+                            taint.union(&tv.taint);
+                            let mut m = BTreeMap::new();
+                            m.insert("path".into(), Value::Str(p.to_string()));
+                            m.insert("value".into(), tv.value);
+                            Value::Map(m)
+                        })
+                        .collect();
+                    ctx.set_output_taint(taint);
+                    Ok(Outcome::Done(Value::List(values)))
+                }
+                _ => Err(DriverError::NoSuchMethod(method)),
+            }
+        }
+    }
+
+    fn dataplane_with_state_handle(
+        state: Backend,
+        method: MethodId,
+        bound_path: Path,
+    ) -> (DataPlane, HandleId, Arc<crate::fact::InMemoryFactStore>) {
+        let mut table = HandleTable::new();
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        plan.insert(
+            method,
+            Arc::new(TaintReportingStateDriver {
+                state: state.clone(),
+            }),
+        );
+        let id = table.insert(Handle {
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            resource: ResourceId::new(5),
+            rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
+            driver_plan: plan,
+            fast_path: FastPath::Unconditional,
+            state: HandleState::Active,
+            bound_path: Some(bound_path),
+        });
+        let (facts, store) = FactSink::in_memory();
+        (
+            DataPlane::new(Arc::new(RwLock::new(table)), facts, state),
+            id,
+            store,
+        )
+    }
+
     fn op(handle: HandleId, method: u64, input: Value) -> Operation {
         Operation {
             id: OperationId::new(ProcessId::new(1), NodeId::new(0), 0),
@@ -1061,6 +1262,67 @@ mod tests {
             )
             .await;
         assert_eq!(out.outcome, Outcome::Done(Value::Int(9)));
+    }
+
+    #[tokio::test]
+    async fn state_read_output_taint_uses_persisted_taint() {
+        let state = test_state();
+        let path = Path::parse("state://chat/private").unwrap();
+        let protected =
+            nexus_types::TaintSet::of(nexus_types::TaintSource::Protected { path: path.clone() });
+        state
+            .write_set_tainted(&path, Value::Str("secret".into()), protected)
+            .await
+            .unwrap();
+        let (dp, id, store) = dataplane_with_state_handle(state, MethodId::new(0), path);
+
+        let out = dp
+            .execute(
+                &op(id, 0, Value::Null),
+                0,
+                ReplayClass::Observation,
+                SUPPORTS_UNARY,
+                0,
+                true,
+            )
+            .await;
+
+        assert!(out.output_taint.has_protected());
+        assert!(store.all_facts().unwrap()[0].taint.has_protected());
+    }
+
+    #[tokio::test]
+    async fn state_list_output_taint_unions_persisted_taint() {
+        let state = test_state();
+        let prefix = Path::parse("state://chat").unwrap();
+        let public = Path::parse("state://chat/public").unwrap();
+        let private = Path::parse("state://chat/private").unwrap();
+        state
+            .write_set(&public, Value::Str("ok".into()))
+            .await
+            .unwrap();
+        let protected = nexus_types::TaintSet::of(nexus_types::TaintSource::Protected {
+            path: private.clone(),
+        });
+        state
+            .write_set_tainted(&private, Value::Str("secret".into()), protected)
+            .await
+            .unwrap();
+        let (dp, id, store) = dataplane_with_state_handle(state, MethodId::new(4), prefix);
+
+        let out = dp
+            .execute(
+                &op(id, 4, Value::Null),
+                4,
+                ReplayClass::Observation,
+                SUPPORTS_UNARY,
+                0,
+                true,
+            )
+            .await;
+
+        assert!(out.output_taint.has_protected());
+        assert!(store.all_facts().unwrap()[0].taint.has_protected());
     }
 
     #[tokio::test]
@@ -1123,7 +1385,7 @@ mod tests {
             )
             .await;
         assert!(matches!(out.outcome, Outcome::Done(Value::List(_))));
-        let facts = store.facts_of(ProcessId::new(1));
+        let facts = store.facts_of(ProcessId::new(1)).unwrap();
         assert_eq!(facts.len(), 1, "batchable call records one Fact");
         let batch = facts[0].batch.as_ref().expect("batch summary present");
         assert_eq!(batch.elements, 2);
@@ -1314,7 +1576,7 @@ mod tests {
             state: HandleState::Active,
             bound_path: None,
         });
-        let (facts, _store) = FactSink::in_memory();
+        let (facts, store) = FactSink::in_memory();
         let state = test_state();
         let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, state.clone());
 
@@ -1322,6 +1584,8 @@ mod tests {
         m.insert("_idem_key".to_string(), Value::Str("order-1".into()));
         let input = Value::Map(m);
         let o = op(id, 7, input);
+        let mut retry = o.clone();
+        retry.id = retry.id.retry();
 
         let first = dp
             .execute(
@@ -1330,17 +1594,17 @@ mod tests {
                 ReplayClass::IdempotentEffect,
                 SUPPORTS_UNARY,
                 0,
-                true,
+                false,
             )
             .await;
         let second = dp
             .execute(
-                &o,
+                &retry,
                 0,
                 ReplayClass::IdempotentEffect,
                 SUPPORTS_UNARY,
                 0,
-                true,
+                false,
             )
             .await;
 
@@ -1352,6 +1616,11 @@ mod tests {
             1,
             "driver runs once; the dup is deduped"
         );
+        let facts = store.facts_of(ProcessId::new(1)).unwrap();
+        assert_eq!(facts.len(), 2, "retry attempts remain auditable");
+        assert_eq!(facts[0].id.attempt, 0);
+        assert_eq!(facts[1].id.attempt, 1);
+        assert!(facts.iter().all(|f| f.decision == DecisionTag::Ok));
     }
 
     #[tokio::test]
@@ -1442,11 +1711,11 @@ mod tests {
         fn sync(&self) -> Result<(), crate::fact::FactError> {
             Err(crate::fact::FactError("simulated disk failure".into()))
         }
-        fn facts_of(&self, _process: ProcessId) -> Vec<Fact> {
-            Vec::new()
+        fn facts_of(&self, _process: ProcessId) -> Result<Vec<Fact>, crate::fact::FactError> {
+            Ok(Vec::new())
         }
-        fn all_facts(&self) -> Vec<Fact> {
-            Vec::new()
+        fn all_facts(&self) -> Result<Vec<Fact>, crate::fact::FactError> {
+            Ok(Vec::new())
         }
         fn cursor(&self) -> u64 {
             0
@@ -1520,6 +1789,79 @@ mod tests {
         }
     }
 
+    struct OneChunkStreamingDriver;
+
+    #[async_trait::async_trait]
+    impl Driver for OneChunkStreamingDriver {
+        async fn call(
+            &self,
+            _method: MethodId,
+            _input: Value,
+            output: OutputMode,
+            ctx: &DriverContext,
+        ) -> Result<Outcome, DriverError> {
+            assert_eq!(output, OutputMode::Stream);
+            let _ = ctx.emit(Value::Str("chunk".into()));
+            Ok(Outcome::Done(Value::Int(1)))
+        }
+    }
+
+    struct FailingAppendState;
+
+    #[async_trait::async_trait]
+    impl nexus_state::StateBackend for FailingAppendState {
+        async fn read_tainted(
+            &self,
+            _path: &Path,
+        ) -> StateResult<Option<nexus_state::TaintedValue>> {
+            Ok(None)
+        }
+
+        async fn write_set_tainted(
+            &self,
+            _path: &Path,
+            _value: Value,
+            _taint: nexus_types::TaintSet,
+        ) -> StateResult<()> {
+            Ok(())
+        }
+
+        async fn write_append_tainted(
+            &self,
+            _path: &Path,
+            _item: Value,
+            _taint: nexus_types::TaintSet,
+        ) -> StateResult<()> {
+            Err(StateError::Backend("simulated append failure".into()))
+        }
+
+        async fn write_cas_tainted(
+            &self,
+            _path: &Path,
+            _expected: Option<Value>,
+            _new: Value,
+            _taint: nexus_types::TaintSet,
+        ) -> StateResult<()> {
+            Ok(())
+        }
+
+        async fn write_delete(&self, _path: &Path) -> StateResult<()> {
+            Ok(())
+        }
+
+        async fn read_prefix_tainted(
+            &self,
+            _prefix: &Path,
+        ) -> StateResult<Vec<(Path, nexus_state::TaintedValue)>> {
+            Ok(Vec::new())
+        }
+
+        async fn subscribe(&self, _pattern: &Path) -> StateResult<StateStream> {
+            let (_tx, rx) = tokio::sync::broadcast::channel(1);
+            Ok(rx)
+        }
+    }
+
     #[tokio::test]
     async fn stream_chunks_append_to_state_with_one_fact() {
         let mut table = HandleTable::new();
@@ -1563,6 +1905,39 @@ mod tests {
             1,
             "streaming chunks append to state, not one Fact per chunk"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_append_failure_returns_driver_error() {
+        let mut table = HandleTable::new();
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        plan.insert(MethodId::new(7), Arc::new(OneChunkStreamingDriver));
+        let id = table.insert(Handle {
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            resource: ResourceId::new(5),
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            driver_plan: plan,
+            fast_path: FastPath::Unconditional,
+            state: HandleState::Active,
+            bound_path: None,
+        });
+        let (facts, _) = FactSink::in_memory();
+        let state: nexus_state::Backend = Arc::new(FailingAppendState);
+        let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, state);
+
+        let mut o = op(id, 7, Value::Null);
+        o.output = OutputMode::Stream;
+        let out = dp
+            .execute(&o, 0, ReplayClass::Deterministic, SUPPORTS_STREAM, 0, true)
+            .await;
+
+        match out.outcome {
+            Outcome::Fail(nexus_types::Failure::HandlerError { message, .. }) => {
+                assert!(message.contains("stream sink failed"));
+            }
+            other => panic!("expected stream sink failure, got {other:?}"),
+        }
     }
 
     struct CollectDriver;
@@ -1685,7 +2060,7 @@ mod tests {
             )
             .await;
         assert_eq!(out.outcome, Outcome::Done(Value::Null));
-        let facts = store.facts_of(ProcessId::new(1));
+        let facts = store.facts_of(ProcessId::new(1)).unwrap();
         assert_eq!(facts.len(), 1);
         assert!(matches!(
             facts[0].outcome_ref,

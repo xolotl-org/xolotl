@@ -51,7 +51,7 @@ impl RedbStateBackend {
             event: event.clone(),
         };
         let entry_bytes =
-            serde_json::to_vec(&serialize_history_entry(&entry)).map_err(StateError::Serde)?;
+            serde_json::to_vec(&serialize_history_entry(&entry)?).map_err(StateError::Serde)?;
 
         let mut key = path.to_string().into_bytes();
         key.push(0xFF);
@@ -78,41 +78,52 @@ impl RedbStateBackend {
 fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| match i64::try_from(d.as_millis()) {
+            Ok(ms) => ms,
+            Err(_) => i64::MAX,
+        })
         .unwrap_or(0)
 }
 
-fn serialize_history_entry(entry: &StateHistoryEntry) -> serde_json::Value {
+fn serialize_history_entry(entry: &StateHistoryEntry) -> StateResult<serde_json::Value> {
     let event_json = match &entry.event {
-        StateEvent::Set { path, value, taint } => serde_json::json!({
-            "type": "set",
-            "path": path.to_string(),
-            "value": value_to_json(value),
-            "taint": serde_json::to_value(taint).unwrap_or(serde_json::Value::Null),
-        }),
-        StateEvent::Append { path, item, taint } => serde_json::json!({
-            "type": "append",
-            "path": path.to_string(),
-            "item": value_to_json(item),
-            "taint": serde_json::to_value(taint).unwrap_or(serde_json::Value::Null),
-        }),
+        StateEvent::Set { path, value, taint } => {
+            let value = value_to_json(value)?;
+            let taint = serde_json::to_value(taint).map_err(StateError::Serde)?;
+            serde_json::json!({
+                "type": "set",
+                "path": path.to_string(),
+                "value": value,
+                "taint": taint,
+            })
+        }
+        StateEvent::Append { path, item, taint } => {
+            let item = value_to_json(item)?;
+            let taint = serde_json::to_value(taint).map_err(StateError::Serde)?;
+            serde_json::json!({
+                "type": "append",
+                "path": path.to_string(),
+                "item": item,
+                "taint": taint,
+            })
+        }
         StateEvent::Delete { path } => serde_json::json!({
             "type": "delete",
             "path": path.to_string(),
         }),
     };
-    serde_json::json!({
+    Ok(serde_json::json!({
         "at_millis": entry.at_millis,
         "event": event_json,
-    })
+    }))
 }
 
-fn value_to_json(v: &Value) -> serde_json::Value {
-    serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
+fn value_to_json(v: &Value) -> StateResult<serde_json::Value> {
+    serde_json::to_value(v).map_err(StateError::Serde)
 }
 
-fn json_to_value(j: &serde_json::Value) -> Value {
-    serde_json::from_value(j.clone()).unwrap_or(Value::Null)
+fn json_to_value(j: &serde_json::Value) -> StateResult<Value> {
+    serde_json::from_value(j.clone()).map_err(StateError::Serde)
 }
 
 /// On-disk envelope persisting a value with its taint (§4.4/§12). Stored as JSON
@@ -123,8 +134,8 @@ fn json_to_value(j: &serde_json::Value) -> Value {
 fn encode_envelope(value: &Value, taint: &TaintSet) -> Result<Vec<u8>, StateError> {
     let json = serde_json::json!({
         "__nexus_env": 1,
-        "value": value_to_json(value),
-        "taint": serde_json::to_value(taint).unwrap_or(serde_json::Value::Null),
+        "value": value_to_json(value)?,
+        "taint": serde_json::to_value(taint).map_err(StateError::Serde)?,
     });
     serde_json::to_vec(&json).map_err(StateError::Serde)
 }
@@ -143,9 +154,10 @@ fn decode_envelope(bytes: &[u8]) -> StateResult<TaintedValue> {
     let value = json
         .get("value")
         .map(json_to_value)
+        .transpose()?
         .ok_or_else(|| StateError::Backend("state envelope missing value".into()))?;
     let taint = match json.get("taint") {
-        Some(t) => serde_json::from_value(t.clone()).unwrap_or_default(),
+        Some(t) => serde_json::from_value(t.clone()).map_err(StateError::Serde)?,
         None => TaintSet::pristine(),
     };
     Ok(TaintedValue::new(value, taint))
@@ -336,6 +348,15 @@ impl StateBackend for RedbStateBackend {
     }
 
     async fn read_prefix(&self, prefix: &Path) -> StateResult<Vec<(Path, Value)>> {
+        Ok(self
+            .read_prefix_tainted(prefix)
+            .await?
+            .into_iter()
+            .map(|(path, tv)| (path, tv.value))
+            .collect())
+    }
+
+    async fn read_prefix_tainted(&self, prefix: &Path) -> StateResult<Vec<(Path, TaintedValue)>> {
         let prefix_str = prefix.to_string();
         let txn = self
             .db
@@ -358,7 +379,7 @@ impl StateBackend for RedbStateBackend {
             }
             let path = Path::parse(key_str)
                 .map_err(|e| StateError::Backend(format!("invalid path in db: {e}")))?;
-            let val = decode_envelope(val_guard.value())?.value;
+            let val = decode_envelope(val_guard.value())?;
             results.push((path, val));
         }
         Ok(results)
@@ -396,9 +417,7 @@ impl StateBackend for RedbStateBackend {
             let (_key, val_guard) = entry.map_err(|e| StateError::Backend(e.to_string()))?;
             let json: serde_json::Value =
                 serde_json::from_slice(val_guard.value()).map_err(StateError::Serde)?;
-            if let Some(he) = deserialize_history_entry(&json) {
-                results.push(he);
-            }
+            results.push(deserialize_history_entry(&json)?);
         }
         Ok(results)
     }
@@ -414,34 +433,68 @@ impl StateBackend for RedbStateBackend {
     }
 }
 
-fn deserialize_history_entry(json: &serde_json::Value) -> Option<StateHistoryEntry> {
-    let at_millis = json["at_millis"].as_i64()?;
-    let event_json = &json["event"];
-    let event_type = event_json["type"].as_str()?;
-    let path = Path::parse(event_json["path"].as_str()?).ok()?;
-    let taint = serde_json::from_value(event_json["taint"].clone()).unwrap_or_default();
-    let event = match event_type {
-        "set" => StateEvent::Set {
-            path,
-            value: json_to_value(&event_json["value"]),
-            taint,
-        },
-        "append" => StateEvent::Append {
-            path,
-            item: json_to_value(&event_json["item"]),
-            taint,
-        },
-        "delete" => StateEvent::Delete { path },
-        _ => return None,
-    };
-    Some(StateHistoryEntry { at_millis, event })
+fn deserialize_history_entry(json: &serde_json::Value) -> StateResult<StateHistoryEntry> {
+    let at_millis = json
+        .get("at_millis")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| StateError::Backend("history entry missing at_millis".into()))?;
+    let event_json = json
+        .get("event")
+        .ok_or_else(|| StateError::Backend("history entry missing event".into()))?;
+    let event_type = event_json
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| StateError::Backend("history event missing type".into()))?;
+    let path = Path::parse(
+        event_json
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| StateError::Backend("history event missing path".into()))?,
+    )
+    .map_err(|e| StateError::Backend(format!("history event path is invalid: {e}")))?;
+    let event =
+        match event_type {
+            "set" => {
+                let value = json_to_value(event_json.get("value").ok_or_else(|| {
+                    StateError::Backend("history set event missing value".into())
+                })?)?;
+                let taint =
+                    serde_json::from_value(event_json.get("taint").cloned().ok_or_else(|| {
+                        StateError::Backend("history set event missing taint".into())
+                    })?)
+                    .map_err(StateError::Serde)?;
+                StateEvent::Set { path, value, taint }
+            }
+            "append" => {
+                let item = json_to_value(event_json.get("item").ok_or_else(|| {
+                    StateError::Backend("history append event missing item".into())
+                })?)?;
+                let taint =
+                    serde_json::from_value(event_json.get("taint").cloned().ok_or_else(|| {
+                        StateError::Backend("history append event missing taint".into())
+                    })?)
+                    .map_err(StateError::Serde)?;
+                StateEvent::Append { path, item, taint }
+            }
+            "delete" => StateEvent::Delete { path },
+            _ => {
+                return Err(StateError::Backend(format!(
+                    "unsupported history event type {event_type:?}"
+                )));
+            }
+        };
+    Ok(StateHistoryEntry { at_millis, event })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::RedbStore;
-    use nexus_types::p;
+    use nexus_types::Path;
+
+    fn p(s: &str) -> Path {
+        Path::parse(s).unwrap()
+    }
 
     fn tmp_backend() -> RedbStateBackend {
         let dir = tempfile::tempdir().unwrap();
@@ -476,7 +529,7 @@ mod tests {
                 .unwrap();
             {
                 let mut table = txn.open_table(crate::STATE_VALUES_TABLE).unwrap();
-                let bare = serde_json::to_vec(&value_to_json(&Value::Int(7))).unwrap();
+                let bare = serde_json::to_vec(&value_to_json(&Value::Int(7)).unwrap()).unwrap();
                 table
                     .insert("state://bad-encoding", bare.as_slice())
                     .unwrap();

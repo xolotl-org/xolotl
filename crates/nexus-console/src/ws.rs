@@ -39,8 +39,8 @@ use futures::{SinkExt, StreamExt};
 use nexus_graph::{DoNode, OperationTemplate};
 use nexus_state::StateEvent;
 use nexus_types::{
-    Capability, ExtensionInstallationDef, IdentityRef, NodeId, OperationId, Outcome, OutputMode,
-    Path, ProcSpec, ProcessId, ResourceName, RestartPolicy, TaintSet, Transport, Value,
+    Capability, ExtensionInstallationDef, NodeId, OperationId, Outcome, OutputMode, Path, ProcSpec,
+    ProcessId, ResourceName, RestartPolicy, TaintSet, Transport, Value,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -501,7 +501,6 @@ async fn dispatch_call(
             require_visibility_access(principal, &call)?;
             let mut input = input_map(input_value(&call.input)?)?;
             let path = string_arg(&mut input, "path")?;
-            let out = visibility_state_read(sess, principal, &path).await?;
             record_visibility_audit(
                 &sess.state,
                 principal,
@@ -511,7 +510,8 @@ async fn dispatch_call(
                 call.justification.as_deref(),
                 call.ttl_ms,
                 Some(&path),
-            );
+            )?;
+            let out = visibility_state_read(sess, principal, &path).await?;
             out
         }
         ACTION_VISIBILITY_STATE_LIST => {
@@ -519,7 +519,6 @@ async fn dispatch_call(
             let mut input = input_map(input_value(&call.input)?)?;
             let prefix = string_arg(&mut input, "prefix")?;
             let limit = optional_usize_arg(&mut input, "limit")?.unwrap_or(256);
-            let out = visibility_state_list(sess, principal, &prefix, limit).await?;
             record_visibility_audit(
                 &sess.state,
                 principal,
@@ -529,7 +528,8 @@ async fn dispatch_call(
                 call.justification.as_deref(),
                 call.ttl_ms,
                 Some(&prefix),
-            );
+            )?;
+            let out = visibility_state_list(sess, principal, &prefix, limit).await?;
             out
         }
         ACTION_STATE_SNAPSHOT => snapshot(sess, principal, &call).await?,
@@ -551,6 +551,7 @@ async fn dispatch_call(
             let value = value_arg(&mut input, "value")?;
             let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_config_write_safety(principal, &path)?;
+            validate_config_write_value_for_path(&path, &value)?;
             mgmt::write_config(&sess.state, principal, &path, value, expected_version).await?;
             return Ok(ActionResult::empty(server_rev(sess)));
         }
@@ -699,6 +700,17 @@ async fn dispatch_call(
             let include_recent_facts =
                 optional_bool_arg(&mut input, "include_recent_facts")?.unwrap_or(true);
             let limit = optional_usize_arg(&mut input, "limit")?.unwrap_or(64);
+            let target = process.map(|pid| format!("process:{pid}"));
+            record_visibility_audit(
+                &sess.state,
+                principal,
+                Some(&sess.source_addr),
+                "runtime_process_inspect",
+                call.scope.as_deref(),
+                call.justification.as_deref(),
+                call.ttl_ms,
+                target.as_deref(),
+            )?;
             let out = process_inspect(
                 sess,
                 principal,
@@ -711,17 +723,6 @@ async fn dispatch_call(
                 ),
             )
             .await?;
-            let target = process.map(|pid| format!("process:{pid}"));
-            record_visibility_audit(
-                &sess.state,
-                principal,
-                Some(&sess.source_addr),
-                "runtime_process_inspect",
-                call.scope.as_deref(),
-                call.justification.as_deref(),
-                call.ttl_ms,
-                target.as_deref(),
-            );
             out
         }
         ACTION_AUDIT_FACTS_RECENT => {
@@ -729,17 +730,6 @@ async fn dispatch_call(
             let mut input = input_map(input_value(&call.input)?)?;
             let process = optional_u64_arg(&mut input, "process")?;
             let limit = optional_usize_arg(&mut input, "limit")?.unwrap_or(64);
-            let out = recent_facts(
-                sess,
-                principal,
-                process,
-                bounded_limit(
-                    limit,
-                    sess.state.ws.config().max_fact_limit,
-                    HARD_MAX_WS_FACT_LIMIT,
-                ),
-            )
-            .await?;
             let target = process
                 .map(|pid| format!("state://fact/{pid}"))
                 .unwrap_or_else(|| "state://fact".into());
@@ -752,7 +742,18 @@ async fn dispatch_call(
                 call.justification.as_deref(),
                 call.ttl_ms,
                 Some(&target),
-            );
+            )?;
+            let out = recent_facts(
+                sess,
+                principal,
+                process,
+                bounded_limit(
+                    limit,
+                    sess.state.ws.config().max_fact_limit,
+                    HARD_MAX_WS_FACT_LIMIT,
+                ),
+            )
+            .await?;
             out
         }
         ACTION_LINEAGE_TRACE_READ => {
@@ -761,6 +762,17 @@ async fn dispatch_call(
             let process = u64_arg(&mut input, "process")?;
             let from = optional_usize_arg(&mut input, "from")?.unwrap_or(0);
             let limit = optional_usize_arg(&mut input, "limit")?.unwrap_or(128);
+            let target = format!("state://fact/{process}");
+            record_visibility_audit(
+                &sess.state,
+                principal,
+                Some(&sess.source_addr),
+                "lineage_trace_read",
+                call.scope.as_deref(),
+                call.justification.as_deref(),
+                call.ttl_ms,
+                Some(&target),
+            )?;
             let out = trace_read(
                 sess,
                 principal,
@@ -773,24 +785,12 @@ async fn dispatch_call(
                 ),
             )
             .await?;
-            let target = format!("state://fact/{process}");
-            record_visibility_audit(
-                &sess.state,
-                principal,
-                Some(&sess.source_addr),
-                "lineage_trace_read",
-                call.scope.as_deref(),
-                call.justification.as_deref(),
-                call.ttl_ms,
-                Some(&target),
-            );
             out
         }
         ACTION_LINEAGE_FACT_READ | ACTION_LINEAGE_FACT_BY_OPERATION => {
             require_visibility_access(principal, &call)?;
             let mut input = input_map(input_value(&call.input)?)?;
             let op_id = parse_operation_id(&string_arg(&mut input, "op_id")?)?;
-            let out = lineage_fact_read(sess, principal, op_id).await?;
             record_visibility_audit(
                 &sess.state,
                 principal,
@@ -800,7 +800,8 @@ async fn dispatch_call(
                 call.justification.as_deref(),
                 call.ttl_ms,
                 Some(&format!("operation:{op_id}")),
-            );
+            )?;
+            let out = lineage_fact_read(sess, principal, op_id).await?;
             out
         }
         ACTION_HEALTH_SUMMARY => health_summary(sess, principal).await?,
@@ -811,6 +812,7 @@ async fn dispatch_call(
             let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
             validate_path_segment(&id, "extension installation id")?;
+            validate_extension_installation_def(&id, &def)?;
             mgmt::write_config(
                 &sess.state,
                 principal,
@@ -960,6 +962,16 @@ async fn subscribe(
             ensure_observable_state_path(&pattern)?;
             auth::authorize_path(&sess.state.state, principal, "subscribe", &pattern, None).await?;
             let mut rx = sess.state.state.subscribe(&pattern).await?;
+            record_visibility_audit(
+                &sess.state,
+                principal,
+                Some(&sess.source_addr),
+                "state_watch",
+                stream.scope.as_deref(),
+                stream.justification.as_deref(),
+                stream.ttl_ms,
+                Some(&pattern.to_string()),
+            )?;
             let event_tx = sess.event_tx.clone();
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
             if let Some(handle) = sess.subscriptions.remove(&id) {
@@ -985,16 +997,6 @@ async fn subscribe(
                     shutdown: shutdown_tx,
                 },
             );
-            record_visibility_audit(
-                &sess.state,
-                principal,
-                Some(&sess.source_addr),
-                "state_watch",
-                stream.scope.as_deref(),
-                stream.justification.as_deref(),
-                stream.ttl_ms,
-                Some(&pattern.to_string()),
-            );
             Ok(())
         }
         STREAM_AUDIT_FACTS => {
@@ -1002,6 +1004,19 @@ async fn subscribe(
             let mut input = input_map(input_value(&stream.input)?)?;
             let process = optional_u64_arg(&mut input, "process")?;
             authorize_fact_read(principal, process)?;
+            let target = process
+                .map(|pid| format!("state://fact/{pid}"))
+                .unwrap_or_else(|| "state://fact".into());
+            record_visibility_audit(
+                &sess.state,
+                principal,
+                Some(&sess.source_addr),
+                "audit_facts_stream",
+                stream.scope.as_deref(),
+                stream.justification.as_deref(),
+                stream.ttl_ms,
+                Some(&target),
+            )?;
             let event_tx = sess.event_tx.clone();
             let state = sess.state.clone();
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
@@ -1015,7 +1030,20 @@ async fn subscribe(
                     tokio::select! {
                         _ = &mut shutdown_rx => break,
                         _ = interval.tick() => {
-                            let facts = state.boot.kernel.facts.all_facts();
+                            let facts = match state.boot.kernel.facts.all_facts() {
+                                Ok(facts) => facts,
+                                Err(e) => {
+                                    let _ = event_tx
+                                        .send(SubscriptionMessage {
+                                            stream: id,
+                                            event: ConsoleEvent::SubscriptionClosed {
+                                                reason: e.to_string(),
+                                            },
+                                        })
+                                        .await;
+                                    break;
+                                }
+                            };
                             for fact in facts.iter().skip(seen).filter(|fact| {
                                 process.is_none_or(|pid| fact.caller.get() == pid)
                             }) {
@@ -1042,19 +1070,6 @@ async fn subscribe(
                 SubscriptionHandle {
                     shutdown: shutdown_tx,
                 },
-            );
-            let target = process
-                .map(|pid| format!("state://fact/{pid}"))
-                .unwrap_or_else(|| "state://fact".into());
-            record_visibility_audit(
-                &sess.state,
-                principal,
-                Some(&sess.source_addr),
-                "audit_facts_stream",
-                stream.scope.as_deref(),
-                stream.justification.as_deref(),
-                stream.ttl_ms,
-                Some(&target),
             );
             Ok(())
         }
@@ -1126,8 +1141,6 @@ async fn snapshot(
                     require_visibility_access(principal, call)?;
                 }
                 let limit = optional_usize_arg(&mut section, "limit")?.unwrap_or(64);
-                let runtime =
-                    process_inspect(sess, principal, None, include_recent_facts, limit).await?;
                 if include_recent_facts {
                     record_visibility_audit(
                         &sess.state,
@@ -1138,8 +1151,10 @@ async fn snapshot(
                         call.justification.as_deref(),
                         call.ttl_ms,
                         Some("runtime.processes"),
-                    );
+                    )?;
                 }
+                let runtime =
+                    process_inspect(sess, principal, None, include_recent_facts, limit).await?;
                 out.insert("runtime".into(), runtime);
             }
             other => {
@@ -1192,13 +1207,22 @@ async fn run_state_op(
     input: Value,
 ) -> Result<Value, ConsoleError> {
     let target = ResourceName::new(path.clone());
-    let identity = Path::parse(&principal.identity_path)
-        .ok()
-        .map(|p| nexus_kernel::intern_identity(&p))
-        .unwrap_or(IdentityRef::ROOT);
+    let identity_path = Path::parse(&principal.identity_path)
+        .map_err(|e| ConsoleError::Operation(format!("invalid principal identity path: {e}")))?;
+    if identity_path.segments().is_empty() {
+        return Err(ConsoleError::Operation(
+            "invalid principal identity path: identity path must include at least one segment"
+                .into(),
+        ));
+    }
+    let identity = nexus_kernel::intern_identity(&identity_path);
     let verb = capability_verb_for_state_method(method);
     let cap = format!("{verb}://{}", capability_target(&path));
-    let process = sess.state.boot.spawn_request_process(identity, &[&cap]);
+    let process = sess
+        .state
+        .boot
+        .spawn_request_process(identity, &[&cap])
+        .map_err(|e| ConsoleError::Operation(e.to_string()))?;
     let handle = sess
         .state
         .boot
@@ -1264,7 +1288,7 @@ async fn recent_facts(
         .boot
         .kernel
         .facts
-        .all_facts()
+        .all_facts()?
         .into_iter()
         .filter(|fact| process.is_none_or(|pid| fact.caller.get() == pid))
         .rev()
@@ -1285,22 +1309,46 @@ async fn trace_read(
     limit: usize,
 ) -> Result<Value, ConsoleError> {
     authorize_fact_read(principal, Some(process))?;
-    let rows = sess
+    let all = sess
         .state
         .boot
         .kernel
         .facts
-        .all_facts()
+        .all_facts()?
         .into_iter()
         .filter(|fact| fact.caller.get() == process)
+        .collect::<Vec<_>>();
+    let limit = bounded_limit(
+        limit,
+        sess.state.ws.config().max_trace_limit,
+        HARD_MAX_WS_TRACE_LIMIT,
+    );
+    let rows = all
+        .iter()
         .skip(from)
-        .take(bounded_limit(
-            limit,
-            sess.state.ws.config().max_trace_limit,
-            HARD_MAX_WS_TRACE_LIMIT,
-        ))
-        .collect();
-    Ok(facts_value(rows))
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let partial = from.saturating_add(rows.len()) < all.len();
+    let mut out = BTreeMap::new();
+    out.insert("process".into(), Value::Int(u64_to_i64_saturating(process)));
+    out.insert("from".into(), Value::Int(usize_to_i64_saturating(from)));
+    out.insert("limit".into(), Value::Int(usize_to_i64_saturating(limit)));
+    out.insert(
+        "total_facts".into(),
+        Value::Int(usize_to_i64_saturating(all.len())),
+    );
+    out.insert("items".into(), facts_value(rows));
+    out.insert("partial".into(), Value::Bool(true));
+    out.insert(
+        "partial_reason".into(),
+        Value::Str(if partial {
+            "trace result is paged; request the next page to continue reconstruction".into()
+        } else {
+            "trace projection currently exposes fact order only; span tree, state revision, and endpoint indexes are not materialized".into()
+        }),
+    );
+    Ok(Value::Map(out))
 }
 
 async fn lineage_fact_read(
@@ -1314,7 +1362,7 @@ async fn lineage_fact_read(
         .boot
         .kernel
         .facts
-        .all_facts()
+        .all_facts()?
         .into_iter()
         .find(|fact| fact.id == op_id)
         .ok_or_else(|| ConsoleError::BadRequest(format!("unknown operation id: {op_id}")))?;
@@ -1347,7 +1395,7 @@ async fn health_summary(
         process_status.insert(status, Value::Int(next));
     }
 
-    let facts = sess.state.boot.kernel.facts.all_facts();
+    let facts = sess.state.boot.kernel.facts.all_facts()?;
     let mut decisions = BTreeMap::new();
     for fact in &facts {
         let key = format!("{:?}", fact.decision);
@@ -1680,14 +1728,21 @@ async fn invoke_effect(
 ) -> Result<Value, ConsoleError> {
     let path = Path::parse(effect)?;
     auth::authorize_path(&sess.state.state, principal, "perform", &path, Some(&input)).await?;
-    let identity = Path::parse(&principal.identity_path)
-        .ok()
-        .map(|p| nexus_kernel::intern_identity(&p))
-        .unwrap_or(IdentityRef::ROOT);
-    let process = sess.state.boot.spawn_request_process(
-        identity,
-        &[&format!("perform://{}", capability_target(&path))],
-    );
+    let identity_path = Path::parse(&principal.identity_path)
+        .map_err(|e| ConsoleError::Operation(format!("invalid principal identity path: {e}")))?;
+    if identity_path.segments().is_empty() {
+        return Err(ConsoleError::Operation(
+            "invalid principal identity path: identity path must include at least one segment"
+                .into(),
+        ));
+    }
+    let identity = nexus_kernel::intern_identity(&identity_path);
+    let cap = format!("perform://{}", capability_target(&path));
+    let process = sess
+        .state
+        .boot
+        .spawn_request_process(identity, &[&cap])
+        .map_err(|e| ConsoleError::Operation(e.to_string()))?;
     let target = ResourceName::new(path);
     let handle = sess
         .state
@@ -1719,6 +1774,20 @@ fn decode_frame(bytes: &[u8], configured_max_frame_bytes: usize) -> Result<Clien
 
 fn bounded_limit(requested: usize, configured: usize, hard: usize) -> usize {
     requested.min(configured).min(hard)
+}
+
+fn usize_to_i64_saturating(value: usize) -> i64 {
+    match i64::try_from(value) {
+        Ok(value) => value,
+        Err(_) => i64::MAX,
+    }
+}
+
+fn u64_to_i64_saturating(value: u64) -> i64 {
+    match i64::try_from(value) {
+        Ok(value) => value,
+        Err(_) => i64::MAX,
+    }
 }
 
 async fn send<S>(tx: &mut S, frame: ServerFrame) -> Result<(), ()>
@@ -1781,6 +1850,12 @@ impl From<nexus_types::PathError> for ConsoleError {
 
 impl From<nexus_state::StateError> for ConsoleError {
     fn from(e: nexus_state::StateError) -> Self {
+        Self::Operation(e.to_string())
+    }
+}
+
+impl From<nexus_kernel::FactError> for ConsoleError {
+    fn from(e: nexus_kernel::FactError) -> Self {
         Self::Operation(e.to_string())
     }
 }
@@ -1891,7 +1966,7 @@ fn record_visibility_audit(
     justification: Option<&str>,
     ttl_ms: Option<u64>,
     target: Option<&str>,
-) {
+) -> Result<(), ConsoleError> {
     let mut details = BTreeMap::new();
     if let Some(scope) = scope {
         details.insert("scope".into(), Value::Str(scope.to_string()));
@@ -1908,14 +1983,17 @@ fn record_visibility_audit(
     if let Some(target) = target {
         details.insert("target".into(), Value::Str(target.to_string()));
     }
-    let _ = state.boot.record_gateway_audit(nexus_kernel::GatewayAudit {
-        event: "console_visibility",
-        username: Some(principal.username.as_str()),
-        source_addr,
-        outcome,
-        mfa_level: Some(principal.mfa_level),
-        details: Some(Value::Map(details)),
-    });
+    state
+        .boot
+        .record_gateway_audit(nexus_kernel::GatewayAudit {
+            event: "console_visibility",
+            username: Some(principal.username.as_str()),
+            source_addr,
+            outcome,
+            mfa_level: Some(principal.mfa_level),
+            details: Some(Value::Map(details)),
+        })?;
+    Ok(())
 }
 
 fn ws_limit_message(limit: ConsoleWsLimit) -> String {
@@ -1996,6 +2074,14 @@ fn fact_detail_value(f: nexus_types::Fact) -> Value {
     m.insert("handle".into(), Value::Str(f.handle.to_string()));
     m.insert("input_ref".into(), serde_value(&f.input_ref));
     m.insert("outcome_ref".into(), serde_value(&f.outcome_ref));
+    m.insert("partial".into(), Value::Bool(true));
+    m.insert(
+        "partial_reason".into(),
+        Value::Str(
+            "lineage fact detail excludes materialized payload, state revision, and driver endpoint projections"
+                .into(),
+        ),
+    );
     Value::Map(m)
 }
 
@@ -2168,6 +2254,7 @@ fn require_visibility_gate(
     ttl_ms: Option<u64>,
 ) -> Result<(), ConsoleError> {
     require_step_up(principal)?;
+    validate_principal_identity(principal)?;
     let Some(scope) = scope.map(str::trim) else {
         return Err(ConsoleError::BadRequest(
             "visibility access requires a scope".into(),
@@ -2197,6 +2284,18 @@ fn require_visibility_gate(
         return Err(ConsoleError::BadRequest(format!(
             "visibility ttl_ms must be between 1 and {MAX_VISIBILITY_TTL_MS}"
         )));
+    }
+    Ok(())
+}
+
+fn validate_principal_identity(principal: &ConsolePrincipal) -> Result<(), ConsoleError> {
+    let identity_path = Path::parse(&principal.identity_path)
+        .map_err(|e| ConsoleError::Operation(format!("invalid principal identity path: {e}")))?;
+    if identity_path.segments().is_empty() {
+        return Err(ConsoleError::Operation(
+            "invalid principal identity path: identity path must include at least one segment"
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -2454,7 +2553,52 @@ fn optional_usize_arg(
     input: &mut BTreeMap<String, Value>,
     name: &str,
 ) -> Result<Option<usize>, ConsoleError> {
-    Ok(optional_u64_arg(input, name)?.map(|v| v as usize))
+    optional_u64_arg(input, name)?
+        .map(|v| {
+            usize::try_from(v).map_err(|_| ConsoleError::BadRequest(format!("{name} is too large")))
+        })
+        .transpose()
+}
+
+fn validate_extension_installation_def(id: &str, value: &Value) -> Result<(), ConsoleError> {
+    let json = serde_json::to_value(value).map_err(|e| {
+        ConsoleError::BadRequest(format!(
+            "ExtensionInstallationDef serialization failed: {e}"
+        ))
+    })?;
+    let def: ExtensionInstallationDef = serde_json::from_value(json).map_err(|e| {
+        ConsoleError::BadRequest(format!("ExtensionInstallationDef is malformed: {e}"))
+    })?;
+    if def.id != id {
+        return Err(ConsoleError::BadRequest(
+            "ExtensionInstallationDef id does not match requested installation id".into(),
+        ));
+    }
+    def.validate_admission().map_err(|e| {
+        ConsoleError::BadRequest(format!("ExtensionInstallationDef admission failed: {e}"))
+    })
+}
+
+fn validate_config_write_value_for_path(path: &str, value: &Value) -> Result<(), ConsoleError> {
+    let parsed = Path::parse(path)?;
+    let segs = parsed.segments();
+    if parsed.scheme() == "state"
+        && segs.first().map(|s| s.as_str()) == Some("kernel")
+        && segs.get(1).map(|s| s.as_str()) == Some("extension-installations")
+    {
+        let Some(id) = segs.get(2) else {
+            return Err(ConsoleError::BadRequest(
+                "ExtensionInstallationDef writes must target state://kernel/extension-installations/<id>".into(),
+            ));
+        };
+        if segs.len() != 3 {
+            return Err(ConsoleError::BadRequest(
+                "ExtensionInstallationDef writes must target exactly one installation id".into(),
+            ));
+        }
+        validate_extension_installation_def(id, value)?;
+    }
+    Ok(())
 }
 
 fn optional_bool_arg(
@@ -2521,6 +2665,37 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
+    struct FailingFactStore;
+
+    impl nexus_kernel::FactStore for FailingFactStore {
+        fn append(&self, _fact: nexus_types::Fact) -> Result<u64, nexus_kernel::FactError> {
+            Err(nexus_kernel::FactError("simulated append failure".into()))
+        }
+
+        fn complete(&self, _fact: nexus_types::Fact) -> Result<(), nexus_kernel::FactError> {
+            Err(nexus_kernel::FactError("simulated complete failure".into()))
+        }
+
+        fn sync(&self) -> Result<(), nexus_kernel::FactError> {
+            Ok(())
+        }
+
+        fn facts_of(
+            &self,
+            _process: nexus_types::ProcessId,
+        ) -> Result<Vec<nexus_types::Fact>, nexus_kernel::FactError> {
+            Ok(Vec::new())
+        }
+
+        fn all_facts(&self) -> Result<Vec<nexus_types::Fact>, nexus_kernel::FactError> {
+            Ok(Vec::new())
+        }
+
+        fn cursor(&self) -> u64 {
+            0
+        }
+    }
+
     fn console_state() -> Arc<ConsoleState> {
         let pairing_display = PairingDisplayEdge::default();
         let boot = Arc::new(Bootstrap::in_memory());
@@ -2530,7 +2705,8 @@ mod tests {
                 pairing_display: pairing_display.clone(),
                 ..Default::default()
             },
-        );
+        )
+        .expect("standard providers should install");
         ConsoleState::shared_with_pairing_display(boot, pairing_display)
     }
 
@@ -2559,6 +2735,42 @@ mod tests {
             event_tx: tx,
             rate: FrameRate::default(),
         }
+    }
+
+    fn root_principal() -> ConsolePrincipal {
+        ConsolePrincipal {
+            username: "root".into(),
+            identity_path: "process://root".into(),
+            grants: nexus_types::CapSet::from_strs(["*://**"]).unwrap(),
+            mfa_level: 2,
+        }
+    }
+
+    #[test]
+    fn visibility_audit_fact_failure_is_not_swallowed() {
+        let facts = nexus_kernel::FactSink::new(Arc::new(FailingFactStore));
+        let state: nexus_state::Backend = Arc::new(nexus_state::InMemoryBackend::new());
+        let boot = Arc::new(Bootstrap::from_kernel(nexus_kernel::Kernel::with_backends(
+            state, facts,
+        )));
+        let st = ConsoleState::shared(boot);
+        let principal = root_principal();
+
+        let err = record_visibility_audit(
+            &st,
+            &principal,
+            Some("test"),
+            "state_read",
+            Some("scope"),
+            Some("justification"),
+            Some(1000),
+            Some("state://chat/source/messages/1"),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ConsoleError::Operation(message) if message.contains("simulated complete failure"))
+        );
     }
 
     async fn root_login(st: &Arc<ConsoleState>) -> (String, ConsolePrincipal, String) {
@@ -2670,7 +2882,7 @@ mod tests {
             .processes
             .all_ids()
             .into_iter()
-            .map(|pid| st.boot.kernel.facts.facts_of(pid).len())
+            .map(|pid| st.boot.kernel.facts.facts_of(pid).unwrap().len())
             .sum()
     }
 
@@ -3120,6 +3332,7 @@ mod tests {
             .kernel
             .facts
             .all_facts()
+            .unwrap()
             .last()
             .map(|fact| fact.id.to_string())
             .expect("expected at least one fact");
@@ -3151,6 +3364,66 @@ mod tests {
         assert_eq!(row.get("op_id"), Some(&Value::Str(op_id)));
         assert!(matches!(row.get("input_ref"), Some(Value::Map(_))));
         assert!(matches!(row.get("outcome_ref"), Some(Value::Map(_))));
+        assert_eq!(row.get("partial"), Some(&Value::Bool(true)));
+        assert!(matches!(row.get("partial_reason"), Some(Value::Str(_))));
+    }
+
+    #[tokio::test]
+    async fn lineage_trace_read_explicitly_marks_partial_projection() {
+        let st = console_state();
+        let (token, _principal, password) = root_login(&st).await;
+        let principal = step_up_principal(&st, &token, password).await;
+        st.state
+            .write_set(
+                &Path::parse("state://chat/source/messages/trace").unwrap(),
+                Value::Str("trace source".into()),
+            )
+            .await
+            .unwrap();
+        let mut sess = test_session(st.clone(), principal.clone());
+        dispatch_call(
+            &mut sess,
+            &principal,
+            visibility_call(
+                ACTION_VISIBILITY_STATE_READ,
+                map_value([(
+                    "path",
+                    Value::Str("state://chat/source/messages/trace".into()),
+                )]),
+            ),
+        )
+        .await
+        .unwrap();
+        let process = st
+            .boot
+            .kernel
+            .facts
+            .all_facts()
+            .unwrap()
+            .last()
+            .map(|fact| fact.caller.get())
+            .expect("expected at least one fact");
+
+        let out = dispatch_call(
+            &mut sess,
+            &principal,
+            visibility_call(
+                ACTION_LINEAGE_TRACE_READ,
+                map_value([
+                    ("process", Value::Int(process as i64)),
+                    ("from", Value::Int(0)),
+                    ("limit", Value::Int(8)),
+                ]),
+            ),
+        )
+        .await
+        .unwrap();
+        let Value::Map(row) = output_value(out) else {
+            panic!("expected map")
+        };
+        assert_eq!(row.get("partial"), Some(&Value::Bool(true)));
+        assert!(matches!(row.get("partial_reason"), Some(Value::Str(_))));
+        assert!(matches!(row.get("items"), Some(Value::List(items)) if !items.is_empty()));
     }
 
     #[tokio::test]
@@ -3249,6 +3522,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extension_installation_write_validates_admission_before_state_write() {
+        let st = console_state();
+        let (token, _principal, password) = root_login(&st).await;
+        let principal = step_up_principal(&st, &token, password).await;
+        let mut sess = test_session(st.clone(), principal.clone());
+        let mut bad = extension_installation("acme", 0);
+        let Value::Map(root) = &mut bad else {
+            panic!("expected installation map")
+        };
+        let Some(Value::List(projections)) = root.get_mut("projections") else {
+            panic!("expected projections")
+        };
+        let Some(Value::Map(provider)) = projections.first_mut() else {
+            panic!("expected provider projection")
+        };
+        provider.insert(
+            "namespace".into(),
+            Value::Str("effect://plugin/other".into()),
+        );
+
+        let err = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_EXTENSIONS_INSTALLATION_INSTALL,
+                map_value([
+                    ("id", Value::Str("acme".into())),
+                    ("def", bad.clone()),
+                    ("expected_version", Value::Null),
+                ]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ConsoleError::BadRequest(_)));
+        assert_eq!(
+            st.state
+                .read(&Path::parse("state://kernel/extension-installations/acme").unwrap())
+                .await
+                .unwrap(),
+            None
+        );
+
+        let err = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_CONFIG_WRITE_CAS,
+                map_value([
+                    (
+                        "path",
+                        Value::Str("state://kernel/extension-installations/acme".into()),
+                    ),
+                    ("value", bad),
+                    ("expected_version", Value::Null),
+                ]),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ConsoleError::BadRequest(_)));
+        assert_eq!(
+            st.state
+                .read(&Path::parse("state://kernel/extension-installations/acme").unwrap())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn visibility_read_allows_root_business_state_after_step_up() {
         let st = console_state();
         let (token, _principal, password) = root_login(&st).await;
@@ -3277,6 +3621,42 @@ mod tests {
         assert!(
             after > before,
             "visibility read must execute through Operation/Fact, not backend side channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_principal_identity_rejects_visibility_without_root_fallback() {
+        let st = console_state();
+        st.state
+            .write_set(
+                &Path::parse("state://chat/source/messages/1").unwrap(),
+                Value::Str("hello from chat".into()),
+            )
+            .await
+            .unwrap();
+        let before = st.boot.kernel.processes.all_ids().len();
+        let mut principal = root_principal();
+        principal.identity_path = "not-a-path".into();
+        let mut sess = test_session(st.clone(), principal.clone());
+
+        let err = dispatch_call(
+            &mut sess,
+            &principal,
+            visibility_call(
+                ACTION_VISIBILITY_STATE_READ,
+                map_value([("path", Value::Str("state://chat/source/messages/1".into()))]),
+            ),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ConsoleError::Operation(message) if message.contains("invalid principal identity path"))
+        );
+        assert_eq!(
+            st.boot.kernel.processes.all_ids().len(),
+            before,
+            "malformed console principals must not fall back to root or spawn a process"
         );
     }
 

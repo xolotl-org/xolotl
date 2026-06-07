@@ -9,7 +9,7 @@
 use nexus_kernel::Bootstrap;
 use nexus_state::Backend;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::auth::{ConsoleAuth, ConsoleAuthConfig};
@@ -235,7 +235,7 @@ impl ConsoleWsRuntime {
     }
 
     pub fn try_acquire_source(&self, source: &str) -> Result<(), ConsoleWsLimit> {
-        let mut counts = self.counts.lock().expect("console ws counts poisoned");
+        let mut counts = self.counts();
         if counts.global >= self.config.max_connections_global {
             return Err(ConsoleWsLimit::Global);
         }
@@ -248,7 +248,7 @@ impl ConsoleWsRuntime {
     }
 
     pub fn release_source(&self, source: &str) {
-        let mut counts = self.counts.lock().expect("console ws counts poisoned");
+        let mut counts = self.counts();
         counts.global = counts.global.saturating_sub(1);
         decrement(&mut counts.by_source, source);
     }
@@ -261,7 +261,7 @@ impl ConsoleWsRuntime {
         if current == Some(next) {
             return Ok(());
         }
-        let mut counts = self.counts.lock().expect("console ws counts poisoned");
+        let mut counts = self.counts();
         if count_for(&counts.by_user, next) >= self.config.max_connections_per_user {
             return Err(ConsoleWsLimit::User);
         }
@@ -273,8 +273,15 @@ impl ConsoleWsRuntime {
     }
 
     pub fn release_user(&self, user: &str) {
-        let mut counts = self.counts.lock().expect("console ws counts poisoned");
+        let mut counts = self.counts();
         decrement(&mut counts.by_user, user);
+    }
+
+    fn counts(&self) -> MutexGuard<'_, ConsoleWsCounts> {
+        match self.counts.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 }
 

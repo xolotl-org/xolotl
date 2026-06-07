@@ -53,6 +53,7 @@ impl RedbFactStore {
         slot: u64,
         fact: &Fact,
     ) -> Result<(), FactError> {
+        ensure_fact_schema(fact)?;
         let bytes = serde_json::to_vec(fact).map_err(fact_err)?;
         {
             let mut table = txn.open_table(FACTS_TABLE).map_err(fact_err)?;
@@ -65,10 +66,13 @@ impl RedbFactStore {
         Ok(())
     }
 
-    fn slot_of(&self, id: &OperationId) -> Option<u64> {
-        let txn = self.db.begin_read().ok()?;
-        let index = txn.open_table(FACT_INDEX_TABLE).ok()?;
-        Some(index.get(Self::op_key(id).as_str()).ok()??.value())
+    fn slot_of(&self, id: &OperationId) -> Result<Option<u64>, FactError> {
+        let txn = self.db.begin_read().map_err(fact_err)?;
+        let index = txn.open_table(FACT_INDEX_TABLE).map_err(fact_err)?;
+        Ok(index
+            .get(Self::op_key(id).as_str())
+            .map_err(fact_err)?
+            .map(|slot| slot.value()))
     }
 }
 
@@ -76,7 +80,9 @@ impl FactStore for RedbFactStore {
     fn append(&self, fact: Fact) -> Result<u64, FactError> {
         let mut cursor = self.cursor.lock();
         let slot = *cursor;
-        let next = slot + 1;
+        let next = slot
+            .checked_add(1)
+            .ok_or_else(|| FactError("fact cursor overflow".into()))?;
 
         let txn = self.db.begin_write().map_err(fact_err)?;
         self.store_fact(&txn, slot, &fact)?;
@@ -93,7 +99,7 @@ impl FactStore for RedbFactStore {
 
     fn complete(&self, fact: Fact) -> Result<(), FactError> {
         // Update the existing slot if the fact was begun; else append fresh.
-        let slot = self.slot_of(&fact.id);
+        let slot = self.slot_of(&fact.id)?;
         let txn = self.db.begin_write().map_err(fact_err)?;
         match slot {
             Some(slot) => {
@@ -103,7 +109,9 @@ impl FactStore for RedbFactStore {
             None => {
                 let mut cursor = self.cursor.lock();
                 let slot = *cursor;
-                let next = slot + 1;
+                let next = slot
+                    .checked_add(1)
+                    .ok_or_else(|| FactError("fact cursor overflow".into()))?;
                 self.store_fact(&txn, slot, &fact)?;
                 {
                     let mut meta = txn.open_table(FACT_META_TABLE).map_err(fact_err)?;
@@ -123,50 +131,45 @@ impl FactStore for RedbFactStore {
         Ok(())
     }
 
-    fn facts_of(&self, process: ProcessId) -> Vec<Fact> {
-        let txn = match self.db.begin_read() {
-            Ok(t) => t,
-            Err(_) => return Vec::new(),
-        };
-        let table = match txn.open_table(FACTS_TABLE) {
-            Ok(t) => t,
-            Err(_) => return Vec::new(),
-        };
+    fn facts_of(&self, process: ProcessId) -> Result<Vec<Fact>, FactError> {
+        let txn = self.db.begin_read().map_err(fact_err)?;
+        let table = txn.open_table(FACTS_TABLE).map_err(fact_err)?;
         let mut facts = Vec::new();
-        if let Ok(iter) = table.iter() {
-            for item in iter.flatten() {
-                if let Ok(fact) = serde_json::from_slice::<Fact>(item.1.value())
-                    && fact.caller == process
-                {
-                    facts.push(fact);
-                }
+        for item in table.iter().map_err(fact_err)? {
+            let (_slot, bytes) = item.map_err(fact_err)?;
+            let fact = serde_json::from_slice::<Fact>(bytes.value()).map_err(fact_err)?;
+            if fact.caller == process {
+                facts.push(fact);
             }
         }
-        facts
+        Ok(facts)
     }
 
-    fn all_facts(&self) -> Vec<Fact> {
-        let txn = match self.db.begin_read() {
-            Ok(t) => t,
-            Err(_) => return Vec::new(),
-        };
-        let table = match txn.open_table(FACTS_TABLE) {
-            Ok(t) => t,
-            Err(_) => return Vec::new(),
-        };
+    fn all_facts(&self) -> Result<Vec<Fact>, FactError> {
+        let txn = self.db.begin_read().map_err(fact_err)?;
+        let table = txn.open_table(FACTS_TABLE).map_err(fact_err)?;
         let mut facts = Vec::new();
-        if let Ok(iter) = table.iter() {
-            for item in iter.flatten() {
-                if let Ok(fact) = serde_json::from_slice::<Fact>(item.1.value()) {
-                    facts.push(fact);
-                }
-            }
+        for item in table.iter().map_err(fact_err)? {
+            let (_slot, bytes) = item.map_err(fact_err)?;
+            facts.push(serde_json::from_slice::<Fact>(bytes.value()).map_err(fact_err)?);
         }
-        facts
+        Ok(facts)
     }
 
     fn cursor(&self) -> u64 {
         *self.cursor.lock()
+    }
+}
+
+fn ensure_fact_schema(fact: &Fact) -> Result<(), FactError> {
+    if fact.schema_version == Fact::SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err(FactError(format!(
+            "unsupported Fact schema_version {} (current {})",
+            fact.schema_version,
+            Fact::SCHEMA_VERSION
+        )))
     }
 }
 
@@ -210,7 +213,7 @@ mod tests {
         let fs = store.fact_store().unwrap();
         fs.append(fact(1, 0, false)).unwrap();
         fs.complete(fact(1, 0, true)).unwrap();
-        let facts = fs.facts_of(ProcessId::new(1));
+        let facts = fs.facts_of(ProcessId::new(1)).unwrap();
         assert_eq!(
             facts.len(),
             1,
@@ -230,7 +233,7 @@ mod tests {
         }
         let store = RedbStore::open(&path).unwrap();
         let fs = store.fact_store().unwrap();
-        assert_eq!(fs.facts_of(ProcessId::new(2)).len(), 1);
+        assert_eq!(fs.facts_of(ProcessId::new(2)).unwrap().len(), 1);
         assert_eq!(fs.cursor(), 1, "cursor restored across reopen");
     }
 
@@ -243,7 +246,7 @@ mod tests {
         fs.complete(fact(1, 0, true)).unwrap();
         fs.complete(fact(2, 0, true)).unwrap();
 
-        let facts = fs.all_facts();
+        let facts = fs.all_facts().unwrap();
         assert_eq!(facts.len(), 2);
         assert_eq!(facts[0].caller, ProcessId::new(1));
         assert_eq!(facts[1].caller, ProcessId::new(2));

@@ -912,7 +912,14 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
                 ],
                 vec![],
             ),
-            schema("lineage.trace_read.output", "list", vec![], vec![]),
+            schema(
+                "lineage.trace_read.output",
+                "map",
+                vec![],
+                vec![
+                    "output includes partial/partial_reason because v1 exposes a fact-order projection",
+                ],
+            ),
         ),
         action(
             ACTION_LINEAGE_FACT_READ,
@@ -928,7 +935,14 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
                 vec![field("op_id", "operation_id", true)],
                 vec!["requires ActionCall.scope, justification, and ttl_ms"],
             ),
-            schema("lineage.fact_read.output", "map", vec![], vec![]),
+            schema(
+                "lineage.fact_read.output",
+                "map",
+                vec![],
+                vec![
+                    "output includes partial/partial_reason when lineage projections are not fully materialized",
+                ],
+            ),
         ),
         action(
             ACTION_LINEAGE_FACT_BY_OPERATION,
@@ -944,7 +958,14 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
                 vec![field("op_id", "operation_id", true)],
                 vec!["alias of lineage.fact.read for operation-centric clients"],
             ),
-            schema("lineage.fact_by_operation.output", "map", vec![], vec![]),
+            schema(
+                "lineage.fact_by_operation.output",
+                "map",
+                vec![],
+                vec![
+                    "output includes partial/partial_reason when lineage projections are not fully materialized",
+                ],
+            ),
         ),
         action(
             ACTION_HEALTH_SUMMARY,

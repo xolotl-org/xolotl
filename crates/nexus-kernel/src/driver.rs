@@ -13,6 +13,7 @@ use nexus_types::{
     DriverId, EndpointId, Failure, InterfaceSet, Invoke, InvokeResult, MethodId, OperationId,
     Outcome, OutputMode, Path, Transport, Value,
 };
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -57,6 +58,10 @@ pub struct DriverContext {
     pub target_path: Option<nexus_types::Path>,
     /// Sink for streaming chunks; the driver pushes incremental values here.
     stream_tx: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    /// Provenance of the value produced by this driver call. State-like drivers
+    /// set this from the same backend read that produced the returned Value, so
+    /// the data plane never performs a second provenance read that could race.
+    output_taint: Arc<Mutex<nexus_types::TaintSet>>,
 }
 
 impl DriverContext {
@@ -69,6 +74,7 @@ impl DriverContext {
             taint: nexus_types::TaintSet::pristine(),
             target_path: None,
             stream_tx: None,
+            output_taint: Arc::new(Mutex::new(nexus_types::TaintSet::pristine())),
         }
     }
 
@@ -108,6 +114,17 @@ impl DriverContext {
             Some(tx) => tx.send(chunk).is_ok(),
             None => true,
         }
+    }
+
+    /// Record the provenance of the returned value. Ordinary drivers leave this
+    /// pristine; state projections set it from the same read envelope as the
+    /// output value (§21.5).
+    pub fn set_output_taint(&self, taint: nexus_types::TaintSet) {
+        *self.output_taint.lock() = taint;
+    }
+
+    pub fn output_taint(&self) -> nexus_types::TaintSet {
+        self.output_taint.lock().clone()
     }
 }
 
@@ -163,7 +180,7 @@ impl RemoteDriver {
 impl Driver for RemoteDriver {
     async fn call(
         &self,
-        _method: MethodId,
+        method: MethodId,
         input: Value,
         output: OutputMode,
         ctx: &DriverContext,
@@ -177,6 +194,7 @@ impl Driver for RemoteDriver {
         let invoke = Invoke {
             invocation_id: op_id.to_string(),
             effect_path: self.effect_path.clone(),
+            method_id: method,
             input,
             deadline_ms: None,
             output_stream_to: matches!(output, OutputMode::Stream)
@@ -379,6 +397,7 @@ mod tests {
             seen[0].effect_path.to_string(),
             "effect://plugin/acme/search"
         );
+        assert_eq!(seen[0].method_id, MethodId::new(0));
         assert_eq!(seen[0].output_stream_to, Some(stream));
     }
 }

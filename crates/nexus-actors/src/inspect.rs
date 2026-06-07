@@ -76,7 +76,10 @@ impl Driver for KernelInspectDriver {
                 .map(|child| Value::Int(child.get() as i64))
                 .collect();
             row.insert("children".into(), Value::List(children));
-            let facts = self.facts.facts_of(pid);
+            let facts = self
+                .facts
+                .facts_of(pid)
+                .map_err(|e| DriverError::Other(e.to_string()))?;
             row.insert("fact_count".into(), Value::Int(facts.len() as i64));
             if include_facts {
                 row.insert(

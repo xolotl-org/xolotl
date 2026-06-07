@@ -9,6 +9,7 @@
 //! the wire frames (`Invoke`, `ControlFrame`, …) — all wasm-safe data.
 
 use crate::Timestamp;
+use crate::ids::MethodId;
 use crate::path::Path;
 use crate::replay::Purity;
 use crate::value::Value;
@@ -599,6 +600,9 @@ pub struct Invoke {
     /// key when present, else from CausalPosition (§16.3.3 / §6.1).
     pub invocation_id: String,
     pub effect_path: Path,
+    /// Concrete method on the Resource interface. Remote endpoint dispatch must
+    /// preserve this just like a local [`Driver`](crate::resource::Method).
+    pub method_id: MethodId,
     pub input: Value,
     #[serde(default)]
     pub deadline_ms: Option<i64>,
@@ -686,8 +690,8 @@ mod tests {
     #[test]
     fn installation_with_source_and_provider_projections_is_admitted() {
         let install = ExtensionInstallationDef {
-            id: "wechat".into(),
-            platform: "wechat".into(),
+            id: "instant_messaging_platform".into(),
+            platform: "instant_messaging_platform".into(),
             transport: Transport::Grpc { endpoint: None },
             trust: TrustLevel::Sandboxed,
             config_schema: Value::Null,
@@ -699,7 +703,7 @@ mod tests {
                     namespace: None,
                     provides: vec![],
                     emits: Some(EventSource {
-                        sink: Path::parse("state://wechat/events").unwrap(),
+                        sink: Path::parse("state://instant_messaging_platform/events").unwrap(),
                         purity: Purity::Effectful,
                         event_schema: None,
                     }),
@@ -708,9 +712,11 @@ mod tests {
                 ExtensionProjectionDef {
                     id: "provider".into(),
                     role: Role::Provider,
-                    namespace: Some(Path::parse("effect://plugin/wechat").unwrap()),
+                    namespace: Some(
+                        Path::parse("effect://plugin/instant_messaging_platform").unwrap(),
+                    ),
                     provides: vec![EffectCapability::new(
-                        "effect://plugin/wechat/send_text",
+                        "effect://plugin/instant_messaging_platform/send_text",
                         Purity::Effectful,
                     )],
                     emits: None,
@@ -727,17 +733,17 @@ mod tests {
         let projection = ExtensionProjectionDef {
             id: "provider".into(),
             role: Role::Provider,
-            namespace: Some(Path::parse("effect://plugin/wechat").unwrap()),
+            namespace: Some(Path::parse("effect://plugin/instant_messaging_platform").unwrap()),
             provides: vec![EffectCapability::new(
-                "effect://plugin/wechat/send_text",
+                "effect://plugin/instant_messaging_platform/send_text",
                 Purity::Effectful,
             )],
             emits: None,
             version: 1,
         };
         let install = ExtensionInstallationDef {
-            id: "wechat".into(),
-            platform: "wechat".into(),
+            id: "instant_messaging_platform".into(),
+            platform: "instant_messaging_platform".into(),
             transport: Transport::Grpc { endpoint: None },
             trust: TrustLevel::Sandboxed,
             config_schema: Value::Null,

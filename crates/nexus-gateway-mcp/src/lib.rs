@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `nexus-gateway-mcp` — MCP server-side Gateway adapter (§18.2).
 //!
 //! This crate covers **Nexus as MCP server**: selected Nexus effects are
@@ -202,15 +204,17 @@ mod tests {
     #[tokio::test]
     async fn tool_call_runs_through_gateway() {
         let boot = Arc::new(Bootstrap::in_memory());
-        let target = boot.register_effect(
-            "effect://echo/say",
-            &[nexus_kernel::MethodSpec::new(
-                "invoke",
-                nexus_types::Purity::Pure,
-                nexus_kernel::MethodSpec::UNARY_ASYNC,
-            )],
-            Arc::new(EchoDriver),
-        );
+        let target = boot
+            .register_effect(
+                "effect://echo/say",
+                &[nexus_kernel::MethodSpec::new(
+                    "invoke",
+                    nexus_types::Purity::Pure,
+                    nexus_kernel::MethodSpec::UNARY_ASYNC,
+                )],
+                Arc::new(EchoDriver),
+            )
+            .unwrap();
         let mut inner = InProcessGateway::new(boot)
             .with_declared_capabilities(vec!["perform://effect/echo/say".into()]);
         inner.open(target, "perform").unwrap();

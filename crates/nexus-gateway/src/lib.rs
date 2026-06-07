@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `nexus-gateway` — the Gateway abstraction (§18.1).
 //!
 //! A Gateway is a `Source` (InProcess·Full): it adapts an external protocol to
@@ -117,21 +119,21 @@ impl InProcessGateway {
     }
 
     /// Spawn the attenuated request Process for `identity` (§18.1 step 3).
-    fn spawn_request_process(&self, identity: &RequestIdentity) -> ProcessId {
-        let id_ref = Path::parse(&identity.identity)
-            .ok()
-            .map(|p| intern_identity(&p))
-            .unwrap_or(nexus_types::IdentityRef::ROOT);
+    fn spawn_request_process(&self, identity: &RequestIdentity) -> Result<ProcessId, GatewayError> {
+        let id_path = parse_request_identity(&identity.identity)?;
+        let id_ref = intern_identity(&id_path);
         let declared: Vec<&str> = self
             .declared_capabilities
             .iter()
             .map(|s| s.as_str())
             .collect();
-        self.boot.spawn_request_process(id_ref, &declared)
+        self.boot
+            .spawn_request_process(id_ref, &declared)
+            .map_err(|e| GatewayError::Rejected(e.to_string()))
     }
 
     fn executor_for(&self, identity: &RequestIdentity) -> Result<Executor, GatewayError> {
-        let proc = self.spawn_request_process(identity);
+        let proc = self.spawn_request_process(identity)?;
         let ex = self.boot.kernel.executor_for(proc);
         for (name, verb) in &self.handles {
             let handle = self
@@ -150,6 +152,7 @@ impl Gateway for InProcessGateway {
         if token.0.is_empty() {
             return Err(GatewayError::Unauthenticated);
         }
+        parse_request_identity(&token.0)?;
         // Map the token to an identity (here: the token *is* the identity path;
         // a real gateway looks it up in a credential store).
         let identity = token.0.clone();
@@ -174,6 +177,17 @@ impl Gateway for InProcessGateway {
         });
         Ok(ex.eval_tainted(&program, entry_taint).await)
     }
+}
+
+fn parse_request_identity(identity: &str) -> Result<Path, GatewayError> {
+    let path = Path::parse(identity)
+        .map_err(|e| GatewayError::Rejected(format!("invalid request identity: {e}")))?;
+    if path.segments().is_empty() {
+        return Err(GatewayError::Rejected(
+            "invalid request identity: identity path must include at least one segment".into(),
+        ));
+    }
+    Ok(path)
 }
 
 /// Helper: a trivial program returning a fixed value (health checks).
@@ -234,25 +248,59 @@ mod tests {
             .authenticate(&AuthToken("process://alice".into()))
             .await
             .unwrap();
-        let p1 = gw.spawn_request_process(&id);
-        let p2 = gw.spawn_request_process(&id);
+        let p1 = gw.spawn_request_process(&id).unwrap();
+        let p2 = gw.spawn_request_process(&id).unwrap();
         assert_ne!(p1, root);
         assert_ne!(p2, root);
         assert_ne!(p1, p2, "each request gets its own attenuated Process");
     }
 
     #[tokio::test]
+    async fn malformed_declared_capability_rejects_request() {
+        let boot = Arc::new(Bootstrap::in_memory());
+        let gw = InProcessGateway::new(boot)
+            .with_declared_capabilities(vec!["effect://missing/verb".into()]);
+        let id = gw
+            .authenticate(&AuthToken("process://alice".into()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            gw.submit(&id, DoNode::pure(Value::Null)).await,
+            Err(GatewayError::Rejected(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_identity_rejects_before_request_process_insert() {
+        let boot = Arc::new(Bootstrap::in_memory());
+        let before = boot.kernel.processes.all_ids().len();
+        let gw = InProcessGateway::new(boot.clone());
+
+        assert!(matches!(
+            gw.authenticate(&AuthToken("alice".into())).await,
+            Err(GatewayError::Rejected(_))
+        ));
+        assert_eq!(
+            boot.kernel.processes.all_ids().len(),
+            before,
+            "malformed request identities must not fall back to root or spawn a process"
+        );
+    }
+
+    #[tokio::test]
     async fn submitted_operation_uses_child_owned_handle() {
         let boot = Arc::new(Bootstrap::in_memory());
-        let name = boot.register_effect(
-            "effect://echo/say",
-            &[nexus_kernel::MethodSpec::new(
-                "invoke",
-                nexus_types::Purity::Pure,
-                nexus_kernel::MethodSpec::UNARY_ASYNC,
-            )],
-            Arc::new(nexus_kernel::EchoDriver),
-        );
+        let name = boot
+            .register_effect(
+                "effect://echo/say",
+                &[nexus_kernel::MethodSpec::new(
+                    "invoke",
+                    nexus_types::Purity::Pure,
+                    nexus_kernel::MethodSpec::UNARY_ASYNC,
+                )],
+                Arc::new(nexus_kernel::EchoDriver),
+            )
+            .unwrap();
         let mut gw = InProcessGateway::new(boot)
             .with_declared_capabilities(vec!["perform://effect/echo/say".into()]);
         gw.open(name.clone(), "perform").unwrap();

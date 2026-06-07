@@ -191,21 +191,22 @@ pub fn open_resource(
     };
 
     // Build a dispatch table over the resource's interface methods.
+    let dispatch_driver: crate::driver::DynDriver =
+        match (binding.endpoint, remote_endpoint, driver_impl) {
+            (Some(endpoint_id), Some(endpoint), _) => Arc::new(RemoteDriver::new(
+                endpoint_id,
+                resource_name.clone(),
+                endpoint,
+            )) as crate::driver::DynDriver,
+            (None, _, Some(local)) => local,
+            (Some(endpoint_id), None, _) => return Err(OpenError::NoSuchEndpoint(endpoint_id)),
+            (None, _, None) => return Err(OpenError::NoSuchDriver(binding.driver.id)),
+        };
     let mut plan = DriverPlan::new(binding.driver.id, binding.endpoint, binding.generation);
     for iface_id in &resource.interfaces.interfaces {
         if let Some(iface) = registry.interface(*iface_id) {
             for method in &iface.methods {
-                let driver = match (binding.endpoint, &remote_endpoint, &driver_impl) {
-                    (Some(endpoint_id), Some(endpoint), _) => Arc::new(RemoteDriver::new(
-                        endpoint_id,
-                        resource_name.clone(),
-                        endpoint.clone(),
-                    ))
-                        as crate::driver::DynDriver,
-                    (None, _, Some(local)) => local.clone(),
-                    _ => unreachable!("endpoint/local driver resolved above"),
-                };
-                plan.insert(method.id, driver);
+                plan.insert(method.id, dispatch_driver.clone());
             }
         }
     }

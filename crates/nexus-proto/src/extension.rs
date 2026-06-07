@@ -155,6 +155,8 @@ pub struct Invoke {
     pub deadline_ms: ::core::option::Option<i64>,
     #[prost(string, optional, tag = "5")]
     pub output_stream_to: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, optional, tag = "6")]
+    pub method_id: ::core::option::Option<u64>,
 }
 /// Plugin → Daemon: invocation result.
 #[derive(Clone, PartialEq, ::prost::Message)]

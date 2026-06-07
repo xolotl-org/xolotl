@@ -125,6 +125,7 @@ message Invoke {
   nexus.v1.Value input = 3;
   optional int64 deadline_ms = 4;
   optional string output_stream_to = 5;
+  optional uint64 method_id = 6;
 }
 
 // Plugin → Daemon: invocation result.

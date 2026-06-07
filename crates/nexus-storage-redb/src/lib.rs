@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! redb-backed persistent storage adapters for Nexus (§24.1).
 //!
 //! Provides the production [`StateBackend`](nexus_state::StateBackend) (state

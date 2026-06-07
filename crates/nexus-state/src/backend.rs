@@ -190,6 +190,9 @@ pub trait StateBackend: Send + Sync + 'static {
     async fn read_prefix(&self, _prefix: &Path) -> StateResult<Vec<(Path, Value)>> {
         Err(StateError::Unsupported("read_prefix"))
     }
+
+    /// Return all tainted key-value pairs whose path starts with `prefix`.
+    async fn read_prefix_tainted(&self, prefix: &Path) -> StateResult<Vec<(Path, TaintedValue)>>;
 }
 
 pub type DynBackend = Arc<dyn StateBackend>;

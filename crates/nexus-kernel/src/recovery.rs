@@ -46,6 +46,9 @@ impl ReplayMap {
     pub fn from_facts(facts: &[Fact]) -> Self {
         let mut outcomes = HashMap::new();
         for f in facts {
+            if f.schema_version != Fact::SCHEMA_VERSION {
+                continue;
+            }
             if !f.is_complete() {
                 continue;
             }
@@ -96,6 +99,8 @@ pub struct RecoveryReport {
     pub retried: usize,
     /// Pending non-idempotent operations sent to quarantine.
     pub quarantined: usize,
+    /// Facts whose schema version is not supported by this binary.
+    pub schema_mismatched: usize,
 }
 
 /// An entry written to `state://quarantine/<process>/<op>` (§15.3): an unsafe
@@ -110,6 +115,8 @@ pub struct QuarantineEntry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuarantineAction {
+    /// Run an explicit Fact schema migration before replaying this process.
+    MigrateSchema,
     /// Confirm the remote effect is idempotent-safe and continue.
     ForceReplay,
     /// Write `Fail(QuarantineSkipped)`, let `OrElse` handle it.
@@ -127,6 +134,15 @@ pub fn classify_recovery(facts: &[Fact]) -> (RecoveryReport, Vec<QuarantineEntry
     let mut report = RecoveryReport::default();
     let mut quarantine = Vec::new();
     for f in facts {
+        if f.schema_version != Fact::SCHEMA_VERSION {
+            report.quarantined += 1;
+            report.schema_mismatched += 1;
+            quarantine.push(QuarantineEntry {
+                fact: f.clone(),
+                suggested_action: QuarantineAction::MigrateSchema,
+            });
+            continue;
+        }
         if f.is_complete() {
             report.skipped += 1;
             continue;
@@ -161,11 +177,11 @@ pub fn classify_recovery(facts: &[Fact]) -> (RecoveryReport, Vec<QuarantineEntry
 pub fn recover_process(
     facts: &FactSink,
     process: ProcessId,
-) -> (RecoveryReport, Vec<QuarantineEntry>, ReplayMap) {
-    let facts = facts.facts_of(process);
+) -> Result<(RecoveryReport, Vec<QuarantineEntry>, ReplayMap), crate::FactError> {
+    let facts = facts.facts_of(process)?;
     let (report, quarantine) = classify_recovery(&facts);
     let replay = ReplayMap::from_facts(&facts);
-    (report, quarantine, replay)
+    Ok((report, quarantine, replay))
 }
 
 /// Recover one process and **persist** its quarantine entries to
@@ -175,8 +191,8 @@ pub async fn recover_process_persisting(
     facts: &FactSink,
     state: &nexus_state::Backend,
     process: ProcessId,
-) -> RecoveryReport {
-    let (report, quarantine, _replay) = recover_process(facts, process);
+) -> Result<RecoveryReport, crate::FactError> {
+    let (report, quarantine, _replay) = recover_process(facts, process)?;
     for entry in &quarantine {
         let path = nexus_types::Path::parse(&format!(
             "{}{}/{}",
@@ -194,7 +210,7 @@ pub async fn recover_process_persisting(
             let _ = state.write_set(&path, v).await;
         }
     }
-    report
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -248,5 +264,28 @@ mod tests {
         let (r, q) = classify_recovery(&[fact(0, ReplayClass::IdempotentEffect, false)]);
         assert_eq!(r.retried, 1);
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn unsupported_fact_schema_quarantines_even_completed_fact() {
+        let mut f = fact(0, ReplayClass::Deterministic, true);
+        f.schema_version = Fact::SCHEMA_VERSION + 1;
+        let (r, q) = classify_recovery(&[f.clone()]);
+
+        assert_eq!(r.skipped, 0);
+        assert_eq!(r.quarantined, 1);
+        assert_eq!(r.schema_mismatched, 1);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].fact, f);
+        assert_eq!(q[0].suggested_action, QuarantineAction::MigrateSchema);
+    }
+
+    #[test]
+    fn replay_map_ignores_unsupported_fact_schema() {
+        let mut f = fact(0, ReplayClass::Deterministic, true);
+        f.schema_version = Fact::SCHEMA_VERSION + 1;
+        let replay = ReplayMap::from_facts(&[f]);
+
+        assert!(replay.is_empty());
     }
 }

@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec, SharedFactStore};
-use nexus_types::{MethodId, Outcome, OutputMode, ProcessId, Purity, Value};
+use nexus_types::{Failure, MethodId, Outcome, OutputMode, ProcessId, Purity, Value};
 use std::collections::BTreeMap;
 
 /// Method names in registration order for `state://fact/*`. Read-only:
@@ -69,11 +69,17 @@ impl Driver for FactDriver {
             // read: list the global Fact stream at `state://fact`, or one
             // process when encoded as `state://fact/<id>`.
             0 => {
-                let facts = match ctx.target_path.as_ref().and_then(fact_path_scope) {
-                    Some(FactScope::All) => self.facts.all_facts(),
-                    Some(FactScope::Process(process)) => self.facts.facts_of(process),
-                    None => self.facts.facts_of(ctx.caller),
+                let Some(path) = ctx.target_path.as_ref() else {
+                    return Ok(Outcome::Fail(Failure::InvalidInput {
+                        reason: "fact read has no bound path".into(),
+                    }));
                 };
+                let facts = match fact_path_scope(path) {
+                    Ok(FactScope::All) => self.facts.all_facts(),
+                    Ok(FactScope::Process(process)) => self.facts.facts_of(process),
+                    Err(failure) => return Ok(Outcome::Fail(failure)),
+                }
+                .map_err(|e| DriverError::Other(e.to_string()))?;
                 let list: Vec<Value> = facts.iter().map(Self::fact_to_value).collect();
                 Ok(Outcome::Done(Value::List(list)))
             }
@@ -87,19 +93,26 @@ enum FactScope {
     Process(ProcessId),
 }
 
-fn fact_path_scope(path: &nexus_types::Path) -> Option<FactScope> {
+fn fact_path_scope(path: &nexus_types::Path) -> Result<FactScope, Failure> {
     let segs = path.segments();
     if path.scheme() != "state" || segs.first().map(|s| s.as_str()) != Some("fact") {
-        return None;
+        return Err(Failure::InvalidInput {
+            reason: "fact read target must be state://fact or state://fact/<process>".into(),
+        });
     }
-    match segs.get(1) {
-        None => Some(FactScope::All),
-        Some(raw) => raw
+    match (segs.get(1), segs.get(2)) {
+        (None, None) => Ok(FactScope::All),
+        (Some(raw), None) => raw
             .as_str()
             .parse::<u64>()
-            .ok()
             .map(ProcessId::new)
-            .map(FactScope::Process),
+            .map(FactScope::Process)
+            .map_err(|_| Failure::InvalidInput {
+                reason: "fact process scope must be a numeric process id".into(),
+            }),
+        _ => Err(Failure::InvalidInput {
+            reason: "fact read target must be state://fact or state://fact/<process>".into(),
+        }),
     }
 }
 
@@ -180,5 +193,22 @@ mod tests {
             panic!("expected fact list");
         };
         assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_fact_scope_is_rejected_not_fallback() {
+        let (sink, store) = FactSink::in_memory();
+        sink.complete(fact(ProcessId::new(1), 1)).unwrap();
+        let d = FactDriver::new(store);
+
+        for target in ["state://fact/not-a-process", "state://fact/1/extra"] {
+            let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
+                .with_target_path(nexus_types::Path::parse(target).unwrap());
+            let out = d
+                .call(MethodId::new(0), Value::Null, OutputMode::Unary, &ctx)
+                .await
+                .unwrap();
+            assert!(matches!(out, Outcome::Fail(Failure::InvalidInput { .. })));
+        }
     }
 }

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! gRPC types for Nexus (§24.4) — the wire-format source of truth for
 //! cross-language clients (browser extension / mobile / bridges).
 //!

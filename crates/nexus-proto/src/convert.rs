@@ -71,10 +71,8 @@ pub fn value_from_pb(v: &pb::Value) -> Value {
                 .collect(),
         ),
         Some(Kind::BlobVal(b)) => Value::Blob(blob_from_pb(b)),
-        Some(Kind::TensorVal(t)) if t.blob.is_some() => Value::Tensor(tensor_from_pb(t)),
-        Some(Kind::TensorVal(_)) => Value::Null,
-        Some(Kind::FrameVal(fr)) if fr.blob.is_some() => Value::Frame(frame_from_pb(fr)),
-        Some(Kind::FrameVal(_)) => Value::Null,
+        Some(Kind::TensorVal(t)) => tensor_from_pb(t).map_or(Value::Null, Value::Tensor),
+        Some(Kind::FrameVal(fr)) => frame_from_pb(fr).map_or(Value::Null, Value::Frame),
         Some(Kind::StreamEndVal(m)) => Value::StreamEnd(stream_marker_from_pb(m)),
     }
 }
@@ -103,16 +101,12 @@ fn tensor_to_pb(t: &TensorRef) -> pb::TensorRef {
         shape: t.shape.clone(),
     }
 }
-fn tensor_from_pb(t: &pb::TensorRef) -> TensorRef {
-    TensorRef {
-        blob: blob_from_pb(
-            t.blob
-                .as_ref()
-                .expect("TensorRef blob must be present after validation"),
-        ),
+fn tensor_from_pb(t: &pb::TensorRef) -> Option<TensorRef> {
+    Some(TensorRef {
+        blob: blob_from_pb(t.blob.as_ref()?),
         dtype: dtype_from_str(&t.dtype),
         shape: t.shape.clone(),
-    }
+    })
 }
 
 fn frame_to_pb(fr: &FrameRef) -> pb::FrameRef {
@@ -122,16 +116,12 @@ fn frame_to_pb(fr: &FrameRef) -> pb::FrameRef {
         kind: frame_kind_str(fr.kind).to_string(),
     }
 }
-fn frame_from_pb(fr: &pb::FrameRef) -> FrameRef {
-    FrameRef {
-        blob: blob_from_pb(
-            fr.blob
-                .as_ref()
-                .expect("FrameRef blob must be present after validation"),
-        ),
+fn frame_from_pb(fr: &pb::FrameRef) -> Option<FrameRef> {
+    Some(FrameRef {
+        blob: blob_from_pb(fr.blob.as_ref()?),
         ts_nanos: fr.ts_nanos,
         kind: frame_kind_from_str(&fr.kind),
-    }
+    })
 }
 
 fn stream_marker_to_pb(m: &StreamMarker) -> pb::StreamMarker {
@@ -576,6 +566,7 @@ pub fn invoke_to_pb(i: &Invoke) -> ext::Invoke {
         input: Some(value_to_pb(&i.input)),
         deadline_ms: i.deadline_ms,
         output_stream_to: i.output_stream_to.as_ref().map(|p| p.to_string()),
+        method_id: Some(i.method_id.get()),
     }
 }
 
@@ -588,6 +579,7 @@ pub fn invoke_from_pb(i: &ext::Invoke) -> Result<Invoke, ConvertError> {
                 .as_ref()
                 .ok_or(ConvertError::Missing("effect_path"))?,
         )?,
+        method_id: MethodId::new(i.method_id.ok_or(ConvertError::Missing("method_id"))?),
         input: i.input.as_ref().map(value_from_pb).unwrap_or(Value::Null),
         deadline_ms: i.deadline_ms,
         output_stream_to: i

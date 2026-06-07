@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `nexus-plan` — Plan compiler.
 //!
 //! A *Plan* is a YAML/JSON document describing a goal-directed pipeline of
@@ -217,7 +219,21 @@ fn validate_plan(plan: &Plan) -> Result<(), PlanError> {
         validate_step_target(step, &path_registry)?;
     }
 
-    // 3. Spawn capability ceilings must use §21.1 capability literals, not
+    // 3. Acting/spawn identities must be real identity paths, not bare schemes.
+    for step in &all {
+        match step {
+            Step::Acting { identity, .. } => {
+                validate_identity_literal("acting identity", identity)?
+            }
+            Step::Spawn {
+                identity: Some(identity),
+                ..
+            } => validate_identity_literal("spawn identity", identity)?,
+            _ => {}
+        }
+    }
+
+    // 4. Spawn capability ceilings must use §21.1 capability literals, not
     //    resource paths. The kernel spawn path will attenuate these again, but
     //    Plan compilation is the first fail-closed boundary (§20.4).
     for step in &all {
@@ -230,7 +246,7 @@ fn validate_plan(plan: &Plan) -> Result<(), PlanError> {
         }
     }
 
-    // 4. Reference cycle among `${...}`-linked bindings. Build edges
+    // 5. Reference cycle among `${...}`-linked bindings. Build edges
     //    binding -> referenced-binding, then DFS for a back edge.
     let binders: std::collections::BTreeSet<String> = all
         .iter()
@@ -294,6 +310,22 @@ fn validate_target(
         target: literal.to_string(),
         reason: e.to_string(),
     })
+}
+
+fn validate_identity_literal(kind: &'static str, literal: &str) -> Result<(), PlanError> {
+    let path = Path::parse(literal).map_err(|e| PlanError::Target {
+        kind,
+        target: literal.to_string(),
+        reason: e.to_string(),
+    })?;
+    if path.segments().is_empty() {
+        return Err(PlanError::Target {
+            kind,
+            target: literal.to_string(),
+            reason: "identity path must include at least one segment".into(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_capability_scheme(literal: &str, capability: &Capability) -> Result<(), PlanError> {
@@ -793,6 +825,21 @@ mod tests {
     }
 
     #[test]
+    fn acting_identity_must_be_shaped_path() {
+        let err = compile_test(&plan(vec![Step::Acting {
+            identity: "alice".into(),
+            body: vec![Step::Pure {
+                value: serde_json::json!(1),
+            }],
+        }]));
+        assert!(matches!(
+            err,
+            Err(PlanError::Target { kind, target, .. })
+                if kind == "acting identity" && target == "alice"
+        ));
+    }
+
+    #[test]
     fn spawn_targets_kernel_resource() {
         let node = compile_test(&plan(vec![Step::Spawn {
             identity: Some("process://child".into()),
@@ -830,6 +877,22 @@ mod tests {
             }],
         }]);
         compile_test(&good).unwrap();
+    }
+
+    #[test]
+    fn spawn_identity_must_be_shaped_path() {
+        let bad = plan(vec![Step::Spawn {
+            identity: Some("child".into()),
+            capabilities: vec!["perform://effect/x/post".into()],
+            body: vec![Step::Pure {
+                value: serde_json::json!(1),
+            }],
+        }]);
+        assert!(matches!(
+            compile_test(&bad),
+            Err(PlanError::Target { kind, target, .. })
+                if kind == "spawn identity" && target == "child"
+        ));
     }
 
     #[test]

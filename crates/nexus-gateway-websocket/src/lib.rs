@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `nexus-gateway-websocket` — WebSocket protocol adapter (Gateway/Source,
 //! §18.1).
 //!
@@ -110,9 +112,11 @@ async fn session<G: Gateway + 'static>(socket: WebSocket, gw: Arc<WsGateway<G>>)
                     continue;
                 };
                 let reply = match gw.gateway.submit(&ident, *program).await {
-                    Ok(outcome) => ServerFrame::Result {
-                        id,
-                        outcome: serde_json::to_value(&outcome).unwrap_or(serde_json::Value::Null),
+                    Ok(outcome) => match serde_json::to_value(&outcome) {
+                        Ok(outcome) => ServerFrame::Result { id, outcome },
+                        Err(e) => ServerFrame::Error {
+                            message: format!("outcome serialization failed: {e}"),
+                        },
                     },
                     Err(e) => ServerFrame::Error {
                         message: e.to_string(),
