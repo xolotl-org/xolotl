@@ -57,10 +57,10 @@ pub async fn upgrade(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(st): State<Arc<ConsoleState>>,
 ) -> Response {
-    if let Err(message) = validate_upgrade_headers(&headers) {
+    let source_addr = crate::source_addr(&headers, Some(peer));
+    if let Err(message) = validate_upgrade_headers_audited(&st, &headers, &source_addr) {
         return (StatusCode::FORBIDDEN, message).into_response();
     }
-    let source_addr = crate::source_addr(&headers, Some(peer));
     if let Err(limit) = st.ws.try_acquire_source(&source_addr) {
         let message = ws_limit_message(limit);
         record_ws_audit(&st, None, Some(&source_addr), "rate_limited");
@@ -291,6 +291,12 @@ async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
     match frame {
         ClientFrame::Hello { hello } => {
             if hello.protocol_version != protocol::PROTOCOL_VERSION {
+                record_ws_audit(
+                    &sess.state,
+                    sess.principal.as_ref(),
+                    Some(&sess.source_addr),
+                    "protocol_error",
+                );
                 return ServerFrame::Error {
                     id: None,
                     code: ConsoleErrorCode::BadRequest,
@@ -306,6 +312,12 @@ async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
                 .iter()
                 .any(|encoding| encoding == protocol::WIRE_ENCODING)
             {
+                record_ws_audit(
+                    &sess.state,
+                    sess.principal.as_ref(),
+                    Some(&sess.source_addr),
+                    "protocol_error",
+                );
                 return ServerFrame::Error {
                     id: None,
                     code: ConsoleErrorCode::BadRequest,
@@ -327,6 +339,7 @@ async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
         {
             Ok(principal) => {
                 let Some(sid) = bearer_sid(Some(&token)).map(str::to_string) else {
+                    record_ws_audit(&sess.state, None, Some(&sess.source_addr), "auth_failed");
                     return ServerFrame::Error {
                         id: None,
                         code: ConsoleErrorCode::Unauthorized,
@@ -424,6 +437,12 @@ async fn authenticated_principal(
     id: Option<u64>,
 ) -> Result<ConsolePrincipal, ServerFrame> {
     let Some(sid) = sess.sid.clone() else {
+        record_ws_audit(
+            &sess.state,
+            None,
+            Some(&sess.source_addr),
+            "not_authenticated",
+        );
         return Err(ServerFrame::Error {
             id,
             code: ConsoleErrorCode::NotAuthenticated,
@@ -493,6 +512,16 @@ async fn dispatch_call(
         ACTION_SECRET_CATALOG => protocol::secret_catalog_value(),
         ACTION_SECRET_REVEAL => {
             require_visibility_access(principal, &call)?;
+            record_visibility_audit(
+                &sess.state,
+                principal,
+                Some(&sess.source_addr),
+                "secret_reveal_blocked",
+                call.scope.as_deref(),
+                call.justification.as_deref(),
+                call.ttl_ms,
+                None,
+            )?;
             return Err(ConsoleError::BadRequest(
                 "no revealable secret custody backend is registered; non-recoverable and one-time secrets must be reset, rotated, or recreated".into(),
             ));
@@ -501,6 +530,20 @@ async fn dispatch_call(
             require_visibility_access(principal, &call)?;
             let mut input = input_map(input_value(&call.input)?)?;
             let path = string_arg(&mut input, "path")?;
+            if let Err(e) = ensure_observable_state_path_str(&path) {
+                let target = blocked_visibility_target(&path);
+                record_visibility_audit(
+                    &sess.state,
+                    principal,
+                    Some(&sess.source_addr),
+                    "state_read_blocked",
+                    call.scope.as_deref(),
+                    call.justification.as_deref(),
+                    call.ttl_ms,
+                    Some(&target),
+                )?;
+                return Err(e);
+            }
             record_visibility_audit(
                 &sess.state,
                 principal,
@@ -519,6 +562,20 @@ async fn dispatch_call(
             let mut input = input_map(input_value(&call.input)?)?;
             let prefix = string_arg(&mut input, "prefix")?;
             let limit = optional_usize_arg(&mut input, "limit")?.unwrap_or(256);
+            if let Err(e) = ensure_observable_state_path_str(&prefix) {
+                let target = blocked_visibility_target(&prefix);
+                record_visibility_audit(
+                    &sess.state,
+                    principal,
+                    Some(&sess.source_addr),
+                    "state_list_blocked",
+                    call.scope.as_deref(),
+                    call.justification.as_deref(),
+                    call.ttl_ms,
+                    Some(&target),
+                )?;
+                return Err(e);
+            }
             record_visibility_audit(
                 &sess.state,
                 principal,
@@ -652,7 +709,10 @@ async fn dispatch_call(
             let Some(sid) = sess.sid.take() else {
                 return Err(ConsoleError::NotAuthenticated);
             };
-            sess.state.auth.logout_sid(&sess.state.boot, &sid).await?;
+            sess.state
+                .auth
+                .logout_sid_from_source(&sess.state.boot, &sid, Some(&sess.source_addr))
+                .await?;
             sess.principal = None;
             return Ok(ActionResult::empty(server_rev(sess)));
         }
@@ -670,7 +730,12 @@ async fn dispatch_call(
             require_step_up(principal)?;
             sess.state
                 .auth
-                .revoke_session_by_id(&sess.state.boot, principal, &sid)
+                .revoke_session_by_id_from_source(
+                    &sess.state.boot,
+                    principal,
+                    &sid,
+                    Some(&sess.source_addr),
+                )
                 .await?;
             if sess.sid.as_deref() == Some(sid.as_str()) {
                 sess.sid = None;
@@ -685,7 +750,12 @@ async fn dispatch_call(
             let count = sess
                 .state
                 .auth
-                .revoke_user_sessions(&sess.state.boot, principal, &username)
+                .revoke_user_sessions_from_source(
+                    &sess.state.boot,
+                    principal,
+                    &username,
+                    Some(&sess.source_addr),
+                )
                 .await?;
             if principal.username == username {
                 sess.sid = None;
@@ -1825,6 +1895,7 @@ enum ConsoleError {
     Auth(auth::AuthError),
     Mgmt(MgmtError),
     NotAuthenticated,
+    StepUpRequired,
     RateLimited,
     BadRequest(String),
     Operation(String),
@@ -1874,15 +1945,30 @@ fn console_error_frame(id: Option<u64>, e: ConsoleError) -> ServerFrame {
         ConsoleError::Auth(e) => auth_error_frame(id, e),
         ConsoleError::Mgmt(e) => {
             let (code, message) = match e {
-                MgmtError::Conflict { .. } => (ConsoleErrorCode::Conflict, e.to_string()),
-                MgmtError::NotManageable(_) => (ConsoleErrorCode::Forbidden, e.to_string()),
+                MgmtError::Conflict { expected } => (
+                    ConsoleErrorCode::Conflict,
+                    format!("version conflict (optimistic concurrency): expected {expected:?}"),
+                ),
+                MgmtError::NotManageable(_) => (
+                    ConsoleErrorCode::Forbidden,
+                    "management path is not allowed".into(),
+                ),
                 MgmtError::Auth(e) => {
                     let (status, message) = crate::auth_error(e);
                     (status_to_code(status), message)
                 }
-                MgmtError::Path(_) | MgmtError::Admission(_) | MgmtError::Operation(_) => {
-                    (ConsoleErrorCode::BadRequest, e.to_string())
-                }
+                MgmtError::Path(_) => (
+                    ConsoleErrorCode::BadRequest,
+                    "invalid management path".into(),
+                ),
+                MgmtError::Admission(reason) => (
+                    ConsoleErrorCode::BadRequest,
+                    format!("config admission rejected: {reason}"),
+                ),
+                MgmtError::Operation(_) => (
+                    ConsoleErrorCode::Internal,
+                    "management operation failed".into(),
+                ),
             };
             ServerFrame::Error { id, code, message }
         }
@@ -1890,6 +1976,11 @@ fn console_error_frame(id: Option<u64>, e: ConsoleError) -> ServerFrame {
             id,
             code: ConsoleErrorCode::NotAuthenticated,
             message: "not authenticated".into(),
+        },
+        ConsoleError::StepUpRequired => ServerFrame::Error {
+            id,
+            code: ConsoleErrorCode::Forbidden,
+            message: "step-up required".into(),
         },
         ConsoleError::RateLimited => ServerFrame::Error {
             id,
@@ -1904,7 +1995,11 @@ fn console_error_frame(id: Option<u64>, e: ConsoleError) -> ServerFrame {
         ConsoleError::Operation(message) => ServerFrame::Error {
             id,
             code: ConsoleErrorCode::Internal,
-            message,
+            message: if message.contains("invalid principal identity path") {
+                "invalid console principal".into()
+            } else {
+                "console operation failed".into()
+            },
         },
     }
 }
@@ -1927,14 +2022,23 @@ fn record_console_error_audit(
     err: &ConsoleError,
 ) {
     match err {
+        ConsoleError::StepUpRequired => {
+            record_ws_audit(state, principal, source_addr, "step_up_required")
+        }
         ConsoleError::Auth(auth::AuthError::PermissionDenied) => {
+            record_ws_audit(state, principal, source_addr, "permission_denied")
+        }
+        ConsoleError::Mgmt(MgmtError::Auth(auth::AuthError::PermissionDenied))
+        | ConsoleError::Mgmt(MgmtError::NotManageable(_)) => {
             record_ws_audit(state, principal, source_addr, "permission_denied")
         }
         ConsoleError::NotAuthenticated => {
             record_ws_audit(state, principal, source_addr, "not_authenticated")
         }
         ConsoleError::RateLimited => record_ws_audit(state, principal, source_addr, "rate_limited"),
-        ConsoleError::BadRequest(_) => {
+        ConsoleError::BadRequest(_)
+        | ConsoleError::Mgmt(MgmtError::Path(_))
+        | ConsoleError::Mgmt(MgmtError::Admission(_)) => {
             record_ws_audit(state, principal, source_addr, "bad_request")
         }
         _ => {}
@@ -2191,6 +2295,43 @@ fn ensure_observable_state_path(path: &Path) -> Result<(), ConsoleError> {
     Ok(())
 }
 
+fn ensure_observable_state_path_str(raw: &str) -> Result<(), ConsoleError> {
+    let path = Path::parse(raw)?;
+    ensure_observable_state_path(&path)
+}
+
+fn blocked_visibility_target(raw: &str) -> String {
+    let Ok(path) = Path::parse(raw) else {
+        return "invalid_state_target".into();
+    };
+    if path.scheme() != "state" {
+        return "non_state_target".into();
+    }
+    if nexus_types::is_vault_reserved(&path) {
+        return "state://vault/**".into();
+    }
+    if path
+        .segments()
+        .first()
+        .is_some_and(|segment| matches!(segment.as_str(), "*" | "**"))
+    {
+        return "state://**".into();
+    }
+    path.to_string()
+}
+
+fn validate_upgrade_headers_audited(
+    state: &Arc<ConsoleState>,
+    headers: &HeaderMap,
+    source_addr: &str,
+) -> Result<(), String> {
+    let result = validate_upgrade_headers(headers);
+    if result.is_err() {
+        record_ws_audit(state, None, Some(source_addr), "protocol_error");
+    }
+    result
+}
+
 fn require_process_inspect(principal: &ConsolePrincipal) -> Result<(), ConsoleError> {
     let path = Path::parse("effect://kernel/process/inspect")?;
     if principal.grants.contains("perform", &path) {
@@ -2219,7 +2360,7 @@ fn require_step_up(principal: &ConsolePrincipal) -> Result<(), ConsoleError> {
     if principal.mfa_level >= 2 {
         Ok(())
     } else {
-        Err(ConsoleError::Auth(auth::AuthError::PermissionDenied))
+        Err(ConsoleError::StepUpRequired)
     }
 }
 
@@ -2710,6 +2851,24 @@ mod tests {
         ConsoleState::shared_with_pairing_display(boot, pairing_display)
     }
 
+    fn audit_outcomes(st: &ConsoleState, event: &str) -> Vec<String> {
+        st.boot
+            .kernel
+            .facts
+            .all_facts()
+            .unwrap()
+            .into_iter()
+            .filter_map(|fact| match fact.outcome_ref {
+                nexus_types::OutcomeRef::Inline(Value::Map(m))
+                    if m.get("event").and_then(Value::as_str) == Some(event) =>
+                {
+                    m.get("outcome").and_then(Value::as_str).map(str::to_string)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn test_session(st: Arc<ConsoleState>, principal: ConsolePrincipal) -> WsSession {
         WsSession {
             state: st,
@@ -2721,6 +2880,16 @@ mod tests {
             event_tx: mpsc::channel(1).0,
             rate: FrameRate::default(),
         }
+    }
+
+    fn test_session_for_token(
+        st: Arc<ConsoleState>,
+        principal: ConsolePrincipal,
+        token: &str,
+    ) -> WsSession {
+        let mut sess = test_session(st, principal);
+        sess.sid = bearer_sid(Some(token)).map(str::to_string);
+        sess
     }
 
     fn unauth_session(st: Arc<ConsoleState>) -> WsSession {
@@ -2823,6 +2992,32 @@ mod tests {
             .authenticate_token(&st.boot, &elevated.token)
             .await
             .unwrap()
+    }
+
+    async fn step_up_login(
+        st: &Arc<ConsoleState>,
+        token: &str,
+        password: String,
+    ) -> (String, ConsolePrincipal) {
+        let elevated = st
+            .auth
+            .step_up(
+                &st.boot,
+                token,
+                StepUpRequest {
+                    password: Some(password),
+                    totp_code: None,
+                },
+                "test".into(),
+            )
+            .await
+            .unwrap();
+        let principal = st
+            .auth
+            .authenticate_token(&st.boot, &elevated.token)
+            .await
+            .unwrap();
+        (elevated.token, principal)
     }
 
     fn extension_installation(id: &str, version: u64) -> Value {
@@ -2978,7 +3173,7 @@ mod tests {
     #[tokio::test]
     async fn hello_rejects_unsupported_wire_encoding() {
         let st = console_state();
-        let mut sess = unauth_session(st);
+        let mut sess = unauth_session(st.clone());
         let reply = handle_frame(
             &mut sess,
             ClientFrame::Hello {
@@ -2998,6 +3193,7 @@ mod tests {
                 ..
             }
         ));
+        assert!(audit_outcomes(&st, "console_ws").contains(&"protocol_error".into()));
 
         let reply = handle_frame(
             &mut sess,
@@ -3022,6 +3218,112 @@ mod tests {
                 ..
             }
         ));
+        assert!(audit_outcomes(&sess.state, "console_ws").contains(&"not_authenticated".into()));
+    }
+
+    #[test]
+    fn rejected_upgrade_writes_gateway_audit() {
+        let st = console_state();
+        let headers = HeaderMap::new();
+
+        let err = validate_upgrade_headers_audited(&st, &headers, "127.0.0.1").unwrap_err();
+
+        assert!(err.contains("origin"));
+        assert!(audit_outcomes(&st, "console_ws").contains(&"protocol_error".into()));
+    }
+
+    #[tokio::test]
+    async fn step_up_required_writes_specific_gateway_audit() {
+        let st = console_state();
+        let (token, principal, _password) = root_login(&st).await;
+        let mut sess = test_session_for_token(st.clone(), principal, &token);
+
+        let reply = handle_frame(
+            &mut sess,
+            ClientFrame::Call {
+                id: 11,
+                call: call(
+                    ACTION_PAIRING_DENY,
+                    map_value([("pairing_id", Value::Str("pair-ws".into()))]),
+                ),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            reply,
+            ServerFrame::Error {
+                id: Some(11),
+                code: ConsoleErrorCode::Forbidden,
+                message,
+            } if message == "step-up required"
+        ));
+        assert!(audit_outcomes(&st, "console_ws").contains(&"step_up_required".into()));
+    }
+
+    #[tokio::test]
+    async fn forbidden_management_path_is_redacted_and_audited() {
+        let st = console_state();
+        let (token, principal, _password) = root_login(&st).await;
+        let mut sess = test_session_for_token(st.clone(), principal, &token);
+
+        let reply = handle_frame(
+            &mut sess,
+            ClientFrame::Call {
+                id: 12,
+                call: call(
+                    ACTION_CONFIG_READ,
+                    map_value([(
+                        "path",
+                        Value::Str("state://vault/console/root/password".into()),
+                    )]),
+                ),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            &reply,
+            ServerFrame::Error {
+                id: Some(12),
+                code: ConsoleErrorCode::Forbidden,
+                message,
+            } if message == "management path is not allowed"
+        ));
+        if let ServerFrame::Error { message, .. } = &reply {
+            assert!(!message.contains("state://vault"));
+            assert!(!message.contains("password"));
+        }
+        assert!(audit_outcomes(&st, "console_ws").contains(&"permission_denied".into()));
+    }
+
+    #[tokio::test]
+    async fn secret_reveal_blocked_attempt_is_audited() {
+        let st = console_state();
+        let (token, _principal, password) = root_login(&st).await;
+        let (elevated_token, principal) = step_up_login(&st, &token, password).await;
+        let mut sess = test_session_for_token(st.clone(), principal, &elevated_token);
+
+        let reply = handle_frame(
+            &mut sess,
+            ClientFrame::Call {
+                id: 13,
+                call: visibility_call(ACTION_SECRET_REVEAL, Value::Null),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            reply,
+            ServerFrame::Error {
+                id: Some(13),
+                code: ConsoleErrorCode::BadRequest,
+                ..
+            }
+        ));
+        assert!(
+            audit_outcomes(&st, "console_visibility").contains(&"secret_reveal_blocked".into())
+        );
     }
 
     #[test]
@@ -3114,7 +3416,7 @@ mod tests {
         let st = console_state();
         let (token, _principal, password) = root_login(&st).await;
         let principal = step_up_principal(&st, &token, password).await;
-        let mut sess = test_session(st, principal.clone());
+        let mut sess = test_session(st.clone(), principal.clone());
         dispatch_call(
             &mut sess,
             &principal,
@@ -3181,7 +3483,7 @@ mod tests {
         }));
 
         let principal = step_up_principal(&st, &token, password).await;
-        let mut sess = test_session(st, principal.clone());
+        let mut sess = test_session(st.clone(), principal.clone());
         let out = dispatch_call(
             &mut sess,
             &principal,
@@ -3487,10 +3789,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(
-            err,
-            ConsoleError::Auth(auth::AuthError::PermissionDenied)
-        ));
+        assert!(matches!(err, ConsoleError::StepUpRequired));
     }
 
     #[tokio::test]
@@ -3515,10 +3814,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(
-            err,
-            ConsoleError::Auth(auth::AuthError::PermissionDenied)
-        ));
+        assert!(matches!(err, ConsoleError::StepUpRequired));
     }
 
     #[tokio::test]
@@ -3665,7 +3961,7 @@ mod tests {
         let st = console_state();
         let (token, _principal, password) = root_login(&st).await;
         let principal = step_up_principal(&st, &token, password).await;
-        let mut sess = test_session(st, principal.clone());
+        let mut sess = test_session(st.clone(), principal.clone());
         let err = dispatch_call(
             &mut sess,
             &principal,
@@ -3692,6 +3988,32 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, ConsoleError::BadRequest(_)));
+        assert!(audit_outcomes(&st, "console_visibility").contains(&"state_read_blocked".into()));
+        let visibility_facts = st
+            .boot
+            .kernel
+            .facts
+            .all_facts()
+            .unwrap()
+            .into_iter()
+            .filter(|fact| match &fact.outcome_ref {
+                nexus_types::OutcomeRef::Inline(Value::Map(m)) => {
+                    m.get("event").and_then(Value::as_str) == Some("console_visibility")
+                }
+                _ => false,
+            })
+            .map(|fact| serde_json::to_string(&fact).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            visibility_facts
+                .iter()
+                .any(|fact| fact.contains("state://vault/**"))
+        );
+        assert!(
+            !visibility_facts
+                .iter()
+                .any(|fact| fact.contains("state://vault/console/root/password"))
+        );
     }
 
     #[tokio::test]

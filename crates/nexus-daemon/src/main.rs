@@ -31,6 +31,7 @@ use nexus_gateway::InProcessGateway;
 use nexus_gateway_websocket::WsGateway;
 use nexus_sdk::{Backend, Bootstrap, FactSink, Kernel};
 use nexus_storage_redb::RedbStore;
+use std::io::IsTerminal;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -138,14 +139,18 @@ async fn serve() -> Result<()> {
         "kernel ready"
     );
 
-    let root_bootstrap = nexus_console::bootstrap_root_account(
-        &boot,
-        RootProvisioning {
-            password_hash: cfg.console.root.password_hash.clone(),
-            pubkeys: cfg.console.root.pubkeys.clone(),
-        },
-    )
-    .await?;
+    let root_provisioning = RootProvisioning {
+        password_hash: cfg.console.root.password_hash.clone(),
+        pubkeys: cfg.console.root.pubkeys.clone(),
+    };
+    if nexus_console::root_random_password_needed(&boot, &root_provisioning).await?
+        && !std::io::stderr().is_terminal()
+    {
+        anyhow::bail!(
+            "refusing to bootstrap root with a random password because stderr is not a TTY; set console.root.password_hash or console.root.pubkeys in nexus.toml"
+        );
+    }
+    let root_bootstrap = nexus_console::bootstrap_root_account(&boot, root_provisioning).await?;
     match root_bootstrap {
         BootstrapOutcome::AlreadyPresent => {}
         BootstrapOutcome::CreatedPreseeded { username } => {

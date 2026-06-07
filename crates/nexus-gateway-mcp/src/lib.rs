@@ -14,8 +14,9 @@
 //! policy, budget, Fact recording, and Handle ownership are the same as every
 //! other Gateway (§18.1).
 
-use nexus_gateway::{AuthToken, Gateway, GatewayError};
+use nexus_gateway::{AuthToken, Gateway, GatewayError, RequestIdentity};
 use nexus_graph::{DoNode, OperationTemplate};
+use nexus_kernel::GatewayAudit;
 use nexus_types::{CapError, Capability, Outcome, OutputMode, Path, ResourceName, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -37,7 +38,7 @@ pub enum McpGatewayError {
     },
     #[error("unknown MCP tool {0}")]
     UnknownTool(String),
-    #[error("gateway rejected MCP request: {0}")]
+    #[error("gateway rejected MCP request")]
     Gateway(#[from] GatewayError),
 }
 
@@ -148,14 +149,21 @@ impl<G: Gateway> McpGateway<G> {
         tool: &str,
         args: Value,
     ) -> Result<Outcome, McpGatewayError> {
-        let spec = self
-            .tools
-            .get(tool)
-            .ok_or_else(|| McpGatewayError::UnknownTool(tool.into()))?;
-        let identity = self
+        let Some(spec) = self.tools.get(tool) else {
+            record_mcp_audit(&*self.gateway, None, "unknown_tool");
+            return Err(McpGatewayError::UnknownTool(tool.into()));
+        };
+        let identity = match self
             .gateway
             .authenticate(&AuthToken(auth_token.into()))
-            .await?;
+            .await
+        {
+            Ok(identity) => identity,
+            Err(e) => {
+                record_mcp_audit(&*self.gateway, None, e.audit_outcome());
+                return Err(e.into());
+            }
+        };
         let program = DoNode::op(OperationTemplate {
             target: spec.target.clone(),
             method: spec.method.clone(),
@@ -163,8 +171,29 @@ impl<G: Gateway> McpGateway<G> {
             output: OutputMode::Unary,
             literal_input: Some(args),
         });
-        Ok(self.gateway.submit(&identity, program).await?)
+        match self.gateway.submit(&identity, program).await {
+            Ok(outcome) => Ok(outcome),
+            Err(e) => {
+                record_mcp_audit(&*self.gateway, Some(&identity), e.audit_outcome());
+                Err(e.into())
+            }
+        }
     }
+}
+
+fn record_mcp_audit<G: Gateway>(
+    gateway: &G,
+    identity: Option<&RequestIdentity>,
+    outcome: &'static str,
+) {
+    let _ = gateway.record_gateway_audit(GatewayAudit {
+        event: "gateway_mcp",
+        username: identity.map(|i| i.identity.as_str()),
+        source_addr: None,
+        outcome,
+        mfa_level: None,
+        details: None,
+    });
 }
 
 fn validate_tool_name(name: &str) -> Result<(), McpGatewayError> {
@@ -179,6 +208,24 @@ mod tests {
     use super::*;
     use nexus_gateway::InProcessGateway;
     use nexus_kernel::{Bootstrap, EchoDriver};
+    use nexus_types::OutcomeRef;
+
+    fn audit_outcomes(boot: &Bootstrap, event: &str) -> Vec<String> {
+        boot.kernel
+            .facts
+            .all_facts()
+            .unwrap()
+            .into_iter()
+            .filter_map(|fact| match fact.outcome_ref {
+                OutcomeRef::Inline(Value::Map(m))
+                    if m.get("event").and_then(Value::as_str) == Some(event) =>
+                {
+                    m.get("outcome").and_then(Value::as_str).map(str::to_string)
+                }
+                _ => None,
+            })
+            .collect()
+    }
 
     #[test]
     fn registration_requires_capability_covering_effect() {
@@ -236,5 +283,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, Outcome::Done(Value::Str("from-mcp".into())));
+    }
+
+    #[tokio::test]
+    async fn auth_failure_is_redacted_and_audited() {
+        let boot = Arc::new(Bootstrap::in_memory());
+        let target = boot
+            .register_effect(
+                "effect://echo/say",
+                &[nexus_kernel::MethodSpec::new(
+                    "invoke",
+                    nexus_types::Purity::Pure,
+                    nexus_kernel::MethodSpec::UNARY_ASYNC,
+                )],
+                Arc::new(EchoDriver),
+            )
+            .unwrap();
+        let mut inner = InProcessGateway::new(boot.clone())
+            .with_declared_capabilities(vec!["perform://effect/echo/say".into()]);
+        inner.open(target, "perform").unwrap();
+        let mut mcp = McpGateway::new(Arc::new(inner));
+        mcp.register_tool(
+            McpToolSpec::new(
+                "echo",
+                "effect://echo/say",
+                "invoke",
+                "perform://effect/echo/say",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = mcp.call_tool("", "echo", Value::Null).await.unwrap_err();
+        assert_eq!(err.to_string(), "gateway rejected MCP request");
+        assert!(audit_outcomes(&boot, "gateway_mcp").contains(&"auth_failed".into()));
     }
 }

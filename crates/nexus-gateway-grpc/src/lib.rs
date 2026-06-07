@@ -11,8 +11,8 @@
 //! Builds anywhere prost/tonic resolve — `nexus-proto`'s bindings are vendored,
 //! so no `protoc` is required.
 
-use nexus_gateway::{AuthToken, Gateway, InProcessGateway};
-use nexus_kernel::Bootstrap;
+use nexus_gateway::{AuthToken, Gateway, GatewayError, InProcessGateway, RequestIdentity};
+use nexus_kernel::{Bootstrap, GatewayAudit};
 use nexus_proto::nexus::v1 as pb;
 use nexus_proto::nexus::v1::gateway_service_server::{GatewayService, GatewayServiceServer};
 use nexus_proto::{outcome_to_pb, program_from_pb};
@@ -47,23 +47,53 @@ impl GatewayService for GrpcGateway {
         &self,
         request: Request<pb::SubmitRequest>,
     ) -> Result<Response<pb::SubmitResponse>, Status> {
+        let source_addr = request.remote_addr().map(|addr| addr.ip().to_string());
         let req = request.into_inner();
-        let identity = self
-            .gateway
-            .authenticate(&AuthToken(req.auth_token))
-            .await
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
-        let program = program_from_pb(
-            req.program
-                .as_ref()
-                .ok_or_else(|| Status::invalid_argument("missing program"))?,
-        )
-        .map_err(|e| Status::invalid_argument(format!("bad program: {e}")))?;
-        let outcome = self
-            .gateway
-            .submit(&identity, program)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let identity = match self.gateway.authenticate(&AuthToken(req.auth_token)).await {
+            Ok(identity) => identity,
+            Err(e) => {
+                record_grpc_audit(
+                    &self.gateway,
+                    None,
+                    source_addr.as_deref(),
+                    e.audit_outcome(),
+                );
+                return Err(Status::unauthenticated(e.public_message()));
+            }
+        };
+        let Some(program) = req.program.as_ref() else {
+            record_grpc_audit(
+                &self.gateway,
+                Some(&identity),
+                source_addr.as_deref(),
+                "bad_request",
+            );
+            return Err(Status::invalid_argument("missing program"));
+        };
+        let program = match program_from_pb(program) {
+            Ok(program) => program,
+            Err(_) => {
+                record_grpc_audit(
+                    &self.gateway,
+                    Some(&identity),
+                    source_addr.as_deref(),
+                    "bad_request",
+                );
+                return Err(Status::invalid_argument("bad program"));
+            }
+        };
+        let outcome = match self.gateway.submit(&identity, program).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                record_grpc_audit(
+                    &self.gateway,
+                    Some(&identity),
+                    source_addr.as_deref(),
+                    e.audit_outcome(),
+                );
+                return Err(gateway_status(e));
+            }
+        };
         Ok(Response::new(pb::SubmitResponse {
             outcome: Some(outcome_to_pb(&outcome)),
         }))
@@ -80,13 +110,55 @@ impl GatewayService for GrpcGateway {
     }
 }
 
+fn gateway_status(e: GatewayError) -> Status {
+    let message = e.public_message();
+    match e {
+        GatewayError::Unauthenticated => Status::unauthenticated(message),
+        GatewayError::Unauthorized(_) => Status::permission_denied(message),
+        GatewayError::Rejected(_) => Status::failed_precondition(message),
+    }
+}
+
+fn record_grpc_audit(
+    gateway: &InProcessGateway,
+    identity: Option<&RequestIdentity>,
+    source_addr: Option<&str>,
+    outcome: &'static str,
+) {
+    let _ = gateway.record_gateway_audit(GatewayAudit {
+        event: "gateway_grpc",
+        username: identity.map(|i| i.identity.as_str()),
+        source_addr,
+        outcome,
+        mfa_level: None,
+        details: None,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nexus_graph::DoNode;
     use nexus_proto::{program_to_pb, value_from_pb};
-    use nexus_types::Value;
+    use nexus_types::{OutcomeRef, Value};
     use tonic::Code;
+
+    fn audit_outcomes(boot: &Bootstrap, event: &str) -> Vec<String> {
+        boot.kernel
+            .facts
+            .all_facts()
+            .unwrap()
+            .into_iter()
+            .filter_map(|fact| match fact.outcome_ref {
+                OutcomeRef::Inline(Value::Map(m))
+                    if m.get("event").and_then(Value::as_str) == Some(event) =>
+                {
+                    m.get("outcome").and_then(Value::as_str).map(str::to_string)
+                }
+                _ => None,
+            })
+            .collect()
+    }
 
     #[test]
     fn outcome_carries_structural_value() {
@@ -125,7 +197,7 @@ mod tests {
     #[tokio::test]
     async fn submit_rejects_missing_program() {
         let boot = Arc::new(Bootstrap::in_memory());
-        let svc = GrpcGateway::new(boot);
+        let svc = GrpcGateway::new(boot.clone());
         let err = svc
             .submit(Request::new(pb::SubmitRequest {
                 auth_token: "process://alice".into(),
@@ -134,6 +206,23 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(audit_outcomes(&boot, "gateway_grpc").contains(&"bad_request".into()));
+    }
+
+    #[tokio::test]
+    async fn submit_auth_failure_is_redacted_and_audited() {
+        let boot = Arc::new(Bootstrap::in_memory());
+        let svc = GrpcGateway::new(boot.clone());
+        let err = svc
+            .submit(Request::new(pb::SubmitRequest {
+                auth_token: String::new(),
+                program: Some(program_to_pb(&DoNode::Pure(Value::Int(1)))),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Unauthenticated);
+        assert_eq!(err.message(), "authentication failed");
+        assert!(audit_outcomes(&boot, "gateway_grpc").contains(&"auth_failed".into()));
     }
 
     #[tokio::test]

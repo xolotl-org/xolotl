@@ -14,7 +14,7 @@
 
 use async_trait::async_trait;
 use nexus_graph::DoNode;
-use nexus_kernel::{Bootstrap, Executor, intern_identity};
+use nexus_kernel::{Bootstrap, Executor, GatewayAudit, intern_identity};
 use nexus_types::{Outcome, Path, ProcessId, ResourceName, TaintSet, TaintSource, Value};
 use std::sync::Arc;
 use thiserror::Error;
@@ -27,6 +27,24 @@ pub enum GatewayError {
     Unauthorized(String),
     #[error("request rejected: {0}")]
     Rejected(String),
+}
+
+impl GatewayError {
+    pub fn public_message(&self) -> &'static str {
+        match self {
+            GatewayError::Unauthenticated => "authentication failed",
+            GatewayError::Unauthorized(_) => "authorization failed",
+            GatewayError::Rejected(_) => "request rejected",
+        }
+    }
+
+    pub fn audit_outcome(&self) -> &'static str {
+        match self {
+            GatewayError::Unauthenticated => "auth_failed",
+            GatewayError::Unauthorized(_) => "permission_denied",
+            GatewayError::Rejected(_) => "request_rejected",
+        }
+    }
 }
 
 /// The identity a request runs as, resolved from gateway auth (§18.1 step 2).
@@ -54,6 +72,10 @@ pub trait Gateway: Send + Sync {
         identity: &RequestIdentity,
         program: DoNode,
     ) -> Result<Outcome, GatewayError>;
+
+    fn record_gateway_audit(&self, _audit: GatewayAudit<'_>) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// An in-process gateway over a [`Bootstrap`]. Each request runs as an
@@ -177,6 +199,12 @@ impl Gateway for InProcessGateway {
         });
         Ok(ex.eval_tainted(&program, entry_taint).await)
     }
+
+    fn record_gateway_audit(&self, audit: GatewayAudit<'_>) -> Result<(), String> {
+        self.boot
+            .record_gateway_audit(audit)
+            .map_err(|e| e.to_string())
+    }
 }
 
 fn parse_request_identity(identity: &str) -> Result<Path, GatewayError> {
@@ -222,6 +250,19 @@ mod tests {
             gw.authenticate(&AuthToken("process://alice".into()))
                 .await
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn public_error_messages_are_redacted() {
+        assert_eq!(
+            GatewayError::Unauthorized("process://mallory".into()).public_message(),
+            "authorization failed"
+        );
+        assert_eq!(
+            GatewayError::Rejected("reserved path state://vault/console/root/password".into())
+                .public_message(),
+            "request rejected"
         );
     }
 

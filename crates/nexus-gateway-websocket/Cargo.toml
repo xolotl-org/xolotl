@@ -17,4 +17,3 @@ nexus-kernel = { version = "0.1.0", path = "../nexus-kernel" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["rt", "sync", "time", "macros"] }
-tracing = "0.1.44"

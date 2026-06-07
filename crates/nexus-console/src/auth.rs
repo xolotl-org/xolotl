@@ -113,6 +113,21 @@ pub enum BootstrapOutcome {
     CreatedPreseeded { username: String },
 }
 
+pub async fn root_random_password_needed(
+    boot: &Bootstrap,
+    provisioning: &RootProvisioning,
+) -> Result<bool, AuthError> {
+    if provisioning.password_hash.is_some() || !provisioning.pubkeys.is_empty() {
+        return Ok(false);
+    }
+    let users = boot
+        .kernel
+        .state
+        .read_prefix(&Path::parse(USERS_PREFIX)?)
+        .await?;
+    Ok(users.is_empty())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
     pub username: String,
@@ -362,8 +377,29 @@ impl ConsoleAuth {
         &self,
         boot: &Bootstrap,
         req: KeyChallengeRequest,
+        source_addr: String,
     ) -> Result<KeyChallengeResponse, AuthError> {
-        self.begin_key_login_inner(&boot.kernel.state, req).await
+        let username = req.username.trim().to_string();
+        let result = self.begin_key_login_inner(&boot.kernel.state, req).await;
+        match &result {
+            Ok(_) => record_auth_audit(
+                boot,
+                "console_credential",
+                Some(&username),
+                Some(&source_addr),
+                "key_challenge",
+                None,
+            )?,
+            Err(err) => record_auth_audit(
+                boot,
+                "console_credential",
+                Some(&username),
+                Some(&source_addr),
+                audit_outcome(err),
+                None,
+            )?,
+        }
+        result
     }
 
     async fn begin_key_login_inner(
@@ -671,42 +707,53 @@ impl ConsoleAuth {
     }
 
     pub async fn logout(&self, boot: &Bootstrap, bearer: &str) -> Result<(), AuthError> {
+        self.logout_from_source(boot, bearer, None).await
+    }
+
+    pub async fn logout_from_source(
+        &self,
+        boot: &Bootstrap,
+        bearer: &str,
+        source_addr: Option<&str>,
+    ) -> Result<(), AuthError> {
         let (sid, _) = bearer.split_once('.').ok_or(AuthError::InvalidSession)?;
-        validate_session_id(sid)?;
-        let result = revoke_session(&boot.kernel.state, sid).await;
-        match &result {
-            Ok(()) => {
-                record_auth_audit(boot, "console_credential", None, None, "logout", None)?;
-            }
-            Err(err) => {
-                record_auth_audit(
-                    boot,
-                    "console_credential",
-                    None,
-                    None,
-                    audit_outcome(err),
-                    None,
-                )?;
-            }
-        }
-        result
+        self.logout_sid_from_source(boot, sid, source_addr).await
     }
 
     pub async fn logout_sid(&self, boot: &Bootstrap, sid: &str) -> Result<(), AuthError> {
+        self.logout_sid_from_source(boot, sid, None).await
+    }
+
+    pub async fn logout_sid_from_source(
+        &self,
+        boot: &Bootstrap,
+        sid: &str,
+        source_addr: Option<&str>,
+    ) -> Result<(), AuthError> {
         validate_session_id(sid)?;
+        let session = read_session(&boot.kernel.state, &session_path(sid)).await?;
+        let username = session.as_ref().map(|s| s.username.as_str());
+        let mfa_level = session.as_ref().map(|s| s.mfa_level);
         let result = revoke_session(&boot.kernel.state, sid).await;
         match &result {
             Ok(()) => {
-                record_auth_audit(boot, "console_credential", None, None, "logout", None)?;
+                record_auth_audit(
+                    boot,
+                    "console_credential",
+                    username,
+                    source_addr,
+                    "logout",
+                    mfa_level,
+                )?;
             }
             Err(err) => {
                 record_auth_audit(
                     boot,
                     "console_credential",
-                    None,
-                    None,
+                    username,
+                    source_addr,
                     audit_outcome(err),
-                    None,
+                    mfa_level,
                 )?;
             }
         }
@@ -746,6 +793,17 @@ impl ConsoleAuth {
         principal: &ConsolePrincipal,
         sid: &str,
     ) -> Result<(), AuthError> {
+        self.revoke_session_by_id_from_source(boot, principal, sid, None)
+            .await
+    }
+
+    pub async fn revoke_session_by_id_from_source(
+        &self,
+        boot: &Bootstrap,
+        principal: &ConsolePrincipal,
+        sid: &str,
+        source_addr: Option<&str>,
+    ) -> Result<(), AuthError> {
         validate_session_id(sid)?;
         let path = Path::parse(&session_path(sid))?;
         authorize_path(&boot.kernel.state, principal, "write", &path, None).await?;
@@ -755,7 +813,7 @@ impl ConsoleAuth {
                 boot,
                 "console_credential",
                 Some(&principal.username),
-                None,
+                source_addr,
                 "session_revoke",
                 Some(principal.mfa_level),
             )?,
@@ -763,7 +821,7 @@ impl ConsoleAuth {
                 boot,
                 "console_credential",
                 Some(&principal.username),
-                None,
+                source_addr,
                 audit_outcome(err),
                 Some(principal.mfa_level),
             )?,
@@ -776,6 +834,17 @@ impl ConsoleAuth {
         boot: &Bootstrap,
         principal: &ConsolePrincipal,
         username: &str,
+    ) -> Result<usize, AuthError> {
+        self.revoke_user_sessions_from_source(boot, principal, username, None)
+            .await
+    }
+
+    pub async fn revoke_user_sessions_from_source(
+        &self,
+        boot: &Bootstrap,
+        principal: &ConsolePrincipal,
+        username: &str,
+        source_addr: Option<&str>,
     ) -> Result<usize, AuthError> {
         validate_username(username)?;
         let user_path = Path::parse(&format!("{USERS_PREFIX}/{username}"))?;
@@ -804,7 +873,7 @@ impl ConsoleAuth {
             boot,
             "console_credential",
             Some(&principal.username),
-            None,
+            source_addr,
             "user_sessions_revoke",
             Some(principal.mfa_level),
         )?;
@@ -1879,6 +1948,20 @@ mod tests {
             .collect()
     }
 
+    fn audit_outcomes(boot: &Bootstrap, event: &str) -> Vec<String> {
+        audit_facts(boot)
+            .into_iter()
+            .filter_map(|fact| match fact.outcome_ref {
+                OutcomeRef::Inline(Value::Map(m))
+                    if m.get("event").and_then(Value::as_str) == Some(event) =>
+                {
+                    m.get("outcome").and_then(Value::as_str).map(str::to_string)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn auth_config_is_bounded_by_backend() {
         let cfg = ConsoleAuthConfig {
@@ -1924,6 +2007,36 @@ mod tests {
         );
         m.insert("frozen".into(), Value::Bool(frozen));
         Value::Map(m)
+    }
+
+    #[tokio::test]
+    async fn random_root_password_preflight_tracks_empty_user_store() {
+        let boot = auth_boot();
+        assert!(
+            root_random_password_needed(&boot, &RootProvisioning::default())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !root_random_password_needed(
+                &boot,
+                &RootProvisioning {
+                    password_hash: None,
+                    pubkeys: vec!["ssh-ed25519 unsupported".into()],
+                },
+            )
+            .await
+            .unwrap()
+        );
+
+        bootstrap_root_account(&boot, RootProvisioning::default())
+            .await
+            .unwrap();
+        assert!(
+            !root_random_password_needed(&boot, &RootProvisioning::default())
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2010,12 +2123,23 @@ mod tests {
             )
             .await
             .unwrap();
-        auth.logout(&boot, &login.token).await.unwrap();
+        auth.logout_from_source(&boot, &login.token, Some("203.0.113.10"))
+            .await
+            .unwrap();
         assert!(matches!(
             auth.authenticate_token(&boot, &login.token).await,
             Err(AuthError::InvalidSession)
         ));
         assert!(audit_events(&boot).contains(&"console_credential".into()));
+        assert!(audit_facts(&boot).into_iter().any(|fact| {
+            let OutcomeRef::Inline(Value::Map(m)) = fact.outcome_ref else {
+                return false;
+            };
+            m.get("event").and_then(Value::as_str) == Some("console_credential")
+                && m.get("outcome").and_then(Value::as_str) == Some("logout")
+                && m.get("username").and_then(Value::as_str) == Some("root")
+                && m.get("source_addr").and_then(Value::as_str) == Some("203.0.113.10")
+        }));
     }
 
     #[tokio::test]
@@ -2214,9 +2338,11 @@ mod tests {
                     username: "root".into(),
                     origin: "https://console.local".into(),
                 },
+                "test".into(),
             )
             .await
             .unwrap();
+        assert!(audit_outcomes(&boot, "console_credential").contains(&"key_challenge".into()));
         let signature = signing_key.sign(challenge.transcript.as_bytes());
         let login = auth
             .finish_key_login(

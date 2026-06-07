@@ -10,14 +10,16 @@
 //! WebSocket frames.
 
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, State};
 use axum::response::Response;
 use axum::routing::get;
 use futures::{SinkExt, StreamExt};
 use nexus_gateway::{AuthToken, Gateway, GatewayError, RequestIdentity};
 use nexus_graph::DoNode;
+use nexus_kernel::GatewayAudit;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -59,12 +61,17 @@ impl<G: Gateway + 'static> WsGateway<G> {
 
 async fn upgrade<G: Gateway + 'static>(
     ws: WebSocketUpgrade,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(gw): State<Arc<WsGateway<G>>>,
 ) -> Response {
-    ws.on_upgrade(move |socket| session(socket, gw))
+    ws.on_upgrade(move |socket| session(socket, gw, peer.ip().to_string()))
 }
 
-async fn session<G: Gateway + 'static>(socket: WebSocket, gw: Arc<WsGateway<G>>) {
+async fn session<G: Gateway + 'static>(
+    socket: WebSocket,
+    gw: Arc<WsGateway<G>>,
+    source_addr: String,
+) {
     let (mut tx, mut rx) = socket.split();
     let mut identity: Option<RequestIdentity> = None;
 
@@ -72,15 +79,27 @@ async fn session<G: Gateway + 'static>(socket: WebSocket, gw: Arc<WsGateway<G>>)
         let text = match msg {
             Message::Text(t) => t,
             Message::Close(_) => break,
-            _ => continue,
-        };
-        let frame: ClientFrame = match serde_json::from_str(&text) {
-            Ok(f) => f,
-            Err(e) => {
+            Message::Ping(_) | Message::Pong(_) => continue,
+            _ => {
+                record_ws_audit(&gw, identity.as_ref(), Some(&source_addr), "protocol_error");
                 let _ = send(
                     &mut tx,
                     ServerFrame::Error {
-                        message: format!("bad frame: {e}"),
+                        message: "bad frame".into(),
+                    },
+                )
+                .await;
+                continue;
+            }
+        };
+        let frame: ClientFrame = match serde_json::from_str(&text) {
+            Ok(f) => f,
+            Err(_) => {
+                record_ws_audit(&gw, identity.as_ref(), Some(&source_addr), "protocol_error");
+                let _ = send(
+                    &mut tx,
+                    ServerFrame::Error {
+                        message: "bad frame".into(),
                     },
                 )
                 .await;
@@ -97,11 +116,13 @@ async fn session<G: Gateway + 'static>(socket: WebSocket, gw: Arc<WsGateway<G>>)
                     let _ = send(&mut tx, reply).await;
                 }
                 Err(e) => {
+                    record_ws_audit(&gw, None, Some(&source_addr), e.audit_outcome());
                     let _ = send(&mut tx, auth_err(e)).await;
                 }
             },
             ClientFrame::Submit { id, program } => {
                 let Some(ident) = identity.clone() else {
+                    record_ws_audit(&gw, None, Some(&source_addr), "not_authenticated");
                     let _ = send(
                         &mut tx,
                         ServerFrame::Error {
@@ -114,13 +135,16 @@ async fn session<G: Gateway + 'static>(socket: WebSocket, gw: Arc<WsGateway<G>>)
                 let reply = match gw.gateway.submit(&ident, *program).await {
                     Ok(outcome) => match serde_json::to_value(&outcome) {
                         Ok(outcome) => ServerFrame::Result { id, outcome },
-                        Err(e) => ServerFrame::Error {
-                            message: format!("outcome serialization failed: {e}"),
+                        Err(_) => ServerFrame::Error {
+                            message: "outcome serialization failed".into(),
                         },
                     },
-                    Err(e) => ServerFrame::Error {
-                        message: e.to_string(),
-                    },
+                    Err(e) => {
+                        record_ws_audit(&gw, Some(&ident), Some(&source_addr), e.audit_outcome());
+                        ServerFrame::Error {
+                            message: e.public_message().into(),
+                        }
+                    }
                 };
                 let _ = send(&mut tx, reply).await;
             }
@@ -138,8 +162,24 @@ where
 
 fn auth_err(e: GatewayError) -> ServerFrame {
     ServerFrame::Error {
-        message: e.to_string(),
+        message: e.public_message().into(),
     }
+}
+
+fn record_ws_audit<G: Gateway>(
+    gw: &WsGateway<G>,
+    identity: Option<&RequestIdentity>,
+    source_addr: Option<&str>,
+    outcome: &'static str,
+) {
+    let _ = gw.gateway.record_gateway_audit(GatewayAudit {
+        event: "gateway_ws",
+        username: identity.map(|i| i.identity.as_str()),
+        source_addr,
+        outcome,
+        mfa_level: None,
+        details: None,
+    });
 }
 
 /// Serve a WS gateway on `listener`.
@@ -148,11 +188,11 @@ pub async fn serve<G: Gateway + 'static>(
     listener: TcpListener,
 ) -> std::io::Result<()> {
     let app = gateway.router();
-    tracing::info!(
-        addr = %listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into()),
-        "WebSocket gateway listening"
-    );
-    axum::serve(listener, app).await
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
 }
 
 #[cfg(test)]
