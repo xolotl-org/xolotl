@@ -23,21 +23,30 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Errors raised while publishing Nexus effects as MCP tools or serving calls.
 #[derive(Debug, Error)]
 pub enum McpGatewayError {
+    /// Tool names must be non-empty single path segments.
     #[error("tool name is empty or contains '/'")]
     BadToolName,
+    /// The configured effect path was not a valid Nexus path.
     #[error("bad effect path: {0}")]
     BadEffectPath(#[from] nexus_types::PathError),
+    /// The publishing guard capability literal could not be parsed.
     #[error("bad capability: {0}")]
     BadCapability(#[from] CapError),
+    /// The publishing guard does not cover `perform` on the target effect.
     #[error("capability {capability} does not cover perform on {effect_path}")]
     CapabilityDoesNotCover {
+        /// Capability literal supplied by the publisher.
         capability: String,
+        /// Effect path the tool would expose.
         effect_path: String,
     },
+    /// The MCP client requested a tool that has not been registered.
     #[error("unknown MCP tool {0}")]
     UnknownTool(String),
+    /// The shared Nexus gateway rejected authentication or execution.
     #[error("gateway rejected MCP request")]
     Gateway(#[from] GatewayError),
 }
@@ -45,7 +54,9 @@ pub enum McpGatewayError {
 /// A Nexus effect published as an MCP tool (§18.2).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct McpToolSpec {
+    /// MCP-visible tool name.
     pub name: String,
+    /// Nexus resource invoked by this tool.
     pub target: ResourceName,
     /// Method to invoke on `target`; usually `invoke`, but kept explicit because
     /// Nexus Interface methods are named.
@@ -54,11 +65,15 @@ pub struct McpToolSpec {
     /// tool. This is a publishing guard; per-call authorization still happens
     /// through Gateway-created request Processes and kernel policy.
     pub required_capability: String,
+    /// Optional JSON-schema-like input descriptor exposed to MCP clients.
     pub input_schema: Option<Value>,
+    /// Optional JSON-schema-like output descriptor exposed to MCP clients.
     pub output_schema: Option<Value>,
 }
 
 impl McpToolSpec {
+    /// Create a tool specification and validate that `required_capability`
+    /// authorizes publishing `effect_path` for `perform`.
     pub fn new(
         name: impl Into<String>,
         effect_path: &str,
@@ -85,6 +100,7 @@ impl McpToolSpec {
         })
     }
 
+    /// Attach optional input/output schema descriptors.
     pub fn with_schema(mut self, input: Option<Value>, output: Option<Value>) -> Self {
         self.input_schema = input;
         self.output_schema = output;
@@ -95,10 +111,15 @@ impl McpToolSpec {
 /// Minimal descriptor shape a transport layer can render into MCP `tools/list`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct McpToolDescriptor {
+    /// MCP-visible tool name.
     pub name: String,
+    /// Nexus effect path the tool invokes.
     pub effect_path: String,
+    /// Capability literal required for publication.
     pub required_capability: String,
+    /// Optional input schema descriptor.
     pub input_schema: Option<Value>,
+    /// Optional output schema descriptor.
     pub output_schema: Option<Value>,
 }
 
@@ -109,6 +130,7 @@ pub struct McpGateway<G: Gateway> {
 }
 
 impl<G: Gateway> McpGateway<G> {
+    /// Create an adapter over an existing authenticated Nexus gateway.
     pub fn new(gateway: Arc<G>) -> Self {
         Self {
             gateway,
@@ -116,6 +138,7 @@ impl<G: Gateway> McpGateway<G> {
         }
     }
 
+    /// Register a tool after validating its name and publishing guard.
     pub fn register_tool(&mut self, spec: McpToolSpec) -> Result<(), McpGatewayError> {
         validate_tool_name(&spec.name)?;
         let capability = Capability::parse(&spec.required_capability)?;
@@ -129,6 +152,7 @@ impl<G: Gateway> McpGateway<G> {
         Ok(())
     }
 
+    /// Return tool descriptors suitable for MCP `tools/list`.
     pub fn descriptors(&self) -> Vec<McpToolDescriptor> {
         self.tools
             .values()

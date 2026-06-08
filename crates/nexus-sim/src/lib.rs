@@ -28,12 +28,14 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// scripted outcome; an empty queue yields `Failure::Cancelled`. Records every
 /// input it received for assertions.
 pub struct ScriptedDriver {
+    /// Human-readable label for test diagnostics.
     pub label: String,
     queue: Mutex<VecDeque<Outcome>>,
     calls: Mutex<Vec<Value>>,
 }
 
 impl ScriptedDriver {
+    /// Create an empty scripted driver with a diagnostic `label`.
     pub fn new(label: impl Into<String>) -> Self {
         Self {
             label: label.into(),
@@ -42,14 +44,17 @@ impl ScriptedDriver {
         }
     }
 
+    /// Queue a complete outcome for the next driver call.
     pub fn enqueue(&self, o: Outcome) {
         self.queue.lock().push_back(o);
     }
 
+    /// Queue a successful [`Outcome::Done`] for the next driver call.
     pub fn enqueue_done<V: Into<Value>>(&self, v: V) {
         self.queue.lock().push_back(Outcome::Done(v.into()));
     }
 
+    /// Return all input values received so far.
     pub fn calls(&self) -> Vec<Value> {
         self.calls.lock().clone()
     }
@@ -75,6 +80,7 @@ impl Driver for ScriptedDriver {
 
 /// A `Driver` for `effect://time/*` pinned at `t_millis` — deterministic `now`.
 pub struct FixedClock {
+    /// Fixed millisecond timestamp returned by every call.
     pub t_millis: i64,
 }
 
@@ -229,6 +235,7 @@ impl Driver for CrashAfter {
 /// A simulation kernel: an in-memory [`Bootstrap`] plus convenience for
 /// registering scripted effects.
 pub struct Sim {
+    /// In-memory kernel bootstrap used by the simulation.
     pub boot: Bootstrap,
 }
 
@@ -239,6 +246,7 @@ impl Default for Sim {
 }
 
 impl Sim {
+    /// Create a simulation backed by [`Bootstrap::in_memory`].
     pub fn new() -> Self {
         Self {
             boot: Bootstrap::in_memory(),

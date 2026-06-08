@@ -2,7 +2,7 @@
 //!
 //! `Do<A>` is a computation AST that **compiles into** an
 //! [`ExecutionGraph`](crate::graph::ExecutionGraph) — it is *not* something the
-//! Executor matches on directly (that is the graph, see [`compile`]). It exists
+//! Executor matches on directly (that is the graph, see [`crate::compile`]). It exists
 //! because async call stacks are unserializable, unrecoverable, and unfit for
 //! model-generated plans.
 //!
@@ -23,23 +23,41 @@ pub enum DoNode {
     /// `Pure :: A -> Do<A>` — lift a value.
     Pure(Value),
     /// `AndThen :: Do<A> -> (A -> Do<B>) -> Do<B>` — sequence into a step.
-    AndThen { d: Box<DoNode>, then: StepRef },
+    AndThen {
+        /// Program whose successful result feeds the continuation.
+        d: Box<DoNode>,
+        /// Named pure continuation to invoke with `d`'s result.
+        then: StepRef,
+    },
     /// On failure of `d`, run `or` with the failure as input.
-    OrElse { d: Box<DoNode>, or: StepRef },
+    OrElse {
+        /// Program guarded by this recovery path.
+        d: Box<DoNode>,
+        /// Named recovery step invoked with the failure value.
+        or: StepRef,
+    },
     /// Run both; result is the pair (async I/O overlap, §13.4).
     Both(Box<DoNode>, Box<DoNode>),
     /// Run both; first to complete wins, the other is cancelled.
     Race(Box<DoNode>, Box<DoNode>),
     /// Bind the result of `value` to `name`, available in `body` as `Use(name)`.
     Let {
+        /// Binding name visible while compiling `body`.
         name: String,
+        /// Program that produces the bound value.
         value: Box<DoNode>,
+        /// Program compiled with `name` in scope.
         body: Box<DoNode>,
     },
     /// Reference a `Let`-bound name.
     Use(String),
     /// Run `body` under a block-level identity (`act-as`, §13.2).
-    Acting { identity: Path, body: Box<DoNode> },
+    Acting {
+        /// Identity path to act as for operations inside `body`.
+        identity: Path,
+        /// Program executed within the acting scope.
+        body: Box<DoNode>,
+    },
     /// Inject a failure (propagates to the nearest enclosing `Branch`).
     Fail(Failure),
     /// Block until a signal path is written or a wall-clock deadline (§13.2).
@@ -49,15 +67,22 @@ pub enum DoNode {
 }
 
 impl DoNode {
+    /// Construct a [`DoNode::Pure`] value.
     pub fn pure<V: Into<Value>>(v: V) -> Self {
         DoNode::Pure(v.into())
     }
+
+    /// Construct a side-effecting [`DoNode::Op`] leaf.
     pub fn op(tmpl: OperationTemplate) -> Self {
         DoNode::Op(tmpl)
     }
+
+    /// Construct a [`DoNode::Fail`] leaf.
     pub fn fail(f: Failure) -> Self {
         DoNode::Fail(f)
     }
+
+    /// Sequence this program into a named pure step.
     pub fn and_then(self, then: StepRef) -> Self {
         DoNode::AndThen {
             d: Box::new(self),
@@ -72,18 +97,26 @@ impl DoNode {
     pub fn map(self, step: StepRef) -> Self {
         self.and_then(step)
     }
+
+    /// Recover from this program's failure with a named step.
     pub fn or_else(self, or: StepRef) -> Self {
         DoNode::OrElse {
             d: Box::new(self),
             or,
         }
     }
+
+    /// Run two programs to completion and join their results.
     pub fn both(a: DoNode, b: DoNode) -> Self {
         DoNode::Both(Box::new(a), Box::new(b))
     }
+
+    /// Run two programs and keep the first completed result.
     pub fn race(a: DoNode, b: DoNode) -> Self {
         DoNode::Race(Box::new(a), Box::new(b))
     }
+
+    /// Bind `name` to `value` while compiling `body`.
     pub fn r#let(name: impl Into<String>, value: DoNode, body: DoNode) -> Self {
         DoNode::Let {
             name: name.into(),
@@ -91,9 +124,13 @@ impl DoNode {
             body: Box::new(body),
         }
     }
+
+    /// Reference a value bound by an enclosing [`DoNode::Let`].
     pub fn use_(name: impl Into<String>) -> Self {
         DoNode::Use(name.into())
     }
+
+    /// Run `body` under a block-level acting identity.
     pub fn acting(identity: Path, body: DoNode) -> Self {
         DoNode::Acting {
             identity,

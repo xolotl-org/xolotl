@@ -15,7 +15,7 @@
 //! Operation the program issues against a target the spec did not declare would,
 //! at runtime, be outside the task ceiling.
 //!
-//! [`lint`] walks a program's AST via [`DoNode::ops`](crate::r#do::DoNode::ops)
+//! [`lint`] walks a program's AST via [`DoNode::ops`]
 //! and compares each Operation's required capability against the declared
 //! capability literals.
 
@@ -94,6 +94,7 @@ pub enum LintSeverity {
 /// One issue found by [`lint`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LintFinding {
+    /// Severity assigned to this finding.
     pub severity: LintSeverity,
     /// The operation target the finding is about.
     pub target: String,

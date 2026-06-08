@@ -21,27 +21,39 @@ use nexus_types::{ConstraintSet, HandleId, IdentityRef, ProcessId, ResourceId, R
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Errors returned while compiling an open request into a handle.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum OpenError {
+    /// The process holds no grant whose selector matches the resource/path.
     #[error("no grant held by {process} matches resource {resource}")]
     NoMatchingGrant {
+        /// Process that attempted the open.
         process: ProcessId,
+        /// Resource requested by the open.
         resource: ResourceId,
     },
+    /// A grant selector matched, but the requested rights exceeded it.
     #[error("requested rights exceed the granting rights (not a subset)")]
     RightsNotSubset,
+    /// Registry has no resource with this id.
     #[error("resource {0} not found")]
     NoSuchResource(ResourceId),
+    /// Resource points at a binding that is not registered.
     #[error("binding {0} not found")]
     NoSuchBinding(nexus_types::BindingId),
+    /// Binding points at a driver that is not registered.
     #[error("driver {0} not found")]
     NoSuchDriver(nexus_types::DriverId),
+    /// Binding points at a remote endpoint that is not registered.
     #[error("endpoint {0} not found")]
     NoSuchEndpoint(nexus_types::EndpointId),
+    /// Grant expiry or static constraints failed at open time.
     #[error("grant expired or static constraint failed")]
     StaticConstraintFailed,
+    /// A source policy denied the open before a handle was created.
     #[error("a source policy denied the open: {0}")]
     PolicyDenied(String),
+    /// Reserved state paths cannot be opened through ordinary grants.
     #[error("reserved path cannot be opened through ordinary state grants: {0}")]
     ReservedPath(String),
 }
@@ -49,9 +61,13 @@ pub enum OpenError {
 /// What the caller asks to open: a resource, the rights it wants, and the verb
 /// (selector match key).
 pub struct OpenRequest {
+    /// Process that will own the resulting handle.
     pub process: ProcessId,
+    /// Resource id selected by control-plane name resolution.
     pub resource: ResourceId,
+    /// Capability verb used when matching grant selectors.
     pub verb: String,
+    /// Rights requested for the resulting handle.
     pub rights: Rights,
     /// The identity the opening Process acts as (§5.2 step 4 / §8.1). Carried
     /// into the [`OpenContext`] so identity-scoped policy checks can be

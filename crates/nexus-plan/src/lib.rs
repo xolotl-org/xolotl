@@ -3,7 +3,7 @@
 //! `nexus-plan` — Plan compiler.
 //!
 //! A *Plan* is a YAML/JSON document describing a goal-directed pipeline of
-//! steps. The compiler turns a Plan into a [`DoNode`](nexus_graph::DoNode),
+//! steps. The compiler turns a Plan into a [`DoNode`],
 //! which the kernel compiles to an `ExecutionGraph` and runs (§13).
 //!
 //! Every step maps to the Direction-C primitives. There is no `Op` enum any
@@ -35,90 +35,137 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
+/// JSON value used by Plan documents before they are lowered to
+/// [`nexus_types::Value`].
 pub type JsonValue = serde_json::Value;
 
+/// A serializable workflow document that compiles to one [`DoNode`] program.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
+    /// Stable author-chosen identifier for the plan.
     pub id: String,
+    /// Plan schema/version number carried by the document.
     pub version: u32,
+    /// Optional human-facing summary; not used by compilation.
     #[serde(default)]
     pub description: Option<String>,
+    /// Ordered root steps compiled into the program body.
     pub steps: Vec<Step>,
 }
 
+/// One Plan instruction.
+///
+/// Simple value/effect steps compile to `DoNode::Op`, `DoNode::Pure`, or
+/// `DoNode::Use`; control steps compile to graph composition nodes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Step {
     /// Invoke an effect Resource (`effect://…`), method `invoke`.
     Perform {
+        /// Effect resource path, for example `effect://inference/infer`.
         target: String,
+        /// Literal input passed to the effect driver.
         #[serde(default)]
         input: Option<JsonValue>,
     },
     /// Read the current value of a state Resource (`Value.read`).
     Read {
+        /// State resource path to read.
         path: String,
+        /// Local binding name for the read value. Defaults to `_`.
         #[serde(default = "default_as_name")]
         r#as: String,
     },
     /// Subscribe to a Sequence Resource (`Sequence.subscribe`); the body step
     /// handles each event.
     Subscribe {
+        /// State sequence path to subscribe to.
         path: String,
+        /// Step invoked for each delivered event.
         step: StepRefSpec,
     },
     /// Write a state Resource (`Value.write` / `Sequence.append`).
     Write {
+        /// State resource path to mutate.
         path: String,
+        /// Value written or appended to the state resource.
         value: JsonValue,
+        /// Write method selection. Defaults to [`WriteModeSpec::Set`].
         #[serde(default)]
         mode: WriteModeSpec,
     },
+    /// Continue the current node with a named step reference.
     Then {
+        /// Process-local continuation name.
         name: String,
+        /// Optional literal argument passed to the continuation.
         #[serde(default)]
         arg: Option<JsonValue>,
     },
+    /// Run a named recovery step if the current node fails.
     OnFail {
+        /// Process-local recovery continuation name.
         name: String,
+        /// Optional literal argument passed to the recovery continuation.
         #[serde(default)]
         arg: Option<JsonValue>,
     },
+    /// Run two step sequences and collect both outcomes.
     Parallel {
+        /// Left branch body.
         left: Vec<Step>,
+        /// Right branch body.
         right: Vec<Step>,
     },
+    /// Run two step sequences and return the first completed outcome.
     Race {
+        /// Left branch body.
         left: Vec<Step>,
+        /// Right branch body.
         right: Vec<Step>,
     },
+    /// Bind a literal value in the local environment.
     Let {
+        /// Binding name.
         name: String,
+        /// Literal value bound to `name`.
         value: JsonValue,
     },
+    /// Read a value from the local environment.
     Use {
+        /// Binding name to resolve.
         name: String,
     },
+    /// Return a literal value.
     Pure {
+        /// Literal result value.
         value: JsonValue,
     },
     /// Run `body` under a different identity (`act-as`, §13.2).
     Acting {
+        /// Identity path used for the block.
         identity: String,
+        /// Steps executed under `identity`.
         body: Vec<Step>,
     },
     /// Spawn a child Process: a kernel Operation on `effect://kernel/spawn`.
     Spawn {
+        /// Optional identity path for the child process.
         #[serde(default)]
         identity: Option<String>,
+        /// Capability literals forming the child capability ceiling.
         #[serde(default)]
         capabilities: Vec<String>,
+        /// Child process program body.
         body: Vec<Step>,
     },
     /// Resource acquire/use/release idiom: `release` runs on success or failure.
     Bracket {
+        /// Step that acquires the resource.
         acquire: Box<Step>,
+        /// Steps run while the acquired resource is bound.
         body: Vec<Step>,
+        /// Release step run on both success and failure paths.
         release: StepRefSpec,
     },
 }
@@ -128,7 +175,9 @@ pub enum Step {
 /// the §13.3 `StepRef { process, name }` invariant explicitly.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StepRefSpec {
+    /// Process-local step name.
     pub name: String,
+    /// Optional literal argument supplied when the step is invoked.
     #[serde(default)]
     pub arg: Option<JsonValue>,
 }
@@ -157,28 +206,41 @@ impl WriteModeSpec {
     }
 }
 
+/// Errors raised while parsing, validating, or lowering a [`Plan`].
 #[derive(Debug, Error)]
 pub enum PlanError {
+    /// A path literal failed Nexus path parsing.
     #[error("path: {0}")]
     Path(#[from] nexus_types::PathError),
+    /// The plan did not contain any root steps.
     #[error("plan must contain at least one step")]
     Empty,
+    /// A continuation-only step appeared before any current node existed.
     #[error("step {0} cannot be the first step")]
     BadFirstStep(&'static str),
+    /// Two bindings use the same name in one plan.
     #[error("duplicate step name: {0}")]
     DuplicateName(String),
+    /// A `${name}` binding dependency graph contains a cycle.
     #[error("reference cycle detected involving step: {0}")]
     Cycle(String),
+    /// A capability literal is malformed or targets the wrong path scheme.
     #[error("invalid capability literal `{0}`: {1}")]
     Capability(String, String),
+    /// A step target path is malformed or uses the wrong scheme for its kind.
     #[error("invalid {kind} target `{target}`: {reason}")]
     Target {
+        /// Step kind being validated.
         kind: &'static str,
+        /// Original target/path literal from the plan.
         target: String,
+        /// Validation failure detail.
         reason: String,
     },
+    /// YAML decoding failed.
     #[error("yaml: {0}")]
     Yaml(String),
+    /// JSON decoding or `DoNode` serialization failed.
     #[error("json: {0}")]
     Json(String),
 }
@@ -676,10 +738,12 @@ fn json_to_value(j: &JsonValue) -> Value {
     }
 }
 
+/// Parse a YAML Plan document.
 pub fn parse_yaml(src: &str) -> Result<Plan, PlanError> {
     yaml_serde::from_str(src).map_err(|e| PlanError::Yaml(e.to_string()))
 }
 
+/// Parse a JSON Plan document.
 pub fn parse_json(src: &str) -> Result<Plan, PlanError> {
     serde_json::from_str(src).map_err(|e| PlanError::Json(e.to_string()))
 }

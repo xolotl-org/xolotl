@@ -8,62 +8,114 @@ use nexus_types::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Current Console Protocol major wire version.
 pub const PROTOCOL_VERSION: u16 = 1;
+/// Canonical server name returned in protocol metadata.
 pub const SERVER_NAME: &str = "nexus-console";
+/// Default compact frame encoding advertised by the server.
 pub const WIRE_ENCODING: &str = "msgpack+nexus-console-v1";
 
+/// Describe protocol metadata and descriptors.
 pub const ACTION_PROTOCOL_DESCRIBE: &str = "protocol.describe";
+/// Return a registry snapshot for clients that cache descriptors.
 pub const ACTION_PROTOCOL_REGISTRY_SNAPSHOT: &str = "protocol.registry.snapshot";
+/// Return one schema descriptor by id.
 pub const ACTION_PROTOCOL_SCHEMA_GET: &str = "protocol.schema.get";
+/// Return action/stream coverage status by domain.
 pub const ACTION_REGISTRY_COVERAGE_REPORT: &str = "registry.coverage.report";
+/// Return the caller's effective principal and authority.
 pub const ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE: &str = "authority.principal.effective";
+/// Return the authority matrix for visible actions.
 pub const ACTION_AUTHORITY_ACTION_MATRIX: &str = "authority.action.matrix";
+/// Explain resource access for one target.
 pub const ACTION_AUTHORITY_RESOURCE_ACCESS: &str = "authority.resource.access";
+/// Explain why an action or resource operation was denied.
 pub const ACTION_AUTHORITY_WHY_DENIED: &str = "authority.why_denied";
+/// Describe root data authority and visibility rules.
 pub const ACTION_VISIBILITY_AUTHORITY_DESCRIBE: &str = "visibility.authority.describe";
+/// Read a state value through visibility gates.
 pub const ACTION_VISIBILITY_STATE_READ: &str = "visibility.state.read";
+/// List state children through visibility gates.
 pub const ACTION_VISIBILITY_STATE_LIST: &str = "visibility.state.list";
+/// Return secret custody catalog metadata.
 pub const ACTION_SECRET_CATALOG: &str = "secret.catalog";
+/// Reveal a revealable secret through custody gates.
 pub const ACTION_SECRET_REVEAL: &str = "secret.reveal";
+/// Return a state snapshot view.
 pub const ACTION_STATE_SNAPSHOT: &str = "state.snapshot";
+/// Read one configuration value.
 pub const ACTION_CONFIG_READ: &str = "config.read";
+/// List configuration entries.
 pub const ACTION_CONFIG_LIST: &str = "config.list";
+/// Compare-and-swap a configuration value.
 pub const ACTION_CONFIG_WRITE_CAS: &str = "config.write_cas";
+/// Read one console user record.
 pub const ACTION_ACCESS_USER_READ: &str = "access.user.read";
+/// List console user records.
 pub const ACTION_ACCESS_USER_LIST: &str = "access.user.list";
+/// Compare-and-swap a console user record.
 pub const ACTION_ACCESS_USER_WRITE_CAS: &str = "access.user.write_cas";
+/// Disable a console user.
 pub const ACTION_ACCESS_USER_DISABLE: &str = "access.user.disable";
+/// Read one console role record.
 pub const ACTION_ACCESS_ROLE_READ: &str = "access.role.read";
+/// List console role records.
 pub const ACTION_ACCESS_ROLE_LIST: &str = "access.role.list";
+/// Compare-and-swap a console role record.
 pub const ACTION_ACCESS_ROLE_WRITE_CAS: &str = "access.role.write_cas";
+/// Logout the current session.
 pub const ACTION_ACCESS_SESSION_CURRENT_LOGOUT: &str = "access.session.current.logout";
+/// List console sessions visible to the caller.
 pub const ACTION_ACCESS_SESSION_LIST: &str = "access.session.list";
+/// Revoke one console session.
 pub const ACTION_ACCESS_SESSION_REVOKE: &str = "access.session.revoke";
+/// Revoke all sessions for one user.
 pub const ACTION_ACCESS_SESSION_REVOKE_USER: &str = "access.session.revoke_user";
+/// Inspect one runtime process.
 pub const ACTION_RUNTIME_PROCESS_INSPECT: &str = "runtime.process.inspect";
+/// Return recent audit facts.
 pub const ACTION_AUDIT_FACTS_RECENT: &str = "audit.facts.recent";
+/// Read trace lineage data.
 pub const ACTION_LINEAGE_TRACE_READ: &str = "lineage.trace.read";
+/// Read one Fact by id.
 pub const ACTION_LINEAGE_FACT_READ: &str = "lineage.fact.read";
+/// Read a Fact by operation id.
 pub const ACTION_LINEAGE_FACT_BY_OPERATION: &str = "lineage.fact.by_operation";
+/// Return high-level daemon/runtime health.
 pub const ACTION_HEALTH_SUMMARY: &str = "health.summary";
+/// Install an extension installation descriptor.
 pub const ACTION_EXTENSIONS_INSTALLATION_INSTALL: &str = "extensions.installation.install";
+/// Update an extension installation descriptor.
 pub const ACTION_EXTENSIONS_INSTALLATION_UPDATE: &str = "extensions.installation.update";
+/// Start an installed extension.
 pub const ACTION_EXTENSIONS_INSTALLATION_START: &str = "extensions.installation.start";
+/// Stop a running extension.
 pub const ACTION_EXTENSIONS_INSTALLATION_STOP: &str = "extensions.installation.stop";
+/// Revoke an extension installation and its projected authority.
 pub const ACTION_EXTENSIONS_INSTALLATION_REVOKE: &str = "extensions.installation.revoke";
+/// Create a pairing flow.
 pub const ACTION_PAIRING_CREATE: &str = "pairing.create";
+/// Approve a pending pairing flow.
 pub const ACTION_PAIRING_APPROVE: &str = "pairing.approve";
+/// Deny a pending pairing flow.
 pub const ACTION_PAIRING_DENY: &str = "pairing.deny";
+/// Replace pairing credentials.
 pub const ACTION_PAIRING_REPLACE: &str = "pairing.replace";
 
+/// Stream id for state watch events.
 pub const STREAM_STATE_WATCH: &str = "state.watch";
+/// Stream id for audit Fact events.
 pub const STREAM_AUDIT_FACTS: &str = "audit.facts.stream";
 
+/// Initial client hello used to negotiate protocol version and encoding.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClientHello {
+    /// Client-supported protocol version.
     pub protocol_version: u16,
+    /// Optional client application name for audit and diagnostics.
     #[serde(default)]
     pub client_name: Option<String>,
+    /// Encodings the client accepts, in preference order.
     #[serde(default)]
     pub accepted_encodings: Vec<String>,
 }
@@ -78,56 +130,105 @@ impl Default for ClientHello {
     }
 }
 
+/// One descriptor-named action invocation from a console client.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ActionCall {
+    /// Action id, usually one of the `ACTION_*` constants.
     pub action: String,
+    /// JSON-encoded Nexus value passed as action input.
     #[serde(default)]
     pub input: JsonBytes,
+    /// Optional target scope for break-glass or visibility-gated actions.
     #[serde(default)]
     pub scope: Option<String>,
+    /// Operator justification for high-risk actions.
     #[serde(default)]
     pub justification: Option<String>,
+    /// Optional temporary authority duration for scoped access.
     #[serde(default)]
     pub ttl_ms: Option<u64>,
 }
 
+/// One stream subscription request from a console client.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StreamCall {
+    /// Stream id, usually one of the `STREAM_*` constants.
     pub stream: String,
+    /// JSON-encoded stream input/filter value.
     #[serde(default)]
     pub input: JsonBytes,
+    /// Optional target scope for visibility-gated streams.
     #[serde(default)]
     pub scope: Option<String>,
+    /// Operator justification for sensitive streams.
     #[serde(default)]
     pub justification: Option<String>,
+    /// Optional temporary authority duration for scoped streaming.
     #[serde(default)]
     pub ttl_ms: Option<u64>,
+    /// Optional state/fact revision cursor for resume.
     #[serde(default)]
     pub since_rev: Option<u64>,
 }
 
+/// Compact identity summary returned after authentication.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PrincipalSummary {
+    /// Console username.
     pub username: String,
+    /// Nexus identity path for the principal.
     pub identity_path: String,
+    /// Authenticated MFA level.
     pub mfa_level: u8,
 }
 
+/// Frames sent by the console client over the management WebSocket.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ClientFrame {
-    Hello { hello: ClientHello },
-    Auth { token: String },
-    Call { id: u64, call: ActionCall },
-    Subscribe { id: u64, stream: StreamCall },
-    Unsubscribe { id: u64 },
-    Ping { nonce: u64 },
+    /// Protocol negotiation frame.
+    Hello {
+        /// Client protocol preferences.
+        hello: ClientHello,
+    },
+    /// Present a bearer session token.
+    Auth {
+        /// Console session token.
+        token: String,
+    },
+    /// Invoke one action.
+    Call {
+        /// Client-chosen correlation id.
+        id: u64,
+        /// Action invocation payload.
+        call: ActionCall,
+    },
+    /// Subscribe to one stream.
+    Subscribe {
+        /// Client-chosen subscription id.
+        id: u64,
+        /// Stream subscription payload.
+        stream: StreamCall,
+    },
+    /// Cancel an existing subscription.
+    Unsubscribe {
+        /// Subscription id to cancel.
+        id: u64,
+    },
+    /// Keepalive probe.
+    Ping {
+        /// Client nonce echoed by the server.
+        nonce: u64,
+    },
 }
 
 /// JSON-encoded [`Value`] string. The outer frame is MessagePack; this inner
 /// value envelope keeps Nexus's untagged `Value` representation explicit for
 /// clients in any language.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct JsonBytes(pub String);
+pub struct JsonBytes(
+    /// JSON string encoding a Nexus [`Value`].
+    pub String,
+);
 
 impl Eq for JsonBytes {}
 
@@ -138,26 +239,34 @@ impl Default for JsonBytes {
 }
 
 impl JsonBytes {
+    /// Serialize a Nexus value into the inner JSON string.
     pub fn from_value(v: &Value) -> Self {
         Self(serde_json::to_string(v).unwrap_or_default())
     }
 
+    /// Decode the inner JSON string into a Nexus value.
     pub fn try_to_value(&self) -> Result<Value, serde_json::Error> {
         serde_json::from_str(&self.0)
     }
 
+    /// Decode the inner JSON string, returning [`Value::Null`] on malformed
+    /// input for tolerant projection paths.
     pub fn to_value(&self) -> Value {
         self.try_to_value().unwrap_or(Value::Null)
     }
 }
 
+/// Result of one action invocation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ActionResult {
+    /// Optional JSON-encoded Nexus value output.
     pub output: Option<JsonBytes>,
+    /// Server revision after the action.
     pub server_rev: u64,
 }
 
 impl ActionResult {
+    /// Construct an action result with no output body.
     pub fn empty(server_rev: u64) -> Self {
         Self {
             output: None,
@@ -165,6 +274,7 @@ impl ActionResult {
         }
     }
 
+    /// Construct an action result carrying one Nexus value.
     pub fn value(value: Value, server_rev: u64) -> Self {
         Self {
             output: Some(JsonBytes::from_value(&value)),
@@ -173,173 +283,300 @@ impl ActionResult {
     }
 }
 
+/// Frames sent by the console server over the management WebSocket.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ServerFrame {
+    /// Protocol negotiation succeeded.
     HelloAccepted {
+        /// Server metadata and descriptor registry.
         metadata: ProtocolMetadata,
     },
+    /// Authentication succeeded.
     Authenticated {
+        /// Authenticated principal summary.
         principal: PrincipalSummary,
+        /// Server metadata and descriptor registry.
         metadata: ProtocolMetadata,
     },
+    /// Reply to an action call.
     Reply {
+        /// Client correlation id.
         id: u64,
+        /// Action result.
         result: ActionResult,
     },
+    /// Stream event delivery.
     Event {
+        /// Subscription id.
         stream: u64,
+        /// Event payload.
         event: ConsoleEvent,
     },
+    /// Keepalive response.
     Pong {
+        /// Echoed client nonce.
         nonce: u64,
     },
+    /// Protocol or action error.
     Error {
+        /// Optional client correlation id.
         id: Option<u64>,
+        /// Stable error code.
         code: ConsoleErrorCode,
+        /// Human-readable error message.
         message: String,
     },
 }
 
+/// Event delivered on a subscribed console stream.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ConsoleEvent {
-    StateSet { path: String, value: JsonBytes },
-    StateAppend { path: String, item: JsonBytes },
-    StateDelete { path: String },
-    Audit { fact: JsonBytes },
-    SubscriptionClosed { reason: String },
+    /// A state value was set.
+    StateSet {
+        /// State path that changed.
+        path: String,
+        /// New JSON-encoded value.
+        value: JsonBytes,
+    },
+    /// An item was appended to a state sequence.
+    StateAppend {
+        /// State sequence path that changed.
+        path: String,
+        /// Appended JSON-encoded item.
+        item: JsonBytes,
+    },
+    /// A state value was deleted.
+    StateDelete {
+        /// State path that was deleted.
+        path: String,
+    },
+    /// An audit Fact event was observed.
+    Audit {
+        /// JSON-encoded Fact projection.
+        fact: JsonBytes,
+    },
+    /// Server closed the subscription.
+    SubscriptionClosed {
+        /// Closure reason.
+        reason: String,
+    },
 }
 
 impl Eq for ConsoleEvent {}
 
+/// Stable error codes returned by the Console Protocol.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ConsoleErrorCode {
+    /// Frame was malformed or out of sequence.
     BadFrame,
+    /// Session is missing or invalid.
     NotAuthenticated,
+    /// Caller lacks required authority.
     Unauthorized,
+    /// Request is explicitly forbidden by policy or visibility rules.
     Forbidden,
+    /// Compare-and-swap or revision conflict.
     Conflict,
+    /// Request input failed validation.
     BadRequest,
+    /// Request exceeded rate limits.
     RateLimited,
+    /// Server-side failure.
     Internal,
 }
 
+/// Complete protocol metadata advertised to console clients.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProtocolMetadata {
+    /// Wire protocol version served by this instance.
     pub protocol_version: u16,
+    /// Server name.
     pub server_name: String,
+    /// Selected wire encoding.
     pub encoding: String,
+    /// Current server state revision.
     pub server_rev: u64,
+    /// Current descriptor registry revision.
     pub registry_rev: u64,
+    /// Root visibility authority contract.
     pub root_data_authority: RootDataAuthority,
+    /// Action descriptors visible through the protocol registry.
     pub actions: Vec<ActionDescriptor>,
+    /// Stream descriptors visible through the protocol registry.
     pub streams: Vec<StreamDescriptor>,
+    /// Visibility tiers known to the protocol.
     pub visibility_tiers: Vec<VisibilityTier>,
+    /// Secret custody classes known to the protocol.
     pub secret_classes: Vec<SecretClass>,
 }
 
+/// Root-data-authority invariants exposed by the Console Protocol.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RootDataAuthority {
+    /// Whether root can view all business payloads through visibility gates.
     pub root_can_view_all_business_data: bool,
+    /// Whether step-up is an audit/confirmation gate, not a permission denial.
     pub visibility_step_up_is_gate_not_permission_denial: bool,
+    /// Whether root bypasses Operation/Fact/policy flow.
     pub bypasses_operation_fact_policy: bool,
+    /// Whether vault secret custody is separate from ordinary data visibility.
     pub vault_secret_custody_is_separate: bool,
 }
 
+/// Discoverable descriptor for one mutation action or observability view.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ActionDescriptor {
+    /// Stable action id.
     pub id: String,
+    /// Protocol domain grouping the action.
     pub domain: String,
+    /// Action class.
     pub kind: ActionKind,
+    /// Operational risk level.
     pub risk: RiskLevel,
+    /// Implementation status.
     pub status: ImplementationStatus,
+    /// Maximum visibility tier touched by the action.
     pub visibility: VisibilityTier,
+    /// Secret class if the action handles secret material.
     pub secret_class: Option<SecretClass>,
+    /// Whether the action requires MFA/step-up.
     pub requires_step_up: bool,
+    /// Authority predicates required to invoke the action.
     pub required_authority: Vec<RequiredAuthority>,
+    /// Input schema descriptor.
     pub input: SchemaDescriptor,
+    /// Output schema descriptor.
     pub output: SchemaDescriptor,
 }
 
+/// Discoverable descriptor for one subscription stream.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StreamDescriptor {
+    /// Stable stream id.
     pub id: String,
+    /// Protocol domain grouping the stream.
     pub domain: String,
+    /// Implementation status.
     pub status: ImplementationStatus,
+    /// Maximum visibility tier emitted by the stream.
     pub visibility: VisibilityTier,
+    /// Whether the stream requires MFA/step-up.
     pub requires_step_up: bool,
+    /// Authority predicates required to subscribe.
     pub required_authority: Vec<RequiredAuthority>,
+    /// Stream input/filter schema descriptor.
     pub input: SchemaDescriptor,
+    /// Stream event schema descriptor.
     pub event: SchemaDescriptor,
 }
 
+/// One authority predicate required by a descriptor.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RequiredAuthority {
+    /// Capability verb, such as `read`, `write`, or `subscribe`.
     pub verb: String,
+    /// Target path or path pattern.
     pub target: String,
 }
 
+/// Language-neutral schema descriptor used for action and stream discovery.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SchemaDescriptor {
+    /// Stable schema id.
     pub schema_id: String,
+    /// High-level value kind (`map`, `list`, `null`, etc.).
     pub value_kind: String,
+    /// Known fields for map-like values.
     #[serde(default)]
     pub fields: Vec<FieldDescriptor>,
+    /// Human-readable schema notes and constraints.
     #[serde(default)]
     pub notes: Vec<String>,
 }
 
+/// One field in a map-like schema descriptor.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FieldDescriptor {
+    /// Field name.
     pub name: String,
+    /// Field kind.
     pub kind: String,
+    /// Whether the field is required.
     pub required: bool,
 }
 
+/// High-level descriptor kind for Console Protocol actions.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionKind {
+    /// Protocol discovery action.
     Protocol,
+    /// Read-only observability view.
     View,
+    /// Mutating management action.
     Mutation,
+    /// Secret custody action.
     Secret,
+    /// Data visibility action.
     Visibility,
 }
 
+/// Operational risk level used by descriptors and UI policy.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskLevel {
+    /// Low-risk read or discovery.
     Low,
+    /// Elevated management action.
     Elevated,
+    /// Break-glass or sensitive data access.
     BreakGlass,
 }
 
+/// Whether a descriptor is implemented or only declared for coverage.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImplementationStatus {
+    /// Action/stream is implemented.
     Implemented,
+    /// Descriptor is declared for coverage but not yet implemented.
     Declared,
+    /// Descriptor is intentionally unavailable because custody rules block it.
     BlockedByCustody,
 }
 
+/// Data visibility tier exposed by Console Protocol descriptors.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VisibilityTier {
+    /// Public control-plane metadata.
     PublicControl,
+    /// Management state without business payloads.
     ManagementState,
+    /// Business payload data.
     BusinessData,
+    /// Protected or user-private payload data.
     ProtectedPayload,
+    /// Secret metadata without plaintext.
     SecretMetadata,
+    /// Secret plaintext, only through custody gates.
     SecretPlaintext,
 }
 
+/// Secret custody class.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretClass {
+    /// Secret can be revealed under custody policy.
     RevealableSecret,
+    /// Secret is stored in non-recoverable form.
     NonRecoverableSecret,
+    /// Secret is available only at a display edge and then consumed.
     OneTimeSecret,
 }
 
+/// Build protocol metadata for the given server and registry revisions.
 pub fn protocol_metadata(server_rev: u64, registry_rev: u64) -> ProtocolMetadata {
     ProtocolMetadata {
         protocol_version: PROTOCOL_VERSION,
@@ -371,10 +608,12 @@ pub fn protocol_metadata(server_rev: u64, registry_rev: u64) -> ProtocolMetadata
     }
 }
 
+/// Build protocol metadata and convert it into a Nexus [`Value`].
 pub fn protocol_metadata_value(server_rev: u64, registry_rev: u64) -> Value {
     to_value(protocol_metadata(server_rev, registry_rev))
 }
 
+/// Build the coverage report view described by the console protocol design.
 pub fn coverage_report_value(server_rev: u64, registry_rev: u64) -> Value {
     let actions = action_descriptors();
     let streams = stream_descriptors();
@@ -433,6 +672,7 @@ pub fn coverage_report_value(server_rev: u64, registry_rev: u64) -> Value {
     Value::Map(root)
 }
 
+/// Return one action descriptor encoded as a Nexus value.
 pub fn descriptor_value(action_id: &str) -> Option<Value> {
     action_descriptors()
         .into_iter()
@@ -440,6 +680,7 @@ pub fn descriptor_value(action_id: &str) -> Option<Value> {
         .map(to_value)
 }
 
+/// Return the secret custody catalog exposed by `secret.catalog`.
 pub fn secret_catalog_value() -> Value {
     let mut rows = Vec::new();
     rows.push(secret_row(
@@ -465,6 +706,7 @@ pub fn secret_catalog_value() -> Value {
     Value::List(rows)
 }
 
+/// Return root data authority and visibility-gate metadata.
 pub fn visibility_authority_value() -> Value {
     let mut root = BTreeMap::new();
     root.insert("root_can_view_all_business_data".into(), Value::Bool(true));
@@ -485,6 +727,7 @@ pub fn visibility_authority_value() -> Value {
     Value::Map(root)
 }
 
+/// Return the static stream descriptor registry.
 pub fn stream_descriptors() -> Vec<StreamDescriptor> {
     vec![
         StreamDescriptor {
@@ -523,6 +766,7 @@ pub fn stream_descriptors() -> Vec<StreamDescriptor> {
     ]
 }
 
+/// Return the static action descriptor registry.
 pub fn action_descriptors() -> Vec<ActionDescriptor> {
     vec![
         action(

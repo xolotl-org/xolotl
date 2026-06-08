@@ -21,11 +21,18 @@ use std::sync::Arc;
 /// The assembled kernel. Clone-cheap; all internal state is shared.
 #[derive(Clone)]
 pub struct Kernel {
+    /// Control-plane registry for resources, interfaces, drivers, bindings,
+    /// grants, policies, and open-plan cache.
     pub registry: Registry,
+    /// Shared table of open handles owned by processes.
     pub handles: Arc<RwLock<HandleTable>>,
+    /// Write-ahead fact sink used by data-plane execution and recovery.
     pub facts: FactSink,
+    /// Runtime process tree and per-process mutable state.
     pub processes: ProcessTable,
+    /// Named pure continuation table used by graph `Step` nodes.
     pub steps: StepTable,
+    /// State-plane backend serving `state://` reads, writes, and subscriptions.
     pub state: Backend,
 }
 

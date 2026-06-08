@@ -50,25 +50,38 @@ pub struct StandardConfig {
 /// One MCP host-side tool mount (§18.2).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpToolMount {
+    /// MCP server namespace segment.
     pub server: String,
+    /// MCP tool namespace segment.
     pub tool: String,
+    /// Whether this tool should be mounted with stream-capable method specs.
     pub streaming: bool,
 }
 
+/// Errors returned while installing standard actors and providers.
 #[derive(Debug, Error)]
 pub enum InstallError {
+    /// Kernel bootstrap registration failed.
     #[error("bootstrap registration failed: {0}")]
     Bootstrap(#[from] BootstrapError),
+    /// Effect path could not be matched to an internal method descriptor.
     #[error("standard effect path {path:?} has no matching method")]
-    MethodNotFound { path: String },
+    MethodNotFound {
+        /// Effect path being registered.
+        path: String,
+    },
+    /// MCP server or tool segment is not safe for a resource path.
     #[error("invalid MCP {label} path segment: {segment:?}")]
     InvalidMcpPathSegment {
+        /// Segment kind, such as `server` or `tool`.
         label: &'static str,
+        /// Invalid segment value.
         segment: String,
     },
 }
 
 impl McpToolMount {
+    /// Create a unary MCP tool mount.
     pub fn new(server: impl Into<String>, tool: impl Into<String>) -> Self {
         Self {
             server: server.into(),
@@ -77,6 +90,7 @@ impl McpToolMount {
         }
     }
 
+    /// Mark this MCP tool mount as stream-capable.
     pub fn streaming(mut self) -> Self {
         self.streaming = true;
         self

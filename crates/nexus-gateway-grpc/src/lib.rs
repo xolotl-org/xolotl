@@ -2,7 +2,7 @@
 
 //! `nexus-gateway-grpc` — gRPC protocol adapter (Gateway, §18.1).
 //!
-//! A thin tonic service over the shared [`Gateway`](nexus_gateway::Gateway):
+//! A thin tonic service over the shared [`Gateway`]:
 //! `Submit` authenticates the bearer token, decodes the structured program, runs it,
 //! and returns the outcome. The five §18.1 steps live in `nexus-gateway`; this
 //! crate only speaks gRPC. Values are marshalled with the **structural**
@@ -25,12 +25,14 @@ pub struct GrpcGateway {
 }
 
 impl GrpcGateway {
+    /// Build a gRPC adapter around an in-process gateway for `boot`.
     pub fn new(boot: Arc<Bootstrap>) -> Self {
         Self {
             gateway: Arc::new(InProcessGateway::new(boot)),
         }
     }
 
+    /// Build a gRPC adapter from an already-constructed in-process gateway.
     pub fn from_gateway(gateway: Arc<InProcessGateway>) -> Self {
         Self { gateway }
     }

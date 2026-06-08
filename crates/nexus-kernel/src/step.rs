@@ -24,6 +24,7 @@ pub struct StepTable {
 }
 
 impl StepTable {
+    /// Create an empty step table.
     pub fn new() -> Self {
         Self::default()
     }
@@ -43,10 +44,12 @@ impl StepTable {
         self.inner.read().get(&(process, name.to_string())).cloned()
     }
 
+    /// Number of registered `(process, name)` steps.
     pub fn len(&self) -> usize {
         self.inner.read().len()
     }
 
+    /// Whether no steps are registered.
     pub fn is_empty(&self) -> bool {
         self.inner.read().is_empty()
     }

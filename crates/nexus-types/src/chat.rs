@@ -13,9 +13,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
+    /// System/developer instruction message.
     System,
+    /// End-user message.
     User,
+    /// Assistant/model message.
     Assistant,
+    /// Tool message.
     Tool,
 }
 
@@ -23,25 +27,38 @@ pub enum MessageRole {
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
+    /// Text content.
     Text {
+        /// Text body.
         text: String,
     },
+    /// Tool call requested by the assistant.
     ToolCall {
+        /// Tool call id.
         id: String,
+        /// Tool name.
         name: String,
+        /// Tool arguments.
         arguments: crate::Value,
     },
+    /// Tool result returned to the assistant.
     ToolResult {
+        /// Tool call id being answered.
         id: String,
+        /// Tool result payload.
         result: crate::Value,
     },
+    /// Image content stored out of line.
     ImageRef {
+        /// Referenced image blob.
         blob: BlobRef,
     },
     /// Opaque structured data passed through to the inference backend
     /// without interpretation (e.g. provider-specific cache-control hints).
     Opaque {
+        /// Opaque part kind.
         kind: String,
+        /// Opaque payload.
         payload: crate::Value,
     },
 }
@@ -49,7 +66,9 @@ pub enum ContentPart {
 /// A single turn in a conversation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
+    /// Message author role.
     pub role: MessageRole,
+    /// Ordered content parts.
     pub content: Vec<ContentPart>,
     /// Unix timestamp (seconds).
     pub timestamp: i64,
@@ -63,9 +82,12 @@ pub struct ChatMessage {
 /// Platform-scoped metadata attached to every message.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChatMetadata {
+    /// Source platform name.
     pub platform: String,
+    /// Platform conversation/channel id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
+    /// Platform sender/user id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_id: Option<String>,
     /// Opaque extra fields the platform connector wants to carry.

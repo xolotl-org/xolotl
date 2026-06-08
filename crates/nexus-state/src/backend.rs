@@ -10,44 +10,67 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::broadcast;
 
+/// Errors returned by state-plane backends.
 #[derive(Debug, Error)]
 pub enum StateError {
+    /// The requested state path or backend object was not found.
     #[error("not found: {0}")]
     NotFound(String),
+    /// A compare-and-set write observed a value different from the caller's
+    /// expected value.
     #[error("CAS failed at {path}: expected {expected:?}, found {actual:?}")]
     CasFailed {
+        /// Canonical path that failed the CAS check.
         path: String,
+        /// Value the caller expected to be present before the write.
         expected: Option<Value>,
+        /// Value found by the backend at write time.
         actual: Option<Value>,
     },
+    /// Serialization or deserialization failed while encoding backend data.
     #[error("serialization: {0}")]
     Serde(#[from] serde_json::Error),
+    /// Backend-specific failure reported as a user-visible message.
     #[error("backend: {0}")]
     Backend(String),
+    /// Operation is not supported by this backend implementation.
     #[error("unsupported by backend: {0}")]
     Unsupported(&'static str),
 }
 
+/// Result alias for state-plane operations.
 pub type StateResult<T> = std::result::Result<T, StateError>;
 
-/// Event delivered to subscribers. Each variant carries an `at_millis`
-/// timestamp the backend stamps at write time so `ReadMode::Range` and
-/// `ReadMode::At` queries can be served from the durable history. The written
-/// value's `taint` (§4.4/§21.5) travels with the event so subscribers and the
-/// memory-poison gate see provenance, not just the value.
+/// Event delivered to subscribers and recorded in state history.
+///
+/// Backends that retain history wrap events in [`StateHistoryEntry`] with an
+/// `at_millis` timestamp so `ReadMode::Range` and `ReadMode::At` queries can be
+/// served from durable mutation order. The written value's taint travels with
+/// the event so subscribers and the memory-poison gate see provenance, not just
+/// the value.
 #[derive(Clone, Debug)]
 pub enum StateEvent {
+    /// A value was written or replaced at a path.
     Set {
+        /// Path whose value changed.
         path: Path,
+        /// New value stored at the path.
         value: Value,
+        /// Provenance attached to the written value.
         taint: TaintSet,
     },
+    /// An item was appended to a sequence path.
     Append {
+        /// Sequence path that received the item.
         path: Path,
+        /// Item appended to the sequence.
         item: Value,
+        /// Provenance attached to the appended item.
         taint: TaintSet,
     },
+    /// A value or sequence was deleted from a path.
     Delete {
+        /// Path removed by the delete.
         path: Path,
     },
 }
@@ -68,17 +91,22 @@ impl StateEvent {
 /// a silent drop. Backends store this envelope, not a bare `Value`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaintedValue {
+    /// Stored state-plane value.
     pub value: Value,
+    /// Provenance associated with the stored value.
     pub taint: TaintSet,
 }
 
 impl TaintedValue {
+    /// Wrap `value` with pristine author-trusted taint.
     pub fn pristine(value: Value) -> Self {
         Self {
             value,
             taint: TaintSet::pristine(),
         }
     }
+
+    /// Wrap `value` with an explicit provenance set.
     pub fn new(value: Value, taint: TaintSet) -> Self {
         Self { value, taint }
     }
@@ -91,10 +119,19 @@ pub type StateStream = broadcast::Receiver<StateEvent>;
 /// that cannot retain history return `Unsupported`.
 #[derive(Clone, Debug)]
 pub struct StateHistoryEntry {
+    /// Millisecond timestamp assigned by the backend at mutation commit time.
     pub at_millis: i64,
+    /// Mutation recorded at this history position.
     pub event: StateEvent,
 }
 
+/// Storage abstraction for the Nexus state plane.
+///
+/// The kernel reaches `state://` resources through this trait instead of
+/// binding itself to SQL, redb, files, or in-memory maps. Implementations are
+/// responsible for storing values with taint, preserving mutation order where
+/// they advertise history support, and notifying subscriptions only after a
+/// write is visible.
 #[async_trait]
 pub trait StateBackend: Send + Sync + 'static {
     // ── taint-aware primitives (§4.4/§12) ──────────────────────────────
@@ -127,7 +164,10 @@ pub trait StateBackend: Send + Sync + 'static {
         taint: TaintSet,
     ) -> StateResult<()>;
 
+    /// Delete the value or sequence currently stored at `path`.
     async fn write_delete(&self, path: &Path) -> StateResult<()>;
+
+    /// Subscribe to post-commit events whose path matches `pattern`.
     async fn subscribe(&self, pattern: &Path) -> StateResult<StateStream>;
 
     // ── bare convenience methods (pristine-taint defaults) ─────────────
@@ -195,6 +235,7 @@ pub trait StateBackend: Send + Sync + 'static {
     async fn read_prefix_tainted(&self, prefix: &Path) -> StateResult<Vec<(Path, TaintedValue)>>;
 }
 
+/// Shared trait-object handle for a state backend.
 pub type DynBackend = Arc<dyn StateBackend>;
 
 /// Default `Merge` semantics shared by every backend (§2.3).

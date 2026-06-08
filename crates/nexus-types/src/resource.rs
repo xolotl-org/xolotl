@@ -34,9 +34,13 @@ bitflags::bitflags! {
     /// requests exactly one mode, which must be in that set.
     #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
     pub struct OutputModeSet: u8 {
+        /// Unary request/response support.
         const UNARY         = 0b0001;
+        /// Streaming response support.
         const STREAM        = 0b0010;
+        /// Async process response support.
         const ASYNC_PROCESS = 0b0100;
+        /// Sink-only request support.
         const SINK_ONLY     = 0b1000;
     }
 }
@@ -54,7 +58,10 @@ pub enum OutputMode {
     /// Caller-side adapter that aggregates the method's supported underlying
     /// output (`Unary` or `Stream`) into a bounded list of at most `limit`
     /// elements (§4.3).
-    Collect { limit: usize },
+    Collect {
+        /// Maximum number of produced values buffered into the collected list.
+        limit: usize,
+    },
     /// One request → an async process handle (poll/await separately).
     AsyncProcess,
     /// Write-only; no response body expected.
@@ -64,7 +71,7 @@ pub enum OutputMode {
 impl OutputMode {
     /// The single-bit set this mode belongs to (for the "is supported" check).
     /// `Collect` has no bit of its own — it is a caller-side adapter (§4.3), so
-    /// it maps to no set here and is handled specially in [`is_supported_by`].
+    /// it maps to no set here and is handled specially by `is_supported_by`.
     pub fn as_set(self) -> OutputModeSet {
         match self {
             OutputMode::Unary => OutputModeSet::UNARY,
@@ -96,12 +103,19 @@ bitflags::bitflags! {
     /// redaction (scan per modality) without inspecting content.
     #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
     pub struct ModalitySet: u16 {
+        /// Text content.
         const TEXT      = 0b0000_0001;
+        /// Image content.
         const IMAGE     = 0b0000_0010;
+        /// Audio content.
         const AUDIO     = 0b0000_0100;
+        /// Video content.
         const VIDEO     = 0b0000_1000;
+        /// Embedding vector content.
         const EMBEDDING = 0b0001_0000;
+        /// Pose or action-trajectory content.
         const POSE      = 0b0010_0000;
+        /// Sensor telemetry content.
         const SENSOR    = 0b0100_0000;
     }
 }
@@ -161,18 +175,24 @@ impl CostModel {
 /// outputs, replays, and bills.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Method {
+    /// Method id within the interface.
     pub id: MethodId,
     /// Stable name within the interface (e.g. `read`, `invoke`, `append`).
     pub name: String,
+    /// Input schema descriptor id.
     pub input: SchemaId,
+    /// Output schema descriptor id.
     pub output: SchemaId,
+    /// Modalities accepted or produced by this method.
     pub modality: ModalitySet,
     /// Declared side-effect class; the kernel derives [`ReplayClass`].
     pub purity: Purity,
     /// Replay semantics; defaults to the class derived from `purity` but may
     /// be explicitly overridden at admission.
     pub replay: ReplayClass,
+    /// Output modes this method can satisfy.
     pub supports: OutputModeSet,
+    /// Cost model used for budget reservation.
     pub cost: CostModel,
     /// Whether this method is batchable (§17.5): a call may take `List<elem>`
     /// and produce `List<result>`, applying per-element cost/redaction but
@@ -190,20 +210,39 @@ pub struct Method {
 #[serde(rename_all = "snake_case", tag = "law")]
 pub enum InterfaceLaw {
     /// `method(x)` then `method(x)` ≡ `method(x)` (e.g. idempotent writes).
-    Idempotent { method: String },
+    Idempotent {
+        /// Method name governed by the law.
+        method: String,
+    },
     /// Reading back what was written returns it: `get(write(k,v)) == v`.
-    ReadYourWrites { write: String, read: String },
+    ReadYourWrites {
+        /// Write method name.
+        write: String,
+        /// Read method name.
+        read: String,
+    },
     /// Two methods commute: order does not affect the result.
-    Commutes { a: String, b: String },
+    Commutes {
+        /// First method name.
+        a: String,
+        /// Second method name.
+        b: String,
+    },
     /// A free-form named law for laws not yet modeled structurally.
-    Custom { name: String },
+    Custom {
+        /// Law name.
+        name: String,
+    },
 }
 
 /// A method family a Resource exposes (§4.2).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Interface {
+    /// Stable interface id.
     pub id: InterfaceId,
+    /// Interface family used for high-level classification.
     pub family: InterfaceFamily,
+    /// Methods exposed by this interface.
     pub methods: Vec<Method>,
     /// Algebraic laws (§4.2) for validation / optimization / Sim. Empty by
     /// default; advisory metadata, never load-bearing for execution.
@@ -226,10 +265,12 @@ impl Interface {
 /// The set of interfaces a Resource exposes / a Binding/Driver implements.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InterfaceSet {
+    /// Interface ids in the set.
     pub interfaces: Vec<InterfaceId>,
 }
 
 impl InterfaceSet {
+    /// Create a set from interface ids.
     pub fn new(interfaces: Vec<InterfaceId>) -> Self {
         Self { interfaces }
     }
@@ -244,16 +285,18 @@ impl InterfaceSet {
 }
 
 /// Control-plane name of a Resource (§10.2). `Path` form, e.g.
-/// `effect://inference/infer`. Never appears in an [`Operation`] or on the
-/// hot path — resolved to a [`ResourceId`] in the control plane.
+/// `effect://inference/infer`. Never appears in an Operation or on the hot
+/// path — resolved to a [`ResourceId`] in the control plane.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ResourceName(pub Path);
 
 impl ResourceName {
+    /// Wrap a parsed path as a resource name.
     pub fn new(path: Path) -> Self {
         Self(path)
     }
+    /// Borrow the underlying path.
     pub fn path(&self) -> &Path {
         &self.0
     }
@@ -281,10 +324,13 @@ pub enum ResourceKind {
 /// provider id). Console-facing; not consulted on the hot path.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Metadata {
+    /// Optional display label for consoles and descriptors.
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Optional provider id that projected this resource.
     #[serde(default)]
     pub provider_id: Option<String>,
+    /// Free-form tags for discovery and filtering.
     #[serde(default)]
     pub tags: Vec<String>,
 }
@@ -293,8 +339,11 @@ pub struct Metadata {
 /// metadata. The live binding is referenced by [`Resource::binding`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResourceDescriptor {
+    /// Control-plane resource name.
     pub name: ResourceName,
+    /// Broad resource category.
     pub kind: ResourceKind,
+    /// Console/provider metadata.
     #[serde(default)]
     pub metadata: Metadata,
 }
@@ -304,9 +353,13 @@ pub struct ResourceDescriptor {
 /// Handle or Fact); the descriptor itself is never touched on the hot path.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Resource {
+    /// Stable resource id assigned by the registry.
     pub id: ResourceId,
+    /// Name, kind, and metadata.
     pub descriptor: ResourceDescriptor,
+    /// Interfaces this resource exposes.
     pub interfaces: InterfaceSet,
+    /// Binding selected for this resource.
     pub binding: BindingId,
 }
 
@@ -314,7 +367,9 @@ pub struct Resource {
 /// lives in the kernel; this descriptor only names it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DriverRef {
+    /// Stable driver id assigned by the registry.
     pub id: DriverId,
+    /// Human-readable driver name.
     pub name: String,
 }
 
@@ -323,10 +378,13 @@ pub struct DriverRef {
 /// (§14.3); the descriptor here records the binding the control plane resolved.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Binding {
+    /// Stable binding id assigned by the registry.
     pub id: BindingId,
     /// Path-pattern selector for the Resources this binding covers.
     pub selector: crate::grant::ResourceSelector,
+    /// Interfaces this binding can serve.
     pub interfaces: InterfaceSet,
+    /// Driver selected by the binding.
     pub driver: DriverRef,
     /// `None` = local inline driver; `Some` = remote endpoint (§7.4).
     pub endpoint: Option<EndpointId>,

@@ -37,13 +37,21 @@ pub enum TaintSource {
     /// authoritative provenance an extension's self-reported metadata cannot
     /// clear or forge (§16.3.3).
     Inbound {
+        /// `installation_id/projection_id` source projection key.
         source_projection_key: SmolStr,
+        /// Stream name within that source projection.
         event_stream: SmolStr,
     },
     /// A fetch result or external tool output, tagged by host.
-    Fetched { host: SmolStr },
+    Fetched {
+        /// Host that produced the fetched content.
+        host: SmolStr,
+    },
     /// Read from a protected source (`state://vault/*`, private, health).
-    Protected { path: Path },
+    Protected {
+        /// Protected path that contributed data.
+        path: Path,
+    },
 }
 
 impl TaintSource {

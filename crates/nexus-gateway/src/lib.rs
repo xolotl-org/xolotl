@@ -19,17 +19,23 @@ use nexus_types::{Outcome, Path, ProcessId, ResourceName, TaintSet, TaintSource,
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Errors surfaced by gateway authentication, authorization, and request
+/// admission.
 #[derive(Debug, Error)]
 pub enum GatewayError {
+    /// Credentials were absent or failed validation.
     #[error("authentication failed")]
     Unauthenticated,
+    /// Authenticated identity is not allowed to use this gateway.
     #[error("identity {0} is not authorized for this gateway")]
     Unauthorized(String),
+    /// The request was rejected by gateway admission or kernel setup.
     #[error("request rejected: {0}")]
     Rejected(String),
 }
 
 impl GatewayError {
+    /// Redacted message suitable for returning to an external client.
     pub fn public_message(&self) -> &'static str {
         match self {
             GatewayError::Unauthenticated => "authentication failed",
@@ -38,6 +44,7 @@ impl GatewayError {
         }
     }
 
+    /// Stable audit outcome tag for this error.
     pub fn audit_outcome(&self) -> &'static str {
         match self {
             GatewayError::Unauthenticated => "auth_failed",
@@ -73,6 +80,11 @@ pub trait Gateway: Send + Sync {
         program: DoNode,
     ) -> Result<Outcome, GatewayError>;
 
+    /// Record gateway-local audit metadata for an inbound request.
+    ///
+    /// The default implementation is a no-op for test gateways. Production
+    /// gateways should forward the record to the kernel audit path so protocol
+    /// authentication and admission decisions remain visible.
     fn record_gateway_audit(&self, _audit: GatewayAudit<'_>) -> Result<(), String> {
         Ok(())
     }
@@ -99,6 +111,7 @@ pub struct InProcessGateway {
 }
 
 impl InProcessGateway {
+    /// Create a gateway backed by an in-memory or production [`Bootstrap`].
     pub fn new(boot: Arc<Bootstrap>) -> Self {
         Self {
             boot,

@@ -51,6 +51,8 @@ use tokio::sync::mpsc;
 
 const MAX_VISIBILITY_TTL_MS: u64 = 10 * 60 * 1000;
 
+/// Upgrade an authenticated HTTP request path to the Console Protocol
+/// WebSocket endpoint.
 pub async fn upgrade(
     ws: WebSocketUpgrade,
     headers: HeaderMap,

@@ -31,6 +31,7 @@ pub struct FetchDriver {
 }
 
 impl FetchDriver {
+    /// Create a fetch driver that offloads large responses into `state`.
     pub fn new(state: Backend) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -93,7 +94,7 @@ fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
 /// Small bodies are inlined as a `Str`; bodies at or over [`INLINE_BODY_LIMIT`]
 /// are returned as a content-addressed [`Value::Blob`] so the Fact stays small
 /// (§4.4). Callers that produce a BlobRef must also persist the bytes via
-/// [`body_to_value_persisted`].
+/// `body_to_value_persisted`.
 pub fn body_to_value(bytes: Vec<u8>, mime: Option<String>) -> Value {
     if bytes.len() >= INLINE_BODY_LIMIT {
         let hash = blake3::hash(&bytes).to_hex().to_string();

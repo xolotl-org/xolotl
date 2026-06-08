@@ -23,7 +23,9 @@ use std::sync::Arc;
 /// Result of executing one operation: the outcome plus the recorded decision
 /// tag (so the executor can drive control flow and the Fact is consistent).
 pub struct ExecOutput {
+    /// Driver or policy outcome produced by the operation.
     pub outcome: Outcome,
+    /// Taint carried by the operation result.
     pub output_taint: TaintSet,
 }
 
@@ -32,7 +34,9 @@ pub struct ExecOutput {
 /// driver call.
 #[derive(Clone)]
 pub struct DataPlane {
+    /// Shared handle table used for generational handle lookup.
     pub handles: Arc<RwLock<HandleTable>>,
+    /// Fact sink used to record operation attempts and completions.
     pub facts: FactSink,
     /// Idempotency dedup store (§21.3): effective-key → cached outcome for
     /// `IdempotentEffect` ops. Records are stored under `state://idemp/<hash>`,
@@ -45,6 +49,7 @@ pub struct DataPlane {
 }
 
 impl DataPlane {
+    /// Create a data plane over a handle table, fact sink, and state backend.
     pub fn new(
         handles: Arc<RwLock<HandleTable>>,
         facts: FactSink,
@@ -58,6 +63,7 @@ impl DataPlane {
         }
     }
 
+    /// Attach the process table used by async process outputs.
     pub fn with_processes(mut self, processes: crate::process::ProcessTable) -> Self {
         self.processes = Some(processes);
         self
@@ -65,7 +71,7 @@ impl DataPlane {
 
     /// Execute one operation (§6). `method_index` is the bit position of the
     /// method within the resource's interface (for the rights bitmap);
-    /// `replay` is the operation's derived [`ReplayClass`] used for the Fact
+    /// `replay` is the operation's derived [`nexus_types::ReplayClass`] used for the Fact
     /// barrier. `now_millis` stamps the Fact and feeds residual checks.
     /// `record` gates Fact creation (§9.2): side effects, observations that feed
     /// control flow, and denials always record; a pure-deterministic read whose
@@ -91,6 +97,8 @@ impl DataPlane {
         .await
     }
 
+    /// Execute one operation while passing the method's `batchable` declaration
+    /// into the driver context.
     pub async fn execute_batchable(
         &self,
         op: &Operation,

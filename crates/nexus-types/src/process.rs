@@ -13,7 +13,7 @@ use crate::value::{Failure, Value};
 use serde::{Deserialize, Serialize};
 
 /// Reference to a Program source (control-plane input, §3). The kernel does
-/// not prescribe the source format (Do<A>, model plan, runbook, native).
+/// not prescribe the source format (`Do<A>`, model plan, runbook, native).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProgramRef {
     /// Opaque source identifier (path or content id of the program source).
@@ -25,6 +25,7 @@ pub struct ProgramRef {
 /// type stays wasm-safe and serializable. Recovery re-binds the same hash.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompiledProgramRef {
+    /// Hash of the compiled execution graph bound to the process.
     pub graph_hash: [u8; 32],
 }
 
@@ -43,18 +44,27 @@ pub enum Recoverability {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessStatus {
+    /// Process record exists but execution has not started.
     #[default]
     Created,
+    /// Process is actively executing its graph.
     Running,
+    /// Process is blocked on a wait, approval, stream, or async result.
     Waiting,
+    /// Process is paused by policy or operator action.
     Suspended,
+    /// Process is running cleanup before terminal completion.
     Finalizing,
+    /// Process completed successfully.
     Completed,
+    /// Process terminated with failure.
     Failed,
+    /// Process was cancelled before normal completion.
     Cancelled,
 }
 
 impl ProcessStatus {
+    /// Returns true for statuses that cannot transition back to execution.
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -67,13 +77,16 @@ impl ProcessStatus {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExpireRule {
+    /// Continue until explicitly cancelled.
     UntilCancelled,
+    /// Expire after the program reaches success or failure.
     #[default]
     UntilDoneOrFail,
     /// Wall-clock millis-since-epoch deadline.
     Deadline(i64),
     /// Expire when a signal is written to this path.
     OnSignal(Path),
+    /// Expire when any configured budget dimension is exhausted.
     BudgetExhausted,
 }
 
@@ -81,8 +94,11 @@ pub enum ExpireRule {
 /// here; the budget *spec* (limits) lives in [`StartRecord`].
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BudgetState {
+    /// Micro-USD already reserved or spent in the current accounting window.
     pub spent_micro_usd: u64,
+    /// Number of operations currently reserved but not settled.
     pub inflight_ops: u32,
+    /// Inference tokens reserved or spent in the current accounting window.
     pub inference_tokens: u64,
 }
 
@@ -154,9 +170,13 @@ impl BudgetState {
 /// Per-dimension budget limits (§21.2). `None` = unbounded on that dimension.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BudgetSpec {
+    /// Maximum micro-USD allowed per day.
     pub daily_micro_usd: Option<u64>,
+    /// Maximum micro-USD allowed per month.
     pub monthly_micro_usd: Option<u64>,
+    /// Maximum number of concurrent in-flight operations.
     pub max_inflight_ops: Option<u32>,
+    /// Maximum inference tokens allowed in the accounting window.
     pub max_inference_tokens: Option<u64>,
 }
 
@@ -166,7 +186,9 @@ pub struct BudgetSpec {
 pub struct StartRecord {
     /// The identity prefix this Process acts as by default.
     pub identity: IdentityRef,
+    /// Budget limits for the process.
     pub budget: BudgetSpec,
+    /// Expiry behavior for the process.
     pub expires: ExpireRule,
     /// Free-form persona / configuration parameters.
     #[serde(default)]
@@ -178,15 +200,22 @@ pub struct StartRecord {
 /// program.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Process {
+    /// Stable process id.
     pub id: ProcessId,
+    /// Parent process, if this was spawned by another process.
     pub parent: Option<ProcessId>,
+    /// Program source reference used at creation time.
     pub source: ProgramRef,
+    /// Frozen compiled graph reference used for execution and recovery.
     pub program: CompiledProgramRef,
+    /// Startup identity, budget, expiry, and parameters.
     pub start: StartRecord,
     /// Grant sources held by this Process (handles are tracked in the kernel
     /// HandleTable, keyed by owner).
     pub grants: Vec<GrantId>,
+    /// Current budget account state.
     pub budget: BudgetState,
+    /// Lifecycle state.
     pub status: ProcessStatus,
 }
 
@@ -194,6 +223,7 @@ pub struct Process {
 /// child's grant can only narrow, never strengthen.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GrantAttenuation {
+    /// Parent grant being attenuated.
     pub grant: GrantId,
     /// Narrowed selector literal (must be ⊆ the parent grant's selector).
     pub selector: String,
@@ -205,9 +235,13 @@ pub struct GrantAttenuation {
 /// Request to create a child Process (§3). Grants may only be attenuated.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SpawnRequest {
+    /// Parent process issuing the spawn.
     pub parent: ProcessId,
+    /// Child program source reference.
     pub program: ProgramRef,
+    /// Child startup parameters.
     pub start: StartRecord,
+    /// Attenuated grants delegated to the child.
     pub grants: Vec<GrantAttenuation>,
 }
 
@@ -225,14 +259,17 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// Returns true for successful outcomes, including short-circuited success.
     pub fn is_success(&self) -> bool {
         matches!(self, Outcome::Done(_) | Outcome::Short(_))
     }
 
+    /// Returns true when the outcome is a failure.
     pub fn is_fail(&self) -> bool {
         matches!(self, Outcome::Fail(_))
     }
 
+    /// Convert success outcomes into their value, or return the failure.
     pub fn into_value(self) -> Result<Value, Failure> {
         match self {
             Outcome::Done(v) | Outcome::Short(v) => Ok(v),
@@ -240,6 +277,7 @@ impl Outcome {
         }
     }
 
+    /// Borrow the success value if this outcome completed.
     pub fn value(&self) -> Option<&Value> {
         match self {
             Outcome::Done(v) | Outcome::Short(v) => Some(v),

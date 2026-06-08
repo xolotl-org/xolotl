@@ -55,12 +55,17 @@ pub struct PairingDriver {
     display_edge: PairingDisplayEdge,
 }
 
+/// One-shot edge for pairing display secrets.
+///
+/// Secrets staged here are consumed by Console/transport code after the
+/// ordinary pairing Operation records only hash/checksum metadata.
 #[derive(Clone, Default)]
 pub struct PairingDisplayEdge {
     pending_secrets: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
 impl PairingDisplayEdge {
+    /// Consume and remove the display secret for `pairing_id`.
     pub fn take_display_secret(&self, pairing_id: &str) -> Option<String> {
         self.pending_secrets.lock().remove(pairing_id)
     }
@@ -73,10 +78,12 @@ impl PairingDisplayEdge {
 }
 
 impl PairingDriver {
+    /// Create a pairing driver with a default one-shot display edge.
     pub fn new(state: Backend) -> Self {
         Self::with_display_edge(state, PairingDisplayEdge::default())
     }
 
+    /// Create a pairing driver with an explicit display edge.
     pub fn with_display_edge(state: Backend, display_edge: PairingDisplayEdge) -> Self {
         Self {
             state,
@@ -845,6 +852,7 @@ fn credential_hash(installation_id: &str, pairing_id: &str, generation: i64) -> 
 /// daemon's credential store and at the transport boundary.
 #[derive(Clone)]
 pub struct ExtensionCredential {
+    /// Installation this credential belongs to.
     pub installation_id: String,
     /// The current credential generation; a revoke bumps it (§16.3.4).
     pub generation: u64,
@@ -965,13 +973,21 @@ impl ExtensionCredential {
 /// are not encrypted, but any change invalidates the AEAD tag.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnvelopeAad {
+    /// Envelope format version.
     pub version: u32,
+    /// Projection id for the frame's role session.
     pub projection_id: String,
+    /// Role name bound into the frame.
     pub role: String,
+    /// Session id bound into the frame.
     pub session_id: String,
+    /// Monotonic frame sequence number.
     pub seq: u64,
+    /// Business/control frame type.
     pub frame_type: String,
+    /// Binding generation observed by the sender.
     pub binding_generation: u64,
+    /// Credential generation observed by the sender.
     pub credential_generation: u64,
 }
 
@@ -994,10 +1010,15 @@ impl Default for EnvelopeAad {
 /// business/control frame; AAD binds the envelope to the session/generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecureExtensionEnvelope {
+    /// Installation id the envelope is for.
     pub installation_id: String,
+    /// Credential generation used to seal the frame.
     pub generation: u64,
+    /// Authenticated frame metadata.
     pub aad: EnvelopeAad,
+    /// Random nonce prefix; combined with `aad.seq`.
     pub nonce_prefix: [u8; 12],
+    /// Encrypted serialized frame body.
     pub ciphertext: Vec<u8>,
 }
 

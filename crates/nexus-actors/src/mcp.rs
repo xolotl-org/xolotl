@@ -82,6 +82,7 @@ pub struct McpToolDriver {
 }
 
 impl McpToolDriver {
+    /// Create an MCP tool driver backed by `client`.
     pub fn new(tool: impl Into<String>, client: Arc<dyn McpClient>) -> Self {
         Self {
             tool: tool.into(),
@@ -128,12 +129,16 @@ impl Driver for McpToolDriver {
 /// An MCP tool descriptor exposed by Nexus (Nexus as MCP server, §18.2).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpToolDescriptor {
+    /// MCP tool name exposed to clients.
     pub name: String,
+    /// Nexus effect path backing the tool.
     pub effect_path: String,
     /// The capability set required to call this tool — the exposure is rejected
     /// without it (§18.2 "暴露前必须绑定 capability set").
     pub required_capability: String,
+    /// Optional MCP input schema.
     pub input_schema: Option<Value>,
+    /// Optional MCP output schema.
     pub output_schema: Option<Value>,
 }
 

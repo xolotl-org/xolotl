@@ -282,6 +282,7 @@ pub struct IndexDriver {
 }
 
 impl IndexDriver {
+    /// Create an empty in-memory vector index driver.
     pub fn new() -> Self {
         Self::default()
     }

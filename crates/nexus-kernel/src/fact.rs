@@ -62,6 +62,7 @@ struct FactStoreInner {
 }
 
 impl InMemoryFactStore {
+    /// Create an empty in-memory fact store.
     pub fn new() -> Self {
         Self::default()
     }
@@ -71,10 +72,12 @@ impl InMemoryFactStore {
         self.inner.lock().sync_count
     }
 
+    /// Number of facts currently retained in memory.
     pub fn len(&self) -> usize {
         self.inner.lock().facts.len()
     }
 
+    /// Whether no facts have been appended.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -142,10 +145,12 @@ pub struct FactSink {
 }
 
 impl FactSink {
+    /// Wrap a shared fact store in the kernel-facing sink.
     pub fn new(store: SharedFactStore) -> Self {
         Self { store }
     }
 
+    /// Create a sink backed by an in-memory fact store and return both handles.
     pub fn in_memory() -> (Self, Arc<InMemoryFactStore>) {
         let store = Arc::new(InMemoryFactStore::new());
         (
@@ -182,18 +187,22 @@ impl FactSink {
         Ok(())
     }
 
+    /// Access the underlying shared fact store.
     pub fn store(&self) -> &SharedFactStore {
         &self.store
     }
 
+    /// Return all facts for `process` in append order.
     pub fn facts_of(&self, process: nexus_types::ProcessId) -> Result<Vec<Fact>, FactError> {
         self.store.facts_of(process)
     }
 
+    /// Return all facts in append order.
     pub fn all_facts(&self) -> Result<Vec<Fact>, FactError> {
         self.store.all_facts()
     }
 
+    /// Current append cursor of the underlying fact store.
     pub fn cursor(&self) -> u64 {
         self.store.cursor()
     }

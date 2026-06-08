@@ -19,18 +19,24 @@ use std::sync::Arc;
 /// The verdict of a policy / one check (§8).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PolicyDecision {
+    /// Residual checks allowed the operation to proceed.
     Allow,
     /// Requires human confirmation (§17 Approval). Carries the approval key.
     Ask {
+        /// Stable key used by the approval broker to correlate a decision.
         approval_key: String,
+        /// Operator-facing reason for the approval request.
         reason: String,
     },
+    /// Policy rejected the operation.
     Deny {
+        /// Human-readable denial reason.
         reason: String,
     },
 }
 
 impl PolicyDecision {
+    /// Whether this decision is [`PolicyDecision::Allow`].
     pub fn is_allow(&self) -> bool {
         matches!(self, PolicyDecision::Allow)
     }
@@ -39,6 +45,7 @@ impl PolicyDecision {
 /// What `open()` knows when compiling a policy (§8.1): everything fixed at open
 /// time, so decidable checks can be evaluated and eliminated now.
 pub struct OpenContext<'a> {
+    /// Resource being opened.
     pub resource: ResourceId,
     /// The resource's address (for path-based policy matching).
     pub resource_path: &'a Path,
@@ -52,8 +59,10 @@ pub struct OpenContext<'a> {
     pub now_millis: i64,
 }
 
+/// Errors returned while compiling a source policy at open time.
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyCompileError {
+    /// The policy denied the open before a handle could be created.
     #[error("policy denied at open: {0}")]
     DeniedAtOpen(String),
 }
@@ -74,8 +83,11 @@ pub trait PolicySource: Send + Sync + 'static {
 /// The request context a residual check evaluates against (the runtime view of
 /// an operation — input + acting + wall clock + target resource).
 pub struct CheckCtx<'a> {
+    /// Operation input being evaluated.
     pub input: &'a Value,
+    /// Identity the operation acts as.
     pub acting: nexus_types::IdentityRef,
+    /// Wall clock timestamp used for time-dependent residual checks.
     pub now_millis: i64,
     /// The resource the operation targets (rate-limit / audit keying, §21.3).
     pub target: ResourceId,
@@ -87,6 +99,7 @@ pub struct CheckCtx<'a> {
 /// handles; `Unconditional` handles carry none.
 #[async_trait::async_trait]
 pub trait CompiledCheck: Send + Sync + 'static {
+    /// Evaluate this residual check against one operation.
     async fn evaluate(&self, ctx: &CheckCtx) -> PolicyDecision;
     /// Short name for trace/why-not projections.
     fn name(&self) -> &'static str;
@@ -101,12 +114,14 @@ pub struct PolicySnapshot {
 }
 
 impl PolicySnapshot {
+    /// Create a policy snapshot from residual checks.
     pub fn new(checks: Vec<Arc<dyn CompiledCheck>>) -> Self {
         Self {
             checks: Arc::new(checks),
         }
     }
 
+    /// Create an empty residual snapshot.
     pub fn empty() -> Self {
         Self {
             checks: Arc::new(Vec::new()),
@@ -119,6 +134,7 @@ impl PolicySnapshot {
         self.checks.is_empty()
     }
 
+    /// Number of residual checks in this snapshot.
     pub fn len(&self) -> usize {
         self.checks.len()
     }
@@ -149,6 +165,7 @@ impl PolicySnapshot {
 /// not be eliminated at open (e.g. `@account=alice`, `@budget<=0.10`). Carries
 /// the [`ConstraintSet`] and evaluates it fail-closed against the op input.
 pub struct ConstraintCheck {
+    /// Constraint predicates to evaluate against operation input.
     pub constraints: ConstraintSet,
 }
 
@@ -174,8 +191,11 @@ impl CompiledCheck for ConstraintCheck {
 /// the operation resolves: `approved` ⇒ Allow, `denied` ⇒ Deny, otherwise Ask
 /// (still pending). Without a registry it is always `Ask` (the simplest gate).
 pub struct ApprovalCheck {
+    /// Approval correlation key.
     pub approval_key: String,
+    /// Reason shown to the approver.
     pub reason: String,
+    /// Optional hydrated decision source.
     pub registry: Option<ApprovalRegistry>,
 }
 
@@ -230,8 +250,11 @@ impl CompiledCheck for ApprovalCheck {
 /// A human-approval decision (§17.4).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApprovalDecision {
+    /// No human decision has been recorded.
     Pending,
+    /// Human approved the operation.
     Approved,
+    /// Human denied the operation.
     Denied,
 }
 
@@ -246,14 +269,17 @@ pub struct ApprovalRegistry {
 }
 
 impl ApprovalRegistry {
+    /// Create an empty approval decision registry.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Look up the current decision for an approval key.
     pub fn decision(&self, key: &str) -> Option<ApprovalDecision> {
         self.inner.read().get(key).copied()
     }
 
+    /// Store or replace the decision for an approval key.
     pub fn set(&self, key: impl Into<String>, decision: ApprovalDecision) {
         self.inner.write().insert(key.into(), decision);
     }
@@ -270,12 +296,15 @@ impl ApprovalRegistry {
 /// in `state://kernel/ratelimit/resource:<target>/identity:<acting>`, so a
 /// crash/restart preserves the active sliding window.
 pub struct RateLimitCheck {
+    /// Maximum allowed admissions inside one sliding window.
     pub max_per_window: u32,
+    /// Sliding window length in milliseconds.
     pub window_millis: i64,
     state: nexus_state::Backend,
 }
 
 impl RateLimitCheck {
+    /// Create a rate-limit residual check backed by the state plane.
     pub fn new(max_per_window: u32, window_millis: i64, state: nexus_state::Backend) -> Self {
         Self {
             max_per_window,
@@ -405,7 +434,9 @@ fn encode_rate_hits(hits: &[i64]) -> Value {
 /// scheme / segments) are decided at open and eliminated; only the predicate
 /// (if any) survives as a residual input check.
 pub struct CapabilityPolicy {
+    /// Capability pattern this policy source applies to.
     pub pattern: Capability,
+    /// Predicate constraints that survive as residual checks.
     pub constraints: ConstraintSet,
 }
 

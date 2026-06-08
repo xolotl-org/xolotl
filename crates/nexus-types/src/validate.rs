@@ -33,12 +33,14 @@ pub struct PathRegistry {
 }
 
 impl PathRegistry {
+    /// Create an empty registry.
     pub fn new() -> Self {
         Self {
             validators: BTreeMap::new(),
         }
     }
 
+    /// Register a validator for a scheme.
     pub fn register(&mut self, scheme: &str, validator: Arc<dyn PathValidator>) {
         self.validators.insert(scheme.to_string(), validator);
     }
@@ -53,6 +55,7 @@ impl PathRegistry {
         }
     }
 
+    /// Whether no validators are registered.
     pub fn is_empty(&self) -> bool {
         self.validators.is_empty()
     }

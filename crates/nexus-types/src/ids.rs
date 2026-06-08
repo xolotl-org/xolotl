@@ -19,7 +19,9 @@ macro_rules! id_u64 {
         pub struct $name(pub u64);
 
         impl $name {
+            /// Construct an id from its raw integer value.
             pub const fn new(v: u64) -> Self { Self(v) }
+            /// Return the raw integer value.
             pub const fn get(self) -> u64 { self.0 }
         }
 
@@ -53,8 +55,7 @@ id_u64!(/// Identifies a compiled `ExecutionGraph`.
     GraphId);
 
 /// A resolved identity prefix. The data plane carries this, never the raw
-/// `Path` of the identity (§3, §2.5). `acting` on an [`Operation`] is one of
-/// these.
+/// `Path` of the identity (§3, §2.5). `acting` on an operation is one of these.
 #[derive(
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
@@ -62,10 +63,13 @@ id_u64!(/// Identifies a compiled `ExecutionGraph`.
 pub struct IdentityRef(pub u64);
 
 impl IdentityRef {
+    /// Root/system identity.
     pub const ROOT: IdentityRef = IdentityRef(0);
+    /// Construct an identity ref from its raw integer value.
     pub const fn new(v: u64) -> Self {
         Self(v)
     }
+    /// Return the raw integer value.
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -84,11 +88,14 @@ impl std::fmt::Display for IdentityRef {
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
 pub struct HandleId {
+    /// Slot index in the handle table.
     pub index: u32,
+    /// Slot generation used to reject stale handles.
     pub generation: u32,
 }
 
 impl HandleId {
+    /// Construct a handle id from slot index and generation.
     pub const fn new(index: u32, generation: u32) -> Self {
         Self { index, generation }
     }
@@ -111,10 +118,13 @@ impl std::fmt::Display for HandleId {
 pub struct NodeId(pub u32);
 
 impl NodeId {
+    /// Root node id.
     pub const ROOT: NodeId = NodeId(0);
+    /// Construct a node id from its raw integer value.
     pub const fn new(v: u32) -> Self {
         Self(v)
     }
+    /// Return the raw integer value.
     pub const fn get(self) -> u32 {
         self.0
     }
@@ -139,9 +149,11 @@ pub type CausalPosition = NodeId;
 pub struct Timestamp(pub i64);
 
 impl Timestamp {
+    /// Construct a timestamp from milliseconds since the Unix epoch.
     pub const fn millis(v: i64) -> Self {
         Self(v)
     }
+    /// Return milliseconds since the Unix epoch.
     pub const fn get(self) -> i64 {
         self.0
     }

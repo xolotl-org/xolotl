@@ -15,7 +15,7 @@ use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
 
-/// Bootstrap-only config: [storage] + [server].
+/// Bootstrap-only config: `[storage]` + `[server]`.
 /// Runtime config (backends, models, routing) lives in state.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct NexusConfig {

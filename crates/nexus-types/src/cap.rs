@@ -12,11 +12,14 @@ use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use thiserror::Error;
 
+/// One parsed capability literal.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Capability {
+    /// Capability verb, such as `perform`, `read`, or `spawn`.
     pub verb: String,
     /// `*` or `**` matches any scheme.
     pub scheme: String,
+    /// Path segment pattern.
     pub segments: Vec<SmolStr>,
     /// Optional attenuation predicate (`@key<op>value`). When present, the
     /// capability only authorizes a request whose op input — and the wall
@@ -37,19 +40,27 @@ pub struct Predicate {
     /// Field name looked up in the op input map. The reserved key `until`
     /// instead compares against the current wall clock (millis since epoch).
     pub key: String,
+    /// Comparison operation.
     pub op: PredOp,
     /// Comparison literal. A leading `$` (currency sugar) is stripped before
     /// numeric comparison.
     pub value: String,
 }
 
+/// Predicate comparison operator.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum PredOp {
+    /// Equality.
     Eq,
+    /// Inequality.
     Ne,
+    /// Less-than or equal.
     Le,
+    /// Strictly less-than.
     Lt,
+    /// Greater-than or equal.
     Ge,
+    /// Strictly greater-than.
     Gt,
 }
 
@@ -153,13 +164,16 @@ impl std::fmt::Display for Predicate {
     }
 }
 
+/// Capability parsing errors.
 #[derive(Debug, Error)]
 pub enum CapError {
+    /// Capability literal is malformed.
     #[error("malformed capability: {0}")]
     Malformed(String),
 }
 
 impl Capability {
+    /// Parse a capability literal.
     pub fn parse(s: &str) -> Result<Self, CapError> {
         let (verb, rest) = s
             .split_once("://")
@@ -208,7 +222,7 @@ impl Capability {
         self.predicate.is_none() && self.covers_path(verb, target)
     }
 
-    /// Like [`covers`] but also evaluates the predicate (if any) against the
+    /// Like [`Self::covers`] but also evaluates the predicate (if any) against the
     /// op `input` and `now_millis`. This is the authoritative check used at
     /// `open()` time and by residual policy checks (§5/§8).
     pub fn covers_with(&self, verb: &str, target: &Path, input: &Value, now_millis: i64) -> bool {
@@ -342,14 +356,20 @@ fn pattern_subsumes(a: &[SmolStr], b: &[SmolStr]) -> bool {
     bi == b.len()
 }
 
+/// A set of capabilities.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CapSet(pub Vec<Capability>);
+pub struct CapSet(
+    /// Capabilities in this set.
+    pub Vec<Capability>,
+);
 
 impl CapSet {
+    /// Create an empty capability set.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Parse a capability set from string literals.
     pub fn from_strs<I, S>(items: I) -> Result<Self, CapError>
     where
         I: IntoIterator<Item = S>,
@@ -362,10 +382,12 @@ impl CapSet {
         Ok(Self(v))
     }
 
+    /// Add one capability to the set.
     pub fn push(&mut self, c: Capability) {
         self.0.push(c);
     }
 
+    /// Return true if any non-predicated capability covers the target.
     pub fn contains(&self, verb: &str, target: &Path) -> bool {
         self.0.iter().any(|c| c.covers(verb, target))
     }
@@ -379,6 +401,7 @@ impl CapSet {
             .any(|c| c.covers_with(verb, target, input, now_millis))
     }
 
+    /// Return true if this set contains all required verb/path pairs.
     pub fn contains_all(&self, requireds: &[(&str, Path)]) -> bool {
         requireds.iter().all(|(v, p)| self.contains(v, p))
     }
@@ -395,12 +418,15 @@ impl CapSet {
         CapSet(out)
     }
 
+    /// Iterate over capabilities.
     pub fn iter(&self) -> std::slice::Iter<'_, Capability> {
         self.0.iter()
     }
+    /// Number of capabilities in the set.
     pub fn len(&self) -> usize {
         self.0.len()
     }
+    /// Whether the set is empty.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

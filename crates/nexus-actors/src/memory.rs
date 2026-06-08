@@ -36,13 +36,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// (consolidated) → Archive (cold).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Tier {
+    /// Session-local working memory.
     Working,
+    /// Recently used memory that still decays.
     Recent,
+    /// Consolidated long-term memory.
     LongTerm,
+    /// Cold memory retained for archival recall.
     Archive,
 }
 
 impl Tier {
+    /// Stable string representation stored in memory metadata.
     pub fn as_str(self) -> &'static str {
         match self {
             Tier::Working => "working",
@@ -92,6 +97,7 @@ struct EmbeddingForIndex {
 }
 
 impl MemoryDriver {
+    /// Create a memory driver with the baseline in-process retrieval stack.
     pub fn new(state: Backend) -> Self {
         Self {
             state,

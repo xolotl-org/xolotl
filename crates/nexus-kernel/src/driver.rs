@@ -22,12 +22,16 @@ use thiserror::Error;
 /// `DriverError` is mapped to a `Failure`/`DecisionTag` by the data plane.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum DriverError {
+    /// Requested method is not present in this driver plan.
     #[error("method {0} not implemented by this driver")]
     NoSuchMethod(MethodId),
+    /// Driver cannot produce the requested output mode.
     #[error("output mode {0:?} not supported")]
     UnsupportedOutput(OutputMode),
+    /// Transport or endpoint failure while reaching the driver.
     #[error("transport error: {0}")]
     Transport(String),
+    /// Driver-specific failure that does not fit a narrower category.
     #[error("driver error: {0}")]
     Other(String),
 }
@@ -65,6 +69,7 @@ pub struct DriverContext {
 }
 
 impl DriverContext {
+    /// Create a context for a call acting as `acting` on behalf of `caller`.
     pub fn new(acting: nexus_types::IdentityRef, caller: nexus_types::ProcessId) -> Self {
         Self {
             acting,
@@ -97,6 +102,7 @@ impl DriverContext {
         self
     }
 
+    /// Attach a streaming sink for `OutputMode::Stream` results.
     pub fn with_stream(
         mut self,
         to: nexus_types::Path,
@@ -123,6 +129,7 @@ impl DriverContext {
         *self.output_taint.lock() = taint;
     }
 
+    /// Return the output taint recorded by the driver.
     pub fn output_taint(&self) -> nexus_types::TaintSet {
         self.output_taint.lock().clone()
     }
@@ -152,9 +159,11 @@ pub type DynDriver = Arc<dyn Driver>;
 /// endpoint bindings to a [`RemoteDriver`] that calls this interface.
 #[async_trait]
 pub trait RemoteEndpoint: Send + Sync + 'static {
+    /// Send an invoke request to a remote provider endpoint.
     async fn invoke(&self, invoke: Invoke) -> Result<InvokeResult, DriverError>;
 }
 
+/// Shared remote endpoint handle.
 pub type DynRemoteEndpoint = Arc<dyn RemoteEndpoint>;
 
 /// RPC stub compiled into a [`DriverPlan`] for `Binding.endpoint = Some(_)`.
@@ -167,6 +176,7 @@ pub struct RemoteDriver {
 }
 
 impl RemoteDriver {
+    /// Create a remote driver stub for one endpoint and effect path.
     pub fn new(endpoint_id: EndpointId, effect_path: Path, endpoint: DynRemoteEndpoint) -> Self {
         Self {
             endpoint_id,
@@ -215,10 +225,13 @@ impl Driver for RemoteDriver {
 /// Descriptor of a driver implementation (control plane, §7.2).
 #[derive(Clone)]
 pub struct DriverDescriptor {
+    /// Stable driver id assigned by the registry.
     pub id: DriverId,
+    /// Human-readable driver name for registry and console views.
     pub name: String,
     /// Interfaces this driver implements (admission checks coverage, §7.2).
     pub implements: InterfaceSet,
+    /// Local or remote transport shape used by this driver.
     pub transport: Transport,
     /// The live implementation.
     pub driver: DynDriver,
@@ -227,7 +240,9 @@ pub struct DriverDescriptor {
 /// Per-method dispatch entry within a [`DriverPlan`].
 #[derive(Clone)]
 pub struct DispatchEntry {
+    /// Method id this dispatch entry serves.
     pub method: MethodId,
+    /// Driver implementation used for the method.
     pub driver: DynDriver,
 }
 
@@ -236,7 +251,10 @@ pub struct DispatchEntry {
 /// further resolution. `generation` matches the Binding link epoch (§14.3).
 #[derive(Clone)]
 pub struct DriverPlan {
+    /// Driver descriptor selected by open.
     pub driver_id: DriverId,
+    /// Remote endpoint selected by the binding, if this plan dispatches over a
+    /// transport boundary.
     pub endpoint: Option<nexus_types::EndpointId>,
     /// method id → live driver. Local inline or a remote RPC stub driver.
     ///
@@ -244,10 +262,12 @@ pub struct DriverPlan {
     /// Keep the frozen dispatch table shared so those clones stay O(1) Arc
     /// bumps instead of duplicating the HashMap on every operation.
     table: Arc<HashMap<MethodId, DynDriver>>,
+    /// Binding generation captured when the handle was opened.
     pub generation: u64,
 }
 
 impl DriverPlan {
+    /// Create an empty dispatch plan for a driver and optional endpoint.
     pub fn new(
         driver_id: DriverId,
         endpoint: Option<nexus_types::EndpointId>,
@@ -261,6 +281,7 @@ impl DriverPlan {
         }
     }
 
+    /// Add or replace a per-method driver entry.
     pub fn insert(&mut self, method: MethodId, driver: DynDriver) {
         Arc::make_mut(&mut self.table).insert(method, driver);
     }
@@ -281,10 +302,12 @@ impl DriverPlan {
         driver.call(method, input, output, ctx).await
     }
 
+    /// Whether this plan contains a dispatch entry for `method`.
     pub fn supports(&self, method: MethodId) -> bool {
         self.table.contains_key(&method)
     }
 
+    /// Whether this plan calls a remote endpoint.
     pub fn is_remote(&self) -> bool {
         self.endpoint.is_some()
     }

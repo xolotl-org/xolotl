@@ -23,6 +23,7 @@ pub struct FactDriver {
 }
 
 impl FactDriver {
+    /// Create a fact read-side projection driver backed by a shared fact store.
     pub fn new(facts: SharedFactStore) -> Self {
         Self { facts }
     }

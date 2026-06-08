@@ -28,7 +28,9 @@ use thiserror::Error;
 /// A ready kernel plus the root Process id (§14.1). The root holds an
 /// omnipotent grant; everything else is attenuated from it.
 pub struct Bootstrap {
+    /// Assembled kernel instance.
     pub kernel: Kernel,
+    /// Root/system process seeded during bootstrap.
     pub root: ProcessId,
 }
 
@@ -36,34 +38,57 @@ pub struct Bootstrap {
 /// a request Process exists (credentials must not enter Operation input), but
 /// they still need to be projected from the Fact stream.
 pub struct GatewayAudit<'a> {
+    /// Audit event name, such as `console_login`.
     pub event: &'a str,
+    /// Username involved in the event, when known.
     pub username: Option<&'a str>,
+    /// Redacted source address or peer label.
     pub source_addr: Option<&'a str>,
+    /// Stable outcome tag for the event.
     pub outcome: &'a str,
+    /// MFA assurance level associated with the event.
     pub mfa_level: Option<u8>,
+    /// Additional redacted metadata.
     pub details: Option<nexus_types::Value>,
 }
 
+/// Errors raised while assembling built-in resources, drivers, and bootstrap
+/// facts/state.
 #[derive(Debug, Error)]
 pub enum BootstrapError {
+    /// A method list is invalid for the resource being registered.
     #[error("invalid method spec for {resource}: {reason}")]
-    InvalidMethodSpec { resource: String, reason: String },
+    InvalidMethodSpec {
+        /// Resource path being registered.
+        resource: String,
+        /// Validation failure reason.
+        reason: String,
+    },
+    /// A capability selector literal could not be parsed.
     #[error("invalid selector {literal:?}: {source}")]
     Selector {
+        /// Literal selector that failed parsing.
         literal: String,
         #[source]
+        /// Parser error.
         source: CapError,
     },
+    /// A resource path literal could not be parsed.
     #[error("invalid path {literal:?}: {source}")]
     Path {
+        /// Literal path that failed parsing.
         literal: String,
         #[source]
+        /// Parser error.
         source: PathError,
     },
+    /// Registry admission rejected a bootstrap object.
     #[error("admission failed: {0}")]
     Admission(#[from] AdmissionError),
+    /// Writing a bootstrap fact failed.
     #[error("fact write failed: {0}")]
     Fact(#[from] crate::FactError),
+    /// Writing bootstrap state failed.
     #[error("state write failed: {0}")]
     State(#[from] nexus_state::StateError),
 }
@@ -72,18 +97,28 @@ pub enum BootstrapError {
 /// bootstrap path may silently advertise streaming for a unary-only driver.
 #[derive(Clone, Copy, Debug)]
 pub struct MethodSpec {
+    /// Public method name inside the interface.
     pub name: &'static str,
+    /// Method purity used to derive replay class.
     pub purity: Purity,
+    /// Output modes supported by this method.
     pub supports: OutputModeSet,
+    /// Whether the method accepts explicit list-shaped batches.
     pub batchable: bool,
+    /// Whether the method observes external state and must record observations
+    /// that affect recovery.
     pub observes_external: bool,
 }
 
 impl MethodSpec {
+    /// Convenience output set for unary plus async-process methods.
     pub const UNARY_ASYNC: OutputModeSet = OutputModeSet::from_bits_retain(0b0101);
+    /// Convenience output set for unary, stream, and async-process methods.
     pub const STREAM_ASYNC: OutputModeSet = OutputModeSet::from_bits_retain(0b0111);
+    /// Convenience output set for sink-only plus async-process methods.
     pub const SINK_ASYNC: OutputModeSet = OutputModeSet::from_bits_retain(0b1100);
 
+    /// Create a method specification with explicit output support.
     pub const fn new(name: &'static str, purity: Purity, supports: OutputModeSet) -> Self {
         Self {
             name,
@@ -94,16 +129,19 @@ impl MethodSpec {
         }
     }
 
+    /// Mark this method as observing external state.
     pub const fn observes_external(mut self) -> Self {
         self.observes_external = true;
         self
     }
 
+    /// Mark this method as explicitly batchable.
     pub const fn batchable(mut self) -> Self {
         self.batchable = true;
         self
     }
 
+    /// Create a unary/async-process method spec.
     pub fn unary_async(name: &'static str, purity: Purity) -> Self {
         Self::new(
             name,
@@ -112,6 +150,7 @@ impl MethodSpec {
         )
     }
 
+    /// Create a stream-capable method spec.
     pub fn stream_async(name: &'static str, purity: Purity) -> Self {
         Self::new(
             name,
@@ -120,6 +159,7 @@ impl MethodSpec {
         )
     }
 
+    /// Create a sink-only/async-process method spec.
     pub fn sink_async(name: &'static str, purity: Purity) -> Self {
         Self::new(
             name,

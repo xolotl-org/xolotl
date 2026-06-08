@@ -20,13 +20,25 @@ pub enum AuditTag {
     /// cross-identity (delegated) action worth surfacing.
     CrossIdentity,
     /// The operation's modeled cost exceeded the rule threshold.
-    HighCost { micro_usd: u64 },
+    HighCost {
+        /// Settled or projected cost in micro-USD.
+        micro_usd: u64,
+    },
     /// A compliance-relevant operation (rule-matched).
-    Compliance { rule: String },
+    Compliance {
+        /// Rule label that matched.
+        rule: String,
+    },
     /// An alert-worthy event (rule-matched); projectors may page on these.
-    Alert { rule: String },
+    Alert {
+        /// Rule label that matched.
+        rule: String,
+    },
     /// A producer-defined audit label carried in redacted Fact metadata.
-    Custom { label: String },
+    Custom {
+        /// Custom audit label.
+        label: String,
+    },
 }
 
 /// Hot-updatable audit rules (`state://kernel/audit/rules`, §21.3). Empty rules

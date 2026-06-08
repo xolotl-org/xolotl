@@ -197,6 +197,7 @@ pub struct ApprovalDriver {
 }
 
 impl ApprovalDriver {
+    /// Create an approval broker backed by the state plane.
     pub fn new(state: Backend) -> Self {
         Self { state }
     }

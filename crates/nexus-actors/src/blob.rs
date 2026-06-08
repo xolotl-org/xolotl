@@ -3,7 +3,7 @@
 //!
 //! Large bytes are content-addressed (blake3) and held in the state backend
 //! under `state://blob/<hash>`; the Operation returns only a [`BlobRef`] /
-//! [`TensorRef`] so Facts never inline payloads (§4.4). GC is retention +
+//! tensor reference so Facts never inline payloads (§4.4). GC is retention +
 //! refcount (§17.4): each `write` increments a per-hash reference count and
 //! `delete` decrements it; the bytes are physically deleted only when the count
 //! reaches zero. Refcounts are stored in the state backend at
@@ -38,6 +38,7 @@ pub struct BlobDriver {
 }
 
 impl BlobDriver {
+    /// Create a blob driver backed by the state plane.
     pub fn new(state: Backend) -> Self {
         Self { state }
     }

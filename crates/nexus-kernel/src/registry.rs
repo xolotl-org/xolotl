@@ -17,28 +17,42 @@ use thiserror::Error;
 
 const SMALL_HOLDER_GRANT_SCAN_LIMIT: usize = 8;
 
+/// Errors returned by control-plane resource name resolution.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ResolveError {
+    /// No registered resource matched the requested name.
     #[error("no resource named {0}")]
     NoSuchResource(String),
 }
 
+/// Errors returned by registry admission checks.
 #[derive(Debug, Error)]
 pub enum AdmissionError {
+    /// Binding's driver does not implement a declared interface.
     #[error("interface {0} not implemented by driver {1}")]
     InterfaceNotImplemented(InterfaceId, DriverId),
+    /// Resource requires interfaces not covered by its binding.
     #[error("binding {0} does not cover resource {1}'s interfaces")]
     InterfacesNotCovered(BindingId, ResourceId),
+    /// Non-kernel caller attempted to register a reserved path.
     #[error("resource name {0} is under a reserved kernel prefix")]
     ReservedPrefix(String),
+    /// Admission failed for a domain-specific reason.
     #[error("admission rejected: {0}")]
     Rejected(String),
 }
 
+/// Exact-match grant selector index key.
+///
+/// Wildcard selectors are not indexed with this key; they stay in the
+/// per-holder wildcard fallback list.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct GrantSelectorKey {
+    /// Process that holds the grant.
     pub holder: ProcessId,
+    /// Capability verb, such as `read` or `perform`.
     pub verb: String,
+    /// Concrete path matched by an exact selector.
     pub path: Path,
 }
 
@@ -47,14 +61,23 @@ pub struct GrantSelectorKey {
 /// the slow path.
 #[derive(Default)]
 pub struct RegistryInner {
+    /// Registered resources keyed by compact id.
     pub resources: HashMap<ResourceId, Resource>,
+    /// Registered interfaces keyed by compact id.
     pub interfaces: HashMap<InterfaceId, Interface>,
+    /// Registered driver descriptors keyed by compact id.
     pub drivers: HashMap<DriverId, DriverDescriptor>,
+    /// Registered remote endpoint transports keyed by compact id.
     pub endpoints: HashMap<EndpointId, DynRemoteEndpoint>,
+    /// Registered bindings keyed by compact id.
     pub bindings: HashMap<BindingId, Binding>,
+    /// Registered grants keyed by grant id.
     pub grants: HashMap<GrantId, Grant>,
+    /// Grant ids grouped by holder for slow-path grant scans.
     pub grants_by_holder: HashMap<ProcessId, Vec<GrantId>>,
+    /// Exact, non-wildcard selector index for large grant sets.
     pub exact_grants: HashMap<GrantSelectorKey, Vec<GrantId>>,
+    /// Wildcard selector fallback grant ids grouped by holder.
     pub wildcard_grants_by_holder: HashMap<ProcessId, Vec<GrantId>>,
     /// Source policies (§8 / §10.1), consulted at `open()`. Held as trait
     /// objects so any `PolicySource` can register.
@@ -65,7 +88,9 @@ pub struct RegistryInner {
     /// descriptions change, so cached plans never survive a re-link/policy
     /// update/admission mutation.
     pub open_cache: HashMap<OpenCacheKey, CompiledOpenPlan>,
+    /// Number of compiled-open-plan cache hits.
     pub open_cache_hits: u64,
+    /// Number of compiled-open-plan cache misses.
     pub open_cache_misses: u64,
     next_id: u64,
 }
@@ -159,17 +184,26 @@ fn target_selector_key(process: ProcessId, verb: &str, target: &Path) -> GrantSe
 /// generations cannot leak through stale plans.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct OpenCacheKey {
+    /// Grant selected by open.
     pub grant: GrantId,
+    /// Resource being opened.
     pub resource: ResourceId,
+    /// Concrete resource path used for selector and policy matching.
     pub resource_path: nexus_types::Path,
+    /// Capability verb requested by open.
     pub verb: String,
+    /// Requested method bitmap bits.
     pub methods: u64,
+    /// Requested right flag bits.
     pub flags: u32,
+    /// Acting identity captured in the open context.
     pub acting: nexus_types::IdentityRef,
+    /// Open-time wall clock used for expiry and static policy checks.
     pub now_millis: i64,
 }
 
 impl OpenCacheKey {
+    /// Build a key from the open context and requested rights.
     pub fn new(
         grant: GrantId,
         resource: ResourceId,
@@ -197,24 +231,40 @@ impl OpenCacheKey {
 /// per open.
 #[derive(Clone)]
 pub struct CompiledOpenPlan {
+    /// Resource id captured by the compiled plan.
     pub resource: ResourceId,
+    /// Rights that will be copied into the handle.
     pub rights: Rights,
+    /// Frozen driver dispatch plan.
     pub driver_plan: DriverPlan,
+    /// Fast-path policy marker captured by open.
     pub fast_path: FastPath,
 }
 
+/// Snapshot of registry object counts and open-plan cache metrics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RegistryCounts {
+    /// Number of registered resources.
     pub resources: usize,
+    /// Number of registered interfaces.
     pub interfaces: usize,
+    /// Number of registered drivers.
     pub drivers: usize,
+    /// Number of registered remote endpoints.
     pub endpoints: usize,
+    /// Number of registered bindings.
     pub bindings: usize,
+    /// Number of registered grants.
     pub grants: usize,
+    /// Number of registered source policies.
     pub policies: usize,
+    /// Number of resource-name index entries.
     pub names: usize,
+    /// Number of compiled open plans in the cache.
     pub open_cache_entries: usize,
+    /// Number of open-plan cache hits.
     pub open_cache_hits: u64,
+    /// Number of open-plan cache misses.
     pub open_cache_misses: u64,
 }
 
@@ -225,39 +275,48 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Create an empty shared registry.
     pub fn new() -> Self {
         Self::default()
     }
 
     // ── id allocation ──────────────────────────────────────────────
 
+    /// Allocate the next resource id.
     pub fn next_resource_id(&self) -> ResourceId {
         ResourceId::new(self.inner.write().fresh_id())
     }
+    /// Allocate the next interface id.
     pub fn next_interface_id(&self) -> InterfaceId {
         InterfaceId::new(self.inner.write().fresh_id())
     }
+    /// Allocate the next driver id.
     pub fn next_driver_id(&self) -> DriverId {
         DriverId::new(self.inner.write().fresh_id())
     }
+    /// Allocate the next remote endpoint id.
     pub fn next_endpoint_id(&self) -> EndpointId {
         EndpointId::new(self.inner.write().fresh_id())
     }
+    /// Allocate the next binding id.
     pub fn next_binding_id(&self) -> BindingId {
         BindingId::new(self.inner.write().fresh_id())
     }
+    /// Allocate the next grant id.
     pub fn next_grant_id(&self) -> GrantId {
         GrantId::new(self.inner.write().fresh_id())
     }
 
     // ── registration (admission lives in `admit_*`) ─────────────────
 
+    /// Register an interface descriptor and invalidate cached open plans.
     pub fn register_interface(&self, iface: Interface) {
         let mut inner = self.inner.write();
         inner.interfaces.insert(iface.id, iface);
         inner.invalidate_open_cache();
     }
 
+    /// Register a driver descriptor and invalidate cached open plans.
     pub fn register_driver(&self, desc: DriverDescriptor) {
         let mut inner = self.inner.write();
         inner.drivers.insert(desc.id, desc);
@@ -324,6 +383,9 @@ impl Registry {
         Ok(id)
     }
 
+    /// Register a binding without admission checks.
+    ///
+    /// Prefer [`Registry::admit_binding`] for externally supplied bindings.
     pub fn register_binding(&self, binding: Binding) {
         let mut inner = self.inner.write();
         inner.bindings.insert(binding.id, binding);
@@ -347,6 +409,7 @@ impl Registry {
         Ok(())
     }
 
+    /// Register or replace a grant and update grant selector indexes.
     pub fn register_grant(&self, grant: Grant) -> GrantId {
         let id = grant.id;
         let mut inner = self.inner.write();
@@ -376,6 +439,10 @@ impl Registry {
 
     // ── name resolution (§10.2) ─────────────────────────────────────
 
+    /// Resolve a control-plane resource name to a resource id.
+    ///
+    /// Callable `effect://` resources require exact matches; collection-style
+    /// resources such as `state://` may resolve by longest path prefix.
     pub fn resolve_resource(&self, name: &ResourceName) -> Result<ResourceId, ResolveError> {
         let inner = self.inner.read();
         // Exact match first (the common case: every effect:// resource).
@@ -409,18 +476,22 @@ impl Registry {
 
     // ── slow-path reads for open() ──────────────────────────────────
 
+    /// Fetch a registered resource descriptor.
     pub fn resource(&self, id: ResourceId) -> Option<Resource> {
         self.inner.read().resources.get(&id).cloned()
     }
 
+    /// Fetch a registered binding descriptor.
     pub fn binding(&self, id: BindingId) -> Option<Binding> {
         self.inner.read().bindings.get(&id).cloned()
     }
 
+    /// Fetch a registered interface descriptor.
     pub fn interface(&self, id: InterfaceId) -> Option<Interface> {
         self.inner.read().interfaces.get(&id).cloned()
     }
 
+    /// Fetch a registered driver descriptor.
     pub fn driver(&self, id: DriverId) -> Option<DriverDescriptor> {
         self.inner.read().drivers.get(&id).cloned()
     }
@@ -435,6 +506,7 @@ impl Registry {
         self.inner.read().endpoints.get(&id).cloned()
     }
 
+    /// Fetch a registered grant.
     pub fn grant(&self, id: GrantId) -> Option<Grant> {
         self.inner.read().grants.get(&id).cloned()
     }
@@ -495,10 +567,12 @@ impl Registry {
         iface.method_index(name).map(|(i, m)| (i, m.id))
     }
 
+    /// Number of registered resources.
     pub fn resource_count(&self) -> usize {
         self.inner.read().resources.len()
     }
 
+    /// Snapshot counts for registry observability.
     pub fn counts(&self) -> RegistryCounts {
         let inner = self.inner.read();
         RegistryCounts {
@@ -516,6 +590,7 @@ impl Registry {
         }
     }
 
+    /// Look up a compiled open plan and update hit/miss counters.
     pub fn cached_open_plan(&self, key: &OpenCacheKey) -> Option<CompiledOpenPlan> {
         let mut inner = self.inner.write();
         let plan = inner.open_cache.get(key).cloned();
@@ -527,10 +602,12 @@ impl Registry {
         plan
     }
 
+    /// Store a compiled open plan in the cache.
     pub fn store_open_plan(&self, key: OpenCacheKey, plan: CompiledOpenPlan) {
         self.inner.write().open_cache.insert(key, plan);
     }
 
+    /// Return `(hits, misses, entries)` for the compiled open-plan cache.
     pub fn open_cache_stats(&self) -> (u64, u64, usize) {
         let inner = self.inner.read();
         (

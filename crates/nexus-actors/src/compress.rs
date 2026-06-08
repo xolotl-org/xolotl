@@ -7,7 +7,7 @@
 //! input text under a target token budget; `trim-plan` drops the
 //! lowest-priority steps of a plan to fit a step budget. Both are the seam where
 //! a real model summarizer plugs in (§17.1); the offline baseline uses the
-//! deterministic [`EchoBackend`] summary + a structural trim.
+//! deterministic echo backend summary + a structural trim.
 
 use crate::inference::InferenceBackend;
 use async_trait::async_trait;
@@ -33,6 +33,7 @@ pub struct CompressDriver {
 }
 
 impl CompressDriver {
+    /// Create a compression driver using `backend` for model-backed summaries.
     pub fn new(backend: Arc<dyn InferenceBackend>) -> Self {
         Self { backend }
     }

@@ -4,7 +4,7 @@
 // `.proto` spec if either changes.
 
 /// Universal addressing primitive.
-/// String form: path://\[cluster/\]<scheme>/<seg>\[/<seg>...\]
+/// String form: `path://[cluster/]<scheme>/<seg>[/<seg>...]`.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Path {
     #[prost(string, optional, tag = "1")]
@@ -136,7 +136,7 @@ pub mod outcome {
         Short(super::Value),
     }
 }
-/// Capability literal: <verb>://<scheme>/<segs>\[@<predicate>\].
+/// Capability literal: `<verb>://<scheme>/<segs>[@<predicate>]`.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Capability {
     #[prost(string, tag = "1")]

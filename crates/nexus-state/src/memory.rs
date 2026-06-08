@@ -48,6 +48,12 @@ fn now_millis() -> i64 {
 }
 
 impl InMemoryBackend {
+    /// Create an empty in-process backend.
+    ///
+    /// This backend is intended for tests, embedded SDK use, and small default
+    /// deployments. It retains all mutation history in memory so callers can
+    /// exercise `read_range` and `read_at`, but it does not enforce a retention
+    /// limit.
     pub fn new() -> Self {
         Self {
             map: DashMap::new(),

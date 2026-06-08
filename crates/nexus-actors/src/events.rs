@@ -36,6 +36,7 @@ pub struct EventBusDriver {
 }
 
 impl EventBusDriver {
+    /// Create an event bus driver backed by the state plane.
     pub fn new(state: Backend) -> Self {
         Self { state }
     }

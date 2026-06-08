@@ -12,12 +12,14 @@ use std::collections::BTreeMap;
 pub const INSPECT_METHODS: &[MethodSpec] =
     &[MethodSpec::new("inspect", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external()];
 
+/// Driver backing `effect://kernel/process/inspect`.
 pub struct KernelInspectDriver {
     processes: nexus_kernel::ProcessTable,
     facts: nexus_kernel::FactSink,
 }
 
 impl KernelInspectDriver {
+    /// Create an inspect driver over process and fact state.
     pub fn new(processes: nexus_kernel::ProcessTable, facts: nexus_kernel::FactSink) -> Self {
         Self { processes, facts }
     }

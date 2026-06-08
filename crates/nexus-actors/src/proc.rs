@@ -39,8 +39,11 @@ pub const PROC_METHODS: &[MethodSpec] = &[
 
 /// Process lifecycle phases (§16.3.1).
 pub const PHASE_STARTING: &str = "starting";
+/// External process is ready to serve endpoint traffic.
 pub const PHASE_READY: &str = "ready";
+/// External process is draining and should not receive new work.
 pub const PHASE_DRAINING: &str = "draining";
+/// External process is stopped.
 pub const PHASE_DEAD: &str = "dead";
 
 /// The privileged Driver that manages external extension processes (§16.3.1).
@@ -56,6 +59,7 @@ struct LiveChild {
 }
 
 impl ProcDriver {
+    /// Create a process driver backed by the state plane.
     pub fn new(state: Backend) -> Self {
         Self {
             state,
@@ -427,18 +431,21 @@ pub fn reconcile(desired_ids: &[String], live: &BTreeMap<String, String>) -> Vec
         .collect()
 }
 
-/// What a [`RestartPolicy`] decides for a crashed process (§16.3.1).
+/// What a restart policy decides for a crashed process (§16.3.1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SuperviseDecision {
     /// Restart now (no delay).
     Restart,
     /// Restart after `delay_ms` (backoff).
-    RestartAfter { delay_ms: u64 },
+    RestartAfter {
+        /// Delay before attempting the restart.
+        delay_ms: u64,
+    },
     /// Stop at Dead and alarm — the crash budget is exhausted (§16.3.1).
     GiveUp,
 }
 
-/// Evaluate a [`RestartPolicy`] for a process that has crashed (§16.3.1). Given
+/// Evaluate a restart policy for a process that has crashed (§16.3.1). Given
 /// the number of failures already seen *within the policy window* and the
 /// current attempt's backoff index, decide whether to restart (and how long to
 /// wait) or stop at Dead. Pure → testable; the supervision Process applies it.

@@ -3,7 +3,7 @@
 //! `nexus-gateway-websocket` — WebSocket protocol adapter (Gateway/Source,
 //! §18.1).
 //!
-//! A thin transport over the shared [`Gateway`](nexus_gateway::Gateway): a
+//! A thin transport over the shared [`Gateway`]: a
 //! client connects, sends an auth frame, then submits programs as JSON
 //! `DoNode`s; the gateway runs each through the kernel and streams the outcome
 //! back. The five §18.1 steps live in `nexus-gateway`; this crate only speaks
@@ -48,10 +48,12 @@ pub struct WsGateway<G: Gateway> {
 }
 
 impl<G: Gateway + 'static> WsGateway<G> {
+    /// Create a WebSocket adapter over an existing Nexus gateway.
     pub fn new(gateway: Arc<G>) -> Self {
         Self { gateway }
     }
 
+    /// Build an Axum router exposing the gateway at `/ws`.
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
             .route("/ws", get(upgrade::<G>))

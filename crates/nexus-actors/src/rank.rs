@@ -33,7 +33,7 @@ const RRF_K: f64 = 60.0;
 
 /// Drives the rank actions. Weights resolve in precedence order: per-call
 /// `weights` input → `state://kernel/rank/weights` (hot-tunable config, §17.2)
-/// → the built-in [`DEFAULT_WEIGHTS`]. The state backend is optional so the
+/// → the built-in default weights. The state backend is optional so the
 /// driver works standalone (tests) without config.
 #[derive(Clone, Default)]
 pub struct RankerDriver {
@@ -41,6 +41,7 @@ pub struct RankerDriver {
 }
 
 impl RankerDriver {
+    /// Create a ranker driver with built-in default weights only.
     pub fn new() -> Self {
         Self { state: None }
     }

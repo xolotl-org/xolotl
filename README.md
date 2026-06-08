@@ -22,6 +22,18 @@ The implementation tracks the current design:
 - capability literals use the verb form, such as
   `perform://effect/inference/infer`, rather than resource paths.
 
+## Documentation
+
+Generate and check Rust API documentation:
+
+```sh
+RUSTDOCFLAGS='-W missing-docs' cargo doc --workspace --no-deps
+```
+
+Then open `target/doc/index.html` in a browser. Crate pages are under
+`target/doc/<crate_name>/index.html`, with hyphens converted to underscores;
+for example, `nexus-sdk` is available at `target/doc/nexus_sdk/index.html`.
+
 ## Architecture
 
 The hot path is deliberately small:

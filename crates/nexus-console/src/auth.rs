@@ -28,23 +28,38 @@ const SESSIONS_PREFIX: &str = "state://kernel/console/sessions";
 const CHALLENGES_PREFIX: &str = "state://kernel/console/challenges";
 const VAULT_PREFIX: &str = "state://vault/console";
 const ROOT_USERNAME: &str = "root";
+/// Default absolute session lifetime, in milliseconds.
 pub const DEFAULT_SESSION_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+/// Default idle session lifetime, in milliseconds.
 pub const DEFAULT_IDLE_TTL_MS: i64 = 2 * 60 * 60 * 1000;
+/// Default number of active sessions allowed per user.
 pub const DEFAULT_MAX_SESSIONS_PER_USER: usize = 5;
+/// Default total number of active sessions allowed globally.
 pub const DEFAULT_GLOBAL_SESSION_LIMIT: usize = 10_000;
+/// Minimum accepted absolute session lifetime, in milliseconds.
 pub const MIN_SESSION_TTL_MS: i64 = 60 * 1000;
+/// Maximum accepted absolute session lifetime, in milliseconds.
 pub const MAX_SESSION_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// Minimum accepted idle session lifetime, in milliseconds.
 pub const MIN_IDLE_TTL_MS: i64 = 60 * 1000;
+/// Maximum accepted idle session lifetime, in milliseconds.
 pub const MAX_IDLE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+/// Minimum accepted per-user session limit.
 pub const MIN_MAX_SESSIONS_PER_USER: usize = 1;
+/// Hard upper bound for per-user session limit.
 pub const HARD_MAX_SESSIONS_PER_USER: usize = 1_000;
+/// Minimum accepted global session limit.
 pub const MIN_GLOBAL_SESSION_LIMIT: usize = 1;
+/// Hard upper bound for global session limit.
 pub const HARD_GLOBAL_SESSION_LIMIT: usize = 100_000;
+/// Minimum Argon2 verification concurrency.
 pub const MIN_ARGON2_CONCURRENCY: usize = 1;
+/// Hard upper bound for Argon2 verification concurrency.
 pub const HARD_ARGON2_CONCURRENCY: usize = 256;
 const TOTP_PERIOD_SECS: i64 = 30;
 const KEY_CHALLENGE_TTL_MS: i64 = 60_000;
 
+/// Default Argon2 verification concurrency based on available CPU parallelism.
 pub fn default_argon2_concurrency() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -54,18 +69,27 @@ pub fn default_argon2_concurrency() -> usize {
 
 type HmacSha1 = Hmac<Sha1>;
 
+/// Optional root-account material supplied at daemon bootstrap.
 #[derive(Clone, Debug, Default)]
 pub struct RootProvisioning {
+    /// Optional precomputed Argon2 PHC string for the root password.
     pub password_hash: Option<String>,
+    /// Optional public-key descriptors for key login.
     pub pubkeys: Vec<String>,
 }
 
+/// Console authentication tuning.
 #[derive(Clone, Debug)]
 pub struct ConsoleAuthConfig {
+    /// Absolute session TTL in milliseconds.
     pub session_ttl_ms: i64,
+    /// Idle session TTL in milliseconds.
     pub idle_ttl_ms: i64,
+    /// Maximum active sessions per user.
     pub max_sessions_per_user: usize,
+    /// Maximum active sessions across all users.
     pub global_session_limit: usize,
+    /// Maximum concurrent Argon2 verifications.
     pub argon2_concurrency: usize,
 }
 
@@ -82,6 +106,7 @@ impl Default for ConsoleAuthConfig {
 }
 
 impl ConsoleAuthConfig {
+    /// Clamp all tuning values into hard safety bounds.
     pub fn bounded(self) -> Self {
         let session_ttl_ms = self
             .session_ttl_ms
@@ -106,13 +131,26 @@ impl ConsoleAuthConfig {
     }
 }
 
+/// Result of root-account bootstrap.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum BootstrapOutcome {
+    /// A root account already exists.
     AlreadyPresent,
-    CreatedRandomPassword { username: String, password: String },
-    CreatedPreseeded { username: String },
+    /// Root was created and a one-time random password should be displayed.
+    CreatedRandomPassword {
+        /// Created username.
+        username: String,
+        /// One-time generated password.
+        password: String,
+    },
+    /// Root was created from preseeded password or key material.
+    CreatedPreseeded {
+        /// Created username.
+        username: String,
+    },
 }
 
+/// Return whether bootstrap would need to generate a random root password.
 pub async fn root_random_password_needed(
     boot: &Bootstrap,
     provisioning: &RootProvisioning,
@@ -128,97 +166,154 @@ pub async fn root_random_password_needed(
     Ok(users.is_empty())
 }
 
+/// Password login request.
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
+    /// Console username.
     pub username: String,
+    /// Plaintext password, consumed only by the auth boundary.
     pub password: String,
+    /// Optional TOTP code when the user has TOTP enabled.
     #[serde(default)]
     pub totp_code: Option<String>,
 }
 
+/// Login or step-up response carrying a new bearer token.
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
+    /// Session id.
     pub sid: String,
+    /// Bearer token in `sid.secret` form.
     pub token: String,
+    /// Absolute expiry timestamp in millis since epoch.
     pub expires_at: i64,
+    /// Idle expiry timestamp in millis since epoch.
     pub idle_expires_at: i64,
+    /// MFA level attached to the session.
     pub mfa_level: u8,
 }
 
+/// Request to upgrade an existing session's MFA level.
 #[derive(Debug, Deserialize)]
 pub struct StepUpRequest {
+    /// Password proof for accounts without TOTP.
     #[serde(default)]
     pub password: Option<String>,
+    /// TOTP code for accounts with TOTP enabled.
     #[serde(default)]
     pub totp_code: Option<String>,
 }
 
+/// Request to start public-key login.
 #[derive(Debug, Deserialize)]
 pub struct KeyChallengeRequest {
+    /// Console username.
     pub username: String,
+    /// Client origin bound into the signed transcript.
     pub origin: String,
 }
 
+/// One public-key login challenge.
 #[derive(Debug, Serialize)]
 pub struct KeyChallengeResponse {
+    /// Challenge id used by the finish request.
     pub challenge_id: String,
+    /// Random nonce to sign.
     pub nonce: String,
+    /// Origin bound to the challenge.
     pub origin: String,
+    /// Challenge expiry timestamp in millis since epoch.
     pub expires_at: i64,
+    /// Canonical transcript the client must sign.
     pub transcript: String,
 }
 
+/// Request to finish public-key login.
 #[derive(Debug, Deserialize)]
 pub struct KeyLoginRequest {
+    /// Console username.
     pub username: String,
+    /// Challenge id returned by [`KeyChallengeResponse`].
     pub challenge_id: String,
+    /// Signature over the challenge transcript.
     pub signature: String,
+    /// Client origin; must match the challenge.
     pub origin: String,
+    /// Optional public-key descriptor selecting a registered key.
     #[serde(default)]
     pub key: Option<String>,
 }
 
+/// Authenticated console principal used by management actions.
 #[derive(Clone, Debug)]
 pub struct ConsolePrincipal {
+    /// Console username.
     pub username: String,
+    /// Nexus identity path associated with the user.
     pub identity_path: String,
+    /// Effective grants after roles and direct grants are combined.
     pub grants: CapSet,
+    /// Session MFA level.
     pub mfa_level: u8,
 }
 
+/// Public session metadata returned by session-list actions.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {
+    /// Session id.
     pub sid: String,
+    /// Owning username.
     pub username: String,
+    /// Identity path active for this session.
     pub identity_path: String,
+    /// Issue timestamp in millis since epoch.
     pub issued_at: i64,
+    /// Absolute expiry timestamp in millis since epoch.
     pub expires_at: i64,
+    /// Idle expiry timestamp in millis since epoch.
     pub idle_expires_at: i64,
+    /// Session MFA level.
     pub mfa_level: u8,
+    /// Last-seen timestamp in millis since epoch.
     pub last_seen: i64,
+    /// Source address recorded when the session was issued.
     pub source_addr: String,
 }
 
+/// Authentication and authorization errors returned by the console boundary.
 #[derive(Debug, Error)]
 pub enum AuthError {
+    /// Username failed syntax validation.
     #[error("invalid username")]
     InvalidUsername,
+    /// Password, key signature, or TOTP proof was invalid.
     #[error("invalid credentials")]
     InvalidCredentials,
+    /// Account is disabled, locked, or otherwise unavailable.
     #[error("account is disabled or locked")]
     AccountUnavailable,
+    /// Session token or id is missing, expired, revoked, or malformed.
     #[error("session is missing, expired, or revoked")]
     InvalidSession,
+    /// Key-login challenge is missing, expired, already used, or mismatched.
     #[error("key challenge is missing, expired, or already used")]
     InvalidChallenge,
+    /// Bearer token was required but absent.
     #[error("authorization bearer token is required")]
     MissingBearer,
+    /// Principal does not hold authority for the requested target.
     #[error("permission denied")]
     PermissionDenied,
+    /// Login attempt is temporarily rate limited.
     #[error("rate limited; retry after {retry_after_ms} ms")]
-    RateLimited { retry_after_ms: i64 },
+    RateLimited {
+        /// Milliseconds until the next allowed attempt.
+        retry_after_ms: i64,
+    },
+    /// State backend error.
     #[error("state error: {0}")]
     State(String),
+    /// Cryptographic parsing, hashing, or verification error.
     #[error("crypto error: {0}")]
     Crypto(String),
 }
@@ -249,6 +344,7 @@ struct FailureBucket {
     window_started_at: i64,
 }
 
+/// Console authentication service.
 pub struct ConsoleAuth {
     config: ConsoleAuthConfig,
     decoy_phc: String,
@@ -263,6 +359,7 @@ impl Default for ConsoleAuth {
 }
 
 impl ConsoleAuth {
+    /// Create an auth service with bounded tuning and a decoy password hash.
     pub fn new(config: ConsoleAuthConfig) -> Self {
         let config = config.bounded();
         let decoy_phc = match hash_password_with_salt("invalid-password", &[0x42; 16]) {
@@ -277,6 +374,9 @@ impl ConsoleAuth {
         }
     }
 
+    /// Authenticate with password/TOTP and issue a new session.
+    ///
+    /// Records a console auth audit fact for both success and failure.
     pub async fn login(
         &self,
         boot: &Bootstrap,
@@ -373,6 +473,10 @@ impl ConsoleAuth {
             .await
     }
 
+    /// Start public-key login by creating a single-use signed challenge.
+    ///
+    /// The returned transcript is bound to username, challenge id, nonce, and
+    /// origin. Records a credential audit fact.
     pub async fn begin_key_login(
         &self,
         boot: &Bootstrap,
@@ -434,6 +538,10 @@ impl ConsoleAuth {
         })
     }
 
+    /// Verify a public-key challenge signature and issue a new session.
+    ///
+    /// Challenges are single-use: the challenge is revoked before signature
+    /// validation completes.
     pub async fn finish_key_login(
         &self,
         boot: &Bootstrap,
@@ -515,6 +623,9 @@ impl ConsoleAuth {
         self.issue_session(state, &user, source_addr, 1).await
     }
 
+    /// Upgrade an existing bearer session to MFA level 2.
+    ///
+    /// Uses TOTP when enabled for the user, otherwise rechecks the password.
     pub async fn step_up(
         &self,
         boot: &Bootstrap,
@@ -611,6 +722,7 @@ impl ConsoleAuth {
         self.issue_session(state, &user, source_addr, 2).await
     }
 
+    /// Authenticate a bearer token in `sid.secret` form.
     pub async fn authenticate_token(
         &self,
         boot: &Bootstrap,
@@ -620,6 +732,10 @@ impl ConsoleAuth {
             .await
     }
 
+    /// Authenticate by session id without a bearer secret.
+    ///
+    /// This is intended for trusted management paths that already validated
+    /// access to the session id.
     pub async fn authenticate_sid(
         &self,
         boot: &Bootstrap,
@@ -706,10 +822,12 @@ impl ConsoleAuth {
         })
     }
 
+    /// Revoke the bearer token's session.
     pub async fn logout(&self, boot: &Bootstrap, bearer: &str) -> Result<(), AuthError> {
         self.logout_from_source(boot, bearer, None).await
     }
 
+    /// Revoke the bearer token's session and record an optional source address.
     pub async fn logout_from_source(
         &self,
         boot: &Bootstrap,
@@ -720,10 +838,12 @@ impl ConsoleAuth {
         self.logout_sid_from_source(boot, sid, source_addr).await
     }
 
+    /// Revoke one session id.
     pub async fn logout_sid(&self, boot: &Bootstrap, sid: &str) -> Result<(), AuthError> {
         self.logout_sid_from_source(boot, sid, None).await
     }
 
+    /// Revoke one session id and record an optional source address.
     pub async fn logout_sid_from_source(
         &self,
         boot: &Bootstrap,
@@ -760,6 +880,7 @@ impl ConsoleAuth {
         result
     }
 
+    /// List all visible console sessions for `principal`.
     pub async fn list_sessions(
         &self,
         boot: &Bootstrap,
@@ -787,6 +908,7 @@ impl ConsoleAuth {
         Ok(sessions)
     }
 
+    /// Revoke one session after authorizing `principal` for the session path.
     pub async fn revoke_session_by_id(
         &self,
         boot: &Bootstrap,
@@ -797,6 +919,7 @@ impl ConsoleAuth {
             .await
     }
 
+    /// Revoke one session and record an optional source address.
     pub async fn revoke_session_by_id_from_source(
         &self,
         boot: &Bootstrap,
@@ -829,6 +952,7 @@ impl ConsoleAuth {
         result
     }
 
+    /// Revoke all active sessions for `username`.
     pub async fn revoke_user_sessions(
         &self,
         boot: &Bootstrap,
@@ -839,6 +963,7 @@ impl ConsoleAuth {
             .await
     }
 
+    /// Revoke all active sessions for `username` and record an optional source.
     pub async fn revoke_user_sessions_from_source(
         &self,
         boot: &Bootstrap,
@@ -991,6 +1116,10 @@ impl ConsoleAuth {
     }
 }
 
+/// Create the root account if no console users exist.
+///
+/// A random password is generated only when no password hash or public keys are
+/// preseeded. Successful creation records a bootstrap audit fact.
 pub async fn bootstrap_root_account(
     boot: &Bootstrap,
     provisioning: RootProvisioning,
@@ -1084,6 +1213,7 @@ async fn bootstrap_root_account_inner(
     Ok(outcome)
 }
 
+/// Extract a `Bearer ...` token from HTTP headers.
 pub fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Result<&str, AuthError> {
     let raw = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -1092,6 +1222,7 @@ pub fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Result<&str, Auth
     raw.strip_prefix("Bearer ").ok_or(AuthError::MissingBearer)
 }
 
+/// Validate console username syntax.
 pub fn validate_username(username: &str) -> Result<(), AuthError> {
     if username.is_empty() || username.len() > 63 {
         return Err(AuthError::InvalidUsername);
@@ -1108,6 +1239,11 @@ pub fn validate_username(username: &str) -> Result<(), AuthError> {
     }
 }
 
+/// Authorize a principal for a state path and optional replacement value.
+///
+/// Console management paths require both direct path authority and the console
+/// management effect authority; user/role writes are additionally checked so a
+/// non-root admin cannot grant authority above their ceiling.
 pub async fn authorize_path(
     state: &Backend,
     principal: &ConsolePrincipal,

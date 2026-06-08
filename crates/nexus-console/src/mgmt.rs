@@ -19,18 +19,28 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Errors raised by console management state helpers.
 #[derive(Debug, Error)]
 pub enum MgmtError {
+    /// Path is outside the console-manageable kernel state prefix.
     #[error("path is not under the manageable state://kernel/ prefix: {0}")]
     NotManageable(String),
+    /// Path parsing failed.
     #[error("path error: {0}")]
     Path(#[from] nexus_types::PathError),
+    /// Authorization failed.
     #[error("auth error: {0}")]
     Auth(#[from] auth::AuthError),
+    /// Optimistic concurrency check failed.
     #[error("version conflict (optimistic concurrency): expected {expected:?}")]
-    Conflict { expected: Option<u64> },
+    Conflict {
+        /// Version expected by the caller.
+        expected: Option<u64>,
+    },
+    /// Config admission rejected the proposed value.
     #[error("config admission rejected: {0}")]
     Admission(String),
+    /// Underlying state operation failed.
     #[error("operation failed: {0}")]
     Operation(String),
 }

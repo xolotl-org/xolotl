@@ -16,6 +16,18 @@ Default English documentation: [README.md](README.md)
 - capability 字面量使用动词形式，例如
   `perform://effect/inference/infer`，不是 resource path。
 
+## 文档
+
+生成并检查 Rust API 文档：
+
+```sh
+RUSTDOCFLAGS='-W missing-docs' cargo doc --workspace --no-deps
+```
+
+然后在浏览器里打开 `target/doc/index.html`。各 crate 页面位于
+`target/doc/<crate_name>/index.html`，crate 名里的连字符会转换成下划线；
+例如 `nexus-sdk` 对应 `target/doc/nexus_sdk/index.html`。
+
 ## 架构
 
 热路径保持很小：

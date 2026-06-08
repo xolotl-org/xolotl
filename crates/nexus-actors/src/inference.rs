@@ -43,11 +43,17 @@ pub trait InferenceBackend: Send + Sync + 'static {
 /// request's required modality and features (tools/vision/audio/json/streaming).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ModelCapabilities {
+    /// Modalities this model can accept or produce.
     pub modality: nexus_types::ModalitySet,
+    /// Whether the model supports tool-use prompts or tool schemas.
     pub tools: bool,
+    /// Whether the model supports image/blob vision input.
     pub vision: bool,
+    /// Whether the model supports audio input.
     pub audio: bool,
+    /// Whether the model can constrain output to JSON.
     pub json: bool,
+    /// Whether the model can stream output chunks.
     pub streaming: bool,
 }
 
@@ -69,11 +75,17 @@ impl Default for ModelCapabilities {
 /// requested OutputMode.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RequestRequirements {
+    /// Modalities required by the request input.
     pub modality: nexus_types::ModalitySet,
+    /// Request includes tool definitions or needs tool-use support.
     pub needs_tools: bool,
+    /// Request contains image/blob vision input.
     pub needs_vision: bool,
+    /// Request contains audio input.
     pub needs_audio: bool,
+    /// Request asks for JSON-constrained output.
     pub needs_json: bool,
+    /// Request output mode requires streaming support.
     pub needs_streaming: bool,
 }
 

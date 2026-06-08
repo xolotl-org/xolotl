@@ -19,6 +19,7 @@ struct Subscriber {
     sender: broadcast::Sender<StateEvent>,
 }
 
+/// redb-backed implementation of the Nexus `state://` backend.
 pub struct RedbStateBackend {
     db: Arc<Database>,
     history_clock: Arc<AtomicI64>,

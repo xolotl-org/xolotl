@@ -1,7 +1,7 @@
 //! The Executor: advances a compiled [`ExecutionGraph`] to produce Operations
 //! and an Outcome (§13.4).
 //!
-//! The Executor **only ever advances a graph** — it never interprets the Do<A>
+//! The Executor **only ever advances a graph** — it never interprets the `Do<A>`
 //! source form directly. `eval()` compiles the program once (`compile_do`),
 //! binds the resulting graph, then walks it node-by-node. Each node's id is its
 //! **stable `CausalPosition`** (§6.1 / §13.2): assigned by the compiler in
@@ -33,8 +33,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Errors raised by executor-local graph evaluation.
 #[derive(Debug, Error)]
 pub enum ExecError {
+    /// A recursive `Step` splice exceeded the configured recursion limit.
     #[error("step recursion exceeded depth {0}")]
     RecursionLimit(usize),
 }
@@ -47,9 +49,14 @@ const MAX_DEPTH: usize = 4096;
 /// Operation dispatch), the registry (to resolve target names → handles), and
 /// the step table (named continuations).
 pub struct Executor {
+    /// Process whose graph this executor is running.
     pub process: ProcessId,
+    /// Data-plane dispatcher used for operation nodes.
     pub data_plane: DataPlane,
+    /// Control-plane registry used before data-plane dispatch to resolve names
+    /// and method metadata.
     pub registry: Registry,
+    /// Table of named pure continuation steps.
     pub steps: StepTable,
     /// Optional state backend, used to resolve `Wait(Signal)` nodes (§13.2).
     /// `None` for executors that never wait on a signal path.
@@ -120,6 +127,7 @@ impl Env {
 }
 
 impl Executor {
+    /// Create an executor bound to one process.
     pub fn new(
         process: ProcessId,
         data_plane: DataPlane,
@@ -178,7 +186,7 @@ impl Executor {
         self.open_handles.write().insert(name, handle);
     }
 
-    /// Evaluate a whole program to an Outcome. Compiles the Do<A> into one
+    /// Evaluate a whole program to an Outcome. Compiles the `Do<A>` into one
     /// [`ExecutionGraph`] (§13.3), then advances the graph — the Executor never
     /// interprets the source form directly (§13.2).
     pub async fn eval(&self, program: &DoNode) -> Outcome {

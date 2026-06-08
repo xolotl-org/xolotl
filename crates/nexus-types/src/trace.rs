@@ -23,7 +23,9 @@ pub struct SpanId(pub u64);
 /// across replay (no wall-clock dependence on identity).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Span {
+    /// Trace this span belongs to.
     pub trace_id: TraceId,
+    /// Span id unique within the trace.
     pub span_id: SpanId,
     /// Parent span: the Process's span (an Operation is a child of its Process;
     /// a spawned child Process's span is a child of the spawner's, §21.3).
@@ -31,6 +33,7 @@ pub struct Span {
     /// Short operation name (`<resource>/<method>` once resolved; here the
     /// method id, since the Fact carries ids not names).
     pub name: SmolStr,
+    /// Span start timestamp in millis since epoch.
     pub start_millis: i64,
     /// Whether the underlying operation succeeded (drives span status).
     pub ok: bool,
@@ -41,6 +44,7 @@ pub struct Span {
 /// child span id from its `OperationId`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TraceContext {
+    /// Trace id being propagated.
     pub trace_id: TraceId,
     /// The current parent span (the Process or Acting-block span).
     pub parent_span: SpanId,

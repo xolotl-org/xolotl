@@ -25,6 +25,7 @@ pub struct StepRef {
 }
 
 impl StepRef {
+    /// Create a reference to a named step on `process`.
     pub fn new(process: ProcessId, name: impl Into<String>) -> Self {
         Self {
             process,
@@ -32,6 +33,8 @@ impl StepRef {
             arg: None,
         }
     }
+
+    /// Attach an inline argument to pass alongside the piped input value.
     pub fn with_arg(mut self, v: Value) -> Self {
         self.arg = Some(v);
         self
@@ -68,7 +71,10 @@ pub struct OperationTemplate {
 pub enum BranchKind {
     /// `OrElse` compensation: on failure of the guarded subgraph, route into
     /// the recovery step (carrying the failure as input).
-    OrElse { recover: StepRef },
+    OrElse {
+        /// Named recovery step invoked with the failure value.
+        recover: StepRef,
+    },
 }
 
 /// What a [`NodeKind::Join`] does (§13.3).
@@ -132,7 +138,10 @@ impl NodeKind {
 /// A graph node, identified by its stable [`NodeId`] (= `CausalPosition`).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Node {
+    /// Stable causal position for this node.
     pub id: NodeId,
+    /// Operation, continuation, join, branch, wait, or immediate value carried
+    /// by this node.
     pub kind: NodeKind,
 }
 
@@ -155,8 +164,11 @@ pub enum EdgeKind {
 /// A directed edge between two nodes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Edge {
+    /// Source node for this graph edge.
     pub from: NodeId,
+    /// Destination node for this graph edge.
     pub to: NodeId,
+    /// Semantic role of the edge.
     pub kind: EdgeKind,
 }
 
@@ -164,7 +176,9 @@ pub struct Edge {
 /// Executor only advances a cursor over it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionGraph {
+    /// Nodes in stable id order as produced by the compiler.
     pub nodes: Vec<Node>,
+    /// Directed edges that encode value flow, continuations, arms, and uses.
     pub edges: Vec<Edge>,
     /// The entry node (where execution / recovery begins).
     pub root: NodeId,
@@ -202,6 +216,8 @@ impl ExecutionGraph {
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
+
+    /// Whether the graph contains no nodes.
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }

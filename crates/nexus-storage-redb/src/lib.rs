@@ -27,6 +27,7 @@ const FACT_PROCESS_INDEX_TABLE: TableDefinition<&str, u64> =
     TableDefinition::new("fact_process_index");
 const FACT_META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("fact_meta");
 
+/// Shared redb store that can materialize both state and fact adapters.
 #[derive(Clone)]
 pub struct RedbStore {
     db: Arc<Database>,
@@ -34,6 +35,7 @@ pub struct RedbStore {
 }
 
 impl RedbStore {
+    /// Open or create the redb database and initialize Nexus tables.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, redb::DatabaseError> {
         let db = Database::create(path.into())?;
         {
@@ -52,6 +54,7 @@ impl RedbStore {
         })
     }
 
+    /// Build a state-plane backend backed by this database.
     pub fn state_backend(&self) -> RedbStateBackend {
         RedbStateBackend::new(self.db.clone(), self.state_history_clock.clone())
     }

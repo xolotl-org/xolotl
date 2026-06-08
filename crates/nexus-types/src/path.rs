@@ -67,24 +67,34 @@ impl<'de> Deserialize<'de> for Path {
     }
 }
 
+/// Path parsing and validation errors.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum PathError {
+    /// Path string was empty.
     #[error("empty path")]
     Empty,
+    /// Path had no scheme.
     #[error("missing scheme")]
     MissingScheme,
+    /// Scheme contained `/`.
     #[error("scheme cannot contain '/'")]
     BadScheme,
+    /// A segment was empty.
     #[error("segment cannot be empty")]
     EmptySegment,
+    /// Inline path parameters are not supported.
     #[error("path parameters are not supported; put options in operation input values")]
     ParamsUnsupported,
+    /// Scheme contained an invalid character.
     #[error("invalid character in scheme '{0}': only [a-zA-Z][a-zA-Z0-9_-]* allowed")]
     BadSchemeChar(String),
+    /// Segment contained an invalid character.
     #[error("invalid character in segment '{0}': only [a-zA-Z0-9][a-zA-Z0-9_.:-]* allowed")]
     BadSegmentChar(String),
+    /// Cluster contained an invalid character.
     #[error("invalid character in cluster '{0}': only [a-zA-Z0-9_-]+ allowed")]
     BadClusterChar(String),
+    /// Path contained non-ASCII characters.
     #[error("non-ASCII characters are not allowed in paths")]
     NonAscii,
 }
@@ -114,6 +124,10 @@ impl Path {
         })
     }
 
+    /// Construct an empty path from a scheme.
+    ///
+    /// This debug-asserts that the scheme is valid; prefer [`Self::try_new`]
+    /// for external input.
     pub fn new(scheme: impl Into<SmolStr>) -> Self {
         let s = scheme.into();
         debug_assert!(is_ident(&s), "scheme must be a valid identifier: {s}");
@@ -124,6 +138,7 @@ impl Path {
         }
     }
 
+    /// Parse a path string.
     pub fn parse(s: &str) -> Result<Self, PathError> {
         if s.is_empty() {
             return Err(PathError::Empty);
@@ -185,16 +200,20 @@ impl Path {
         })
     }
 
+    /// Return the path scheme.
     pub fn scheme(&self) -> &str {
         &self.scheme
     }
+    /// Return path segments.
     pub fn segments(&self) -> &[SmolStr] {
         &self.segments
     }
+    /// Return the optional cluster.
     pub fn cluster(&self) -> Option<&str> {
         self.cluster.as_deref()
     }
 
+    /// Append a segment without validation.
     pub fn push(mut self, seg: impl Into<SmolStr>) -> Self {
         self.segments.push(seg.into());
         self
@@ -217,6 +236,7 @@ impl Path {
         Ok(self)
     }
 
+    /// Attach a cluster without validation.
     pub fn with_cluster(mut self, c: impl Into<SmolStr>) -> Self {
         self.cluster = Some(c.into());
         self
@@ -252,6 +272,7 @@ impl Path {
             .all(|(a, b)| a == b)
     }
 
+    /// Clone this path for use as a path pattern.
     pub fn as_pattern(&self) -> Path {
         self.clone()
     }

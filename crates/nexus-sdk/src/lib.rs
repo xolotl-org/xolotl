@@ -50,6 +50,7 @@ impl Nexus {
         })
     }
 
+    /// Access the embedded bootstrap and kernel handles.
     pub fn bootstrap(&self) -> &Bootstrap {
         &self.boot
     }

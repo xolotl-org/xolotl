@@ -13,21 +13,28 @@ use std::sync::Arc;
 /// Live bookkeeping for one Process. The serializable `Process` descriptor
 /// lives in `nexus-types`; this is the runtime entry the kernel mutates.
 pub struct ProcessEntry {
+    /// Process identifier.
     pub id: ProcessId,
+    /// Parent process, if this process was spawned by another process.
     pub parent: Option<ProcessId>,
+    /// Interned identity this process runs as.
     pub identity: IdentityRef,
+    /// Current lifecycle state.
     pub status: ProcessStatus,
+    /// Grants held by this process.
     pub grants: Vec<GrantId>,
+    /// Current budget counters.
     pub budget: BudgetState,
     /// Per-dimension spending limits (§21.2). Default is unbounded on every
     /// dimension (a process with no declared budget is unconstrained).
     pub budget_spec: BudgetSpec,
     /// Finalizer programs, run in reverse order on finalize (§14.2). Stored as
-    /// serialized Do<A> so they survive recovery; the kernel re-runs them.
+    /// serialized `Do<A>` so they survive recovery; the kernel re-runs them.
     pub on_finalize: Vec<nexus_graph::DoNode>,
 }
 
 impl ProcessEntry {
+    /// Create a process entry in the `Created` state.
     pub fn new(id: ProcessId, parent: Option<ProcessId>, identity: IdentityRef) -> Self {
         Self {
             id,
@@ -57,6 +64,7 @@ struct ProcessTableInner {
 }
 
 impl ProcessTable {
+    /// Create an empty process table.
     pub fn new() -> Self {
         Self::default()
     }
@@ -77,16 +85,19 @@ impl ProcessTable {
         inner.procs.insert(entry.id, entry);
     }
 
+    /// Return the current status for a process.
     pub fn status(&self, id: ProcessId) -> Option<ProcessStatus> {
         self.inner.read().procs.get(&id).map(|p| p.status)
     }
 
+    /// Update a process status if the process exists.
     pub fn set_status(&self, id: ProcessId, status: ProcessStatus) {
         if let Some(p) = self.inner.write().procs.get_mut(&id) {
             p.status = status;
         }
     }
 
+    /// Return the identity a process runs as.
     pub fn identity(&self, id: ProcessId) -> Option<IdentityRef> {
         self.inner.read().procs.get(&id).map(|p| p.identity)
     }
@@ -96,6 +107,7 @@ impl ProcessTable {
         self.inner.read().procs.keys().copied().collect()
     }
 
+    /// Direct children of a process.
     pub fn children_of(&self, id: ProcessId) -> Vec<ProcessId> {
         self.inner
             .read()
@@ -105,6 +117,7 @@ impl ProcessTable {
             .unwrap_or_default()
     }
 
+    /// Register a finalizer program to run when `id` finalizes.
     pub fn add_finalizer(&self, id: ProcessId, body: nexus_graph::DoNode) {
         if let Some(p) = self.inner.write().procs.get_mut(&id) {
             p.on_finalize.push(body);
@@ -139,6 +152,7 @@ impl ProcessTable {
         out.push(id);
     }
 
+    /// Mutate a process budget state under the table lock.
     pub fn budget_mut<R>(&self, id: ProcessId, f: impl FnOnce(&mut BudgetState) -> R) -> Option<R> {
         self.inner
             .write()
@@ -193,10 +207,12 @@ impl ProcessTable {
         }
     }
 
+    /// Number of live process entries.
     pub fn count(&self) -> usize {
         self.inner.read().procs.len()
     }
 
+    /// Whether a process id exists in the table.
     pub fn exists(&self, id: ProcessId) -> bool {
         self.inner.read().procs.contains_key(&id)
     }

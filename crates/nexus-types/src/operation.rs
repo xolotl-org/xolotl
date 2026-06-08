@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 /// Never depends on wall clock; needs no central counter.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct OperationId {
+    /// Process that owns this causal position.
     pub process: ProcessId,
     /// Stable position in the compiled graph = `NodeId` (§13.2).
     pub position: CausalPosition,
@@ -28,6 +29,7 @@ pub struct OperationId {
 }
 
 impl OperationId {
+    /// Create an operation id from its causal coordinates.
     pub fn new(process: ProcessId, position: CausalPosition, attempt: u32) -> Self {
         Self {
             process,
@@ -67,7 +69,12 @@ pub enum ValueRef {
     Inline(Value),
     /// A large value addressed by content hash (blob/tensor/frame); the bytes
     /// live in the blob/tensor store, never in the Fact.
-    External { hash: String, size: u64 },
+    External {
+        /// Content hash for the external payload.
+        hash: String,
+        /// Byte size of the external payload.
+        size: u64,
+    },
 }
 
 impl ValueRef {
@@ -111,6 +118,7 @@ impl ValueRef {
         }
     }
 
+    /// Borrow the inline value if this reference carries one.
     pub fn as_inline(&self) -> Option<&Value> {
         match self {
             ValueRef::Inline(v) => Some(v),
@@ -126,12 +134,15 @@ impl ValueRef {
 /// them by value here is cheap — the bytes never travel inline.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Operation {
+    /// Causally derived operation id.
     pub id: OperationId,
     /// The calling Process (`caller`, §2.5).
     pub process: ProcessId,
     /// The identity this call runs as (`acting`, §2.5).
     pub acting: IdentityRef,
+    /// Handle authorizing this call.
     pub handle: HandleId,
+    /// Interface method id selected by open/dispatch.
     pub method: MethodId,
     /// The input passed to the driver. Recorded in the Fact as `ValueRef::of`.
     pub input: Value,
@@ -139,6 +150,7 @@ pub struct Operation {
     /// outcome inherits this taint, and outbound/memory policies read it.
     #[serde(default)]
     pub taint: crate::taint::TaintSet,
+    /// Output mode requested by the caller.
     pub output: crate::resource::OutputMode,
 }
 
@@ -155,13 +167,16 @@ pub enum DecisionTag {
     RejectedByPolicy,
     /// The driver returned an error.
     DriverError,
+    /// Operation timed out.
     Timeout,
+    /// Operation was cancelled.
     Cancelled,
     /// Held in quarantine (unsafe replay).
     Quarantined,
 }
 
 impl DecisionTag {
+    /// Returns true when the decision represents success.
     pub fn is_ok(self) -> bool {
         matches!(self, DecisionTag::Ok)
     }
@@ -176,7 +191,12 @@ pub enum OutcomeRef {
     /// A small outcome carried inline.
     Inline(Value),
     /// A large outcome addressed by content hash.
-    External { hash: String, size: u64 },
+    External {
+        /// Content hash for the external payload.
+        hash: String,
+        /// Byte size of the external payload.
+        size: u64,
+    },
     /// No completed success body: pending facts and failures use this. A
     /// successful unit/null outcome is recorded as `Inline(Value::Null)` so
     /// recovery can distinguish completion from "begun, not completed".
@@ -184,6 +204,7 @@ pub enum OutcomeRef {
 }
 
 impl OutcomeRef {
+    /// Wrap a success value, externalizing large payload references.
     pub fn of(v: Value) -> Self {
         match &v {
             Value::Blob(b) => OutcomeRef::External {
@@ -223,6 +244,7 @@ impl OutcomeRef {
         }
     }
 
+    /// Borrow the inline success body if this reference carries one.
     pub fn as_inline(&self) -> Option<&Value> {
         match self {
             OutcomeRef::Inline(v) => Some(v),
@@ -236,14 +258,20 @@ impl OutcomeRef {
 /// `outcome_ref`, so summarizing a batch never discards the completed result.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BatchSummary {
+    /// Number of elements in the batch input list.
     pub elements: u64,
+    /// Estimated input tokens for the whole batch.
     pub input_tokens: u64,
+    /// Estimated output tokens for the whole batch.
     pub output_tokens: u64,
+    /// Redacted structural summary of the input.
     pub input_summary: Value,
+    /// Redacted structural summary of the output.
     pub output_summary: Value,
 }
 
 impl BatchSummary {
+    /// Build a summary for list-shaped batch input and optional outcome.
     pub fn new(input: &Value, outcome: Option<&OutcomeRef>) -> Option<Self> {
         let Value::List(items) = input else {
             return None;
@@ -258,6 +286,7 @@ impl BatchSummary {
         })
     }
 
+    /// Convert the summary to a value for audit and console projections.
     pub fn to_value(&self) -> Value {
         let mut m = BTreeMap::new();
         m.insert("elements".into(), Value::Int(self.elements as i64));
@@ -351,11 +380,17 @@ fn kind_map(name: &str) -> BTreeMap<String, Value> {
 pub struct Fact {
     /// `OperationId` — globally unique, no central counter (§9 / §6.1).
     pub id: OperationId,
+    /// Fact schema version used for migration and replay compatibility.
     pub schema_version: u32,
+    /// Process that issued the operation.
     pub caller: ProcessId,
+    /// Identity the operation ran as.
     pub acting: IdentityRef,
+    /// Handle used to authorize and dispatch the operation.
     pub handle: HandleId,
+    /// Resource id resolved by the handle.
     pub resource: ResourceId,
+    /// Method id invoked on the resource interface.
     pub method: MethodId,
     /// Reference only; large objects are blob/tensor refs (§4.4).
     pub input_ref: ValueRef,
@@ -371,7 +406,9 @@ pub struct Fact {
     /// method while `input_ref`/`outcome_ref` remain the replay material.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch: Option<BatchSummary>,
+    /// Replay class derived from method purity and operation semantics.
     pub replay: ReplayClass,
+    /// Timestamp assigned when the Fact was recorded.
     pub timestamp: Timestamp,
 }
 

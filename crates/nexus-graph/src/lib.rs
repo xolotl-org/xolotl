@@ -2,7 +2,7 @@
 
 //! `nexus-graph` — the single execution IR and its front-ends.
 //!
-//! Every Program format (Do<A>, model plan, native) compiles to one
+//! Every Program format (`Do<A>`, model plan, native) compiles to one
 //! [`ExecutionGraph`] (§13.2). The Executor (in `nexus-kernel`) only ever
 //! advances a graph cursor — it never interprets a source format directly.
 //! This is what makes "format independence" a fact rather than a slogan: many
@@ -12,7 +12,7 @@
 //! and is wasm-safe: the Do→Graph compiler can run in the browser.
 //!
 //! - [`graph`]   — `ExecutionGraph` / `Node` / `NodeKind`, the IR.
-//! - [`r#do`]    — `Do<A>` (`DoNode`): the preferred serializable front-end.
+//! - `r#do`      — `Do<A>` (`DoNode`): the preferred serializable front-end.
 //! - [`compile`] — Do→Graph compiler; assigns stable `NodeId == CausalPosition`.
 //! - [`cursor`]  — `GraphCursor`: where execution / recovery is positioned.
 //! - [`actor_spec`] — `ActorSpec` + `lint`: declared vs. used effects (§20.2/§21.5).

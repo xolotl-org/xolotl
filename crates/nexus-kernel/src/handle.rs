@@ -25,8 +25,11 @@ pub enum FastPath {
 /// Lifecycle state of a handle (§5.3).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HandleState {
+    /// Handle can be used by its owning process.
     Active,
+    /// Handle was voluntarily closed but the slot still resolves.
     Closed,
+    /// Handle was revoked; stale ids no longer resolve.
     Revoked,
 }
 
@@ -34,12 +37,19 @@ pub enum HandleState {
 /// the attenuated rights, the frozen dispatch table, and the fast-path marker.
 #[derive(Clone)]
 pub struct Handle {
+    /// Generational identifier for this handle table slot.
     pub id: HandleId,
+    /// Process that owns this handle.
     pub process: ProcessId,
+    /// Resource this handle authorizes access to.
     pub resource: ResourceId,
+    /// Attenuated method and flag rights granted by open.
     pub rights: Rights,
+    /// Frozen dispatch plan selected at open time.
     pub driver_plan: DriverPlan,
+    /// Residual-policy marker for the data-plane hot path.
     pub fast_path: FastPath,
+    /// Current lifecycle state.
     pub state: HandleState,
     /// The concrete target path this handle was opened against (§12). For
     /// prefix-resolved Resources (`state://**`), the driver needs the actual
@@ -89,6 +99,7 @@ pub struct HandleTable {
 }
 
 impl HandleTable {
+    /// Create an empty generational handle table.
     pub fn new() -> Self {
         Self {
             slots: Vec::new(),
@@ -126,6 +137,7 @@ impl HandleTable {
         slot.handle.as_ref()
     }
 
+    /// Mutable lookup with the same generation check as [`HandleTable::get`].
     pub fn get_mut(&mut self, id: HandleId) -> Option<&mut Handle> {
         let slot = self.slots.get_mut(id.index as usize)?;
         if slot.generation != id.generation {
@@ -166,6 +178,7 @@ impl HandleTable {
         self.slots.iter().filter(|s| s.handle.is_some()).count()
     }
 
+    /// Whether no live handles are present.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

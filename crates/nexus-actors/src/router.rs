@@ -12,7 +12,7 @@
 //! Config lives in `state://kernel/inference/{backends,models,groups}` and
 //! `state://kernel/routing/inference` (§17.1). The [`Router`] here is the
 //! in-process selection engine; the daemon loads config into it and registers
-//! real backends. The offline baseline registers a single [`EchoBackend`] model.
+//! real backends. The offline baseline registers a single echo backend model.
 
 use crate::inference::{InferenceBackend, ModelCapabilities, RequestRequirements};
 use parking_lot::Mutex;
@@ -38,7 +38,9 @@ pub enum GroupPolicy {
 pub struct ModelEntry {
     /// Stable `<backend>/<model_id>` qualified name.
     pub id: String,
+    /// Backend implementation that serves this model.
     pub backend: Arc<dyn InferenceBackend>,
+    /// Capability declaration used for candidate filtering.
     pub caps: ModelCapabilities,
     /// Relative weight for [`GroupPolicy::Weighted`] (and a Priority tiebreak).
     pub weight: u32,
@@ -54,6 +56,7 @@ struct ModelStats {
 }
 
 impl ModelEntry {
+    /// Create a model entry using the backend's declared capabilities.
     pub fn new(id: impl Into<String>, backend: Arc<dyn InferenceBackend>) -> Self {
         let caps = backend.capabilities();
         Self {
@@ -65,6 +68,7 @@ impl ModelEntry {
         }
     }
 
+    /// Set this model's routing weight.
     pub fn with_weight(mut self, weight: u32) -> Self {
         self.weight = weight.max(1);
         self
@@ -92,9 +96,11 @@ impl ModelEntry {
 /// A named set of candidate models with a selection policy and an optional
 /// fallback group (§17.1).
 pub struct ModelGroup {
+    /// Group name referenced by routing config or fallback.
     pub name: String,
+    /// Selection policy used within this group.
     pub policy: GroupPolicy,
-    /// Indices into [`Router::models`].
+    /// Indices into the router's model table.
     pub members: Vec<usize>,
     /// Group to escalate to when every member fails (§17.1).
     pub fallback: Option<String>,
@@ -103,6 +109,7 @@ pub struct ModelGroup {
 }
 
 impl ModelGroup {
+    /// Create a model group over model-table member indices.
     pub fn new(name: impl Into<String>, policy: GroupPolicy, members: Vec<usize>) -> Self {
         Self {
             name: name.into(),
@@ -113,6 +120,7 @@ impl ModelGroup {
         }
     }
 
+    /// Set the fallback group used when all members fail.
     pub fn with_fallback(mut self, group: impl Into<String>) -> Self {
         self.fallback = Some(group.into());
         self
@@ -134,7 +142,9 @@ pub struct Router {
 
 /// The result of routing: which model handled it and its output.
 pub struct Routed {
+    /// Model id that handled the request.
     pub model_id: String,
+    /// Output returned by the selected model.
     pub output: nexus_types::Value,
 }
 
@@ -156,7 +166,7 @@ impl Router {
         }
     }
 
-    /// The single-backend offline baseline ([`EchoBackend`]).
+    /// The single-backend offline baseline.
     pub fn baseline() -> Self {
         Self::new(vec![ModelEntry::new(
             "baseline/echo",
@@ -169,10 +179,12 @@ impl Router {
         self.groups.insert(group.name.clone(), group);
     }
 
+    /// Set the group used when a request does not name one.
     pub fn set_default_group(&mut self, name: impl Into<String>) {
         self.default_group = name.into();
     }
 
+    /// Set the per-model retry count for retryable backend errors.
     pub fn set_max_retries(&mut self, n: u32) {
         self.max_retries = n;
     }

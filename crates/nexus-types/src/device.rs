@@ -12,11 +12,17 @@ use std::collections::BTreeMap;
 /// A provider of one or more Effects to the Nexus kernel.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EffectProvider {
+    /// Stable provider id.
     pub id: String,
+    /// Human-readable provider name.
     pub display_name: String,
+    /// Transport used to reach the provider.
     pub transport: Transport,
+    /// Trust level assigned to the provider.
     pub trust: TrustLevel,
+    /// Effects this provider can handle.
     pub capabilities: Vec<EffectCapability>,
+    /// Current provider lifecycle status.
     #[serde(default)]
     pub status: ProviderStatus,
 }
@@ -25,19 +31,29 @@ pub struct EffectProvider {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
+    /// In-process provider.
     #[default]
     InProcess,
+    /// gRPC provider endpoint.
     Grpc {
+        /// Optional endpoint override.
         endpoint: Option<String>,
     },
+    /// Stdio child process provider.
     Stdio {
+        /// Optional executable command.
         command: Option<String>,
+        /// Command arguments.
         args: Vec<String>,
     },
+    /// WebSocket provider endpoint.
     WebSocket {
+        /// Optional endpoint override.
         endpoint: Option<String>,
     },
+    /// HTTP provider endpoint.
     Http {
+        /// Optional endpoint override.
         endpoint: Option<String>,
     },
 }
@@ -57,10 +73,14 @@ pub enum TrustLevel {
 /// for modality-aware routing (§17.1) and schema-versioned wire contracts.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EffectCapability {
+    /// Effect resource path this capability handles.
     pub effect_path: String,
+    /// Declared purity for replay classification.
     pub purity: Purity,
+    /// Optional human-readable description.
     #[serde(default)]
     pub description: Option<String>,
+    /// Optional input schema descriptor.
     #[serde(default)]
     pub input_schema: Option<Value>,
     /// Output schema (§16.2) — lets the router validate / project the result.
@@ -75,15 +95,24 @@ pub struct EffectCapability {
     pub schema_version: u32,
 }
 
+/// Provider lifecycle status.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderStatus {
+    /// Provider has been registered but not started.
     #[default]
     Registered,
+    /// Provider startup is in progress.
     Starting,
+    /// Provider is reachable.
     Online,
+    /// Provider is not reachable.
     Offline,
-    Error(String),
+    /// Provider reported an error.
+    Error(
+        /// Error message.
+        String,
+    ),
 }
 
 impl EffectProvider {
@@ -99,6 +128,7 @@ impl EffectProvider {
         }
     }
 
+    /// Convert this provider descriptor to a Nexus value map.
     pub fn to_value(&self) -> Value {
         let mut m = BTreeMap::new();
         m.insert("id".into(), Value::Str(self.id.clone()));
@@ -111,6 +141,7 @@ impl EffectProvider {
         Value::Map(m)
     }
 
+    /// Decode a provider descriptor from a Nexus value map.
     pub fn from_value(v: &Value) -> Option<Self> {
         let m = v.as_map()?;
         let id = m.get("id")?.as_str()?.to_string();
@@ -151,6 +182,7 @@ impl EffectProvider {
 }
 
 impl EffectCapability {
+    /// Create a capability descriptor for one effect path.
     pub fn new(effect_path: impl Into<String>, purity: Purity) -> Self {
         Self {
             effect_path: effect_path.into(),
@@ -163,6 +195,7 @@ impl EffectCapability {
         }
     }
 
+    /// Convert this capability descriptor to a Nexus value map.
     pub fn to_value(&self) -> Value {
         let mut m = BTreeMap::new();
         m.insert("effect_path".into(), Value::Str(self.effect_path.clone()));
@@ -191,6 +224,7 @@ impl EffectCapability {
         Value::Map(m)
     }
 
+    /// Decode a capability descriptor from a Nexus value map.
     pub fn from_value(v: &Value) -> Option<Self> {
         let m = v.as_map()?;
         let effect_path = m.get("effect_path")?.as_str()?.to_string();

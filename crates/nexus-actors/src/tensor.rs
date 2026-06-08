@@ -29,6 +29,7 @@ pub struct TensorDriver {
 }
 
 impl TensorDriver {
+    /// Create a tensor driver backed by the state plane.
     pub fn new(state: Backend) -> Self {
         Self { state }
     }

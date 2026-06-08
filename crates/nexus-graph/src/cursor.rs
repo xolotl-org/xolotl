@@ -13,12 +13,14 @@ use serde::{Deserialize, Serialize};
 /// plus the value flowing into it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Frame {
+    /// Node to execute when this frame is popped.
     pub node: NodeId,
     /// The value to feed this node (the upstream result). `Null` at the root.
     pub input: Value,
 }
 
 impl Frame {
+    /// Create a frame for `node` with the value that should flow into it.
     pub fn new(node: NodeId, input: Value) -> Self {
         Self { node, input }
     }

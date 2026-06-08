@@ -2,7 +2,7 @@
 //!
 //! Recovery is per-Process: read the latest snapshot, replay the facts after
 //! it, realign the graph cursor by `NodeId` (§13.2), and handle pending
-//! operations per their [`ReplayClass`](nexus_types::ReplayClass) —
+//! operations per their [`ReplayClass`] —
 //! idempotent ones may retry, non-idempotent ones go to quarantine (§15.3).
 
 use crate::fact::FactSink;
@@ -24,6 +24,7 @@ pub struct ReplayMap {
 }
 
 impl ReplayMap {
+    /// Create an empty replay map for a fresh run.
     pub fn new() -> Self {
         Self::default()
     }
@@ -78,8 +79,11 @@ impl ReplayMap {
 /// replaying the full fact stream.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Process captured by this snapshot.
     pub process: ProcessId,
+    /// Fact sink append cursor at snapshot time.
     pub at_cursor: u64,
+    /// Graph execution cursor captured at snapshot time.
     pub graph_cursor: GraphCursor,
     /// The Process descriptor captured at snapshot time (§15.2).
     #[serde(default)]
@@ -107,7 +111,9 @@ pub struct RecoveryReport {
 /// replay held for an operator decision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QuarantineEntry {
+    /// Fact that cannot be replayed automatically.
     pub fact: Fact,
+    /// Suggested operator action for the quarantined fact.
     pub suggested_action: QuarantineAction,
 }
 

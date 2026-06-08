@@ -28,14 +28,25 @@ use nexus_types::{NodeId, Value};
 use std::collections::HashMap;
 use thiserror::Error;
 
+/// Errors produced while lowering a [`DoNode`] into an [`ExecutionGraph`].
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum CompileError {
+    /// A `Use(name)` node referenced a name that was not bound by an enclosing
+    /// `Let`.
     #[error("Use(\"{0}\") references a name not bound by any enclosing Let")]
     UnboundName(String),
+    /// The program exceeded the graph size admission limit.
     #[error("graph exceeded the maximum of {max} nodes")]
-    TooLarge { max: usize },
+    TooLarge {
+        /// Maximum number of nodes accepted by the compiler.
+        max: usize,
+    },
+    /// The graph could not be serialized for structural hashing.
     #[error("graph hash serialization failed: {message}")]
-    GraphHash { message: String },
+    GraphHash {
+        /// Serialization error message.
+        message: String,
+    },
 }
 
 /// Maximum nodes in one compiled graph (admission bound; prevents unbounded

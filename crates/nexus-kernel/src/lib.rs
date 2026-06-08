@@ -3,10 +3,10 @@
 //! `nexus-kernel` — the Direction-C kernel (syscall + ExecutionGraph).
 //!
 //! The control plane is a compiler: `open()` compiles a Grant against a
-//! Resource into a [`Handle`](handle::Handle). The data plane is a VM that
+//! Resource into a [`Handle`]. The data plane is a VM that
 //! executes [`Operation`](nexus_types::Operation)s through that handle's frozen
-//! [`DriverPlan`](driver::DriverPlan), recording a [`Fact`](nexus_types::Fact).
-//! The [`Executor`](executor::Executor) advances an
+//! [`DriverPlan`], recording a [`Fact`](nexus_types::Fact).
+//! The [`Executor`] advances an
 //! [`ExecutionGraph`](nexus_graph::ExecutionGraph) cursor (§13.4).
 //!
 //! Module map:

@@ -57,50 +57,74 @@ pub enum SessionReject {
 /// Why a Source event ingest was rejected at the daemon boundary (§16.3.4).
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SourceIngestError {
+    /// Session gate rejected the frame before ingest.
     #[error("session rejected frame: {0:?}")]
     Session(SessionReject),
+    /// Frame targeted a projection different from the ready session.
     #[error("source projection {0} is not the ready session projection")]
     ProjectionMismatch(String),
+    /// Frame's observed registry hash differs from the current registry.
     #[error("source session registry hash mismatch")]
     RegistryHashMismatch,
+    /// Frame credential generation differs from the current credential.
     #[error("source session credential generation mismatch")]
     CredentialGenerationMismatch,
+    /// Frame binding generation differs from the current binding generation.
     #[error("source session binding generation mismatch")]
     BindingGenerationMismatch,
+    /// Frame installation config version differs from current install state.
     #[error("source session installation config version mismatch")]
     InstallationConfigVersionMismatch,
+    /// Frame projection version differs from current projection state.
     #[error("source session projection version mismatch")]
     ProjectionVersionMismatch,
+    /// Ready projection is not declared as a Source role.
     #[error("extension is not a Source")]
     NotSource,
+    /// Source projection has no declared event sink.
     #[error("source extension has no emits declaration")]
     MissingEmits,
+    /// Event id could not be represented as a durable path segment.
     #[error("source event id is empty after path normalization")]
     InvalidEventId,
+    /// Event payload failed declared schema validation.
     #[error("payload schema mismatch: {0}")]
     Schema(String),
+    /// Residual source policy rejected the event payload.
     #[error("policy rejected source event: {0}")]
     Policy(String),
+    /// State write or dedup bookkeeping failed.
     #[error("state write failed: {0}")]
     State(String),
 }
 
 /// Runtime authority required to admit one inbound Source event (§16.3.4).
 pub struct SourceIngest<'a> {
+    /// State backend used for dedup and event append.
     pub state: Backend,
+    /// Ready endpoint session that gates this frame.
     pub session: &'a EndpointSession,
+    /// Installation id the frame claims to belong to.
     pub installation_id: &'a str,
+    /// Source projection definition admitted for the installation.
     pub projection: &'a ExtensionProjectionDef,
+    /// Current registry hash expected by this daemon.
     pub current_registry_hash: &'a str,
+    /// Current credential generation for the installation.
     pub credential_generation: u64,
+    /// Current binding generation for the source projection.
     pub current_binding_generation: u64,
+    /// Current shared installation config version.
     pub current_installation_config_version: u64,
+    /// Residual source policy snapshot evaluated before append.
     pub policy: &'a PolicySnapshot,
+    /// Identity the source event is admitted under.
     pub acting: IdentityRef,
     /// Resource id for the declared event sink. Source policy uses this as the
     /// runtime target key; callers that have not registered a concrete Resource
     /// can pass `ResourceId::new(0)` and still get input-dependent checks.
     pub target: ResourceId,
+    /// Wall-clock timestamp used by residual policy checks.
     pub now_millis: i64,
 }
 
@@ -346,14 +370,18 @@ impl EndpointSession {
         }
     }
 
+    /// Current handshake phase.
     pub fn phase(&self) -> SessionPhase {
         self.phase
     }
 
+    /// Whether the session has completed the handshake and may carry business
+    /// frames.
     pub fn is_ready(&self) -> bool {
         self.phase == SessionPhase::Ready
     }
 
+    /// Authoritative session context sent by the daemon after hello.
     pub fn context(&self) -> Option<&SessionContext> {
         self.context.as_ref()
     }

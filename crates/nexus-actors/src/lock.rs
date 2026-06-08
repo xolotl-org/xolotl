@@ -24,6 +24,7 @@ pub struct LockDriver {
 }
 
 impl LockDriver {
+    /// Create a lock driver backed by the state plane.
     pub fn new(state: Backend) -> Self {
         Self { state }
     }

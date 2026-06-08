@@ -34,6 +34,7 @@ pub struct StateDriver {
 }
 
 impl StateDriver {
+    /// Create a state driver over `state`.
     pub fn new(state: Backend) -> Self {
         Self { state }
     }

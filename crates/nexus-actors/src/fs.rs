@@ -6,7 +6,7 @@
 //! are `NonIdempotentEffect`. Large reads cross the `effect://blob/write`
 //! offload boundary ("大文件走 effect://blob/write 只记 BlobRef"): a `read` of a
 //! file larger than [`INLINE_MAX`] persists the bytes in the standard blob
-//! store and returns a [`BlobRef`] (blake3 hash + size + mime); small files are
+//! store and returns a blob reference (blake3 hash + size + mime); small files are
 //! returned inline.
 
 use async_trait::async_trait;
@@ -27,7 +27,7 @@ pub const FS_METHODS: &[MethodSpec] = &[
 ];
 
 /// Reads at or below this size inline into the returned `Value`; larger files
-/// cross the blob offload boundary and come back as a [`BlobRef`] (§17.3).
+/// cross the blob offload boundary and come back as a blob reference (§17.3).
 pub const INLINE_MAX: u64 = 1 << 20; // 1 MiB
 
 /// Drives the filesystem actions, sandboxed to a root directory.
@@ -38,6 +38,8 @@ pub struct FsDriver {
 }
 
 impl FsDriver {
+    /// Create a filesystem driver rooted at `root` and using `state` for blob
+    /// offload.
     pub fn new(root: impl Into<PathBuf>, state: Backend) -> Self {
         let root = root.into();
         let root = std::fs::canonicalize(&root).unwrap_or(root);

@@ -43,6 +43,7 @@ pub struct DeliberationDriver {
 }
 
 impl DeliberationDriver {
+    /// Create a deliberation driver using `backend` for panelist calls.
     pub fn new(backend: Arc<dyn InferenceBackend>) -> Self {
         Self { backend }
     }

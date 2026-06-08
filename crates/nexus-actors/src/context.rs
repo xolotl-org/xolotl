@@ -63,6 +63,7 @@ fn layer_text(v: &Value) -> String {
 pub struct ContextDriver;
 
 impl ContextDriver {
+    /// Create a stateless context assembly driver.
     pub fn new() -> Self {
         Self
     }

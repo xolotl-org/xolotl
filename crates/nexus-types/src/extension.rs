@@ -32,7 +32,9 @@ pub type JsonSchema = Value;
 /// and binding generations independent.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExtensionProjectionDef {
+    /// Projection id unique within an installation.
     pub id: String,
+    /// Whether this projection provides effects or emits source events.
     pub role: Role,
     /// Provider: every exposed effect must sit under this sandbox namespace.
     /// Source projections usually leave this as `None`.
@@ -59,9 +61,13 @@ pub struct ExtensionProjectionDef {
 /// for send/media effects), all sharing one process and credential.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExtensionInstallationDef {
+    /// Installation id used in state paths, process ids, and sandbox prefixes.
     pub id: String,
+    /// Platform name, for example a connector family.
     pub platform: String,
+    /// Transport used to communicate with the extension runtime.
     pub transport: Transport,
+    /// Trust level assigned by admission.
     pub trust: TrustLevel,
     /// Shared config contract for this installation. Projection-specific method
     /// schemas stay in `provides` / `emits`.
@@ -80,7 +86,9 @@ pub struct ExtensionInstallationDef {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
+    /// Extension exposes effect resources through remote bindings.
     Provider,
+    /// Extension emits inbound events into a state sequence.
     Source,
 }
 
@@ -100,46 +108,78 @@ pub struct EventSource {
     pub event_schema: Option<JsonSchema>,
 }
 
+/// Admission failures for extension installations and projections.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum ExtensionAdmissionError {
+    /// Installation id was empty.
     #[error("extension installation id must not be empty")]
     EmptyInstallationId,
+    /// Installation id was not a safe path segment.
     #[error(
         "extension installation id must start with an ASCII letter or digit and contain only ASCII letters, digits, '_' or '-'"
     )]
     MalformedInstallationId,
+    /// Projection id was empty.
     #[error("extension projection id must not be empty")]
     EmptyProjectionId,
+    /// Projection id was not a safe path segment.
     #[error(
         "extension projection id must start with an ASCII letter or digit and contain only ASCII letters, digits, '_' or '-'"
     )]
     MalformedProjectionId,
+    /// Installation declared no projections.
     #[error("extension installation must declare at least one projection")]
     InstallationWithoutProjections,
+    /// Installation declared the same projection id more than once.
     #[error("extension projection id {0:?} is duplicated")]
     DuplicateProjectionId(String),
+    /// Provider projection declared no capabilities.
     #[error("provider extension must declare at least one provided effect")]
     ProviderWithoutCapabilities,
+    /// Provider projection also declared source events.
     #[error("provider extension must not declare a source event stream")]
     ProviderWithEventSource,
+    /// Source projection declared no event sink.
     #[error("source extension must declare an event stream")]
     SourceWithoutEventStream,
+    /// Source projection also declared provider capabilities.
     #[error("source extension must not declare provider capabilities")]
     SourceWithCapabilities,
+    /// Source event sink was not a concrete local state path.
     #[error("source event sink must be a concrete local state:// path: {actual}")]
-    BadSourceEventSink { actual: Path },
+    BadSourceEventSink {
+        /// Event sink path supplied by the projection.
+        actual: Path,
+    },
+    /// Sandboxed source event sink did not match its required path.
     #[error("sandboxed source event sink must be {expected}, got {actual}")]
-    BadSandboxEventSink { expected: Path, actual: Path },
+    BadSandboxEventSink {
+        /// Required sandbox sink path.
+        expected: Path,
+        /// Sink path supplied by the projection.
+        actual: Path,
+    },
+    /// Provider effect path could not be parsed.
     #[error("provider effect path is malformed: {0}")]
     MalformedEffectPath(String),
+    /// Provider effect path escaped the declared namespace.
     #[error("provider effect {effect} escapes namespace {namespace}")]
-    NamespaceEscape { namespace: Path, effect: Path },
+    NamespaceEscape {
+        /// Declared provider namespace.
+        namespace: Path,
+        /// Escaping effect path.
+        effect: Path,
+    },
+    /// Sandboxed provider namespace was not under an allowed prefix.
     #[error("sandboxed extension namespace must be effect://plugin/<id> or effect://mcp-tool/<id>")]
     BadSandboxNamespace,
+    /// Sandboxed namespace id segment did not match installation id.
     #[error("sandboxed extension id does not match namespace id segment")]
     SandboxIdMismatch,
+    /// Full-trust installation used a transport reserved for sandboxed runtimes.
     #[error("full-trust extension cannot use transport {0}")]
     FullTrustTransport(String),
+    /// Sandboxed installation attempted in-process transport.
     #[error("in-process transport requires full trust")]
     InProcessSandbox,
 }
@@ -230,6 +270,7 @@ impl ExtensionInstallationDef {
         Ok(())
     }
 
+    /// Return a projection by id.
     pub fn projection(&self, id: &str) -> Option<&ExtensionProjectionDef> {
         self.projections
             .iter()
@@ -317,6 +358,7 @@ fn validate_source_event_sink(path: &Path) -> Result<(), ExtensionAdmissionError
     }
 }
 
+/// Build the required source event sink for a sandboxed source projection.
 pub fn sandboxed_source_event_sink_path(
     installation_id: &str,
     projection_id: &str,
@@ -350,12 +392,15 @@ fn transport_name(t: &Transport) -> &'static str {
 /// share one config contract.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ManifestDef {
+    /// Platform name this template installs.
     pub platform: String,
     /// Source of an installation's shared config schema.
     pub config_schema: JsonSchema,
     /// Projection templates this platform can install.
     pub projections: Vec<ExtensionProjectionDef>,
+    /// Transports supported by this platform template.
     pub supported_transports: Vec<Transport>,
+    /// Default transport selected when an installation does not override it.
     pub default_transport: Transport,
     /// Optimistic concurrency/config revision for this install template.
     pub version: u64,
@@ -369,7 +414,9 @@ pub struct ManifestDef {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtensionTransport {
+    /// WebSocket pairing endpoint.
     WebSocket,
+    /// gRPC pairing endpoint.
     Grpc,
 }
 
@@ -377,6 +424,7 @@ pub enum ExtensionTransport {
 /// extensions must not invent defaults; they connect only to these contacts.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DaemonContacts {
+    /// Ordered daemon contact candidates.
     pub contacts: Vec<DaemonContact>,
 }
 
@@ -384,11 +432,16 @@ pub struct DaemonContacts {
 /// of host/IP + port (`host:7443`, `192.168.1.20:7443`, `[fd00::12]:7443`).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DaemonContact {
+    /// Transport used for this contact.
     pub transport: ExtensionTransport,
+    /// Host/IP plus port, without URL scheme.
     pub authority: String,
+    /// Service name exposed at this contact.
     pub service: String,
+    /// Optional TLS server name override.
     #[serde(default)]
     pub tls_name: Option<String>,
+    /// Lower numbers are preferred.
     pub priority: u8,
 }
 
@@ -396,17 +449,26 @@ pub struct DaemonContact {
 /// pass. Visual encodings may compress or shard it, but must not omit contacts.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PairingPayload {
+    /// Pairing payload schema version.
     pub version: u32,
+    /// Pairing flow id.
     pub pairing_id: String,
+    /// One-time secret used to claim the pairing.
     pub pairing_secret: String,
+    /// Daemon contact list.
     pub daemon_contacts: DaemonContacts,
+    /// Daemon identity public key.
     pub daemon_identity_pub: String,
+    /// Human-checkable daemon fingerprint.
     pub daemon_fingerprint: String,
+    /// Expiry timestamp.
     pub expires_at: Timestamp,
+    /// Display checksum for human/manual verification.
     pub display_checksum: String,
 }
 
 impl DaemonContact {
+    /// Validate authority and service fields.
     pub fn validate(&self) -> Result<(), PairingPayloadError> {
         validate_authority(&self.authority)?;
         if self.service.trim().is_empty() {
@@ -417,6 +479,7 @@ impl DaemonContact {
 }
 
 impl PairingPayload {
+    /// Validate that the payload contains usable daemon contacts.
     pub fn validate(&self) -> Result<(), PairingPayloadError> {
         if self.daemon_contacts.contacts.is_empty() {
             return Err(PairingPayloadError::MissingContacts);
@@ -428,12 +491,16 @@ impl PairingPayload {
     }
 }
 
+/// Pairing payload validation errors.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum PairingPayloadError {
+    /// Payload had no daemon contacts.
     #[error("pairing payload must include at least one daemon contact")]
     MissingContacts,
+    /// Contact authority was not `host:port` or `[ipv6]:port`.
     #[error("daemon contact authority must be host:port or [ipv6]:port, without a scheme")]
     BadAuthority,
+    /// Contact service name was empty.
     #[error("daemon contact service cannot be empty")]
     EmptyService,
 }
@@ -474,9 +541,20 @@ fn validate_authority(authority: &str) -> Result<(), PairingPayloadError> {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RestartPolicy {
+    /// Never restart after exit.
     Never,
-    OnFailure { max: u32, window_ms: u64 },
-    Always { backoff: Backoff },
+    /// Restart on failure up to `max` failures inside `window_ms`.
+    OnFailure {
+        /// Maximum failures allowed inside the window.
+        max: u32,
+        /// Failure-counting window in milliseconds.
+        window_ms: u64,
+    },
+    /// Always restart using the configured backoff.
+    Always {
+        /// Backoff strategy between restarts.
+        backoff: Backoff,
+    },
 }
 
 impl Default for RestartPolicy {
@@ -492,12 +570,18 @@ impl Default for RestartPolicy {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Backoff {
+    /// Fixed delay between restarts.
     Fixed {
+        /// Delay in milliseconds.
         ms: u64,
     },
+    /// Exponential backoff.
     Exp {
+        /// Initial delay in milliseconds.
         base_ms: u64,
+        /// Maximum delay in milliseconds.
         cap_ms: u64,
+        /// Whether jitter should be applied.
         jitter: bool,
     },
 }
@@ -507,16 +591,20 @@ pub enum Backoff {
 /// can fork/exec.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProcSpec {
+    /// Process id under `proc://`.
     pub id: String,
     /// Decides how to bring it up: Stdio is self-forked; Grpc/WS/Http connect.
     pub transport: Transport,
     /// argv for a Stdio child; `None` for an externally-managed process.
     #[serde(default)]
     pub command: Option<Vec<String>>,
+    /// Environment variables passed to a Stdio child.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Working directory for a Stdio child.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Restart policy used by supervision.
     pub restart: RestartPolicy,
 }
 
@@ -526,7 +614,9 @@ pub struct ProcSpec {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowSignal {
+    /// Pause inbound event delivery.
     Pause,
+    /// Resume inbound event delivery.
     Resume,
 }
 
@@ -536,8 +626,10 @@ pub enum FlowSignal {
 /// generations live in [`SessionContext`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ObservedGenerations {
+    /// Presentation configuration generation observed by the extension.
     #[serde(default)]
     pub presentation_config_generation: u64,
+    /// Alias catalog generation observed by the extension.
     #[serde(default)]
     pub alias_catalog_generation: u64,
 }
@@ -547,12 +639,18 @@ pub struct ObservedGenerations {
 /// authority). Self-describing extensions report their config contract here.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RoleSessionClientHello {
+    /// Role requested by the extension endpoint.
     pub role: Role,
+    /// Installation id the endpoint claims.
     pub installation_id: String,
+    /// Projection id the endpoint claims.
     pub projection_id: String,
+    /// Registry hash observed by the endpoint.
     pub registry_hash: String,
+    /// Lightweight generation tags observed by the endpoint.
     #[serde(default)]
     pub observed: ObservedGenerations,
+    /// Optional self-described config schema.
     #[serde(default)]
     pub config_schema: Option<JsonSchema>,
 }
@@ -562,15 +660,25 @@ pub struct RoleSessionClientHello {
 /// never declares or guesses these.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionContext {
+    /// Installation id accepted by the daemon.
     pub installation_id: String,
+    /// Projection id accepted by the daemon.
     pub projection_id: String,
+    /// Role accepted by the daemon.
     pub role: Role,
+    /// Authoritative registry hash.
     pub registry_hash: String,
+    /// Credential generation selected by the daemon.
     pub credential_generation: u64,
+    /// Binding generation selected by the daemon.
     pub binding_generation: u64,
+    /// Installation config version selected by the daemon.
     pub extension_config_version: u64,
+    /// Projection version selected by the daemon.
     pub projection_version: u64,
+    /// Presentation config generation selected by the daemon.
     pub presentation_config_generation: u64,
+    /// Alias catalog generation selected by the daemon.
     pub alias_catalog_generation: u64,
 }
 
@@ -579,6 +687,7 @@ pub struct SessionContext {
 /// fail-closed; no business frames flow before this.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RoleReady {
+    /// Session context accepted by the extension.
     pub accepted_context: SessionContext,
 }
 
@@ -586,7 +695,9 @@ pub struct RoleReady {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigAxis {
+    /// Authority/configuration axis.
     ExtensionConfig,
+    /// Presentation-only axis.
     PresentationConfig,
 }
 
@@ -594,9 +705,13 @@ pub enum ConfigAxis {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectReason {
+    /// Presentation or profile hash did not match.
     ProfileMismatch,
+    /// Config payload failed schema validation.
     SchemaInvalid,
+    /// Update generation was stale.
     GenerationStale,
+    /// Endpoint does not support this update.
     Unsupported,
 }
 
@@ -604,8 +719,13 @@ pub enum RejectReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyStatus {
+    /// Update was applied.
     Applied,
-    Rejected { reason: RejectReason },
+    /// Update was rejected.
+    Rejected {
+        /// Rejection reason.
+        reason: RejectReason,
+    },
 }
 
 /// Control frames shared by both roles (§16.3.3). Configuration travels on two
@@ -615,38 +735,54 @@ pub enum ApplyStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlFrame {
+    /// Liveness heartbeat.
     Heartbeat,
+    /// Request graceful or forced shutdown.
     Shutdown {
+        /// Whether the endpoint should attempt graceful shutdown.
         graceful: bool,
+        /// Shutdown timeout in milliseconds.
         timeout_ms: u64,
     },
+    /// Flow-control signal.
     FlowControl(FlowSignal),
     /// Report axis: extension → daemon, declares what this end can render and
     /// which entry points are locally disabled. The profile body is opaque
     /// here; the platform docs (Web/Mobile) define its schema.
     PresentationProfileUpdate {
+        /// Profile generation reported by the extension.
         profile_generation: u64,
+        /// Hash of the reported profile.
         profile_hash: String,
+        /// Opaque profile body.
         profile: Value,
     },
     /// Authority axis: daemon → extension, via §18.4 Value.write+Cas; advances
     /// `ExtensionInstallationDef.version` and may bump the Binding generation.
     ExtensionConfigUpdate {
+        /// New extension config version.
         config_version: u64,
+        /// New extension config body.
         config: Value,
     },
     /// Presentation axis: daemon → extension; pure display / entry-point /
     /// renderer budget — never grants capability, bounded by `profile_hash`.
     PresentationConfigUpdate {
+        /// New presentation config generation.
         generation: u64,
+        /// Profile hash this config targets.
         profile_hash: String,
+        /// Presentation config body.
         config: Value,
     },
     /// Shared reply loop: the extension must report how it applied an update;
     /// the daemon uses it to judge liveness and to fail closed.
     ConfigAck {
+        /// Config axis being acknowledged.
         axis: ConfigAxis,
+        /// Version or generation being acknowledged.
         version: u64,
+        /// Apply result.
         status: ApplyStatus,
     },
 }
@@ -657,13 +793,17 @@ pub struct Invoke {
     /// Stable across reconnect/replay: derived from the business idempotency
     /// key when present, else from CausalPosition (§16.3.3 / §6.1).
     pub invocation_id: String,
+    /// Effect resource path invoked by the remote operation.
     pub effect_path: Path,
     /// Concrete method on the Resource interface. Remote endpoint dispatch must
     /// preserve this just like a local [`Driver`](crate::resource::Method).
     pub method_id: MethodId,
+    /// Operation input value.
     pub input: Value,
+    /// Optional deadline in milliseconds since epoch.
     #[serde(default)]
     pub deadline_ms: Option<i64>,
+    /// Optional stream path for streaming output.
     #[serde(default)]
     pub output_stream_to: Option<Path>,
 }
@@ -671,14 +811,18 @@ pub struct Invoke {
 /// Error detail returned in an [`InvokeResult`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ErrorInfo {
+    /// Stable error class.
     pub kind: String,
+    /// Error message.
     pub message: String,
 }
 
 /// Provider data frame: the result of one [`Invoke`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InvokeResult {
+    /// Invocation id matching the request.
     pub invocation_id: String,
+    /// Successful output value or endpoint error detail.
     pub outcome: Result<Value, ErrorInfo>,
 }
 
@@ -687,18 +831,25 @@ pub struct InvokeResult {
 /// are settled in the handshake [`SessionContext`], not on each event.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InboundEvent {
+    /// Event id used for deduplication and acknowledgement.
     pub id: String,
+    /// Event payload.
     pub payload: Value,
+    /// Lightweight generation tags observed when emitting the event.
     #[serde(default)]
     pub observed: ObservedGenerations,
+    /// Event timestamp in milliseconds since epoch.
     pub timestamp_ms: i64,
 }
 
 /// Source data frame: a command sent back out to the source.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutboundCommand {
+    /// Command id used for deduplication.
     pub id: String,
+    /// Opaque command body understood by the source extension.
     pub action: Value,
+    /// Lightweight generation tags attached by the daemon.
     #[serde(default)]
     pub observed: ObservedGenerations,
 }
@@ -707,15 +858,20 @@ pub struct OutboundCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AckStatus {
+    /// Event was accepted.
     Accepted,
+    /// Event was already processed.
     Duplicate,
+    /// Event was rejected.
     Rejected,
 }
 
 /// Source data frame: ack of an [`InboundEvent`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EventAck {
+    /// Event id being acknowledged.
     pub id: String,
+    /// Acknowledgement status.
     pub status: AckStatus,
 }
 
@@ -726,18 +882,25 @@ pub struct EventAck {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverflowPolicy {
+    /// Drop oldest buffered events.
     DropOldest,
+    /// Ask the bridge to pause and resume at thresholds.
     Backpressure {
+        /// Pause threshold.
         pause_threshold: u32,
+        /// Resume threshold.
         resume_threshold: u32,
     },
+    /// Disconnect the bridge when capacity is exceeded.
     DisconnectBridge,
 }
 
 /// Capacity of an inbound event stream (§16.4).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StreamCapacity {
+    /// Maximum buffered events.
     pub max_events: u32,
+    /// Overflow handling policy.
     pub on_overflow: OverflowPolicy,
 }
 

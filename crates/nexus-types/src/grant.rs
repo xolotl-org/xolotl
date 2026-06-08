@@ -44,7 +44,9 @@ bitflags::bitflags! {
     /// bitmap is interpreted relative to the Resource's interface method order.
     #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
     pub struct MethodBitmap: u64 {
+        /// No methods.
         const NONE = 0;
+        /// All methods.
         const ALL  = u64::MAX;
     }
 }
@@ -91,9 +93,13 @@ bitflags_serde_bits!(RightFlags, u32);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeriveKind {
+    /// Clone a handle.
     Clone,
+    /// Transfer a handle to another process.
     Transfer,
+    /// Pass a handle to a spawned child.
     SpawnWith,
+    /// Delegate authority.
     Delegate,
 }
 
@@ -111,11 +117,14 @@ impl DeriveKind {
 /// The methods + derivation flags a grant authorizes (§5.1).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Rights {
+    /// Authorized method bitmap.
     pub methods: MethodBitmap,
+    /// Authorized propagation flags.
     pub flags: RightFlags,
 }
 
 impl Rights {
+    /// Create rights from method and propagation bitsets.
     pub fn new(methods: MethodBitmap, flags: RightFlags) -> Self {
         Self { methods, flags }
     }
@@ -145,6 +154,7 @@ pub struct ResourceSelector {
 }
 
 impl ResourceSelector {
+    /// Selector covering every verb and path.
     pub fn all() -> Self {
         Self {
             pattern: Capability {
@@ -156,6 +166,7 @@ impl ResourceSelector {
         }
     }
 
+    /// Parse a selector from a capability literal.
     pub fn parse(literal: &str) -> Result<Self, crate::cap::CapError> {
         Ok(Self {
             pattern: Capability::parse(literal)?,
@@ -188,10 +199,12 @@ pub struct ConstraintSet {
 }
 
 impl ConstraintSet {
+    /// Empty constraint set.
     pub fn empty() -> Self {
         Self { predicates: vec![] }
     }
 
+    /// Whether no constraints are present.
     pub fn is_empty(&self) -> bool {
         self.predicates.is_empty()
     }
@@ -215,6 +228,7 @@ pub enum Expiry {
 }
 
 impl Expiry {
+    /// Return true if the expiry has passed at `now_millis`.
     pub fn is_expired(self, now_millis: i64) -> bool {
         matches!(self, Expiry::At(t) if now_millis > t)
     }
@@ -225,11 +239,17 @@ impl Expiry {
 /// `Handle`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Grant {
+    /// Grant id.
     pub id: GrantId,
+    /// Process holding the grant.
     pub holder: ProcessId,
+    /// Resources and verb this grant selects.
     pub selector: ResourceSelector,
+    /// Rights authorized by this grant.
     pub rights: Rights,
+    /// Residual constraints on use.
     pub constraints: ConstraintSet,
+    /// Expiry policy.
     pub expires: Expiry,
 }
 

@@ -7,7 +7,7 @@ pub struct SubmitRequest {
     /// Bearer token mapped to a request identity by the gateway (§18.1 step 1-2).
     #[prost(string, tag = "1")]
     pub auth_token: ::prost::alloc::string::String,
-    /// Structured Do<A> program, compiled and run by the kernel.
+    /// Structured `Do<A>` program, compiled and run by the kernel.
     #[prost(message, optional, tag = "2")]
     pub program: ::core::option::Option<Program>,
 }
