@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
 
-//! `nexus-gateway` — the Gateway abstraction (§18.1).
+//! `nexus-gateway` — the Gateway abstraction.
 //!
 //! A Gateway is a `Source` (InProcess·Full): it adapts an external protocol to
-//! the kernel in five steps (§18.1): validate auth → map to an identity →
+//! the kernel in five steps: validate auth → map to an identity →
 //! create a request Process → translate inbound frames to Operations → translate
-//! outcomes back. It introduces **no new primitive** — it is an ordinary
-//! Process issuing capability-bound Operations.
+//! outcomes back. Submitted work runs as a request Process issuing
+//! capability-scoped Operations.
 //!
 //! This crate defines the shared [`Gateway`] trait and an [`InProcessGateway`]
 //! that runs a submitted program through the kernel. Protocol crates
@@ -54,7 +54,7 @@ impl GatewayError {
     }
 }
 
-/// The identity a request runs as, resolved from gateway auth (§18.1 step 2).
+/// The identity a request runs as, resolved from gateway auth.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestIdentity {
     /// The mapped identity path, e.g. `process://alice`.
@@ -66,7 +66,7 @@ pub struct RequestIdentity {
 #[derive(Clone, Debug)]
 pub struct AuthToken(pub String);
 
-/// The shared gateway contract (§18.1). Implementors validate auth, map to an
+/// The shared gateway contract. Implementors validate auth, map to an
 /// identity, and run a request, returning the outcome.
 #[async_trait]
 pub trait Gateway: Send + Sync {
@@ -91,27 +91,26 @@ pub trait Gateway: Send + Sync {
 }
 
 /// An in-process gateway over a [`Bootstrap`]. Each request runs as an
-/// **attenuated child Process** spawned per identity (§18.1 step 3), holding
-/// only the gateway's `declared_capabilities` as its capability ceiling
-/// (§21.5(2)).
+/// **attenuated child Process** spawned per identity, holding
+/// only the gateway's `declared_capabilities` as its capability ceiling.
 /// Externally-submitted programs run with `Inbound` taint so any protected data
-/// they touch cannot flow back out (§21.5).
+/// they touch cannot flow back out.
 pub struct InProcessGateway {
     boot: Arc<Bootstrap>,
     /// Allowed identities (auth allowlist). Empty = allow any authenticated.
     allowed: Vec<String>,
     /// Resources exposed to requests. Handles are opened per request Process
-    /// after attenuation, so a child never uses a root-owned Handle (§5/§18.1).
+    /// after attenuation, so a child never uses a root-owned Handle.
     handles: Vec<(ResourceName, String)>,
     /// The task-level capability ceiling: capability literals a request Process
-    /// may reach (§21.5(2)). Empty = the request gets no grants.
+    /// may reach. Empty = the request gets no grants.
     declared_capabilities: Vec<String>,
     /// Source label for the `Inbound` taint stamped on submitted programs.
     source_label: String,
 }
 
 impl InProcessGateway {
-    /// Create a gateway backed by an in-memory or production [`Bootstrap`].
+    /// Create a gateway backed by a [`Bootstrap`].
     pub fn new(boot: Arc<Bootstrap>) -> Self {
         Self {
             boot,
@@ -129,20 +128,20 @@ impl InProcessGateway {
     }
 
     /// Declare the capabilities a request may reach — the per-task capability
-    /// ceiling (§21.5(2)). Without this, request Processes get no grants.
+    /// ceiling. Without this, request Processes get no grants.
     pub fn with_declared_capabilities(mut self, capabilities: Vec<String>) -> Self {
         self.declared_capabilities = capabilities;
         self
     }
 
-    /// Label used for the `Inbound` taint source (e.g. the platform name).
+    /// Label used for the `Inbound` taint source, such as a connector name.
     pub fn with_source_label(mut self, label: impl Into<String>) -> Self {
         self.source_label = label.into();
         self
     }
 
     /// Expose a resource for requests. The actual Handle is opened for each
-    /// attenuated request Process, preserving Handle ownership (§5.3).
+    /// attenuated request Process, preserving Handle ownership.
     pub fn open(&mut self, name: ResourceName, verb: &str) -> Result<(), GatewayError> {
         self.boot
             .kernel
@@ -153,7 +152,7 @@ impl InProcessGateway {
         Ok(())
     }
 
-    /// Spawn the attenuated request Process for `identity` (§18.1 step 3).
+    /// Spawn the attenuated request Process for `identity`.
     fn spawn_request_process(&self, identity: &RequestIdentity) -> Result<ProcessId, GatewayError> {
         let id_path = parse_request_identity(&identity.identity)?;
         let id_ref = intern_identity(&id_path);
@@ -204,8 +203,8 @@ impl Gateway for InProcessGateway {
     ) -> Result<Outcome, GatewayError> {
         let ex = self.executor_for(identity)?;
         // Externally-submitted programs carry Inbound taint: anything they read
-        // from a protected source cannot flow back out (§21.5). The gateway is
-        // the source boundary; `submit` is its event stream (§16.3.3).
+        // from a protected source cannot flow back out. The gateway is
+        // the source boundary; `submit` is its event stream.
         let entry_taint = TaintSet::of(TaintSource::Inbound {
             source_projection_key: self.source_label.as_str().into(),
             event_stream: "submit".into(),
@@ -294,7 +293,7 @@ mod tests {
     #[tokio::test]
     async fn request_runs_as_attenuated_child_not_root() {
         // Each request spawns its own Process under root; two requests get
-        // distinct Process ids, and neither is the root (§18.1 step 3).
+        // distinct Process ids, and neither is the root.
         let boot = Arc::new(Bootstrap::in_memory());
         let root = boot.root;
         let gw = InProcessGateway::new(boot.clone());

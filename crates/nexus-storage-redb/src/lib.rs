@@ -1,11 +1,10 @@
 #![forbid(unsafe_code)]
 
-//! redb-backed persistent storage adapters for Nexus (§24.1).
+//! redb-backed persistent storage adapters for Nexus.
 //!
-//! Provides the production [`StateBackend`](nexus_state::StateBackend) (state
-//! plane, `state://`) and the durable [`FactStore`](nexus_kernel::FactStore)
-//! (the write-ahead source of truth, §9).
-
+//! Provides a persistent [`StateBackend`](nexus_state::StateBackend) (state
+//! plane, `state://`) and a durable [`FactStore`](nexus_kernel::FactStore).
+//!
 mod fact;
 mod state;
 
@@ -17,12 +16,12 @@ use std::sync::{Arc, atomic::AtomicI64};
 
 const STATE_VALUES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("state_values");
 const STATE_HISTORY_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state_history");
-/// Facts keyed by monotonic append cursor (§9).
+/// Facts keyed by monotonic append cursor.
 const FACTS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("facts");
 /// OperationId key → cursor slot, so `complete` updates the begun fact.
 const FACT_INDEX_TABLE: TableDefinition<&str, u64> = TableDefinition::new("fact_index");
-/// `(caller process, cursor slot)` → cursor slot, so `facts_of(process)` is a
-/// bounded range scan instead of a full fact-log decode.
+/// `(caller process, cursor slot)` → cursor slot, enabling bounded range scans
+/// for `facts_of(process)`.
 const FACT_PROCESS_INDEX_TABLE: TableDefinition<&str, u64> =
     TableDefinition::new("fact_process_index");
 const FACT_META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("fact_meta");
@@ -59,7 +58,7 @@ impl RedbStore {
         RedbStateBackend::new(self.db.clone(), self.state_history_clock.clone())
     }
 
-    /// The durable fact store (§9).
+    /// The durable fact store.
     pub fn fact_store(&self) -> Result<RedbFactStore, redb::DatabaseError> {
         RedbFactStore::new(self.db.clone())
     }

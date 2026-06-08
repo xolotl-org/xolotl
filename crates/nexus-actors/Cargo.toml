@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Standard in-process Drivers and Providers for Nexus (§17)"
+description = "Standard in-process Drivers and Providers for Nexus"
 
 [dependencies]
 async-trait = "0.1.89"

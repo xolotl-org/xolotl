@@ -1,13 +1,13 @@
-//! Event Bus (§17): `effect://events/publish`,
+//! Event Bus: `effect://events/publish`,
 //! `effect://events/subscribe`.
 //!
 //! Thin façade over the state plane's Sequence semantics: publish = append to a
 //! topic's Sequence Resource; subscribe = register interest (the kernel's state
 //! backend delivers via its broadcast channel). Cross-Process communication is
-//! "one appends, another subscribes the same Resource" (§12).
+//! "one appends, another subscribes the same Resource".
 //!
 //! `subscribe` is mode-aware. In `OutputMode::Stream` it taps the backend's
-//! subscription channel (`state.subscribe`, the same seam the executor's
+//! subscription channel (`state.subscribe`, the same channel the executor's
 //! `Wait(Signal)` consumes) and forwards each appended event to the operation's
 //! stream sink via [`DriverContext::emit`], bounded so a quiet topic can't wedge
 //! the run. In `OutputMode::Unary` it confirms the topic is addressable.
@@ -26,8 +26,8 @@ pub const EVENTS_METHODS: &[MethodSpec] = &[
 ];
 
 /// Upper bound on events forwarded to one streaming subscriber before the
-/// driver returns, so a subscribe Operation always terminates (§4.3). A caller
-/// may lower it via `max_events`; production wires a long-lived Source instead.
+/// driver returns, so a subscribe Operation always terminates. A caller
+/// may lower it via `max_events`; long-lived ingest should use a Source.
 const DEFAULT_STREAM_LIMIT: usize = 1024;
 
 /// Drives the event bus actions.

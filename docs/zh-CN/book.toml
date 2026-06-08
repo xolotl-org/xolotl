@@ -1,0 +1,10 @@
+[book]
+title = "Nexus 手册"
+authors = ["noctiro"]
+language = "zh-CN"
+src = "src"
+
+[output.html]
+additional-css = ["theme/cjk.css"]
+git-repository-url = "https://github.com/noctiro/nexus"
+edit-url-template = "https://github.com/noctiro/nexus/edit/main/docs/zh-CN/{path}"

@@ -1,5 +1,7 @@
 # Build
 /target/
+/docs/book/
+/docs/zh-CN/book/
 
 # Environment
 .env

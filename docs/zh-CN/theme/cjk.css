@@ -1,0 +1,21 @@
+:root {
+  --content-max-width: 980px;
+}
+
+html:lang(zh-CN),
+html:lang(zh-CN) body {
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", "WenQuanYi Micro Hei",
+    sans-serif;
+}
+
+html:lang(zh-CN) body,
+html:lang(zh-CN) .content {
+  line-height: 1.8;
+}
+
+html:lang(zh-CN) code,
+html:lang(zh-CN) pre,
+html:lang(zh-CN) .hljs {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", "Menlo", monospace;
+}

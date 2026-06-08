@@ -1,10 +1,9 @@
 //! Console state: kernel handles, auth state, and WebSocket runtime limits.
 //!
 //! The Console Protocol host maps authenticated console users to management
-//! identities and then dispatches descriptor-named actions through ordinary
-//! capability-bound Operations and audited visibility gates. This state object
-//! owns only shared execution state; it does not expose a privileged raw
-//! storage channel.
+//! identities and then dispatches descriptor-named actions through authorization,
+//! state, and audited visibility gates. Actions that invoke runtime effects use
+//! capability-scoped Operations. This state object owns shared execution state.
 
 use nexus_kernel::Bootstrap;
 use nexus_state::Backend;
@@ -94,7 +93,7 @@ pub struct ConsoleState {
     /// Shared kernel bootstrap handle.
     pub boot: Arc<Bootstrap>,
     /// The state backend the console reads/writes management config through.
-    /// All management config lives under `state://kernel/*` (Layer 1, §12).
+    /// All management config lives under `state://kernel/*`.
     pub state: Backend,
     /// Authentication service.
     pub auth: ConsoleAuth,

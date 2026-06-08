@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
 
-//! `nexus-gateway-websocket` — WebSocket protocol adapter (Gateway/Source,
-//! §18.1).
+//! `nexus-gateway-websocket` — WebSocket protocol adapter for program
+//! submission.
 //!
 //! A thin transport over the shared [`Gateway`]: a
 //! client connects, sends an auth frame, then submits programs as JSON
 //! `DoNode`s; the gateway runs each through the kernel and streams the outcome
-//! back. The five §18.1 steps live in `nexus-gateway`; this crate only speaks
+//! back. Request admission lives in `nexus-gateway`; this crate only speaks
 //! WebSocket frames.
 
 use axum::Router;

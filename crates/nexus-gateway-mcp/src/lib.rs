@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! `nexus-gateway-mcp` — MCP server-side Gateway adapter (§18.2).
+//! `nexus-gateway-mcp` — MCP server-side Gateway adapter.
 //!
 //! This crate covers **Nexus as MCP server**: selected Nexus effects are
 //! published as MCP tools only when each tool is bound to an explicit capability
@@ -12,7 +12,7 @@
 //! [`McpGateway::call_tool`]. The actual execution still goes through the shared
 //! [`nexus_gateway::Gateway`] path, so auth, request Process creation, taint,
 //! policy, budget, Fact recording, and Handle ownership are the same as every
-//! other Gateway (§18.1).
+//! other Gateway.
 
 use nexus_gateway::{AuthToken, Gateway, GatewayError, RequestIdentity};
 use nexus_graph::{DoNode, OperationTemplate};
@@ -51,7 +51,7 @@ pub enum McpGatewayError {
     Gateway(#[from] GatewayError),
 }
 
-/// A Nexus effect published as an MCP tool (§18.2).
+/// A Nexus effect published as an MCP tool.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct McpToolSpec {
     /// MCP-visible tool name.
@@ -166,7 +166,7 @@ impl<G: Gateway> McpGateway<G> {
             .collect()
     }
 
-    /// Translate one MCP `tools/call` into an ordinary Gateway submission.
+    /// Translate one MCP `tools/call` into a standard Gateway submission.
     pub async fn call_tool(
         &self,
         auth_token: impl Into<String>,

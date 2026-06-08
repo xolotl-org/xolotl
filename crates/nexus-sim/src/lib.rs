@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! `nexus-sim` — deterministic simulation harness for tests and replay (§23).
+//! `nexus-sim` — deterministic simulation harness for tests and replay.
 //!
 //! - [`ScriptedDriver`]: a programmable [`Driver`] whose responses are queued
 //!   in advance, for testing programs without real effects.
@@ -8,13 +8,13 @@
 //!   timestamp, so `now` is reproducible.
 //! - [`SimClock`]: an **advanceable** virtual clock for `effect://time/*`;
 //!   `now`/`sleep` are served from a shared counter a test can `advance`/`set`,
-//!   so time-dependent control flow is deterministic (§23).
+//!   so time-dependent control flow is deterministic.
 //! - [`CrashAfter`]: wraps any [`Driver`] and fails the (N+1)-th call to
-//!   simulate "crash after the Nth Operation" (§23).
-//! - [`why_not`]: a pure Fact projection (§9.1) explaining why an Operation
-//!   ended denied / rejected — the "why-not" debug face (§23).
+//!   simulate "crash after the Nth Operation".
+//! - [`why_not`]: a pure Fact projection explaining why an Operation
+//!   ended denied / rejected — the "why-not" debug face.
 //! - [`replay_report`]: classify a Process's recorded Facts the way recovery
-//!   would (§15), to assert determinism / pending handling.
+//!   would, to assert determinism / pending handling.
 
 use async_trait::async_trait;
 use nexus_kernel::{Bootstrap, Driver, DriverContext, DriverError, DynDriver, FactSink};
@@ -97,7 +97,7 @@ impl Driver for FixedClock {
     }
 }
 
-/// An **advanceable** virtual clock for `effect://time/*` (§23). Unlike
+/// An **advanceable** virtual clock for `effect://time/*`. Unlike
 /// [`FixedClock`], a test can move time forward with [`advance`](Self::advance)
 /// or pin it with [`set`](Self::set); `now` reads the shared counter and
 /// `sleep` advances it by the requested delay (no real waiting), so
@@ -174,7 +174,7 @@ impl Driver for SimClock {
 }
 
 /// Wraps any [`Driver`] and injects a crash after a fixed number of successful
-/// calls (§23: "simulate a crash after the Nth Operation"). The first `n` calls
+/// calls. The first `n` calls
 /// delegate to the inner driver; the (n+1)-th and every later call return a
 /// distinctive `DriverError` — the failure a Driver would surface when its
 /// process dies mid-effect — so a test can assert the program halts at the Nth
@@ -272,7 +272,7 @@ impl Sim {
     }
 }
 
-/// Replay classification of a Process's recorded facts (§15.1). Mirrors what
+/// Replay classification of a Process's recorded facts. Mirrors what
 /// recovery would decide; useful to assert determinism in tests.
 pub fn replay_report(
     facts: &FactSink,
@@ -281,8 +281,8 @@ pub fn replay_report(
     nexus_kernel::recover_process(facts, process).map(|(report, _, _)| report)
 }
 
-/// The "why-not" explanation for one Operation (§23). A pure projection over the
-/// Process's Facts (§9.1) — it reads the recorded `decision`, `taint`, and
+/// The "why-not" explanation for one Operation. A pure projection over the
+/// Process's Facts — it reads the recorded `decision`, `taint`, and
 /// outcome, and never re-runs anything. Answers: did the Operation reach a
 /// decision, what was it, was its input tainted / protected, and a
 /// human-readable summary.
@@ -292,11 +292,11 @@ pub struct WhyNot {
     pub op: nexus_types::OperationId,
     /// The recorded decision tag (the proximate verdict).
     pub decision: nexus_types::DecisionTag,
-    /// Whether the input lineage touched a protected source (§21.5) — the
+    /// Whether the input lineage touched a protected source — the
     /// structural reason an outbound Operation is denied.
     pub tainted_protected: bool,
     /// Whether the input lineage touched untrusted content (model / inbound /
-    /// fetched) — the memory-poison / injection signal (§21.5).
+    /// fetched) — the memory-poison / injection signal.
     pub tainted_untrusted: bool,
     /// Human-readable explanation.
     pub explanation: String,
@@ -310,7 +310,7 @@ impl WhyNot {
 }
 
 /// Explain why Operation `op` ended the way it did, from a Process's recorded
-/// Facts (§23 why-not / §9.1 projection).
+/// Facts.
 ///
 /// Returns `None` if no Fact for `op` exists (the Operation never reached a
 /// decision — e.g. its graph cursor was never reached). Otherwise returns a
@@ -336,14 +336,14 @@ pub fn why_not(facts: &[nexus_types::Fact], op: nexus_types::OperationId) -> Opt
                 .to_string()
         }
         DecisionTag::RejectedByPolicy => {
-            let mut s = "rejected by a residual policy check (§21)".to_string();
+            let mut s = "rejected by a residual policy check".to_string();
             if tainted_protected {
                 s.push_str(
                     "; its input lineage touched a protected source, so an \
-                            outbound flow is structurally denied (§21.5)",
+                            outbound flow is structurally denied",
                 );
             } else if tainted_untrusted {
-                s.push_str("; its input carried untrusted content (model/inbound/fetched) (§21.5)");
+                s.push_str("; its input carried untrusted content (model/inbound/fetched)");
             }
             s
         }
@@ -351,8 +351,7 @@ pub fn why_not(facts: &[nexus_types::Fact], op: nexus_types::OperationId) -> Opt
         DecisionTag::Timeout => "the operation timed out".to_string(),
         DecisionTag::Cancelled => "the operation was cancelled".to_string(),
         DecisionTag::Quarantined => {
-            "held in quarantine as an unsafe replay, pending an operator decision (§15.3)"
-                .to_string()
+            "held in quarantine as an unsafe replay, pending an operator decision".to_string()
         }
     };
 

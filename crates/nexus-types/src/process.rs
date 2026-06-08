@@ -1,10 +1,10 @@
-//! `Process` — the only active entity (§3), plus the process lifecycle types
+//! `Process` — the only active entity, plus the process lifecycle types
 //! and `Outcome`.
 //!
 //! Only a Process can issue an [`Operation`](crate::operation::Operation);
 //! Resources are always passive. A Process is bound to one frozen compiled
 //! program (referenced here by hash; the live `ExecutionGraph` lives in
-//! `nexus-graph`) and recovers against that same product (§10.4).
+//! `nexus-graph`) and recovers against that same product.
 
 use crate::grant::Expiry;
 use crate::ids::{GrantId, IdentityRef, ProcessId};
@@ -12,7 +12,7 @@ use crate::path::Path;
 use crate::value::{Failure, Value};
 use serde::{Deserialize, Serialize};
 
-/// Reference to a Program source (control-plane input, §3). The kernel does
+/// Reference to a Program source. The kernel does
 /// not prescribe the source format (`Do<A>`, model plan, runbook, native).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProgramRef {
@@ -20,7 +20,7 @@ pub struct ProgramRef {
     pub source_id: String,
 }
 
-/// Reference to the frozen compiled program a Process is bound to (§10.4). The
+/// Reference to the frozen compiled program a Process is bound to. The
 /// live `ExecutionGraph` lives in `nexus-graph`; here we carry its hash so the
 /// type stays wasm-safe and serializable. Recovery re-binds the same hash.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -29,7 +29,7 @@ pub struct CompiledProgramRef {
     pub graph_hash: [u8; 32],
 }
 
-/// Whether a Program satisfies the recoverability contract (§13.1).
+/// Whether a Program satisfies the recoverability contract.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Recoverability {
@@ -40,7 +40,7 @@ pub enum Recoverability {
     NonRecoverable,
 }
 
-/// Lifecycle status of a Process (§3 / §14.2).
+/// Lifecycle status of a Process.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessStatus {
@@ -73,7 +73,7 @@ impl ProcessStatus {
     }
 }
 
-/// When a Process expires (§14.2). On expiry it enters `Finalizing`.
+/// When a Process expires. On expiry it enters `Finalizing`.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExpireRule {
@@ -90,7 +90,7 @@ pub enum ExpireRule {
     BudgetExhausted,
 }
 
-/// Budget account state for a Process (§21). Spending dimensions are tracked
+/// Budget account state for a Process. Spending dimensions are tracked
 /// here; the budget *spec* (limits) lives in [`StartRecord`].
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BudgetState {
@@ -103,7 +103,7 @@ pub struct BudgetState {
 }
 
 impl BudgetState {
-    /// Try to reserve one operation's estimated cost against `spec` (§21.2):
+    /// Try to reserve one operation's estimated cost against `spec`:
     /// pre-debit `inflight_ops`, estimated USD, and estimated tokens, denying
     /// (without mutating) if any dimension would exceed its limit. The estimate
     /// is deliberately conservative (high) so a side effect is never issued and
@@ -121,7 +121,7 @@ impl BudgetState {
             return Err("inflight_ops".into());
         }
         // Daily and monthly USD share the single `spent_micro_usd` counter; the
-        // tighter limit binds (a reset sweep, §21.2, zeroes it on the boundary).
+        // tighter limit binds.
         let projected_usd = self.spent_micro_usd.saturating_add(est_micro_usd);
         if let Some(max) = spec.daily_micro_usd
             && projected_usd > max
@@ -144,7 +144,7 @@ impl BudgetState {
         Ok(())
     }
 
-    /// Settle a previously-reserved operation against its actual cost (§21.2):
+    /// Settle a previously-reserved operation against its actual cost:
     /// release the inflight slot and adjust the reserved USD/tokens to the
     /// measured values (the estimate was conservative, so this usually refunds).
     pub fn settle(
@@ -167,7 +167,7 @@ impl BudgetState {
     }
 }
 
-/// Per-dimension budget limits (§21.2). `None` = unbounded on that dimension.
+/// Per-dimension budget limits. `None` = unbounded on that dimension.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BudgetSpec {
     /// Maximum micro-USD allowed per day.
@@ -180,7 +180,7 @@ pub struct BudgetSpec {
     pub max_inference_tokens: Option<u64>,
 }
 
-/// Startup parameters for a Process (§3): identity prefix, initial grants,
+/// Startup parameters for a Process: identity prefix, initial grants,
 /// budget, persona parameters.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StartRecord {
@@ -195,7 +195,7 @@ pub struct StartRecord {
     pub params: Value,
 }
 
-/// The only active entity (§3). Holds compiled capabilities (handles, by id in
+/// The only active entity. Holds compiled capabilities (handles, by id in
 /// the kernel's HandleTable) and grant sources; runs one frozen compiled
 /// program.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -219,7 +219,7 @@ pub struct Process {
     pub status: ProcessStatus,
 }
 
-/// One attenuation a parent applies to a grant when spawning a child (§3): a
+/// One attenuation a parent applies to a grant when spawning a child: a
 /// child's grant can only narrow, never strengthen.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GrantAttenuation {
@@ -232,7 +232,7 @@ pub struct GrantAttenuation {
     pub expires: Expiry,
 }
 
-/// Request to create a child Process (§3). Grants may only be attenuated.
+/// Request to create a child Process. Grants may only be attenuated.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SpawnRequest {
     /// Parent process issuing the spawn.
@@ -245,7 +245,7 @@ pub struct SpawnRequest {
     pub grants: Vec<GrantAttenuation>,
 }
 
-/// The result of one operation / node evaluation (§4.4).
+/// The result of one operation / node evaluation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {

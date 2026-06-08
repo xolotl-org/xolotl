@@ -1,4 +1,4 @@
-//! The `Kernel` — the assembled runtime (§2.4).
+//! The `Kernel` — the assembled runtime.
 //!
 //! It ties together the control plane (the six-part [`Registry`]), the data
 //! plane ([`DataPlane`]: handle table + fact sink), the process table, the step
@@ -51,7 +51,7 @@ impl Kernel {
         }
     }
 
-    /// Build a kernel with explicit state + fact backends (§24.1 redb).
+    /// Build a kernel with explicit state + fact backends.
     pub fn with_backends(state: Backend, facts: FactSink) -> Self {
         Self {
             registry: Registry::new(),
@@ -70,8 +70,8 @@ impl Kernel {
     }
 
     /// An executor bound to `process`, sharing this kernel's data plane,
-    /// registry, step table, and state backend (the latter lets `Wait(Signal)`
-    /// nodes resolve, §13.2).
+    /// registry, step table, and state backend. The state backend lets
+    /// `Wait(Signal)` nodes resolve.
     pub fn executor_for(&self, process: ProcessId) -> Executor {
         Executor::new(
             process,

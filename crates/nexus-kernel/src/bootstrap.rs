@@ -1,16 +1,17 @@
-//! Bootstrap (§14.1): assemble a ready-to-use kernel through ordered phases.
+//! Bootstrap: assemble a ready-to-use kernel through an ordered startup
+//! sequence.
 //!
-//! Phases (§14.1): parse config → open state backend → mount FactSink → build
-//! registries → create root/system Process + kernel Resources → install
-//! in-process Drivers + shared long-lived Processes → recover unfinished
-//! Processes → start Gateways (Sources) → mark ready.
+//! Bootstrap sequence: parse config, open the state backend, mount the
+//! FactSink, build registries, create the root/system Process, install
+//! in-process Drivers, recover unfinished Processes, start Gateways, and mark
+//! the daemon ready.
 //!
 //! This module provides the assembly primitives; the daemon drives the full
-//! phase sequence. The [`Bootstrap`] helper wires a kernel with a root Process
+//! startup sequence. The [`Bootstrap`] helper wires a kernel with a root Process
 //! holding an omnipotent kernel grant, plus a fluent way to register the
-//! standard Resource/Interface/Driver/Binding/Grant tuples (§24.2: the kernel
-//! has no special loading path — built-ins and external providers use the same
-//! registration face).
+//! standard Resource/Interface/Driver/Binding/Grant tuples. The kernel has no
+//! special loading path; built-ins and external providers use the same
+//! registration interface.
 
 use crate::driver::{DriverDescriptor, DynDriver};
 use crate::kernel::Kernel;
@@ -25,7 +26,7 @@ use nexus_types::{
 };
 use thiserror::Error;
 
-/// A ready kernel plus the root Process id (§14.1). The root holds an
+/// A ready kernel plus the root Process id. The root holds an
 /// omnipotent grant; everything else is attenuated from it.
 pub struct Bootstrap {
     /// Assembled kernel instance.
@@ -34,9 +35,8 @@ pub struct Bootstrap {
     pub root: ProcessId,
 }
 
-/// Redacted gateway-layer audit metadata (§18.5.6). These events happen before
-/// a request Process exists (credentials must not enter Operation input), but
-/// they still need to be projected from the Fact stream.
+/// Redacted gateway-layer audit metadata. These events happen before a request
+/// Process exists, and credentials remain outside Operation input.
 pub struct GatewayAudit<'a> {
     /// Audit event name, such as `console_login`.
     pub event: &'a str,
@@ -93,7 +93,7 @@ pub enum BootstrapError {
     State(#[from] nexus_state::StateError),
 }
 
-/// Assembly-time method descriptor. Output support is explicit (§4.3): no
+/// Assembly-time method descriptor. Output support is explicit: no
 /// bootstrap path may silently advertise streaming for a unary-only driver.
 #[derive(Clone, Copy, Debug)]
 pub struct MethodSpec {
@@ -170,27 +170,27 @@ impl MethodSpec {
 }
 
 impl Bootstrap {
-    /// Phase 1-5 with in-memory backends: build the kernel, create the root
-    /// Process, and grant it the omnipotent capability (`*://**`).
+    /// Build an in-memory kernel, create the root Process, and grant it the
+    /// omnipotent capability (`*://**`).
     pub fn in_memory() -> Self {
         let kernel = Kernel::in_memory();
         Self::seed(kernel)
     }
 
-    /// Phase 4-5 over an already-built [`Kernel`] (e.g. with redb backends):
-    /// create the root Process and seed its omnipotent grant.
+    /// Create the root Process and seed its omnipotent grant over an
+    /// already-built [`Kernel`] such as one backed by redb.
     pub fn from_kernel(kernel: Kernel) -> Self {
         Self::seed(kernel)
     }
 
     fn seed(kernel: Kernel) -> Self {
-        // Phase 4: create the root/system Process.
+        // Create the root/system Process.
         let root = kernel.processes.fresh_id();
         let mut entry = ProcessEntry::new(root, None, IdentityRef::ROOT);
         entry.status = ProcessStatus::Running;
         kernel.processes.insert(entry);
 
-        // Root holds the omnipotent grant (attenuated for every child, §3).
+        // Root holds the omnipotent grant.
         let grant = Grant {
             id: kernel.registry.next_grant_id(),
             holder: root,
@@ -206,7 +206,7 @@ impl Bootstrap {
 
     /// Register a Callable effect Resource backed by an in-process driver, and
     /// return its [`ResourceName`]. Callable effects are one authorized action
-    /// per path and expose exactly one public method: `invoke` (§21.1). Drivers
+    /// per path and expose exactly one public method: `invoke`. Drivers
     /// that implement several actions must register several effect paths.
     pub fn register_effect(
         &self,
@@ -218,7 +218,7 @@ impl Bootstrap {
     }
 
     /// Like [`register_effect`](Self::register_effect) but every method carries
-    /// `cost` (§21.2). Cost-bearing providers (inference, fetch) use this so the
+    /// `cost`. Cost-bearing providers (inference, fetch) use this so the
     /// budget check (reserve/settle) has a real estimate to work from.
     pub fn register_effect_with_cost(
         &self,
@@ -265,10 +265,10 @@ impl Bootstrap {
                 source,
             }
         })?;
-        // Admit (not bare-register) so the §7.2 invariant — the bound Driver
-        // implements every Interface the Binding declares — is enforced even for
-        // built-ins. The driver registered just above implements `iface_id`, so
-        // a failure here is an assembly-time programmer error.
+        // Admit (not bare-register) so the invariant is enforced even for
+        // built-ins: the bound Driver implements every Interface the Binding
+        // declares. The driver registered just above implements `iface_id`, so a
+        // failure here is an assembly-time programmer error.
         reg.admit_binding(Binding {
             id: binding_id,
             selector,
@@ -302,12 +302,13 @@ impl Bootstrap {
         Ok(name)
     }
 
-    /// Register a single Resource serving an entire `<scheme>://` subtree
-    /// (§12), backed by `driver`. Used for the StateDriver: one Resource at the
-    /// `state://` root that resolve_resource prefix-matches for every concrete
-    /// `state://…` path, so state R/W becomes ordinary Operations. `methods` are
-    /// the Value/Sequence methods (`read`/`write`/`append`/`delete`); the binding
-    /// selector authorizes those verbs over the whole `<scheme>/**` subtree.
+    /// Register a single Resource serving an entire `<scheme>://` subtree,
+    /// backed by `driver`. Used for the StateDriver: one Resource at the
+    /// `state://` root that `resolve_resource` prefix-matches for every
+    /// concrete state path, so state reads and writes become state-driver
+    /// Operations. `methods` are the Value/Sequence methods
+    /// (`read`/`write`/`append`/`delete`/`list`); the binding selector
+    /// authorizes those verbs over the whole `<scheme>/**` subtree.
     pub fn register_subtree_resource(
         &self,
         scheme: &str,
@@ -326,7 +327,7 @@ impl Bootstrap {
 
     /// Register a concrete subtree root, e.g. `state://fact`, with an explicit
     /// grant selector pattern, e.g. `read://state/fact/**`. More-specific roots
-    /// win during name resolution (§12), so read-only projections can live under
+    /// win during name resolution, so read-only projections can live under
     /// `state://` without falling through to the generic StateDriver.
     pub fn register_subtree_resource_at(
         &self,
@@ -412,7 +413,7 @@ impl Bootstrap {
             .resolve_resource(name)
             .map_err(|_| OpenError::NoSuchResource(nexus_types::ResourceId::new(0)))?;
         let mut handles = self.kernel.handles.write();
-        // The acting identity is the opening Process's own identity (§5.2 step 4);
+        // The acting identity is the opening Process's own identity;
         // root's internal opens fall back to ROOT.
         let acting = self
             .kernel
@@ -436,7 +437,7 @@ impl Bootstrap {
                 ),
                 acting,
                 // Carry the concrete requested path so prefix-resolved Resources
-                // (state://**) bind the real path on the handle (§12).
+                // (state://**) bind the real path on the handle.
                 requested_path: Some(name.path().clone()),
                 now_millis: crate::executor::now_millis(),
             },
@@ -444,7 +445,7 @@ impl Bootstrap {
     }
 
     /// Spawn an **attenuated request Process** under root for a gateway request
-    /// (§18.1 step 3 / §21.5(2)). The child runs as `identity` and holds grants
+    /// The child runs as `identity` and holds grants
     /// narrowed to `declared_capabilities` — the task-level capability ceiling:
     /// an injected Plan inside this Process can reach *only* the declared
     /// capabilities, not root's full authority. With an empty list the child
@@ -487,8 +488,8 @@ impl Bootstrap {
         Ok(child)
     }
 
-    /// Phase 6 (§14.1): recover every unfinished Process from its Fact stream,
-    /// persisting any quarantine entries to `state://quarantine/*` (§15.2/§15.3).
+    /// Recover every unfinished Process from its Fact stream, persisting any
+    /// quarantine entries to `state://quarantine/*`.
     /// Returns the aggregate recovery report. Called by the daemon on boot.
     pub async fn recover_all(&self) -> Result<crate::recovery::RecoveryReport, crate::FactError> {
         let mut agg = crate::recovery::RecoveryReport::default();
@@ -508,7 +509,7 @@ impl Bootstrap {
     }
 
     /// Record a Gateway-layer audit Fact for pre-Operation events such as
-    /// console login/logout/root bootstrap (§18.5.6). Credential material is
+    /// console login/logout/root bootstrap. Credential material is
     /// intentionally absent: only redacted event metadata reaches the Fact log.
     pub fn record_gateway_audit(&self, audit: GatewayAudit<'_>) -> Result<(), crate::FactError> {
         let process = self.kernel.processes.fresh_id();
@@ -560,9 +561,9 @@ impl Bootstrap {
         Ok(())
     }
 
-    /// Finalize a Process (§14.2): the ordered teardown sequence. Mutating the
+    /// Finalize a Process: the ordered teardown sequence. Mutating the
     /// process tree + handle table directly (this is the kernel's own
-    /// bookkeeping, not a capability-bound effect):
+    /// bookkeeping, not a runtime Operation):
     ///
     /// 1. mark `Finalizing`
     /// 2. cancel descendants deepest-first
@@ -582,7 +583,7 @@ impl Bootstrap {
             }
         }
 
-        // 3. run finalizers in reverse (§14.2 step 3).
+        // 3. run finalizers in reverse.
         for body in procs.take_finalizers(process) {
             let ex = self.kernel.executor_for(process);
             let _ = ex.eval(&body).await;
@@ -591,11 +592,11 @@ impl Bootstrap {
         // 4. revoke handles owned by the process.
         let revoked = self.kernel.handles.write().revoke_owned_by(process);
 
-        // 5. write a ProcessFinalized Fact to the Fact stream (§14.2 step 6 — the
-        // authoritative lifecycle record), mark Completed, and write a state
-        // marker for quick lookup. The Fact uses a reserved high CausalPosition so
-        // it never collides with a program node's id. If the Fact cannot be
-        // recorded, leave the Process in Finalizing instead of silently terminal.
+        // 5. Write a ProcessFinalized Fact to the Fact stream as the
+        // authoritative lifecycle record, mark Completed, and write a state
+        // marker for quick lookup. The Fact uses a reserved high CausalPosition
+        // so it never collides with a program node's id. If the Fact cannot be
+        // recorded, leave the Process in Finalizing for operator inspection.
         let finalized = Fact {
             id: nexus_types::OperationId::new(process, FINALIZED_NODE, 0),
             schema_version: Fact::SCHEMA_VERSION,
@@ -638,7 +639,7 @@ impl Bootstrap {
 }
 
 /// Reserved CausalPosition for the per-process `ProcessFinalized` lifecycle Fact
-/// (§14.2). Far above any compiled program's node ids so it never collides.
+/// Far above any compiled program's node ids so it never collides.
 const FINALIZED_NODE: nexus_types::NodeId = nexus_types::NodeId::new(u32::MAX);
 const GATEWAY_AUDIT_NODE: nexus_types::NodeId = nexus_types::NodeId::new(u32::MAX - 1);
 
@@ -759,9 +760,9 @@ mod tests {
         let out = ex.eval(&prog).await;
         assert_eq!(out, nexus_types::Outcome::Done(Value::Str("hello".into())));
 
-        // §9.2: a single unconsumed pure-Deterministic read need not record a
-        // Fact — recovery can recompute it. The EchoDriver method is Pure, the
-        // op's output flows nowhere, so no Fact is written.
+        // A single unconsumed pure-Deterministic read need not record a Fact
+        // because recovery can recompute it. The EchoDriver method is Pure, and
+        // the op's output flows nowhere, so no Fact is written.
         assert_eq!(boot.kernel.facts.facts_of(boot.root).unwrap().len(), 0);
     }
 
@@ -802,8 +803,8 @@ mod tests {
 
     #[tokio::test]
     async fn budget_exhaustion_denies_costly_op_before_effect() {
-        // §21.2: a process with a tiny daily budget running a costed effect is
-        // denied with BudgetExhausted — the reservation fires before dispatch.
+        // A process with a tiny daily budget running a costed effect is denied
+        // with BudgetExhausted because the reservation fires before dispatch.
         let boot = Bootstrap::in_memory();
         let name = boot
             .register_effect_with_cost(
@@ -849,8 +850,8 @@ mod tests {
 
     #[tokio::test]
     async fn batchable_budget_charges_flat_cost_per_element() {
-        // §17.5: batchable methods apply CostModel per element. A 3-element batch
-        // with flat=100 reserves 300 before dispatch, so a 250 budget denies.
+        // Batchable methods apply CostModel per element. A 3-element batch with
+        // flat=100 reserves 300 before dispatch, so a 250 budget denies.
         let boot = Bootstrap::in_memory();
         let name = boot
             .register_effect_with_cost(
@@ -968,7 +969,7 @@ mod tests {
 
     #[tokio::test]
     async fn consumed_operation_records_a_fact() {
-        // When the operation's output is consumed downstream (§9.2), a Fact is
+        // When the operation's output is consumed downstream, a Fact is
         // recorded so recovery can reuse it.
         let boot = Bootstrap::in_memory();
         let name = boot
@@ -1011,7 +1012,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_marks_completed_and_writes_marker() {
         let boot = Bootstrap::in_memory();
-        // Spawn a child request Process, then finalize it (§14.2).
+        // Spawn a child request Process, then finalize it.
         let child = boot
             .spawn_request_process(nexus_types::IdentityRef::ROOT, &[])
             .unwrap();
@@ -1024,7 +1025,7 @@ mod tests {
         let path = finalized_marker_path(child).unwrap();
         let marker = boot.kernel.state.read(&path).await.unwrap();
         assert!(marker.is_some());
-        // §14.2 step 6: a ProcessFinalized Fact is appended to the Fact stream.
+        // Finalization appends a ProcessFinalized Fact to the Fact stream.
         let facts = boot.kernel.facts.facts_of(child).unwrap();
         assert!(
             facts.iter().any(|f| {
@@ -1128,10 +1129,10 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_replays_completed_effect_without_reissuing() {
-        // §15.2: re-running a recovered program must NOT repeat an effect that
-        // already happened. We run a consumed Operation once (recording a Fact),
-        // build a ReplayMap from the fact stream, then re-run the same program
-        // with the map — the effect driver must not be called the second time.
+        // Re-running a recovered program must not repeat an effect that already
+        // happened. We run a consumed Operation once, build a ReplayMap from the
+        // fact stream, then re-run the same program with the map; the effect
+        // driver must not be called the second time.
         use crate::driver::FnDriver;
         use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicU32, Ordering};

@@ -1,8 +1,8 @@
-//! Control-plane registries, name resolution, and admission (§10).
+//! Control-plane registries, name resolution, and admission.
 //!
 //! The [`Registry`] holds the six control-plane descriptions
 //! (Resource/Interface/Driver/Binding/Policy/Grant). It is consulted only on
-//! the slow path (`open()`, admission) — **never** by the data plane (§10.1).
+//! the slow path (`open()`, admission) — **never** by the data plane.
 
 use crate::driver::{DriverDescriptor, DriverPlan, DynDriver, DynRemoteEndpoint};
 use crate::handle::FastPath;
@@ -44,8 +44,8 @@ pub enum AdmissionError {
 
 /// Exact-match grant selector index key.
 ///
-/// Wildcard selectors are not indexed with this key; they stay in the
-/// per-holder wildcard fallback list.
+/// Exact selectors use this key; wildcard selectors stay in the per-holder
+/// wildcard fallback list.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct GrantSelectorKey {
     /// Process that holds the grant.
@@ -56,7 +56,7 @@ pub struct GrantSelectorKey {
     pub path: Path,
 }
 
-/// The six control-plane registries (§10.1). Behind a single lock for
+/// The six control-plane registries. Behind a single lock for
 /// simplicity; the data plane never touches this, so contention is confined to
 /// the slow path.
 #[derive(Default)]
@@ -79,12 +79,12 @@ pub struct RegistryInner {
     pub exact_grants: HashMap<GrantSelectorKey, Vec<GrantId>>,
     /// Wildcard selector fallback grant ids grouped by holder.
     pub wildcard_grants_by_holder: HashMap<ProcessId, Vec<GrantId>>,
-    /// Source policies (§8 / §10.1), consulted at `open()`. Held as trait
+    /// Source policies, consulted at `open()`. Held as trait
     /// objects so any `PolicySource` can register.
     pub policies: Vec<Arc<dyn crate::policy::PolicySource>>,
-    /// Name → id index for resolution (§10.2).
+    /// Name → id index for resolution.
     pub names: HashMap<ResourceName, ResourceId>,
-    /// Compiled open-plan cache (§5.6). Cleared whenever control-plane
+    /// Compiled open-plan cache. Cleared whenever control-plane
     /// descriptions change, so cached plans never survive a re-link/policy
     /// update/admission mutation.
     pub open_cache: HashMap<OpenCacheKey, CompiledOpenPlan>,
@@ -178,7 +178,7 @@ fn target_selector_key(process: ProcessId, verb: &str, target: &Path) -> GrantSe
     }
 }
 
-/// Cache key for `open()` compilation (§5.6). It includes every current
+/// Cache key for `open()` compilation. It includes every current
 /// `OpenContext` field that can affect policy compilation, plus concrete
 /// rights. Registry mutations clear the cache, so binding/policy/driver
 /// generations cannot leak through stale plans.
@@ -323,7 +323,7 @@ impl Registry {
         inner.invalidate_open_cache();
     }
 
-    /// Register or replace a remote endpoint transport (§7.4). Bindings with
+    /// Register or replace a remote endpoint transport. Bindings with
     /// `endpoint = Some(id)` compile to RPC stubs backed by this entry.
     pub fn register_endpoint(&self, id: EndpointId, endpoint: DynRemoteEndpoint) {
         let mut inner = self.inner.write();
@@ -331,9 +331,9 @@ impl Registry {
         inner.invalidate_open_cache();
     }
 
-    /// Admit and register a Resource (§10.3). Rejects reserved-prefix names
+    /// Admit and register a Resource. Rejects reserved-prefix names
     /// for non-kernel callers and verifies the binding covers the resource's
-    /// interfaces (§7.2).
+    /// interfaces.
     pub fn admit_resource(
         &self,
         resource: Resource,
@@ -360,7 +360,7 @@ impl Registry {
         Ok(id)
     }
 
-    /// Admit and register a Binding (§7.2 / §10.3). The bound Driver must
+    /// Admit and register a Binding. The bound Driver must
     /// implement every Interface the Binding declares — checked here so a
     /// Binding can never reference interfaces its Driver doesn't provide.
     pub fn admit_binding(&self, binding: Binding) -> Result<BindingId, AdmissionError> {
@@ -392,7 +392,7 @@ impl Registry {
         inner.invalidate_open_cache();
     }
 
-    /// Admission sandbox check (§16.3.2 / §10.3): every effect path a sandboxed
+    /// Admission sandbox check: every effect path a sandboxed
     /// provider declares must fall under its namespace prefix. Returns the first
     /// offending path, or `Ok(())` if all are within bounds.
     pub fn check_namespace_sandbox(
@@ -423,7 +423,7 @@ impl Registry {
         id
     }
 
-    /// Register a source policy (§8 / §10.1). Consulted at every `open()` whose
+    /// Register a source policy. Consulted at every `open()` whose
     /// resource the policy applies to.
     pub fn register_policy(&self, policy: Arc<dyn crate::policy::PolicySource>) {
         let mut inner = self.inner.write();
@@ -437,7 +437,7 @@ impl Registry {
         self.inner.read().policies.clone()
     }
 
-    // ── name resolution (§10.2) ─────────────────────────────────────
+    // ── name resolution ─────────────────────────────────────
 
     /// Resolve a control-plane resource name to a resource id.
     ///
@@ -449,7 +449,7 @@ impl Registry {
         if let Some(id) = inner.names.get(name).copied() {
             return Ok(id);
         }
-        // Prefix resolution (§12) is only for collection-style resources such
+        // Prefix resolution is only for collection-style resources such
         // as `state://**`. Callable `effect://...` resources must resolve by
         // exact path so an aggregate effect prefix can never serve sibling
         // actions like `effect://approval/check`.
@@ -511,7 +511,7 @@ impl Registry {
         self.inner.read().grants.get(&id).cloned()
     }
 
-    /// All grants held by `process` (slow path; `open()` step 1, §5.2).
+    /// All grants held by `process`, used by the `open()` slow path.
     pub fn grants_of(&self, process: ProcessId) -> Vec<Grant> {
         let inner = self.inner.read();
         inner
@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn namespace_sandbox_rejects_escape() {
-        // §16.3.2: a sandboxed provider's effects must stay under its namespace.
+        // A sandboxed provider's effects must stay under its namespace.
         let ns = nexus_types::Path::parse("effect://plugin/acme").unwrap();
         assert!(
             Registry::check_namespace_sandbox(

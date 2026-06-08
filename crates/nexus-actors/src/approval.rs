@@ -1,21 +1,21 @@
-//! Approval Broker (§17.4): `effect://approval/ask`,
+//! Approval Broker: `effect://approval/ask`,
 //! `effect://approval/check`, `effect://approval/respond`.
 //!
 //! `ask` records a pending approval keyed by `dedup_key`; duplicate asks merge
-//! (§17.4 "同 dedup_key 合并为一次询问"). An ask carries a **fanout policy** —
-//! `AnyOne` (首答生效, first responder decides) or `RequireAll` (全到齐才返回,
-//! all listed approvers must approve) — and an optional **deadline** in millis
-//! since epoch (§17.4 "timeout 用子 Process 的 Deadline 实现").
+//! into the same pending decision. An ask carries a **fanout policy**:
+//! `AnyOne`, where the first responder decides, or `RequireAll`, where every
+//! listed approver must approve. It may also carry a **deadline** in
+//! milliseconds since epoch.
 //!
 //! `respond` records one approver's decision and re-resolves the record under
 //! its fanout policy. A real broker drives responses from human input through a
-//! gateway; `respond` is the in-spine seam that gateway calls.
+//! gateway; `respond` is the driver entry point that gateway calls.
 //!
 //! `check` is a pure read of whether a key is decided, reported as a status
 //! string (`pending` / `approved` / `denied` / `expired`), so Policy `Ask`
-//! checks (§8) can consult it without re-issuing the ask. `check` reports
+//! checks can consult it without re-issuing the ask. `check` reports
 //! `expired` once `now > deadline` while still pending; `now` comes from a
-//! `now_millis` input field when supplied (deterministic replay, §9.3), else the
+//! `now_millis` input field when supplied, else the
 //! wall clock.
 
 use async_trait::async_trait;
@@ -38,7 +38,7 @@ const STATUS_APPROVED: &str = "approved";
 const STATUS_DENIED: &str = "denied";
 const STATUS_EXPIRED: &str = "expired";
 
-/// How an ask is resolved from responses (§17.4).
+/// How an ask is resolved from responses.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Fanout {
     /// First responder decides (`fanout=AnyOne`).
@@ -63,7 +63,7 @@ impl Fanout {
 }
 
 /// The persisted approval record. Stored as a `Value::Map` so it lives in the
-/// ordinary state plane (§12) and travels with taint like any other value.
+/// state plane and travels with taint like any other value.
 #[derive(Clone, Debug, PartialEq)]
 struct Record {
     status: String,

@@ -1,12 +1,11 @@
-//! Three-queue cooperative scheduler (§13.5).
+//! Three-queue cooperative scheduler.
 //!
-//! The Executor does not start its own thread pool; Processes share the runtime
-//! and are dispatched by priority across three queues. This is **soft**
-//! priority — no hard real-time guarantee (§25).
+//! Processes share the runtime and are dispatched by priority across three
+//! queues. This is **soft** priority without a hard real-time guarantee.
 
 use serde::{Deserialize, Serialize};
 
-/// Scheduling queue for a unit of executor work (§13.5).
+/// Scheduling queue for a unit of executor work.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Queue {

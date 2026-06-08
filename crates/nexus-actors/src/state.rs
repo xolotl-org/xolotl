@@ -1,16 +1,15 @@
-//! State Driver (§12): exposes `state://**` as a Resource so a Process reads
-//! and writes durable state through ordinary Operations — `Value.read` /
-//! `Value.write` / `Sequence.append` — instead of a privileged side channel.
+//! State Driver: exposes `state://**` as a Resource so a Process reads
+//! and writes durable state through Operations (`read`, `write`,
+//! `append`, `delete`, and `list`).
 //!
-//! This is the §12 "读写就是 Operation" contract made real: state access now
-//! traverses the same Handle → Policy → Fact path as any effect, so capability
-//! checks, taint propagation, and audit apply uniformly. The concrete path the
-//! Process targets arrives in [`DriverContext::target_path`] (the registered
-//! Resource is the `state://` prefix; the handle records the real path, §5.3).
+//! State access traverses the same Handle → Policy → Fact path as any effect,
+//! so capability checks, taint propagation, and audit apply uniformly. The
+//! concrete path the Process targets arrives in [`DriverContext::target_path`];
+//! the registered Resource is the `state://` prefix, and the handle records the
+//! real path.
 //!
 //! Taint persists with the value: a write carries the operation's input taint
-//! (§4.4/§21.5) into the backend envelope, so provenance is never silently
-//! dropped at the state boundary.
+//! into the backend envelope, preserving provenance across the state boundary.
 
 use async_trait::async_trait;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};
@@ -19,7 +18,9 @@ use nexus_types::{MethodId, Outcome, OutputMode, Purity, TaintSet, Value};
 
 /// Method names in registration order for `state://**`. The kernel derives the
 /// rights-bitmap bit and ReplayClass from each; `read` is an Observation,
-/// `write`/`append`/`delete` are effects on durable state.
+/// `write`/`append`/`delete` are effects on durable state. Event subscriptions
+/// are exposed by `effect://events/subscribe`, not by this generic state
+/// driver.
 pub const STATE_METHODS: &[MethodSpec] = &[
     MethodSpec::new("read", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external(),
     MethodSpec::new("write", Purity::Idempotent, MethodSpec::UNARY_ASYNC),
@@ -28,7 +29,7 @@ pub const STATE_METHODS: &[MethodSpec] = &[
     MethodSpec::new("list", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external(),
 ];
 
-/// Drives `state://**` over the kernel's state [`Backend`] (§12).
+/// Drives `state://**` over the kernel's state [`Backend`].
 pub struct StateDriver {
     state: Backend,
 }
@@ -49,8 +50,8 @@ impl Driver for StateDriver {
         _output: OutputMode,
         ctx: &DriverContext,
     ) -> Result<Outcome, DriverError> {
-        // The concrete path comes from the handle's bound path (§12); the
-        // Operation itself carries no path (§11). Refuse if absent — a state op
+        // The concrete path comes from the handle's bound path; the
+        // Operation itself carries no path. Refuse if absent — a state op
         // with no resolved path is a kernel wiring error, not a runtime input.
         let path = ctx
             .target_path
@@ -73,7 +74,7 @@ impl Driver for StateDriver {
                 Ok(Outcome::Done(value))
             }
             // write: set the value, persisting the operation's input taint
-            // alongside it (§4.4/§21.5) — provenance is never dropped here.
+            // alongside it — provenance is never dropped here.
             1 => {
                 if let Some((expected, new_value)) = parse_cas_write(input.clone()) {
                     self.state

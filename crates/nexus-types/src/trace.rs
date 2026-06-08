@@ -1,15 +1,15 @@
-//! Distributed-trace projection (§21.3): spans are **derived from Facts**, not
-//! a separate emission path. A request carries a `trace_id`; each Operation
-//! becomes a child span under its Process's span, and `Spawn`/`Acting` inherit
-//! the parent span. This module is the wasm-safe span model + the derivation
-//! that turns a Fact into a span. A projector can render these to OpenTelemetry.
+//! Distributed-trace projection: spans are derived from Facts. A request carries
+//! a `trace_id`; each Operation becomes a child span under its Process's span,
+//! and `Spawn`/`Acting` inherit the parent span. This module is the wasm-safe
+//! span model + the derivation that turns a Fact into a span. A projector can
+//! render these to OpenTelemetry.
 
 use crate::ids::ProcessId;
 use crate::operation::{DecisionTag, Fact};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
-/// A trace id shared by every span of one logical request (§21.3). Propagated
+/// A trace id shared by every span of one logical request. Propagated
 /// from the gateway inbound through Spawn/Acting; stable across the request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct TraceId(pub u64);
@@ -18,7 +18,7 @@ pub struct TraceId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct SpanId(pub u64);
 
-/// One span derived from a Fact (§21.3). The Operation's stable `OperationId`
+/// One span derived from a Fact. The Operation's stable `OperationId`
 /// gives a deterministic span id, so the same op always maps to the same span
 /// across replay (no wall-clock dependence on identity).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -27,8 +27,8 @@ pub struct Span {
     pub trace_id: TraceId,
     /// Span id unique within the trace.
     pub span_id: SpanId,
-    /// Parent span: the Process's span (an Operation is a child of its Process;
-    /// a spawned child Process's span is a child of the spawner's, §21.3).
+    /// Parent span: the Process's span. An Operation is a child of its Process;
+    /// a spawned child Process's span is a child of the spawner's span.
     pub parent: Option<SpanId>,
     /// Short operation name (`<resource>/<method>` once resolved; here the
     /// method id, since the Fact carries ids not names).
@@ -39,7 +39,7 @@ pub struct Span {
     pub ok: bool,
 }
 
-/// The propagating trace context threaded through execution (§21.3). Carried in
+/// The propagating trace context threaded through execution. Carried in
 /// the executor `Env` and inherited by Spawn/Acting; each Operation derives a
 /// child span id from its `OperationId`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,7 +51,7 @@ pub struct TraceContext {
 }
 
 impl TraceContext {
-    /// Root a fresh trace for `process` (gateway inbound, §18.1). The root span
+    /// Root a fresh trace for `process`. The root span
     /// id is derived from the process id so it is stable.
     pub fn root_for(process: ProcessId) -> Self {
         let trace_id = TraceId(splitmix(process.get() ^ 0x9E37_79B9_7F4A_7C15));
@@ -62,7 +62,7 @@ impl TraceContext {
     }
 
     /// Derive a child trace context under a new parent span (Spawn / Acting,
-    /// §21.3): same trace, new parent derived from `seed`.
+    /// ): same trace, new parent derived from `seed`.
     pub fn child(self, seed: u64) -> Self {
         Self {
             trace_id: self.trace_id,
@@ -70,7 +70,7 @@ impl TraceContext {
         }
     }
 
-    /// Build the span for one Fact under this context (§21.3). The span id is
+    /// Build the span for one Fact under this context. The span id is
     /// derived from the Fact's `OperationId` so it is deterministic and stable
     /// across replay.
     pub fn span_for(&self, fact: &Fact) -> Span {

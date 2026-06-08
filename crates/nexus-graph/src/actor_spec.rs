@@ -1,19 +1,18 @@
-//! `ActorSpec` + linter (§20.2, §21.5) — declared vs. actually-used capabilities.
+//! `ActorSpec` + linter — declared vs. actually-used capabilities.
 //!
-//! An **Actor** is a named, long-lived Process whose body is a `Do<()>` (§20.2).
+//! An **Actor** is a named, long-lived Process whose body is a `Do<()>`.
 //! An [`ActorSpec`] is the lintable declaration wrapper around that body: it
 //! declares the capabilities / state paths / subscriptions / budget the Actor
 //! intends to touch, so an operator can know what the Actor reaches *without
-//! reading its code* (§20.2).
+//! reading its code*.
 //!
-//! The declaration is more than documentation. Per §21.5(2), an Actor's
-//! `declared_capabilities` is promoted from a lint hint to a **runtime ceiling**:
-//! when a Process begins handling untrusted input, the kernel derives an
-//! attenuated child-Handle set covering only the declared capabilities, so an
-//! injected Plan cannot reach a capability the task never declared. That makes the
-//! security-relevant lint finding the **undeclared-but-used** capability: an
-//! Operation the program issues against a target the spec did not declare would,
-//! at runtime, be outside the task ceiling.
+//! The declaration is more than documentation. `declared_capabilities` is
+//! treated as a runtime ceiling when a Process begins handling untrusted input:
+//! the kernel derives an attenuated child-Handle set covering only the declared
+//! capabilities, so an injected Plan cannot reach a capability the task never
+//! declared. That makes the security-relevant lint finding the
+//! **undeclared-but-used** capability: an Operation the program issues against a
+//! target the spec did not declare would be outside the task ceiling at runtime.
 //!
 //! [`lint`] walks a program's AST via [`DoNode::ops`]
 //! and compares each Operation's required capability against the declared
@@ -24,32 +23,32 @@ use nexus_types::{BudgetSpec, CapSet, Capability};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-/// The lintable declaration around an Actor's `Do<()>` body (§20.2). Standard
+/// The lintable declaration around an Actor's `Do<()>` body. Standard
 /// Actors ship unprivileged and version-aligned with the runtime; this spec is
 /// what an operator (or `nexus-console`) reads to audit reach.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ActorSpec {
-    /// A stable name for the Actor (`process://<identity>/<name>`, §20.3).
+    /// A stable name for the Actor.
     #[serde(default)]
     pub name: String,
     /// Capability literals the Actor declares it may use. These are canonical
-    /// §21.1 capability strings such as `perform://effect/x/post`,
+    /// capability strings such as `perform://effect/x/post`,
     /// `read://state/memory/alice/**`, and `subscribe://state/chat/**`. This
-    /// list is **also** the §21.5 task-level capability ceiling.
+    /// list is also the task-level capability ceiling.
     #[serde(default)]
     pub declared_capabilities: Vec<String>,
     /// `state://…` path patterns the Actor declares it will read/write.
     #[serde(default)]
     pub declared_states: Vec<String>,
-    /// Stream paths the Actor subscribes to (compiled into a `for_each`
-    /// Reaction, §20.4).
+    /// Stream paths the Actor subscribes to, compiled into a `for_each`
+    /// Reaction.
     #[serde(default)]
     pub subscriptions: Vec<String>,
     /// The capability set the Actor is granted; the operator checks declared
-    /// capabilities are covered by these Grants (§20.2).
+    /// capabilities are covered by these Grants.
     #[serde(default)]
     pub capabilities: CapSet,
-    /// Cost / inflight ceiling for the Actor (§21.2).
+    /// Cost / inflight ceiling for the Actor.
     #[serde(default)]
     pub budget: BudgetSpec,
 }
@@ -85,7 +84,7 @@ impl ActorSpec {
 #[serde(rename_all = "snake_case")]
 pub enum LintSeverity {
     /// Security-relevant: the program would exceed the declared ceiling at
-    /// runtime (§21.5(2)).
+    /// runtime.
     Error,
     /// Advisory only.
     Warning,
@@ -106,14 +105,12 @@ pub struct LintFinding {
     pub message: String,
 }
 
-/// Lint a program's AST against its [`ActorSpec`] (§20.2 / §21.5).
+/// Lint a program's AST against its [`ActorSpec`].
 ///
-/// Flags every capability the program **uses but does not declare** — these are
-/// the security-relevant ones, because §21.5(2) makes `declared_capabilities`
-/// the runtime ceiling: an undeclared capability would be outside the attenuated
-/// task-level Handle set and would be denied (or, if the ceiling were not
-/// enforced, would be an unaudited reach). A fully-declared program yields no
-/// findings.
+/// Flags every capability the program **uses but does not declare**. These are
+/// security-relevant because `declared_capabilities` forms the runtime ceiling:
+/// an undeclared capability is outside the attenuated task-level Handle set and
+/// would be denied. A fully-declared program yields no findings.
 ///
 /// Each distinct undeclared `(target, method)` produces one finding. Declared
 /// capabilities that the program never uses are *not* flagged here —
@@ -144,7 +141,7 @@ pub fn lint(spec: &ActorSpec, program: &DoNode) -> Vec<LintFinding> {
             method: op.method.clone(),
             message: format!(
                 "capability `{verb}://{}` for method `{}` is used but not declared in \
-                 ActorSpec.declared_capabilities; it exceeds the §21.5 task-level ceiling",
+                 ActorSpec.declared_capabilities; it exceeds the task-level ceiling",
                 capability_target(&target),
                 op.method
             ),

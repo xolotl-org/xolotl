@@ -72,31 +72,31 @@ pub struct ChatMessage {
     pub content: Vec<ContentPart>,
     /// Unix timestamp (seconds).
     pub timestamp: i64,
-    /// Platform-specific metadata (sender id, channel, etc.).
+    /// Source-system metadata such as sender id and channel.
     /// Never injected into the model prompt — only used for
     /// routing and audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ChatMetadata>,
 }
 
-/// Platform-scoped metadata attached to every message.
+/// Source-system metadata attached to every message.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChatMetadata {
-    /// Source platform name.
+    /// Source system name.
     pub platform: String,
-    /// Platform conversation/channel id.
+    /// Source-system conversation or channel id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
-    /// Platform sender/user id.
+    /// Source-system sender or user id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_id: Option<String>,
-    /// Opaque extra fields the platform connector wants to carry.
+    /// Opaque extra fields the connector wants to carry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra: Option<crate::Value>,
 }
 
 impl ChatMessage {
-    /// Create a simple user text message with the given platform metadata.
+    /// Create a simple user text message with the given source metadata.
     pub fn user(
         platform: impl Into<String>,
         conversation_id: impl Into<String>,
@@ -178,7 +178,7 @@ fn now_secs() -> i64 {
     {
         // On wasm32 (the Leptos web client) there is no `SystemTime`. Client-side
         // timestamps are provisional anyway: the daemon stamps the authoritative
-        // ingest time when the event is written to the state stream (§16.3.3), so
+        // ingest time when the event is written to the state stream, so
         // returning 0 here is a deliberate "unset, daemon will fill" sentinel.
         0
     }

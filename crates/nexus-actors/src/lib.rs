@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
-//! `nexus-actors` — the standard in-process Drivers / Providers (§17).
+//! `nexus-actors` — the standard in-process Drivers / Providers.
 //!
 //! Each module is a [`Driver`](nexus_kernel::Driver) implementing one
 //! `effect://…` Resource's methods. They are registered through the kernel's
-//! ordinary assembly face (`Bootstrap::register_effect`) — the kernel has no
-//! special loading path for built-ins vs external providers (§24.2).
+//! standard assembly face (`Bootstrap::register_effect`) — the kernel has no
+//! special loading path for built-ins vs external providers.
 //!
 //! Method dispatch convention: each driver's methods are listed in a
 //! `*_METHODS` table in registration order; the method's index in that table

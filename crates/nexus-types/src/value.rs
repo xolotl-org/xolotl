@@ -29,13 +29,12 @@ pub enum Value {
     /// Small binary payload. Large payloads should use [`Value::Blob`].
     Bytes(#[serde(with = "serde_bytes")] Vec<u8>),
     /// Reference to large opaque content (image / audio / video / file).
-    /// Never inlined into a Fact (§4.4 iron rule).
+    /// Never inlined into a Fact.
     Blob(BlobRef),
     /// Numeric tensor reference: embeddings, audio waveforms, video frames,
-    /// action vectors (§4.4). Bytes live behind the inner `BlobRef`.
+    /// action vectors. Bytes live behind the inner `BlobRef`.
     Tensor(TensorRef),
-    /// A single timestamped frame: media sample or trajectory/sensor point
-    /// (§4.4).
+    /// A single timestamped frame: media sample or trajectory/sensor point.
     Frame(FrameRef),
     /// End-of-stream marker carried in stream sequences.
     StreamEnd(StreamMarker),
@@ -193,9 +192,8 @@ impl From<()> for Value {
 /// A pointer to large opaque content stored in `state://blob/<hash>` or
 /// equivalent. Carries metadata for routing and quota.
 ///
-/// `hash` is the hex-encoded sha256 of the content (the design's `sha256:
-/// [u8;32]` rendered as a wasm/JSON-friendly hex string — equivalent content
-/// address, fewer conversions). Large bytes never inline into a Fact (§4.4).
+/// `hash` is the hex-encoded sha256 of the content, represented as a
+/// wasm/JSON-friendly string. Facts store large bytes by reference.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct BlobRef {
     /// Content hash identifying the stored bytes.
@@ -206,7 +204,7 @@ pub struct BlobRef {
     pub mime: Option<String>,
 }
 
-/// Numeric dtype of a [`TensorRef`] (§4.4). The kernel never computes on
+/// Numeric dtype of a [`TensorRef`]. The kernel never computes on
 /// tensors; this is metadata for routing (which model accepts which dtype)
 /// and for the tensor store to interpret the backing bytes.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -235,7 +233,7 @@ pub enum DType {
 }
 
 /// Reference to a numeric tensor: embedding, audio waveform, video frame,
-/// action vector (§4.4). The bytes live behind `blob`; `dtype`/`shape`
+/// action vector. The bytes live behind `blob`; `dtype`/`shape`
 /// describe how to interpret them. No codec/compute here — wasm-safe.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct TensorRef {
@@ -247,7 +245,7 @@ pub struct TensorRef {
     pub shape: Vec<u64>,
 }
 
-/// What a [`FrameRef`] samples (§4.4).
+/// What a [`FrameRef`] samples.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FrameKind {
@@ -261,8 +259,8 @@ pub enum FrameKind {
     Sensor,
 }
 
-/// A single timestamped frame: one media sample or trajectory/sensor point
-/// (§4.4). Streams of these are appended to a Sequence Resource with
+/// A single timestamped frame: one media sample or trajectory/sensor point.
+/// Streams of these are appended to a Sequence Resource with
 /// monotonically increasing `ts_nanos`.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct FrameRef {
@@ -291,12 +289,12 @@ impl Value {
 
     /// Whether this value carries a large out-of-line payload (blob / tensor
     /// / frame). The Fact recorder and trace projections use this to ensure
-    /// only references — never bytes — are persisted (§4.4 iron rule).
+    /// only references — never bytes — are persisted.
     pub fn is_large_ref(&self) -> bool {
         matches!(self, Value::Blob(_) | Value::Tensor(_) | Value::Frame(_))
     }
 
-    /// A cheap, conservative token-count estimate for budgeting (§21.2). Text is
+    /// A cheap, conservative token-count estimate for budgeting. Text is
     /// approximated at ~4 chars/token (the common GPT/BPE heuristic); structural
     /// values sum their parts. Out-of-line refs (blob/tensor/frame) contribute a
     /// flat nominal count since their true token cost is modality-specific and
@@ -346,7 +344,7 @@ pub enum Failure {
     },
     /// The target rejected work due to rate limits.
     RateLimited,
-    /// The operation is suspended pending human approval (§8 / §17.4). Unlike a
+    /// The operation is suspended pending human approval. Unlike a
     /// hard denial, this is *retryable*: once the approval is granted (the
     /// broker records `approved`), re-executing the operation passes. Carries
     /// the approval key to wait on and a human-readable reason.
@@ -456,7 +454,7 @@ impl Failure {
     }
 }
 
-/// How `Value`s are combined by a merge write (§12 `Value.write` Merge).
+/// How `Value`s are combined by a merge write.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeRule {

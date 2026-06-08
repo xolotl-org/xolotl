@@ -1,10 +1,10 @@
-//! Fetch provider (§17.3): `effect://fetch/get`.
+//! Fetch provider: `effect://fetch/get`.
 //!
-//! Safety (§17.3): SSRF guard — only `http`/`https`, and the host must not be
+//! Safety: SSRF guard — only `http`/`https`, and the host must not be
 //! loopback, a private network (IPv4 *or* IPv6), or a `.local`/`.internal`
 //! name. `fetch` is `Effectful` (a GET can have side effects / be
 //! non-replayable). Large responses are offloaded to a content-addressed
-//! [`BlobRef`] (§17.3 "大响应走 blob") so Facts never inline big payloads (§4.4).
+//! [`BlobRef`] so Facts never inline big payloads.
 
 use async_trait::async_trait;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};
@@ -13,8 +13,8 @@ use nexus_types::{BlobRef, MethodId, Outcome, OutputMode, Purity, Value};
 use std::collections::BTreeMap;
 use std::net::Ipv6Addr;
 
-/// Bodies larger than this are offloaded to a blob ref instead of inlined
-/// (§17.3 "大响应走 blob"). 1 MiB keeps Facts small while inlining typical pages.
+/// Bodies larger than this are offloaded to a blob ref.
+/// 1 MiB keeps Facts small while inlining typical pages.
 pub const INLINE_BODY_LIMIT: usize = 1 << 20;
 
 /// Method names in registration order for `effect://fetch/get`.
@@ -40,7 +40,7 @@ impl FetchDriver {
     }
 }
 
-/// SSRF guard (§17.3): reject non-http(s), loopback, private ranges, and
+/// SSRF guard: reject non-http(s), loopback, private ranges, and
 /// internal TLDs. Returns the validated URL or an error.
 pub fn validate_url(raw: &str) -> Result<url::Url, DriverError> {
     let u = url::Url::parse(raw).map_err(|e| DriverError::Other(format!("bad url: {e}")))?;
@@ -78,7 +78,7 @@ pub fn validate_url(raw: &str) -> Result<url::Url, DriverError> {
     Ok(u)
 }
 
-/// True for IPv6 ranges that must not be reachable from `fetch` (§17.3):
+/// True for IPv6 ranges that must not be reachable from `fetch`:
 /// unique-local `fc00::/7` (covers `fc00::`/`fd00::`) and link-local
 /// `fe80::/10`. (Loopback `::1` and unspecified `::` are handled by the
 /// stdlib predicates at the call site.) Uses the first segment because the
@@ -90,10 +90,10 @@ fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
     unique_local || link_local
 }
 
-/// Decide how a fetched response body is surfaced (§17.3 "大响应走 blob").
+/// Decide how a fetched response body is surfaced.
 /// Small bodies are inlined as a `Str`; bodies at or over [`INLINE_BODY_LIMIT`]
-/// are returned as a content-addressed [`Value::Blob`] so the Fact stays small
-/// (§4.4). Callers that produce a BlobRef must also persist the bytes via
+/// are returned as a content-addressed [`Value::Blob`] so the Fact stays small.
+/// Callers that produce a BlobRef must also persist the bytes via
 /// `body_to_value_persisted`.
 pub fn body_to_value(bytes: Vec<u8>, mime: Option<String>) -> Value {
     if bytes.len() >= INLINE_BODY_LIMIT {
@@ -164,7 +164,7 @@ impl Driver for FetchDriver {
             .map_err(|e| DriverError::Transport(e.to_string()))?;
         let mut m = BTreeMap::new();
         m.insert("status".into(), Value::Int(status));
-        // §17.3: inline small bodies, offload large ones to a BlobRef.
+        // Inline small bodies, offload large ones to a BlobRef.
         m.insert(
             "body".into(),
             body_to_value_persisted(&self.state, body.to_vec(), mime).await?,

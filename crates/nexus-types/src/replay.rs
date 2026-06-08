@@ -2,14 +2,14 @@
 //!
 //! An author declares the coarser [`Purity`] of a method / effect ("is this
 //! safe to replay?"). The kernel derives the finer [`ReplayClass`] from it,
-//! and the persistence discipline (§9.3) follows automatically — only
+//! and the persistence discipline follows automatically — only
 //! [`ReplayClass::NonIdempotentEffect`] pays a write-ahead fsync barrier.
 
 use serde::{Deserialize, Serialize};
 
 /// How safe an effect is to replay. Declared by the method / `EffectCapability`
-/// author (§4.2, §16.2). Sources that declare nothing (including MCP tools)
-/// default to [`Purity::Effectful`] (§9.3).
+/// author. Sources that declare nothing (including MCP tools)
+/// default to [`Purity::Effectful`].
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Purity {
@@ -24,7 +24,7 @@ pub enum Purity {
 }
 
 /// The replay semantics the kernel actually enforces, derived from
-/// [`Purity`] plus whether the operation observes external state (§9.3).
+/// [`Purity`] plus whether the operation observes external state.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplayClass {
@@ -35,12 +35,12 @@ pub enum ReplayClass {
     /// External effect protected by an idempotency key; safe to retry.
     IdempotentEffect,
     /// Repeating produces a new effect; the *only* class that takes a
-    /// write-ahead fsync barrier before the effect is issued (§9.3 / §15.1).
+    /// write-ahead fsync barrier before the effect is issued.
     NonIdempotentEffect,
 }
 
 impl Purity {
-    /// Derive the [`ReplayClass`] (§9.3). A [`Purity::Pure`] method maps to
+    /// Derive the [`ReplayClass`]. A [`Purity::Pure`] method maps to
     /// `Deterministic` for a pure computation, or `Observation` when it reads
     /// external state — the caller passes `observes_external` to disambiguate.
     pub fn replay_class(self, observes_external: bool) -> ReplayClass {
@@ -55,7 +55,7 @@ impl Purity {
 
 impl ReplayClass {
     /// Whether issuing this operation requires a write-ahead fsync barrier
-    /// *before* the driver call (§9.3 / §15.1). True only for
+    /// *before* the driver call. True only for
     /// [`ReplayClass::NonIdempotentEffect`].
     pub fn needs_write_ahead_barrier(self) -> bool {
         matches!(self, ReplayClass::NonIdempotentEffect)

@@ -1,4 +1,4 @@
-//! Endpoint session supervisor (§16.3.3 / §16.3.4): the per-extension session
+//! Endpoint session supervisor: the per-extension session
 //! state machine that gates the 3-stage handshake and enforces the fail-closed
 //! frame discipline, plus the secure-envelope (PSK) credential layer.
 //!
@@ -9,9 +9,9 @@
 //!   stage 3: extension → RoleReady(accepted)      (confirms alignment)
 //! ```
 //! The daemon dispatches **no business frame** (`Invoke`, inbound event) before
-//! `RoleReady` (§16.3.3). After it, every Source frame's `ObservedGenerations`
+//! `RoleReady`. After it, every Source frame's `ObservedGenerations`
 //! must match the session's, and frames bearing a revoked credential generation
-//! are rejected (§16.3.4 fail-closed invariants). This module is the in-process
+//! are rejected. This module is the in-process
 //! state machine + envelope crypto; the live gRPC transport binds to it.
 
 use nexus_kernel::{CheckCtx, PolicyDecision, PolicySnapshot};
@@ -23,7 +23,7 @@ use nexus_types::extension::{
 use nexus_types::{IdentityRef, Path, ResourceId, TaintSet, TaintSource, Value};
 use std::collections::BTreeSet;
 
-/// Where a session is in the handshake (§16.3.3). Business frames are only
+/// Where a session is in the handshake. Business frames are only
 /// admitted in [`SessionPhase::Ready`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionPhase {
@@ -37,7 +37,7 @@ pub enum SessionPhase {
     Closed,
 }
 
-/// Why a frame was rejected by the session gate (§16.3.3 / §16.3.4).
+/// Why a frame was rejected by the session gate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionReject {
     /// A business frame arrived before the handshake completed.
@@ -54,7 +54,7 @@ pub enum SessionReject {
     Closed,
 }
 
-/// Why a Source event ingest was rejected at the daemon boundary (§16.3.4).
+/// Why a Source event ingest was rejected at the daemon boundary.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SourceIngestError {
     /// Session gate rejected the frame before ingest.
@@ -98,7 +98,7 @@ pub enum SourceIngestError {
     State(String),
 }
 
-/// Runtime authority required to admit one inbound Source event (§16.3.4).
+/// Runtime authority required to admit one inbound Source event.
 pub struct SourceIngest<'a> {
     /// State backend used for dedup and event append.
     pub state: Backend,
@@ -128,7 +128,7 @@ pub struct SourceIngest<'a> {
     pub now_millis: i64,
 }
 
-/// Authoritative daemon ingest for one [`InboundEvent`] (§16.3.4). This is the
+/// Authoritative daemon ingest for one [`InboundEvent`]. This is the
 /// only place an extension Source frame becomes state: it gates the ready
 /// session, validates declaration/schema/policy, dedupes event ids durably, and
 /// forcibly stamps `TaintSource::Inbound` before appending to the declared sink.
@@ -349,14 +349,14 @@ fn schema_type_matches(expected: &str, value: &Value) -> bool {
     }
 }
 
-/// One extension session's authoritative state (§16.3.3). Owned by the daemon
+/// One extension session's authoritative state. Owned by the daemon
 /// side; the extension only ever echoes what it observes.
 pub struct EndpointSession {
     phase: SessionPhase,
-    /// The daemon-adjudicated context sent in stage 2 (the source of truth).
+    /// The daemon-adjudicated context sent in stage 2.
     context: Option<SessionContext>,
     /// The credential generation currently valid; frames on an older generation
-    /// are rejected after a revoke (§16.3.4 fail-closed).
+    /// are rejected after a revoke.
     valid_credential_generation: u64,
 }
 
@@ -386,7 +386,7 @@ impl EndpointSession {
         self.context.as_ref()
     }
 
-    /// Stage 1 → 2 (§16.3.3): the extension's hello is received and the daemon
+    /// Stage 1 → 2: the extension's hello is received and the daemon
     /// adjudicates the authoritative `SessionContext` to send back. The daemon
     /// chooses every generation; the extension's cached `observed` is advisory
     /// only. Returns the context to transmit, or rejects out-of-order/closed.
@@ -408,7 +408,7 @@ impl EndpointSession {
         Ok(context)
     }
 
-    /// Stage 3 (§16.3.3): the extension confirms alignment. The accepted context
+    /// Stage 3: the extension confirms alignment. The accepted context
     /// must match what the daemon sent verbatim — any divergence is fail-closed
     /// (the session moves to Closed, no business frames ever flow).
     pub fn on_ready(&mut self, ready: &RoleReady) -> Result<(), SessionReject> {
@@ -430,7 +430,7 @@ impl EndpointSession {
         }
     }
 
-    /// Gate a business frame (`Invoke` dispatch / inbound event, §16.3.3): only
+    /// Gate a business frame: only
     /// admitted once `Ready`. Returns `Ok` to dispatch, or the reject reason.
     pub fn admit_business(&self) -> Result<(), SessionReject> {
         match self.phase {
@@ -440,7 +440,7 @@ impl EndpointSession {
         }
     }
 
-    /// Gate an inbound Source event's observed generations (§16.3.3): a Source
+    /// Gate an inbound Source event's observed generations: a Source
     /// frame must not claim generations newer than the session's authoritative
     /// ones (a stale or forged frame is rejected). Equal/older presentation
     /// generations are fine (the extension may lag a config push).
@@ -455,7 +455,7 @@ impl EndpointSession {
         Ok(())
     }
 
-    /// Gate a credential generation (§16.3.4 fail-closed): after a revoke bumps
+    /// Gate a credential generation: after a revoke bumps
     /// `valid_credential_generation`, any frame on an older generation is
     /// rejected. Equal-or-newer is accepted.
     pub fn admit_credential(&self, generation: u64) -> Result<(), SessionReject> {
@@ -465,7 +465,7 @@ impl EndpointSession {
         Ok(())
     }
 
-    /// Revoke all credentials older than `new_generation` (§16.3.4): bumps the
+    /// Revoke all credentials older than `new_generation`: bumps the
     /// floor so stale-generation frames are refused thereafter.
     pub fn revoke_below(&mut self, new_generation: u64) {
         self.valid_credential_generation = self.valid_credential_generation.max(new_generation);

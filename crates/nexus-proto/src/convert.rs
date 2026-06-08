@@ -547,7 +547,7 @@ pub fn outcome_to_pb(o: &Outcome) -> pb::Outcome {
     pb::Outcome { result }
 }
 
-// ─── Extension frames (§16.3.3) ──────────────────────────────────────────────
+// ─── Extension frames ──────────────────────────────────────────────
 //
 // The `nexus_types::extension` frames ⇄ the generated `pb::extension` wire
 // messages. These are the marshalling used by the gRPC `ExtensionService`
@@ -558,7 +558,7 @@ pub fn outcome_to_pb(o: &Outcome) -> pb::Outcome {
 use nexus_types::extension::{ErrorInfo, Invoke, InvokeResult};
 use pb::extension as ext;
 
-/// `Invoke` → wire `Invoke` (§16.3.3): the daemon→extension dispatch frame.
+/// `Invoke` → wire `Invoke`: the daemon→extension dispatch frame.
 pub fn invoke_to_pb(i: &Invoke) -> ext::Invoke {
     ext::Invoke {
         invocation_id: i.invocation_id.clone(),
@@ -590,7 +590,7 @@ pub fn invoke_from_pb(i: &ext::Invoke) -> Result<Invoke, ConvertError> {
     })
 }
 
-/// `InvokeResult` → wire `InvokeResult` (§16.3.3): the extension→daemon result.
+/// `InvokeResult` → wire `InvokeResult`: the extension→daemon result.
 pub fn invoke_result_to_pb(r: &InvokeResult) -> ext::InvokeResult {
     let outcome = match &r.outcome {
         Ok(v) => Some(ext::invoke_result::Outcome::Success(value_to_pb(v))),

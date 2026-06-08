@@ -1,8 +1,8 @@
-//! Lock provider (§17): `effect://lock/acquire`, `effect://lock/release`.
+//! Lock provider: `effect://lock/acquire`, `effect://lock/release`.
 //!
 //! A cooperative advisory lock over the state plane: `acquire` is a
 //! `Cas{expected:None}` create on `state://kernel/locks/<name>` (no-lock = free,
-//! held = present). Pairs with the `bracket` idiom (§20.1) so the lock is
+//! held = present). Pairs with the `bracket` idiom so the lock is
 //! released on any exit path.
 
 use async_trait::async_trait;

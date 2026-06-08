@@ -1,10 +1,10 @@
 //! `GraphCursor` — where execution / recovery is positioned in an
-//! [`ExecutionGraph`](crate::graph::ExecutionGraph) (§13.4 / §15.2).
+//! [`ExecutionGraph`](crate::graph::ExecutionGraph).
 //!
 //! The Executor advances the cursor; `Step` nodes splice their produced
-//! subgraph in at the cursor (the run-time face of `AndThen`). On recovery the
-//! cursor is realigned by [`NodeId`] (§6.1 / §13.2) — never by wall clock — so
-//! concurrent branches re-converge deterministically.
+//! subgraph in at the cursor (the run-time face of `AndThen`). Serialized
+//! cursors and done sets are keyed by [`NodeId`], never by wall clock, so a
+//! recovered run can align work to stable graph positions.
 
 use nexus_types::{NodeId, Value};
 use serde::{Deserialize, Serialize};
@@ -27,9 +27,9 @@ impl Frame {
 }
 
 /// Position of execution within a graph. Serializable so it can be snapshotted
-/// and restored on recovery (§15.2). The `pending` stack holds the not-yet-run
+/// and restored on recovery. The `pending` stack holds the not-yet-run
 /// continuations; `done` records nodes whose outcome is already recorded (so
-/// replay skips them, §15.1).
+/// replay skips them).
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GraphCursor {
     /// Continuation stack (LIFO): the next node to run is the top.
@@ -62,7 +62,7 @@ impl GraphCursor {
         self.pending.push(frame);
     }
 
-    /// Mark a node's outcome durably recorded (replay will skip it, §15.1).
+    /// Mark a node's outcome durably recorded.
     pub fn mark_done(&mut self, node: NodeId) {
         if !self.done.contains(&node) {
             self.done.push(node);

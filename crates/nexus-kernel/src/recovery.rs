@@ -1,9 +1,9 @@
-//! Recovery and quarantine (§15).
+//! Recovery and quarantine.
 //!
-//! Recovery is per-Process: read the latest snapshot, replay the facts after
-//! it, realign the graph cursor by `NodeId` (§13.2), and handle pending
-//! operations per their [`ReplayClass`] —
-//! idempotent ones may retry, non-idempotent ones go to quarantine (§15.3).
+//! Recovery is per-Process: classify the process Fact stream, build a replay
+//! map for completed outcomes, and handle pending operations per their
+//! [`ReplayClass`]. Idempotent ones may retry; non-idempotent ones go to
+//! quarantine.
 
 use crate::fact::FactSink;
 use nexus_graph::GraphCursor;
@@ -11,12 +11,12 @@ use nexus_types::{Fact, NodeId, Outcome, ProcessId, ReplayClass};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// A replay map (§15.2): `CausalPosition` (NodeId) → the recorded outcome of a
+/// A replay map: `CausalPosition` (NodeId) → the recorded outcome of a
 /// completed Operation. When a recovered Process re-runs its program, the
 /// Executor consults this map at each Operation node; a hit returns the recorded
 /// outcome **without re-issuing the side effect**, so a NonIdempotentEffect that
 /// already happened is never repeated. This is how recovery "restarts the
-/// Executor" (§15.2) safely — the program runs again, but durable steps are
+/// Executor" safely — the program runs again, but durable steps are
 /// short-circuited to their recorded results, realigned by NodeId.
 #[derive(Clone, Debug, Default)]
 pub struct ReplayMap {
@@ -40,7 +40,7 @@ impl ReplayMap {
         self.outcomes.get(&node)
     }
 
-    /// Build a replay map from a process's fact stream (§15.2): every *completed*
+    /// Build a replay map from a process's fact stream: every *completed*
     /// fact contributes its recorded outcome at its CausalPosition. Pending
     /// facts (no outcome) are not included — they re-execute (idempotent) or are
     /// quarantined (non-idempotent) per [`classify_recovery`].
@@ -73,9 +73,9 @@ impl ReplayMap {
     }
 }
 
-/// A snapshot taken to shorten recovery for a long-running Process (§15.2).
+/// A snapshot taken to shorten recovery for a long-running Process.
 /// `at_cursor` is the FactSink append cursor at snapshot time — not a Fact
-/// field (§9). `process_state` and `bindings` let recovery resume without
+/// field. `process_state` and `bindings` let recovery resume without
 /// replaying the full fact stream.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -85,16 +85,16 @@ pub struct Snapshot {
     pub at_cursor: u64,
     /// Graph execution cursor captured at snapshot time.
     pub graph_cursor: GraphCursor,
-    /// The Process descriptor captured at snapshot time (§15.2).
+    /// The Process descriptor captured at snapshot time.
     #[serde(default)]
     pub process_state: Option<nexus_types::Process>,
     /// Binding values (Let-bound results) captured at snapshot time, keyed by
-    /// the producer NodeId, so recovery restores the data environment (§15.2).
+    /// the producer NodeId, so recovery restores the data environment.
     #[serde(default)]
     pub bindings: HashMap<NodeId, nexus_types::Value>,
 }
 
-/// What recovery decided for one process (§15.2).
+/// What recovery decided for one process.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RecoveryReport {
     /// Completed operations skipped (already durable).
@@ -107,7 +107,7 @@ pub struct RecoveryReport {
     pub schema_mismatched: usize,
 }
 
-/// An entry written to `state://quarantine/<process>/<op>` (§15.3): an unsafe
+/// An entry written to `state://quarantine/<process>/<op>`: an unsafe
 /// replay held for an operator decision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QuarantineEntry {
@@ -117,7 +117,7 @@ pub struct QuarantineEntry {
     pub suggested_action: QuarantineAction,
 }
 
-/// Operator action on a quarantined op (§15.3). Each is itself an Operation.
+/// Operator action on a quarantined op. Each is itself an Operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuarantineAction {
@@ -133,7 +133,7 @@ pub enum QuarantineAction {
     Finalize,
 }
 
-/// Classify a process's facts on recovery (§15.1 crash-recovery points). A
+/// Classify a process's facts on recovery. A
 /// fact with no outcome is *pending*; how it is handled depends on its replay
 /// class. Returns the recovery report.
 pub fn classify_recovery(facts: &[Fact]) -> (RecoveryReport, Vec<QuarantineEntry>) {
@@ -153,7 +153,7 @@ pub fn classify_recovery(facts: &[Fact]) -> (RecoveryReport, Vec<QuarantineEntry
             report.skipped += 1;
             continue;
         }
-        // Pending: decide by ReplayClass (§15.1 table).
+        // Pending: decide by ReplayClass.
         match f.replay {
             ReplayClass::Deterministic | ReplayClass::Observation => {
                 // Safe to recompute / reread on replay.
@@ -176,10 +176,10 @@ pub fn classify_recovery(facts: &[Fact]) -> (RecoveryReport, Vec<QuarantineEntry
     (report, quarantine)
 }
 
-/// Recover one process from its fact stream (§15.2). Returns the classification
+/// Recover one process from its fact stream. Returns the classification
 /// report, the quarantine entries, and a [`ReplayMap`] of completed outcomes so
 /// the caller can re-run the process's program with already-durable Operations
-/// short-circuited (the "restart the Executor" step of §15.2).
+/// short-circuited.
 pub fn recover_process(
     facts: &FactSink,
     process: ProcessId,
@@ -191,7 +191,7 @@ pub fn recover_process(
 }
 
 /// Recover one process and **persist** its quarantine entries to
-/// `state://quarantine/<process>/<op-id>` (§15.3), so an operator can inspect
+/// `state://quarantine/<process>/<op-id>`, so an operator can inspect
 /// and act on them. Returns the recovery report.
 pub async fn recover_process_persisting(
     facts: &FactSink,

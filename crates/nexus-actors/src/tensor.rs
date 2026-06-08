@@ -1,7 +1,7 @@
-//! Tensor store (§17 / §17.4): `effect://tensor/write`,
+//! Tensor store: `effect://tensor/write`,
 //! `effect://tensor/read`, `effect://tensor/delete`.
 //!
-//! Tensors (embeddings, audio waveforms, video/action vectors, §4.4) are stored
+//! Tensors are stored
 //! by content hash like blobs, but carry dtype + shape metadata so a reader
 //! reconstructs the right view. The bytes live behind a `BlobRef`; this driver
 //! persists only the `TensorRef` envelope (blob + dtype + shape) under
@@ -53,7 +53,7 @@ impl Driver for TensorDriver {
         match method.get() {
             // write({data:[f32...], dtype?, shape?}) → TensorRef. The bytes go
             // through the shared Blob Store path; state://tensor/* stores only
-            // the TensorRef envelope (§12 / §17.4).
+            // the TensorRef envelope.
             0 => {
                 let data = match m.get("data") {
                     Some(Value::List(xs)) if !xs.is_empty() => xs.clone(),

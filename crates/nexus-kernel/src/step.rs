@@ -1,10 +1,10 @@
-//! The step table: named, pure `Value -> Do<A>` continuations (§13.3).
+//! The step table: named, pure `Value -> Do<A>` continuations.
 //!
-//! Steps are **not** closures. A [`StepRef`](nexus_graph::StepRef) names a step
-//! registered on a Process; the executor looks it up and calls it with the
-//! piped-in value to produce a subgraph, which is spliced at the cursor (the
-//! run-time face of `AndThen`, §13.4). Named-not-closure keeps the graph
-//! serializable and blocks cross-identity code injection.
+//! A [`StepRef`](nexus_graph::StepRef) names a step registered on a Process;
+//! the executor looks it up and calls it with the piped-in value to produce a
+//! subgraph, which is spliced at the cursor (the run-time face of `AndThen`).
+//! Named steps keep the graph serializable and block cross-identity code
+//! injection.
 
 use nexus_graph::DoNode;
 use nexus_types::{ProcessId, Value};
@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 /// A step function: pure, total, `(piped_value, optional_arg) -> Do<A>`. It
 /// must not perform IO — time / randomness / effects go through Operation
-/// nodes so the compiled `NodeId`s stay stable (§13.3).
+/// nodes so the compiled `NodeId`s stay stable.
 pub type StepFn = Arc<dyn Fn(Value, Option<Value>) -> DoNode + Send + Sync>;
 
 /// Per-process registry of named steps. Keyed by `(process, name)`.

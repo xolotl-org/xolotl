@@ -1,7 +1,7 @@
-//! Inference Router (§17.1): routes `effect://inference/*` to a concrete model
+//! Inference Router: routes `effect://inference/*` to a concrete model
 //! backend by group policy, modality/capability filtering, retry, and fallback.
 //!
-//! Routing flow (§17.1):
+//! Routing flow:
 //! ```text
 //! match rule → group → filter models by request modality & capabilities
 //!   → pick by group policy (Priority/RoundRobin/Latency/Weighted)
@@ -10,7 +10,7 @@
 //! ```
 //!
 //! Config lives in `state://kernel/inference/{backends,models,groups}` and
-//! `state://kernel/routing/inference` (§17.1). The [`Router`] here is the
+//! `state://kernel/routing/inference`. The [`Router`] here is the
 //! in-process selection engine; the daemon loads config into it and registers
 //! real backends. The offline baseline registers a single echo backend model.
 
@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// How a group picks among its candidate models (§17.1).
+/// How a group picks among its candidate models.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum GroupPolicy {
     /// Always the highest-priority (lowest index) healthy candidate.
@@ -34,7 +34,7 @@ pub enum GroupPolicy {
     Weighted,
 }
 
-/// One registered model: a backend plus its routing metadata (§17.1).
+/// One registered model: a backend plus its routing metadata.
 pub struct ModelEntry {
     /// Stable `<backend>/<model_id>` qualified name.
     pub id: String,
@@ -94,7 +94,7 @@ impl ModelEntry {
 }
 
 /// A named set of candidate models with a selection policy and an optional
-/// fallback group (§17.1).
+/// fallback group.
 pub struct ModelGroup {
     /// Group name referenced by routing config or fallback.
     pub name: String,
@@ -102,7 +102,7 @@ pub struct ModelGroup {
     pub policy: GroupPolicy,
     /// Indices into the router's model table.
     pub members: Vec<usize>,
-    /// Group to escalate to when every member fails (§17.1).
+    /// Group to escalate to when every member fails.
     pub fallback: Option<String>,
     /// Round-robin cursor (for [`GroupPolicy::RoundRobin`]).
     rr_cursor: AtomicU64,
@@ -127,14 +127,14 @@ impl ModelGroup {
     }
 }
 
-/// The routing engine (§17.1). Holds models and groups; selects and invokes a
+/// The routing engine. Holds models and groups; selects and invokes a
 /// backend with retry + fallback. Cheap to share; selection is lock-light.
 pub struct Router {
     models: Vec<ModelEntry>,
     groups: HashMap<String, ModelGroup>,
     /// The group used when a request names none (the routing default rule).
     default_group: String,
-    /// Max attempts per model on retryable (429/5xx-class) errors (§17.1).
+    /// Max attempts per model on retryable (429/5xx-class) errors.
     max_retries: u32,
     /// Weighted-policy RNG state (deterministic, seeded per Router).
     rng: Mutex<u64>,
@@ -189,7 +189,7 @@ impl Router {
         self.max_retries = n;
     }
 
-    /// Route an `infer` call (§17.1): pick a group, filter by requirements, pick
+    /// Route an `infer` call: pick a group, filter by requirements, pick
     /// a model by policy, call with retry, and on whole-group failure escalate to
     /// the fallback group. `requirements` gates which models are candidates.
     pub async fn infer(
@@ -259,7 +259,7 @@ impl Router {
                     Err(e) => last_err = e,
                 }
             }
-            // Whole group failed → fallback (§17.1).
+            // Whole group failed → fallback.
             if let Some(group) = self.groups.get(group_name)
                 && let Some(fallback) = &group.fallback
             {
@@ -281,7 +281,7 @@ impl Router {
             .collect()
     }
 
-    /// Order candidates by the group's policy (§17.1).
+    /// Order candidates by the group's policy.
     fn order_candidates(&self, group: &str, candidates: &[usize]) -> Vec<usize> {
         let Some(g) = self.groups.get(group) else {
             return candidates.to_vec();
@@ -373,7 +373,7 @@ impl Router {
     }
 }
 
-/// Whether a backend error is transient and worth retrying (§17.1: 429/5xx).
+/// Whether a backend error is transient and worth retrying.
 /// Backends report errors as strings; we match the conventional markers.
 fn is_retryable(err: &str) -> bool {
     let e = err.to_ascii_lowercase();

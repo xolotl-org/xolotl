@@ -1,39 +1,40 @@
-//! `Skill` — a named, versioned reusable unit of knowledge + procedure (§20.6).
+//! `Skill` — a named, versioned reusable unit of knowledge + procedure.
 //!
-//! "Skill" is not a new primitive: it is the naming of two things that already
-//! exist — a **knowledge body** (instructions / methodology a model reads) plus
-//! an optional **procedure** (a Plan the kernel executes). It lives as one
-//! `memory` entry under the `skills/` namespace (§17.2):
+//! A Skill does not add a runtime operation class. It names two things that
+//! already exist: a **knowledge body** (instructions / methodology a model
+//! reads) plus an optional **procedure** (a Plan the kernel executes). It lives
+//! as one
+//! `memory` entry under the `skills/` namespace:
 //!
 //! ```text
 //! Skill = state://memory/<id>/skills/<name>
 //!   {
 //!     knowledge:    Value,          // instructions / methodology / examples
-//!     procedure:    Option<Path>,   // → state://kernel/plans/<id> (§20.4 Plan)
+//!     procedure:    Option<Path>,   // → state://kernel/plans/<id>
 //!     trigger_hint: Value,          // description / keywords / sample queries for recall
 //!     scope:        SkillScope,     // Global | Identity(<id>) | Conversation(<conv>)
 //!     version:      u64,
 //!   }
 //! ```
 //!
-//! Two iron rules, neither of which adds a mechanism (§20.6):
+//! Two iron rules, neither of which adds a mechanism:
 //!
 //! - The **knowledge body** is injected through the *same* recall path as any
-//!   memory: Context Assembly (§20.5 layer 3) does a vector search + rerank over
+//!   memory: Context Assembly does a vector search + rerank over
 //!   the current query, and `skills/` entries whose `trigger_hint` matches are
 //!   injected. Irrelevant Skills never enter the prompt and never burn budget.
-//! - The **procedure** runs through the *same* path as a Plan (§20.4): the
+//! - The **procedure** runs through the *same* path as a Plan: the
 //!   stored `procedure` Path points at a serialized Plan/`Do<A>`
 //!   (`state://kernel/plans/<id>`) which the memory/plan layer validates
 //!   (target / capability / schema) and **compiles to `Do<A>` on load**, then
 //!   runs *inside the calling Process*, inheriting its capabilities and budget
-//!   (the §21.5 task-level ceiling constrains it too). A Skill grants **no**
+//! A Skill grants **no**
 //!   privilege to bypass capability checks.
 //!
 //! This type is the data descriptor only. It deliberately stores `procedure`
 //! as a `Path` reference (not an inlined Plan): inlining a `Plan`/`Do<A>` here
 //! would force `nexus-types` to depend on `nexus-graph`, inverting the layering
-//! (§24.2). The memory/plan layer (`nexus-plan`, which *does* see the Plan
+//! The memory/plan layer (`nexus-plan`, which *does* see the Plan
 //! type) is responsible for resolving that Path and compiling the Plan on load.
 
 use crate::path::Path;
@@ -41,7 +42,7 @@ use crate::value::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// The visibility / applicability scope of a [`Skill`] (§20.6). Determines how
+/// The visibility / applicability scope of a [`Skill`]. Determines how
 /// broadly recall may surface it.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,7 +56,7 @@ pub enum SkillScope {
     Conversation(String),
 }
 
-/// A named, versioned reusable unit of knowledge + (optional) procedure (§20.6).
+/// A named, versioned reusable unit of knowledge + (optional) procedure.
 ///
 /// Stored as one memory entry at `state://memory/<id>/skills/<name>`. The
 /// `knowledge` half is injected like a dynamic prompt fragment by recall; the
@@ -63,24 +64,23 @@ pub enum SkillScope {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Skill {
     /// Instructions / methodology / examples — the reusable prompt fragment
-    /// recall injects (§20.5 layer 3).
+    /// recall injects.
     pub knowledge: Value,
     /// Optional reference to a serialized Plan/`Do<A>` at
-    /// `state://kernel/plans/<id>` (§20.4). Compiled to `Do<A>` on load by the
+    /// `state://kernel/plans/<id>`. Compiled to `Do<A>` on load by the
     /// memory/plan layer; runs in the calling Process under its capabilities and
     /// budget. `None` = knowledge-only Skill (pure dynamic prompt).
     #[serde(default)]
     pub procedure: Option<Path>,
     /// Description / keywords / sample queries used for retrieval — decides when
-    /// this Skill is recalled (§20.6).
+    /// this Skill is recalled.
     #[serde(default)]
     pub trigger_hint: Value,
-    /// Visibility scope (§20.6).
+    /// Visibility scope.
     #[serde(default)]
     pub scope: SkillScope,
     /// Monotonic version; bumped on each edit so Console can review / roll back
-    /// (§20.6, §18.4 CAS).
-    #[serde(default)]
+    ///    #[serde(default)]
     pub version: u64,
 }
 
@@ -96,14 +96,14 @@ impl Skill {
         }
     }
 
-    /// Whether this Skill carries an executable procedure (§20.4 Plan).
+    /// Whether this Skill carries an executable procedure.
     pub fn has_procedure(&self) -> bool {
         self.procedure.is_some()
     }
 
     /// Project to a `Value` map for storage / wire (mirrors the convention used
     /// by [`crate::device::EffectProvider`]). The stored shape matches the
-    /// `state://memory/<id>/skills/<name>` schema (§20.6).
+    /// `state://memory/<id>/skills/<name>` schema.
     pub fn to_value(&self) -> Value {
         let mut m = BTreeMap::new();
         m.insert("knowledge".into(), self.knowledge.clone());

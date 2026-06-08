@@ -224,7 +224,7 @@ impl Capability {
 
     /// Like [`Self::covers`] but also evaluates the predicate (if any) against the
     /// op `input` and `now_millis`. This is the authoritative check used at
-    /// `open()` time and by residual policy checks (§5/§8).
+    /// `open()` time and by residual policy checks.
     pub fn covers_with(&self, verb: &str, target: &Path, input: &Value, now_millis: i64) -> bool {
         if !self.covers_path(verb, target) {
             return false;
@@ -246,7 +246,7 @@ impl Capability {
     }
 
     /// Public structural match against `(verb, target)`, **ignoring any
-    /// predicate**. Used by `ResourceSelector` (§5.1), where predicates live
+    /// predicate**. Used by `ResourceSelector`, where predicates live
     /// in a separate `ConstraintSet` and are evaluated independently.
     pub fn verb_scheme_segments_match(&self, verb: &str, target: &Path) -> bool {
         self.covers_path(verb, target)

@@ -2,9 +2,9 @@
 //! default daemon when no persistent backend is configured.
 //!
 //! Retains an in-memory event history per path so `ReadMode::Range` and
-//! `ReadMode::At` queries (§2.3, §6.7) round-trip end-to-end. The history
-//! grows unbounded — production deployments override `read_range` /
-//! `read_at` with a backend that owns its own retention policy.
+//! `ReadMode::At` queries round-trip end-to-end. The history
+//! grows unbounded; persistent deployments should use a backend that owns its
+//! retention policy.
 
 use crate::backend::{
     StateBackend, StateError, StateEvent, StateHistoryEntry, StateResult, StateStream, TaintedValue,
@@ -23,7 +23,7 @@ struct Subscriber {
     sender: broadcast::Sender<StateEvent>,
 }
 
-/// In-process state. Stores a [`TaintedValue`] per path so provenance (§4.4/§12)
+/// In-process state. Stores a [`TaintedValue`] per path so provenance
 /// persists with the value.
 pub struct InMemoryBackend {
     map: DashMap<Path, TaintedValue>,
@@ -143,7 +143,7 @@ impl StateBackend for InMemoryBackend {
             }
         }
         // The sequence's taint accrues the union of every appended item's
-        // lineage (§21.5): a list that ever held untrusted content stays tainted.
+        // lineage: a list that ever held untrusted content stays tainted.
         entry.taint.union(&taint);
         drop(entry);
         let ev = self.record(StateEvent::Append {

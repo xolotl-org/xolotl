@@ -1,8 +1,8 @@
-//! Console WebSocket protocol endpoint (§24.3).
+//! Console WebSocket protocol endpoint.
 //!
 //! This is the post-login control path. Frames carry descriptor-named protocol
 //! actions (`ActionCall`) and streams (`StreamCall`). Dispatch goes through
-//! kernel/auth management surfaces and ordinary Operation/Fact paths, not
+//! kernel/auth management surfaces and Operation/Fact paths, not
 //! through a raw `{target, method, input}` shell.
 
 use crate::auth::{self, ConsolePrincipal, SessionSummary};

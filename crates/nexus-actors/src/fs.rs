@@ -1,13 +1,12 @@
-//! Filesystem provider (§17.3): `effect://fs/read`, `effect://fs/write`,
+//! Filesystem provider: `effect://fs/read`, `effect://fs/write`,
 //! `effect://fs/list`, `effect://fs/delete`, `effect://fs/glob`.
 //!
-//! Safety (§17.3): paths are canonicalized to block symlink escape; reads and
+//! Safety: paths are canonicalized to block symlink escape; reads and
 //! `glob` are `Observation` (replayed from the recorded value), writes/deletes
 //! are `NonIdempotentEffect`. Large reads cross the `effect://blob/write`
-//! offload boundary ("大文件走 effect://blob/write 只记 BlobRef"): a `read` of a
-//! file larger than [`INLINE_MAX`] persists the bytes in the standard blob
-//! store and returns a blob reference (blake3 hash + size + mime); small files are
-//! returned inline.
+//! offload boundary: a `read` of a file larger than [`INLINE_MAX`] persists the
+//! bytes in the standard blob store and returns a blob reference (blake3 hash +
+//! size + mime); small files are returned inline.
 
 use async_trait::async_trait;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};
@@ -27,7 +26,7 @@ pub const FS_METHODS: &[MethodSpec] = &[
 ];
 
 /// Reads at or below this size inline into the returned `Value`; larger files
-/// cross the blob offload boundary and come back as a blob reference (§17.3).
+/// cross the blob offload boundary and come back as a blob reference.
 pub const INLINE_MAX: u64 = 1 << 20; // 1 MiB
 
 /// Drives the filesystem actions, sandboxed to a root directory.
@@ -84,11 +83,11 @@ impl Driver for FsDriver {
             // read
             0 => {
                 let p = self.resolve(path)?;
-                // §17.3 offload boundary: stat first; a file larger than
-                // INLINE_MAX is content-addressed (blake3) and returned as a
-                // BlobRef so the Fact never inlines the payload (§4.4). The
-                // same state-backed blob store as `effect://blob/write` holds
-                // the bytes, so the returned BlobRef is immediately readable.
+                // Stat first; a file larger than INLINE_MAX is
+                // content-addressed with blake3 and returned as a BlobRef so
+                // the Fact never inlines the payload. The same state-backed
+                // blob store as `effect://blob/write` holds the bytes, so the
+                // returned BlobRef is immediately readable.
                 let meta = tokio::fs::metadata(&p)
                     .await
                     .map_err(|e| DriverError::Other(e.to_string()))?;

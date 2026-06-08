@@ -1,6 +1,6 @@
-//! `Grant` — the *source* form of a capability (§5.1).
+//! `Grant` — the *source* form of a capability.
 //!
-//! A capability has two forms (§2.2):
+//! A capability has two forms:
 //!
 //! - [`Grant`] — attenuable, delegable, derivable. A selector + rights +
 //!   constraints + expiry. This is the "source code".
@@ -37,7 +37,7 @@ macro_rules! bitflags_serde_bits {
 }
 
 bitflags::bitflags! {
-    /// Method bitmap (§5.1): which methods of a Resource's interface this
+    /// Method bitmap: which methods of a Resource's interface this
     /// grant authorizes. `O(1)` subset check at `open()` and on the hot path.
     ///
     /// Methods are assigned bit positions per-interface at admission time; the
@@ -64,15 +64,16 @@ impl MethodBitmap {
         i < 64 && self.contains(MethodBitmap::method(i))
     }
 
-    /// Bitmap subset test: is `self` ⊆ `other`? (Attenuation invariant: a
-    /// derived handle's methods must be a subset of its parent's, §5.3.)
+    /// Bitmap subset test: is `self` ⊆ `other`? This preserves the attenuation
+    /// invariant that a derived handle's methods must be a subset of its
+    /// parent's methods.
     pub fn is_subset_of(self, other: MethodBitmap) -> bool {
         other.contains(self)
     }
 }
 
 bitflags::bitflags! {
-    /// Derivation flags on a grant (§5.1). Independent of which methods are
+    /// Derivation flags on a grant. Independent of which methods are
     /// allowed: these govern how the resulting Handle may be *propagated*.
     #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
     pub struct RightFlags: u32 {
@@ -114,7 +115,7 @@ impl DeriveKind {
     }
 }
 
-/// The methods + derivation flags a grant authorizes (§5.1).
+/// The methods + derivation flags a grant authorizes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Rights {
     /// Authorized method bitmap.
@@ -129,22 +130,21 @@ impl Rights {
         Self { methods, flags }
     }
 
-    /// Bitmap subset (used by `open()` step 2 and `derive_handle`, §5.2/§5.3):
-    /// requested rights must be ⊆ the grant's rights, and flags monotonically
-    /// attenuate.
+    /// Bitmap subset used by `open()` and `derive_handle`: requested rights
+    /// must be ⊆ the grant's rights, and flags monotonically attenuate.
     pub fn is_subset_of(&self, parent: &Rights) -> bool {
         self.methods.is_subset_of(parent.methods) && parent.flags.contains(self.flags)
     }
 
-    /// Whether the parent's flags permit the requested derivation kind (§5.3).
+    /// Whether the parent's flags permit the requested derivation kind.
     pub fn allows_derive(&self, kind: DeriveKind) -> bool {
         self.flags.contains(kind.required_flag())
     }
 }
 
-/// Which Resources a grant matches (§5.1). The same selector serves both
+/// Which Resources a grant matches. The same selector serves both
 /// authorization (does `open()` of resource R hit this grant?) and capability
-/// discovery (enumerate the Resources I may touch, §4.5). It is a path
+/// discovery. It is a path
 /// pattern, reusing the [`Capability`] literal grammar (`*` / `**` segments).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResourceSelector {
@@ -186,7 +186,7 @@ impl ResourceSelector {
     }
 }
 
-/// Dynamic narrowing conditions on a grant (§5.1): input-field predicates,
+/// Dynamic narrowing conditions on a grant: input-field predicates,
 /// time windows, quotas. Evaluation is **fail-closed** — a missing field,
 /// type mismatch, or expired window means "not covered". Reuses the
 /// [`Capability`] predicate machinery; the constraints are the residual the
@@ -216,7 +216,7 @@ impl ConstraintSet {
     }
 }
 
-/// When a grant stops being valid (§5.1).
+/// When a grant stops being valid.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Expiry {
@@ -234,7 +234,7 @@ impl Expiry {
     }
 }
 
-/// The source form of a capability (§5.1): attenuable, delegable, derivable.
+/// The source form of a capability: attenuable, delegable, derivable.
 /// `open()` (in `nexus-kernel`) compiles a Grant against a Resource into a
 /// `Handle`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

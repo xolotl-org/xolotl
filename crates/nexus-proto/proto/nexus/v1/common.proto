@@ -1,7 +1,7 @@
 syntax = "proto3";
 package nexus.v1;
 
-// Universal addressing primitive.
+// Universal addressing type.
 // String form: path://[cluster/]<scheme>/<seg>[/<seg>...]
 message Path {
   optional string cluster = 1;
@@ -27,7 +27,7 @@ message Value {
   }
 }
 
-// End-of-stream sentinel for streamed value sequences (§4.4 / state append).
+// End-of-stream sentinel for streamed value sequences.
 message StreamMarker {
   oneof kind {
     bool done = 1;          // graceful end
@@ -47,7 +47,7 @@ message MapValue {
   map<string, Value> entries = 1;
 }
 
-// Pointer to large opaque content in blob storage (§4.4).
+// Pointer to large opaque content in blob storage.
 message BlobRef {
   string hash = 1;
   uint64 size = 2;

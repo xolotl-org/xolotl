@@ -1,12 +1,12 @@
-//! `FactSink` — the write-ahead source of truth (§9), with ReplayClass-graded
-//! persistence barriers (§9.3 / §15.1).
+//! `FactSink` — write-ahead Fact recording with ReplayClass-graded persistence
+//! barriers.
 //!
 //! The hot path writes a fixed-size record (refs + tags). Only
 //! `NonIdempotentEffect` operations take a write-ahead fsync barrier before the
 //! effect is issued; everything else is an in-memory append flushed by group
 //! commit. The sink maintains a monotonic append cursor used **only** for
 //! snapshot cut-points and archival — it is not a Fact field and plays no part
-//! in identity or idempotency (§9).
+//! in identity or idempotency.
 
 use nexus_types::{Fact, OperationId};
 use parking_lot::Mutex;
@@ -16,18 +16,17 @@ use thiserror::Error;
 
 /// A durable-write failure from the fact store (disk full, corruption, txn
 /// abort). The kernel maps a **pre-effect** failure to a denied operation —
-/// never issue an effect we could not first record (§9.3) — and logs a
-/// **post-effect** failure for crash recovery to reconcile from the fsync'd
-/// pending record (§15.1). A read failure is not modelled here: reads fall back
-/// to an empty result so recovery treats the data as absent rather than crashing.
+/// prevents the effect and logs a **post-effect** failure for crash recovery to
+/// reconcile from the fsync'd pending record. Read failures fall back to an
+/// empty result so recovery treats the data as absent.
 #[derive(Debug, Error)]
 #[error("fact store write failed: {0}")]
 pub struct FactError(pub String);
 
 /// Pluggable durable sink. The in-memory impl is the default; redb provides a
-/// persistent one (§24.1). The kernel speaks only this trait. Read failures are
+/// persistent one. The kernel speaks only this trait. Read failures are
 /// explicit so recovery/audit do not silently treat corrupted Fact storage as
-/// an empty stream (§0.1 / §15).
+/// an empty stream.
 pub trait FactStore: Send + Sync + 'static {
     /// Append a (possibly pending) fact. Returns the append cursor position.
     /// Errors before the cursor advances, so a retry reuses the same slot.
@@ -37,16 +36,16 @@ pub trait FactStore: Send + Sync + 'static {
     /// Force durability up to the current cursor (fsync). Called for
     /// write-ahead barriers.
     fn sync(&self) -> Result<(), FactError>;
-    /// All facts for one process, in append order (recovery, §15.2).
+    /// All facts for one process, in append order.
     fn facts_of(&self, process: nexus_types::ProcessId) -> Result<Vec<Fact>, FactError>;
-    /// All facts, in append order (audit / billing / trace projection, §9.1).
+    /// All facts, in append order.
     fn all_facts(&self) -> Result<Vec<Fact>, FactError>;
-    /// The current monotonic append cursor (snapshot cut-point, §9).
+    /// The current monotonic append cursor.
     fn cursor(&self) -> u64;
 }
 
 /// In-memory fact store. Tracks append order and a fsync counter so tests can
-/// assert "only NonIdempotentEffect takes a barrier" (§28 acceptance).
+/// assert "only NonIdempotentEffect takes a barrier".
 #[derive(Default)]
 pub struct InMemoryFactStore {
     inner: Mutex<FactStoreInner>,
@@ -138,7 +137,7 @@ impl FactStore for InMemoryFactStore {
 pub type SharedFactStore = Arc<dyn FactStore>;
 
 /// The kernel-facing sink: wraps a [`FactStore`] and applies the
-/// ReplayClass-graded barrier discipline (§9.3 / §15.1).
+/// ReplayClass-graded barrier discipline.
 #[derive(Clone)]
 pub struct FactSink {
     store: SharedFactStore,
@@ -161,10 +160,10 @@ impl FactSink {
         )
     }
 
-    /// Begin recording an operation *before* the driver call (§15.1 step 1).
+    /// Begin recording an operation *before* the driver call.
     /// For `NonIdempotentEffect` this writes-ahead and fsyncs (the only class
     /// that does); other classes append in memory. A failure here is reported to
-    /// the caller, which **must not** issue the effect (§9.3 fail-closed).
+    /// the caller, which **must not** issue the effect.
     pub fn begin(&self, pending: Fact) -> Result<(), FactError> {
         validate_fact_schema(&pending)?;
         let needs_barrier = pending.replay.needs_write_ahead_barrier();
@@ -175,7 +174,7 @@ impl FactSink {
         Ok(())
     }
 
-    /// Complete an operation's record after the driver returns (§15.1 step 3).
+    /// Complete an operation's record after the driver returns.
     /// `NonIdempotentEffect` fsyncs again; others ride group commit.
     pub fn complete(&self, fact: Fact) -> Result<(), FactError> {
         validate_fact_schema(&fact)?;

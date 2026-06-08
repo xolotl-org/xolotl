@@ -1,12 +1,12 @@
 //! Compact identifiers used across the data and control planes.
 //!
 //! The data plane never carries names or `Path` strings — it carries these
-//! compact ids (§2.3, §10.2). `Path` / `ResourceName` exist only in the
+//! compact ids. `Path` / `ResourceName` exist only in the
 //! control plane for addressing and are resolved to ids at `open()` time.
 //!
 //! All ids are `Copy` newtypes over small integers so the hot path pays no
 //! allocation or hashing cost. `HandleId` is a generational `(index, gen)`
-//! pair (§5.4) so revoke/reopen cannot be confused (ABA-safe).
+//! pair so revoke/reopen cannot be confused (ABA-safe).
 
 use serde::{Deserialize, Serialize};
 
@@ -49,13 +49,13 @@ id_u64!(/// Identifies a single method within an interface.
     MethodId);
 id_u64!(/// Identifies a method input/output schema.
     SchemaId);
-id_u64!(/// Identifies a remote endpoint (§7.4).
+id_u64!(/// Identifies a remote endpoint.
     EndpointId);
 id_u64!(/// Identifies a compiled `ExecutionGraph`.
     GraphId);
 
 /// A resolved identity prefix. The data plane carries this, never the raw
-/// `Path` of the identity (§3, §2.5). `acting` on an operation is one of these.
+/// `Path` of the identity. `acting` on an operation is one of these.
 #[derive(
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
@@ -82,7 +82,7 @@ impl std::fmt::Display for IdentityRef {
 }
 
 /// Generational handle id: `(index, generation)` into the slotmap
-/// `HandleTable` (§5.4). Lookup is `O(1)` array indexing; revoke bumps the
+/// `HandleTable`. Lookup is `O(1)` array indexing; revoke bumps the
 /// slot generation so a stale `HandleId` (old generation) is rejected.
 #[derive(
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
@@ -107,8 +107,8 @@ impl std::fmt::Display for HandleId {
     }
 }
 
-/// Stable position of a node within a compiled `ExecutionGraph` (§13.2).
-/// **`NodeId` == `CausalPosition`** (§6.1): it is assigned at compile time,
+/// Stable position of a node within a compiled `ExecutionGraph`.
+/// **`NodeId` == `CausalPosition`**: it is assigned at compile time,
 /// is stable while the Program is unchanged, and never depends on wall clock
 /// or randomness. This is the anchor for idempotency dedup and replay.
 #[derive(
@@ -136,12 +136,12 @@ impl std::fmt::Display for NodeId {
     }
 }
 
-/// `CausalPosition` is exactly a [`NodeId`] (§6.1 / §13.2). The alias exists
+/// `CausalPosition` is exactly a [`NodeId`]. The alias exists
 /// to keep call sites that speak in causal-position terms readable.
 pub type CausalPosition = NodeId;
 
 /// Wall-clock timestamp in milliseconds since the Unix epoch. Used only for
-/// audit/projection ordering — never for identity or causal ordering (§9).
+/// audit/projection ordering — never for identity or causal ordering.
 #[derive(
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]

@@ -1,4 +1,4 @@
-//! Inference Router (§17.1): `effect://inference/infer`,
+//! Inference Router: `effect://inference/infer`,
 //! `effect://inference/embed`, `effect://inference/rerank`,
 //! `effect://inference/plan`.
 //!
@@ -32,14 +32,14 @@ pub trait InferenceBackend: Send + Sync + 'static {
     async fn infer(&self, input: &Value) -> Result<Value, String>;
     /// Embed input into a fixed-dim tensor (deterministic for the baseline).
     async fn embed(&self, input: &Value) -> Result<Value, String>;
-    /// The capabilities this backend supports (§17.1), for modality/feature
+    /// The capabilities this backend supports, for modality/feature
     /// filtering during routing. The baseline supports text only.
     fn capabilities(&self) -> ModelCapabilities {
         ModelCapabilities::default()
     }
 }
 
-/// Capability flags a model declares (§17.1), used to filter candidates by the
+/// Capability flags a model declares, used to filter candidates by the
 /// request's required modality and features (tools/vision/audio/json/streaming).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ModelCapabilities {
@@ -70,7 +70,7 @@ impl Default for ModelCapabilities {
     }
 }
 
-/// What a request requires of a model (§17.1). A model is a candidate only if it
+/// What a request requires of a model. A model is a candidate only if it
 /// satisfies every required capability. Derived from the request input + the
 /// requested OutputMode.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -90,7 +90,7 @@ pub struct RequestRequirements {
 }
 
 impl ModelCapabilities {
-    /// Whether this model satisfies the request's required capabilities (§17.1).
+    /// Whether this model satisfies the request's required capabilities.
     pub fn satisfies(&self, req: &RequestRequirements) -> bool {
         self.modality.contains(req.modality)
             && (!req.needs_tools || self.tools)
@@ -109,11 +109,11 @@ impl ModelCapabilities {
 /// * `embed` hashes the input into a small fixed-dim tensor with a declared
 ///   embedding space, so Memory retrieval is internally consistent.
 ///
-/// Swap in a real [`InferenceBackend`] via [`InferenceDriver::new`] for
-/// production model calls; the method contract is identical.
+/// Swap in another [`InferenceBackend`] via [`InferenceDriver::new`]; the
+/// method contract is identical.
 pub struct EchoBackend;
 
-/// The embedding space id the baseline tags its vectors with (§17.1). Retrieval
+/// The embedding space id the baseline tags its vectors with. Retrieval
 /// only compares vectors sharing a space; the baseline is its own space.
 pub const BASELINE_EMBEDDING_SPACE: &str = "nexus-baseline-blake3-8d";
 
@@ -128,8 +128,8 @@ impl InferenceBackend for EchoBackend {
         let text = render_text(input);
         // 8-dim deterministic embedding from the content hash. The baseline
         // carries the vector inline (alongside the TensorRef) so the in-memory
-        // Vector Index can do real cosine without a tensor store; production
-        // stores the tensor and returns only the ref.
+        // Vector Index can do cosine search without a tensor store. Backends
+        // with separate tensor storage can return only the ref.
         let h = blake3::hash(text.as_bytes());
         let bytes = h.as_bytes();
         let vector: Vec<Value> = (0..8)
@@ -149,8 +149,8 @@ impl InferenceBackend for EchoBackend {
             dtype: DType::F32,
             shape: vec![8],
         };
-        // §17.1: every embedding is tagged with its space_id + embedding_model
-        // so retrieval never compares vectors from different spaces.
+        // Every embedding is tagged with its space_id + embedding_model so
+        // retrieval never compares vectors from different spaces.
         let mut m = std::collections::BTreeMap::new();
         m.insert("tensor".into(), Value::Tensor(tensor));
         m.insert("vector".into(), Value::List(vector));
@@ -201,7 +201,7 @@ fn render_text(v: &Value) -> String {
 }
 
 /// Drives the inference actions. Holds a [`Router`](crate::router::Router) that
-/// selects a concrete model backend per request (§17.1). The offline default is
+/// selects a concrete model backend per request. The offline default is
 /// a single-backend router over [`EchoBackend`].
 pub struct InferenceDriver {
     router: Arc<crate::router::Router>,
@@ -234,7 +234,7 @@ impl InferenceDriver {
 }
 
 /// Derive the model requirements of an inference request from its input value
-/// and the requested output mode (§17.1). Vision/audio are implied by Blob/Frame
+/// and the requested output mode. Vision/audio are implied by Blob/Frame
 /// parts; streaming by the OutputMode; json/tools by explicit input flags.
 fn requirements_of(input: &Value, output: OutputMode) -> RequestRequirements {
     use OutputMode as Om;
@@ -243,7 +243,7 @@ fn requirements_of(input: &Value, output: OutputMode) -> RequestRequirements {
         needs_streaming: matches!(output, Om::Stream),
         ..Default::default()
     };
-    // Inspect parts for non-text modality (§4.4 / §17.1).
+    // Inspect parts for non-text modality.
     fn scan(v: &Value, req: &mut RequestRequirements) {
         match v {
             Value::Blob(_) => {
@@ -290,7 +290,7 @@ impl Driver for InferenceDriver {
     ) -> Result<Outcome, DriverError> {
         match method.get() {
             // infer / plan (3): route to a model, with capability filtering,
-            // retry, and fallback (§17.1).
+            // retry, and fallback.
             0 | 3 => {
                 let req = requirements_of(&input, output);
                 let routed = self
@@ -298,7 +298,7 @@ impl Driver for InferenceDriver {
                     .infer(&input, &req, None)
                     .await
                     .map_err(DriverError::Other)?;
-                // Streaming normalization (§17.1): a non-streaming backend's
+                // Streaming normalization: a non-streaming backend's
                 // unary result is delivered as a single chunk + Done so a
                 // streaming caller sees a uniform shape.
                 if matches!(output, OutputMode::Stream) {
@@ -306,7 +306,7 @@ impl Driver for InferenceDriver {
                 }
                 Ok(Outcome::Done(routed.output))
             }
-            // embed: batchable (§17.5) — a List input embeds each element and
+            // embed: batchable — a List input embeds each element and
             // returns a List of embeddings (one Operation, one Fact). Embedding
             // capability is orthogonal to chat modality, so candidates aren't
             // constrained by an EMBEDDING bit (the baseline text model also
@@ -333,7 +333,7 @@ impl Driver for InferenceDriver {
                     Ok(Outcome::Done(routed.output))
                 }
             }
-            // rerank: batchable (§17.5). A List input is a batch of rerank
+            // rerank: batchable. A List input is a batch of rerank
             // requests; each element returns its own ranked list.
             2 => Ok(Outcome::Done(match &input {
                 Value::List(items) => Value::List(items.iter().map(rerank).collect()),
@@ -465,9 +465,9 @@ mod tests {
 
     #[tokio::test]
     async fn embed_is_batchable_list_in_list_out() {
-        // §17.5: embed accepts a List and returns a List of per-element
-        // embeddings (one Operation → one result; the Fact-coalescing layer
-        // records a single summarizing Fact).
+        // Embed accepts a List and returns a List of per-element embeddings.
+        // One Operation returns one result, and the Fact coalescing layer
+        // records a single summarizing Fact.
         let d = InferenceDriver::baseline();
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
         let batch = Value::List(vec![
@@ -503,7 +503,7 @@ mod tests {
             .unwrap();
         match out {
             Outcome::Done(Value::Map(m)) => {
-                // §17.1: the embedding is tagged with its space_id + model, and
+                // The embedding is tagged with its space_id + model, and
                 // carries both the TensorRef and the inline vector.
                 assert_eq!(
                     m.get("space_id").and_then(|v| v.as_str()),

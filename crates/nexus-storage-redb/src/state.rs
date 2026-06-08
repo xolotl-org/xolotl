@@ -197,7 +197,7 @@ fn history_key_parts(key: &[u8]) -> StateResult<(Path, i64)> {
     Ok((path, i64::from_be_bytes(ts)))
 }
 
-/// On-disk envelope persisting a value with its taint (§4.4/§12). Stored as JSON
+/// On-disk envelope persisting a value with its taint. Stored as JSON
 /// in `STATE_VALUES_TABLE`; bare `Value` encodings are rejected so provenance is
 /// never silently dropped. We build the JSON by hand (this crate doesn't depend
 /// on `serde` derive directly).

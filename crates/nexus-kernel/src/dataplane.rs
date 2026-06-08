@@ -1,10 +1,10 @@
-//! The data plane (§6, §11): fixed-cost operation execution.
+//! The data plane: fixed-cost operation execution.
 //!
-//! `execute` is the hot path of §2.3: generational handle lookup → owner check
+//! `execute` is the data-plane hot path: generational handle lookup → owner check
 //! → active check → rights bitmap → (Conditional only) residual policy → driver
 //! dispatch → Fact append. `Unconditional` handles skip the policy step
-//! entirely — that is a structural fact, not a runtime branch on an empty list
-//! (§5.5). The data plane never touches the Registry or parses anything (§11).
+//! entirely as a structural fast path. The data plane receives compiled handles
+//! and driver plans.
 
 use crate::driver::{DriverContext, DriverError};
 use crate::fact::FactSink;
@@ -29,7 +29,7 @@ pub struct ExecOutput {
     pub output_taint: TaintSet,
 }
 
-/// The data plane: a handle table and a fact sink (§11). Shared behind a lock;
+/// The data plane: a handle table and a fact sink. Shared behind a lock;
 /// the lock is held only for the table lookup, released before the (async)
 /// driver call.
 #[derive(Clone)]
@@ -38,13 +38,13 @@ pub struct DataPlane {
     pub handles: Arc<RwLock<HandleTable>>,
     /// Fact sink used to record operation attempts and completions.
     pub facts: FactSink,
-    /// Idempotency dedup store (§21.3): effective-key → cached outcome for
+    /// Idempotency dedup store: effective-key → cached outcome for
     /// `IdempotentEffect` ops. Records are stored under `state://idemp/<hash>`,
     /// where the hash is over the authenticated-context-bound key
     /// (`idempotency::derive_key`), so an injected Plan cannot forge or collide
     /// another identity's records.
     state: nexus_state::Backend,
-    /// Optional process table for the `AsyncProcess` adapter (§4.3).
+    /// Optional process table for the `AsyncProcess` adapter.
     processes: Option<crate::process::ProcessTable>,
 }
 
@@ -69,11 +69,11 @@ impl DataPlane {
         self
     }
 
-    /// Execute one operation (§6). `method_index` is the bit position of the
+    /// Execute one operation. `method_index` is the bit position of the
     /// method within the resource's interface (for the rights bitmap);
     /// `replay` is the operation's derived [`nexus_types::ReplayClass`] used for the Fact
     /// barrier. `now_millis` stamps the Fact and feeds residual checks.
-    /// `record` gates Fact creation (§9.2): side effects, observations that feed
+    /// `record` gates Fact creation: side effects, observations that feed
     /// control flow, and denials always record; a pure-deterministic read whose
     /// output nothing consumes may skip (recovery recomputes it).
     pub async fn execute(
@@ -124,7 +124,7 @@ impl DataPlane {
 
     /// Record a pre-dispatch denial for an Operation that has already resolved
     /// to a handle but must fail before issuing the driver call. This covers
-    /// executor-level checks such as budget reservation (§9.2 / §21.2): the
+    /// executor-level checks such as budget reservation: the
     /// effect is never sent, but the rejected attempt still appears in the Fact
     /// stream for recovery, why-not, audit, and accounting projections.
     pub fn record_pre_dispatch_denial(
@@ -153,7 +153,7 @@ impl DataPlane {
         // Resolve the handle, clone the dispatch plan + fast-path, and capture
         // the resource id — all under a short read lock. The driver call
         // happens after the lock is dropped so concurrent ops on other handles
-        // overlap (Both/Race async I/O, §13.4).
+        // overlap.
         let resolved = {
             let table = self.handles.read();
             let Some(h) = table.get(op.handle) else {
@@ -210,7 +210,7 @@ impl DataPlane {
 
         // The driver receives the full input value. Large modality values
         // (Blob/Tensor/Frame) are already out-of-line refs, so this is cheap;
-        // the Fact records the fixed-size `ValueRef` projection (§4.4).
+        // the Fact records the fixed-size `ValueRef` projection.
         let input = op.input.clone();
 
         // Pairing display secrets are generated inside PairingDriver and handed
@@ -248,7 +248,7 @@ impl DataPlane {
             );
         }
 
-        // Conditional handles run residual policy; Unconditional skip it (§5.5).
+        // Conditional handles run residual policy; Unconditional skip it.
         if let FastPath::Conditional(snapshot) = &resolved.fast_path {
             let ctx = CheckCtx {
                 input: &input,
@@ -272,11 +272,11 @@ impl DataPlane {
                     approval_key,
                     reason,
                 } => {
-                    // §8 / §17.4: not a hard denial — the operation is *suspended*
-                    // pending human approval. It records as RejectedByPolicy (the
-                    // effect did not happen) but returns the retryable
-                    // `ApprovalPending` failure, so once the broker approves the
-                    // key a re-execution passes the same residual check.
+                    // This is not a hard denial. The operation is suspended
+                    // pending human approval. It records as RejectedByPolicy
+                    // because the effect did not happen, but returns the
+                    // retryable `ApprovalPending` failure so re-execution can
+                    // pass once the broker approves the key.
                     return self.deny(
                         op,
                         Some(resolved.resource),
@@ -292,7 +292,7 @@ impl DataPlane {
             }
         }
 
-        // Idempotency dedup (§21.3): an `IdempotentEffect` op is keyed by its
+        // Idempotency dedup: an `IdempotentEffect` op is keyed by its
         // authenticated-context-bound idempotency key. A second op with the same
         // effective key short-circuits to the cached outcome instead of
         // re-issuing the effect — this is what makes crash-replay and explicit
@@ -351,9 +351,9 @@ impl DataPlane {
             None
         };
 
-        // Begin the Fact *before* the effect (write-ahead barrier for
-        // NonIdempotentEffect, §15.1). Only Deterministic/Observation reads may
-        // skip when their output is not consumed (§9.2). IdempotentEffect and
+        // Begin the Fact *before* the effect as the write-ahead barrier for
+        // NonIdempotentEffect. Only Deterministic/Observation reads may
+        // skip when their output is not consumed. IdempotentEffect and
         // NonIdempotentEffect are external side effects and must record even
         // when their result is ignored.
         let do_record = record
@@ -366,7 +366,7 @@ impl DataPlane {
         if do_record {
             let pending = self.pending_fact(op, resolved.resource, replay, now_millis);
             // Fail-closed: if we cannot durably record the intent, we must NOT
-            // issue the effect (§9.3 — the write-ahead barrier exists precisely
+            // issue the effect ( — the write-ahead barrier exists precisely
             // to prevent an "already happened, never recorded" effect).
             if let Err(e) = self.facts.begin(pending) {
                 tracing::error!(?e, op = ?op.id, "write-ahead fact append failed; denying op");
@@ -380,11 +380,11 @@ impl DataPlane {
             }
         }
 
-        // Dispatch through the frozen plan (§6 step driver_plan.call). The
+        // Dispatch through the frozen plan. The
         // operation's own `method` id is authoritative. The op's input taint and
         // the handle's bound path are handed to the driver so persistence
-        // drivers derive provenance (§21.5) and state drivers reach the concrete
-        // path (§12) without a path ever entering the Operation/Fact.
+        // drivers derive provenance and state drivers reach the concrete
+        // path without a path ever entering the Operation/Fact.
         let mut ctx = DriverContext::new(op.acting, op.process)
             .with_operation_id(op.id)
             .with_taint(op.taint.clone());
@@ -523,7 +523,7 @@ impl DataPlane {
         // Complete the Fact with the outcome (only if we began one). The effect
         // has already been issued, so a completion-write failure cannot un-issue
         // it: log it and let crash recovery reconcile from the begun (fsync'd)
-        // pending record (§15.1). The caller still gets the real outcome.
+        // pending record. The caller still gets the real outcome.
         if do_record
             && let Err(e) = self.facts.complete(self.completed_fact(
                 op,
@@ -540,7 +540,7 @@ impl DataPlane {
         }
 
         // Cache a successful IdempotentEffect outcome under its key so a later
-        // op with the same key dedupes to it (§21.3). Failures are not cached —
+        // op with the same key dedupes to it. Failures are not cached —
         // a retry of a failed idempotent op should re-attempt.
         if let Some(key) = idem_key
             && outcome.is_success()
@@ -589,10 +589,10 @@ impl DataPlane {
         tag: DecisionTag,
         failure: Failure,
     ) -> ExecOutput {
-        // A denied/rejected effect attempt is still recorded (§6: failures
-        // must record a Fact for why-not / retry decisions). A record failure on
-        // the deny path is logged — the effect was never issued, so there is
-        // nothing unsafe to reconcile; the caller still gets the denial outcome.
+        // A denied or rejected effect attempt is still recorded because
+        // failures must record a Fact for why-not and retry decisions. A record
+        // failure on the deny path is logged; the effect was never issued, so
+        // there is nothing unsafe to reconcile.
         let fact = self.completed_fact(
             op,
             resource.unwrap_or_else(|| nexus_types::ResourceId::new(0)),
@@ -1338,7 +1338,7 @@ mod tests {
         // Regression: a Blob/Tensor/Frame input must reach the driver as the
         // full value (it used to be silently dropped to Null because the Fact
         // projection leaked onto the dispatch path). The Fact still records a
-        // fixed-size ValueRef::External (§4.4).
+        // fixed-size ValueRef::External.
         use nexus_types::BlobRef;
         let (dp, id) = dataplane_with_handle(
             Rights::new(MethodBitmap::method(0), RightFlags::empty()),
@@ -1460,7 +1460,7 @@ mod tests {
         });
         let (facts, store) = FactSink::in_memory();
         let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
-        // record=false, but a NonIdempotentEffect is always recorded (§9.2) so
+        // record=false, but a NonIdempotentEffect is always recorded so
         // the write-ahead barrier still fires.
         let out = dp
             .execute(
@@ -1482,8 +1482,8 @@ mod tests {
 
     #[tokio::test]
     async fn unconsumed_deterministic_read_skips_fact() {
-        // §9.2: with record=false and a Deterministic class, no Fact is written
-        // (recovery recomputes the read). The store stays empty.
+        // With record=false and a Deterministic class, no Fact is written
+        // because recovery can recompute the read. The store stays empty.
         let (dp, id) = dataplane_with_handle(
             Rights::new(MethodBitmap::method(0), RightFlags::empty()),
             FastPath::Unconditional,
@@ -1525,9 +1525,9 @@ mod tests {
 
     #[tokio::test]
     async fn unconsumed_idempotent_effect_still_records_fact() {
-        // §9.2: Effectful / IdempotentEffect operations are external side
-        // effects, so recovery must know they happened even if the result is
-        // not consumed by later graph nodes.
+        // Effectful / IdempotentEffect operations are external side effects, so
+        // recovery must know they happened even if later graph nodes do not
+        // consume the result.
         let mut table = HandleTable::new();
         let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
         plan.insert(MethodId::new(7), Arc::new(EchoDriver));
@@ -1559,8 +1559,8 @@ mod tests {
 
     #[tokio::test]
     async fn idempotent_effect_dedupes_by_business_key() {
-        // §21.3: two IdempotentEffect ops carrying the same `_idem_key` run the
-        // driver only once; the second short-circuits to the cached outcome.
+        // Two IdempotentEffect ops carrying the same `_idem_key` run the driver
+        // only once; the second short-circuits to the cached outcome.
         use std::sync::atomic::{AtomicU32, Ordering};
         static CALLS: AtomicU32 = AtomicU32::new(0);
         CALLS.store(0, Ordering::SeqCst);
@@ -1633,8 +1633,8 @@ mod tests {
 
     #[tokio::test]
     async fn idempotent_effect_dedupes_across_data_plane_instances() {
-        // §21.3: idempotency records live in state://idemp/*, so a restarted
-        // DataPlane sharing the backend still dedupes the same effective key.
+        // Idempotency records live in state://idemp/*, so a restarted DataPlane
+        // sharing the backend still dedupes the same effective key.
         use std::sync::atomic::{AtomicU32, Ordering};
         static CALLS: AtomicU32 = AtomicU32::new(0);
         CALLS.store(0, Ordering::SeqCst);
@@ -1706,7 +1706,7 @@ mod tests {
         );
     }
 
-    /// A FactStore whose writes always fail — to exercise the §9.3 fail-closed
+    /// A FactStore whose writes always fail, exercising the fail-closed
     /// write-ahead path without needing a real disk fault.
     struct FailingFactStore;
     impl crate::fact::FactStore for FailingFactStore {
@@ -1732,9 +1732,9 @@ mod tests {
 
     #[tokio::test]
     async fn write_ahead_failure_denies_effect_fail_closed() {
-        // §9.3: a NonIdempotentEffect must write-ahead BEFORE the effect is
-        // issued. If that durable append fails, the op is denied and the driver
-        // is never called — no "happened but unrecorded" effect.
+        // A NonIdempotentEffect must write ahead before the effect is issued.
+        // If that durable append fails, the op is denied and the driver is
+        // never called; no effect can happen without a record.
         use std::sync::atomic::{AtomicBool, Ordering};
         static CALLED: AtomicBool = AtomicBool::new(false);
         CALLED.store(false, Ordering::SeqCst);

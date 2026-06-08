@@ -1,11 +1,10 @@
-//! Ranker (§17.2): `effect://rank/score`, `effect://rank/fuse`.
+//! Ranker: `effect://rank/score`, `effect://rank/fuse`.
 //!
-//! Ranking is a pluggable Ranker, not a hard-coded constant (§17.2). `score`
-//! fuses multiple signals (semantic similarity / weight / recency / confidence)
-//! by **policy-configurable** weights; `fuse` combines several recall lists by
-//! Reciprocal Rank Fusion (RRF). The default weights `0.4/0.3/0.2/0.1` are just
-//! the default config — production stores them in `state://kernel/rank/*` and
-//! hot-tunes them, rather than burying them in code.
+//! Ranking is implemented by a pluggable Ranker. `score` fuses multiple signals
+//! (semantic similarity / weight / recency / confidence) by
+//! **policy-configurable** weights; `fuse` combines several recall lists by
+//! Reciprocal Rank Fusion (RRF). The default weights `0.4/0.3/0.2/0.1` are the
+//! default config. Deployments can store rank settings in `state://kernel/rank/*`.
 
 use async_trait::async_trait;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};
@@ -20,7 +19,7 @@ pub const RANK_METHODS: &[MethodSpec] = &[
     MethodSpec::new("fuse", Purity::Pure, MethodSpec::UNARY_ASYNC),
 ];
 
-/// Default signal weights (§17.2) — overridable via input `weights`.
+/// Default signal weights — overridable via input `weights`.
 const DEFAULT_WEIGHTS: [(&str, f64); 4] = [
     ("semantic_sim", 0.4),
     ("weight", 0.3),
@@ -32,7 +31,7 @@ const DEFAULT_WEIGHTS: [(&str, f64); 4] = [
 const RRF_K: f64 = 60.0;
 
 /// Drives the rank actions. Weights resolve in precedence order: per-call
-/// `weights` input → `state://kernel/rank/weights` (hot-tunable config, §17.2)
+/// `weights` input → `state://kernel/rank/weights`
 /// → the built-in default weights. The state backend is optional so the
 /// driver works standalone (tests) without config.
 #[derive(Clone, Default)]
@@ -47,13 +46,13 @@ impl RankerDriver {
     }
 
     /// Attach a state backend so default weights are read from
-    /// `state://kernel/rank/weights` (hot-tunable, §17.2).
+    /// `state://kernel/rank/weights`.
     pub fn with_state(mut self, state: nexus_state::Backend) -> Self {
         self.state = Some(state);
         self
     }
 
-    /// Resolve the signal weights for a `score` call (§17.2): per-call override,
+    /// Resolve the signal weights for a `score` call: per-call override,
     /// else hot-tunable state config, else the built-in defaults.
     async fn resolve_weights(&self, m: &BTreeMap<String, Value>) -> Vec<(String, f64)> {
         if let Some(w) = m.get("weights").and_then(|v| v.as_map()) {
@@ -217,7 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn weights_come_from_state_config_when_present() {
-        // §17.2: default weights are hot-tunable via state://kernel/rank/weights.
+        // Default weights are hot-tunable via state://kernel/rank/weights.
         // We flip the weighting to favor `weight` over `semantic_sim` and verify
         // the ranking changes accordingly.
         use nexus_state::{Backend, InMemoryBackend};

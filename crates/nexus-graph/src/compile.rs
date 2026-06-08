@@ -1,13 +1,13 @@
-//! Do→Graph compiler (§13.3): lower a [`DoNode`] AST into one
+//! Do→Graph compiler: lower a [`DoNode`] AST into one
 //! [`ExecutionGraph`].
 //!
 //! The compiler's contract is **stable, deterministic [`NodeId`]s**: the same
 //! `DoNode` always compiles to the same node ids, assigned in a fixed
 //! pre-order traversal, never depending on wall clock or randomness. `NodeId
-//! == CausalPosition` (§6.1) — this is the anchor that lets concurrency and
+//! == CausalPosition` — this is the anchor that lets concurrency and
 //! crash-recovery coexist.
 //!
-//! Compilation rules (§13.3):
+//! Compilation rules:
 //!
 //! ```text
 //! Pure(a)                Node::Pure
@@ -49,8 +49,8 @@ pub enum CompileError {
     },
 }
 
-/// Maximum nodes in one compiled graph (admission bound; prevents unbounded
-/// programs, §10.3).
+/// Maximum nodes in one compiled graph. This admission bound prevents
+/// unbounded programs.
 const MAX_NODES: usize = 1 << 20;
 
 struct Compiler {
@@ -60,7 +60,7 @@ struct Compiler {
     bindings: HashMap<String, NodeId>,
     /// Base id offset: the first node gets `base`, the next `base+1`, … This
     /// lets spliced `Step` subgraphs receive globally-unique CausalPositions
-    /// that continue past the parent graph (§13.4 splice-after-cursor).
+    /// that continue past the parent graph.
     base: u32,
 }
 
@@ -117,7 +117,7 @@ impl Compiler {
             }
 
             DoNode::Fail(f) => {
-                // Failure-dual of Pure (§13.3): a dedicated node carrying the
+                // Failure-dual of Pure: a dedicated node carrying the
                 // Failure losslessly; the Executor propagates it to the nearest
                 // enclosing Branch.
                 let id = self.push(NodeKind::Fail(f.clone()))?;
@@ -156,7 +156,7 @@ impl Compiler {
             DoNode::OrElse { d, or } => {
                 // Branch node is the entry; the guarded subgraph hangs off an
                 // Arm edge; the recover step is stored in the node. On failure
-                // of the guarded arm the Executor runs `recover` (§13.3).
+                // of the guarded arm the Executor runs `recover`.
                 let branch = self.push(NodeKind::Branch(BranchKind::OrElse {
                     recover: or.clone(),
                 }))?;
@@ -217,7 +217,7 @@ impl Compiler {
                     .copied()
                     .ok_or_else(|| CompileError::UnboundName(name.clone()))?;
                 // A Use is a pure pass-through node with a Use-edge back to the
-                // bound producer (DAG data dependency, §13.3).
+                // bound producer.
                 let id = self.push(NodeKind::Pure(Value::Null))?;
                 self.edge(target, id, EdgeKind::Use);
                 Ok(Span {
@@ -228,7 +228,7 @@ impl Compiler {
 
             DoNode::Acting { identity, body } => {
                 // The Acting node carries the identity Path directly in the IR
-                // (§13.2); the kernel interns it to an IdentityRef when binding
+                //; the kernel interns it to an IdentityRef when binding
                 // the child Operations. Body runs as the node's single arm, and
                 // the Acting node is also the span exit so the identity scope
                 // does not leak into the continuation (the walker restores the
@@ -246,7 +246,7 @@ impl Compiler {
 }
 
 /// Compile a [`DoNode`] program into one [`ExecutionGraph`] with stable node
-/// ids and a content hash (§13.3 / §10.4).
+/// ids and a content hash.
 pub fn compile_do(program: &DoNode) -> Result<ExecutionGraph, CompileError> {
     let mut c = Compiler::new();
     let span = c.lower(program)?;
@@ -260,9 +260,9 @@ pub fn compile_do(program: &DoNode) -> Result<ExecutionGraph, CompileError> {
     Ok(graph)
 }
 
-/// Compile a subgraph whose node ids start at `base` instead of 0. Used by the
-/// Executor to splice a `Step`'s produced subgraph into the live run with
-/// CausalPositions that continue past everything already numbered (§13.4), so
+/// Compile a subgraph whose node ids start at `base`. Used by the Executor to
+/// splice a `Step`'s produced subgraph into the live run with
+/// CausalPositions that continue past everything already numbered, so
 /// every Operation across the whole run keeps a unique, stable id. The returned
 /// graph's `graph_hash` is left zeroed (a spliced fragment is not independently
 /// content-addressed; the parent program's hash anchors recovery).

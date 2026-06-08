@@ -1,11 +1,10 @@
-//! Kernel management helpers used by the Console Protocol host (§18.4).
+//! Kernel management helpers used by the Console Protocol host.
 //!
 //! These functions are the read/write projection for manageable
-//! `state://kernel/*` configuration. They are ordinary capability-bound
-//! Operations with CAS admission, not a privileged storage backdoor. Broader
-//! protocol actions such as visibility, authority inspection, lineage, health,
-//! pairing, and stream dispatch live in `ws`/`protocol` and call into this
-//! module only for kernel management state.
+//! `state://kernel/*` configuration. They run through capability-scoped
+//! Operations with CAS admission. Broader protocol actions such as visibility,
+//! authority inspection, lineage, health, pairing, and stream dispatch live in
+//! `ws`/`protocol` and call into this module for kernel management state.
 
 use crate::auth::{self, ConsolePrincipal};
 use crate::state::ConsoleState;
@@ -45,8 +44,8 @@ pub enum MgmtError {
     Operation(String),
 }
 
-/// Only `state://kernel/*` is manageable from the console (Layer 1 config,
-/// §12). The vault and fact prefixes are never writable here (§21.6 / §9.4).
+/// Only `state://kernel/*` is manageable from the console. The vault and fact
+/// prefixes are never writable here.
 fn ensure_manageable(path: &Path) -> Result<(), MgmtError> {
     let s = path.to_string();
     if !s.starts_with("state://kernel/") {
@@ -58,7 +57,7 @@ fn ensure_manageable(path: &Path) -> Result<(), MgmtError> {
     Ok(())
 }
 
-/// Read a management config value (inspect, §18.4).
+/// Read a management config value.
 pub async fn inspect(
     state: &Arc<ConsoleState>,
     principal: &ConsolePrincipal,
@@ -104,10 +103,10 @@ pub async fn inspect_prefix(
         .collect()
 }
 
-/// Change config: a `Value.write` with `Cas` on the expected prior version
-/// (§16.3.5 / §18.4). `expected_version` of `None` means "create if absent"
-/// (install); `Some(v)` means "update only if current version == v"
-/// (reconfigure). The value's `version` field is bumped on write.
+/// Change config with a CAS state write on the expected prior version.
+/// `expected_version` of `None` means "create if absent" (install);
+/// `Some(v)` means "update only if current version == v" (reconfigure). The
+/// value's `version` field is bumped on write.
 pub async fn write_config(
     state: &Arc<ConsoleState>,
     principal: &ConsolePrincipal,
@@ -119,7 +118,7 @@ pub async fn write_config(
     ensure_manageable(&p)?;
     auth::authorize_path(&state.state, principal, "write", &p, Some(&value)).await?;
 
-    // Read current to verify the optimistic-concurrency version (§24.3).
+    // Read current to verify the optimistic-concurrency version.
     let current = match run_state_op(state, principal, p.clone(), "read", Value::Null).await? {
         Value::Null => None,
         v => Some(v),

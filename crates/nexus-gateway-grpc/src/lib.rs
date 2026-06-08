@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 
-//! `nexus-gateway-grpc` — gRPC protocol adapter (Gateway, §18.1).
+//! `nexus-gateway-grpc` — gRPC protocol adapter.
 //!
 //! A thin tonic service over the shared [`Gateway`]:
 //! `Submit` authenticates the bearer token, decodes the structured program, runs it,
-//! and returns the outcome. The five §18.1 steps live in `nexus-gateway`; this
+//! and returns the outcome. Request admission lives in `nexus-gateway`; this
 //! crate only speaks gRPC. Values are marshalled with the **structural**
 //! `nexus-proto` conversions.
 //!

@@ -1,7 +1,7 @@
-//! Time provider (§17): `effect://time/now`, `effect://time/sleep`,
+//! Time provider: `effect://time/now`, `effect://time/sleep`,
 //! `effect://time/cron`.
 //!
-//! `now` is an Observation (its value is recorded and reused on replay, §9.3);
+//! `now` is an Observation;
 //! `sleep` is an Idempotent delay; `cron` registers a recurring schedule by
 //! computing the next fire time from a cron spec. Wall clock here is real; the
 //! Sim executor swaps in a virtual clock for deterministic replay.
@@ -50,11 +50,11 @@ impl Driver for TimeDriver {
                 Ok(Outcome::Done(Value::Null))
             }
             // cron: compute the next fire time (millis since epoch) for the given
-            // spec (§17/§19). Returns `{next_millis}`; the Scheduler Driver
-            // (§19) consumes this to spawn the recurring Process. The spine
+            // spec. Returns `{next_millis}`; the Scheduler Driver
+            // consumes this to spawn the recurring Process. The spine
             // supports the common `every <n> <unit>` form and an explicit
-            // `interval_ms`; a full 5-field cron parser is a production
-            // refinement.
+            // `interval_ms`; a full 5-field cron parser belongs in a broader
+            // scheduler implementation.
             2 => {
                 let m = input.as_map().cloned().unwrap_or_default();
                 let now = now_millis();

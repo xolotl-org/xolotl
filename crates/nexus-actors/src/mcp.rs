@@ -1,11 +1,11 @@
-//! MCP bidirectional interoperability (§18.2).
+//! MCP bidirectional interoperability.
 //!
 //! * **Nexus as host**: an MCP server is a *sandboxed Provider* exposing
 //!   `effect://mcp-tool/<server>/<tool>`. The MCP tool schema maps to
 //!   `EffectCapability.input/output_schema`; purity defaults to Effectful;
 //!   streaming tools are registered with stream-capable output support.
 //!   Redaction / Audit / taint still apply because every tool call is an
-//!   ordinary Operation.
+//!   Operation.
 //! * **Nexus as server**: [`expose_as_mcp_tool`] turns a Nexus effect into an
 //!   MCP tool descriptor — and *requires* a bound capability set before
 //!   exposure, so an effect is never published wider than its capability.
@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Method names for one concrete `effect://mcp-tool/<server>/<tool>` Provider.
-/// MCP tools default to Effectful (§16.3.7 / §18.2) unless the server declares
+/// MCP tools default to Effectful unless the server declares
 /// otherwise.
 pub const MCP_TOOL_METHODS: &[MethodSpec] = &[MethodSpec::new(
     "invoke",
@@ -36,8 +36,8 @@ pub const MCP_STREAM_TOOL_METHODS: &[MethodSpec] = &[MethodSpec::new(
     MethodSpec::STREAM_ASYNC,
 )];
 
-/// The transport seam to a real MCP server. Production implements this over
-/// stdio / SSE; the spine uses [`EchoMcpClient`].
+/// Transport adapter for a real MCP server. Runtime integrations implement
+/// this over stdio or SSE; tests can use [`EchoMcpClient`].
 #[async_trait]
 pub trait McpClient: Send + Sync + 'static {
     /// Invoke `tool` with `args`, returning the tool's result value.
@@ -72,8 +72,8 @@ impl McpClient for EchoMcpClient {
     }
 }
 
-/// Drives one concrete `effect://mcp-tool/<server>/<tool>` Resource (Nexus as
-/// MCP host, §18.2). Sandboxed: it is registered under the
+/// Drives one concrete `effect://mcp-tool/<server>/<tool>` Resource when Nexus
+/// acts as an MCP host. Sandboxed tools are registered under the
 /// `effect://mcp-tool/<server>/` namespace and can only reach the bound MCP
 /// server.
 pub struct McpToolDriver {
@@ -126,7 +126,7 @@ impl Driver for McpToolDriver {
     }
 }
 
-/// An MCP tool descriptor exposed by Nexus (Nexus as MCP server, §18.2).
+/// An MCP tool descriptor exposed by Nexus.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpToolDescriptor {
     /// MCP tool name exposed to clients.
@@ -134,7 +134,7 @@ pub struct McpToolDescriptor {
     /// Nexus effect path backing the tool.
     pub effect_path: String,
     /// The capability set required to call this tool — the exposure is rejected
-    /// without it (§18.2 "暴露前必须绑定 capability set").
+    /// without it.
     pub required_capability: String,
     /// Optional MCP input schema.
     pub input_schema: Option<Value>,
@@ -142,7 +142,7 @@ pub struct McpToolDescriptor {
     pub output_schema: Option<Value>,
 }
 
-/// Expose a Nexus effect as an MCP tool (§18.2). Returns `Err` if no capability
+/// Expose a Nexus effect as an MCP tool. Returns `Err` if no capability
 /// is bound — an effect is never published wider than its capability.
 pub fn expose_as_mcp_tool(
     name: &str,
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn server_exposure_requires_capability() {
-        // §18.2: exposing without a capability is rejected.
+        // Exposing without a capability is rejected.
         assert!(expose_as_mcp_tool("t", "effect://x/y", "", None, None).is_err());
         let d = expose_as_mcp_tool(
             "search",

@@ -4,12 +4,17 @@
 //!
 //! A *Plan* is a YAML/JSON document describing a goal-directed pipeline of
 //! steps. The compiler turns a Plan into a [`DoNode`],
-//! which the kernel compiles to an `ExecutionGraph` and runs (§13).
+//! which the kernel compiles to an `ExecutionGraph` and runs.
 //!
-//! Every step maps to the Direction-C primitives. There is no `Op` enum any
-//! more: state and effect access are both `Operation`s on a Resource named by
-//! its `Path`, distinguished by the method (`read`/`write`/`append`/`subscribe`
-//! for `state://`, `invoke` for `effect://`).
+//! Every step maps to runtime primitives. State and effect access are both
+//! `Operation`s on a Resource named by its `Path`, distinguished by the method
+//! (`read`/`write`/`append` for state access, `invoke` for
+//! `effect://`).
+//!
+//! `Step::Subscribe` lowers to an Operation with method `subscribe` on the
+//! supplied state path. That represents the compiler shape, not a guarantee
+//! that every installed state driver exposes such a method. The standard event
+//! bus exposes subscriptions through `effect://events/subscribe`.
 //!
 //! | step kind   | DoNode mapping                                              |
 //! |-------------|-------------------------------------------------------------|
@@ -76,8 +81,8 @@ pub enum Step {
         #[serde(default = "default_as_name")]
         r#as: String,
     },
-    /// Subscribe to a Sequence Resource (`Sequence.subscribe`); the body step
-    /// handles each event.
+    /// Lower to a state-path `subscribe` operation; the installed resource must
+    /// expose that method for the program to run successfully.
     Subscribe {
         /// State sequence path to subscribe to.
         path: String,
@@ -141,7 +146,7 @@ pub enum Step {
         /// Literal result value.
         value: JsonValue,
     },
-    /// Run `body` under a different identity (`act-as`, §13.2).
+    /// Run `body` under a different identity.
     Acting {
         /// Identity path used for the block.
         identity: String,
@@ -172,7 +177,7 @@ pub enum Step {
 
 /// A process-local step reference (name + optional inline arg). The compiler
 /// binds it to the caller-supplied ProcessId so the serialized Do graph carries
-/// the §13.3 `StepRef { process, name }` invariant explicitly.
+/// the `StepRef { process, name }` invariant explicitly.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StepRefSpec {
     /// Process-local step name.
@@ -254,7 +259,7 @@ pub fn compile_for(process: ProcessId, plan: &Plan) -> Result<DoNode, PlanError>
     compile_steps(process, &plan.steps)
 }
 
-/// Static validation pass run before lowering (§20.4: "校验 … 引用环").
+/// Static validation pass run before lowering.
 ///
 /// Rejects: duplicate explicit `let` binding names, and reference cycles formed
 /// by steps that bind a name and reference another binding via `${name}`
@@ -275,7 +280,7 @@ fn validate_plan(plan: &Plan) -> Result<(), PlanError> {
         }
     }
 
-    // 2. Operation targets must match their step kind (§20.4 target validation).
+    // 2. Operation targets must match their step kind.
     //    This catches resource-path/capability confusion before lowering.
     for step in &all {
         validate_step_target(step, &path_registry)?;
@@ -295,9 +300,9 @@ fn validate_plan(plan: &Plan) -> Result<(), PlanError> {
         }
     }
 
-    // 4. Spawn capability ceilings must use §21.1 capability literals, not
+    // 4. Spawn capability ceilings must use  capability literals, not
     //    resource paths. The kernel spawn path will attenuate these again, but
-    //    Plan compilation is the first fail-closed boundary (§20.4).
+    //    Plan compilation is the first fail-closed boundary.
     for step in &all {
         if let Step::Spawn { capabilities, .. } = step {
             for capability in capabilities {
@@ -504,7 +509,7 @@ fn step_refs(step: &Step) -> Vec<String> {
 }
 
 /// Scan a JSON value for `${name}` placeholders, returning each referenced name
-/// (§20.4 ref syntax). The Plan model otherwise binds via `let`/`use`; this lets
+/// The Plan model otherwise binds via `let`/`use`; this lets
 /// inline args express data dependencies for ordering and parallelism.
 fn extract_refs(value: &JsonValue) -> Vec<String> {
     let mut out = Vec::new();
@@ -542,7 +547,7 @@ fn scan_placeholders(s: &str, out: &mut Vec<String>) {
 }
 
 /// Whether two adjacent value steps carry no data dependency in either
-/// direction, so they may run in parallel (§20.4: "无依赖→Both 并行").
+/// direction, so they may run in parallel.
 fn independent(a: &Step, b: &Step) -> bool {
     let (ba, bb) = (step_binds(a), step_binds(b));
     let (ra, rb) = (step_refs(a), step_refs(b));
@@ -552,7 +557,8 @@ fn independent(a: &Step, b: &Step) -> bool {
 
 /// Whether a step is a plain value step eligible for auto-parallel pairing.
 /// Control steps (`then`/`on_fail`) and compound steps (parallel/race/acting/
-/// spawn/bracket/subscribe) are never auto-paired — conservative by design.
+/// spawn/bracket/subscribe) are never auto-paired; this is intentionally
+/// conservative.
 fn is_mergeable(step: &Step) -> bool {
     matches!(
         step,
@@ -567,12 +573,12 @@ fn is_mergeable(step: &Step) -> bool {
 
 /// Compile a sequence of steps, threading `then`/`on_fail` as continuations and
 /// binding other steps in sequence via `Let`. Adjacent independent value steps
-/// are paired into `Both` for parallelism (§20.4).
+/// are paired into `Both` for parallelism.
 ///
-/// Limitation vs the full design: parallelism is **pairwise and greedy
+/// Current implementation limit: parallelism is **pairwise and greedy
 /// left-to-right**, not a full topological reorder of the whole step list. A run
 /// of three independent steps `[A, B, C]` becomes `Let(Both(A, B), C)`, not a
-/// 3-way fan-out. This is the conservative subset called for in the task.
+/// 3-way fan-out.
 fn compile_steps(process: ProcessId, steps: &[Step]) -> Result<DoNode, PlanError> {
     if steps.is_empty() {
         return Err(PlanError::Empty);
@@ -645,8 +651,8 @@ fn step_to_do(process: ProcessId, step: &Step) -> Result<DoNode, PlanError> {
         Step::Perform { target, input } => op(target, "invoke", input.as_ref().map(json_to_value))?,
         Step::Read { path, .. } => op(path, "read", None)?,
         Step::Subscribe { path, step } => {
-            // Subscribe is a Sequence.subscribe Operation; the handling step is
-            // carried as the literal input so the driver can wire delivery.
+            // The handling step is carried as literal input so a compatible
+            // subscribe driver can wire delivery.
             let mut m = BTreeMap::new();
             m.insert("step".into(), Value::Str(step.name.clone()));
             if let Some(a) = &step.arg {
@@ -1070,7 +1076,7 @@ steps:
 
     #[test]
     fn independent_steps_compile_to_both() {
-        // Two performs with no data dependency → Both (auto-parallelism, §20.4).
+        // Two performs with no data dependency → Both.
         let node = compile_test(&plan(vec![
             Step::Perform {
                 target: "effect://x/a".into(),

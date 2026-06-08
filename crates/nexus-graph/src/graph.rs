@@ -1,22 +1,22 @@
-//! The single execution IR (§13.2): `ExecutionGraph` / `Node` / `NodeKind`.
+//! The single execution IR: `ExecutionGraph` / `Node` / `NodeKind`.
 //!
-//! `NodeId == CausalPosition` (§6.1): assigned at compile time, stable while
+//! `NodeId == CausalPosition`: assigned at compile time, stable while
 //! the Program is unchanged, never derived from wall clock or randomness. It
 //! is the anchor for concurrency-safe recovery and idempotent dedup.
 
 use nexus_types::{Failure, MethodId, NodeId, OutputMode, Path, ProcessId, ResourceName, Value};
 use serde::{Deserialize, Serialize};
 
-/// A reference to a named step function on the owning Process (§13.3). Steps
+/// A reference to a named step function on the owning Process. Steps
 /// are **pure** `Value -> Do<A>` continuations; they are named, not closures,
 /// so the graph is serializable and cannot smuggle cross-identity code.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StepRef {
     /// Process that owns the named step. The executor rejects a `StepRef` whose
-    /// process differs from the currently running Process (§13.3).
+    /// process differs from the currently running Process.
     pub process: ProcessId,
     /// Step name on `process`'s step table. Cross-process work is only possible
-    /// via Operations on Resources (§13.3).
+    /// via Operations on Resources.
     pub name: String,
     /// Optional inline argument supplied at compile time, passed alongside the
     /// piped-in value (used by `for_each`-style helpers).
@@ -41,7 +41,7 @@ impl StepRef {
     }
 }
 
-/// Template for the single side-effecting node kind (§13.2). At compile time we
+/// Template for the single side-effecting node kind. At compile time we
 /// know the target Resource (by name → resolved to a Handle at open) and the
 /// method; the concrete input is bound from the upstream value when the
 /// Executor reaches the node.
@@ -56,7 +56,7 @@ pub struct OperationTemplate {
     /// interface; `None` until then.
     #[serde(default)]
     pub method_id: Option<MethodId>,
-    /// Requested output mode (§4.3).
+    /// Requested output mode.
     #[serde(default)]
     pub output: OutputMode,
     /// A literal input fixed at compile time. When `None`, the node's input is
@@ -77,18 +77,18 @@ pub enum BranchKind {
     },
 }
 
-/// What a [`NodeKind::Join`] does (§13.3).
+/// What a [`NodeKind::Join`] does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JoinKind {
-    /// Both branches must complete; result is the pair (async I/O overlap,
-    /// not CPU parallelism — §13.4).
+    /// Both branches must complete; result is the pair. Branches may overlap
+    /// async I/O, but this is not CPU parallelism.
     Both,
     /// First branch to complete wins; the other is cancelled.
     Race,
 }
 
-/// What a [`NodeKind::Wait`] waits for (§13.2).
+/// What a [`NodeKind::Wait`] waits for.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WaitSpec {
@@ -98,10 +98,9 @@ pub enum WaitSpec {
     Deadline(i64),
 }
 
-/// One node in the execution graph (§13.2). `Operation` is the only
-/// side-effecting kind. `Fail` is the failure-dual of `Pure` (§13.3): an
-/// immediate node that yields a failure outcome rather than a value — kept as
-/// its own kind so the `Failure` is carried losslessly.
+/// One node in the execution graph. `Operation` is the side-effecting kind.
+/// `Fail` is the failure-dual of `Pure`: an immediate node that yields a
+/// failure outcome and carries the `Failure` losslessly.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeKind {
@@ -119,7 +118,7 @@ pub enum NodeKind {
     Branch(BranchKind),
     /// Both (all complete) / Race (take first).
     Join(JoinKind),
-    /// Block-level identity switch (`act-as`, §13.2). Carries the identity
+    /// Block-level identity switch. Carries the identity
     /// `Path`; the kernel interns it to an `IdentityRef` when binding the
     /// node's child Operations (the hot `Operation` struct carries the ref).
     Acting(Path),
@@ -172,7 +171,7 @@ pub struct Edge {
     pub kind: EdgeKind,
 }
 
-/// The single execution IR (§13.2). All Program formats compile to this; the
+/// The single execution IR. All Program formats compile to this; the
 /// Executor only advances a cursor over it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionGraph {
@@ -183,7 +182,7 @@ pub struct ExecutionGraph {
     /// The entry node (where execution / recovery begins).
     pub root: NodeId,
     /// Content hash over the structure; the Process binds to this and recovery
-    /// re-binds the same product (§10.4).
+    /// re-binds the same product.
     pub graph_hash: [u8; 32],
 }
 
@@ -222,7 +221,7 @@ impl ExecutionGraph {
         self.nodes.is_empty()
     }
 
-    /// Whether node `id`'s output is consumed by any other node (§9.2): it has
+    /// Whether node `id`'s output is consumed by any other node: it has
     /// an outgoing `Then` (continuation), `Use` (data dependency), or feeds a
     /// `Join`/`Branch` arm result. An unconsumed pure-deterministic read need
     /// not record a Fact — recovery can safely recompute it. This is the

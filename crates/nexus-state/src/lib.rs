@@ -3,10 +3,11 @@
 //! `nexus-state` — backend trait and in-process implementation for the
 //! Nexus state plane (`state://`).
 //!
-//! The kernel never reads or writes storage directly — every state-plane
-//! `Operation` (`Value.read`, `Value.write`, `Sequence.append`,
-//! `Sequence.subscribe`, §12) is served by a `StateBackend`. This crate ships
-//! one always-available implementation, the in-memory backend.
+//! The data plane reaches storage through state-plane Operations served by a
+//! `StateBackend`. The standard state driver exposes read, write, append,
+//! delete, and list methods; event subscriptions and `Wait(Signal)` use the
+//! backend subscription API. This crate ships one always-available
+//! implementation, the in-memory backend.
 
 pub mod backend;
 pub mod memory;

@@ -1,12 +1,12 @@
-//! Extension projection (§16): how an external capability is declared and how
+//! Extension projection: how an external capability is declared and how
 //! it lands on kernel primitives.
 //!
-//! An extension is **not** a kernel object. It projects onto existing ones
-//! (§16.3): the external process becomes an Executor Resource (`proc://<id>`),
-//! each capability it provides becomes a remote `Binding`, and its
-//! configuration is plain state the console reads and writes. This module
-//! holds the *declarations* (`ExtensionInstallationDef`, `ManifestDef`) and
-//! the wire frames (`Invoke`, `ControlFrame`, …) — all wasm-safe data.
+//! An extension projects onto kernel primitives: the external process becomes
+//! an Executor Resource (`proc://<id>`), each capability it provides becomes a
+//! remote `Binding`, and its configuration is plain state the console reads and
+//! writes. This module holds the *declarations* (`ExtensionInstallationDef`,
+//! `ManifestDef`) and the wire frames (`Invoke`, `ControlFrame`, …) — all
+//! wasm-safe data.
 
 use crate::Timestamp;
 use crate::ids::MethodId;
@@ -20,10 +20,10 @@ use thiserror::Error;
 pub use crate::device::{EffectCapability, Transport, TrustLevel};
 
 /// A JSON Schema, modeled as a [`Value`] (object) to stay wasm-safe and avoid
-/// a schema-library dependency. Used as a config contract (§16.3.5).
+/// a schema-library dependency. Used as a config contract.
 pub type JsonSchema = Value;
 
-/// One capability projection inside an installed extension package (§16.3).
+/// One capability projection inside an installed extension package.
 ///
 /// A projection is deliberately single-role. A real connector may install
 /// several projections under one [`ExtensionInstallationDef`], but each
@@ -53,7 +53,7 @@ pub struct ExtensionProjectionDef {
     pub version: u64,
 }
 
-/// A real installed extension package/runtime (§16.3).
+/// A real installed extension package/runtime.
 ///
 /// This is the lifecycle, pairing, process, and shared-configuration unit. It
 /// may contain multiple independent projections (for example a chat connector
@@ -63,7 +63,7 @@ pub struct ExtensionProjectionDef {
 pub struct ExtensionInstallationDef {
     /// Installation id used in state paths, process ids, and sandbox prefixes.
     pub id: String,
-    /// Platform name, for example a connector family.
+    /// Connector family name.
     pub platform: String,
     /// Transport used to communicate with the extension runtime.
     pub transport: Transport,
@@ -81,7 +81,7 @@ pub struct ExtensionInstallationDef {
     pub version: u64,
 }
 
-/// What role an extension plays (§16.2). A Provider exposes effects (each →
+/// What role an extension plays. A Provider exposes effects (each →
 /// a remote Binding); a Source emits an inbound event stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -92,7 +92,7 @@ pub enum Role {
     Source,
 }
 
-/// Where a Source writes its inbound events (§16.2): a Sequence Resource that
+/// Where a Source writes its inbound events: a Sequence Resource that
 /// downstream Processes subscribe to.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EventSource {
@@ -251,7 +251,7 @@ impl ExtensionProjectionDef {
 impl ExtensionInstallationDef {
     /// Admission check for an installed runtime package and all of its
     /// projections. This is control-plane-only; the data-plane still sees
-    /// ordinary Source ingest and Provider Bindings after reconcile.
+    /// Source ingest and Provider Bindings after reconcile.
     pub fn validate_admission(&self) -> Result<(), ExtensionAdmissionError> {
         validate_installation_id(&self.id)?;
         validate_trust_transport(self.trust, &self.transport)?;
@@ -387,18 +387,17 @@ fn transport_name(t: &Transport) -> &'static str {
     }
 }
 
-/// A reusable install template for a platform (§16.3.5) — pure state. Lets
-/// "install N instances of the same platform" (e.g. several Telegram accounts)
-/// share one config contract.
+/// A reusable install template stored as pure state. Lets multiple installations,
+/// such as several Telegram accounts, share one config contract.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ManifestDef {
-    /// Platform name this template installs.
+    /// Connector name this template installs.
     pub platform: String,
     /// Source of an installation's shared config schema.
     pub config_schema: JsonSchema,
-    /// Projection templates this platform can install.
+    /// Projection templates this manifest can install.
     pub projections: Vec<ExtensionProjectionDef>,
-    /// Transports supported by this platform template.
+    /// Transports supported by this manifest.
     pub supported_transports: Vec<Transport>,
     /// Default transport selected when an installation does not override it.
     pub default_transport: Transport,
@@ -406,7 +405,7 @@ pub struct ManifestDef {
     pub version: u64,
 }
 
-// ── pairing payload (§16.3.4) ────────────────────────────────────────
+// ── pairing payload ────────────────────────────────────────
 
 /// Transport choices encoded in a pairing payload. This is narrower than the
 /// generic provider [`Transport`]: pairing only tells an unpaired extension
@@ -421,7 +420,7 @@ pub enum ExtensionTransport {
 }
 
 /// The daemon connection choices embedded in a pairing payload. Unpaired
-/// extensions must not invent defaults; they connect only to these contacts.
+/// extensions connect to these contacts.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DaemonContacts {
     /// Ordered daemon contact candidates.
@@ -534,9 +533,9 @@ fn validate_authority(authority: &str) -> Result<(), PairingPayloadError> {
     Ok(())
 }
 
-// ── proc:// Executor Resource (§16.3.1) ───────────────────────────────
+// ── proc:// Executor Resource ───────────────────────────────
 
-/// How a dead `proc://` process is restarted (§16.3.1), borrowing Erlang/OTP
+/// How a dead `proc://` process is restarted, borrowing Erlang/OTP
 /// supervision semantics.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -566,7 +565,7 @@ impl Default for RestartPolicy {
     }
 }
 
-/// Restart backoff strategy (§16.3.1).
+/// Restart backoff strategy.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Backoff {
@@ -586,7 +585,7 @@ pub enum Backoff {
     },
 }
 
-/// Spec for an external process projected as an Executor Resource (§16.3.1).
+/// Spec for an external process projected as an Executor Resource.
 /// Only `ProcDriver` (privileged) consumes this; it is the sole driver that
 /// can fork/exec.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -608,9 +607,9 @@ pub struct ProcSpec {
     pub restart: RestartPolicy,
 }
 
-// ── data + control frames (§16.3.3) ───────────────────────────────────
+// ── data + control frames ───────────────────────────────────
 
-/// Flow-control signal carried on a [`ControlFrame`] (§16.3.3).
+/// Flow-control signal carried on a [`ControlFrame`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowSignal {
@@ -621,7 +620,7 @@ pub enum FlowSignal {
 }
 
 /// Generation tags an extension echoes for comparison; the daemon holds the
-/// authority and chooses the real values (§16.3.3). Only the two lightweight
+/// authority and chooses the real values. Only the two lightweight
 /// presentation/alias axes ride on each inbound event — session-level
 /// generations live in [`SessionContext`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -634,7 +633,7 @@ pub struct ObservedGenerations {
     pub alias_catalog_generation: u64,
 }
 
-/// Stage 1 of the session handshake (§16.3.3): the extension opens by
+/// Stage 1 of the session handshake: the extension opens by
 /// reporting identity + locally cached generations/hash (pure echo, no
 /// authority). Self-describing extensions report their config contract here.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -655,7 +654,7 @@ pub struct RoleSessionClientHello {
     pub config_schema: Option<JsonSchema>,
 }
 
-/// Stage 2 of the handshake (§16.3.3): the daemon adjudicates every
+/// Stage 2 of the handshake: the daemon adjudicates every
 /// authoritative registry hash/generation and sends them down. The extension
 /// never declares or guesses these.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -682,7 +681,7 @@ pub struct SessionContext {
     pub alias_catalog_generation: u64,
 }
 
-/// Stage 3 of the handshake (§16.3.3): the extension confirms it has aligned to
+/// Stage 3 of the handshake: the extension confirms it has aligned to
 /// the daemon-chosen [`SessionContext`]. Any generation/hash mismatch is
 /// fail-closed; no business frames flow before this.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -691,7 +690,7 @@ pub struct RoleReady {
     pub accepted_context: SessionContext,
 }
 
-/// Which configuration axis a [`ControlFrame::ConfigAck`] answers (§16.3.3).
+/// Which configuration axis a [`ControlFrame::ConfigAck`] answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigAxis {
@@ -701,7 +700,7 @@ pub enum ConfigAxis {
     PresentationConfig,
 }
 
-/// Why an extension rejected a config/presentation update (§16.3.3).
+/// Why an extension rejected a config/presentation update.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectReason {
@@ -715,7 +714,7 @@ pub enum RejectReason {
     Unsupported,
 }
 
-/// Result of applying a config/presentation update (§16.3.3).
+/// Result of applying a config/presentation update.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyStatus {
@@ -728,7 +727,7 @@ pub enum ApplyStatus {
     },
 }
 
-/// Control frames shared by both roles (§16.3.3). Configuration travels on two
+/// Control frames shared by both roles. Configuration travels on two
 /// independent axes that never mix — `ExtensionConfigUpdate` (authority: what
 /// the extension may do) and `PresentationConfigUpdate` (presentation only:
 /// never grants capability) — plus a profile-report axis flowing the other way.
@@ -748,7 +747,7 @@ pub enum ControlFrame {
     FlowControl(FlowSignal),
     /// Report axis: extension → daemon, declares what this end can render and
     /// which entry points are locally disabled. The profile body is opaque
-    /// here; the platform docs (Web/Mobile) define its schema.
+    /// here; connector docs such as Web/Mobile define its schema.
     PresentationProfileUpdate {
         /// Profile generation reported by the extension.
         profile_generation: u64,
@@ -757,7 +756,7 @@ pub enum ControlFrame {
         /// Opaque profile body.
         profile: Value,
     },
-    /// Authority axis: daemon → extension, via §18.4 Value.write+Cas; advances
+    /// Authority axis from daemon to extension via a CAS state write. Advances
     /// `ExtensionInstallationDef.version` and may bump the Binding generation.
     ExtensionConfigUpdate {
         /// New extension config version.
@@ -787,11 +786,11 @@ pub enum ControlFrame {
     },
 }
 
-/// Provider data frame: one remote Operation (§16.3.3 / §7.4 RPC stub).
+/// Provider data frame: one remote Operation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Invoke {
     /// Stable across reconnect/replay: derived from the business idempotency
-    /// key when present, else from CausalPosition (§16.3.3 / §6.1).
+    /// key when present, else from CausalPosition.
     pub invocation_id: String,
     /// Effect resource path invoked by the remote operation.
     pub effect_path: Path,
@@ -826,7 +825,7 @@ pub struct InvokeResult {
     pub outcome: Result<Value, ErrorInfo>,
 }
 
-/// Source data frame: one inbound event (§16.3.3). Carries only the two
+/// Source data frame: one inbound event. Carries only the two
 /// lightweight presentation/alias generation tags — session-level generations
 /// are settled in the handshake [`SessionContext`], not on each event.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -854,7 +853,7 @@ pub struct OutboundCommand {
     pub observed: ObservedGenerations,
 }
 
-/// Acknowledgement status for an inbound event (§16.3.3).
+/// Acknowledgement status for an inbound event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AckStatus {
@@ -875,9 +874,9 @@ pub struct EventAck {
     pub status: AckStatus,
 }
 
-// ── inbound stream capacity vs rate (§16.4) ───────────────────────────
+// ── inbound stream capacity vs rate ───────────────────────────
 
-/// What to do when an inbound stream overflows its capacity (§16.4). Distinct
+/// What to do when an inbound stream overflows its capacity. Distinct
 /// from rate limiting, which is a policy concern.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -895,7 +894,7 @@ pub enum OverflowPolicy {
     DisconnectBridge,
 }
 
-/// Capacity of an inbound event stream (§16.4).
+/// Capacity of an inbound event stream.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StreamCapacity {
     /// Maximum buffered events.

@@ -1,6 +1,6 @@
 //! Control-plane descriptors: `Resource`, `Interface`, `Method`, `Binding`.
 //!
-//! These are **wasm-safe data** (§24.1): they describe what a Resource is, what
+//! These are **wasm-safe data**: they describe what a Resource is, what
 //! methods it exposes, and which Driver it binds to — but they hold no live
 //! dispatch table. The runtime `Handle` / `DriverPlan` (which carry
 //! `Arc<dyn Driver>`) live in `nexus-kernel`. The console and wire protocols
@@ -11,8 +11,7 @@ use crate::path::Path;
 use crate::replay::{Purity, ReplayClass};
 use serde::{Deserialize, Serialize};
 
-/// Implements serde for a `bitflags` type via its raw integer bits (the
-/// bitflags `serde` feature is not enabled; bits are encoded directly).
+/// Implements serde for a `bitflags` type via its raw integer bits.
 macro_rules! bitflags_serde_bits {
     ($name:ident, $int:ty) => {
         impl serde::Serialize for $name {
@@ -29,7 +28,7 @@ macro_rules! bitflags_serde_bits {
 }
 
 bitflags::bitflags! {
-    /// Output modes a method supports / a caller requests (§4.3). A method
+    /// Output modes a method supports / a caller requests. A method
     /// declares its supported set; an [`Operation`](crate::operation::Operation)
     /// requests exactly one mode, which must be in that set.
     #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -46,7 +45,7 @@ bitflags::bitflags! {
 }
 bitflags_serde_bits!(OutputModeSet, u8);
 
-/// The single output mode a caller requests on one operation (§4.3).
+/// The single output mode a caller requests on one operation.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputMode {
@@ -57,7 +56,7 @@ pub enum OutputMode {
     Stream,
     /// Caller-side adapter that aggregates the method's supported underlying
     /// output (`Unary` or `Stream`) into a bounded list of at most `limit`
-    /// elements (§4.3).
+    /// elements.
     Collect {
         /// Maximum number of produced values buffered into the collected list.
         limit: usize,
@@ -70,13 +69,13 @@ pub enum OutputMode {
 
 impl OutputMode {
     /// The single-bit set this mode belongs to (for the "is supported" check).
-    /// `Collect` has no bit of its own — it is a caller-side adapter (§4.3), so
+    /// `Collect` has no bit of its own — it is a caller-side adapter, so
     /// it maps to no set here and is handled specially by `is_supported_by`.
     pub fn as_set(self) -> OutputModeSet {
         match self {
             OutputMode::Unary => OutputModeSet::UNARY,
             OutputMode::Stream => OutputModeSet::STREAM,
-            // Collect aggregates an underlying Unary/Stream production; it has
+            // Collect aggregates an underlying Unary/Stream result; it has
             // no dedicated support bit (see `is_supported_by`).
             OutputMode::Collect { .. } => OutputModeSet::empty(),
             OutputMode::AsyncProcess => OutputModeSet::ASYNC_PROCESS,
@@ -84,7 +83,7 @@ impl OutputMode {
         }
     }
 
-    /// Whether `supported` permits this requested mode (§4.3). `Collect` is a
+    /// Whether `supported` permits this requested mode. `Collect` is a
     /// caller-side aggregation adapter: it is satisfiable by any method that
     /// supports `Unary` or `Stream` (the adapter buffers up to `limit`).
     pub fn is_supported_by(self, supported: OutputModeSet) -> bool {
@@ -98,7 +97,7 @@ impl OutputMode {
 }
 
 bitflags::bitflags! {
-    /// Modalities a method accepts / produces (§4.4). Drives routing (pick a
+    /// Modalities a method accepts / produces. Drives routing (pick a
     /// model that supports the modality), budgeting (bill per modality), and
     /// redaction (scan per modality) without inspecting content.
     #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -121,7 +120,7 @@ bitflags::bitflags! {
 }
 bitflags_serde_bits!(ModalitySet, u16);
 
-/// The seven interface families every Resource's interface belongs to (§4.2).
+/// The seven interface families every Resource's interface belongs to.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterfaceFamily {
@@ -133,7 +132,7 @@ pub enum InterfaceFamily {
     Callable,
     /// spawn/kill/status: process or task execution.
     Executor,
-    /// list/open_child: child enumeration (also capability discovery, §4.5).
+    /// list/open_child: child enumeration.
     Directory,
     /// write: write-only, no response body required.
     Sink,
@@ -141,7 +140,7 @@ pub enum InterfaceFamily {
     Observable,
 }
 
-/// Cost model for a method, used by routing / budgeting (§21). Kept simple and
+/// Cost model for a method, used by routing / budgeting. Kept simple and
 /// wasm-safe — the kernel feeds these into the budget check (CompiledCheck).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CostModel {
@@ -154,7 +153,7 @@ pub struct CostModel {
 }
 
 impl CostModel {
-    /// Estimate the micro-USD cost of one call (§21.2 `estimate_cost`), given
+    /// Estimate the micro-USD cost of one call, given
     /// input and (projected) output token counts. Used for budget reservation
     /// *before* the effect, so it is deliberately a conservative upper bound:
     /// callers pass a high output estimate. Settlement later corrects to actual.
@@ -171,7 +170,7 @@ impl CostModel {
     }
 }
 
-/// One method of an interface (§4.2). Describes how the method executes,
+/// One method of an interface. Describes how the method executes,
 /// outputs, replays, and bills.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Method {
@@ -194,7 +193,7 @@ pub struct Method {
     pub supports: OutputModeSet,
     /// Cost model used for budget reservation.
     pub cost: CostModel,
-    /// Whether this method is batchable (§17.5): a call may take `List<elem>`
+    /// Whether this method is batchable: a call may take `List<elem>`
     /// and produce `List<result>`, applying per-element cost/redaction but
     /// recording a single summarizing Fact. `embed`/`rerank`/`index.upsert`
     /// declare this true. Defaults to false (one call, one Fact).
@@ -202,7 +201,7 @@ pub struct Method {
     pub batchable: bool,
 }
 
-/// An algebraic law an [`Interface`] declares (§4.2), used by validation,
+/// An algebraic law an [`Interface`] declares, used by validation,
 /// optimization, and the simulator to reason about method behavior without
 /// executing it. Laws are advisory metadata: the kernel does not synthesize
 /// behavior from them, but tooling (Sim, the planner, equivalence checks) may.
@@ -235,7 +234,7 @@ pub enum InterfaceLaw {
     },
 }
 
-/// A method family a Resource exposes (§4.2).
+/// A method family a Resource exposes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Interface {
     /// Stable interface id.
@@ -244,7 +243,7 @@ pub struct Interface {
     pub family: InterfaceFamily,
     /// Methods exposed by this interface.
     pub methods: Vec<Method>,
-    /// Algebraic laws (§4.2) for validation / optimization / Sim. Empty by
+    /// Algebraic laws for validation / optimization / Sim. Empty by
     /// default; advisory metadata, never load-bearing for execution.
     #[serde(default)]
     pub laws: Vec<InterfaceLaw>,
@@ -274,8 +273,10 @@ impl InterfaceSet {
     pub fn new(interfaces: Vec<InterfaceId>) -> Self {
         Self { interfaces }
     }
-    /// Does this set cover every interface in `required`? (Admission check:
-    /// a Binding's interfaces must cover the Resource's, §7.2.)
+    /// Does this set cover every interface in `required`?
+    ///
+    /// Admission requires a Binding's interfaces to cover the Resource's
+    /// interfaces.
     pub fn covers(&self, required: &InterfaceSet) -> bool {
         required
             .interfaces
@@ -284,7 +285,7 @@ impl InterfaceSet {
     }
 }
 
-/// Control-plane name of a Resource (§10.2). `Path` form, e.g.
+/// Control-plane name of a Resource. `Path` form, e.g.
 /// `effect://inference/infer`. Never appears in an Operation or on the hot
 /// path — resolved to a [`ResourceId`] in the control plane.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -312,7 +313,7 @@ pub enum ResourceKind {
     Effect,
     /// Durable state / memory / log: `state://…`.
     State,
-    /// An external process projected as an Executor Resource: `proc://…` (§16.3.1).
+    /// An external process projected as an Executor Resource: `proc://…`.
     Process,
     /// A device or sensor.
     Device,
@@ -335,7 +336,7 @@ pub struct Metadata {
     pub tags: Vec<String>,
 }
 
-/// Descriptor for a Resource (§4.1): control-plane addressing + kind +
+/// Descriptor for a Resource: control-plane addressing + kind +
 /// metadata. The live binding is referenced by [`Resource::binding`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResourceDescriptor {
@@ -349,7 +350,7 @@ pub struct ResourceDescriptor {
 }
 
 /// A passive object that can be operated on, authorized, audited, and bound to
-/// a driver (§4.1). The data plane only ever sees its [`ResourceId`] (inside a
+/// a driver. The data plane only ever sees its [`ResourceId`] (inside a
 /// Handle or Fact); the descriptor itself is never touched on the hot path.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Resource {
@@ -373,9 +374,9 @@ pub struct DriverRef {
     pub name: String,
 }
 
-/// Binds a Resource (by selector) to a Driver, with a link generation (§7.1).
+/// Binds a Resource (by selector) to a Driver, with a link generation.
 /// Hot replace = bump `generation` and atomically swap the dispatch entry
-/// (§14.3); the descriptor here records the binding the control plane resolved.
+///; the descriptor here records the binding the control plane resolved.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Binding {
     /// Stable binding id assigned by the registry.
@@ -386,8 +387,8 @@ pub struct Binding {
     pub interfaces: InterfaceSet,
     /// Driver selected by the binding.
     pub driver: DriverRef,
-    /// `None` = local inline driver; `Some` = remote endpoint (§7.4).
+    /// `None` = local inline driver; `Some` = remote endpoint.
     pub endpoint: Option<EndpointId>,
-    /// Link epoch; incremented on hot replace (§14.3).
+    /// Link epoch; incremented on hot replace.
     pub generation: u64,
 }

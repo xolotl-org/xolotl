@@ -1,8 +1,8 @@
 //! Console Protocol DTOs and static registry descriptors.
 //!
 //! `nexus-console` is the control-plane protocol host. Web UI and third-party
-//! panels consume this registry, then issue descriptor-named actions; they do
-//! not bind to Rust enum variants or backend internals.
+//! panels consume this registry, then issue descriptor-named actions. The
+//! descriptor registry is the public protocol surface.
 
 use nexus_types::Value;
 use serde::{Deserialize, Serialize};
@@ -419,7 +419,7 @@ pub struct RootDataAuthority {
     pub visibility_step_up_is_gate_not_permission_denial: bool,
     /// Whether root bypasses Operation/Fact/policy flow.
     pub bypasses_operation_fact_policy: bool,
-    /// Whether vault secret custody is separate from ordinary data visibility.
+    /// Whether vault secret custody is separate from non-secret data visibility.
     pub vault_secret_custody_is_separate: bool,
 }
 
@@ -613,7 +613,7 @@ pub fn protocol_metadata_value(server_rev: u64, registry_rev: u64) -> Value {
     to_value(protocol_metadata(server_rev, registry_rev))
 }
 
-/// Build the coverage report view described by the console protocol design.
+/// Build the coverage report view described by the console protocol contract.
 pub fn coverage_report_value(server_rev: u64, registry_rev: u64) -> Value {
     let actions = action_descriptors();
     let streams = stream_descriptors();

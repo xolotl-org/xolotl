@@ -4,7 +4,7 @@
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SubmitRequest {
-    /// Bearer token mapped to a request identity by the gateway (§18.1 step 1-2).
+    /// Bearer token mapped to a request identity by the gateway.
     #[prost(string, tag = "1")]
     pub auth_token: ::prost::alloc::string::String,
     /// Structured `Do<A>` program, compiled and run by the kernel.
@@ -199,7 +199,7 @@ pub mod gateway_service_server {
             request: tonic::Request<super::HealthRequest>,
         ) -> std::result::Result<tonic::Response<super::HealthResponse>, tonic::Status>;
     }
-    /// Gateway service (§18.1): the primary entry point for external gRPC clients.
+    /// Gateway service: the primary entry point for external gRPC clients.
     #[derive(Debug)]
     pub struct GatewayServiceServer<T> {
         inner: Arc<T>,
@@ -392,7 +392,7 @@ pub mod gateway_service_client {
     )]
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
-    /// Gateway service (§18.1) client.
+    /// Gateway service client.
     #[derive(Debug, Clone)]
     pub struct GatewayServiceClient<T> {
         inner: tonic::client::Grpc<T>,

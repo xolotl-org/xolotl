@@ -1,8 +1,8 @@
-//! Process table, spawn, and finalize (§3, §14.2).
+//! Process table, spawn, and finalize.
 //!
 //! A [`ProcessEntry`] tracks a live Process's status, parent, grants, budget,
 //! and finalizers. Spawn attenuates capabilities (a child's grant cannot
-//! exceed its parent's, §3); finalize cancels children, runs finalizers in
+//! exceed its parent's); finalize cancels children, runs finalizers in
 //! reverse, revokes handles, and writes a `ProcessFinalized` fact.
 
 use nexus_types::{BudgetSpec, BudgetState, GrantId, IdentityRef, ProcessId, ProcessStatus};
@@ -25,10 +25,10 @@ pub struct ProcessEntry {
     pub grants: Vec<GrantId>,
     /// Current budget counters.
     pub budget: BudgetState,
-    /// Per-dimension spending limits (§21.2). Default is unbounded on every
+    /// Per-dimension spending limits. Default is unbounded on every
     /// dimension (a process with no declared budget is unconstrained).
     pub budget_spec: BudgetSpec,
-    /// Finalizer programs, run in reverse order on finalize (§14.2). Stored as
+    /// Finalizer programs, run in reverse order on finalize. Stored as
     /// serialized `Do<A>` so they survive recovery; the kernel re-runs them.
     pub on_finalize: Vec<nexus_graph::DoNode>,
 }
@@ -49,7 +49,7 @@ impl ProcessEntry {
     }
 }
 
-/// The process tree (§3): a registry of live processes plus parent/child links,
+/// The process tree: a registry of live processes plus parent/child links,
 /// carrying cancellation propagation and capability attenuation.
 #[derive(Clone, Default)]
 pub struct ProcessTable {
@@ -102,7 +102,7 @@ impl ProcessTable {
         self.inner.read().procs.get(&id).map(|p| p.identity)
     }
 
-    /// All live process ids (recovery sweep, §14.1 phase 6).
+    /// All live process ids.
     pub fn all_ids(&self) -> Vec<ProcessId> {
         self.inner.read().procs.keys().copied().collect()
     }
@@ -124,7 +124,7 @@ impl ProcessTable {
         }
     }
 
-    /// Take the finalizers for a process in reverse order (§14.2 step 3).
+    /// Take the finalizers for a process in reverse order.
     pub fn take_finalizers(&self, id: ProcessId) -> Vec<nexus_graph::DoNode> {
         let mut inner = self.inner.write();
         match inner.procs.get_mut(&id) {
@@ -137,8 +137,8 @@ impl ProcessTable {
         }
     }
 
-    /// Recursively collect a process and all descendants (cancel propagation,
-    /// §14.2 step 2), deepest first.
+    /// Recursively collect a process and all descendants for cancel propagation,
+    /// deepest first.
     pub fn subtree_post_order(&self, root: ProcessId) -> Vec<ProcessId> {
         let mut out = Vec::new();
         self.collect_post_order(root, &mut out);
@@ -168,7 +168,7 @@ impl ProcessTable {
         }
     }
 
-    /// Reserve one operation's estimated cost against `id`'s budget (§21.2),
+    /// Reserve one operation's estimated cost against `id`'s budget,
     /// pre-debiting under the lock so concurrent ops can't race past the limit.
     /// Returns `Err(dim)` naming the exhausted dimension. A process with no
     /// entry (standalone/test) is treated as unbounded → `Ok(())`.
@@ -188,7 +188,7 @@ impl ProcessTable {
         }
     }
 
-    /// Settle a previously-reserved operation against its actual cost (§21.2).
+    /// Settle a previously-reserved operation against its actual cost.
     pub fn settle(
         &self,
         id: ProcessId,

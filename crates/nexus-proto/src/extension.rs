@@ -82,7 +82,7 @@ pub struct RoleReady {
     #[prost(message, optional, tag = "1")]
     pub accepted_context: ::core::option::Option<SessionContext>,
 }
-/// Bridge → Daemon: platform event occurred.
+/// Bridge → Daemon: source event occurred.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InboundEvent {
     #[prost(string, tag = "1")]
@@ -91,11 +91,11 @@ pub struct InboundEvent {
     pub payload: ::core::option::Option<super::Value>,
     #[prost(int64, tag = "3")]
     pub timestamp_ms: i64,
-    /// Lightweight presentation/alias generation tags (§16.3.3).
+    /// Lightweight presentation/alias generation tags.
     #[prost(message, optional, tag = "4")]
     pub observed: ::core::option::Option<ObservedGenerations>,
 }
-/// Daemon → Bridge: execute this action on the platform.
+/// Daemon → Bridge: execute this action through the connector.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OutboundCommand {
     #[prost(string, tag = "1")]
@@ -105,7 +105,7 @@ pub struct OutboundCommand {
     #[prost(message, optional, tag = "3")]
     pub observed: ::core::option::Option<ObservedGenerations>,
 }
-/// The two lightweight generation axes carried on each Source frame (§16.3.3).
+/// The two lightweight generation axes carried on each Source frame.
 /// Session-level generations live in SessionContext instead.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ObservedGenerations {
@@ -216,7 +216,7 @@ pub mod control_frame {
         ConfigAck(super::ConfigAck),
     }
 }
-/// Extension → daemon: report what this end can render (§16.3.3).
+/// Extension → daemon: report what this end can render.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PresentationProfileUpdate {
     #[prost(uint64, tag = "1")]
@@ -226,7 +226,7 @@ pub struct PresentationProfileUpdate {
     #[prost(message, optional, tag = "3")]
     pub profile: ::core::option::Option<super::Value>,
 }
-/// Daemon → extension: authority config update (§16.3.3), via §18.4 CAS.
+/// Daemon → extension: authority config update, via  CAS.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExtensionConfigUpdate {
     #[prost(uint64, tag = "1")]
@@ -234,7 +234,7 @@ pub struct ExtensionConfigUpdate {
     #[prost(message, optional, tag = "2")]
     pub config: ::core::option::Option<super::Value>,
 }
-/// Daemon → extension: presentation-only config (§16.3.3), never grants capability.
+/// Daemon → extension: presentation-only config, never grants capability.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PresentationConfigUpdate {
     #[prost(uint64, tag = "1")]
@@ -244,7 +244,7 @@ pub struct PresentationConfigUpdate {
     #[prost(message, optional, tag = "3")]
     pub config: ::core::option::Option<super::Value>,
 }
-/// Extension → daemon: how a config/presentation update was applied (§16.3.3).
+/// Extension → daemon: how a config/presentation update was applied.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ConfigAck {
     #[prost(enumeration = "ConfigAxis", tag = "1")]
@@ -284,7 +284,7 @@ pub struct ErrorInfo {
     pub details:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
-/// Role = which primitive the extension projects (orthogonal to transport/trust).
+/// Role projected by an extension, orthogonal to transport and trust.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ExtensionRole {
@@ -362,7 +362,7 @@ impl FlowSignal {
         }
     }
 }
-/// Which config axis a [`ConfigAck`] answers (§16.3.3).
+/// Which config axis a [`ConfigAck`] answers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ConfigAxis {
@@ -370,7 +370,7 @@ pub enum ConfigAxis {
     ExtensionConfig = 1,
     PresentationConfig = 2,
 }
-/// Result of applying a config/presentation update (§16.3.3).
+/// Result of applying a config/presentation update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum ApplyStatus {
@@ -378,7 +378,7 @@ pub enum ApplyStatus {
     Applied = 1,
     Rejected = 2,
 }
-/// Why an extension rejected an update (§16.3.3).
+/// Why an extension rejected an update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum RejectReason {

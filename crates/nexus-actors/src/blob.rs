@@ -1,10 +1,10 @@
-//! Blob store (§17.4): `effect://blob/write`, `effect://blob/read`,
+//! Blob store: `effect://blob/write`, `effect://blob/read`,
 //! `effect://blob/delete`.
 //!
 //! Large bytes are content-addressed (blake3) and held in the state backend
 //! under `state://blob/<hash>`; the Operation returns only a [`BlobRef`] /
-//! tensor reference so Facts never inline payloads (§4.4). GC is retention +
-//! refcount (§17.4): each `write` increments a per-hash reference count and
+//! tensor reference so Facts never inline payloads. GC is retention +
+//! refcount: each `write` increments a per-hash reference count and
 //! `delete` decrements it; the bytes are physically deleted only when the count
 //! reaches zero. Refcounts are stored in the state backend at
 //! `state://blob-refcount/<hash>` so they survive Driver restarts and are shared
@@ -104,7 +104,7 @@ impl Driver for BlobDriver {
     ) -> Result<Outcome, DriverError> {
         match method.get() {
             // write: input carries the bytes (Bytes or Str); returns a BlobRef.
-            // Each write takes one reference (§17.4 refcount).
+            // Each write takes one reference.
             0 => {
                 let bytes: Vec<u8> = match &input {
                     Value::Bytes(b) => b.clone(),
@@ -128,7 +128,7 @@ impl Driver for BlobDriver {
                     .map_err(|e| DriverError::Other(e.to_string()))?;
                 Ok(Outcome::Done(v.unwrap_or(Value::Null)))
             }
-            // delete: drop one reference (§17.4). The bytes are physically
+            // delete: drop one reference. The bytes are physically
             // removed only when the refcount reaches zero.
             2 => {
                 if let Some(hash) = blob_hash(&input)

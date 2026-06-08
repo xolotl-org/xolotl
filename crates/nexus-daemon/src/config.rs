@@ -15,8 +15,10 @@ use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
 
-/// Bootstrap-only config: `[storage]` + `[server]`.
-/// Runtime config (backends, models, routing) lives in state.
+/// Bootstrap-only config loaded by `nexusd`: storage, listeners, console root
+/// bootstrap material, and bounded console auth/WebSocket resource limits.
+/// Runtime config such as providers, models, groups, routing, bindings, and
+/// policies lives in Nexus state.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct NexusConfig {
     #[serde(default)]

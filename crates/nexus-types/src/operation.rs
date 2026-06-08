@@ -1,11 +1,11 @@
-//! `Operation`, `OperationId`, and `Fact` — the data-plane records (§6, §9).
+//! `Operation`, `OperationId`, and `Fact` — the data-plane records.
 //!
 //! An [`Operation`] is the *only* way a side effect happens. Its identity,
 //! [`OperationId`], is causally derived — `(ProcessId, CausalPosition,
-//! attempt)` — with **no central counter** (§6.1). A [`Fact`] is the immutable,
-//! write-ahead record of one operation attempt and is the system's single
-//! source of truth (§9). Both are fixed-size hot records: they carry *refs*,
-//! never inlined large payloads (§4.4 / §9).
+//! attempt)` — with **no central counter**. A [`Fact`] is the immutable,
+//! write-ahead record of one operation attempt. Recovery, audit, billing, and
+//! trace projections are built from Facts. Both records stay fixed-size on the
+//! hot path: they carry *refs*, never inlined large payloads.
 
 use crate::ids::{
     CausalPosition, HandleId, IdentityRef, MethodId, ProcessId, ResourceId, Timestamp,
@@ -15,14 +15,14 @@ use crate::value::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Causally-derived, globally-unique operation identity (§6.1). Equal id ⇒
+/// Causally-derived, globally-unique operation identity. Equal id ⇒
 /// same causal position + same attempt ⇒ exact dedup point in the Fact stream.
 /// Never depends on wall clock; needs no central counter.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct OperationId {
     /// Process that owns this causal position.
     pub process: ProcessId,
-    /// Stable position in the compiled graph = `NodeId` (§13.2).
+    /// Stable position in the compiled graph = `NodeId`.
     pub position: CausalPosition,
     /// Incremented only on explicit retry; crash-replay reuses the same value.
     pub attempt: u32,
@@ -60,7 +60,7 @@ impl std::fmt::Display for OperationId {
 }
 
 /// Reference to an operation's input/output value. On the hot path large
-/// payloads are passed by ref so the Fact stays fixed-size (§4.4 / §9). For
+/// payloads are passed by ref so the Fact stays fixed-size. For
 /// small inline values the ref *is* the value.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -127,18 +127,18 @@ impl ValueRef {
     }
 }
 
-/// A single actual call — the one path through which side effects occur (§6).
+/// A single actual call — the one path through which side effects occur.
 /// Carries the input `Value` for dispatch; the data plane projects it to a
-/// fixed-size [`ValueRef`] when recording the Fact (§4.4 / §9). Large modality
+/// fixed-size [`ValueRef`] when recording the Fact. Large modality
 /// values (`Blob`/`Tensor`/`Frame`) are *already* out-of-line refs, so passing
 /// them by value here is cheap — the bytes never travel inline.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Operation {
     /// Causally derived operation id.
     pub id: OperationId,
-    /// The calling Process (`caller`, §2.5).
+    /// The calling Process.
     pub process: ProcessId,
-    /// The identity this call runs as (`acting`, §2.5).
+    /// The identity this call runs as.
     pub acting: IdentityRef,
     /// Handle authorizing this call.
     pub handle: HandleId,
@@ -146,7 +146,7 @@ pub struct Operation {
     pub method: MethodId,
     /// The input passed to the driver. Recorded in the Fact as `ValueRef::of`.
     pub input: Value,
-    /// Provenance of the input value (§21.5). Propagates input→output: the
+    /// Provenance of the input value. Propagates input→output: the
     /// outcome inherits this taint, and outbound/memory policies read it.
     #[serde(default)]
     pub taint: crate::taint::TaintSet,
@@ -154,8 +154,8 @@ pub struct Operation {
     pub output: crate::resource::OutputMode,
 }
 
-/// Why an operation ended the way it did — a fixed-size enum tag, not a full
-/// snapshot (§9). The detailed outcome is materialized on the projection side.
+/// Why an operation ended the way it did. This is a fixed-size enum tag; the
+/// detailed outcome is materialized on the projection side.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionTag {
@@ -182,7 +182,7 @@ impl DecisionTag {
     }
 }
 
-/// Reference to a materialized outcome summary (§9). The hot path writes only
+/// Reference to a materialized outcome summary. The hot path writes only
 /// this ref; audit/billing/trace projections materialize the detail lazily
 /// from `input_ref` / `outcome_ref`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -253,9 +253,9 @@ impl OutcomeRef {
     }
 }
 
-/// Compact shape/cost metadata for one explicit batchable Operation (§17.5).
-/// It is an audit summary, not the replay body: recovery still uses
-/// `outcome_ref`, so summarizing a batch never discards the completed result.
+/// Compact shape/cost metadata for one explicit batchable Operation.
+/// Recovery still uses `outcome_ref`, so summarizing a batch preserves the
+/// completed result.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BatchSummary {
     /// Number of elements in the batch input list.
@@ -375,10 +375,10 @@ fn kind_map(name: &str) -> BTreeMap<String, Value> {
 }
 
 /// Immutable record of one operation attempt; the system's write-ahead source
-/// of truth (§9). Fixed-size hot record: refs + lightweight tags only.
+/// of truth. Fixed-size hot record: refs + lightweight tags only.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Fact {
-    /// `OperationId` — globally unique, no central counter (§9 / §6.1).
+    /// `OperationId` — globally unique, no central counter.
     pub id: OperationId,
     /// Fact schema version used for migration and replay compatibility.
     pub schema_version: u32,
@@ -392,9 +392,9 @@ pub struct Fact {
     pub resource: ResourceId,
     /// Method id invoked on the resource interface.
     pub method: MethodId,
-    /// Reference only; large objects are blob/tensor refs (§4.4).
+    /// Reference only; large objects are blob/tensor refs.
     pub input_ref: ValueRef,
-    /// Provenance of the input (§21.5), recorded for audit / why-not. Defaults
+    /// Provenance of the input, recorded for audit / why-not. Defaults
     /// to pristine for Facts written before taint tracking existed.
     #[serde(default)]
     pub taint: crate::taint::TaintSet,
@@ -402,7 +402,7 @@ pub struct Fact {
     pub decision: DecisionTag,
     /// Reference; the summary is materialized on the projection side.
     pub outcome_ref: OutcomeRef,
-    /// Optional §17.5 batch summary. It describes a `List` input to a batchable
+    /// Optional  batch summary. It describes a `List` input to a batchable
     /// method while `input_ref`/`outcome_ref` remain the replay material.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch: Option<BatchSummary>,
@@ -413,13 +413,13 @@ pub struct Fact {
 }
 
 impl Fact {
-    /// Current Fact schema version (§9.1 / §26). Bumping this requires a
+    /// Current Fact schema version. Bumping this requires a
     /// migration so historical Facts stay replayable.
     pub const SCHEMA_VERSION: u32 = 1;
 
     /// Whether this Fact records a completed attempt (has an outcome). A
     /// pending Fact (begun, not completed) is handled per ReplayClass on
-    /// recovery (§15.1).
+    /// recovery.
     pub fn is_complete(&self) -> bool {
         !matches!(self.outcome_ref, OutcomeRef::None) || !self.decision.is_ok()
     }

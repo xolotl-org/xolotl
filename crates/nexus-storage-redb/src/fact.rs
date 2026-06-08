@@ -1,7 +1,6 @@
-//! redb-backed [`FactStore`] (§9 / §24.1): the durable write-ahead source of
-//! truth. Facts are stored by a monotonic append cursor; a secondary index
-//! maps each fact's [`OperationId`] to its cursor slot so `complete` can update
-//! the pending record in place.
+//! redb-backed [`FactStore`]. Facts are stored by a monotonic append cursor; a
+//! secondary index maps each fact's [`OperationId`] to its cursor slot so
+//! `complete` can update the pending record in place.
 
 use crate::{
     FACT_INDEX_TABLE, FACT_META_TABLE, FACT_PROCESS_INDEX_TABLE, FACTS_TABLE, map_db_error,
@@ -20,8 +19,8 @@ fn fact_err(e: impl ToString) -> FactError {
     FactError(e.to_string())
 }
 
-/// Durable fact store. `cursor` is the monotonic append position (snapshot
-/// cut-point, §9) — not a fact field.
+/// Durable fact store. `cursor` is the monotonic append position used as a
+/// snapshot cut-point, not a fact field.
 pub struct RedbFactStore {
     db: Arc<Database>,
     cursor: Mutex<u64>,
@@ -176,7 +175,7 @@ impl FactStore for RedbFactStore {
     fn sync(&self) -> Result<(), FactError> {
         // redb commits are durable on commit; an explicit barrier is a no-op
         // beyond what each `append`/`complete` txn already guarantees. The
-        // ReplayClass discipline (§9.3) is enforced by the FactSink wrapper.
+        // ReplayClass discipline is enforced by the FactSink wrapper.
         Ok(())
     }
 

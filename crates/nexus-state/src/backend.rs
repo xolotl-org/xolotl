@@ -1,7 +1,7 @@
-//! `StateBackend` trait — the only abstraction the kernel imposes on storage.
+//! `StateBackend` trait — the storage abstraction used by the kernel.
 //!
-//! The kernel never deals in SQL or files. It hands `Path + Value` to a
-//! backend. Backends decide how to persist, version, and notify.
+//! The kernel hands `Path + Value` to a backend. Backends decide how to
+//! persist, version, and notify.
 
 use async_trait::async_trait;
 use nexus_types::{MergeRule, Path, TaintSet, Value};
@@ -86,7 +86,7 @@ impl StateEvent {
     }
 }
 
-/// A stored value together with its provenance (§4.4/§12). State persists the
+/// A stored value together with its provenance. State persists the
 /// taint alongside the value; cleansing taint must be an explicit rewrite, never
 /// a silent drop. Backends store this envelope, not a bare `Value`.
 #[derive(Clone, Debug, PartialEq)]
@@ -127,14 +127,13 @@ pub struct StateHistoryEntry {
 
 /// Storage abstraction for the Nexus state plane.
 ///
-/// The kernel reaches `state://` resources through this trait instead of
-/// binding itself to SQL, redb, files, or in-memory maps. Implementations are
-/// responsible for storing values with taint, preserving mutation order where
-/// they advertise history support, and notifying subscriptions only after a
-/// write is visible.
+/// The kernel reaches `state://` resources through this trait. Implementations
+/// are responsible for storing values with taint, preserving mutation order
+/// where they advertise history support, and notifying subscriptions only after
+/// a write is visible.
 #[async_trait]
 pub trait StateBackend: Send + Sync + 'static {
-    // ── taint-aware primitives (§4.4/§12) ──────────────────────────────
+    // ── taint-aware primitives ──────────────────────────────
     // Backends implement these; the bare convenience methods below default to
     // them with pristine taint (author-trusted kernel-internal writes).
 
@@ -212,8 +211,8 @@ pub trait StateBackend: Send + Sync + 'static {
     }
     /// Merge `value` into whatever currently lives at `path`, by `rule`.
     /// Default implementation is read-modify-write atop `read` + `write_set`,
-    /// which is correct for backends that don't expose a richer atomic
-    /// primitive.
+    /// which is correct for backends that don't expose an atomic merge
+    /// operation.
     async fn write_merge(&self, path: &Path, value: Value, rule: MergeRule) -> StateResult<()> {
         let current = self.read(path).await?;
         let merged = merge_values(current, value, rule);
@@ -238,7 +237,7 @@ pub trait StateBackend: Send + Sync + 'static {
 /// Shared trait-object handle for a state backend.
 pub type DynBackend = Arc<dyn StateBackend>;
 
-/// Default `Merge` semantics shared by every backend (§2.3).
+/// Default `Merge` semantics shared by every backend.
 pub fn merge_values(current: Option<Value>, incoming: Value, rule: MergeRule) -> Value {
     match (current, incoming, rule) {
         (None, incoming, _) => incoming,

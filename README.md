@@ -1,28 +1,78 @@
 # Nexus
 
-Nexus is an AI identity runtime: a microkernel for capability-bound effects,
-durable program execution, and audited external integrations.
+Nexus is a capability runtime for model-backed applications. It maps model
+inference, tool calls, memory, state, and outside systems into `effect://` and
+`state://` resources so programs access them through handles compiled by
+`open()`. Model backends, tool processes, and state stores remain behind
+resource bindings and drivers.
 
-The kernel has one active entity, `Process`. A process holds compiled
-capability handles, issues operations against resources, runs them through
-drivers under policy, and records the result as facts. Files, terminal actions,
-models, memory, remote devices, long-lived state, and external tools are all
-projected through the same `Resource / Interface / Driver` model.
+Nexus supplies the execution boundary between model calls, tool execution,
+long-lived state, and external protocols. Model training, application UI, and
+business logic stay outside this runtime. Infer, embed, rerank, and plan are
+effect resources; MCP, file, terminal, and fetch-style tools are effect
+resources; extensions connect as providers or sources; program front ends lower
+to execution graphs. Every access goes through the same `Resource / Interface /
+Driver`, `open()` handle, and capability-check path.
 
 Chinese documentation: [README.zh-CN.md](README.zh-CN.md)
 
+## Implemented Surface
+
+- Model execution: `effect://inference/*` supports infer, embed, rerank, and
+  plan; the router selects backends by capability, modality, group policy,
+  retry, and fallback.
+- Tool access: MCP tools, files, terminal commands, fetch, time, events, locks,
+  blobs, tensors, approvals, and compression are registered as effect
+  resources.
+- Memory and context: the memory driver combines the state backend, vector
+  index, and ranker; context assembly and compression are separate effects.
+- Extensions: installed extensions project remote effects as providers or
+  inbound event streams as sources.
+- Capability boundary: `open()` compiles resource paths, grants, policies, and
+  bindings into process-owned handles; spawned processes receive attenuated
+  rights.
+- Program front ends: Rust `DoNode`, Plan documents, and structured protobuf
+  `Program` submissions lower to one execution graph and one executor.
+
 ## Status
 
-This repository is an early Rust workspace for the Nexus runtime and gateways.
-The implementation tracks the current design:
+This repository is an early Rust workspace for the Nexus capability runtime and
+gateways. The implementation currently enforces these public compatibility
+rules:
 
-- resource paths do not support `@param` suffixes such as
+- resource path grammar rejects `@param` suffixes such as
   `effect://memory/recall@scope=user`;
 - gRPC `GatewayService.Submit` accepts a structured protobuf `Program`;
 - capability literals use the verb form, such as
-  `perform://effect/inference/infer`, rather than resource paths.
+  `perform://effect/inference/infer`; resource paths keep the `effect://...`
+  shape.
 
 ## Documentation
+
+Public manuals:
+
+Install mdBook when needed:
+
+```sh
+cargo install mdbook
+```
+
+- English: read [docs/src/README.md](docs/src/README.md), or build with:
+
+```sh
+mdbook build docs
+```
+
+- Chinese: read [docs/zh-CN/src/README.md](docs/zh-CN/src/README.md), or build
+  with:
+
+```sh
+mdbook build docs/zh-CN
+```
+
+For a local browser preview, run `mdbook serve docs` or
+`mdbook serve docs/zh-CN`. The Chinese book declares `language = "zh-CN"` and
+loads `docs/zh-CN/theme/cjk.css` for CJK fonts and line height.
 
 Generate and check Rust API documentation:
 
@@ -47,7 +97,7 @@ Process
   producing Outcome and Fact
 ```
 
-The design separates the runtime into four planes:
+Nexus separates the runtime into four planes:
 
 - Control plane: registry, naming, admission, policy compilation, binding
   resolution, and `open()` handle compilation.
@@ -56,7 +106,7 @@ The design separates the runtime into four planes:
 - Extension plane: external providers, sources, drivers, and protocol adapters.
 - Program plane: durable `Do<A>` programs and the execution graph.
 
-The control plane handles parsing and compilation. The data plane only executes
+The control plane handles parsing and compilation. The data plane executes
 compiled objects.
 
 ## Workspace
@@ -120,8 +170,8 @@ Start the daemon:
 cargo run -p nexus-daemon -- up
 ```
 
-`nexusd` is a launcher only. Runtime management is handled by the console
-gateway, not by daemon subcommands.
+`nexusd` launches the host process. Runtime management goes through the console
+gateway.
 
 Default addresses from `nexus.toml.example`:
 
@@ -134,9 +184,8 @@ are configured, `nexusd` prints a one-time root password to stderr.
 
 ## Configuration
 
-`nexus.toml` is bootstrap-only configuration. It controls storage, gateway
-listen addresses, root bootstrap credentials, and bounded console resource
-limits:
+`nexus.toml` is bootstrap configuration. It controls storage, gateway listen
+addresses, root bootstrap credentials, and bounded console resource limits:
 
 - `[storage]`: `redb` persistent storage or in-memory storage.
 - `[server]`: console, gRPC, and WebSocket bind addresses.
@@ -148,17 +197,22 @@ limits:
 
 Runtime configuration, provider setup, model routing, groups, bindings, and
 policy-managed state belong in Nexus state and are managed through the console
-gateway. The console auth/WS settings are deployment capacity knobs only; they
-do not disable capability checks, step-up gates, Origin/Host validation,
-path-specific admission, action registry validation, or secret redaction.
+gateway. The console auth/WS settings are deployment capacity knobs. Capability
+checks, step-up gates, Origin/Host validation, path-specific admission, action
+registry validation, and secret redaction remain enforced by runtime paths.
 
 ## External Interfaces
 
+Detailed connection docs are in the manual: [Gateways](docs/src/gateways.md),
+[Program Gateways](docs/src/program-gateways.md), and
+[Console Protocol](docs/src/console-protocol.md).
+
 ### Console
 
-`nexus-console` is the management-domain gateway for Web Console. It is not a
-privileged side channel: management actions still become capability-bound
-Operations with admission, authorization, CAS, and audit.
+`nexus-console` is the management-domain gateway for Web Console. Management
+actions use the same authorization, state, CAS, and audit surfaces as the rest
+of the runtime. When a management action invokes a runtime effect, that effect
+is a standard capability-scoped Operation.
 
 The current interface shape is:
 
@@ -170,15 +224,16 @@ The current interface shape is:
   `ExtensionInstallation*` lifecycle actions, pairing actions, logout, and
   console user/role/session management.
 
-Post-login management features belong on Console WebSocket, not HTTP.
+Post-login management runs on Console WebSocket. HTTP remains the health and
+authentication entry point.
 
 ### Extension Protocol
 
 Extensions are described as one `ExtensionInstallationDef` plus one or more
 single-role `ExtensionProjectionDef`s. The installation is the lifecycle,
-transport, pairing, credential, and shared-config unit. Each projection is
-either a Provider, which exposes `effect://...` capabilities through remote
-Bindings, or a Source, which emits inbound events into a declared state stream.
+transport, pairing, credential, and shared-config unit. Projection roles are
+Provider, which exposes `effect://...` capabilities through remote Bindings,
+and Source, which emits inbound events into a declared state stream.
 
 Control state uses these prefixes:
 
@@ -194,8 +249,8 @@ Out-of-process extensions connect with the extension gRPC/WebSocket protocol:
 `RoleSessionClientHello { installation_id, projection_id, ... }`,
 daemon-selected `SessionContext`, `RoleReady`, AEAD-protected business/control
 frames, and Provider `Invoke` / Source `InboundEvent` frames. Pairing inputs use
-`installation_id`; secrets stay on the one-shot display edge and do not enter
-Operation input, state, Facts, or traces.
+`installation_id`; secrets stay on the one-shot display edge. Operation input,
+state, Facts, and traces receive only redacted metadata or references.
 
 ### gRPC And Proto
 
@@ -225,7 +280,7 @@ taint, policy, fact, and handle path as other program gateways.
 
 `nexus-gateway-mcp` exposes selected Nexus effects as MCP tools only when each
 tool is bound to an explicit required capability. MCP calls are translated into
-ordinary gateway submissions.
+standard gateway submissions.
 
 ## Path And Capability Rules
 
@@ -251,8 +306,8 @@ read://state/memory/alice/thread
 write://state/kernel/config
 ```
 
-Path parameters are rejected. Use structured values, explicit resource
-segments, or policy/config state instead of `@param` suffixes.
+Path parameters are rejected. Put options in structured values, explicit
+resource segments, or policy/config state.
 
 ## Development Notes
 
@@ -261,8 +316,8 @@ segments, or policy/config state instead of `@param` suffixes.
 - Keep the data plane limited to compiled IDs, handles, driver plans, policy
   snapshots, operations, outcomes, and facts.
 - External protocol crates should remain thin adapters over `nexus-gateway` or
-  kernel extension primitives.
-- Breaking design changes should update proto, vendored bindings, conversions,
+  the kernel extension registration/runtime surfaces.
+- Breaking runtime or protocol changes should update proto, vendored bindings, conversions,
   tests, and docs in the same change.
 
 ## License

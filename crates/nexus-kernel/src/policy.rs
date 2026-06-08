@@ -1,27 +1,27 @@
-//! `Policy` → `PolicySnapshot` (§8): source policy compiles, partially
+//! `Policy` → `PolicySnapshot`: source policy compiles, partially
 //! evaluates, and leaves only *residual* [`CompiledCheck`]s for the hot path.
 //!
 //! Anything decidable at `open()` (does this identity may-read this path?) is
 //! evaluated and **eliminated** there. Only input-dependent checks (budget,
 //! redaction, input predicates, command match, rate limit) remain. If the
-//! residual is empty, the Handle is marked `Unconditional` (§5.5) and the data
+//! residual is empty, the Handle is marked `Unconditional` and the data
 //! plane skips policy entirely.
 //!
 //! A [`PolicySource`] is the slow-path object an operator registers; it
 //! compiles against an [`OpenContext`] into a residual snapshot. The kernel's
-//! [`Registry`](crate::registry::Registry) holds the registered sources (the
-//! sixth control-plane registry, §10.1) and `open()` runs every source whose
-//! selector matches the resource, merging their residuals.
+//! [`Registry`](crate::registry::Registry) holds the registered sources, and
+//! `open()` runs every source whose selector matches the resource, merging
+//! their residuals.
 
 use nexus_types::{Capability, ConstraintSet, IdentityRef, Path, ResourceId, Rights, Value};
 use std::sync::Arc;
 
-/// The verdict of a policy / one check (§8).
+/// The verdict of a policy / one check.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PolicyDecision {
     /// Residual checks allowed the operation to proceed.
     Allow,
-    /// Requires human confirmation (§17 Approval). Carries the approval key.
+    /// Requires human confirmation. Carries the approval key.
     Ask {
         /// Stable key used by the approval broker to correlate a decision.
         approval_key: String,
@@ -42,7 +42,7 @@ impl PolicyDecision {
     }
 }
 
-/// What `open()` knows when compiling a policy (§8.1): everything fixed at open
+/// What `open()` knows when compiling a policy: everything fixed at open
 /// time, so decidable checks can be evaluated and eliminated now.
 pub struct OpenContext<'a> {
     /// Resource being opened.
@@ -67,7 +67,7 @@ pub enum PolicyCompileError {
     DeniedAtOpen(String),
 }
 
-/// A registered source policy (§8). It is arbitrarily complex but **never on
+/// A registered source policy. It is arbitrarily complex but **never on
 /// the hot path**: it compiles once at `open()` into a residual snapshot,
 /// partially evaluating away everything the [`OpenContext`] already decides.
 pub trait PolicySource: Send + Sync + 'static {
@@ -89,11 +89,11 @@ pub struct CheckCtx<'a> {
     pub acting: nexus_types::IdentityRef,
     /// Wall clock timestamp used for time-dependent residual checks.
     pub now_millis: i64,
-    /// The resource the operation targets (rate-limit / audit keying, §21.3).
+    /// The resource the operation targets.
     pub target: ResourceId,
 }
 
-/// One residual check (§8.1). Every policy type — capability predicates,
+/// One residual check. Every policy type — capability predicates,
 /// budget settlement, redaction, rate limit, approval, command match —
 /// is an instance of this. Sequentially evaluated only for `Conditional`
 /// handles; `Unconditional` handles carry none.
@@ -105,7 +105,7 @@ pub trait CompiledCheck: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 }
 
-/// A compiled, frozen policy attached to a `Conditional` handle (§8). It is the
+/// A compiled, frozen policy attached to a `Conditional` handle. It is the
 /// payload of `FastPath::Conditional`; an `Unconditional` handle has no
 /// `PolicySnapshot` at all, so "zero policy cost" is a structural fact.
 #[derive(Clone)]
@@ -128,8 +128,8 @@ impl PolicySnapshot {
         }
     }
 
-    /// Whether the residual is empty (⇒ the handle may be marked
-    /// `Unconditional`, §5.5).
+    /// Whether the residual is empty, allowing the handle to be marked
+    /// `Unconditional`.
     pub fn is_empty(&self) -> bool {
         self.checks.is_empty()
     }
@@ -139,15 +139,15 @@ impl PolicySnapshot {
         self.checks.len()
     }
 
-    /// Concatenate two residual snapshots (used by `open()` to merge the
-    /// residuals of every matching source policy, §8).
+    /// Concatenate two residual snapshots, as `open()` does when merging the
+    /// residuals of every matching source policy.
     pub fn merge(self, other: PolicySnapshot) -> PolicySnapshot {
         let mut checks: Vec<Arc<dyn CompiledCheck>> = (*self.checks).clone();
         checks.extend(other.checks.iter().cloned());
         PolicySnapshot::new(checks)
     }
 
-    /// Run residual checks in order; the first non-Allow short-circuits (§8).
+    /// Run residual checks in order; the first non-Allow short-circuits.
     pub async fn check(&self, ctx: &CheckCtx<'_>) -> PolicyDecision {
         for c in self.checks.iter() {
             let d = c.evaluate(ctx).await;
@@ -185,7 +185,7 @@ impl CompiledCheck for ConstraintCheck {
     }
 }
 
-/// A residual approval gate (§8 / §17.4): the operation is held until a human
+/// A residual approval gate: the operation is held until a human
 /// approves the `approval_key` out-of-band. It consults a shared
 /// [`ApprovalRegistry`] so that once the broker records a decision, re-running
 /// the operation resolves: `approved` ⇒ Allow, `denied` ⇒ Deny, otherwise Ask
@@ -209,7 +209,7 @@ impl ApprovalCheck {
         }
     }
 
-    /// A gate backed by a resolution registry (resume path, §17.4).
+    /// A gate backed by a resolution registry.
     pub fn with_registry(
         approval_key: impl Into<String>,
         reason: impl Into<String>,
@@ -247,7 +247,7 @@ impl CompiledCheck for ApprovalCheck {
     }
 }
 
-/// A human-approval decision (§17.4).
+/// A human-approval decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApprovalDecision {
     /// No human decision has been recorded.
@@ -258,7 +258,7 @@ pub enum ApprovalDecision {
     Denied,
 }
 
-/// Shared resolution source for [`ApprovalCheck`] (§17.4). The Approval Broker
+/// Shared resolution source for [`ApprovalCheck`]. The Approval Broker
 /// writes decisions here when a human approves/denies; the residual check reads
 /// them on the next execution so a suspended operation can resume. The Approval
 /// Broker persists records at `state://kernel/approvals/*`; this registry is the
@@ -285,15 +285,15 @@ impl ApprovalRegistry {
     }
 }
 
-/// A residual rate-limit check (§21.3): allow at most `max_per_window`
+/// A residual rate-limit check: allow at most `max_per_window`
 /// operations per `window_millis`, as a true **sliding window** keyed by
 /// `(target, acting)`. The window holds the timestamps of recent admissions;
 /// on each call, entries older than `window_millis` are evicted, then the
 /// request is admitted iff fewer than `max_per_window` remain.
 ///
-/// Keying by `acting` means a delegated identity gets its own budget (Bob
-/// acting as Alice is limited per-(target, Alice), §21.3). The window is stored
-/// in `state://kernel/ratelimit/resource:<target>/identity:<acting>`, so a
+/// Keying by `acting` means a delegated identity gets its own budget; Bob
+/// acting as Alice is limited per `(target, Alice)`. The window is stored in
+/// `state://kernel/ratelimit/resource:<target>/identity:<acting>`, so a
 /// crash/restart preserves the active sliding window.
 pub struct RateLimitCheck {
     /// Maximum allowed admissions inside one sliding window.
@@ -430,7 +430,7 @@ fn encode_rate_hits(hits: &[i64]) -> Value {
 }
 
 /// A policy source that attaches a residual [`ConstraintCheck`] for a capability
-/// pattern when the open's path matches (§8 / §21.1). The static parts (verb /
+/// pattern when the open's path matches. The static parts (verb /
 /// scheme / segments) are decided at open and eliminated; only the predicate
 /// (if any) survives as a residual input check.
 pub struct CapabilityPolicy {
@@ -448,7 +448,7 @@ impl PolicySource for CapabilityPolicy {
 
     fn compile(&self, _ctx: &OpenContext) -> Result<PolicySnapshot, PolicyCompileError> {
         // Static match already decided at `applies_to`; only the input-dependent
-        // predicate constraints survive as residual (§8.1).
+        // predicate constraints survive as residual.
         if self.constraints.is_empty() {
             Ok(PolicySnapshot::empty())
         } else {
@@ -517,8 +517,8 @@ mod tests {
 
     #[tokio::test]
     async fn approval_resolves_to_allow_once_approved() {
-        // §17.4 resume: a gate backed by a registry asks until the broker records
-        // a decision; approved ⇒ Allow, denied ⇒ Deny.
+        // A gate backed by a registry asks until the broker records a decision:
+        // approved means Allow, denied means Deny.
         let reg = ApprovalRegistry::new();
         let snap = PolicySnapshot::new(vec![Arc::new(ApprovalCheck::with_registry(
             "pay-1",
@@ -564,7 +564,7 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limit_is_keyed_by_target_and_acting() {
-        // Different targets and acting identities each get their own window (§21.3).
+        // Different targets and acting identities each get their own window.
         let snap = PolicySnapshot::new(vec![Arc::new(RateLimitCheck::new(1, 1000, state()))]);
         let alice = CheckCtx {
             input: &Value::Null,

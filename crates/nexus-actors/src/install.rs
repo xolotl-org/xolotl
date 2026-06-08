@@ -1,10 +1,9 @@
-//! Assembly: install the standard Drivers into a [`Bootstrap`] (§17, §24.2).
+//! Assembly: install the standard Drivers into a [`Bootstrap`].
 //!
-//! Every provider goes through the kernel's ordinary `register_effect` face —
-//! there is no special loading path for built-ins (§24.2). Standard callable
-//! effects are registered one Resource per public effect path, each exposing a
-//! single `invoke` method, so `perform://effect/foo/bar` grants exactly that
-//! effect path rather than every sibling method on a bundled interface.
+//! Every provider goes through the kernel's standard `register_effect` face.
+//! Standard callable effects are registered one Resource per public effect
+//! path, each exposing a single `invoke` method, so `perform://effect/foo/bar`
+//! grants exactly that effect path.
 
 use crate::{
     approval::{APPROVAL_METHODS, ApprovalDriver},
@@ -37,17 +36,18 @@ pub struct StandardConfig {
     pub terminal_allowlist: Vec<String>,
     /// Enable the network fetch provider.
     pub enable_fetch: bool,
-    /// MCP tools to mount as sandboxed Providers (§18.2). Each entry registers
+    /// MCP tools to mount as sandboxed Providers. Each entry registers
     /// one concrete `effect://mcp-tool/<server>/<tool>` Resource. Empty means no
-    /// MCP tools. The offline spine backs entries with deterministic echo
-    /// clients; production can call `register_mcp_tool` with a stdio/SSE client.
+    /// MCP tools. The offline baseline backs entries with deterministic echo
+    /// clients; runtime integrations can call `register_mcp_tool` with a
+    /// stdio/SSE client.
     pub mcp_tools: Vec<McpToolMount>,
     /// One-shot display edge for extension pairing secrets. The secret does not
     /// enter Operation input/outcome, state, or Facts.
     pub pairing_display: PairingDisplayEdge,
 }
 
-/// One MCP host-side tool mount (§18.2).
+/// One MCP host-side tool mount.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpToolMount {
     /// MCP server namespace segment.
@@ -97,14 +97,14 @@ impl McpToolMount {
     }
 }
 
-/// Install the core in-process providers (§17) on `boot`, sharing its kernel's
+/// Install the core in-process providers on `boot`, sharing its kernel's
 /// state backend.
 pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(), InstallError> {
     let state = boot.kernel.state.clone();
 
-    // Inference carries a modeled cost so the §21.2 budget reserve/settle has a
-    // real estimate (the baseline EchoBackend is free at runtime, but the
-    // CostModel shape is what production backends populate).
+    // Inference carries a modeled cost so the budget reserve/settle path has a
+    // real estimate (the baseline EchoBackend is free at runtime, but other
+    // backends populate the same CostModel shape).
     let inference: Arc<dyn Driver> = Arc::new(InferenceDriver::baseline());
     for path in [
         "effect://inference/infer",
@@ -124,8 +124,8 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
             },
         )?;
     }
-    // §17.2 retrieval stack: Vector Index (ANN) + pluggable Ranker. Memory uses
-    // these exact instances, and they are also exposed as ordinary effect
+    // The retrieval stack uses a vector index plus a pluggable ranker. Memory
+    // uses these exact instances, and they are also exposed as effect
     // Resources below.
     let index = Arc::new(IndexDriver::new());
     let rank = Arc::new(RankerDriver::new().with_state(state.clone()));
@@ -179,7 +179,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
         DELIBERATION_METHODS,
         Arc::new(DeliberationDriver::new(Arc::new(EchoBackend))),
     )?;
-    // §9.4 read-side: capability-gated, read-only state://fact/* projection.
+    // Fact reads use a capability-gated, read-only state://fact/* projection.
     boot.register_subtree_resource_at(
         "state://fact",
         "read://state/fact/**",
@@ -196,7 +196,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
             boot.kernel.facts.clone(),
         )),
     )?;
-    // §17.2 retrieval stack: Vector Index (ANN) + pluggable Ranker.
+    // Expose the vector index as effect Resources.
     let index_driver: Arc<dyn Driver> = index.clone();
     for path in [
         "effect://index/upsert",
@@ -209,7 +209,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
     for path in ["effect://rank/score", "effect://rank/fuse"] {
         register_single_effect(boot, path, RANK_METHODS, rank_driver.clone())?;
     }
-    // §17/§19.1 Token Compressor: model-backed summarize + structural plan trim.
+    // / Token Compressor: model-backed summarize + structural plan trim.
     let compress: Arc<dyn Driver> =
         Arc::new(crate::compress::CompressDriver::new(Arc::new(EchoBackend)));
     for path in ["effect://compress/summarize", "effect://compress/trim-plan"] {
@@ -220,7 +220,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
             compress.clone(),
         )?;
     }
-    // §17.4 Tensor store: content-addressed tensor persistence.
+    // Register the content-addressed tensor store.
     let tensor: Arc<dyn Driver> = Arc::new(crate::tensor::TensorDriver::new(state.clone()));
     for path in [
         "effect://tensor/write",
@@ -229,7 +229,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
     ] {
         register_single_effect(boot, path, crate::tensor::TENSOR_METHODS, tensor.clone())?;
     }
-    // §16.3.1 extension runtime: privileged process-lifecycle Driver.
+    // Register the extension process-lifecycle driver.
     let proc: Arc<dyn Driver> = Arc::new(crate::proc::ProcDriver::new(state.clone()));
     for path in [
         "effect://proc/spawn",
@@ -240,7 +240,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
     ] {
         register_single_effect(boot, path, crate::proc::PROC_METHODS, proc.clone())?;
     }
-    // §16.3.4 extension pairing management: ordinary capability-bound effects.
+    // Register extension pairing management as capability-scoped effects.
     let pairing: Arc<dyn Driver> = Arc::new(PairingDriver::with_display_edge(
         state.clone(),
         config.pairing_display.clone(),
@@ -254,7 +254,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
     ] {
         register_single_effect(boot, path, PAIRING_METHODS, pairing.clone())?;
     }
-    // §20.5 Context Assembly: layered prompt assembly under a token budget.
+    // Register layered context assembly under a token budget.
     register_single_effect(
         boot,
         "effect://context/assemble",
@@ -262,9 +262,9 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
         Arc::new(crate::context::ContextDriver::new()),
     )?;
 
-    // §12 state-as-Operation: expose `state://**` as one Resource so a Process
-    // reads/writes durable state through ordinary Value/Sequence Operations,
-    // with taint persisted and capability checks applied uniformly.
+    // Expose `state://**` as one Resource so a Process reads and writes durable
+    // state through Value/Sequence Operations, with taint persisted
+    // and capability checks applied uniformly.
     boot.register_subtree_resource(
         "state",
         nexus_types::InterfaceFamily::Value,
@@ -302,8 +302,8 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
             Arc::new(crate::fetch::FetchDriver::new(state.clone())),
         )?;
     }
-    // §18.2 Nexus-as-host: mount each configured MCP tool as a sandboxed
-    // Provider at `effect://mcp-tool/<server>/<tool>`.
+    // Mount each configured MCP tool as a sandboxed Provider at
+    // `effect://mcp-tool/<server>/<tool>`.
     for mount in &config.mcp_tools {
         register_mcp_tool(
             boot,
@@ -403,9 +403,10 @@ impl Driver for SingleMethodDriver {
 }
 
 /// Register one MCP tool as a sandboxed Provider at
-/// `effect://mcp-tool/<server>/<tool>` (§18.2). Each tool call is an ordinary
-/// Operation, so taint / audit / budget apply. `client` is the transport seam —
-/// `EchoMcpClient` offline, a real stdio/SSE client in production.
+/// `effect://mcp-tool/<server>/<tool>`. Each tool call is an Operation, so
+/// taint / audit / budget apply. `client` supplies the MCP transport:
+/// [`crate::mcp::EchoMcpClient`] for tests, or a stdio/SSE client for live
+/// integrations.
 pub fn register_mcp_tool(
     boot: &Bootstrap,
     server: &str,
@@ -415,7 +416,8 @@ pub fn register_mcp_tool(
 ) -> Result<nexus_types::ResourceName, InstallError> {
     validate_mcp_path_segment("server", server)?;
     validate_mcp_path_segment("tool", tool)?;
-    // §10.3 sandbox prefix: every MCP effect lives under `effect://mcp-tool/<id>/*`.
+    // Every MCP effect lives under the sandbox prefix
+    // `effect://mcp-tool/<id>/*`.
     let path = format!("effect://mcp-tool/{server}/{tool}");
     Ok(boot.register_effect(
         &path,
@@ -478,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_read_write_as_operations() {
-        // §12: a Process writes then reads `state://memory/note` through ordinary
+        // A Process writes then reads `state://memory/note` through
         // Operations against the prefix-resolved state Resource.
         let boot = Bootstrap::in_memory();
         assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
@@ -521,9 +523,8 @@ mod tests {
 
     #[tokio::test]
     async fn state_write_persists_taint() {
-        // §4.4/§21.5: a write carrying untrusted-content taint persists that
-        // taint in the backend envelope — provenance is not dropped at the
-        // state boundary.
+        // A write carrying untrusted-content taint persists that taint in the
+        // backend envelope; provenance is not dropped at the state boundary.
         let boot = Bootstrap::in_memory();
         assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
 
@@ -590,8 +591,8 @@ mod tests {
 
     #[tokio::test]
     async fn fact_read_side_is_state_projection_not_effect_alias() {
-        // §9.4: Fact read side is a capability-gated state://fact/* projection,
-        // not a callable effect alias.
+        // Fact reads use a capability-gated state://fact/* projection, not a
+        // callable effect alias.
         let boot = Bootstrap::in_memory();
         assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
 
@@ -646,8 +647,8 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_tools_are_off_by_default() {
-        // §18.2 opt-in: with no `mcp_tools`, no `effect://mcp-tool/*` resource
-        // is registered — existing assemblies are unaffected.
+        // With no `mcp_tools`, no `effect://mcp-tool/*` resource is registered;
+        // existing assemblies are unaffected.
         let boot = Bootstrap::in_memory();
         assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
         let name = nexus_types::ResourceName::new(
@@ -661,8 +662,8 @@ mod tests {
 
     #[tokio::test]
     async fn registered_mcp_tool_resolves_and_invokes_end_to_end() {
-        // §18.2 Nexus-as-host: a configured MCP tool is reachable through the
-        // ordinary open()→bind→eval path, backed offline by EchoMcpClient.
+        // A configured MCP tool is reachable through the standard
+        // open/bind/eval path, backed offline by EchoMcpClient.
         let boot = Bootstrap::in_memory();
         let config = StandardConfig {
             mcp_tools: vec![McpToolMount::new("files", "list_dir")],

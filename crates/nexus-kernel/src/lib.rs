@@ -1,29 +1,29 @@
 #![forbid(unsafe_code)]
 
-//! `nexus-kernel` — the Direction-C kernel (syscall + ExecutionGraph).
+//! `nexus-kernel` - the Nexus runtime kernel.
 //!
 //! The control plane is a compiler: `open()` compiles a Grant against a
 //! Resource into a [`Handle`]. The data plane is a VM that
 //! executes [`Operation`](nexus_types::Operation)s through that handle's frozen
 //! [`DriverPlan`], recording a [`Fact`](nexus_types::Fact).
 //! The [`Executor`] advances an
-//! [`ExecutionGraph`](nexus_graph::ExecutionGraph) cursor (§13.4).
+//! [`ExecutionGraph`](nexus_graph::ExecutionGraph) cursor.
 //!
 //! Module map:
 //!
-//! - [`driver`]    — `Driver` trait, `DriverContext`, `DriverPlan` (§7).
-//! - [`policy`]    — `PolicySnapshot` / `CompiledCheck` residual checks (§8).
-//! - [`handle`]    — `Handle`, `FastPath`, generational `HandleTable` (§5).
-//! - [`registry`]  — six control-plane registries + name resolution (§10).
-//! - [`open`]      — `open()` = compile → Handle (§5.2).
-//! - [`fact`]      — `FactSink` with ReplayClass barriers (§9.3).
-//! - [`dataplane`] — `DataPlane::execute` fast/slow path (§6, §11).
-//! - [`step`]      — named, pure step continuations (§13.3).
-//! - [`executor`]  — graph stepper (§13.4).
-//! - [`scheduler`] — three-queue scheduler (§13.5).
-//! - [`process`]   — process table, spawn, finalize (§14).
-//! - [`recovery`]  — replay + quarantine (§15).
-//! - [`bootstrap`] — boot phases + assembly primitives (§14.1).
+//! - [`driver`]    — `Driver` trait, `DriverContext`, `DriverPlan`.
+//! - [`policy`]    — `PolicySnapshot` / `CompiledCheck` residual checks.
+//! - [`handle`]    — `Handle`, `FastPath`, generational `HandleTable`.
+//! - [`registry`]  — six control-plane registries + name resolution.
+//! - [`open`]      — `open()` = compile to Handle.
+//! - [`fact`]      — `FactSink` with ReplayClass barriers.
+//! - [`dataplane`] — `DataPlane::execute` fast/slow path.
+//! - [`step`]      — named, pure step continuations.
+//! - [`executor`]  — graph stepper.
+//! - [`scheduler`] — three-queue scheduler.
+//! - [`process`]   — process table, spawn, finalize.
+//! - [`recovery`]  — replay + quarantine.
+//! - [`bootstrap`] — startup assembly primitives.
 //! - [`kernel`]    — the assembled `Kernel`.
 
 pub mod bootstrap;

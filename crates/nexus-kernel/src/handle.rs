@@ -1,9 +1,9 @@
-//! `Handle` — the compiled form of a capability (§5.3), and `HandleTable` —
-//! the generational slotmap it lives in (§5.4).
+//! `Handle` — the compiled form of a capability, and `HandleTable` —
+//! the generational slotmap it lives in.
 //!
 //! A Handle is the product of `open()`: a closed, executable token carrying
-//! attenuated rights, a frozen [`DriverPlan`], and either no policy
-//! (`Unconditional`) or a residual [`PolicySnapshot`] (`Conditional`). Lookup
+//! attenuated rights, a frozen [`DriverPlan`], and a policy mode:
+//! `Unconditional` or `Conditional` with a residual [`PolicySnapshot`]. Lookup
 //! is `O(1)` array indexing; revoke bumps a slot's generation so a stale
 //! `HandleId` is rejected (ABA-safe), closing the use-after-revoke hole.
 
@@ -11,7 +11,7 @@ use crate::driver::DriverPlan;
 use crate::policy::PolicySnapshot;
 use nexus_types::{HandleId, Path, ProcessId, ResourceId, Rights};
 
-/// Whether the data plane must run residual policy for this handle (§5.5).
+/// Whether the data plane must run residual policy for this handle.
 /// `Unconditional` carries no policy at all — "zero policy cost" is a type-level
 /// fact, not a runtime branch on an empty list.
 #[derive(Clone)]
@@ -22,7 +22,7 @@ pub enum FastPath {
     Conditional(PolicySnapshot),
 }
 
-/// Lifecycle state of a handle (§5.3).
+/// Lifecycle state of a handle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HandleState {
     /// Handle can be used by its owning process.
@@ -33,7 +33,7 @@ pub enum HandleState {
     Revoked,
 }
 
-/// The compiled capability token (§5.3). Held by exactly one Process; carries
+/// The compiled capability token. Held by exactly one Process; carries
 /// the attenuated rights, the frozen dispatch table, and the fast-path marker.
 #[derive(Clone)]
 pub struct Handle {
@@ -51,16 +51,16 @@ pub struct Handle {
     pub fast_path: FastPath,
     /// Current lifecycle state.
     pub state: HandleState,
-    /// The concrete target path this handle was opened against (§12). For
+    /// The concrete target path this handle was opened against. For
     /// prefix-resolved Resources (`state://**`), the driver needs the actual
     /// path, not the pattern. `None` for handles where the path is implicit in
-    /// the resource id. Carried on the Handle (not the Operation) so the §11
+    /// the resource id. Carried on the Handle (not the Operation) so the
     /// invariant — Operations carry no paths — still holds.
     pub bound_path: Option<Path>,
 }
 
 impl Handle {
-    /// Owner check: pointer-cheap equality on the data plane (§2.3).
+    /// Owner check: pointer-cheap equality on the data plane.
     pub fn check_owner(&self, process: ProcessId) -> bool {
         self.process == process
     }
@@ -70,12 +70,12 @@ impl Handle {
         self.state == HandleState::Active
     }
 
-    /// Rights bitmap check for a method index (§2.3).
+    /// Rights bitmap check for a method index.
     pub fn allows_method(&self, method_index: u32) -> bool {
         self.rights.methods.allows(method_index)
     }
 
-    /// Whether this handle skips policy entirely (§5.5).
+    /// Whether this handle skips policy entirely.
     pub fn is_unconditional(&self) -> bool {
         matches!(self.fast_path, FastPath::Unconditional)
     }
@@ -89,7 +89,7 @@ struct Slot {
     handle: Option<Handle>,
 }
 
-/// Generational slotmap of live handles (§5.4). `O(1)` lookup by index +
+/// Generational slotmap of live handles. `O(1)` lookup by index +
 /// generation compare; revoke/reopen is ABA-safe.
 #[derive(Default)]
 pub struct HandleTable {
@@ -161,8 +161,8 @@ impl HandleTable {
         true
     }
 
-    /// Close (not revoke) a handle: marks it Closed but keeps the slot so the
-    /// id still resolves to a Closed handle (callers see the state).
+    /// Mark a handle Closed while keeping the slot so the id still resolves to
+    /// a Closed handle (callers see the state).
     pub fn close(&mut self, id: HandleId) -> bool {
         match self.get_mut(id) {
             Some(h) => {
@@ -183,7 +183,7 @@ impl HandleTable {
         self.len() == 0
     }
 
-    /// Revoke all handles owned by `process` (§14.2 finalize step 4). Returns
+    /// Revoke all handles owned by `process`. Returns
     /// the count revoked.
     pub fn revoke_owned_by(&mut self, process: ProcessId) -> usize {
         let ids: Vec<HandleId> = self

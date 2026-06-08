@@ -17,7 +17,7 @@ fn blob() -> BlobRef {
     }
 }
 
-fn rich_value() -> Value {
+fn composite_value() -> Value {
     let mut m = BTreeMap::new();
     m.insert("null".into(), Value::Null);
     m.insert("bool".into(), Value::Bool(true));
@@ -54,7 +54,7 @@ fn rich_value() -> Value {
 
 #[test]
 fn value_round_trips_every_variant() {
-    let v = rich_value();
+    let v = composite_value();
     let back = value_from_pb(&value_to_pb(&v));
     assert_eq!(v, back, "structural Value mapping must be lossless");
 }
@@ -201,12 +201,12 @@ fn outcome_done_and_fail_map() {
 #[test]
 fn value_survives_protobuf_encode_decode() {
     use prost::Message;
-    let pb = value_to_pb(&rich_value());
+    let pb = value_to_pb(&composite_value());
     let bytes = pb.encode_to_vec();
     let decoded = crate::nexus::v1::Value::decode(&bytes[..]).expect("decode");
     assert_eq!(pb, decoded);
     // …and the structural meaning survives the full wire trip.
-    assert_eq!(value_from_pb(&decoded), rich_value());
+    assert_eq!(value_from_pb(&decoded), composite_value());
 }
 
 #[test]
@@ -277,7 +277,7 @@ fn extension_handshake_frames_survive_wire() {
 
 #[test]
 fn control_frame_config_ack_survives_wire() {
-    // Regression: ConfigAck is oneof tag 7 (§16.3.3). The oneof field's `tags`
+    // Regression: ConfigAck is oneof tag 7. The oneof field's `tags`
     // list previously omitted 7, so ConfigAck silently failed to round-trip.
     use crate::nexus::v1::extension as ext;
     use prost::Message;
@@ -323,7 +323,7 @@ fn service_names_and_method_paths_are_correct() {
 
 #[test]
 fn invoke_frame_types_roundtrip_through_pb() {
-    // §16.3.3: the Invoke business frame maps losslessly types ⇄ proto.
+    // The Invoke business frame maps losslessly between types and proto.
     use crate::convert::{invoke_from_pb, invoke_to_pb};
     use nexus_types::extension::Invoke;
     use nexus_types::{MethodId, Path, Value};

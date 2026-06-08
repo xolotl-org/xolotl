@@ -1,11 +1,10 @@
 #![forbid(unsafe_code)]
 
-//! `nexus-console` — the Console Protocol host and management-domain Gateway
-//! (§18.4 / §24.3).
+//! `nexus-console` — the Console Protocol host and management-domain Gateway.
 //!
 //! HTTP is limited to bootstrap/auth. Post-login control is carried by the
 //! Console WebSocket (`/ws`) using descriptor-named protocol actions. Every
-//! action runs as an ordinary capability-bound Operation or read-side
+//! action runs as a capability-scoped Operation or read-side
 //! projection — no privileged backend handle and no raw shell.
 
 use axum::extract::{ConnectInfo, State};

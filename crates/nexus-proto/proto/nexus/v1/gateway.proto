@@ -3,9 +3,9 @@ package nexus.v1;
 
 import "nexus/v1/common.proto";
 
-// Gateway service (§18.1): the primary entry point for external gRPC clients.
+// Gateway service: the primary entry point for external gRPC clients.
 // A client authenticates, then submits structured Do<A> programs to run; the
-// gateway runs each as a capability-bound Process and returns the Outcome.
+// gateway runs each as a capability-scoped Process and returns the Outcome.
 service GatewayService {
   // Run one submitted program and return its outcome.
   rpc Submit(SubmitRequest) returns (SubmitResponse);
@@ -14,7 +14,7 @@ service GatewayService {
 }
 
 message SubmitRequest {
-  // Bearer token mapped to a request identity by the gateway (§18.1 step 1-2).
+  // Bearer token mapped to a request identity by the gateway.
   string auth_token = 1;
   // Structured Do<A> program, compiled and run by the kernel.
   Program program = 2;

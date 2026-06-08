@@ -45,6 +45,7 @@ idle_timeout_secs = 7200           # 2h
 max_frames_per_second = 64
 max_bytes_per_second = 4194304     # 4 MiB/s
 max_subscriptions = 32
+max_state_list_limit = 512
 max_fact_limit = 256
 max_trace_limit = 512
 event_send_timeout_ms = 5000

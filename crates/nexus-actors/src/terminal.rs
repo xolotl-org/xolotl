@@ -1,8 +1,8 @@
-//! Terminal provider (§17.3): `effect://terminal/run`.
+//! Terminal provider: `effect://terminal/run`.
 //!
-//! Safety (§17.3): **never** goes through a shell — input is `command +
+//! Safety: **never** goes through a shell — input is `command +
 //! Vec<String>` args, executed directly. Three layers of protection gate every
-//! run ("三层防护:策略能力 + 命令 allowlist/denylist + 高危命令 Approval"):
+//! run:
 //!
 //! 1. **Policy capability** — enforced upstream by the kernel before the driver
 //!    is even reached (the Operation must hold the `effect://terminal/run`
@@ -89,17 +89,17 @@ impl TerminalDriver {
     /// Returns `Ok(())` if the command may proceed to spawn. Pulled out of
     /// `call` so it is unit-testable without an actual subprocess.
     fn gate(&self, cmd: &str, approved: bool) -> Result<(), DriverError> {
-        // Layer 2a: denylist always wins, even over an allowlist entry.
+        // Denylist check: denylist always wins, even over an allowlist entry.
         if self.denied(cmd) {
             return Err(DriverError::Other(format!("command is denylisted: {cmd}")));
         }
-        // Layer 2b: must be explicitly allowlisted.
+        // Allowlist check: the command must be explicitly allowed.
         if !self.allowed(cmd) {
             return Err(DriverError::Other(format!(
                 "command not on allowlist: {cmd}"
             )));
         }
-        // Layer 3: high-risk commands need Approval.
+        // Approval check: high-risk commands need explicit approval.
         if self.high_risk(cmd) && !approved {
             return Err(DriverError::Other(format!(
                 "command `{cmd}` is high-risk and requires approval (set `approved: true`)"

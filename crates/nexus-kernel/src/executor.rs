@@ -1,14 +1,14 @@
 //! The Executor: advances a compiled [`ExecutionGraph`] to produce Operations
-//! and an Outcome (§13.4).
+//! and an Outcome.
 //!
 //! The Executor **only ever advances a graph** — it never interprets the `Do<A>`
 //! source form directly. `eval()` compiles the program once (`compile_do`),
 //! binds the resulting graph, then walks it node-by-node. Each node's id is its
-//! **stable `CausalPosition`** (§6.1 / §13.2): assigned by the compiler in
+//! **stable `CausalPosition`**: assigned by the compiler in
 //! pre-order, identical across recompiles, so an Operation's identity is
 //! independent of wall clock and survives crash-recovery.
 //!
-//! Per node kind (§13.4):
+//! Per node kind:
 //! - `Pure` / `Fail` yield a value / failure immediately.
 //! - `Operation` issues one data-plane call (records a Fact).
 //! - `Step` splices its produced subgraph at the cursor (run-time `AndThen`).
@@ -42,7 +42,7 @@ pub enum ExecError {
 }
 
 /// Maximum splice depth — a runaway recursive Step (debate loops, etc.) is
-/// bounded so a buggy program can't hang the executor (cf. §20.4.1).
+/// bounded so a buggy program can't hang the executor.
 const MAX_DEPTH: usize = 4096;
 
 /// Drives one Process's program to completion. Holds the data plane (for
@@ -58,29 +58,28 @@ pub struct Executor {
     pub registry: Registry,
     /// Table of named pure continuation steps.
     pub steps: StepTable,
-    /// Optional state backend, used to resolve `Wait(Signal)` nodes (§13.2).
+    /// Optional state backend, used to resolve `Wait(Signal)` nodes.
     /// `None` for executors that never wait on a signal path.
     state: Option<nexus_state::Backend>,
     /// Optional process table, used to observe cancellation at Operation
-    /// boundaries (§13.4 / §14.2). `None` for standalone executors (tests) that
+    /// boundaries. `None` for standalone executors (tests) that
     /// have no process lifecycle to honor.
     processes: Option<crate::process::ProcessTable>,
-    /// Optional replay map (§15.2): when recovering, completed Operations
-    /// short-circuit to their recorded outcome instead of re-issuing the effect.
+    /// Optional replay map: when recovering, completed Operations
+    /// short-circuit to their recorded outcome.
     /// `None` / empty for a fresh run.
     replay: Option<Arc<crate::recovery::ReplayMap>>,
     /// Maps an opened ResourceName → the HandleId the process holds for it, so
-    /// repeated Operations on the same effect reuse the compiled handle
-    /// (the CompiledOpenPlan amortization, §5.6).
+    /// repeated Operations on the same effect reuse the compiled handle.
     open_handles: Arc<parking_lot::RwLock<HashMap<ResourceName, nexus_types::HandleId>>>,
-    /// Per-(resource, method) compiled metadata cache (§10.1/§11): the data
+    /// Per-(resource, method) compiled metadata cache: the data
     /// plane must not re-query the Registry on every Operation. The first op on
     /// a (target, method) resolves it once; subsequent ops read this cache, so
     /// the hot path never walks the Registry again.
     method_cache: Arc<parking_lot::RwLock<HashMap<(ResourceName, String), MethodMeta>>>,
 }
 
-/// Compiled, cached metadata for one (resource, method) (§11): the bit position,
+/// Compiled, cached metadata for one (resource, method): the bit position,
 /// id, replay class, supported output modes, and cost — everything the data
 /// plane needs to dispatch without touching the Registry again.
 #[derive(Clone)]
@@ -95,7 +94,7 @@ struct MethodMeta {
 
 /// Block-scoped evaluation environment: `Let`-bound values keyed by the
 /// **producer NodeId** (so `Use` edges resolve structurally), the current
-/// acting identity, and the **taint** of the value currently flowing (§21.5).
+/// acting identity, and the **taint** of the value currently flowing.
 /// Threaded by value through recursion (no shared mutation).
 #[derive(Clone)]
 struct Env {
@@ -104,7 +103,7 @@ struct Env {
     /// Producer NodeId → that value's taint (parallel to `bindings`).
     binding_taint: HashMap<NodeId, nexus_types::TaintSet>,
     acting: IdentityRef,
-    /// Provenance of the value flowing into the current node (§21.5).
+    /// Provenance of the value flowing into the current node.
     taint: nexus_types::TaintSet,
 }
 
@@ -147,27 +146,27 @@ impl Executor {
         }
     }
 
-    /// Attach a state backend so `Wait(Signal)` nodes can resolve (§13.2).
+    /// Attach a state backend so `Wait(Signal)` nodes can resolve.
     pub fn with_state(mut self, state: nexus_state::Backend) -> Self {
         self.state = Some(state);
         self
     }
 
     /// Attach a replay map so a recovered run short-circuits already-completed
-    /// Operations to their recorded outcomes (§15.2).
+    /// Operations to their recorded outcomes.
     pub fn with_replay(mut self, replay: Arc<crate::recovery::ReplayMap>) -> Self {
         self.replay = Some(replay);
         self
     }
 
     /// Attach the process table so the executor honors cancellation at each
-    /// Operation boundary (§13.4 / §14.2).
+    /// Operation boundary.
     pub fn with_processes(mut self, processes: crate::process::ProcessTable) -> Self {
         self.processes = Some(processes);
         self
     }
 
-    /// Whether this process has been cancelled or moved past Running (§14.2).
+    /// Whether this process has been cancelled or moved past Running.
     /// Returns false when no process table is attached (standalone executors).
     fn is_cancelled(&self) -> bool {
         match &self.processes {
@@ -187,8 +186,8 @@ impl Executor {
     }
 
     /// Evaluate a whole program to an Outcome. Compiles the `Do<A>` into one
-    /// [`ExecutionGraph`] (§13.3), then advances the graph — the Executor never
-    /// interprets the source form directly (§13.2).
+    /// [`ExecutionGraph`], then advances the graph — the Executor never
+    /// interprets the source form directly.
     pub async fn eval(&self, program: &DoNode) -> Outcome {
         let graph = match compile_do(program) {
             Ok(g) => g,
@@ -208,9 +207,10 @@ impl Executor {
             .await
     }
 
-    /// Evaluate a program whose entry value carries `entry_taint` — used when a
-    /// Gateway runs an externally-sourced program (the inbound content is
-    /// tainted `Inbound`, §21.5), so the whole run inherits that lineage.
+    /// Evaluate a program whose entry value carries `entry_taint`.
+    ///
+    /// Gateways use this for externally-sourced programs, where inbound content
+    /// is tainted as `Inbound` so the whole run inherits that lineage.
     pub async fn eval_tainted(
         &self,
         program: &DoNode,
@@ -236,14 +236,14 @@ impl Executor {
     ) -> Outcome {
         // `next_splice_base` hands out id ranges for spliced Step subgraphs so
         // their CausalPositions never collide with the parent graph or each
-        // other (§13.4). It starts past the highest compiled id.
+        // other. It starts past the highest compiled id.
         let next_base = Arc::new(std::sync::atomic::AtomicU32::new(graph.len() as u32));
         let env = Env::root().with_taint(entry_taint);
         self.run_node(graph, graph.root, Value::Null, &env, 0, &next_base)
             .await
     }
     /// Evaluate the node at `id` with `input` flowing in, then advance to its
-    /// continuation. The node's id **is** its CausalPosition (§6.1) — read
+    /// continuation. The node's id **is** its CausalPosition — read
     /// straight off the compiled graph, never re-derived.
     fn run_node<'a>(
         &'a self,
@@ -285,10 +285,9 @@ impl Executor {
                 NodeKind::Fail(f) => Outcome::Fail(f.clone()),
 
                 NodeKind::Operation(tmpl) => {
-                    // §13.4 / §14.2: a Process observes cancellation at each
-                    // Operation boundary. If it was cancelled (or moved to
-                    // Finalizing), short-circuit to Cancelled before issuing the
-                    // side effect — a cancelled Process must not keep acting.
+                    // A Process observes cancellation at each Operation
+                    // boundary. If it was cancelled or moved to Finalizing,
+                    // short-circuit to Cancelled before issuing the side effect.
                     if self.is_cancelled() {
                         return self
                             .continue_with(
@@ -301,11 +300,10 @@ impl Executor {
                             )
                             .await;
                     }
-                    // §15.2 recovery: if this Operation's outcome is already
-                    // durably recorded (replay map hit by CausalPosition), reuse
-                    // it instead of re-issuing the side effect. This is what makes
-                    // re-running a recovered program safe — a NonIdempotentEffect
-                    // that already happened is never repeated.
+                    // If this Operation's outcome is already durably recorded
+                    // for its CausalPosition, reuse it instead of re-issuing
+                    // the side effect. This keeps recovered runs from repeating
+                    // a NonIdempotentEffect that already happened.
                     if let Some(replay) = &self.replay
                         && let Some(recorded) = replay.get(id)
                     {
@@ -314,12 +312,12 @@ impl Executor {
                             .continue_with(graph, id, recorded, env, depth, next_base)
                             .await;
                     }
-                    // §9.2: record a Fact when the op has side effects or its
-                    // output is consumed by downstream control flow; an
-                    // unconsumed pure read may skip (recovery recomputes it).
+                    // Record a Fact when the op has side effects or its output
+                    // is consumed by downstream control flow. An unconsumed
+                    // pure read may skip because recovery can recompute it.
                     let record = graph.output_is_consumed(id);
                     let (out, out_taint) = self.run_operation(tmpl, input, env, id, record).await;
-                    // The result flows on carrying the operation's taint (§21.5).
+                    // The result flows on carrying the operation's taint.
                     let env2 = env.with_taint(out_taint);
                     self.continue_with(graph, id, out, &env2, depth, next_base)
                         .await
@@ -362,7 +360,7 @@ impl Executor {
                             match kind {
                                 // Genuine concurrency: both arms make progress
                                 // across their Operation awaits; wall-clock ≈
-                                // max(arm), not sum (§13.4).
+                                // max(arm), not sum.
                                 JoinKind::Both => {
                                     let (ra, rb) = tokio::join!(fa, fb);
                                     match (ra, rb) {
@@ -393,12 +391,12 @@ impl Executor {
                 }
 
                 NodeKind::Acting(path) => {
-                    // §3/§5.1/§20.1: switching the acting identity is a
+                    // Switching the acting identity is a
                     // *delegation*, not a free operation. The process must hold
                     // a grant `act-as://<identity>` carrying the DELEGATE flag.
                     // Without it the switch is denied fail-closed — otherwise any
                     // program could assume any identity and defeat the capability
-                    // model. Fact records caller and acting both (§6 line 252).
+                    // model. Fact records caller and acting both.
                     if !self.authorize_act_as(path) {
                         let out = Outcome::Fail(nexus_types::Failure::policy(
                             "act-as",
@@ -507,8 +505,8 @@ impl Executor {
     }
 
     /// Resolve a `Use` node's value and taint: the output recorded for the
-    /// producer node reachable along the incoming `Use` edge (§13.3 DAG data
-    /// dependency). The producer's taint flows on with the value (§21.5).
+    /// producer node reachable along the incoming `Use` edge ( DAG data
+    /// dependency). The producer's taint flows on with the value.
     fn resolve_use(
         &self,
         graph: &ExecutionGraph,
@@ -531,7 +529,7 @@ impl Executor {
     /// Splice and run a `Step`'s produced subgraph (the run-time face of
     /// `AndThen` / `OrElse` recovery). The step is a pure `Value -> Do<A>`
     /// continuation; its subgraph is compiled with a fresh id offset so its
-    /// Operation CausalPositions stay globally unique (§13.4).
+    /// Operation CausalPositions stay globally unique.
     async fn run_step(
         &self,
         sref: &StepRef,
@@ -643,10 +641,10 @@ impl Executor {
         }
     }
 
-    /// Issue one Operation through the data plane (§6), labelling it with its
+    /// Issue one Operation through the data plane, labelling it with its
     /// stable CausalPosition (the node's id). Resolves the target Resource →
     /// owned Handle, then dispatches. Returns the outcome and the taint that
-    /// flows on with the result value (§21.5).
+    /// flows on with the result value.
     async fn run_operation(
         &self,
         tmpl: &OperationTemplate,
@@ -657,7 +655,7 @@ impl Executor {
     ) -> (Outcome, nexus_types::TaintSet) {
         let effective_input = tmpl.literal_input.clone().unwrap_or(input);
 
-        // The output inherits the flowing value's lineage (§21.5) plus the
+        // The output inherits the flowing value's lineage plus the
         // target's intrinsic source (e.g. inference → ModelOutput, a vault read
         // → Protected, a fetch → Fetched).
         let mut op_taint = env.taint.clone();
@@ -665,7 +663,7 @@ impl Executor {
             op_taint.add(src);
         }
 
-        // Structural outbound defense (§21.5), checked *before* resource
+        // Structural outbound defense, checked *before* resource
         // resolution so a tainted exfiltration attempt is denied on structure
         // alone: a value whose lineage touched a Protected source must not flow
         // out through an outbound Operation (post / send / publish). This is a
@@ -684,7 +682,7 @@ impl Executor {
             );
         }
 
-        // Resolve compiled method metadata once and cache it (§11): the hot path
+        // Resolve compiled method metadata once and cache it: the hot path
         // must not re-query the Registry per Operation. A cache miss resolves via
         // the Registry and memoizes; a hit skips it entirely.
         let Some(meta) = self.resolve_meta(&tmpl.target, &tmpl.method) else {
@@ -714,7 +712,7 @@ impl Executor {
             ..
         } = meta;
 
-        // §4.3: the requested OutputMode must be in the method's supported set.
+        // The requested OutputMode must be in the method's supported set.
         // Reject early (before dispatch) so a caller can't ask a Unary-only
         // method to stream, or vice versa.
         if !tmpl.output.is_supported_by(supports) {
@@ -740,8 +738,8 @@ impl Executor {
             output: tmpl.output,
         };
 
-        // §21.2 Budget: reserve a conservative estimate before the effect, then
-        // settle to the measured cost after. Free methods skip this entirely.
+        // Reserve a conservative budget estimate before the effect, then settle
+        // to the measured cost after. Free methods skip this entirely.
         // Attribution is to the running Process (whose budget the acting identity
         // draws on). Reservation is fail-closed: over budget ⇒ deny before the
         // side effect is ever issued.
@@ -773,7 +771,7 @@ impl Executor {
             .execute_batchable(&op, method_index, replay, supports, batchable, now, record)
             .await;
 
-        // Settle against actual cost (§21.2). The actual token count is taken
+        // Settle against actual cost. The actual token count is taken
         // from the produced value; a real backend reports it in outcome
         // metadata, but the value-derived estimate is a faithful baseline.
         if let (Some((res_usd, res_tokens)), Some(procs)) = (reservation, &self.processes) {
@@ -794,7 +792,7 @@ impl Executor {
         (out.outcome, op_taint)
     }
 
-    /// Authorize an `Acting(identity)` switch (§3/§5.1). The process must hold a
+    /// Authorize an `Acting(identity)` switch. The process must hold a
     /// grant whose selector is `act-as://<identity>` (matched structurally) and
     /// whose rights carry the `DELEGATE` flag. Returns false (deny) otherwise.
     ///
@@ -814,7 +812,7 @@ impl Executor {
         self.open_handles.read().get(name).copied()
     }
 
-    /// Resolve cached [`MethodMeta`] for a (target, method) (§11). A cache miss
+    /// Resolve cached [`MethodMeta`] for a (target, method). A cache miss
     /// walks the Registry once and memoizes; subsequent calls are pure cache
     /// reads, so the per-Operation hot path never re-queries the Registry.
     /// Returns `None` if the target resource doesn't resolve.
@@ -886,7 +884,7 @@ fn estimate_cost(
     }
 }
 
-/// Intern an identity path to a stable [`IdentityRef`] by hashing (§3). Public
+/// Intern an identity path to a stable [`IdentityRef`] by hashing. Public
 /// so Gateways map a request identity to the same ref the executor uses for
 /// `Acting` blocks.
 pub fn intern_identity(path: &nexus_types::Path) -> IdentityRef {
@@ -900,7 +898,7 @@ pub fn intern_identity(path: &nexus_types::Path) -> IdentityRef {
     IdentityRef::new(n | 1)
 }
 
-/// The intrinsic taint a target Resource confers on its output (§21.5): an
+/// The intrinsic taint a target Resource confers on its output: an
 /// inference call yields `ModelOutput`, a fetch yields `Fetched`, a read of a
 /// protected prefix (`state://vault/*` etc.) yields `Protected`. Returns `None`
 /// for neutral targets that merely pass their input lineage through.
@@ -928,7 +926,7 @@ fn intrinsic_source(target: &ResourceName) -> Option<nexus_types::TaintSource> {
     }
 }
 
-/// Whether an Operation on `target` sends data to the outside world (§21.5).
+/// Whether an Operation on `target` sends data to the outside world.
 /// Outbound effects are the gate for protected-data exfiltration: posting,
 /// sending, publishing, or any fetch with a request body. Conservative: unknown
 /// effects under known outbound domains count as outbound.
@@ -1116,7 +1114,7 @@ mod tests {
     #[tokio::test]
     async fn acting_denied_without_delegate_grant() {
         // Process 1 holds no grants (empty registry). An Acting block must be
-        // denied fail-closed — no silent identity switch (§3/§5.1).
+        // denied fail-closed — no silent identity switch.
         let ex = executor();
         let prog = DoNode::acting(
             nexus_types::Path::parse("process/bob").unwrap(),
@@ -1159,7 +1157,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_process_short_circuits_at_operation_boundary() {
         // A process marked Cancelled must not issue its Operation: the boundary
-        // check short-circuits to Failure::Cancelled (§13.4 / §14.2).
+        // check short-circuits to Failure::Cancelled.
         use crate::process::{ProcessEntry, ProcessTable};
         use nexus_graph::OperationTemplate;
         let (facts, _) = FactSink::in_memory();
@@ -1441,7 +1439,7 @@ mod tests {
     #[tokio::test]
     async fn protected_data_to_outbound_is_denied() {
         // A value tainted Protected (read from vault) flowing into an outbound
-        // Operation is structurally denied (§21.5) — the taint gate fires before
+        // Operation is structurally denied — the taint gate fires before
         // resource resolution would.
         use nexus_graph::OperationTemplate;
         let ex = executor();

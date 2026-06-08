@@ -1,12 +1,12 @@
-//! Token Compressor (§17 / §19.1): `effect://compress/summarize`,
+//! Token Compressor: `effect://compress/summarize`,
 //! `effect://compress/trim-plan`.
 //!
 //! Context windows are bounded by a token budget; when a Sequence (a chat log,
 //! a plan transcript) grows past budget, the compressor shrinks it. `summarize`
 //! delegates to an inference backend to produce a shorter rendition of the
 //! input text under a target token budget; `trim-plan` drops the
-//! lowest-priority steps of a plan to fit a step budget. Both are the seam where
-//! a real model summarizer plugs in (§17.1); the offline baseline uses the
+//! lowest-priority steps of a plan to fit a step budget. The summarizer is
+//! supplied by the configured inference backend; the offline baseline uses the
 //! deterministic echo backend summary + a structural trim.
 
 use crate::inference::InferenceBackend;
@@ -20,14 +20,14 @@ use std::sync::Arc;
 /// one as a separate `effect://compress/<method>` Resource with public method
 /// `invoke`.
 pub const COMPRESS_METHODS: &[MethodSpec] = &[
-    // summarize: model-backed; not safely replayable by default (§9.3).
+    // summarize: model-backed; not safely replayable by default.
     MethodSpec::new("summarize", Purity::Effectful, MethodSpec::UNARY_ASYNC),
     // trim-plan: pure structural truncation.
     MethodSpec::new("trim-plan", Purity::Pure, MethodSpec::UNARY_ASYNC),
 ];
 
 /// Drives the compression actions. Holds an embedding/inference backend used to
-/// produce summaries (§17.1).
+/// produce summaries.
 pub struct CompressDriver {
     backend: Arc<dyn InferenceBackend>,
 }
@@ -39,7 +39,7 @@ impl CompressDriver {
     }
 }
 
-/// Roughly estimate tokens for a text (the ~4-chars/token heuristic, §21.2).
+/// Roughly estimate tokens for a text.
 fn approx_tokens(text: &str) -> usize {
     (text.chars().count() / 4).max(1)
 }
@@ -74,7 +74,7 @@ impl Driver for CompressDriver {
                 let summary = if original_tokens <= max_tokens {
                     text.clone()
                 } else {
-                    // Delegate to the model to summarize under budget (§17.1).
+                    // Delegate to the model to summarize under budget.
                     let prompt = format!(
                         "Summarize the following in at most {max_tokens} tokens:\n\n{text}"
                     );
@@ -97,7 +97,7 @@ impl Driver for CompressDriver {
             }
             // trim-plan({steps:[...], max_steps}) → {steps} keeping the
             // highest-priority `max_steps` (by an optional per-step `priority`,
-            // else original order). Structural, pure (§19).
+            // else original order). Structural, pure.
             1 => {
                 let max_steps = m
                     .get("max_steps")

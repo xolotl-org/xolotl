@@ -27,7 +27,7 @@ message ExtensionFrame {
   }
 }
 
-// ─── Three-stage session handshake (§16.3.3) ───────────────────────────────
+// ─── Three-stage session handshake ───────────────────────────────
 
 // Stage 1: extension reports identity plus locally observed generations/hash.
 message RoleSessionClientHello {
@@ -58,8 +58,7 @@ message RoleReady {
   SessionContext accepted_context = 1;
 }
 
-// Role = which primitive the extension projects (orthogonal to transport/trust).
-// See design §25-A.2.
+// Role projected by an extension, orthogonal to transport and trust.
 enum ExtensionRole {
   EXTENSION_ROLE_UNSPECIFIED = 0;
   // Source: provides a state:// inbound event stream (chat bridge, webhook).
@@ -70,23 +69,23 @@ enum ExtensionRole {
 
 // ─── Source role (chat bridge) frames ───────────────────────────────────────
 
-// Bridge → Daemon: platform event occurred.
+// Bridge → Daemon: source event occurred.
 message InboundEvent {
   string id = 1;
   nexus.v1.Value payload = 2;
   int64 timestamp_ms = 3;
-  // Lightweight presentation/alias generation tags (§16.3.3).
+  // Lightweight presentation/alias generation tags.
   ObservedGenerations observed = 4;
 }
 
-// Daemon → Bridge: execute this action on the platform.
+// Daemon → Bridge: execute this action through the connector.
 message OutboundCommand {
   string id = 1;
   nexus.v1.Value action = 2;
   ObservedGenerations observed = 3;
 }
 
-// The two lightweight generation axes carried on each Source frame (§16.3.3).
+// The two lightweight generation axes carried on each Source frame.
 // Session-level generations live in SessionContext instead.
 message ObservedGenerations {
   uint64 presentation_config_generation = 1;
@@ -162,22 +161,22 @@ message ControlFrame {
   }
 }
 
-// Extension → daemon: report what this end can render (§16.3.3). The profile
-// body is opaque here; the platform docs (Web/Mobile) define its schema.
+// Extension → daemon: report what this end can render. The profile
+// body is opaque here; connector docs such as Web/Mobile define its schema.
 message PresentationProfileUpdate {
   uint64 profile_generation = 1;
   string profile_hash = 2;
   nexus.v1.Value profile = 3;
 }
 
-// Daemon → extension: authority config update (§16.3.3), via §18.4 CAS;
+// Daemon → extension: authority config update, via  CAS;
 // advances ExtensionInstallationDef.version and may bump the Binding generation.
 message ExtensionConfigUpdate {
   uint64 config_version = 1;
   nexus.v1.Value config = 2;
 }
 
-// Daemon → extension: presentation-only config (§16.3.3). Never grants
+// Daemon → extension: presentation-only config. Never grants
 // capability; bounded by profile_hash and local overrides.
 message PresentationConfigUpdate {
   uint64 generation = 1;
@@ -185,7 +184,7 @@ message PresentationConfigUpdate {
   nexus.v1.Value config = 3;
 }
 
-// Extension → daemon: how a config/presentation update was applied (§16.3.3).
+// Extension → daemon: how a config/presentation update was applied.
 message ConfigAck {
   ConfigAxis axis = 1;
   uint64 version = 2;

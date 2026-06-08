@@ -1,8 +1,8 @@
-//! Idempotency key derivation (§21.3 / §6.1).
+//! Idempotency key derivation.
 //!
 //! The default idempotency key for an operation is its [`OperationId`] —
 //! `(process, CausalPosition, attempt)` — which is already stable across
-//! crash-replay (§6.1), so re-executing a recovered program reuses the same key
+//! crash-replay, so re-executing a recovered program reuses the same key
 //! and a supporting handler dedupes automatically.
 //!
 //! Business code may override the key with an `_idem_key` field in the op input
@@ -22,7 +22,7 @@ use crate::value::Value;
 /// The reserved input field a caller sets to supply a business idempotency key.
 pub const IDEM_KEY_FIELD: &str = "_idem_key";
 
-/// Derive the effective idempotency key for an operation (§21.3). If the input
+/// Derive the effective idempotency key for an operation. If the input
 /// carries `_idem_key`, the result binds it to the authenticated context
 /// (`acting` + `CausalPosition`) so it cannot be forged or collided by injected
 /// input alone; otherwise the key is the operation's own stable id. The return

@@ -1,10 +1,10 @@
-//! Path: the universal addressing primitive.
+//! Path: the universal addressing type.
 //!
 //! Form: `[cluster/]<scheme>/<seg>[/<seg>...]`
 //!
 //! The canonical wire form uses `scheme://segments` (e.g. `effect://inference/infer`).
-//! Path parameters are not part of the grammar: operation options live in
-//! structured input values, and attenuation predicates live on capabilities.
+//! Operation options live in structured input values, and attenuation
+//! predicates live on capabilities.
 
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;

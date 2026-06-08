@@ -1,16 +1,15 @@
-//! Extension pairing & secure envelope (§16.3.4): the pairing state driver and
+//! Extension pairing & secure envelope: the pairing state driver and
 //! the credential layer that makes a session's frames confidential,
 //! authenticated, and tamper-evident.
 //!
 //! An installation holds a pre-shared key (`installation_psk`). Each frame the
 //! extension sends is wrapped in a [`SecureExtensionEnvelope`] whose frame body
 //! is AEAD ciphertext and whose AAD binds role, session, sequence, binding
-//! generation, and credential generation. Fail-closed invariants (§16.3.4): no
+//! generation, and credential generation. Fail-closed invariants: no
 //! credential → no Ready session; a frame whose AEAD tag doesn't verify, or
 //! whose generation is below the valid floor, is rejected. Pairing secrets are
-//! generated inside the driver, ordinary Operations record only hash/checksum,
-//! and Console gets the display secret via the one-shot edge API rather than a
-//! model-readable `Value`.
+//! generated inside the driver, Operations record only hash/checksum, and
+//! Console gets the display secret via the one-shot edge API.
 
 use async_trait::async_trait;
 use blake3::Hasher;
@@ -47,7 +46,7 @@ const STATE_EXPIRED: &str = "expired";
 const STATE_REPLACED: &str = "replaced";
 const STATE_REVOKED: &str = "revoked";
 
-/// Drives the extension-pairing management effects (§16.3.4). It persists only
+/// Drives the extension-pairing management effects. It persists only
 /// hashes and status records in the state plane; raw pairing secrets stay at the
 /// display/transport edge.
 pub struct PairingDriver {
@@ -58,7 +57,7 @@ pub struct PairingDriver {
 /// One-shot edge for pairing display secrets.
 ///
 /// Secrets staged here are consumed by Console/transport code after the
-/// ordinary pairing Operation records only hash/checksum metadata.
+/// Pairing Operations record only hash/checksum metadata.
 #[derive(Clone, Default)]
 pub struct PairingDisplayEdge {
     pending_secrets: Arc<Mutex<BTreeMap<String, String>>>,
@@ -95,7 +94,7 @@ impl PairingDriver {
     ///
     /// This is intentionally not a Driver method and therefore not callable as
     /// an Operation: the secret must not appear in Fact input/outcome. Console
-    /// and pairing transports use this one-shot edge after the ordinary
+    /// and pairing transports use this one-shot edge after the standard
     /// `effect://extension/pairing/create|replace` Operation has recorded only
     /// the hash/checksum.
     pub fn take_display_secret(&self, pairing_id: &str) -> Option<String> {
@@ -847,14 +846,14 @@ fn credential_hash(installation_id: &str, pairing_id: &str, generation: i64) -> 
     h.finalize().to_hex().to_string()
 }
 
-/// A paired installation's credential (§16.3.4). The `psk` is the secret; it is
+/// A paired installation's credential. The `psk` is the secret; it is
 /// never serialized into a Fact or a model-readable Value — it lives only in the
 /// daemon's credential store and at the transport boundary.
 #[derive(Clone)]
 pub struct ExtensionCredential {
     /// Installation this credential belongs to.
     pub installation_id: String,
-    /// The current credential generation; a revoke bumps it (§16.3.4).
+    /// The current credential generation; a revoke bumps it.
     pub generation: u64,
     psk: [u8; 32],
 }
@@ -869,7 +868,7 @@ impl ExtensionCredential {
         }
     }
 
-    /// Derive a credential from a pairing secret string (§16.3.4): the PSK is
+    /// Derive a credential from a pairing secret string: the PSK is
     /// the blake3 hash of the installation id + the pairing secret, so the same
     /// pair always derives the same key deterministically.
     pub fn from_pairing(
@@ -889,13 +888,13 @@ impl ExtensionCredential {
         }
     }
 
-    /// Seal `payload` into an AEAD envelope (§16.3.4). Convenience form for
+    /// Seal `payload` into an AEAD envelope. Convenience form for
     /// tests and callers that do not need to override the default AAD.
     pub fn seal(&self, payload: &[u8]) -> Result<SecureExtensionEnvelope, EnvelopeError> {
         self.seal_with_aad(payload, EnvelopeAad::default())
     }
 
-    /// Seal `payload` into an AEAD envelope (§16.3.4): ciphertext hides the
+    /// Seal `payload` into an AEAD envelope: ciphertext hides the
     /// frame body, while AAD binds the generation, role/session, seq, binding
     /// generation, and credential generation so a frame cannot be replayed under
     /// a different session or generation.
@@ -926,7 +925,7 @@ impl ExtensionCredential {
         })
     }
 
-    /// Verify an envelope against this credential (§16.3.4 fail-closed): the
+    /// Verify an envelope against this credential: the
     /// installation must match, the generation must be ≥ the valid floor, and
     /// the AEAD tag must verify. Returns plaintext on success.
     pub fn open<'a>(
@@ -969,8 +968,8 @@ impl ExtensionCredential {
     }
 }
 
-/// Authenticated data for one secure extension frame (§16.3.4). These fields
-/// are not encrypted, but any change invalidates the AEAD tag.
+/// Authenticated data for one secure extension frame. These fields remain
+/// plaintext and are covered by the AEAD tag.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnvelopeAad {
     /// Envelope format version.
@@ -1006,7 +1005,7 @@ impl Default for EnvelopeAad {
     }
 }
 
-/// An AEAD-protected frame envelope (§16.3.4). The ciphertext is the serialized
+/// An AEAD-protected frame envelope. The ciphertext is the serialized
 /// business/control frame; AAD binds the envelope to the session/generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecureExtensionEnvelope {
@@ -1022,7 +1021,7 @@ pub struct SecureExtensionEnvelope {
     pub ciphertext: Vec<u8>,
 }
 
-/// Why an envelope failed to open (§16.3.4 fail-closed).
+/// Why an envelope failed to open.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EnvelopeError {
     /// The envelope names a different installation than the credential.

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "WebSocket protocol adapter (Gateway/Source, §18.1) for Nexus"
+description = "WebSocket protocol adapter for Nexus"
 
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "ws"] }

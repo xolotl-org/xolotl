@@ -1,12 +1,11 @@
-//! `Driver` — the implementation behind a Resource's interface methods (§7.2),
+//! `Driver` — the implementation behind a Resource's interface methods,
 //! plus the restricted [`DriverContext`] facade and the compiled
 //! [`DriverPlan`] dispatch table.
 //!
-//! A Driver is the handler side of a restricted effect (§1.1): it receives an
-//! input and returns an [`Outcome`], it does **not** receive a continuation and
-//! cannot resume. Sub-operations a driver issues run with the *caller's*
-//! authority and re-pass policy independently (§7.3) — a low-privilege Process
-//! calling a high-privilege Driver cannot escalate.
+//! A Driver is the handler side of a restricted effect: it receives an input
+//! and returns an [`Outcome`]. Sub-operations a driver issues run with the
+//! *caller's* authority and re-pass policy independently, which prevents a
+//! low-privilege Process from escalating through a high-privilege Driver.
 
 use async_trait::async_trait;
 use nexus_types::{
@@ -36,7 +35,7 @@ pub enum DriverError {
     Other(String),
 }
 
-/// Restricted facade handed to a [`Driver::call`] (§7.3). It does **not** grant
+/// Restricted facade handed to a [`Driver::call`]. It does **not** grant
 /// the driver any ambient authority: to cause further effects, a driver issues
 /// sub-operations through `submit`, which run with the original caller's
 /// identity and re-pass policy. Reads/writes of driver-local scratch go through
@@ -48,15 +47,15 @@ pub struct DriverContext {
     /// The calling Process (sub-operations inherit this caller).
     pub caller: nexus_types::ProcessId,
     /// The originating Operation id. Remote endpoint stubs use this to derive a
-    /// replay-stable invocation id (§16.3.3 / §6.1).
+    /// replay-stable invocation id.
     pub operation_id: Option<OperationId>,
-    /// Optional stream sink path for `OutputMode::Stream` results (§4.3).
+    /// Optional stream sink path for `OutputMode::Stream` results.
     pub stream_to: Option<nexus_types::Path>,
-    /// The provenance of the operation's input (§21.5). Drivers that persist
+    /// The provenance of the operation's input. Drivers that persist
     /// data (memory) consult this to derive low-trust flags from lineage rather
     /// than trusting a caller-supplied flag.
     pub taint: nexus_types::TaintSet,
-    /// The concrete target path of the operation (§12). For prefix-resolved
+    /// The concrete target path of the operation. For prefix-resolved
     /// Resources like `state://**`, the driver needs the actual path it was
     /// invoked against (the registered Resource name is just the pattern).
     pub target_path: Option<nexus_types::Path>,
@@ -83,20 +82,20 @@ impl DriverContext {
         }
     }
 
-    /// Attach the originating Operation id (§6.1). Drivers that do not need
+    /// Attach the originating Operation id. Drivers that do not need
     /// cross-process transport ignore it; remote endpoint stubs require it.
     pub fn with_operation_id(mut self, id: OperationId) -> Self {
         self.operation_id = Some(id);
         self
     }
 
-    /// Attach the operation's input taint (§21.5).
+    /// Attach the operation's input taint.
     pub fn with_taint(mut self, taint: nexus_types::TaintSet) -> Self {
         self.taint = taint;
         self
     }
 
-    /// Attach the concrete target path (§12 state-as-Operation).
+    /// Attach the concrete target path.
     pub fn with_target_path(mut self, path: nexus_types::Path) -> Self {
         self.target_path = Some(path);
         self
@@ -124,7 +123,7 @@ impl DriverContext {
 
     /// Record the provenance of the returned value. Ordinary drivers leave this
     /// pristine; state projections set it from the same read envelope as the
-    /// output value (§21.5).
+    /// output value.
     pub fn set_output_taint(&self, taint: nexus_types::TaintSet) {
         *self.output_taint.lock() = taint;
     }
@@ -135,13 +134,13 @@ impl DriverContext {
     }
 }
 
-/// The implementation behind interface methods (§7.2). Local drivers run
+/// The implementation behind interface methods. Local drivers run
 /// in-process; remote drivers are reached through an endpoint (the
 /// [`DriverPlan`] holds the dispatch detail).
 #[async_trait]
 pub trait Driver: Send + Sync + 'static {
     /// Invoke `method` with `input`, producing an [`Outcome`]. The driver does
-    /// not receive a continuation (§1.1): it returns once.
+    /// not receive a continuation: it returns once.
     async fn call(
         &self,
         method: MethodId,
@@ -154,7 +153,7 @@ pub trait Driver: Send + Sync + 'static {
 /// Shared driver handle.
 pub type DynDriver = Arc<dyn Driver>;
 
-/// Transport edge for a remote endpoint (§7.4 / §16.3.3). Concrete gRPC,
+/// Transport edge for a remote endpoint. Concrete gRPC,
 /// WebSocket, stdio, or test transports implement this; `DriverPlan` compiles
 /// endpoint bindings to a [`RemoteDriver`] that calls this interface.
 #[async_trait]
@@ -222,14 +221,14 @@ impl Driver for RemoteDriver {
     }
 }
 
-/// Descriptor of a driver implementation (control plane, §7.2).
+/// Descriptor of a driver implementation.
 #[derive(Clone)]
 pub struct DriverDescriptor {
     /// Stable driver id assigned by the registry.
     pub id: DriverId,
     /// Human-readable driver name for registry and console views.
     pub name: String,
-    /// Interfaces this driver implements (admission checks coverage, §7.2).
+    /// Interfaces this driver implements.
     pub implements: InterfaceSet,
     /// Local or remote transport shape used by this driver.
     pub transport: Transport,
@@ -246,9 +245,9 @@ pub struct DispatchEntry {
     pub driver: DynDriver,
 }
 
-/// A compiled dispatch table for one opened Resource (§7.1). Produced at
+/// A compiled dispatch table for one opened Resource. Produced at
 /// `open()` and frozen into the Handle; the data plane calls through it with no
-/// further resolution. `generation` matches the Binding link epoch (§14.3).
+/// further resolution. `generation` matches the Binding link epoch.
 #[derive(Clone)]
 pub struct DriverPlan {
     /// Driver descriptor selected by open.
@@ -260,7 +259,7 @@ pub struct DriverPlan {
     ///
     /// Handles, the open-plan cache, and the data plane all clone DriverPlan.
     /// Keep the frozen dispatch table shared so those clones stay O(1) Arc
-    /// bumps instead of duplicating the HashMap on every operation.
+    /// bumps per operation.
     table: Arc<HashMap<MethodId, DynDriver>>,
     /// Binding generation captured when the handle was opened.
     pub generation: u64,
@@ -287,7 +286,7 @@ impl DriverPlan {
     }
 
     /// Dispatch `method`. The data plane has already checked rights and policy
-    /// (§6); the plan only resolves and calls.
+    ///; the plan only resolves and calls.
     pub async fn call(
         &self,
         method: MethodId,

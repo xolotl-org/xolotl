@@ -1,7 +1,7 @@
-//! Fact read-side Driver (§9.4): `state://fact` / `state://fact/<process>/*`.
+//! Fact read-side Driver: `state://fact` / `state://fact/<process>/*`.
 //!
-//! Facts are the write-ahead source of truth (§9), written by the kernel. The
-//! read side is a capability-gated, **read-only** projection: `state://fact`
+//! Facts are the kernel-written operation records. The read side is a
+//! capability-gated, **read-only** projection: `state://fact`
 //! lists the append stream for audit / billing / trace projectors, while
 //! `state://fact/<process>` lists one process for why-not / replay tooling.
 //! This Driver never mutates anything — it only reads the FactStore.
@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 /// Method names in registration order for `state://fact/*`. Read-only:
 /// `read` is an Observation (it reflects external/durable state), not Pure, so
-/// its outcome is recorded when it feeds control flow (§9.2/§9.3).
+/// its outcome is recorded when it feeds control flow.
 pub const FACT_METHODS: &[MethodSpec] =
     &[MethodSpec::new("read", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external()];
 
@@ -40,11 +40,11 @@ impl FactDriver {
         m.insert("decision".into(), Value::Str(format!("{:?}", f.decision)));
         m.insert("replay".into(), Value::Str(format!("{:?}", f.replay)));
         m.insert("timestamp".into(), Value::Int(f.timestamp.get()));
-        // Surface the taint lineage for why-not tooling (§21.5).
+        // Surface the taint lineage for why-not tooling.
         let tainted = !f.taint.is_pristine();
         m.insert("tainted".into(), Value::Bool(tainted));
         m.insert("protected".into(), Value::Bool(f.taint.has_protected()));
-        // Audit tags (§21.3): the rule-independent structural projection
+        // Audit tags: the rule-independent structural projection
         // (sensitive_data / cross_identity) derived from this Fact alone.
         // Rule-driven tags (high_cost / compliance / alert) come from a projector
         // reading `state://kernel/audit/rules`; the always-on ones surface here.

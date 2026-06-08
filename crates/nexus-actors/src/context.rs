@@ -1,15 +1,16 @@
-//! Context Assembly (§20.5): `effect://context/assemble`.
+//! Context Assembly: `effect://context/assemble`.
 //!
-//! The hardest part of a chat agent is not *reading* a Sequence but deciding —
-//! within a finite token budget — what to inject, in what order, when to
-//! summarize, and when to evict. This Driver implements the §20.5 algorithm:
+//! Context assembly selects prompt material within a finite token budget. It
+//! decides what to inject, in what order, when to
+//! summarize, and when to evict. This Driver implements a layered assembly
+//! algorithm:
 //! fill layers high-priority-first until the budget runs out, and on overflow
 //! evict in reverse priority (oldest summary first; persona/environment anchors
 //! are never evicted). It is a pure function over its input layers — the caller
 //! pre-fetches each layer (persona, env anchor, recall, recent turns, summary,
 //! tool results) and this driver composes the final one-shot prompt.
 //!
-//! Layers (priority high→low, §20.5):
+//! Layers:
 //!   1. System / persona anchor (never evicted)
 //!   2. Environment anchor: time, available capabilities (never evicted)
 //!   3. Task Skills + recall (vector search + rerank), taint-tagged
@@ -32,7 +33,7 @@ pub const CONTEXT_METHODS: &[MethodSpec] = &[MethodSpec::new(
 )];
 
 /// Priority order of layers — index 0 is highest. The first two are anchors
-/// that are never evicted (§20.5).
+/// that are never evicted.
 const LAYER_ORDER: &[&str] = &[
     "persona",
     "environment",
@@ -43,7 +44,7 @@ const LAYER_ORDER: &[&str] = &[
 ];
 const NEVER_EVICT: usize = 2; // persona + environment
 
-/// Estimate tokens for a text fragment (≈ 4 chars/token, the §20.5 heuristic).
+/// Estimate tokens for a text fragment.
 fn est_tokens(s: &str) -> usize {
     s.len().div_ceil(4)
 }
@@ -93,7 +94,7 @@ impl Driver for ContextDriver {
             .cloned()
             .unwrap_or_default();
 
-        // Fill layers high-priority-first until the budget is exhausted (§20.5).
+        // Fill layers high-priority-first until the budget is exhausted.
         let mut included: Vec<(String, String, usize)> = Vec::new();
         let mut used = 0usize;
         for (i, layer) in LAYER_ORDER.iter().enumerate() {
@@ -118,14 +119,14 @@ impl Driver for ContextDriver {
         }
 
         // If anchors alone overflowed, evict from the back of the non-anchor
-        // layers until within budget (reverse-priority eviction, §20.5).
+        // layers until within budget.
         while used > budget && included.len() > NEVER_EVICT {
             if let Some((_, _, cost)) = included.pop() {
                 used = used.saturating_sub(cost);
             }
         }
 
-        // Compose the one-shot prompt in priority order (not persisted, §20.5).
+        // Compose the one-shot prompt in priority order.
         let prompt = included
             .iter()
             .map(|(name, text, _)| format!("## {name}\n{text}"))
@@ -233,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn anchors_survive_even_over_budget() {
         let d = ContextDriver::new();
-        // Budget is 1 token but the persona anchor is never evicted (§20.5).
+        // Budget is 1 token but the persona anchor is never evicted.
         let input = assemble_input(1, vec![("persona", "core identity must persist")]);
         let out = d
             .call(MethodId::new(0), input, OutputMode::Unary, &ctx())

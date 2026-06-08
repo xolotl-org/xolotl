@@ -1,14 +1,12 @@
 #![forbid(unsafe_code)]
 
-//! `nexusd` — the long-running Nexus host process, and the Layer-0 command
-//! line (§24.1).
+//! `nexusd` - the long-running Nexus host process and bootstrap command line.
 //!
 //! `nexusd` is both the command you run and the process that runs: like
 //! `sshd`/`dockerd`, the binary *is* the launcher. There is no separate CLI
-//! crate — that would only forward to this process. Per §18.4 the command line
-//! is for **launching the daemon only** and never a management channel;
-//! runtime management is the Web Console's job, over an audited,
-//! capability-bound Operation path.
+//! crate; that would only forward to this process. The command line is for
+//! **launching the daemon only** and never a management channel;
+//! runtime management is the Web Console's job.
 //!
 //! Usage:
 //!   nexusd                 launch the host (default)
@@ -17,9 +15,9 @@
 //!   nexusd --version | -V  print the version and exit
 //!   nexusd --help | -h     print usage and exit
 //!
-//! Bootstrap phases (§14.1): parse config → open state backend → mount
-//! FactSink → build registries + root Process → install in-process Drivers →
-//! (recover) → start Gateways (console, websocket, optional gRPC) → ready.
+//! Bootstrap sequence: parse config, open state and FactStore backends, build
+//! registries and the root Process, install in-process Drivers, recover, start
+//! gateways, and report ready.
 
 mod config;
 
@@ -39,7 +37,7 @@ const CONSOLE_ADDR_ENV: &str = "NEXUS_CONSOLE_ADDR";
 const WS_ADDR_ENV: &str = "NEXUS_WS_ADDR";
 
 const USAGE: &str = "\
-nexusd — the Nexus host process (Layer-0 launcher, §24.1)
+nexusd — the Nexus host process
 
 Usage:
   nexusd [up]            launch the host (default)
@@ -47,11 +45,11 @@ Usage:
   nexusd --version, -V   print the version and exit
   nexusd --help, -h      print this help and exit
 
-Management is the Web Console's job (§18.4); the command line only launches.";
+Management is the Web Console's job; the command line only launches.";
 
 fn main() -> Result<()> {
-    // Layer-0 command-line dispatch (§18.4: launch only, never management).
-    // Hand-rolled to keep the daemon's dependency set minimal — no clap.
+    // Command-line dispatch is hand-rolled to keep the daemon's dependency set
+    // minimal.
     match std::env::args().nth(1).as_deref() {
         Some("--version") | Some("-V") => {
             println!("nexusd {}", env!("CARGO_PKG_VERSION"));
@@ -62,10 +60,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("info") => {
-            println!("nexus {} — Direction-C kernel", env!("CARGO_PKG_VERSION"));
-            println!(
-                "management: Web Console only (§18.4); the command line only launches the host"
-            );
+            println!("nexus {} runtime kernel", env!("CARGO_PKG_VERSION"));
+            println!("management: Web Console only; the command line only launches the host");
             Ok(())
         }
         // Default and explicit `up` both launch the host.
@@ -97,7 +93,7 @@ async fn serve() -> Result<()> {
 
     let cfg = NexusConfig::load()?.unwrap_or_default();
 
-    // Phase 1-2: open the state backend + fact sink.
+    // Open the state backend and fact sink.
     let (state, facts): (Backend, FactSink) = match cfg.storage.kind.as_str() {
         "memory" => {
             tracing::info!("state + facts: in-memory (non-persistent)");
@@ -120,7 +116,7 @@ async fn serve() -> Result<()> {
         }
     };
 
-    // Phase 3-5: kernel, root Process, standard providers.
+    // Build the kernel, root Process, and standard providers.
     let kernel = Kernel::with_backends(state, facts);
     let boot = Arc::new(Bootstrap::from_kernel(kernel));
     let pairing_display = PairingDisplayEdge::default();
@@ -166,8 +162,8 @@ async fn serve() -> Result<()> {
         }
     }
 
-    // Phase 6: recover any unfinished Processes from their Fact streams,
-    // quarantining unsafe non-idempotent replays (§14.1 / §15.2).
+    // Recover unfinished Processes from their Fact streams, quarantining unsafe
+    // non-idempotent replays.
     let recovery = boot.recover_all().await?;
     if recovery.skipped + recovery.retried + recovery.quarantined > 0 {
         tracing::info!(
@@ -179,7 +175,7 @@ async fn serve() -> Result<()> {
         );
     }
 
-    // Phase 7: start gateways.
+    // Start gateways.
     let mut handles = Vec::new();
 
     if let Some(addr) = cfg
@@ -228,7 +224,7 @@ async fn serve() -> Result<()> {
     #[cfg(feature = "grpc")]
     start_grpc(&cfg, &boot, &mut handles).await?;
 
-    // Phase 8: ready.
+    // Mark the daemon ready.
     tracing::info!("nexusd ready");
     wait_for_shutdown().await?;
     for h in handles {

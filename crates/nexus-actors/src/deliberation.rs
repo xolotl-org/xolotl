@@ -1,15 +1,15 @@
-//! Deliberation (§20.4.1): `effect://deliberation/run`.
+//! Deliberation: `effect://deliberation/run`.
 //!
 //! Runs a panel of model "panelists" over one or more rounds and returns a
 //! verdict. Single-round fan-out (vote / synthesize) is the `rounds == 1`
 //! special case of multi-round debate: each round, every panelist responds to
 //! the running transcript; a judge checks convergence; if not converged and
-//! the round budget remains, another round runs (§20.4.1).
+//! the round budget remains, another round runs.
 //!
 //! This is the *driver* form, exposing deliberation as one standard effect.
 //! The same shape can be written directly as a recursive `Do<A>` in a Process
-//! (the design's primary framing) — both reduce to ordinary inference
-//! Operations, so taint is never laundered by debate and each call is budgeted.
+//! as well. Both forms reduce to inference Operations, so taint is
+//! never laundered by debate and each call is budgeted.
 
 use crate::inference::InferenceBackend;
 use async_trait::async_trait;
@@ -132,13 +132,13 @@ fn text_of(v: &Value) -> String {
     }
 }
 
-/// Convergence threshold for `judge` (§20.4.1). A round is "converged" when a
+/// Convergence threshold for `judge`. A round is "converged" when a
 /// majority of panelists agree (exactly, after normalization) OR the panel is
 /// highly self-similar lexically. Both are real judge predicates a pure `Step`
-/// can compute; a production judge can swap in a confidence-weighted scorer.
+/// can compute; another judge can use a confidence-weighted scorer.
 const SIMILARITY_THRESHOLD: f64 = 0.8;
 
-/// Judge predicate (§20.4.1): the panel has converged when either
+/// Judge predicate: the panel has converged when either
 /// (a) a strict majority share the same normalized answer, or
 /// (b) the mean pairwise lexical similarity clears [`SIMILARITY_THRESHOLD`].
 ///

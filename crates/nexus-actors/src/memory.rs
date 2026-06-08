@@ -1,25 +1,25 @@
-//! Memory Store (§17.2): `effect://memory/store`, `effect://memory/recall`,
+//! Memory Store: `effect://memory/store`, `effect://memory/recall`,
 //! `effect://memory/forget`, `effect://memory/commit`,
 //! `effect://memory/consolidate`.
 //!
-//! Memory is `state://memory/<owner>/*` underneath; this driver owns the access
-//! policy (store, recall, decay, consolidation), not the data. Each entry
-//! carries tier metadata (the `FactMeta` shape of §17.2): tier, weight,
+//! Memory data lives under `state://memory/<owner>/*`; this driver owns the
+//! access policy (store, recall, decay, consolidation). Each entry carries tier
+//! metadata: tier, weight,
 //! timestamps, access count, confidence, and provenance.
 //!
-//! **Recall goes through the Vector Index, not a linear scan** (§17.2). On store
-//! the entry's text is embedded and upserted into the [`IndexDriver`] under the
+//! Recall goes through the Vector Index. On store the entry's text is embedded
+//! and upserted into the [`IndexDriver`] under the
 //! owner's space; recall embeds the query, runs `index.search` for the nearest
 //! candidates, then fuses signals through the [`RankerDriver`] (semantic_sim +
 //! weight + recency + confidence) and truncates to k. Store/commit fail if an
 //! entry cannot be embedded and indexed, and `forget` deletes the corresponding
-//! index rows before removing state. This is the §17.2 pipeline (search → rank
-//! → token-budget) wired end to end. Skills (§20.6) are ordinary memory entries
+//! index rows before removing state. The search → rank → token-budget pipeline
+//! is wired end to end. Skills are memory entries
 //! under `skills/`.
 //!
-//! Memory-poison defense (§21.5): an entry whose operation input carries
-//! untrusted-content taint is tagged `low_trust` (derived, not caller-trusted)
-//! so re-injection into a prompt can apply a pollution check.
+//! Memory-poison defense: an entry whose operation input carries
+//! untrusted-content taint is tagged `low_trust` as a derived flag, so
+//! re-injection into a prompt can apply a pollution check.
 
 use crate::index::IndexDriver;
 use crate::inference::{EchoBackend, InferenceBackend};
@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Memory tiers (§17.2): Working (session) → Recent (decays) → LongTerm
+/// Memory tiers: Working (session) → Recent (decays) → LongTerm
 /// (consolidated) → Archive (cold).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Tier {
@@ -67,16 +67,16 @@ pub const MEMORY_METHODS: &[MethodSpec] = &[
     MethodSpec::new("forget", Purity::Effectful, MethodSpec::UNARY_ASYNC),
     // commit: promote/consolidate-friendly write with full metadata.
     MethodSpec::new("commit", Purity::Idempotent, MethodSpec::UNARY_ASYNC),
-    // consolidate: cluster + summarize Recent → LongTerm (the spine clusters by
-    // lexical overlap; production clusters by embedding cosine then summarizes
-    // via inference).
+    // consolidate: cluster + summarize Recent → LongTerm (the baseline clusters
+    // by lexical overlap; other configurations can cluster by embedding cosine
+    // and summarize via inference).
     MethodSpec::new("consolidate", Purity::Effectful, MethodSpec::UNARY_ASYNC),
 ];
 
 /// Drives the memory actions, backed by a state backend. Recall delegates to
 /// an in-process [`IndexDriver`] (ANN/cosine) + [`RankerDriver`] (signal fusion)
-/// rather than scanning state linearly (§17.2). `install_standard` wires the
-/// same Index/Ranker instances that are exposed as `effect://index/*` and
+/// for candidate retrieval and ordering. `install_standard` wires the same
+/// Index/Ranker instances that are exposed as `effect://index/*` and
 /// `effect://rank/*`; the direct handles here are the in-process dispatch form
 /// of that Resource delegation. The embedding backend turns entry/query text
 /// into vectors; the offline default is [`EchoBackend`].
@@ -109,7 +109,7 @@ impl MemoryDriver {
     }
 
     /// Share the same retrieval stack that is registered as `effect://index/*`
-    /// and `effect://rank/*` (§17.2).
+    /// and `effect://rank/*`.
     pub fn with_retrieval_stack(
         mut self,
         index: Arc<IndexDriver>,
@@ -120,25 +120,23 @@ impl MemoryDriver {
         self
     }
 
-    /// Override the embedding backend (production wires a real model; tests use
-    /// the deterministic baseline).
+    /// Override the embedding backend. Tests use the deterministic baseline.
     pub fn with_embedder(mut self, embedder: Arc<dyn InferenceBackend>) -> Self {
         self.embedder = embedder;
         self
     }
 
-    /// The index namespace for an owner + embedding space (§17.1/§17.2). Owner
-    /// isolation prevents cross-identity comparison; embedding-space isolation
-    /// rejects cross-model comparisons rather than inventing a meaningless
-    /// similarity.
+    /// The index namespace for an owner + embedding space. Owner isolation
+    /// bounds comparisons to one identity; embedding-space isolation rejects
+    /// cross-model comparisons.
     fn index_space(owner: &str, embedding_space: &str) -> String {
         format!("memory/{owner}/{embedding_space}")
     }
 
     /// Embed `text` into a `Vec<Value>` vector via the embedding backend's
-    /// `embed` (the baseline returns an inline `vector` field alongside the
-    /// TensorRef, §17.1). Memory's in-process index requires that inline vector;
-    /// production index drivers may dereference the TensorRef under the same
+    /// `embed`. The baseline returns an inline `vector` field alongside the
+    /// TensorRef. Memory's in-process index requires that inline vector; index
+    /// drivers with tensor storage may dereference the TensorRef under the same
     /// method contract.
     async fn embed_for_index(&self, text: &str) -> Result<EmbeddingForIndex, DriverError> {
         let out = self
@@ -195,14 +193,14 @@ impl Driver for MemoryDriver {
             .and_then(|v| v.as_str())
             .unwrap_or("global")
             .to_string();
-        // §21.5: low-trust is derived from the *operation's input lineage*, not
-        // a caller-supplied flag — an injected Plan can't launder untrusted
+        // Low-trust is derived from the operation's input lineage, not a
+        // caller-supplied flag. An injected Plan cannot launder untrusted
         // content into trusted memory by omitting `low_trust`. The caller flag
-        // can only *raise* the bit, never clear a taint-derived one.
+        // can only raise the bit, never clear a taint-derived one.
         let taint_low_trust = ctx.taint.has_untrusted_content();
         match method.get() {
             // store: append a memory entry to the owner's log, wrapping it with
-            // Working-tier metadata (§17.2 FactMeta shape).
+            // Working-tier metadata.
             0 => {
                 let entry = m.get("entry").cloned().unwrap_or(Value::Null);
                 let mut wrapped = wrap_entry(entry, Tier::Working, &m, taint_low_trust);
@@ -213,7 +211,7 @@ impl Driver for MemoryDriver {
                     .map_err(|e| DriverError::Other(e.to_string()))?;
                 Ok(Outcome::Done(Value::Bool(true)))
             }
-            // recall: nearest-k via the Vector Index + Ranker fusion (§17.2),
+            // recall: nearest-k via the Vector Index + Ranker fusion,
             // never a linear scan. Pipeline: embed query → index.search → load
             // candidate entries → rank.score (semantic_sim + weight + recency +
             // confidence) → truncate to k.
@@ -242,7 +240,7 @@ impl Driver for MemoryDriver {
                 Ok(Outcome::Done(Value::Null))
             }
             // commit: like store but with an explicit tier + confidence + the
-            // memory-poison low-trust tag (§21.5). The caller (a Memory Process)
+            // memory-poison low-trust tag. The caller (a Memory Process)
             // sets `low_trust` when the content came from untrusted provenance.
             3 => {
                 let entry = m.get("entry").cloned().unwrap_or(Value::Null);
@@ -260,11 +258,11 @@ impl Driver for MemoryDriver {
                     .map_err(|e| DriverError::Other(e.to_string()))?;
                 Ok(Outcome::Done(Value::Bool(true)))
             }
-            // consolidate (§17.2): cluster Recent/Working entries by similarity,
+            // consolidate: cluster Recent/Working entries by similarity,
             // emit a per-cluster summary at LongTerm tier (indexed so it's
-            // recallable), and down-weight the source entries. The offline spine
-            // summary is a deterministic concatenation; production calls
-            // inference to summarize — the seam is `summarize_cluster`.
+            // recallable), and down-weight the source entries. The baseline
+            // summary is deterministic concatenation; other configurations can
+            // call inference from `summarize_cluster`.
             4 => {
                 let entries = self.load_entries(&owner).await?;
                 let mut summaries = consolidate(&entries);
@@ -299,10 +297,9 @@ impl MemoryDriver {
     }
 
     /// Stamp a stable `_idx_id`/`_idx_space` onto `entry`, embed its text, and
-    /// upsert the vector into the owner+embedding index space (§17.2), so recall
-    /// can map a search hit back to this entry. This is not best-effort:
-    /// embedding/index failure aborts the memory write so state and index cannot
-    /// diverge.
+    /// upsert the vector into the owner+embedding index space, so recall can
+    /// map a search hit back to this entry. Embedding/index failure aborts the
+    /// memory write and keeps state/index alignment.
     async fn stamp_and_index(&self, owner: &str, entry: &mut Value) -> Result<(), DriverError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         let text = entry_text(entry);
@@ -368,7 +365,7 @@ impl MemoryDriver {
         Ok(())
     }
 
-    /// The §17.2 recall pipeline: embed query → `index.search` for the nearest
+    /// The  recall pipeline: embed query → `index.search` for the nearest
     /// candidate ids → load entries → `rank.score` signal fusion → top-k.
     async fn recall(&self, owner: &str, query: &str, k: usize) -> Result<Vec<Value>, DriverError> {
         let entries = self.load_entries(owner).await?;
@@ -453,7 +450,7 @@ impl MemoryDriver {
             return Ok(vec![]);
         }
 
-        // Fuse signals through the Ranker (§17.2).
+        // Fuse signals through the Ranker.
         let mut rank_in = BTreeMap::new();
         rank_in.insert("signals".into(), Value::List(signals));
         let ctx = DriverContext::new(
@@ -505,10 +502,10 @@ fn indexed_entry(entry: &Value) -> Option<(String, String)> {
     Some((space, id))
 }
 
-/// Wrap a raw entry into the §17.2 metadata envelope: tier, weight,
-/// confidence, access count, and the §21.5 `low_trust` poison tag. A raw
+/// Wrap a raw entry into the metadata envelope: tier, weight, confidence,
+/// access count, and the `low_trust` poison tag. A raw
 /// `entry` may itself be a map with `text`; we preserve it under `text`.
-/// `taint_low_trust` is derived from the operation's input lineage (§21.5);
+/// `taint_low_trust` is derived from the operation's input lineage;
 /// the caller's explicit `low_trust` flag may only *raise* the bit, never clear
 /// a taint-derived one — so untrusted provenance can't be laundered away.
 fn wrap_entry(
@@ -538,7 +535,7 @@ fn wrap_entry(
     );
     m.insert("access_count".into(), Value::Int(0));
     m.insert("low_trust".into(), Value::Bool(low_trust));
-    // Preserve any embedding metadata the caller attached (§17.1 space_id).
+    // Preserve any embedding metadata the caller attached.
     for key in ["space_id", "embedding_model", "tags", "media"] {
         if let Some(v) = input.get(key) {
             m.insert(key.into(), v.clone());
@@ -548,7 +545,7 @@ fn wrap_entry(
 }
 
 /// Cluster entries by lexical overlap and emit one LongTerm summary per cluster
-/// (§17.2 consolidate, spine form). Greedy: each unclustered entry seeds a
+/// Greedy: each unclustered entry seeds a
 /// cluster that absorbs entries overlapping above a threshold.
 fn consolidate(entries: &[Value]) -> Vec<Value> {
     const THRESHOLD: f64 = 0.34;
@@ -568,8 +565,8 @@ fn consolidate(entries: &[Value]) -> Vec<Value> {
             }
         }
         if cluster.len() >= 2 {
-            // Deterministic summary: join the cluster (production calls
-            // inference to summarize).
+            // Deterministic summary: join the cluster. Other configurations can
+            // call inference to summarize.
             let summary = format!("[consolidated] {}", cluster.join(" | "));
             let mut m = BTreeMap::new();
             m.insert("text".into(), Value::Str(summary));
@@ -604,7 +601,7 @@ fn entry_text(v: &Value) -> String {
 }
 
 /// Lexical overlap score in [0,1] — a deterministic stand-in for vector cosine
-/// similarity (the ranking seam where ANN/rerank plug in, §17.2).
+/// similarity.
 fn overlap(query: &str, text: &str) -> f64 {
     let q: std::collections::BTreeSet<&str> = query.split_whitespace().collect();
     if q.is_empty() {
@@ -632,8 +629,8 @@ mod tests {
 
     /// A deterministic test embedder that maps text to a fixed-dim bag-of-words
     /// vector over a small vocabulary, so cosine similarity reflects shared
-    /// words. Exercises the recall pipeline with semantically meaningful vectors
-    /// (the production seam where a real embedding model plugs in).
+    /// words. Exercises the recall pipeline with semantically meaningful
+    /// vectors.
     struct BagOfWordsEmbedder;
     #[async_trait]
     impl InferenceBackend for BagOfWordsEmbedder {
@@ -676,7 +673,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_then_recall_ranks_by_overlap() {
-        // Recall now goes through the Vector Index + Ranker (§17.2), not a linear
+        // Recall now goes through the Vector Index + Ranker, not a linear
         // scan. We inject a deterministic bag-of-words embedder so cosine
         // similarity is semantically meaningful (the baseline blake3 embedder is
         // content-hash, not semantic — it exercises the *pipeline* but can't rank
@@ -766,10 +763,10 @@ mod tests {
 
     #[tokio::test]
     async fn store_derives_low_trust_from_operation_taint() {
-        // §21.5: even without the caller setting `low_trust`, a store whose
-        // operation input carries untrusted-content taint (model/inbound/fetch)
-        // is tagged low_trust — the kernel derives it from lineage, so an
-        // injected Plan can't launder untrusted content by omitting the flag.
+        // Even without the caller setting `low_trust`, a store whose operation
+        // input carries untrusted-content taint is tagged low_trust. The kernel
+        // derives it from lineage, so an injected Plan cannot launder untrusted
+        // content by omitting the flag.
         use nexus_types::{TaintSet, TaintSource};
         let state: Backend = Arc::new(InMemoryBackend::new());
         let d = MemoryDriver::new(state).with_embedder(Arc::new(BagOfWordsEmbedder));
@@ -809,8 +806,8 @@ mod tests {
 
     #[tokio::test]
     async fn commit_tags_low_trust_for_poison_defense() {
-        // §21.5: an entry committed from untrusted content is tagged low_trust
-        // so re-injection can apply a pollution check.
+        // An entry committed from untrusted content is tagged low_trust so
+        // re-injection can apply a pollution check.
         let state: Backend = Arc::new(InMemoryBackend::new());
         let d = MemoryDriver::new(state).with_embedder(Arc::new(BagOfWordsEmbedder));
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));

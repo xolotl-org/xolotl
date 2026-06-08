@@ -30,7 +30,7 @@ rust-version = "1.95"
 license      = "MIT"
 authors      = ["noctiro"]
 repository   = "https://github.com/noctiro/nexus"
-description  = "Nexus — AI Identity Runtime (microkernel + algebraic effects + actor system)"
+description  = "Capability runtime for model calls, tool access, memory, state, and extensions"
 
 [profile.release]
 opt-level     = 3

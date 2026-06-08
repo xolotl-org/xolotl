@@ -1,4 +1,4 @@
-//! Console authentication and authorization (§18.5).
+//! Console authentication and authorization.
 //!
 //! Credentials stay outside Operation input and Facts. Account records live
 //! under `state://kernel/console/*`; password/session/TOTP secrets live under
@@ -2234,7 +2234,7 @@ mod tests {
         assert!(validate_username("alice_1").is_ok());
         assert!(validate_username("bad/name").is_err());
         assert!(validate_username(".bad").is_err());
-        assert!(validate_username("含").is_err());
+        assert!(validate_username("\u{542b}").is_err());
     }
 
     #[tokio::test]

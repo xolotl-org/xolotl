@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "gRPC protocol adapter (Gateway, §18.1) for Nexus"
+description = "gRPC protocol adapter for Nexus"
 
 [dependencies]
 nexus-gateway = { version = "0.1.0", path = "../nexus-gateway" }

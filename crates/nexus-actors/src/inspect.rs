@@ -1,6 +1,6 @@
-//! Kernel process inspection driver (§18.4 / §24.3).
+//! Kernel process inspection driver.
 //!
-//! The Console reaches runtime state through this ordinary effect, so inspect
+//! The Console reaches runtime state through this effect, so inspect
 //! reads are capability-gated Operations and recorded in the Fact stream.
 
 use async_trait::async_trait;

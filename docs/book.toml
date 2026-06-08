@@ -1,0 +1,9 @@
+[book]
+title = "Nexus Manual"
+authors = ["noctiro"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/noctiro/nexus"
+edit-url-template = "https://github.com/noctiro/nexus/edit/main/docs/{path}"

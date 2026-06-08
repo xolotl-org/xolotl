@@ -1,16 +1,16 @@
-//! Process / Extension runtime (§16.3): `effect://proc/spawn`,
+//! Process / Extension runtime: `effect://proc/spawn`,
 //! `effect://proc/kill`, `effect://proc/signal`, `effect://proc/status`,
 //! `effect://proc/heartbeat`, and the ExtensionManager reconcile loop.
 //!
 //! `ProcDriver` is the privileged Driver that manages out-of-process extension
-//! instances (§16.3.1). Each action it takes is an Operation (records a Fact)
-//! and the live process state is an ordinary State Resource at
+//! instances. Each action it takes is an Operation (records a Fact)
+//! and the live process state is a State Resource at
 //! `state://kernel/procs/<id>/status` — there is no kernel special case. In the
 //! standard in-process implementation Stdio specs really fork/exec a child
 //! process; Grpc/WebSocket/Http specs are connection targets for the endpoint
 //! supervisor and are tracked as `starting` until that layer reports readiness.
 //!
-//! `ExtensionManager` (§16.3.4) is an ordinary supervision routine: it compares
+//! `ExtensionManager` is a supervision routine: it compares
 //! the desired set of extension installations
 //! (`state://kernel/extension-installations/*`) against the live process states
 //! and drives them toward the desired phase.
@@ -27,7 +27,7 @@ use tokio::process::{Child, Command};
 
 /// Internal method names in registration order. `install_standard` exposes each
 /// one as a separate `effect://proc/<method>` Resource with public method
-/// `invoke`. All lifecycle mutations are Effectful (§16.3.1); `status` is a
+/// `invoke`. All lifecycle mutations are Effectful; `status` is a
 /// pure read of external process state.
 pub const PROC_METHODS: &[MethodSpec] = &[
     MethodSpec::new("spawn", Purity::Effectful, MethodSpec::UNARY_ASYNC),
@@ -37,7 +37,7 @@ pub const PROC_METHODS: &[MethodSpec] = &[
     MethodSpec::new("heartbeat", Purity::Effectful, MethodSpec::UNARY_ASYNC),
 ];
 
-/// Process lifecycle phases (§16.3.1).
+/// Process lifecycle phases.
 pub const PHASE_STARTING: &str = "starting";
 /// External process is ready to serve endpoint traffic.
 pub const PHASE_READY: &str = "ready";
@@ -46,7 +46,7 @@ pub const PHASE_DRAINING: &str = "draining";
 /// External process is stopped.
 pub const PHASE_DEAD: &str = "dead";
 
-/// The privileged Driver that manages external extension processes (§16.3.1).
+/// The privileged Driver that manages external extension processes.
 pub struct ProcDriver {
     state: Backend,
     children: Arc<Mutex<BTreeMap<String, LiveChild>>>,
@@ -75,7 +75,7 @@ impl ProcDriver {
             .map_err(|e| DriverError::Other(format!("invalid proc id {id:?}: {e}")))
     }
 
-    /// Build a process's health path (§16.3.1): `last_heartbeat`, `rtt_ms`,
+    /// Build a process's health path: `last_heartbeat`, `rtt_ms`,
     /// `inflight` live here, updated on each heartbeat.
     fn health_path(id: &str) -> Result<Path, DriverError> {
         Path::parse(&format!("state://kernel/procs/{id}/health"))
@@ -280,7 +280,7 @@ impl Driver for ProcDriver {
                     self.read_status(&id).await?.unwrap_or(Value::Null),
                 ))
             }
-            // heartbeat: record liveness to the health path (§16.3.1). Input may
+            // heartbeat: record liveness to the health path. Input may
             // carry `rtt_ms` / `inflight`; we stamp `last_heartbeat` from the
             // clock so a supervisor can detect a silent (hung) process.
             4 => {
@@ -416,7 +416,7 @@ async fn send_signal(_pid: u32, sig: &str) -> Result<(), DriverError> {
     )))
 }
 
-/// Reconcile the desired extension set against live process states (§16.3.4).
+/// Reconcile the desired extension set against live process states.
 /// For each desired extension whose process is absent or `dead`, this returns
 /// the `id`s that need (re)starting. A supervision Process calls `proc/spawn`
 /// on each. Pure over its inputs (no I/O) so it is easy to test and replay.
@@ -431,7 +431,7 @@ pub fn reconcile(desired_ids: &[String], live: &BTreeMap<String, String>) -> Vec
         .collect()
 }
 
-/// What a restart policy decides for a crashed process (§16.3.1).
+/// What a restart policy decides for a crashed process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SuperviseDecision {
     /// Restart now (no delay).
@@ -441,11 +441,11 @@ pub enum SuperviseDecision {
         /// Delay before attempting the restart.
         delay_ms: u64,
     },
-    /// Stop at Dead and alarm — the crash budget is exhausted (§16.3.1).
+    /// Stop at Dead and alarm — the crash budget is exhausted.
     GiveUp,
 }
 
-/// Evaluate a restart policy for a process that has crashed (§16.3.1). Given
+/// Evaluate a restart policy for a process that has crashed. Given
 /// the number of failures already seen *within the policy window* and the
 /// current attempt's backoff index, decide whether to restart (and how long to
 /// wait) or stop at Dead. Pure → testable; the supervision Process applies it.

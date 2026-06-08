@@ -1,14 +1,15 @@
-//! Vector Index (§17.2): `effect://index/upsert`,
+//! Vector Index: `effect://index/upsert`,
 //! `effect://index/search`, `effect://index/delete`.
 //!
-//! Retrieval goes through a Vector Index, **not** a linear scan over memory
-//! (§17.2). This crate ships an in-memory ANN index using deterministic random
+//! Retrieval goes through a Vector Index. This crate ships an in-memory ANN
+//! index using deterministic random
 //! hyperplane LSH; tiny spaces use exact cosine scoring, while larger spaces
 //! score only a bounded candidate set. The same method contract can be backed
-//! by HNSW / Faiss / pgvector in production, so `recall` code never changes.
-//! The `space_id` isolates vectors from different embedding models (§17.1): a
-//! search in one space never compares against another, and a cross-space query
-//! is rejected rather than returning a meaningless score.
+//! by other vector stores, so `recall` code does not depend on one index
+//! implementation.
+//! The `space_id` isolates vectors from different embedding models: a
+//! search in one space is evaluated only against that same space, and a
+//! cross-space query is rejected.
 
 use async_trait::async_trait;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};
@@ -31,7 +32,7 @@ pub const INDEX_METHODS: &[MethodSpec] = &[
 
 /// Exact search is still cheaper and more accurate for small local indexes.
 /// Above this size, the driver switches to ANN candidate generation so
-/// million-vector recall cannot degrade into a full scan (§28).
+/// million-vector recall cannot degrade into a full scan.
 const EXACT_SEARCH_LIMIT: usize = 4096;
 const LSH_TABLES: usize = 16;
 const LSH_BITS: usize = 6;
@@ -273,7 +274,7 @@ impl SpaceIndex {
     }
 }
 
-/// In-memory vector index, partitioned by `space_id` (§17.1). Shared + cheap to
+/// In-memory vector index, partitioned by `space_id`. Shared + cheap to
 /// clone (the store is `Arc`-wrapped) so the Driver can be registered once.
 #[derive(Clone, Default)]
 pub struct IndexDriver {
@@ -675,8 +676,7 @@ mod tests {
     async fn unknown_space_is_rejected() {
         let d = IndexDriver::new();
         upsert(&d, "s1", "a", &[1.0, 0.0]).await;
-        // Search a different space rejects instead of returning a misleading
-        // "no results" answer (§17.1/§17.2).
+        // Searching a different space is rejected.
         let mut q = BTreeMap::new();
         q.insert("space_id".into(), Value::Str("s2".into()));
         q.insert("query_vec".into(), vec_val(&[1.0, 0.0]));

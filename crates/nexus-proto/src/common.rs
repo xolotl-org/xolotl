@@ -3,7 +3,7 @@
 // module so the crate builds without `protoc`. Keep it in sync with the
 // `.proto` spec if either changes.
 
-/// Universal addressing primitive.
+/// Universal addressing type.
 /// String form: `path://[cluster/]<scheme>/<seg>[/<seg>...]`.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Path {
@@ -50,7 +50,7 @@ pub mod value {
         StreamEndVal(super::StreamMarker),
     }
 }
-/// End-of-stream sentinel for streamed value sequences (§4.4 / state append).
+/// End-of-stream sentinel for streamed value sequences.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StreamMarker {
     #[prost(oneof = "stream_marker::Kind", tags = "1, 2")]
@@ -78,7 +78,7 @@ pub struct MapValue {
     #[prost(map = "string, message", tag = "1")]
     pub entries: ::std::collections::HashMap<::prost::alloc::string::String, Value>,
 }
-/// Pointer to large opaque content in blob storage (§4.4).
+/// Pointer to large opaque content in blob storage.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BlobRef {
     #[prost(string, tag = "1")]
@@ -153,7 +153,7 @@ pub struct CapSet {
     #[prost(message, repeated, tag = "1")]
     pub capabilities: ::prost::alloc::vec::Vec<Capability>,
 }
-/// Null singleton (§proto3 well-known pattern).
+/// Null singleton.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum NullValue {

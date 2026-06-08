@@ -69,8 +69,8 @@ pub enum TrustLevel {
     Sandboxed,
 }
 
-/// A single Effect this provider can handle (§16.2). Carries enough metadata
-/// for modality-aware routing (§17.1) and schema-versioned wire contracts.
+/// A single Effect this provider can handle. Carries enough metadata
+/// for modality-aware routing and schema-versioned wire contracts.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EffectCapability {
     /// Effect resource path this capability handles.
@@ -83,14 +83,14 @@ pub struct EffectCapability {
     /// Optional input schema descriptor.
     #[serde(default)]
     pub input_schema: Option<Value>,
-    /// Output schema (§16.2) — lets the router validate / project the result.
+    /// Output schema — lets the router validate / project the result.
     #[serde(default)]
     pub output_schema: Option<Value>,
-    /// Modalities this effect accepts/produces (§16.2 / §17.1), for
+    /// Modalities this effect accepts/produces, for
     /// modality-aware routing. `None` = text-only by default.
     #[serde(default)]
     pub modality: Option<crate::resource::ModalitySet>,
-    /// Wire schema version (§16.2 / §26), bumped on a breaking I/O change.
+    /// Wire schema version, bumped on a breaking I/O change.
     #[serde(default)]
     pub schema_version: u32,
 }

@@ -1,20 +1,20 @@
-//! `Do<A>` — the preferred, serializable Program front-end (§13.3).
+//! `Do<A>` — the preferred, serializable Program front-end.
 //!
 //! `Do<A>` is a computation AST that **compiles into** an
-//! [`ExecutionGraph`](crate::graph::ExecutionGraph) — it is *not* something the
-//! Executor matches on directly (that is the graph, see [`crate::compile`]). It exists
-//! because async call stacks are unserializable, unrecoverable, and unfit for
-//! model-generated plans.
+//! [`ExecutionGraph`](crate::graph::ExecutionGraph). The Executor runs the
+//! compiled graph, see [`crate::compile`]. `Do<A>` exists because async call
+//! stacks are unserializable, unrecoverable, and unfit for model-generated
+//! plans.
 //!
-//! Nine combinators, each with a fixed graph-compilation rule (§13.3). Steps
-//! are **named, pure** `Value -> Do<A>` continuations — never closures (which
-//! cannot be serialized and would be a cross-identity code-injection backdoor).
+//! Nine combinators, each with a fixed graph-compilation rule. Steps
+//! are **named, pure** `Value -> Do<A>` continuations. Named continuations are
+//! serializable and avoid cross-identity code injection.
 
 use crate::graph::{OperationTemplate, StepRef, WaitSpec};
 use nexus_types::{Failure, Path, Value};
 use serde::{Deserialize, Serialize};
 
-/// The nine combinators plus an `Op` leaf and a `Wait` leaf (§13.3). Erased
+/// The nine combinators plus an `Op` leaf and a `Wait` leaf. Erased
 /// over the `A` type parameter — the kernel validates the Outcome shape at the
 /// boundary, the AST itself flows as data.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -36,7 +36,7 @@ pub enum DoNode {
         /// Named recovery step invoked with the failure value.
         or: StepRef,
     },
-    /// Run both; result is the pair (async I/O overlap, §13.4).
+    /// Run both; result is the pair.
     Both(Box<DoNode>, Box<DoNode>),
     /// Run both; first to complete wins, the other is cancelled.
     Race(Box<DoNode>, Box<DoNode>),
@@ -51,7 +51,7 @@ pub enum DoNode {
     },
     /// Reference a `Let`-bound name.
     Use(String),
-    /// Run `body` under a block-level identity (`act-as`, §13.2).
+    /// Run `body` under a block-level identity.
     Acting {
         /// Identity path to act as for operations inside `body`.
         identity: Path,
@@ -60,7 +60,7 @@ pub enum DoNode {
     },
     /// Inject a failure (propagates to the nearest enclosing `Branch`).
     Fail(Failure),
-    /// Block until a signal path is written or a wall-clock deadline (§13.2).
+    /// Block until a signal path is written or a wall-clock deadline.
     Wait(WaitSpec),
     /// The side-effecting leaf: issue one Operation.
     Op(OperationTemplate),
@@ -89,7 +89,7 @@ impl DoNode {
             then,
         }
     }
-    /// `map` (§20.1): project the result through a **pure** Step. `map<B>`
+    /// `map`: project the result through a **pure** Step. `map<B>`
     /// desugars to `AndThen` into a pure projecting Step — it is a named alias
     /// of [`and_then`](Self::and_then) whose contract is that `step` performs
     /// no effects (it returns `Pure(f(value))`). Use this for value reshaping;
@@ -138,7 +138,7 @@ impl DoNode {
         }
     }
 
-    /// Wait until `path` is written (§13.2).
+    /// Wait until `path` is written.
     pub fn wait_signal(path: Path) -> Self {
         DoNode::Wait(WaitSpec::Signal(path))
     }
@@ -147,7 +147,7 @@ impl DoNode {
         DoNode::Wait(WaitSpec::Deadline(at_millis))
     }
 
-    /// Bracket pattern (§20.1): acquire → use → release-on-any-exit. `release`
+    /// Bracket pattern: acquire → use → release-on-any-exit. `release`
     /// runs whether `body_step` succeeds or fails, like try-finally.
     pub fn bracket(acquire: DoNode, body_step: StepRef, release_step: StepRef) -> Self {
         DoNode::Let {
@@ -164,16 +164,16 @@ impl DoNode {
         }
     }
 
-    /// Bounded `retry` (§20.1): "展开为 OrElse + Let 计数" — desugars to a chain
-    /// of [`OrElse`](DoNode::OrElse) so that each failure routes to `recover`,
-    /// which is expected to re-attempt the work.
+    /// Bounded `retry`: desugars to a chain of [`OrElse`](DoNode::OrElse) so
+    /// that each failure routes to `recover`, which is expected to re-attempt
+    /// the work.
     ///
     /// Because Steps are **named, pure continuations** (never closures) and the
-    /// AST has no loop primitive, the bound is encoded *structurally*: we nest
+    /// AST has no loop node, the bound is encoded *structurally*: we nest
     /// `OrElse` `max` times, giving up to `max` additional attempts after the
     /// initial run (so `max + 1` total tries). With `max == 0` the program is
-    /// returned unchanged (no retry). The counter the design alludes to is the
-    /// fixed nesting depth here — fully serializable, no runtime loop.
+    /// returned unchanged (no retry). The retry count is represented by the
+    /// fixed nesting depth here: fully serializable, with no runtime loop.
     ///
     /// ```text
     /// retry(d, 2, recover)
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn map_builds_and_then() {
-        // §20.1: `map` is sugar for `AndThen` into a pure projecting Step.
+        // `map` is sugar for `AndThen` into a pure projecting Step.
         let d = DoNode::op(op("effect://x/post")).map(s("project"));
         match d {
             DoNode::AndThen { then, .. } => assert_eq!(then.name, "project"),

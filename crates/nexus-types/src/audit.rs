@@ -1,7 +1,7 @@
-//! Audit projection (§21.3 / §9.1): audit is **not** a separate log — it is a
-//! derived projection over the Fact stream that attaches tags, indexes, and
-//! alerts. Rules live in `state://kernel/audit/rules` and hot-update; this
-//! module is the pure, wasm-safe derivation a projector applies to each Fact.
+//! Audit projection: audit is derived from the Fact stream and attaches tags,
+//! indexes, and alerts. Rules live in `state://kernel/audit/rules` and
+//! hot-update; this module is the pure, wasm-safe derivation a projector
+//! applies to each Fact.
 //!
 //! The kernel never writes a second audit record; a projector reads Facts and
 //! emits [`AuditTag`]s, which downstream tooling indexes or alerts on.
@@ -9,7 +9,7 @@
 use crate::operation::{DecisionTag, Fact};
 use serde::{Deserialize, Serialize};
 
-/// A tag a projector attaches to a Fact (§21.3). These are the standard audit
+/// A tag a projector attaches to a Fact. These are the standard audit
 /// classifications; `Custom` carries rule-defined labels.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "tag")]
@@ -41,7 +41,7 @@ pub enum AuditTag {
     },
 }
 
-/// Hot-updatable audit rules (`state://kernel/audit/rules`, §21.3). Empty rules
+/// Hot-updatable audit rules. Empty rules
 /// still produce the structural tags (sensitive_data / cross_identity) that are
 /// derivable from the Fact alone.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -58,7 +58,7 @@ pub struct AuditRules {
 }
 
 impl AuditRules {
-    /// Derive the audit tags for one Fact (§9.1 projection). `cost_micro_usd` is
+    /// Derive the audit tags for one Fact. `cost_micro_usd` is
     /// the settled cost the billing projection computed for this op (0 if free
     /// / unknown). The result is purely a function of the Fact + rules, so it is
     /// reproducible and needs no separate log.
@@ -75,7 +75,7 @@ impl AuditRules {
         // Cross-identity: the running process acts as an identity other than the
         // kernel's default for it. We approximate with caller≠acting hashing:
         // the caller process id and acting identity diverging is the signal a
-        // delegation occurred (§21.3). Callers map process→identity upstream;
+        // delegation occurred. Callers map process→identity upstream;
         // here we surface any non-root acting under a different-id caller.
         if fact.acting != crate::IdentityRef::ROOT && fact.acting.get() != fact.caller.get() {
             tags.push(AuditTag::CrossIdentity);

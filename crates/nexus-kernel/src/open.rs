@@ -1,7 +1,7 @@
-//! `open()` = compile (§5.2): turn a Grant + Resource + Policy + Binding into a
+//! `open()` = compile: turn a Grant + Resource + Policy + Binding into a
 //! closed, executable [`Handle`]. This is the only way a Handle is created.
 //!
-//! The seven compile steps (§5.2):
+//! The seven compile steps:
 //!
 //! ```text
 //! 1. find holder==process grant whose selector hits the resource
@@ -9,7 +9,7 @@
 //! 3. check static (open-time) constraints
 //! 4. compile applicable Policy → PolicySnapshot, partially evaluating
 //! 5. read Binding → build DriverPlan (local inline / remote stub)
-//! 6. residual empty? → mark Unconditional (§5.5)
+//! 6. residual empty? → mark Unconditional
 //! 7. allocate (index, generation) slot in HandleTable, return Handle
 //! ```
 
@@ -53,8 +53,8 @@ pub enum OpenError {
     /// A source policy denied the open before a handle was created.
     #[error("a source policy denied the open: {0}")]
     PolicyDenied(String),
-    /// Reserved state paths cannot be opened through ordinary grants.
-    #[error("reserved path cannot be opened through ordinary state grants: {0}")]
+    /// Reserved state paths cannot be opened through non-kernel grants.
+    #[error("reserved path cannot be opened through non-kernel state grants: {0}")]
     ReservedPath(String),
 }
 
@@ -69,12 +69,12 @@ pub struct OpenRequest {
     pub verb: String,
     /// Rights requested for the resulting handle.
     pub rights: Rights,
-    /// The identity the opening Process acts as (§5.2 step 4 / §8.1). Carried
+    /// The identity the opening Process acts as. Carried
     /// into the [`OpenContext`] so identity-scoped policy checks can be
     /// partially evaluated and eliminated at open time. Defaults to
     /// [`IdentityRef::ROOT`] only for the kernel's own internal opens.
     pub acting: IdentityRef,
-    /// The concrete path the caller asked to open (§12). For prefix-resolved
+    /// The concrete path the caller asked to open. For prefix-resolved
     /// Resources (`state://**`) this is the specific path beneath the registered
     /// root, and becomes the handle's `bound_path` so the driver reaches the
     /// real path. `None` falls back to the resolved Resource's own name.
@@ -83,7 +83,7 @@ pub struct OpenRequest {
     pub now_millis: i64,
 }
 
-/// Compile and install a Handle (§5.2). On success the Handle is in the table
+/// Compile and install a Handle. On success the Handle is in the table
 /// and its [`HandleId`] is returned.
 pub fn open_resource(
     registry: &Registry,
@@ -95,8 +95,8 @@ pub fn open_resource(
         .resource(req.resource)
         .ok_or(OpenError::NoSuchResource(req.resource))?;
     // The path used for grant/selector matching and as the handle's bound path
-    // is the *requested* concrete path when given (prefix-resolved Resources,
-    // §12), else the resolved Resource's own name.
+    // is the *requested* concrete path when given; otherwise it is the resolved
+    // Resource's own name.
     let match_path = req
         .requested_path
         .clone()
@@ -111,7 +111,7 @@ pub fn open_resource(
         return Err(OpenError::ReservedPath(resource_name.to_string()));
     }
 
-    // Step 1+2 fused (§5.2): find a grant held by the process that both hits
+    // Step 1+2 fused: find a grant held by the process that both hits
     // the resource via its selector AND covers the requested rights. Fusing the
     // two checks is required: a process may hold several grants matching the
     // same resource (e.g. one for method X, one for method Y). Picking the first
@@ -163,7 +163,7 @@ pub fn open_resource(
 
     // Step 4: compile policy → snapshot with partial evaluation. The residual
     // is the input-dependent part of (a) the grant's own constraints and (b)
-    // every registered source policy that applies to this open (§8). The
+    // every registered source policy that applies to this open. The
     // open-time decidable parts are evaluated and eliminated.
     let mut snapshot = compile_policy_snapshot(&constraints);
     let open_ctx = OpenContext {
@@ -227,7 +227,7 @@ pub fn open_resource(
         }
     }
 
-    // Step 6: residual empty → Unconditional (§5.5).
+    // Step 6: residual empty → Unconditional.
     let fast_path = if snapshot.is_empty() {
         FastPath::Unconditional
     } else {
@@ -258,13 +258,13 @@ fn handle_from_plan(
         driver_plan: plan.driver_plan,
         fast_path: plan.fast_path,
         state: HandleState::Active,
-        // The concrete path this handle addresses (§12), so prefix-resolved
+        // The concrete path this handle addresses, so prefix-resolved
         // Resources (state://**) reach the driver with the real path.
         bound_path,
     }
 }
 
-/// Compile a constraint set into a residual [`PolicySnapshot`] (§8.1). An empty
+/// Compile a constraint set into a residual [`PolicySnapshot`]. An empty
 /// constraint set produces an empty (Unconditional) snapshot.
 fn compile_policy_snapshot(constraints: &ConstraintSet) -> PolicySnapshot {
     if constraints.is_empty() {
@@ -276,7 +276,7 @@ fn compile_policy_snapshot(constraints: &ConstraintSet) -> PolicySnapshot {
     }
 }
 
-/// Derive a child handle by attenuation (§5.3): rights must be a subset and the
+/// Derive a child handle by attenuation: rights must be a subset and the
 /// requested derivation kind must be permitted by the parent's flags.
 pub fn derive_handle(
     handles: &mut HandleTable,
@@ -733,7 +733,7 @@ mod tests {
         // A process holds TWO grants hitting the same resource: the first (by
         // registration order) covers only derive flags but NO methods; the
         // second covers method 0. Requesting method 0 must succeed by selecting
-        // the *covering* grant, not spuriously fail on the first match (§5.2).
+        // the *covering* grant, not spuriously fail on the first match.
         let reg = Registry::new();
         let rid = setup_resource(&reg, "effect://x/post");
         // Grant A: matches selector, but rights cover no methods.
