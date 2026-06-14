@@ -1,8 +1,8 @@
-//! Process / Extension runtime: `effect://proc/spawn`,
+//! External process runtime: `effect://proc/spawn`,
 //! `effect://proc/kill`, `effect://proc/signal`, `effect://proc/status`,
-//! `effect://proc/heartbeat`, and the ExtensionManager reconcile loop.
+//! `effect://proc/heartbeat`, and the process reconcile loop.
 //!
-//! `ProcDriver` is the privileged Driver that manages out-of-process extension
+//! `ProcDriver` is the privileged Driver that manages out-of-process external
 //! instances. Each action it takes is an Operation (records a Fact)
 //! and the live process state is a State Resource at
 //! `state://kernel/procs/<id>/status` — there is no kernel special case. In the
@@ -10,9 +10,9 @@
 //! process; Grpc/WebSocket/Http specs are connection targets for the endpoint
 //! supervisor and are tracked as `starting` until that layer reports readiness.
 //!
-//! `ExtensionManager` is a supervision routine: it compares
-//! the desired set of extension installations
-//! (`state://kernel/extension-installations/*`) against the live process states
+//! The manager is a supervision routine: it compares
+//! the desired set of external installations
+//! (`state://kernel/external-installations/*`) against the live process states
 //! and drives them toward the desired phase.
 
 use async_trait::async_trait;
@@ -46,7 +46,7 @@ pub const PHASE_DRAINING: &str = "draining";
 /// External process is stopped.
 pub const PHASE_DEAD: &str = "dead";
 
-/// The privileged Driver that manages external extension processes.
+/// The privileged Driver that manages external processes.
 pub struct ProcDriver {
     state: Backend,
     children: Arc<Mutex<BTreeMap<String, LiveChild>>>,
@@ -226,7 +226,7 @@ impl Driver for ProcDriver {
     ) -> Result<Outcome, DriverError> {
         let m = input.as_map().cloned().unwrap_or_default();
         match method.get() {
-            // spawn: bring up (or connect to) the extension process. Stdio
+            // spawn: bring up (or connect to) the external process. Stdio
             // specs fork/exec here; endpoint transports are tracked as
             // Starting until EndpointSupervisor reports readiness.
             0 => {
@@ -416,8 +416,8 @@ async fn send_signal(_pid: u32, sig: &str) -> Result<(), DriverError> {
     )))
 }
 
-/// Reconcile the desired extension set against live process states.
-/// For each desired extension whose process is absent or `dead`, this returns
+/// Reconcile the desired external process set against live process states.
+/// For each desired external process whose state is absent or `dead`, this returns
 /// the `id`s that need (re)starting. A supervision Process calls `proc/spawn`
 /// on each. Pure over its inputs (no I/O) so it is easy to test and replay.
 pub fn reconcile(desired_ids: &[String], live: &BTreeMap<String, String>) -> Vec<String> {
@@ -454,11 +454,11 @@ pub enum SuperviseDecision {
 /// (including this one). `attempt` is the 0-based restart attempt, used to scale
 /// exponential backoff.
 pub fn supervise(
-    policy: &nexus_types::extension::RestartPolicy,
+    policy: &nexus_types::external::RestartPolicy,
     failures_in_window: u32,
     attempt: u32,
 ) -> SuperviseDecision {
-    use nexus_types::extension::{Backoff, RestartPolicy};
+    use nexus_types::external::{Backoff, RestartPolicy};
     match policy {
         RestartPolicy::Never => SuperviseDecision::GiveUp,
         RestartPolicy::OnFailure { max, .. } => {
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn supervise_on_failure_gives_up_past_budget() {
-        use nexus_types::extension::RestartPolicy;
+        use nexus_types::external::RestartPolicy;
         let policy = RestartPolicy::OnFailure {
             max: 3,
             window_ms: 60_000,
@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn supervise_never_gives_up_immediately() {
-        use nexus_types::extension::RestartPolicy;
+        use nexus_types::external::RestartPolicy;
         assert_eq!(
             supervise(&RestartPolicy::Never, 0, 0),
             SuperviseDecision::GiveUp
@@ -796,7 +796,7 @@ mod tests {
 
     #[test]
     fn supervise_always_applies_exponential_backoff() {
-        use nexus_types::extension::{Backoff, RestartPolicy};
+        use nexus_types::external::{Backoff, RestartPolicy};
         let policy = RestartPolicy::Always {
             backoff: Backoff::Exp {
                 base_ms: 100,

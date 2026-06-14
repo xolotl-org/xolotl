@@ -1,56 +1,50 @@
 # 网关
 
-本页是 `nexusd` 的接入口总览，用来判断客户端应该连接哪个监听地址和协议。
-具体协议契约拆在独立页面：
+本页说明 `nexusd` 的监听地址和客户端协议。
 
-- [程序网关](program-gateways.md)：外部客户端通过 gRPC、WebSocket 或 MCP
-  适配器提交 `Program` 或 `DoNode` 工作。
-- [控制台协议](console-protocol.md)：控制台客户端通过 HTTP 认证，再通过控制台
-  WebSocket 执行管理动作和订阅。
+外部程序只有一套角色模型：以 Provider 或 Source projection 接入。gRPC 和 WebSocket 是同一个 external gateway 的两种传输实现。
 
 ## 接入口
 
-当 `[server]` 中的配置字段存在，或对应环境变量存在时，`nexusd` 会启动该通道。
-`nexus.toml.example` 默认配置了下列三个监听地址。gRPC 监听地址需要
-`nexus-daemon` 的 `grpc` feature；默认构建已启用该 feature。
+当 `[server]` 中的配置字段存在，或对应环境变量存在时，`nexusd` 会启动该通道。gRPC 监听需要 `grpc` feature；默认 `nexus-daemon` 构建已启用。
 
 | 接口 | 配置字段 | 环境变量 | 路径或服务 | 编码 |
 | --- | --- | --- | --- | --- |
 | 控制台 HTTP | `console_addr` | `NEXUS_CONSOLE_ADDR` | `/health`、`/api/auth/*` | HTTP JSON |
 | 控制台 WebSocket | `console_addr` | `NEXUS_CONSOLE_ADDR` | `/ws` | MessagePack，`msgpack+nexus-console-v1` |
-| 程序 gRPC | `grpc_addr` | `NEXUS_GRPC_ADDR` | `nexus.v1.GatewayService` | Protobuf |
-| 程序 WebSocket | `ws_addr` | `NEXUS_WS_ADDR` | `/ws` | 文本 JSON |
+| External gRPC | `external_grpc_addr` | `NEXUS_EXTERNAL_GRPC_ADDR` | `nexus.v1.external.ExternalService.Session` | Protobuf |
+| External WebSocket | `external_websocket_addr` | `NEXUS_EXTERNAL_WEBSOCKET_ADDR` | `/ws` | 二进制 protobuf frame |
 
-控制台 WebSocket 和程序 WebSocket 都挂在 `/ws`，需要通过监听地址和帧编码区分：
+控制台 WebSocket 和 external WebSocket 都挂在 `/ws`，通过监听地址和帧编码区分：
 
-- 控制台 WebSocket 使用 `[server].console_addr` 和二进制 MessagePack 帧。
-- 程序 WebSocket 使用 `[server].ws_addr` 和文本 JSON 帧。
+- 控制台 WebSocket 使用 `[server].console_addr` 和 MessagePack 控制台帧。
+- External WebSocket 使用 `[server].external_websocket_addr` 和二进制 Provider/Source session frame。
 
 ## 如何选择接口
 
 | 需求 | 接口 |
 | --- | --- |
 | 执行管理动作、检查运行时状态、管理用户、管理会话、订阅状态或审计流 | 控制台协议 |
-| 从跨语言客户端提交结构化程序 | 程序 gRPC |
-| 从 Rust 侧工具或仓库内测试提交 JSON `DoNode` | 程序 WebSocket |
-| 把选定 Nexus 效果发布为带显式必需能力的 MCP 工具 | MCP 网关 |
+| 连接提供 effect handler 的外部程序 | External gateway Provider |
+| 连接发送入站事件或接收 outbound command 的外部程序 | External gateway Source |
+| 通过显式 publish capability 把选定 Nexus effect 暴露为 MCP tool | MCP |
 
-## 请求边界
+## External Gateway
 
-程序网关使用共享 `Gateway` trait（特征）：
+External gateway session 见 [External Gateway](external-gateway.md)。Provider 和 Source 是唯一的外部 projection role。
 
-1. 校验客户端提交的令牌；
-2. 把令牌映射为请求身份，例如 `process://alice`；
-3. 创建已衰减授权的请求进程；
-4. 把协议载荷转换为 `DoNode` 程序；
-5. 通过执行器运行程序并返回 `Outcome`。
+daemon 负责 session 准入和裁定：
 
-宿主在构建 `InProcessGateway` 时声明请求可达的能力，并为请求进程打开需要暴露的资源句柄。网络适配器负责传输、认证帧解析、结构转换和网关审计标签。
+1. 外部程序发送 `RoleSessionClientHello`；
+2. daemon 读取 installation、projection、pairing 和已批准 session state；
+3. daemon 发送带权威 generation 和限制的 `SessionContext`；
+4. 外部程序回复 `RoleReady`；
+5. session ready 后才允许业务 frame 流动。
 
-控制台协议使用 `nexus-console`。HTTP 只承担健康检查和认证。登录后的管理路径使用控制台 WebSocket，通过有描述符名称的动作和流进行调用；授权、CAS、可见性门槛和审计记录仍由运行时路径处理。
+Provider ready 后会为该 ready session 注册投影 binding。Source event 只有通过 generation、schema、dedupe、capacity、rate 和 policy 检查后才会准入。
 
-## 扩展接入
+## 控制台协议
 
-扩展由一个安装声明加一个或多个投影声明。Provider 投影通过远端绑定暴露效果处理器。Source 投影把入站事件写入声明的状态流。配对、凭据生成、撤销下限、会话上下文和业务帧都表示为 `nexus-types` 与 `nexus-proto` 中的类型化数据。
+控制台 HTTP 只负责健康检查和认证。登录后的管理功能通过 Console WebSocket 执行，带授权、CAS、可见性门槛和审计记录。
 
-敏感值限制在一次性展示边界；操作输入、状态、事实记录和跟踪只接收脱敏元数据或引用。
+控制台传输安全由 daemon 持有：`production_tls`、`trusted_reverse_proxy`、`local_trusted` 和显式 unsafe mode 通过 `[console.transport_security]` 配置。

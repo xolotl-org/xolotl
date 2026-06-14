@@ -159,7 +159,7 @@ impl PolicySnapshot {
     }
 }
 
-// ── built-in residual checks ──────────────────────────────────────────
+// Built-in residual checks.
 
 /// A residual constraint-set check: the grant's input predicates that could
 /// not be eliminated at open (e.g. `@account=alice`, `@budget<=0.10`). Carries

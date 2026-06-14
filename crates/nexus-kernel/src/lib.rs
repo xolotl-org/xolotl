@@ -41,7 +41,10 @@ pub mod registry;
 pub mod scheduler;
 pub mod step;
 
-pub use bootstrap::{Bootstrap, BootstrapError, GatewayAudit, MethodSpec};
+pub use bootstrap::{
+    Bootstrap, BootstrapError, CompiledRequestGrantTemplate, GatewayAudit, MethodSpec,
+    RequestGrantTemplate,
+};
 pub use dataplane::{DataPlane, ExecOutput};
 pub use driver::{
     DispatchEntry, Driver, DriverContext, DriverDescriptor, DriverError, DriverPlan, DynDriver,

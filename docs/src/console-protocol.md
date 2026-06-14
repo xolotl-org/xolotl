@@ -1,11 +1,11 @@
 # Console Protocol
 
-`nexus-console` is the management-domain protocol host used by console clients.
+`nexus-console` hosts the management protocol used by console clients.
 It exposes HTTP routes for health and authentication, then uses Console
 WebSocket for logged-in management actions and streams.
 
 Management actions are descriptor-named calls. They use the runtime state,
-authorization, CAS, visibility, and audit surfaces; actions that invoke runtime
+authorization, CAS, visibility checks, and audit records; actions that invoke runtime
 effects do so as capability-scoped Operations.
 
 ## Listener
@@ -92,8 +92,8 @@ checks:
 - source-level connection limits have capacity.
 
 The endpoint accepts binary MessagePack frames. Text frames return
-`ConsoleErrorCode::BadFrame`. The configured frame limit is bounded by the
-backend hard cap of 4 MiB.
+`ConsoleErrorCode::BadFrame`. The configured frame limit is capped at 4 MiB by
+the backend.
 
 ## Encoding
 
@@ -189,7 +189,7 @@ Implemented action families include:
 | State and config | `state.snapshot`, `config.read`, `config.list`, `config.write_cas` |
 | Console access | `access.user.*`, `access.role.*`, `access.session.*`, `access.session.current.logout` |
 | Runtime, audit, and lineage | `runtime.process.inspect`, `audit.facts.recent`, `lineage.trace.read`, `lineage.fact.read`, `lineage.fact.by_operation`, `health.summary` |
-| Extensions and pairing | `extensions.installation.*`, `pairing.create`, `pairing.approve`, `pairing.deny`, `pairing.replace` |
+| External programs and pairing | `external.installation.*`, `pairing.create`, `pairing.approve`, `pairing.deny`, `pairing.replace` |
 
 Streams:
 

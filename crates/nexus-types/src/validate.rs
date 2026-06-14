@@ -61,7 +61,7 @@ impl PathRegistry {
     }
 }
 
-// ── built-in validators ───────────────────────────────────────────
+// Built-in validators.
 
 /// `state://` paths must have at least one segment.
 pub struct StatePathValidator;

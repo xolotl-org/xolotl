@@ -9,7 +9,7 @@ repository.workspace = true
 description.workspace = true
 
 # NOTE: no `protoc` build step. The Rust bindings are hand-vendored in
-# `src/{common,gateway,extension}.rs` (faithful to tonic-prost-build 0.14
+# `src/{common,program,external}.rs` (faithful to tonic-prost-build 0.14
 # output) so this crate builds anywhere prost/tonic resolve. The `.proto` files
 # under `proto/` remain the canonical wire schema; keep the two in sync.
 

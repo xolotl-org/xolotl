@@ -59,7 +59,10 @@ pub use mcp::{
     McpToolDriver, expose_as_mcp_tool,
 };
 pub use memory::{MEMORY_METHODS, MemoryDriver};
-pub use pairing::{PAIRING_METHODS, PairingDisplayEdge, PairingDriver};
+pub use pairing::{
+    DEFAULT_SECURE_ENVELOPE_REPLAY_WINDOW, PAIRING_METHODS, PairingDisplayEdge, PairingDriver,
+    SecureEnvelopeReplayWindow,
+};
 pub use proc::{PROC_METHODS, ProcDriver, reconcile};
 pub use rank::{RANK_METHODS, RankerDriver};
 pub use terminal::{TERMINAL_METHODS, TerminalDriver};

@@ -941,7 +941,7 @@ fn is_outbound(target: &ResourceName) -> bool {
     // Domains that inherently leave the trust boundary.
     matches!(
         domain,
-        "email" | "chat_platform" | "instant_messaging_platform" | "webhook" | "http"
+        "email" | "chat_platform" | "instant_messaging_platform" | "http_callback" | "http"
     )
         || matches!(method, "post" | "send" | "publish" | "reply" | "emit")
         // fetch with a body is outbound; a bare GET is covered by Fetched taint.
@@ -1427,6 +1427,9 @@ mod tests {
             nexus_types::Path::parse("effect://instant_messaging_platform/notify").unwrap(),
         );
         assert!(is_outbound(&instant_messaging_platform));
+        let http_callback =
+            ResourceName::new(nexus_types::Path::parse("effect://http_callback/notify").unwrap());
+        assert!(is_outbound(&http_callback));
         let email = ResourceName::new(nexus_types::Path::parse("effect://email/send").unwrap());
         assert!(is_outbound(&email));
         let infer =

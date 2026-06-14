@@ -32,7 +32,10 @@ pub use protocol::{
     ActionCall, ActionResult, ClientFrame, ClientHello, ConsoleErrorCode, ConsoleEvent,
     PrincipalSummary, ProtocolMetadata, ServerFrame, StreamCall,
 };
-pub use state::{ConsoleState, ConsoleWsConfig};
+pub use state::{
+    ConsoleState, ConsoleTransportSecurityConfig, ConsoleTransportSecurityMode,
+    ConsoleTrustedProxyConfig, ConsoleUnsafeTransportRelaxation, ConsoleWsConfig,
+};
 
 /// Build the console router.
 pub fn router(state: Arc<ConsoleState>) -> Router {
@@ -76,7 +79,7 @@ async fn api_login(
     headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, String)> {
-    let source = source_addr(&headers, Some(peer));
+    let source = verified_source_addr(&headers, Some(peer), &st.transport_security);
     let response = st
         .auth
         .login(&st.boot, body, source)
@@ -91,7 +94,7 @@ async fn api_key_challenge(
     headers: HeaderMap,
     Json(body): Json<KeyChallengeRequest>,
 ) -> Result<Json<KeyChallengeResponse>, (StatusCode, String)> {
-    let source = source_addr(&headers, Some(peer));
+    let source = verified_source_addr(&headers, Some(peer), &st.transport_security);
     let response = st
         .auth
         .begin_key_login(&st.boot, body, source)
@@ -106,7 +109,7 @@ async fn api_key_login(
     headers: HeaderMap,
     Json(body): Json<KeyLoginRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, String)> {
-    let source = source_addr(&headers, Some(peer));
+    let source = verified_source_addr(&headers, Some(peer), &st.transport_security);
     let response = st
         .auth
         .finish_key_login(&st.boot, body, source)
@@ -121,7 +124,7 @@ async fn api_step_up(
     headers: HeaderMap,
     Json(body): Json<StepUpRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, String)> {
-    let source = source_addr(&headers, Some(peer));
+    let source = verified_source_addr(&headers, Some(peer), &st.transport_security);
     let bearer = match auth::bearer_from_headers(&headers) {
         Ok(bearer) => bearer,
         Err(e) => {
@@ -137,10 +140,24 @@ async fn api_step_up(
     Ok(Json(response))
 }
 
-pub(crate) fn source_addr(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
-    if let Some(peer) = peer {
-        return peer.ip().to_string();
+pub(crate) fn verified_source_addr(
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    transport: &ConsoleTransportSecurityConfig,
+) -> String {
+    let peer_ip = peer.map(|peer| peer.ip());
+    if transport.trusts_peer(peer_ip)
+        && transport.trusted_proxy.honor_x_forwarded_for
+        && let Some(forwarded) = forwarded_client_addr(headers)
+    {
+        return forwarded;
     }
+    peer_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn forwarded_client_addr(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-forwarded-for")
         .or_else(|| headers.get("x-real-ip"))
@@ -148,8 +165,12 @@ pub(crate) fn source_addr(headers: &HeaderMap, peer: Option<SocketAddr>) -> Stri
         .and_then(|s| s.split(',').next())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or("unknown")
-        .to_string()
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+pub(crate) fn source_addr(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    verified_source_addr(headers, peer, &ConsoleTransportSecurityConfig::default())
 }
 
 fn record_http_auth_audit(
@@ -192,7 +213,7 @@ mod tests {
     use nexus_actors::{StandardConfig, install_standard};
     use nexus_kernel::Bootstrap;
     use nexus_types::{OutcomeRef, Value};
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
 
     fn audit_outcomes(st: &ConsoleState, event: &str) -> Vec<String> {
@@ -222,11 +243,39 @@ mod tests {
     }
 
     #[test]
-    fn source_addr_prefers_peer_over_forwarded_headers() {
+    fn source_addr_prefers_peer_over_forwarded_headers_by_default() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "203.0.113.8".parse().unwrap());
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
         assert_eq!(source_addr(&headers, Some(peer)), "127.0.0.1");
+    }
+
+    #[test]
+    fn source_addr_uses_forwarded_for_from_trusted_proxy() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "203.0.113.8, 198.51.100.2".parse().unwrap(),
+        );
+        let proxy_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let peer = SocketAddr::new(proxy_ip, 12345);
+        let cfg = ConsoleTransportSecurityConfig {
+            mode: ConsoleTransportSecurityMode::TrustedReverseProxy,
+            trusted_proxy: ConsoleTrustedProxyConfig {
+                peers: vec![proxy_ip],
+                ..ConsoleTrustedProxyConfig::default()
+            },
+            unsafe_relaxations: Vec::new(),
+        };
+        assert_eq!(
+            verified_source_addr(&headers, Some(peer), &cfg),
+            "203.0.113.8"
+        );
+        let untrusted_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 12345);
+        assert_eq!(
+            verified_source_addr(&headers, Some(untrusted_peer), &cfg),
+            "127.0.0.2"
+        );
     }
 
     #[test]

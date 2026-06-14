@@ -5,7 +5,7 @@
 //! exceed its parent's); finalize cancels children, runs finalizers in
 //! reverse, revokes handles, and writes a `ProcessFinalized` fact.
 
-use nexus_types::{BudgetSpec, BudgetState, GrantId, IdentityRef, ProcessId, ProcessStatus};
+use nexus_types::{BudgetSpec, BudgetState, Grant, GrantId, IdentityRef, ProcessId, ProcessStatus};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,6 +23,8 @@ pub struct ProcessEntry {
     pub status: ProcessStatus,
     /// Grants held by this process.
     pub grants: Vec<GrantId>,
+    /// Request-scoped grants attached directly to this process.
+    pub attached_grants: Vec<Grant>,
     /// Current budget counters.
     pub budget: BudgetState,
     /// Per-dimension spending limits. Default is unbounded on every
@@ -42,6 +44,7 @@ impl ProcessEntry {
             identity,
             status: ProcessStatus::Created,
             grants: Vec::new(),
+            attached_grants: Vec::new(),
             budget: BudgetState::default(),
             budget_spec: BudgetSpec::default(),
             on_finalize: Vec::new(),
@@ -61,6 +64,7 @@ struct ProcessTableInner {
     procs: HashMap<ProcessId, ProcessEntry>,
     children: HashMap<ProcessId, Vec<ProcessId>>,
     next: u64,
+    next_attached_grant: u64,
 }
 
 impl ProcessTable {
@@ -74,6 +78,13 @@ impl ProcessTable {
         let mut inner = self.inner.write();
         inner.next += 1;
         ProcessId::new(inner.next)
+    }
+
+    /// Allocate a process-attached grant id.
+    pub fn fresh_attached_grant_id(&self) -> GrantId {
+        let mut inner = self.inner.write();
+        inner.next_attached_grant += 1;
+        GrantId::new((1u64 << 63) | inner.next_attached_grant)
     }
 
     /// Insert a new process entry, linking it under its parent.
@@ -100,6 +111,16 @@ impl ProcessTable {
     /// Return the identity a process runs as.
     pub fn identity(&self, id: ProcessId) -> Option<IdentityRef> {
         self.inner.read().procs.get(&id).map(|p| p.identity)
+    }
+
+    /// Request-scoped grants attached directly to a process.
+    pub fn attached_grants(&self, id: ProcessId) -> Vec<Grant> {
+        self.inner
+            .read()
+            .procs
+            .get(&id)
+            .map(|p| p.attached_grants.clone())
+            .unwrap_or_default()
     }
 
     /// All live process ids.

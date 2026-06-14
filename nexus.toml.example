@@ -1,20 +1,69 @@
-# Nexus Configuration (Bootstrap Only)
-# Copy to `nexus.toml` in your working directory, or set NEXUS_CONFIG=/path/to/config.toml
+# Nexus Configuration
+# Copy to `nexus.toml` in your working directory, or set NEXUS_CONFIG=/path/to/config.toml.
 #
-# This file configures bootstrap-only daemon settings: storage, listener
-# addresses, console root bootstrap credentials, and console resource limits.
-# Runtime config (backends, models, groups, routing, bindings) lives in state
-# and is managed via Console WebSocket. gRPC clients submit structured Program
-# frames through GatewayService.
+# This file contains daemon bootstrap settings: storage, listener addresses,
+# external Provider/Source gateway limits, console root bootstrap credentials,
+# and bounded console resource limits. Runtime
+# configuration for models, groups, routing, bindings, external program
+# installations, Provider projections, Source projections, and policy lives in
+# Nexus state and is managed through Console WebSocket.
 
 [storage]
 kind = "redb"           # "redb" (persistent) or "memory" (non-persistent)
-path = "nexus.db"       # single redb file for state + FactStore tables
+path = "nexus.db"       # single redb file for state and FactStore tables
 
 [server]
 console_addr = "127.0.0.1:9000"
-grpc_addr = "127.0.0.1:9100"
-ws_addr = "127.0.0.1:9200"
+external_grpc_addr = "127.0.0.1:9444"
+external_websocket_addr = "127.0.0.1:9200"
+
+[external_gateway.grpc]
+# External gRPC accepts Provider and Source role sessions.
+source_dedupe_window_ms = 86400000
+provider_max_in_flight_invocations = 1024
+provider_max_in_flight_per_identity = 256
+provider_max_in_flight_per_effect = 256
+source_max_in_flight_commands = 1024
+source_command_rate_limit_window_ms = 60000
+source_command_rate_limit_max = 600
+
+[external_gateway.grpc.transport_security]
+mode = "local_trusted" # production_tls | mtls | trusted_reverse_proxy | local_trusted | unsafe_plaintext | disabled_for_test
+# trusted_proxy_peers = ["127.0.0.1"]
+# honor_x_forwarded_proto = true
+# honor_x_forwarded_host = true
+# honor_x_forwarded_for = true
+# certificate_chain_path = "/etc/nexus/external-grpc-cert.pem"
+# private_key_path = "/etc/nexus/external-grpc-key.pem"
+# client_trust_roots = ["/etc/nexus/external-client-ca.pem"]
+# unsafe_relaxations = ["ignore_origin_port"]
+
+[external_gateway.websocket]
+# External WebSocket accepts the same Provider and Source role sessions as
+# external gRPC. It is a transport choice, not a separate external role.
+source_dedupe_window_ms = 86400000
+provider_max_in_flight_invocations = 1024
+provider_max_in_flight_per_identity = 256
+provider_max_in_flight_per_effect = 256
+source_max_in_flight_commands = 1024
+source_command_rate_limit_window_ms = 60000
+source_command_rate_limit_max = 600
+
+[external_gateway.websocket.transport]
+max_frame_bytes = 1048576
+first_frame_timeout_ms = 10000
+idle_timeout_ms = 300000
+max_connections = 256
+
+[external_gateway.websocket.transport_security]
+# External WebSocket is a plain listener. Use trusted_reverse_proxy for external
+# TLS termination; production_tls and mtls fail closed here.
+mode = "local_trusted" # trusted_reverse_proxy | local_trusted | unsafe_plaintext | disabled_for_test
+# trusted_proxy_peers = ["127.0.0.1"]
+# honor_x_forwarded_proto = true
+# honor_x_forwarded_host = true
+# honor_x_forwarded_for = true
+# unsafe_relaxations = ["ignore_origin_port"]
 
 # Optional deployment automation:
 # If omitted and state://kernel/console/users/* is empty, nexusd creates root
@@ -25,7 +74,7 @@ ws_addr = "127.0.0.1:9200"
 
 # Optional console authentication/session limits. These are capacity and TTL
 # knobs only; capability checks, step-up gates, Origin/Host validation, and
-# secret redaction are not configurable bypasses.
+# secret redaction are enforced by runtime paths.
 [console.auth]
 session_ttl_ms = 86400000          # 24h absolute session TTL
 idle_ttl_ms = 7200000              # 2h idle TTL
@@ -33,6 +82,17 @@ max_sessions_per_user = 5
 global_session_limit = 10000
 # argon2_concurrency defaults to available CPU parallelism.
 # argon2_concurrency = 4
+
+# Optional Console transport security. Defaults to production_tls semantics.
+# If TLS is terminated by nginx/Caddy/Envoy/Ingress, use trusted_reverse_proxy
+# and list the proxy peer(s). Only those peers may supply X-Forwarded-* headers.
+[console.transport_security]
+mode = "production_tls" # production_tls | trusted_reverse_proxy | local_trusted | unsafe_plaintext | disabled_for_test
+# trusted_proxy_peers = ["127.0.0.1"]
+# honor_x_forwarded_proto = true
+# honor_x_forwarded_host = true
+# honor_x_forwarded_for = true
+# unsafe_relaxations = ["ignore_origin_port"]
 
 # Optional Console WebSocket limits. Defaults favor one normal web console tab
 # plus modest multi-tab/admin use while bounding daemon memory and CPU.

@@ -6,7 +6,7 @@ behavior of those paths.
 ## Authority
 
 Authority starts as a `Grant`, is attenuated during spawn or request admission,
-and is compiled by `open()` into a process-owned `Handle`. The data plane checks
+and is compiled by `open()` into a process-owned `Handle`. The data path checks
 the Handle owner, liveness, method rights, and residual policy before dispatch.
 
 Kernel-reserved prefixes such as `state://kernel/*`, `state://vault/*`, and
@@ -16,9 +16,10 @@ admitted per path and management actions use fixed descriptors.
 ## Provenance And Taint
 
 Values carry provenance in a `TaintSet`. Taint sources include author constants,
-model output, inbound events, fetched content, and protected sources. Operation
-inputs propagate taint to outputs, and state stores a `TaintedValue` so
-provenance survives state writes and reads.
+model output, inbound payloads admitted by gateway, Source, and Provider
+boundaries, fetched content, and protected sources. Operation inputs propagate
+taint to outputs, and state stores a `TaintedValue` so provenance survives
+state writes and reads.
 
 Policies can then decide from lineage. For example, an outbound Operation can
 be denied when its input lineage touched a protected source.
@@ -31,8 +32,8 @@ metadata or references.
 Console authentication writes redacted gateway audit Facts. Pairing raw secrets
 are generated inside the pairing driver and leave through the one-shot display
 edge; recorded Operations carry only hash/checksum metadata. The Console
-Protocol declares secret custody actions, but the current host blocks raw
-secret reveal and audits the attempt.
+Protocol declares secret custody actions, but the Console host blocks raw secret
+reveal and audits the attempt.
 
 ## Console Boundary
 

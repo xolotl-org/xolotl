@@ -9,8 +9,8 @@ Steps, branches, joins, identity switches, waits, failures, and structured
 composition.
 
 Plan documents are parsed by `nexus-plan` and lowered to the same `DoNode`
-shape. gRPC submissions use the structured protobuf `Program` type in
-`nexus-proto`, which converts losslessly to `DoNode`.
+shape. The structured protobuf `Program` type in `nexus-proto` is a wire-safe
+representation of the same executable shape and converts losslessly to `DoNode`.
 
 ## ExecutionGraph
 

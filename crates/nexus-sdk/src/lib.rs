@@ -7,7 +7,17 @@
 //! wrapper that opens a resource, binds it, and runs a program.
 
 pub use nexus_actors::{InstallError, StandardConfig, install_standard};
-pub use nexus_gateway::{AuthToken, Gateway, GatewayError, InProcessGateway, RequestIdentity};
+pub use nexus_gateway::{
+    BearerToken, BearerTokenHash, CommitObjectUploadRequest, CommitObjectUploadResponse, Gateway,
+    GatewayAuthMethod, GatewayCredential, GatewayCredentialKind, GatewayDescriptor,
+    GatewayDirectInput, GatewayError, GatewayIdentityMapping, GatewayLimitProfile, GatewayModality,
+    GatewayObjectUploadTicket, GatewayPayloadProvenance, GatewayPrincipalSurfaceBinding,
+    GatewayProfile, GatewayProfileRev, GatewayRuntime, GatewaySession, GatewayStreamChunk,
+    GatewayStreamDirection, GatewayStreamEnd, GatewayStreamOpenRequest, GatewaySubmission,
+    GatewaySubmissionBody, GatewaySurface, GatewaySurfaceDescriptor, GatewaySurfaceKind,
+    IssueObjectUploadTicketRequest, ObjectStoreProof, PresentedCredential, ProgramInspection,
+    ProgramSubmission, SubmitOptions, VerifiedPrincipal,
+};
 pub use nexus_graph::{
     DoNode, ExecutionGraph, GraphCursor, NodeKind, OperationTemplate, StepRef, compile_do,
 };

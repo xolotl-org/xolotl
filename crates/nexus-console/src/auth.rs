@@ -1782,7 +1782,7 @@ async fn write_string(state: &Backend, path: &str, value: String) -> Result<(), 
 fn root_grants() -> Vec<String> {
     vec![
         "perform://effect/kernel/**".into(),
-        "perform://effect/extension/**".into(),
+        "perform://effect/external/**".into(),
         "perform://effect/proc/**".into(),
         "read://state/**".into(),
         "write://state/kernel/**".into(),
@@ -2206,7 +2206,7 @@ mod tests {
         );
         assert!(principal.grants.contains(
             "perform",
-            &Path::parse("effect://extension/pairing/create").unwrap()
+            &Path::parse("effect://external/pairing/create").unwrap()
         ));
         assert!(
             principal

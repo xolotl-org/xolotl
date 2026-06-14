@@ -27,9 +27,8 @@
 //!   stored `procedure` Path points at a serialized Plan/`Do<A>`
 //!   (`state://kernel/plans/<id>`) which the memory/plan layer validates
 //!   (target / capability / schema) and **compiles to `Do<A>` on load**, then
-//!   runs *inside the calling Process*, inheriting its capabilities and budget
-//! A Skill grants **no**
-//!   privilege to bypass capability checks.
+//!   runs *inside the calling Process*, inheriting its capabilities and budget.
+//!   A Skill grants **no** privilege to bypass capability checks.
 //!
 //! This type is the data descriptor only. It deliberately stores `procedure`
 //! as a `Path` reference (not an inlined Plan): inlining a `Plan`/`Do<A>` here

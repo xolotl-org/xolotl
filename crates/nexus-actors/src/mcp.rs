@@ -1,14 +1,13 @@
 //! MCP bidirectional interoperability.
 //!
 //! * **Nexus as host**: an MCP server is a *sandboxed Provider* exposing
-//!   `effect://mcp-tool/<server>/<tool>`. The MCP tool schema maps to
+//!   `effect://external-provider/<server>/<tool>`. The MCP tool schema maps to
 //!   `EffectCapability.input/output_schema`; purity defaults to Effectful;
 //!   streaming tools are registered with stream-capable output support.
 //!   Redaction / Audit / taint still apply because every tool call is an
 //!   Operation.
 //! * **Nexus as server**: [`expose_as_mcp_tool`] turns a Nexus effect into an
-//!   MCP tool descriptor — and *requires* a bound capability set before
-//!   exposure, so an effect is never published wider than its capability.
+//!   MCP tool descriptor and requires a publishing capability before exposure.
 //!
 //! A real MCP transport (stdio / SSE) is wired by implementing [`McpClient`];
 //! the offline spine ships a deterministic echo client so the projection and
@@ -16,11 +15,11 @@
 
 use async_trait::async_trait;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};
-use nexus_types::{MethodId, Outcome, OutputMode, Purity, Value};
+use nexus_types::{Capability, MethodId, Outcome, OutputMode, Path, Purity, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// Method names for one concrete `effect://mcp-tool/<server>/<tool>` Provider.
+/// Method names for one concrete `effect://external-provider/<server>/<tool>` Provider.
 /// MCP tools default to Effectful unless the server declares
 /// otherwise.
 pub const MCP_TOOL_METHODS: &[MethodSpec] = &[MethodSpec::new(
@@ -72,9 +71,9 @@ impl McpClient for EchoMcpClient {
     }
 }
 
-/// Drives one concrete `effect://mcp-tool/<server>/<tool>` Resource when Nexus
+/// Drives one concrete `effect://external-provider/<server>/<tool>` Resource when Nexus
 /// acts as an MCP host. Sandboxed tools are registered under the
-/// `effect://mcp-tool/<server>/` namespace and can only reach the bound MCP
+/// `effect://external-provider/<server>/` namespace and can only reach the bound MCP
 /// server.
 pub struct McpToolDriver {
     tool: String,
@@ -133,33 +132,36 @@ pub struct McpToolDescriptor {
     pub name: String,
     /// Nexus effect path backing the tool.
     pub effect_path: String,
-    /// The capability set required to call this tool — the exposure is rejected
-    /// without it.
-    pub required_capability: String,
+    /// Capability required to publish this tool.
+    pub publish_capability: String,
     /// Optional MCP input schema.
     pub input_schema: Option<Value>,
     /// Optional MCP output schema.
     pub output_schema: Option<Value>,
 }
 
-/// Expose a Nexus effect as an MCP tool. Returns `Err` if no capability
-/// is bound — an effect is never published wider than its capability.
+/// Expose a Nexus effect as an MCP tool.
 pub fn expose_as_mcp_tool(
     name: &str,
     effect_path: &str,
-    required_capability: &str,
+    publish_capability: &str,
     input_schema: Option<Value>,
     output_schema: Option<Value>,
 ) -> Result<McpToolDescriptor, String> {
-    if required_capability.trim().is_empty() {
+    if publish_capability.trim().is_empty() {
         return Err(
-            "refusing to expose an effect as an MCP tool without a bound capability".into(),
+            "refusing to expose an effect as an MCP tool without a publish capability".into(),
         );
+    }
+    let effect = Path::parse(effect_path).map_err(|e| e.to_string())?;
+    let capability = Capability::parse(publish_capability).map_err(|e| e.to_string())?;
+    if !capability.covers("publish", &effect) {
+        return Err("publish capability does not cover the effect path".into());
     }
     Ok(McpToolDescriptor {
         name: name.into(),
         effect_path: effect_path.into(),
-        required_capability: required_capability.into(),
+        publish_capability: publish_capability.into(),
         input_schema,
         output_schema,
     })
@@ -214,17 +216,26 @@ mod tests {
     }
 
     #[test]
-    fn server_exposure_requires_capability() {
-        // Exposing without a capability is rejected.
+    fn server_exposure_requires_publish_capability() {
         assert!(expose_as_mcp_tool("t", "effect://x/y", "", None, None).is_err());
+        assert!(
+            expose_as_mcp_tool(
+                "search",
+                "effect://search/run",
+                "perform://effect/search/run",
+                None,
+                None,
+            )
+            .is_err()
+        );
         let d = expose_as_mcp_tool(
             "search",
             "effect://search/run",
-            "perform://effect/search/run",
+            "publish://effect/search/run",
             None,
             None,
         )
         .unwrap();
-        assert_eq!(d.required_capability, "perform://effect/search/run");
+        assert_eq!(d.publish_capability, "publish://effect/search/run");
     }
 }

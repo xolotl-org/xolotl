@@ -16,21 +16,21 @@
 //! that every installed state driver exposes such a method. The standard event
 //! bus exposes subscriptions through `effect://events/subscribe`.
 //!
-//! | step kind   | DoNode mapping                                              |
-//! |-------------|-------------------------------------------------------------|
-//! | `perform`   | `Op(OperationTemplate{ method: "invoke" })`                 |
-//! | `read`      | `Op(OperationTemplate{ method: "read" })`                   |
-//! | `subscribe` | `Op(OperationTemplate{ method: "subscribe" })`              |
-//! | `write`     | `Op(OperationTemplate{ method: "write"/"append" })`         |
-//! | `then`      | `AndThen { d, then: StepRef }`                              |
-//! | `on_fail`   | `OrElse { d, or: StepRef }`                                 |
-//! | `parallel`  | `Both(left, right)`                                         |
-//! | `race`      | `Race(left, right)`                                         |
-//! | `let`/`use` | `Let { name, value, body }` / `Use(name)`                   |
-//! | `pure`      | `Pure(value)`                                               |
-//! | `acting`    | `Acting { identity, body }`                                 |
-//! | `spawn`     | `Op(OperationTemplate{ target: effect://kernel/spawn })`    |
-//! | `bracket`   | acquire → (body then release) or-else release               |
+//! Step mappings:
+//! - `perform`: `Op(OperationTemplate { method: "invoke" })`
+//! - `read`: `Op(OperationTemplate { method: "read" })`
+//! - `subscribe`: `Op(OperationTemplate { method: "subscribe" })`
+//! - `write`: `Op(OperationTemplate { method: "write" })` or
+//!   `Op(OperationTemplate { method: "append" })`
+//! - `then`: `AndThen { d, then: StepRef }`
+//! - `on_fail`: `OrElse { d, or: StepRef }`
+//! - `parallel`: `Both(left, right)`
+//! - `race`: `Race(left, right)`
+//! - `let` / `use`: `Let { name, value, body }` / `Use(name)`
+//! - `pure`: `Pure(value)`
+//! - `acting`: `Acting { identity, body }`
+//! - `spawn`: `Op(OperationTemplate { target: effect://kernel/spawn })`
+//! - `bracket`: acquire, then run body and release; on failure, release.
 
 use nexus_graph::{DoNode, OperationTemplate, StepRef};
 use nexus_types::{

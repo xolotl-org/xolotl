@@ -17,7 +17,7 @@ use crate::driver::{DriverPlan, RemoteDriver};
 use crate::handle::{FastPath, Handle, HandleState, HandleTable};
 use crate::policy::{ConstraintCheck, OpenContext, PolicyCompileError, PolicySnapshot};
 use crate::registry::{CompiledOpenPlan, OpenCacheKey, Registry};
-use nexus_types::{ConstraintSet, HandleId, IdentityRef, ProcessId, ResourceId, Rights};
+use nexus_types::{ConstraintSet, Grant, HandleId, IdentityRef, ProcessId, ResourceId, Rights};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -90,6 +90,16 @@ pub fn open_resource(
     handles: &mut HandleTable,
     req: OpenRequest,
 ) -> Result<HandleId, OpenError> {
+    open_resource_with_attached(registry, handles, req, &[])
+}
+
+/// Compile and install a Handle using process-attached grants.
+pub fn open_resource_with_attached(
+    registry: &Registry,
+    handles: &mut HandleTable,
+    req: OpenRequest,
+    attached_grants: &[Grant],
+) -> Result<HandleId, OpenError> {
     // Step 0: resolve the resource descriptor.
     let resource = registry
         .resource(req.resource)
@@ -105,7 +115,8 @@ pub fn open_resource(
     let resource_root = resource.descriptor.name.path();
     let is_fact_projection_resource = resource_root.scheme() == "state"
         && resource_root.segments().first().map(|s| s.as_str()) == Some("fact");
-    if nexus_types::is_vault_reserved(&resource_name)
+    if nexus_types::is_kernel_reserved(&resource_name)
+        || nexus_types::is_vault_reserved(&resource_name)
         || (nexus_types::is_fact_reserved(&resource_name) && !is_fact_projection_resource)
     {
         return Err(OpenError::ReservedPath(resource_name.to_string()));
@@ -119,9 +130,11 @@ pub fn open_resource(
     // request that a *different* held grant authorizes. We therefore require
     // `req.rights ⊆ g.rights` as part of selection, and only surface
     // `RightsNotSubset` when a selector matched but no grant covered the rights.
-    let matching: Vec<_> = registry
-        .candidate_grants(req.process, &req.verb, &resource_name)
+    let mut candidates = registry.candidate_grants(req.process, &req.verb, &resource_name);
+    candidates.extend(attached_grants.iter().cloned());
+    let matching: Vec<_> = candidates
         .into_iter()
+        .filter(|g| g.holder == req.process)
         .filter(|g| {
             !g.expires.is_expired(req.now_millis) && g.selector.matches(&req.verb, &resource_name)
         })
@@ -211,6 +224,8 @@ pub fn open_resource(
         match (binding.endpoint, remote_endpoint, driver_impl) {
             (Some(endpoint_id), Some(endpoint), _) => Arc::new(RemoteDriver::new(
                 endpoint_id,
+                resource.id,
+                binding.generation,
                 resource_name.clone(),
                 endpoint,
             )) as crate::driver::DynDriver,
@@ -311,7 +326,9 @@ pub fn derive_handle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverDescriptor, DriverError, EchoDriver, FnDriver, RemoteEndpoint};
+    use crate::driver::{
+        DriverDescriptor, DriverError, EchoDriver, FnDriver, RemoteEndpoint, RemoteInvokeDispatch,
+    };
     use crate::handle::HandleTable;
     use async_trait::async_trait;
     use nexus_types::{
@@ -373,7 +390,7 @@ mod tests {
                 interfaces: InterfaceSet::new(vec![iface_id]),
                 binding: binding_id,
             },
-            false,
+            path.starts_with("effect://kernel/"),
         )
         .unwrap();
         rid
@@ -413,7 +430,7 @@ mod tests {
         let binding_id = reg.next_binding_id();
         reg.admit_binding(Binding {
             id: binding_id,
-            selector: ResourceSelector::parse("perform://effect/plugin/**").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/external-provider/**").unwrap(),
             interfaces: InterfaceSet::new(vec![iface_id]),
             driver: nexus_types::DriverRef {
                 id: driver_id,
@@ -504,7 +521,11 @@ mod tests {
 
     #[async_trait]
     impl RemoteEndpoint for TestEndpoint {
-        async fn invoke(&self, invoke: Invoke) -> Result<InvokeResult, DriverError> {
+        async fn invoke(
+            &self,
+            _dispatch: RemoteInvokeDispatch,
+            invoke: Invoke,
+        ) -> Result<InvokeResult, DriverError> {
             self.seen.lock().push(invoke.clone());
             Ok(InvokeResult {
                 invocation_id: invoke.invocation_id,
@@ -551,11 +572,16 @@ mod tests {
     #[test]
     fn endpoint_binding_requires_registered_endpoint() {
         let reg = Registry::new();
-        let rid = setup_remote_resource(&reg, "effect://plugin/acme/search", EndpointId::new(99));
+        let rid = setup_remote_resource(
+            &reg,
+            "effect://external-provider/acme/search",
+            EndpointId::new(99),
+        );
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/plugin/acme/search").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/external-provider/acme/search")
+                .unwrap(),
             rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
@@ -578,17 +604,52 @@ mod tests {
         assert!(matches!(err, OpenError::NoSuchEndpoint(id) if id == EndpointId::new(99)));
     }
 
+    #[test]
+    fn ordinary_effect_grant_cannot_open_kernel_effect() {
+        let reg = Registry::new();
+        let rid = setup_resource(&reg, "effect://kernel/process/inspect");
+        reg.register_grant(Grant {
+            id: reg.next_grant_id(),
+            holder: ProcessId::new(1),
+            selector: ResourceSelector::parse("perform://effect/**").unwrap(),
+            rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
+            constraints: ConstraintSet::empty(),
+            expires: Expiry::Never,
+        });
+        let mut handles = HandleTable::new();
+        let err = open_resource(
+            &reg,
+            &mut handles,
+            OpenRequest {
+                process: ProcessId::new(1),
+                resource: rid,
+                verb: "perform".into(),
+                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+                acting: IdentityRef::ROOT,
+                requested_path: None,
+                now_millis: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            OpenError::ReservedPath(p) if p == "effect://kernel/process/inspect"
+        ));
+        assert_eq!(handles.len(), 0);
+    }
+
     #[tokio::test]
     async fn endpoint_binding_compiles_to_remote_driver_plan() {
         let reg = Registry::new();
         let endpoint = reg.next_endpoint_id();
         let seen = Arc::new(Mutex::new(Vec::new()));
         reg.register_endpoint(endpoint, Arc::new(TestEndpoint { seen: seen.clone() }));
-        let rid = setup_remote_resource(&reg, "effect://plugin/acme/search", endpoint);
+        let rid = setup_remote_resource(&reg, "effect://external-provider/acme/search", endpoint);
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/plugin/acme/search").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/external-provider/acme/search")
+                .unwrap(),
             rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
@@ -635,7 +696,7 @@ mod tests {
         assert_eq!(seen[0].invocation_id, "1/4/0");
         assert_eq!(
             seen[0].effect_path.to_string(),
-            "effect://plugin/acme/search"
+            "effect://external-provider/acme/search"
         );
     }
 
@@ -708,7 +769,12 @@ mod tests {
             expires: Expiry::Never,
         });
         let mut handles = HandleTable::new();
-        for path in ["state://vault/alice/token", "state://fact/1"] {
+        for path in [
+            "state://vault/alice/token",
+            "state://fact/1",
+            "state://kernel/bootstrap/phase",
+            "state://kernel",
+        ] {
             let err = open_resource(
                 &reg,
                 &mut handles,

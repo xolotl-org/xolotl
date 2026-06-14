@@ -18,7 +18,7 @@ A Process carries:
 - optional finalizers;
 - parent/child links when spawned by another Process.
 
-Spawning attenuates authority. A child Process receives rights bounded by the
+Spawning attenuates authority. A child Process receives rights limited by the
 parent grant.
 
 Finalization cancels descendants, runs finalizers in reverse order, revokes the
@@ -31,7 +31,7 @@ A Resource is a passive object that can be operated on, authorized, audited, and
 bound to a Driver. Its Interface describes the available methods, output modes,
 purity, cost model, modality support, and batching support.
 
-The data plane normally uses Resource ids and Method ids.
+The data path normally uses Resource ids and Method ids.
 
 ## Driver
 
@@ -41,7 +41,7 @@ returns an Outcome.
 
 Driver authority comes through the restricted `DriverContext`. If a driver
 needs to touch state, emit streaming chunks, derive provenance, or record output
-taint, it goes through the runtime surfaces exposed in its context.
+taint, it uses the runtime APIs exposed in its context.
 
 ## Handle
 
@@ -54,7 +54,7 @@ Revocation bumps the generation so stale Handle ids fail before reuse.
 
 An Operation is the single path through which side effects occur. It contains
 the caller, acting identity, handle id, method id, causal position, input
-Value, output mode, and input taint. When the data plane records a Fact, it
+Value, output mode, and input taint. When the data path records a Fact, it
 projects the input and outcome into `ValueRef` / `OutcomeRef`.
 
 A Fact is the durable record of an operation attempt. It is append-only and

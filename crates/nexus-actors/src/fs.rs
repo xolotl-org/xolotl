@@ -188,7 +188,7 @@ pub fn is_regular_file(p: &FsPath) -> bool {
     p.is_file()
 }
 
-/// Best-effort MIME guess from the file extension, for the offload `BlobRef`'s
+/// Best-effort MIME guess from the filename suffix, for the offload `BlobRef`'s
 /// `mime` field. Deliberately tiny — no codec/sniffing, just the common cases a
 /// driver hands to `effect://blob/write`.
 fn mime_for(p: &FsPath) -> Option<String> {

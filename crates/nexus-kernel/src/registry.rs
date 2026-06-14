@@ -280,7 +280,7 @@ impl Registry {
         Self::default()
     }
 
-    // ── id allocation ──────────────────────────────────────────────
+    // ID allocation.
 
     /// Allocate the next resource id.
     pub fn next_resource_id(&self) -> ResourceId {
@@ -307,7 +307,7 @@ impl Registry {
         GrantId::new(self.inner.write().fresh_id())
     }
 
-    // ── registration (admission lives in `admit_*`) ─────────────────
+    // Registration. Admission lives in `admit_*`.
 
     /// Register an interface descriptor and invalidate cached open plans.
     pub fn register_interface(&self, iface: Interface) {
@@ -329,6 +329,17 @@ impl Registry {
         let mut inner = self.inner.write();
         inner.endpoints.insert(id, endpoint);
         inner.invalidate_open_cache();
+    }
+
+    /// Remove a live remote endpoint transport and invalidate cached open
+    /// plans that may reference it.
+    pub fn unregister_endpoint(&self, id: EndpointId) -> bool {
+        let mut inner = self.inner.write();
+        let removed = inner.endpoints.remove(&id).is_some();
+        if removed {
+            inner.invalidate_open_cache();
+        }
+        removed
     }
 
     /// Admit and register a Resource. Rejects reserved-prefix names
@@ -437,7 +448,7 @@ impl Registry {
         self.inner.read().policies.clone()
     }
 
-    // ── name resolution ─────────────────────────────────────
+    // Name resolution.
 
     /// Resolve a control-plane resource name to a resource id.
     ///
@@ -474,7 +485,7 @@ impl Registry {
             .ok_or_else(|| ResolveError::NoSuchResource(name.path().to_string()))
     }
 
-    // ── slow-path reads for open() ──────────────────────────────────
+    // Slow-path reads for open().
 
     /// Fetch a registered resource descriptor.
     pub fn resource(&self, id: ResourceId) -> Option<Resource> {
@@ -633,13 +644,13 @@ mod tests {
     #[test]
     fn namespace_sandbox_rejects_escape() {
         // A sandboxed provider's effects must stay under its namespace.
-        let ns = nexus_types::Path::parse("effect://plugin/acme").unwrap();
+        let ns = nexus_types::Path::parse("effect://external-provider/acme").unwrap();
         assert!(
             Registry::check_namespace_sandbox(
                 &ns,
                 &[
-                    nexus_types::Path::parse("effect://plugin/acme/fetch").unwrap(),
-                    nexus_types::Path::parse("effect://plugin/acme/post").unwrap()
+                    nexus_types::Path::parse("effect://external-provider/acme/fetch").unwrap(),
+                    nexus_types::Path::parse("effect://external-provider/acme/post").unwrap()
                 ],
             )
             .is_ok()
@@ -648,7 +659,7 @@ mod tests {
             Registry::check_namespace_sandbox(
                 &ns,
                 &[
-                    nexus_types::Path::parse("effect://plugin/acme/ok").unwrap(),
+                    nexus_types::Path::parse("effect://external-provider/acme/ok").unwrap(),
                     nexus_types::Path::parse("effect://x/post").unwrap()
                 ],
             )
@@ -657,7 +668,7 @@ mod tests {
         assert!(
             Registry::check_namespace_sandbox(
                 &ns,
-                &[nexus_types::Path::parse("effect://plugin/acmeevil/tool").unwrap()],
+                &[nexus_types::Path::parse("effect://external-provider/acmeevil/tool").unwrap()],
             )
             .is_err(),
             "segment-aware sandboxing must reject string-prefix siblings"

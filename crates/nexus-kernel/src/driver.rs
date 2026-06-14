@@ -9,8 +9,8 @@
 
 use async_trait::async_trait;
 use nexus_types::{
-    DriverId, EndpointId, Failure, InterfaceSet, Invoke, InvokeResult, MethodId, OperationId,
-    Outcome, OutputMode, Path, Transport, Value,
+    DriverId, EndpointId, Failure, IdentityRef, InterfaceSet, Invoke, InvokeResult, MethodId,
+    OperationId, Outcome, OutputMode, Path, ResourceId, TaintSet, TaintSource, Transport, Value,
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -159,26 +159,55 @@ pub type DynDriver = Arc<dyn Driver>;
 #[async_trait]
 pub trait RemoteEndpoint: Send + Sync + 'static {
     /// Send an invoke request to a remote provider endpoint.
-    async fn invoke(&self, invoke: Invoke) -> Result<InvokeResult, DriverError>;
+    async fn invoke(
+        &self,
+        dispatch: RemoteInvokeDispatch,
+        invoke: Invoke,
+    ) -> Result<InvokeResult, DriverError>;
 }
 
 /// Shared remote endpoint handle.
 pub type DynRemoteEndpoint = Arc<dyn RemoteEndpoint>;
+
+/// Internal dispatch identity captured by `open()` for a remote endpoint call.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RemoteInvokeDispatch {
+    /// Remote endpoint transport selected by the binding.
+    pub endpoint_id: EndpointId,
+    /// Resource selected by `open()`.
+    pub resource_id: ResourceId,
+    /// Method being invoked.
+    pub method_id: MethodId,
+    /// Binding generation captured by the opened handle.
+    pub binding_generation: u64,
+    /// Acting identity captured from the originating operation.
+    pub acting: IdentityRef,
+}
 
 /// RPC stub compiled into a [`DriverPlan`] for `Binding.endpoint = Some(_)`.
 /// It turns a local data-plane call into a provider `Invoke` frame while keeping
 /// the same authorization, policy, budget, taint, and Fact path around it.
 pub struct RemoteDriver {
     endpoint_id: EndpointId,
+    resource_id: ResourceId,
+    binding_generation: u64,
     effect_path: Path,
     endpoint: DynRemoteEndpoint,
 }
 
 impl RemoteDriver {
     /// Create a remote driver stub for one endpoint and effect path.
-    pub fn new(endpoint_id: EndpointId, effect_path: Path, endpoint: DynRemoteEndpoint) -> Self {
+    pub fn new(
+        endpoint_id: EndpointId,
+        resource_id: ResourceId,
+        binding_generation: u64,
+        effect_path: Path,
+        endpoint: DynRemoteEndpoint,
+    ) -> Self {
         Self {
             endpoint_id,
+            resource_id,
+            binding_generation,
             effect_path,
             endpoint,
         }
@@ -210,9 +239,29 @@ impl Driver for RemoteDriver {
                 .then(|| ctx.stream_to.clone())
                 .flatten(),
         };
-        let result = self.endpoint.invoke(invoke).await?;
+        let dispatch = RemoteInvokeDispatch {
+            endpoint_id: self.endpoint_id,
+            resource_id: self.resource_id,
+            method_id: method,
+            binding_generation: self.binding_generation,
+            acting: ctx.acting,
+        };
+        let result = self.endpoint.invoke(dispatch, invoke).await?;
         match result.outcome {
-            Ok(v) => Ok(Outcome::Done(v)),
+            Ok(v) => {
+                ctx.set_output_taint(TaintSet::of(TaintSource::Inbound {
+                    source: format!(
+                        "provider/endpoint/{}/resource/{}/method/{}/binding/{}",
+                        self.endpoint_id.get(),
+                        self.resource_id.get(),
+                        method.get(),
+                        self.binding_generation
+                    )
+                    .into(),
+                    channel: self.effect_path.to_string().into(),
+                }));
+                Ok(Outcome::Done(v))
+            }
             Err(e) => Ok(Outcome::Fail(Failure::HandlerError {
                 kind: e.kind,
                 message: e.message,
@@ -378,14 +427,18 @@ mod tests {
     }
 
     struct RecordingEndpoint {
-        seen: Arc<Mutex<Vec<Invoke>>>,
+        seen: Arc<Mutex<Vec<(RemoteInvokeDispatch, Invoke)>>>,
         result: Result<Value, ErrorInfo>,
     }
 
     #[async_trait]
     impl RemoteEndpoint for RecordingEndpoint {
-        async fn invoke(&self, invoke: Invoke) -> Result<InvokeResult, DriverError> {
-            self.seen.lock().push(invoke.clone());
+        async fn invoke(
+            &self,
+            dispatch: RemoteInvokeDispatch,
+            invoke: Invoke,
+        ) -> Result<InvokeResult, DriverError> {
+            self.seen.lock().push((dispatch, invoke.clone()));
             Ok(InvokeResult {
                 invocation_id: invoke.invocation_id,
                 outcome: self.result.clone(),
@@ -402,7 +455,9 @@ mod tests {
         });
         let driver = RemoteDriver::new(
             EndpointId::new(7),
-            Path::parse("effect://plugin/acme/search").unwrap(),
+            nexus_types::ResourceId::new(11),
+            3,
+            Path::parse("effect://external-provider/acme/search").unwrap(),
             endpoint,
         );
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -415,15 +470,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, Outcome::Done(Value::Str("remote-ok".into())));
+        assert!(ctx.output_taint().sources().iter().any(|taint_source| {
+            matches!(
+                taint_source,
+                TaintSource::Inbound {
+                    source,
+                    channel
+                } if source.as_str() == "provider/endpoint/7/resource/11/method/0/binding/3"
+                    && channel.as_str() == "effect://external-provider/acme/search"
+            )
+        }));
 
         let seen = seen.lock();
         assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].invocation_id, "1/9/0");
+        let (dispatch, invoke) = &seen[0];
+        assert_eq!(dispatch.endpoint_id, EndpointId::new(7));
+        assert_eq!(dispatch.resource_id, nexus_types::ResourceId::new(11));
+        assert_eq!(dispatch.method_id, MethodId::new(0));
+        assert_eq!(dispatch.binding_generation, 3);
+        assert_eq!(dispatch.acting, IdentityRef::ROOT);
+        assert_eq!(invoke.invocation_id, "1/9/0");
         assert_eq!(
-            seen[0].effect_path.to_string(),
-            "effect://plugin/acme/search"
+            invoke.effect_path.to_string(),
+            "effect://external-provider/acme/search"
         );
-        assert_eq!(seen[0].method_id, MethodId::new(0));
-        assert_eq!(seen[0].output_stream_to, Some(stream));
+        assert_eq!(invoke.method_id, MethodId::new(0));
+        assert_eq!(invoke.output_stream_to, Some(stream));
     }
 }

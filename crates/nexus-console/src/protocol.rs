@@ -83,16 +83,16 @@ pub const ACTION_LINEAGE_FACT_READ: &str = "lineage.fact.read";
 pub const ACTION_LINEAGE_FACT_BY_OPERATION: &str = "lineage.fact.by_operation";
 /// Return high-level daemon/runtime health.
 pub const ACTION_HEALTH_SUMMARY: &str = "health.summary";
-/// Install an extension installation descriptor.
-pub const ACTION_EXTENSIONS_INSTALLATION_INSTALL: &str = "extensions.installation.install";
-/// Update an extension installation descriptor.
-pub const ACTION_EXTENSIONS_INSTALLATION_UPDATE: &str = "extensions.installation.update";
-/// Start an installed extension.
-pub const ACTION_EXTENSIONS_INSTALLATION_START: &str = "extensions.installation.start";
-/// Stop a running extension.
-pub const ACTION_EXTENSIONS_INSTALLATION_STOP: &str = "extensions.installation.stop";
-/// Revoke an extension installation and its projected authority.
-pub const ACTION_EXTENSIONS_INSTALLATION_REVOKE: &str = "extensions.installation.revoke";
+/// Install an external installation descriptor.
+pub const ACTION_EXTERNAL_INSTALLATION_INSTALL: &str = "external.installation.install";
+/// Update an external installation descriptor.
+pub const ACTION_EXTERNAL_INSTALLATION_UPDATE: &str = "external.installation.update";
+/// Start an external installation.
+pub const ACTION_EXTERNAL_INSTALLATION_START: &str = "external.installation.start";
+/// Stop a running external installation.
+pub const ACTION_EXTERNAL_INSTALLATION_STOP: &str = "external.installation.stop";
+/// Revoke an external installation and its projected authority.
+pub const ACTION_EXTERNAL_INSTALLATION_REVOKE: &str = "external.installation.revoke";
 /// Create a pairing flow.
 pub const ACTION_PAIRING_CREATE: &str = "pairing.create";
 /// Approve a pending pairing flow.
@@ -408,6 +408,12 @@ pub struct ProtocolMetadata {
     pub visibility_tiers: Vec<VisibilityTier>,
     /// Secret custody classes known to the protocol.
     pub secret_classes: Vec<SecretClass>,
+    /// Low-leak transport security mode summary.
+    pub transport_security_mode: String,
+    /// Whether the listener is running with explicit unsafe transport relaxations.
+    pub unsafe_transport: bool,
+    /// Explicit unsafe transport relaxations enabled for this listener.
+    pub unsafe_transport_relaxations: Vec<String>,
 }
 
 /// Root-data-authority invariants exposed by the Console Protocol.
@@ -534,14 +540,12 @@ pub enum RiskLevel {
     BreakGlass,
 }
 
-/// Whether a descriptor is implemented or only declared for coverage.
+/// Implementation state exposed by Console Protocol descriptors.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImplementationStatus {
     /// Action/stream is implemented.
     Implemented,
-    /// Descriptor is declared for coverage but not yet implemented.
-    Declared,
     /// Descriptor is intentionally unavailable because custody rules block it.
     BlockedByCustody,
 }
@@ -605,6 +609,9 @@ pub fn protocol_metadata(server_rev: u64, registry_rev: u64) -> ProtocolMetadata
             SecretClass::NonRecoverableSecret,
             SecretClass::OneTimeSecret,
         ],
+        transport_security_mode: "production_tls".into(),
+        unsafe_transport: false,
+        unsafe_transport_relaxations: Vec::new(),
     }
 }
 
@@ -1223,7 +1230,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             schema("health.summary.output", "map", vec![], vec![]),
         ),
         extension_action(
-            ACTION_EXTENSIONS_INSTALLATION_INSTALL,
+            ACTION_EXTERNAL_INSTALLATION_INSTALL,
             true,
             vec![
                 field("id", "string", true),
@@ -1232,7 +1239,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ],
         ),
         extension_action(
-            ACTION_EXTENSIONS_INSTALLATION_UPDATE,
+            ACTION_EXTERNAL_INSTALLATION_UPDATE,
             true,
             vec![
                 field("id", "string", true),
@@ -1241,17 +1248,17 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ],
         ),
         extension_action(
-            ACTION_EXTENSIONS_INSTALLATION_START,
+            ACTION_EXTERNAL_INSTALLATION_START,
             true,
             vec![field("id", "string", true)],
         ),
         extension_action(
-            ACTION_EXTENSIONS_INSTALLATION_STOP,
+            ACTION_EXTERNAL_INSTALLATION_STOP,
             true,
             vec![field("id", "string", true)],
         ),
         extension_action(
-            ACTION_EXTENSIONS_INSTALLATION_REVOKE,
+            ACTION_EXTERNAL_INSTALLATION_REVOKE,
             true,
             vec![
                 field("installation_id", "string", true),
@@ -1371,7 +1378,7 @@ fn extension_action(
     let required_authority = extension_authority(id);
     action(
         id,
-        "extensions",
+        "external",
         ActionKind::Mutation,
         RiskLevel::Elevated,
         VisibilityTier::ManagementState,
@@ -1384,25 +1391,25 @@ fn extension_action(
 
 fn extension_authority(id: &str) -> Vec<RequiredAuthority> {
     match id {
-        ACTION_EXTENSIONS_INSTALLATION_INSTALL | ACTION_EXTENSIONS_INSTALLATION_UPDATE => {
+        ACTION_EXTERNAL_INSTALLATION_INSTALL | ACTION_EXTERNAL_INSTALLATION_UPDATE => {
             vec![authority(
                 "write",
-                "state://kernel/extension-installations/**",
+                "state://kernel/external-installations/**",
             )]
         }
-        ACTION_EXTENSIONS_INSTALLATION_START => vec![
-            authority("read", "state://kernel/extension-installations/**"),
+        ACTION_EXTERNAL_INSTALLATION_START => vec![
+            authority("read", "state://kernel/external-installations/**"),
             authority("perform", "effect://proc/spawn"),
         ],
-        ACTION_EXTENSIONS_INSTALLATION_STOP => {
+        ACTION_EXTERNAL_INSTALLATION_STOP => {
             vec![authority("perform", "effect://proc/kill")]
         }
-        ACTION_EXTENSIONS_INSTALLATION_REVOKE => {
-            vec![authority("perform", "effect://extension/revoke")]
+        ACTION_EXTERNAL_INSTALLATION_REVOKE => {
+            vec![authority("perform", "effect://external/revoke")]
         }
         _ => vec![authority(
             "write",
-            "state://kernel/extension-installations/**",
+            "state://kernel/external-installations/**",
         )],
     }
 }
@@ -1423,11 +1430,11 @@ fn pairing_action(id: &str, fields: Vec<FieldDescriptor>) -> ActionDescriptor {
 
 fn pairing_authority(id: &str) -> Vec<RequiredAuthority> {
     let target = match id {
-        ACTION_PAIRING_CREATE => "effect://extension/pairing/create",
-        ACTION_PAIRING_APPROVE => "effect://extension/pairing/approve",
-        ACTION_PAIRING_DENY => "effect://extension/pairing/deny",
-        ACTION_PAIRING_REPLACE => "effect://extension/pairing/replace",
-        _ => "effect://extension/pairing/**",
+        ACTION_PAIRING_CREATE => "effect://external/pairing/create",
+        ACTION_PAIRING_APPROVE => "effect://external/pairing/approve",
+        ACTION_PAIRING_DENY => "effect://external/pairing/deny",
+        ACTION_PAIRING_REPLACE => "effect://external/pairing/replace",
+        _ => "effect://external/pairing/**",
     };
     vec![authority("perform", target)]
 }
@@ -1595,7 +1602,7 @@ mod tests {
             "audit",
             "lineage",
             "health",
-            "extensions",
+            "external",
             "pairing",
         ] {
             assert!(domains.contains(required), "missing domain {required}");
@@ -1673,26 +1680,25 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing descriptor {id}"))
         };
 
-        let install = find(ACTION_EXTENSIONS_INSTALLATION_INSTALL);
+        let install = find(ACTION_EXTERNAL_INSTALLATION_INSTALL);
         assert!(install.required_authority.iter().any(|required| {
             required.verb == "write"
-                && required.target == "state://kernel/extension-installations/**"
+                && required.target == "state://kernel/external-installations/**"
         }));
-        let start = find(ACTION_EXTENSIONS_INSTALLATION_START);
+        let start = find(ACTION_EXTERNAL_INSTALLATION_START);
         assert!(start.required_authority.iter().any(|required| {
-            required.verb == "read"
-                && required.target == "state://kernel/extension-installations/**"
+            required.verb == "read" && required.target == "state://kernel/external-installations/**"
         }));
         assert!(start.required_authority.iter().any(|required| {
             required.verb == "perform" && required.target == "effect://proc/spawn"
         }));
-        let stop = find(ACTION_EXTENSIONS_INSTALLATION_STOP);
+        let stop = find(ACTION_EXTERNAL_INSTALLATION_STOP);
         assert!(stop.required_authority.iter().any(|required| {
             required.verb == "perform" && required.target == "effect://proc/kill"
         }));
-        let revoke = find(ACTION_EXTENSIONS_INSTALLATION_REVOKE);
+        let revoke = find(ACTION_EXTERNAL_INSTALLATION_REVOKE);
         assert!(revoke.required_authority.iter().any(|required| {
-            required.verb == "perform" && required.target == "effect://extension/revoke"
+            required.verb == "perform" && required.target == "effect://external/revoke"
         }));
     }
 
@@ -1700,10 +1706,10 @@ mod tests {
     fn pairing_descriptors_use_specific_effect_authority() {
         let actions = action_descriptors();
         for (id, target) in [
-            (ACTION_PAIRING_CREATE, "effect://extension/pairing/create"),
-            (ACTION_PAIRING_APPROVE, "effect://extension/pairing/approve"),
-            (ACTION_PAIRING_DENY, "effect://extension/pairing/deny"),
-            (ACTION_PAIRING_REPLACE, "effect://extension/pairing/replace"),
+            (ACTION_PAIRING_CREATE, "effect://external/pairing/create"),
+            (ACTION_PAIRING_APPROVE, "effect://external/pairing/approve"),
+            (ACTION_PAIRING_DENY, "effect://external/pairing/deny"),
+            (ACTION_PAIRING_REPLACE, "effect://external/pairing/replace"),
         ] {
             let action = actions
                 .iter()

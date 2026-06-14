@@ -1,6 +1,6 @@
 # 控制台协议
 
-`nexus-console` 是控制台客户端使用的管理域协议宿主。它提供健康检查和认证用的 HTTP 路由；登录后的管理动作和流订阅通过控制台 WebSocket 运行。
+`nexus-console` 承载控制台客户端使用的管理协议。它提供健康检查和认证用的 HTTP 路由；登录后的管理动作和流订阅通过控制台 WebSocket 运行。
 
 管理动作使用有描述符名称的调用。它们使用运行时的状态、授权、CAS、可见性和审计接口；当管理动作调用运行时效果时，该效果作为受能力约束的 `Operation` 执行。
 
@@ -180,7 +180,7 @@ HTTP 认证错误映射：
 | 状态和配置 | `state.snapshot`、`config.read`、`config.list`、`config.write_cas` |
 | 控制台访问 | `access.user.*`、`access.role.*`、`access.session.*`、`access.session.current.logout` |
 | 运行时、审计和来源链 | `runtime.process.inspect`、`audit.facts.recent`、`lineage.trace.read`、`lineage.fact.read`、`lineage.fact.by_operation`、`health.summary` |
-| 扩展和配对 | `extensions.installation.*`、`pairing.create`、`pairing.approve`、`pairing.deny`、`pairing.replace` |
+| 外部程序和配对 | `external.installation.*`、`pairing.create`、`pairing.approve`、`pairing.deny`、`pairing.replace` |
 
 流：
 

@@ -1069,7 +1069,7 @@ fn is_pairing_secret_generation_path(path: Option<&Path>) -> bool {
     let segments = path.segments();
     path.scheme() == "effect"
         && segments.len() == 3
-        && segments[0].as_str() == "extension"
+        && segments[0].as_str() == "external"
         && segments[1].as_str() == "pairing"
         && matches!(segments[2].as_str(), "create" | "replace")
 }

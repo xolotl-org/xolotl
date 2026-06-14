@@ -133,7 +133,7 @@ pub struct StateHistoryEntry {
 /// a write is visible.
 #[async_trait]
 pub trait StateBackend: Send + Sync + 'static {
-    // ── taint-aware primitives ──────────────────────────────
+    // Taint-aware primitives.
     // Backends implement these; the bare convenience methods below default to
     // them with pristine taint (author-trusted kernel-internal writes).
 
@@ -169,7 +169,7 @@ pub trait StateBackend: Send + Sync + 'static {
     /// Subscribe to post-commit events whose path matches `pattern`.
     async fn subscribe(&self, pattern: &Path) -> StateResult<StateStream>;
 
-    // ── bare convenience methods (pristine-taint defaults) ─────────────
+    // Convenience methods with pristine-taint defaults.
 
     /// Read just the value, discarding provenance. Convenience for callers that
     /// don't track taint; prefer `read_tainted` where provenance matters.

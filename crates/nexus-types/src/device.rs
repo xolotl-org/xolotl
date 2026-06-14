@@ -65,7 +65,7 @@ pub enum TrustLevel {
     /// Full trust — can register any Effect path (local tools, remote devices).
     #[default]
     Full,
-    /// Sandboxed — must register under `effect://plugin/{id}/*` or `effect://mcp-tool/{id}/*`.
+    /// Sandboxed — must register under `effect://external-provider/{id}/*`.
     Sandboxed,
 }
 
@@ -421,7 +421,7 @@ mod tests {
             },
             trust: TrustLevel::Sandboxed,
             capabilities: vec![EffectCapability::new(
-                "effect://mcp-tool/mcp-github/search",
+                "effect://external-provider/mcp-github/search",
                 Purity::Idempotent,
             )],
             status: ProviderStatus::Registered,
@@ -436,7 +436,7 @@ mod tests {
         let v = Value::Map(BTreeMap::from([
             (
                 "effect_path".into(),
-                Value::Str("effect://plugin/ext/tool".into()),
+                Value::Str("effect://external-provider/ext/tool".into()),
             ),
             ("purity".into(), Value::Str("effectful".into())),
             ("schema_version".into(), Value::Int(-1)),

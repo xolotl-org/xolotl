@@ -278,7 +278,7 @@ impl Path {
     }
 }
 
-// ── character-set helpers ──────────────────────────────────────────
+// Character-set helpers.
 //
 // These are deliberately conservative. We intentionally forbid:
 //  - non-ASCII (no Unicode confusables)
@@ -322,8 +322,6 @@ fn is_ident(s: &str) -> bool {
     }
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
-
-// ────────────────────────────────────────────────────────────────────
 
 fn split_canonical_cluster(head: &str) -> Option<(&str, &str)> {
     let mut parts = head.split('/');

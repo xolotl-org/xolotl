@@ -48,11 +48,11 @@ be a subset of the parent rights when deriving or attenuating authority.
 
 ## `open()`
 
-`open()` is the control-plane compiler. It resolves a Resource, selects a
+`open()` is the control-path compiler. It resolves a Resource, selects a
 covering Grant, checks open-time constraints, resolves the Binding, builds a
 DriverPlan, compiles residual policy, and installs a process-owned Handle.
 
-After that point, the data plane executes against the compiled Handle.
+After that point, the data path executes against the compiled Handle.
 
 ## Policy Snapshots
 
@@ -61,4 +61,4 @@ eliminated. Checks that depend on operation input, budget, rate limits, command
 matching, approval, or other runtime state stay as residual checks.
 
 If no residual checks remain, the Handle is marked `Unconditional` and the data
-plane skips policy evaluation for that Handle.
+path skips policy evaluation for that Handle.

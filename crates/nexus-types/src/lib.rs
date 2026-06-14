@@ -19,7 +19,7 @@
 //! - [`resource`] — `Resource`/`Interface`/`Method`/`Binding` descriptors.
 //! - [`operation`] — `Operation`/`OperationId`/`Fact` data-plane records.
 //! - [`process`]   — `Process`/lifecycle/`Outcome`.
-//! - [`extension`] — extension installation/projection manifests and wire frames.
+//! - [`external`] — external installation/projection manifests and wire frames.
 //! - [`device`]    — provider summary DTOs (`Transport`/`TrustLevel`/…).
 //! - [`chat`]      — chat message DTOs used by inference.
 //! - [`skill`]     — `Skill`/`SkillScope`: knowledge + procedure unit.
@@ -29,7 +29,7 @@ pub mod audit;
 pub mod cap;
 pub mod chat;
 pub mod device;
-pub mod extension;
+pub mod external;
 pub mod grant;
 pub mod idempotency;
 pub mod ids;
@@ -44,19 +44,18 @@ pub mod trace;
 pub mod validate;
 pub mod value;
 
-// ── curated re-exports ────────────────────────────────────────────────
-
 pub use audit::{AuditRules, AuditTag};
 pub use cap::{CapError, CapSet, Capability, PredOp, Predicate};
 pub use chat::{ChatMessage, ChatMetadata, ContentPart, MessageRole, estimate_tokens};
 pub use device::{EffectCapability, EffectProvider, ProviderStatus, Transport, TrustLevel};
-pub use extension::{
-    AckStatus, ApplyStatus, Backoff, ConfigAxis, ControlFrame, DaemonContact, DaemonContacts,
-    ErrorInfo, EventAck, EventSource, ExtensionInstallationDef, ExtensionProjectionDef,
-    ExtensionTransport, FlowSignal, InboundEvent, Invoke, InvokeResult, JsonSchema, ManifestDef,
-    ObservedGenerations, OutboundCommand, OverflowPolicy, PairingPayload, PairingPayloadError,
-    ProcSpec, RejectReason, RestartPolicy, Role, RoleReady, RoleSessionClientHello, SessionContext,
-    StreamCapacity, sandboxed_source_event_sink_path,
+pub use external::{
+    AckStatus, ApplyStatus, Backoff, CommandResult, ConfigAxis, ControlFrame, DaemonContact,
+    DaemonContacts, EffectHandlerSpec, ErrorInfo, EventAck, EventSource, ExternalInstallationDef,
+    ExternalProjectionDef, ExternalTransport, FlowSignal, InboundEvent, Invoke, InvokeResult,
+    JsonSchema, ManifestDef, ObservedGenerations, OutboundCommand, OverflowPolicy, PairingPayload,
+    PairingPayloadError, ProcSpec, ProviderReady, RejectReason, RestartPolicy, Role, RoleReady,
+    RoleSessionClientHello, SessionContext, SourceRateLimit, StreamCapacity,
+    sandboxed_source_event_sink_path,
 };
 pub use grant::{
     ConstraintSet, DeriveKind, Expiry, Grant, MethodBitmap, ResourceSelector, RightFlags, Rights,
@@ -90,8 +89,6 @@ pub use value::{
     Value, ValueError,
 };
 
-// ── kernel reserved path prefixes ──────────────────────────────
-
 /// Path prefixes reserved for the kernel. Non-kernel Processes cannot register
 /// handlers or write state under these even with a non-kernel Grant; admission
 /// and `open()` enforce it jointly.
@@ -115,9 +112,11 @@ pub const BOOTSTRAP_PHASE_PATH: &str = "state://kernel/bootstrap/phase";
 /// Returns `true` if `path` is under a kernel-reserved prefix.
 pub fn is_kernel_reserved(path: &Path) -> bool {
     let s = path.to_string();
-    KERNEL_RESERVED_PREFIXES
-        .iter()
-        .any(|prefix| s.starts_with(prefix))
+    s == "state://kernel"
+        || s == "effect://kernel"
+        || KERNEL_RESERVED_PREFIXES
+            .iter()
+            .any(|prefix| s.starts_with(prefix))
 }
 
 /// Returns `true` if `path` is under the credential-vault prefix.

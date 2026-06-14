@@ -1,12 +1,10 @@
-//! Extension projection: how an external capability is declared and how
+//! External projection: how an external capability is declared and how
 //! it lands on kernel primitives.
 //!
-//! An extension projects onto kernel primitives: the external process becomes
-//! an Executor Resource (`proc://<id>`), each capability it provides becomes a
-//! remote `Binding`, and its configuration is plain state the console reads and
-//! writes. This module holds the *declarations* (`ExtensionInstallationDef`,
-//! `ManifestDef`) and the wire frames (`Invoke`, `ControlFrame`, …) — all
-//! wasm-safe data.
+//! An external program projects onto kernel primitives: the process becomes an
+//! Executor Resource (`proc://<id>`), each provided capability becomes a remote
+//! `Binding`, and configuration is plain state the console reads and writes.
+//! This module holds declarations and wire frames as wasm-safe data.
 
 use crate::Timestamp;
 use crate::ids::MethodId;
@@ -23,15 +21,15 @@ pub use crate::device::{EffectCapability, Transport, TrustLevel};
 /// a schema-library dependency. Used as a config contract.
 pub type JsonSchema = Value;
 
-/// One capability projection inside an installed extension package.
+/// One capability projection inside an installed external program.
 ///
 /// A projection is deliberately single-role. A real connector may install
-/// several projections under one [`ExtensionInstallationDef`], but each
+/// several projections under one [`ExternalInstallationDef`], but each
 /// projection still compiles to one Source stream or one set of Provider
 /// Bindings. This keeps source ingest, provider authorization, flow control,
 /// and binding generations independent.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ExtensionProjectionDef {
+pub struct ExternalProjectionDef {
     /// Projection id unique within an installation.
     pub id: String,
     /// Whether this projection provides effects or emits source events.
@@ -53,19 +51,19 @@ pub struct ExtensionProjectionDef {
     pub version: u64,
 }
 
-/// A real installed extension package/runtime.
+/// A real installed external program runtime.
 ///
 /// This is the lifecycle, pairing, process, and shared-configuration unit. It
 /// may contain multiple independent projections (for example a chat connector
 /// with one Source projection for inbound events and one Provider projection
 /// for send/media effects), all sharing one process and credential.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ExtensionInstallationDef {
+pub struct ExternalInstallationDef {
     /// Installation id used in state paths, process ids, and sandbox prefixes.
     pub id: String,
     /// Connector family name.
     pub platform: String,
-    /// Transport used to communicate with the extension runtime.
+    /// Transport used to communicate with the external runtime.
     pub transport: Transport,
     /// Trust level assigned by admission.
     pub trust: TrustLevel,
@@ -76,19 +74,18 @@ pub struct ExtensionInstallationDef {
     /// plaintext.
     pub config: Value,
     /// The logical capabilities projected by this installation.
-    pub projections: Vec<ExtensionProjectionDef>,
+    pub projections: Vec<ExternalProjectionDef>,
     /// Optimistic concurrency for shared runtime/config/code changes.
     pub version: u64,
 }
 
-/// What role an extension plays. A Provider exposes effects (each →
-/// a remote Binding); a Source emits an inbound event stream.
+/// External projection role.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
-    /// Extension exposes effect resources through remote bindings.
+    /// Exposes effect resources through remote bindings.
     Provider,
-    /// Extension emits inbound events into a state sequence.
+    /// Emits inbound events into a state sequence.
     Source,
 }
 
@@ -98,7 +95,7 @@ pub enum Role {
 pub struct EventSource {
     /// The local Sequence Resource path inbound events are appended to.
     /// Sandboxed Sources must use
-    /// `state://events/extensions/<installation>/<projection>`.
+    /// `state://events/external/<installation>/<projection>`.
     pub sink: Path,
     /// Declared purity of inbound events (usually `Effectful`).
     #[serde(default)]
@@ -106,58 +103,91 @@ pub struct EventSource {
     /// Optional schema describing the event payload.
     #[serde(default)]
     pub event_schema: Option<JsonSchema>,
+    /// Maximum inline payload bytes accepted for one inbound event.
+    pub max_inline_payload_bytes: usize,
+    /// Bounded stream capacity for admitted inbound events.
+    pub capacity: StreamCapacity,
+    /// Optional ingress rate limit for this Source projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<SourceRateLimit>,
+    /// Whether this Source may receive outbound commands.
+    #[serde(default)]
+    pub commands: bool,
+    /// Schema for daemon-to-source command action values when `commands` is true.
+    #[serde(default)]
+    pub command_schema: Option<JsonSchema>,
+    /// Schema for successful source-to-daemon command result values.
+    #[serde(default)]
+    pub command_result_schema: Option<JsonSchema>,
 }
 
-/// Admission failures for extension installations and projections.
+/// Admission failures for external installations and projections.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
-pub enum ExtensionAdmissionError {
+pub enum ExternalAdmissionError {
     /// Installation id was empty.
-    #[error("extension installation id must not be empty")]
+    #[error("external installation id must not be empty")]
     EmptyInstallationId,
     /// Installation id was not a safe path segment.
     #[error(
-        "extension installation id must start with an ASCII letter or digit and contain only ASCII letters, digits, '_' or '-'"
+        "external installation id must start with an ASCII letter or digit and contain only ASCII letters, digits, '_' or '-'"
     )]
     MalformedInstallationId,
     /// Projection id was empty.
-    #[error("extension projection id must not be empty")]
+    #[error("external projection id must not be empty")]
     EmptyProjectionId,
     /// Projection id was not a safe path segment.
     #[error(
-        "extension projection id must start with an ASCII letter or digit and contain only ASCII letters, digits, '_' or '-'"
+        "external projection id must start with an ASCII letter or digit and contain only ASCII letters, digits, '_' or '-'"
     )]
     MalformedProjectionId,
     /// Installation declared no projections.
-    #[error("extension installation must declare at least one projection")]
+    #[error("external installation must declare at least one projection")]
     InstallationWithoutProjections,
     /// Installation declared the same projection id more than once.
-    #[error("extension projection id {0:?} is duplicated")]
+    #[error("external projection id {0:?} is duplicated")]
     DuplicateProjectionId(String),
     /// Provider projection declared no capabilities.
-    #[error("provider extension must declare at least one provided effect")]
+    #[error("provider projection must declare at least one provided effect")]
     ProviderWithoutCapabilities,
     /// Provider projection also declared source events.
-    #[error("provider extension must not declare a source event stream")]
+    #[error("provider projection must not declare a source event stream")]
     ProviderWithEventSource,
     /// Source projection declared no event sink.
-    #[error("source extension must declare an event stream")]
+    #[error("source projection must declare an event stream")]
     SourceWithoutEventStream,
     /// Source projection also declared provider capabilities.
-    #[error("source extension must not declare provider capabilities")]
+    #[error("source projection must not declare provider capabilities")]
     SourceWithCapabilities,
+    /// Source commands were enabled without command schemas.
+    #[error("source commands require command_schema and command_result_schema")]
+    SourceCommandsWithoutSchemas,
+    /// Source event payload size limit was invalid.
+    #[error("source max_inline_payload_bytes must be greater than zero")]
+    InvalidSourcePayloadLimit,
+    /// Source stream capacity was invalid.
+    #[error("source stream capacity max_events must be greater than zero")]
+    InvalidSourceCapacity,
+    /// Source backpressure thresholds were invalid.
+    #[error(
+        "source backpressure thresholds must satisfy resume_threshold < pause_threshold <= max_events"
+    )]
+    InvalidSourceBackpressureThresholds,
+    /// Source ingress rate limit was invalid.
+    #[error("source rate_limit window_ms and max_events must be greater than zero")]
+    InvalidSourceRateLimit,
     /// Source event sink was not a concrete local state path.
     #[error("source event sink must be a concrete local state:// path: {actual}")]
     BadSourceEventSink {
         /// Event sink path supplied by the projection.
-        actual: Path,
+        actual: Box<Path>,
     },
     /// Sandboxed source event sink did not match its required path.
     #[error("sandboxed source event sink must be {expected}, got {actual}")]
     BadSandboxEventSink {
         /// Required sandbox sink path.
-        expected: Path,
+        expected: Box<Path>,
         /// Sink path supplied by the projection.
-        actual: Path,
+        actual: Box<Path>,
     },
     /// Provider effect path could not be parsed.
     #[error("provider effect path is malformed: {0}")]
@@ -166,25 +196,25 @@ pub enum ExtensionAdmissionError {
     #[error("provider effect {effect} escapes namespace {namespace}")]
     NamespaceEscape {
         /// Declared provider namespace.
-        namespace: Path,
+        namespace: Box<Path>,
         /// Escaping effect path.
-        effect: Path,
+        effect: Box<Path>,
     },
-    /// Sandboxed provider namespace was not under an allowed prefix.
-    #[error("sandboxed extension namespace must be effect://plugin/<id> or effect://mcp-tool/<id>")]
+    /// Sandboxed provider namespace was not under the external provider prefix.
+    #[error("sandboxed external provider namespace must be effect://external-provider/<id>")]
     BadSandboxNamespace,
     /// Sandboxed namespace id segment did not match installation id.
-    #[error("sandboxed extension id does not match namespace id segment")]
+    #[error("sandboxed external id does not match namespace id segment")]
     SandboxIdMismatch,
     /// Full-trust installation used a transport reserved for sandboxed runtimes.
-    #[error("full-trust extension cannot use transport {0}")]
+    #[error("full-trust external program cannot use transport {0}")]
     FullTrustTransport(String),
     /// Sandboxed installation attempted in-process transport.
     #[error("in-process transport requires full trust")]
     InProcessSandbox,
 }
 
-impl ExtensionProjectionDef {
+impl ExternalProjectionDef {
     /// Admission check for one single-role projection. `installation_id`,
     /// `transport`, and `trust` come from the owning installation.
     pub fn validate_admission(
@@ -192,7 +222,7 @@ impl ExtensionProjectionDef {
         installation_id: &str,
         trust: TrustLevel,
         transport: &Transport,
-    ) -> Result<(), ExtensionAdmissionError> {
+    ) -> Result<(), ExternalAdmissionError> {
         validate_installation_id(installation_id)?;
         validate_projection_id(&self.id)?;
         validate_trust_transport(trust, transport)?;
@@ -200,26 +230,26 @@ impl ExtensionProjectionDef {
         match self.role {
             Role::Provider => {
                 if self.provides.is_empty() {
-                    return Err(ExtensionAdmissionError::ProviderWithoutCapabilities);
+                    return Err(ExternalAdmissionError::ProviderWithoutCapabilities);
                 }
                 if self.emits.is_some() {
-                    return Err(ExtensionAdmissionError::ProviderWithEventSource);
+                    return Err(ExternalAdmissionError::ProviderWithEventSource);
                 }
                 let namespace = self
                     .namespace
                     .as_ref()
-                    .ok_or(ExtensionAdmissionError::BadSandboxNamespace)?;
+                    .ok_or(ExternalAdmissionError::BadSandboxNamespace)?;
                 if trust == TrustLevel::Sandboxed {
                     validate_sandbox_namespace(installation_id, namespace)?;
                 }
                 for cap in &self.provides {
                     let effect = Path::parse(&cap.effect_path).map_err(|_| {
-                        ExtensionAdmissionError::MalformedEffectPath(cap.effect_path.clone())
+                        ExternalAdmissionError::MalformedEffectPath(cap.effect_path.clone())
                     })?;
                     if !namespace.is_prefix_of(&effect) {
-                        return Err(ExtensionAdmissionError::NamespaceEscape {
-                            namespace: namespace.clone(),
-                            effect,
+                        return Err(ExternalAdmissionError::NamespaceEscape {
+                            namespace: Box::new(namespace.clone()),
+                            effect: Box::new(effect),
                         });
                     }
                 }
@@ -228,17 +258,27 @@ impl ExtensionProjectionDef {
                 let emits = self
                     .emits
                     .as_ref()
-                    .ok_or(ExtensionAdmissionError::SourceWithoutEventStream)?;
+                    .ok_or(ExternalAdmissionError::SourceWithoutEventStream)?;
                 if !self.provides.is_empty() {
-                    return Err(ExtensionAdmissionError::SourceWithCapabilities);
+                    return Err(ExternalAdmissionError::SourceWithCapabilities);
                 }
                 validate_source_event_sink(&emits.sink)?;
+                if emits.commands
+                    && (emits.command_schema.is_none() || emits.command_result_schema.is_none())
+                {
+                    return Err(ExternalAdmissionError::SourceCommandsWithoutSchemas);
+                }
+                if emits.max_inline_payload_bytes == 0 {
+                    return Err(ExternalAdmissionError::InvalidSourcePayloadLimit);
+                }
+                validate_source_capacity(&emits.capacity)?;
+                validate_source_rate_limit(emits.rate_limit.as_ref())?;
                 if trust == TrustLevel::Sandboxed {
                     let expected = sandboxed_source_event_sink_path(installation_id, &self.id)?;
                     if emits.sink != expected {
-                        return Err(ExtensionAdmissionError::BadSandboxEventSink {
-                            expected,
-                            actual: emits.sink.clone(),
+                        return Err(ExternalAdmissionError::BadSandboxEventSink {
+                            expected: Box::new(expected),
+                            actual: Box::new(emits.sink.clone()),
                         });
                     }
                 }
@@ -248,20 +288,20 @@ impl ExtensionProjectionDef {
     }
 }
 
-impl ExtensionInstallationDef {
+impl ExternalInstallationDef {
     /// Admission check for an installed runtime package and all of its
     /// projections. This is control-plane-only; the data-plane still sees
     /// Source ingest and Provider Bindings after reconcile.
-    pub fn validate_admission(&self) -> Result<(), ExtensionAdmissionError> {
+    pub fn validate_admission(&self) -> Result<(), ExternalAdmissionError> {
         validate_installation_id(&self.id)?;
         validate_trust_transport(self.trust, &self.transport)?;
         if self.projections.is_empty() {
-            return Err(ExtensionAdmissionError::InstallationWithoutProjections);
+            return Err(ExternalAdmissionError::InstallationWithoutProjections);
         }
         let mut seen = std::collections::BTreeSet::new();
         for projection in &self.projections {
             if !seen.insert(projection.id.clone()) {
-                return Err(ExtensionAdmissionError::DuplicateProjectionId(
+                return Err(ExternalAdmissionError::DuplicateProjectionId(
                     projection.id.clone(),
                 ));
             }
@@ -271,29 +311,29 @@ impl ExtensionInstallationDef {
     }
 
     /// Return a projection by id.
-    pub fn projection(&self, id: &str) -> Option<&ExtensionProjectionDef> {
+    pub fn projection(&self, id: &str) -> Option<&ExternalProjectionDef> {
         self.projections
             .iter()
             .find(|projection| projection.id == id)
     }
 }
 
-fn validate_installation_id(id: &str) -> Result<(), ExtensionAdmissionError> {
+fn validate_installation_id(id: &str) -> Result<(), ExternalAdmissionError> {
     if id.trim().is_empty() {
-        return Err(ExtensionAdmissionError::EmptyInstallationId);
+        return Err(ExternalAdmissionError::EmptyInstallationId);
     }
     if !is_safe_id_segment(id) {
-        return Err(ExtensionAdmissionError::MalformedInstallationId);
+        return Err(ExternalAdmissionError::MalformedInstallationId);
     }
     Ok(())
 }
 
-fn validate_projection_id(id: &str) -> Result<(), ExtensionAdmissionError> {
+fn validate_projection_id(id: &str) -> Result<(), ExternalAdmissionError> {
     if id.trim().is_empty() {
-        return Err(ExtensionAdmissionError::EmptyProjectionId);
+        return Err(ExternalAdmissionError::EmptyProjectionId);
     }
     if !is_safe_id_segment(id) {
-        return Err(ExtensionAdmissionError::MalformedProjectionId);
+        return Err(ExternalAdmissionError::MalformedProjectionId);
     }
     Ok(())
 }
@@ -310,37 +350,37 @@ fn is_safe_id_segment(id: &str) -> bool {
 fn validate_trust_transport(
     trust: TrustLevel,
     transport: &Transport,
-) -> Result<(), ExtensionAdmissionError> {
+) -> Result<(), ExternalAdmissionError> {
     match (trust, transport) {
         (
             TrustLevel::Full,
             Transport::InProcess | Transport::Grpc { .. } | Transport::WebSocket { .. },
         ) => Ok(()),
-        (TrustLevel::Full, other) => Err(ExtensionAdmissionError::FullTrustTransport(
+        (TrustLevel::Full, other) => Err(ExternalAdmissionError::FullTrustTransport(
             transport_name(other).into(),
         )),
         (TrustLevel::Sandboxed, Transport::InProcess) => {
-            Err(ExtensionAdmissionError::InProcessSandbox)
+            Err(ExternalAdmissionError::InProcessSandbox)
         }
         (TrustLevel::Sandboxed, _) => Ok(()),
     }
 }
 
-fn validate_sandbox_namespace(id: &str, namespace: &Path) -> Result<(), ExtensionAdmissionError> {
+fn validate_sandbox_namespace(id: &str, namespace: &Path) -> Result<(), ExternalAdmissionError> {
     let segs = namespace.segments();
     let ok_prefix = namespace.scheme() == "effect"
         && segs.len() >= 2
-        && matches!(segs[0].as_str(), "plugin" | "mcp-tool");
+        && segs[0].as_str() == "external-provider";
     if !ok_prefix {
-        return Err(ExtensionAdmissionError::BadSandboxNamespace);
+        return Err(ExternalAdmissionError::BadSandboxNamespace);
     }
     if segs[1].as_str() != id {
-        return Err(ExtensionAdmissionError::SandboxIdMismatch);
+        return Err(ExternalAdmissionError::SandboxIdMismatch);
     }
     Ok(())
 }
 
-fn validate_source_event_sink(path: &Path) -> Result<(), ExtensionAdmissionError> {
+fn validate_source_event_sink(path: &Path) -> Result<(), ExternalAdmissionError> {
     let concrete = path
         .segments()
         .iter()
@@ -352,24 +392,51 @@ fn validate_source_event_sink(path: &Path) -> Result<(), ExtensionAdmissionError
     {
         Ok(())
     } else {
-        Err(ExtensionAdmissionError::BadSourceEventSink {
-            actual: path.clone(),
+        Err(ExternalAdmissionError::BadSourceEventSink {
+            actual: Box::new(path.clone()),
         })
     }
+}
+
+fn validate_source_capacity(capacity: &StreamCapacity) -> Result<(), ExternalAdmissionError> {
+    if capacity.max_events == 0 {
+        return Err(ExternalAdmissionError::InvalidSourceCapacity);
+    }
+    if let OverflowPolicy::Backpressure {
+        pause_threshold,
+        resume_threshold,
+    } = &capacity.on_overflow
+        && (resume_threshold >= pause_threshold || pause_threshold > &capacity.max_events)
+    {
+        return Err(ExternalAdmissionError::InvalidSourceBackpressureThresholds);
+    }
+    Ok(())
+}
+
+fn validate_source_rate_limit(
+    rate_limit: Option<&SourceRateLimit>,
+) -> Result<(), ExternalAdmissionError> {
+    let Some(rate_limit) = rate_limit else {
+        return Ok(());
+    };
+    if rate_limit.window_ms == 0 || rate_limit.max_events == 0 {
+        return Err(ExternalAdmissionError::InvalidSourceRateLimit);
+    }
+    Ok(())
 }
 
 /// Build the required source event sink for a sandboxed source projection.
 pub fn sandboxed_source_event_sink_path(
     installation_id: &str,
     projection_id: &str,
-) -> Result<Path, ExtensionAdmissionError> {
+) -> Result<Path, ExternalAdmissionError> {
     validate_installation_id(installation_id)?;
     validate_projection_id(projection_id)?;
     Ok(Path::try_new("state")
         .expect("static scheme is valid")
         .try_push("events")
         .expect("static segment is valid")
-        .try_push("extensions")
+        .try_push("external")
         .expect("static segment is valid")
         .try_push(installation_id)
         .expect("validated installation id is a valid path segment")
@@ -396,7 +463,7 @@ pub struct ManifestDef {
     /// Source of an installation's shared config schema.
     pub config_schema: JsonSchema,
     /// Projection templates this manifest can install.
-    pub projections: Vec<ExtensionProjectionDef>,
+    pub projections: Vec<ExternalProjectionDef>,
     /// Transports supported by this manifest.
     pub supported_transports: Vec<Transport>,
     /// Default transport selected when an installation does not override it.
@@ -405,22 +472,21 @@ pub struct ManifestDef {
     pub version: u64,
 }
 
-// ── pairing payload ────────────────────────────────────────
+// Pairing payload.
 
 /// Transport choices encoded in a pairing payload. This is narrower than the
-/// generic provider [`Transport`]: pairing only tells an unpaired extension
-/// where to submit its claim.
+/// generic provider [`Transport`]: pairing only tells an unpaired external
+/// program where to submit its claim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ExtensionTransport {
+pub enum ExternalTransport {
     /// WebSocket pairing endpoint.
     WebSocket,
     /// gRPC pairing endpoint.
     Grpc,
 }
 
-/// The daemon connection choices embedded in a pairing payload. Unpaired
-/// extensions connect to these contacts.
+/// The daemon connection choices embedded in a pairing payload.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DaemonContacts {
     /// Ordered daemon contact candidates.
@@ -432,7 +498,7 @@ pub struct DaemonContacts {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DaemonContact {
     /// Transport used for this contact.
-    pub transport: ExtensionTransport,
+    pub transport: ExternalTransport,
     /// Host/IP plus port, without URL scheme.
     pub authority: String,
     /// Service name exposed at this contact.
@@ -533,7 +599,7 @@ fn validate_authority(authority: &str) -> Result<(), PairingPayloadError> {
     Ok(())
 }
 
-// ── proc:// Executor Resource ───────────────────────────────
+// proc:// executor resource.
 
 /// How a dead `proc://` process is restarted, borrowing Erlang/OTP
 /// supervision semantics.
@@ -607,38 +673,38 @@ pub struct ProcSpec {
     pub restart: RestartPolicy,
 }
 
-// ── data + control frames ───────────────────────────────────
+// Data and control frames.
 
-/// Flow-control signal carried on a [`ControlFrame`].
+/// Daemon-owned flow-control signal carried on a [`ControlFrame`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowSignal {
-    /// Pause inbound event delivery.
+    /// Pause delivery toward the external program.
     Pause,
-    /// Resume inbound event delivery.
+    /// Resume delivery toward the external program.
     Resume,
 }
 
-/// Generation tags an extension echoes for comparison; the daemon holds the
+/// Generation tags an external program echoes for comparison; the daemon holds the
 /// authority and chooses the real values. Only the two lightweight
 /// presentation/alias axes ride on each inbound event — session-level
 /// generations live in [`SessionContext`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ObservedGenerations {
-    /// Presentation configuration generation observed by the extension.
+    /// Presentation configuration generation observed by the external program.
     #[serde(default)]
     pub presentation_config_generation: u64,
-    /// Alias catalog generation observed by the extension.
+    /// Alias catalog generation observed by the external program.
     #[serde(default)]
     pub alias_catalog_generation: u64,
 }
 
-/// Stage 1 of the session handshake: the extension opens by
+/// Stage 1 of the session handshake: the external program opens by
 /// reporting identity + locally cached generations/hash (pure echo, no
-/// authority). Self-describing extensions report their config contract here.
+/// authority). Self-describing external programs report their config contract here.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RoleSessionClientHello {
-    /// Role requested by the extension endpoint.
+    /// Role requested by the external endpoint.
     pub role: Role,
     /// Installation id the endpoint claims.
     pub installation_id: String,
@@ -655,7 +721,7 @@ pub struct RoleSessionClientHello {
 }
 
 /// Stage 2 of the handshake: the daemon adjudicates every
-/// authoritative registry hash/generation and sends them down. The extension
+/// authoritative registry hash/generation and sends them down. The external program
 /// never declares or guesses these.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionContext {
@@ -672,21 +738,23 @@ pub struct SessionContext {
     /// Binding generation selected by the daemon.
     pub binding_generation: u64,
     /// Installation config version selected by the daemon.
-    pub extension_config_version: u64,
+    pub installation_config_version: u64,
     /// Projection version selected by the daemon.
     pub projection_version: u64,
     /// Presentation config generation selected by the daemon.
     pub presentation_config_generation: u64,
     /// Alias catalog generation selected by the daemon.
     pub alias_catalog_generation: u64,
+    /// Daemon-selected session id for this role connection.
+    pub session_id: String,
 }
 
-/// Stage 3 of the handshake: the extension confirms it has aligned to
+/// Stage 3 of the handshake: the role client confirms it has aligned to
 /// the daemon-chosen [`SessionContext`]. Any generation/hash mismatch is
 /// fail-closed; no business frames flow before this.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RoleReady {
-    /// Session context accepted by the extension.
+    /// Session context accepted by the role client.
     pub accepted_context: SessionContext,
 }
 
@@ -695,12 +763,12 @@ pub struct RoleReady {
 #[serde(rename_all = "snake_case")]
 pub enum ConfigAxis {
     /// Authority/configuration axis.
-    ExtensionConfig,
+    InstallationConfig,
     /// Presentation-only axis.
     PresentationConfig,
 }
 
-/// Why an extension rejected a config/presentation update.
+/// Why a role client rejected a config/presentation update.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectReason {
@@ -728,43 +796,53 @@ pub enum ApplyStatus {
 }
 
 /// Control frames shared by both roles. Configuration travels on two
-/// independent axes that never mix — `ExtensionConfigUpdate` (authority: what
-/// the extension may do) and `PresentationConfigUpdate` (presentation only:
+/// independent axes that never mix — `InstallationConfigUpdate` (authority: what
+/// the role client may do) and `PresentationConfigUpdate` (presentation only:
 /// never grants capability) — plus a profile-report axis flowing the other way.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlFrame {
     /// Liveness heartbeat.
-    Heartbeat,
-    /// Request graceful or forced shutdown.
+    Heartbeat {
+        /// Heartbeat timestamp in milliseconds since epoch.
+        timestamp_ms: i64,
+    },
+    /// Daemon-to-role-client graceful or forced shutdown request.
     Shutdown {
         /// Whether the endpoint should attempt graceful shutdown.
         graceful: bool,
         /// Shutdown timeout in milliseconds.
         timeout_ms: u64,
     },
-    /// Flow-control signal.
+    /// Daemon-to-role-client flow-control signal.
     FlowControl(FlowSignal),
-    /// Report axis: extension → daemon, declares what this end can render and
+    /// Cancel one Provider invocation previously sent by the daemon.
+    ProviderCancel {
+        /// Invocation id being cancelled.
+        invocation_id: String,
+        /// Redacted cancellation reason.
+        reason: String,
+    },
+    /// Report axis from role client to daemon. Declares what this end can render and
     /// which entry points are locally disabled. The profile body is opaque
     /// here; connector docs such as Web/Mobile define its schema.
     PresentationProfileUpdate {
-        /// Profile generation reported by the extension.
+        /// Profile generation reported by the role client.
         profile_generation: u64,
         /// Hash of the reported profile.
         profile_hash: String,
         /// Opaque profile body.
         profile: Value,
     },
-    /// Authority axis from daemon to extension via a CAS state write. Advances
-    /// `ExtensionInstallationDef.version` and may bump the Binding generation.
-    ExtensionConfigUpdate {
-        /// New extension config version.
+    /// Authority axis from daemon to role client via a CAS state write. Advances
+    /// `ExternalInstallationDef.version` and may bump the Binding generation.
+    InstallationConfigUpdate {
+        /// New external config version.
         config_version: u64,
-        /// New extension config body.
+        /// New external config body.
         config: Value,
     },
-    /// Presentation axis: daemon → extension; pure display / entry-point /
+    /// Presentation axis from daemon to role client: pure display / entry-point /
     /// renderer budget — never grants capability, bounded by `profile_hash`.
     PresentationConfigUpdate {
         /// New presentation config generation.
@@ -774,7 +852,7 @@ pub enum ControlFrame {
         /// Presentation config body.
         config: Value,
     },
-    /// Shared reply loop: the extension must report how it applied an update;
+    /// Shared reply loop: the role client must report how it applied an update;
     /// the daemon uses it to judge liveness and to fail closed.
     ConfigAck {
         /// Config axis being acknowledged.
@@ -784,6 +862,26 @@ pub enum ControlFrame {
         /// Apply result.
         status: ApplyStatus,
     },
+}
+
+/// Provider readiness entry reported by a remote endpoint.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EffectHandlerSpec {
+    /// Effect resource path the endpoint can handle.
+    pub path: String,
+    /// Declared replay safety for this handler.
+    pub purity: Purity,
+    /// Optional human-readable description.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// Provider frame declaring that startup is complete.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderReady {
+    /// Runtime handler set reported by the endpoint.
+    #[serde(default)]
+    pub provides: Vec<EffectHandlerSpec>,
 }
 
 /// Provider data frame: one remote Operation.
@@ -839,6 +937,13 @@ pub struct InboundEvent {
     pub observed: ObservedGenerations,
     /// Event timestamp in milliseconds since epoch.
     pub timestamp_ms: i64,
+    /// Optional stream id for ordered source delivery.
+    #[serde(default)]
+    pub stream_id: Option<String>,
+    /// Optional stream-local sequence number. When set, the daemon admits only
+    /// the next sequence for `stream_id`.
+    #[serde(default)]
+    pub seq: Option<u64>,
 }
 
 /// Source data frame: a command sent back out to the source.
@@ -846,11 +951,20 @@ pub struct InboundEvent {
 pub struct OutboundCommand {
     /// Command id used for deduplication.
     pub id: String,
-    /// Opaque command body understood by the source extension.
+    /// Opaque command body understood by the Source.
     pub action: Value,
     /// Lightweight generation tags attached by the daemon.
     #[serde(default)]
     pub observed: ObservedGenerations,
+}
+
+/// Source data frame: the result of one [`OutboundCommand`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommandResult {
+    /// Command id matching the outbound command.
+    pub id: String,
+    /// Successful result value or endpoint error detail.
+    pub outcome: Result<Value, ErrorInfo>,
 }
 
 /// Acknowledgement status for an inbound event.
@@ -872,9 +986,12 @@ pub struct EventAck {
     pub id: String,
     /// Acknowledgement status.
     pub status: AckStatus,
+    /// Redacted reason when the event was rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reject_reason: Option<String>,
 }
 
-// ── inbound stream capacity vs rate ───────────────────────────
+// Inbound stream capacity and rate limits.
 
 /// What to do when an inbound stream overflows its capacity. Distinct
 /// from rate limiting, which is a policy concern.
@@ -903,13 +1020,32 @@ pub struct StreamCapacity {
     pub on_overflow: OverflowPolicy,
 }
 
+/// Rate limit for inbound events on one Source projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceRateLimit {
+    /// Sliding window length in milliseconds.
+    pub window_ms: u64,
+    /// Maximum events admitted during the window.
+    pub max_events: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_source_capacity() -> StreamCapacity {
+        StreamCapacity {
+            max_events: 1024,
+            on_overflow: OverflowPolicy::Backpressure {
+                pause_threshold: 1024,
+                resume_threshold: 512,
+            },
+        }
+    }
+
     #[test]
     fn installation_with_source_and_provider_projections_is_admitted() {
-        let install = ExtensionInstallationDef {
+        let install = ExternalInstallationDef {
             id: "instant_messaging_platform".into(),
             platform: "instant_messaging_platform".into(),
             transport: Transport::Grpc { endpoint: None },
@@ -917,7 +1053,7 @@ mod tests {
             config_schema: Value::Null,
             config: Value::Null,
             projections: vec![
-                ExtensionProjectionDef {
+                ExternalProjectionDef {
                     id: "source".into(),
                     role: Role::Source,
                     namespace: None,
@@ -930,17 +1066,24 @@ mod tests {
                         .unwrap(),
                         purity: Purity::Effectful,
                         event_schema: None,
+                        max_inline_payload_bytes: 65_536,
+                        capacity: test_source_capacity(),
+                        rate_limit: None,
+                        commands: false,
+                        command_schema: None,
+                        command_result_schema: None,
                     }),
                     version: 1,
                 },
-                ExtensionProjectionDef {
+                ExternalProjectionDef {
                     id: "provider".into(),
                     role: Role::Provider,
                     namespace: Some(
-                        Path::parse("effect://plugin/instant_messaging_platform").unwrap(),
+                        Path::parse("effect://external-provider/instant_messaging_platform")
+                            .unwrap(),
                     ),
                     provides: vec![EffectCapability::new(
-                        "effect://plugin/instant_messaging_platform/send_text",
+                        "effect://external-provider/instant_messaging_platform/send_text",
                         Purity::Effectful,
                     )],
                     emits: None,
@@ -954,18 +1097,20 @@ mod tests {
 
     #[test]
     fn installation_rejects_duplicate_projection_ids() {
-        let projection = ExtensionProjectionDef {
+        let projection = ExternalProjectionDef {
             id: "provider".into(),
             role: Role::Provider,
-            namespace: Some(Path::parse("effect://plugin/instant_messaging_platform").unwrap()),
+            namespace: Some(
+                Path::parse("effect://external-provider/instant_messaging_platform").unwrap(),
+            ),
             provides: vec![EffectCapability::new(
-                "effect://plugin/instant_messaging_platform/send_text",
+                "effect://external-provider/instant_messaging_platform/send_text",
                 Purity::Effectful,
             )],
             emits: None,
             version: 1,
         };
-        let install = ExtensionInstallationDef {
+        let install = ExternalInstallationDef {
             id: "instant_messaging_platform".into(),
             platform: "instant_messaging_platform".into(),
             transport: Transport::Grpc { endpoint: None },
@@ -977,7 +1122,7 @@ mod tests {
         };
         assert_eq!(
             install.validate_admission(),
-            Err(ExtensionAdmissionError::DuplicateProjectionId(
+            Err(ExternalAdmissionError::DuplicateProjectionId(
                 "provider".into()
             ))
         );
@@ -985,15 +1130,15 @@ mod tests {
 
     #[test]
     fn sandbox_provider_admission_is_structural_and_fail_closed() {
-        let valid = ExtensionProjectionDef {
+        let valid = ExternalProjectionDef {
             id: "provider".into(),
             role: Role::Provider,
             provides: vec![EffectCapability::new(
-                "effect://plugin/acme/search",
+                "effect://external-provider/acme/search",
                 Purity::Idempotent,
             )],
             emits: None,
-            namespace: Some(Path::parse("effect://plugin/acme").unwrap()),
+            namespace: Some(Path::parse("effect://external-provider/acme").unwrap()),
             version: 1,
         };
         assert_eq!(
@@ -1009,7 +1154,8 @@ mod tests {
         );
 
         let mut sibling_escape = valid.clone();
-        sibling_escape.provides[0].effect_path = "effect://plugin/acmeevil/search".into();
+        sibling_escape.provides[0].effect_path =
+            "effect://external-provider/acmeevil/search".into();
         assert!(matches!(
             sibling_escape.validate_admission(
                 "acme",
@@ -1019,7 +1165,7 @@ mod tests {
                     args: vec![]
                 }
             ),
-            Err(ExtensionAdmissionError::NamespaceEscape { .. })
+            Err(ExternalAdmissionError::NamespaceEscape { .. })
         ));
 
         let mut bad_namespace = valid.clone();
@@ -1033,18 +1179,18 @@ mod tests {
                     args: vec![]
                 }
             ),
-            Err(ExtensionAdmissionError::BadSandboxNamespace)
+            Err(ExternalAdmissionError::BadSandboxNamespace)
         );
     }
 
     #[test]
     fn projection_role_shape_is_fail_closed() {
-        let provider_without_caps = ExtensionProjectionDef {
+        let provider_without_caps = ExternalProjectionDef {
             id: "provider".into(),
             role: Role::Provider,
             provides: vec![],
             emits: None,
-            namespace: Some(Path::parse("effect://plugin/acme").unwrap()),
+            namespace: Some(Path::parse("effect://external-provider/acme").unwrap()),
             version: 1,
         };
         assert_eq!(
@@ -1056,20 +1202,26 @@ mod tests {
                     args: vec![]
                 }
             ),
-            Err(ExtensionAdmissionError::ProviderWithoutCapabilities)
+            Err(ExternalAdmissionError::ProviderWithoutCapabilities)
         );
 
-        let source_with_caps = ExtensionProjectionDef {
+        let source_with_caps = ExternalProjectionDef {
             id: "source".into(),
             role: Role::Source,
             provides: vec![EffectCapability::new(
-                "effect://plugin/bridge/tool",
+                "effect://external-provider/bridge/tool",
                 Purity::Effectful,
             )],
             emits: Some(EventSource {
                 sink: sandboxed_source_event_sink_path("bridge", "source").unwrap(),
                 purity: Purity::Effectful,
                 event_schema: None,
+                max_inline_payload_bytes: 65_536,
+                capacity: test_source_capacity(),
+                rate_limit: None,
+                commands: false,
+                command_schema: None,
+                command_result_schema: None,
             }),
             namespace: None,
             version: 1,
@@ -1082,13 +1234,13 @@ mod tests {
                     endpoint: Some("wss://example.test".into())
                 }
             ),
-            Err(ExtensionAdmissionError::SourceWithCapabilities)
+            Err(ExternalAdmissionError::SourceWithCapabilities)
         );
     }
 
     #[test]
     fn sandbox_source_event_sink_is_canonical_and_fail_closed() {
-        let valid = ExtensionProjectionDef {
+        let valid = ExternalProjectionDef {
             id: "source".into(),
             role: Role::Source,
             provides: vec![],
@@ -1096,6 +1248,12 @@ mod tests {
                 sink: sandboxed_source_event_sink_path("bridge", "source").unwrap(),
                 purity: Purity::Effectful,
                 event_schema: None,
+                max_inline_payload_bytes: 65_536,
+                capacity: test_source_capacity(),
+                rate_limit: None,
+                commands: false,
+                command_schema: None,
+                command_result_schema: None,
             }),
             namespace: None,
             version: 1,
@@ -1121,13 +1279,133 @@ mod tests {
                     endpoint: Some("wss://example.test".into())
                 }
             ),
-            Err(ExtensionAdmissionError::BadSandboxEventSink { .. })
+            Err(ExternalAdmissionError::BadSandboxEventSink { .. })
         ));
     }
 
     #[test]
+    fn source_commands_require_command_schemas() {
+        let source = ExternalProjectionDef {
+            id: "source".into(),
+            role: Role::Source,
+            provides: vec![],
+            emits: Some(EventSource {
+                sink: sandboxed_source_event_sink_path("bridge", "source").unwrap(),
+                purity: Purity::Effectful,
+                event_schema: None,
+                max_inline_payload_bytes: 65_536,
+                capacity: test_source_capacity(),
+                rate_limit: None,
+                commands: true,
+                command_schema: None,
+                command_result_schema: Some(Value::Map(std::collections::BTreeMap::from([(
+                    "type".into(),
+                    Value::Str("string".into()),
+                )]))),
+            }),
+            namespace: None,
+            version: 1,
+        };
+
+        assert_eq!(
+            source.validate_admission(
+                "bridge",
+                TrustLevel::Sandboxed,
+                &Transport::WebSocket {
+                    endpoint: Some("wss://example.test".into())
+                }
+            ),
+            Err(ExternalAdmissionError::SourceCommandsWithoutSchemas)
+        );
+    }
+
+    #[test]
+    fn source_capacity_and_rate_limit_admission_is_fail_closed() {
+        let mut source = ExternalProjectionDef {
+            id: "source".into(),
+            role: Role::Source,
+            provides: vec![],
+            emits: Some(EventSource {
+                sink: sandboxed_source_event_sink_path("bridge", "source").unwrap(),
+                purity: Purity::Effectful,
+                event_schema: None,
+                max_inline_payload_bytes: 65_536,
+                capacity: test_source_capacity(),
+                rate_limit: None,
+                commands: false,
+                command_schema: None,
+                command_result_schema: None,
+            }),
+            namespace: None,
+            version: 1,
+        };
+
+        source.emits.as_mut().unwrap().max_inline_payload_bytes = 0;
+        assert_eq!(
+            source.validate_admission(
+                "bridge",
+                TrustLevel::Sandboxed,
+                &Transport::WebSocket {
+                    endpoint: Some("wss://example.test".into())
+                }
+            ),
+            Err(ExternalAdmissionError::InvalidSourcePayloadLimit)
+        );
+
+        let emits = source.emits.as_mut().unwrap();
+        emits.max_inline_payload_bytes = 65_536;
+        emits.capacity.max_events = 0;
+        assert_eq!(
+            source.validate_admission(
+                "bridge",
+                TrustLevel::Sandboxed,
+                &Transport::WebSocket {
+                    endpoint: Some("wss://example.test".into())
+                }
+            ),
+            Err(ExternalAdmissionError::InvalidSourceCapacity)
+        );
+
+        let emits = source.emits.as_mut().unwrap();
+        emits.capacity = StreamCapacity {
+            max_events: 10,
+            on_overflow: OverflowPolicy::Backpressure {
+                pause_threshold: 5,
+                resume_threshold: 5,
+            },
+        };
+        assert_eq!(
+            source.validate_admission(
+                "bridge",
+                TrustLevel::Sandboxed,
+                &Transport::WebSocket {
+                    endpoint: Some("wss://example.test".into())
+                }
+            ),
+            Err(ExternalAdmissionError::InvalidSourceBackpressureThresholds)
+        );
+
+        let emits = source.emits.as_mut().unwrap();
+        emits.capacity = test_source_capacity();
+        emits.rate_limit = Some(SourceRateLimit {
+            window_ms: 0,
+            max_events: 1,
+        });
+        assert_eq!(
+            source.validate_admission(
+                "bridge",
+                TrustLevel::Sandboxed,
+                &Transport::WebSocket {
+                    endpoint: Some("wss://example.test".into())
+                }
+            ),
+            Err(ExternalAdmissionError::InvalidSourceRateLimit)
+        );
+    }
+
+    #[test]
     fn source_event_sink_must_be_local_concrete_state_path() {
-        let source = ExtensionProjectionDef {
+        let source = ExternalProjectionDef {
             id: "source".into(),
             role: Role::Source,
             provides: vec![],
@@ -1135,6 +1413,12 @@ mod tests {
                 sink: Path::parse("state://events/full/source").unwrap(),
                 purity: Purity::Effectful,
                 event_schema: None,
+                max_inline_payload_bytes: 65_536,
+                capacity: test_source_capacity(),
+                rate_limit: None,
+                commands: false,
+                command_schema: None,
+                command_result_schema: None,
             }),
             namespace: None,
             version: 1,
@@ -1156,7 +1440,7 @@ mod tests {
                 TrustLevel::Full,
                 &Transport::Grpc { endpoint: None }
             ),
-            Err(ExtensionAdmissionError::BadSourceEventSink { .. })
+            Err(ExternalAdmissionError::BadSourceEventSink { .. })
         ));
 
         let mut clustered = source.clone();
@@ -1168,13 +1452,13 @@ mod tests {
                 TrustLevel::Full,
                 &Transport::Grpc { endpoint: None }
             ),
-            Err(ExtensionAdmissionError::BadSourceEventSink { .. })
+            Err(ExternalAdmissionError::BadSourceEventSink { .. })
         ));
     }
 
     #[test]
     fn trust_transport_combo_is_fail_closed() {
-        let full_stdio = ExtensionInstallationDef {
+        let full_stdio = ExternalInstallationDef {
             id: "local-tool".into(),
             platform: "local-tool".into(),
             transport: Transport::Stdio {
@@ -1184,7 +1468,7 @@ mod tests {
             trust: TrustLevel::Full,
             config_schema: Value::Null,
             config: Value::Null,
-            projections: vec![ExtensionProjectionDef {
+            projections: vec![ExternalProjectionDef {
                 id: "provider".into(),
                 role: Role::Provider,
                 namespace: Some(Path::parse("effect://local-tool").unwrap()),
@@ -1199,7 +1483,7 @@ mod tests {
         };
         assert!(matches!(
             full_stdio.validate_admission(),
-            Err(ExtensionAdmissionError::FullTrustTransport(t)) if t == "stdio"
+            Err(ExternalAdmissionError::FullTrustTransport(t)) if t == "stdio"
         ));
 
         let mut sandbox_in_process = full_stdio.clone();
@@ -1207,12 +1491,12 @@ mod tests {
         sandbox_in_process.trust = TrustLevel::Sandboxed;
         sandbox_in_process.transport = Transport::InProcess;
         sandbox_in_process.projections[0].namespace =
-            Some(Path::parse("effect://plugin/tool").unwrap());
+            Some(Path::parse("effect://external-provider/tool").unwrap());
         sandbox_in_process.projections[0].provides[0].effect_path =
-            "effect://plugin/tool/run".into();
+            "effect://external-provider/tool/run".into();
         assert_eq!(
             sandbox_in_process.validate_admission(),
-            Err(ExtensionAdmissionError::InProcessSandbox)
+            Err(ExternalAdmissionError::InProcessSandbox)
         );
     }
 
@@ -1247,10 +1531,11 @@ mod tests {
             registry_hash: "abc".into(),
             credential_generation: 2,
             binding_generation: 3,
-            extension_config_version: 1,
+            installation_config_version: 1,
             projection_version: 1,
             presentation_config_generation: 4,
             alias_catalog_generation: 5,
+            session_id: "session-1".into(),
         };
         let ready = RoleReady {
             accepted_context: ctx,
@@ -1278,6 +1563,20 @@ mod tests {
     }
 
     #[test]
+    fn command_result_carries_error() {
+        let r = CommandResult {
+            id: "cmd-1".into(),
+            outcome: Err(ErrorInfo {
+                kind: "bridge_error".into(),
+                message: "failed".into(),
+            }),
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: CommandResult = serde_json::from_str(&s).unwrap();
+        assert_eq!(r, back);
+    }
+
+    #[test]
     fn pairing_payload_requires_contacts_and_valid_authorities() {
         let payload = PairingPayload {
             version: 1,
@@ -1286,16 +1585,16 @@ mod tests {
             daemon_contacts: DaemonContacts {
                 contacts: vec![
                     DaemonContact {
-                        transport: ExtensionTransport::WebSocket,
+                        transport: ExternalTransport::WebSocket,
                         authority: "192.168.1.20:7443".into(),
-                        service: "/extension/pair".into(),
+                        service: "/external/pair".into(),
                         tls_name: None,
                         priority: 10,
                     },
                     DaemonContact {
-                        transport: ExtensionTransport::Grpc,
+                        transport: ExternalTransport::Grpc,
                         authority: "[fd00::12]:7443".into(),
-                        service: "NexusExtensionPairing.Pair".into(),
+                        service: "NexusExternalPairing.Pair".into(),
                         tls_name: Some("nexus.local".into()),
                         priority: 20,
                     },
@@ -1324,9 +1623,9 @@ mod tests {
         assert_eq!(empty.validate(), Err(PairingPayloadError::MissingContacts));
 
         let bad = DaemonContact {
-            transport: ExtensionTransport::WebSocket,
+            transport: ExternalTransport::WebSocket,
             authority: "https://nexus.local:7443".into(),
-            service: "/extension/pair".into(),
+            service: "/external/pair".into(),
             tls_name: None,
             priority: 1,
         };

@@ -15,7 +15,7 @@
 
 use crate::driver::{DriverDescriptor, DynDriver};
 use crate::kernel::Kernel;
-use crate::open::{OpenError, OpenRequest, open_resource};
+use crate::open::{OpenError, OpenRequest, open_resource_with_attached};
 use crate::process::ProcessEntry;
 use crate::registry::AdmissionError;
 use nexus_types::{
@@ -52,6 +52,28 @@ pub struct GatewayAudit<'a> {
     pub details: Option<nexus_types::Value>,
 }
 
+/// Request grant template attached to a spawned request Process.
+pub struct RequestGrantTemplate<'a> {
+    /// Capability selector literal for the request grant.
+    pub literal: &'a str,
+    /// Method bits the request grant may exercise.
+    pub methods: MethodBitmap,
+}
+
+/// Parsed request grant template attached to a spawned request Process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompiledRequestGrantTemplate {
+    /// Capability selector for the request grant.
+    pub selector: ResourceSelector,
+    /// Method bits the request grant may exercise.
+    pub methods: MethodBitmap,
+}
+
+struct ParsedRequestGrantTemplate {
+    selector: ResourceSelector,
+    methods: Option<MethodBitmap>,
+}
+
 /// Errors raised while assembling built-in resources, drivers, and bootstrap
 /// facts/state.
 #[derive(Debug, Error)]
@@ -85,6 +107,13 @@ pub enum BootstrapError {
     /// Registry admission rejected a bootstrap object.
     #[error("admission failed: {0}")]
     Admission(#[from] AdmissionError),
+    /// A request grant selector is not covered by any grant the authority
+    /// anchor holds. No Process is created.
+    #[error("request grant {literal:?} exceeds authority anchor ceiling")]
+    CapabilityCeiling {
+        /// Request grant literal that exceeded the anchor.
+        literal: String,
+    },
     /// Writing a bootstrap fact failed.
     #[error("fact write failed: {0}")]
     Fact(#[from] crate::FactError),
@@ -420,7 +449,8 @@ impl Bootstrap {
             .processes
             .identity(process)
             .unwrap_or(IdentityRef::ROOT);
-        open_resource(
+        let attached_grants = self.kernel.processes.attached_grants(process);
+        open_resource_with_attached(
             &self.kernel.registry,
             &mut handles,
             OpenRequest {
@@ -441,50 +471,121 @@ impl Bootstrap {
                 requested_path: Some(name.path().clone()),
                 now_millis: crate::executor::now_millis(),
             },
+            &attached_grants,
         )
     }
 
-    /// Spawn an **attenuated request Process** under root for a gateway request
-    /// The child runs as `identity` and holds grants
-    /// narrowed to `declared_capabilities` — the task-level capability ceiling:
-    /// an injected Plan inside this Process can reach *only* the declared
-    /// capabilities, not root's full authority. With an empty list the child
-    /// gets no grants (an inert task).
-    pub fn spawn_request_process(
+    /// Return the method bitmap selected by a capability verb for a resource.
+    pub fn request_method_bitmap(
         &self,
+        name: &ResourceName,
+        verb: &str,
+    ) -> Result<MethodBitmap, OpenError> {
+        let resource_id = self
+            .kernel
+            .registry
+            .resolve_resource(name)
+            .map_err(|_| OpenError::NoSuchResource(nexus_types::ResourceId::new(0)))?;
+        Ok(method_bitmap_for_verb(
+            &self.kernel.registry,
+            resource_id,
+            verb,
+        ))
+    }
+
+    /// Spawn a request Process under `anchor` with explicit request grant
+    /// templates. The grant registry is not written on the request path.
+    pub fn spawn_request_process_under_with_request_grants(
+        &self,
+        anchor: ProcessId,
         identity: IdentityRef,
-        declared_capabilities: &[&str],
+        grants: &[RequestGrantTemplate<'_>],
     ) -> Result<ProcessId, BootstrapError> {
-        let selectors = declared_capabilities
+        let compiled = grants
             .iter()
-            .map(|declared| {
-                ResourceSelector::parse(declared).map_err(|source| BootstrapError::Selector {
-                    literal: (*declared).to_string(),
-                    source,
-                })
+            .map(|grant| {
+                ResourceSelector::parse(grant.literal)
+                    .map(|selector| ParsedRequestGrantTemplate {
+                        selector,
+                        methods: Some(grant.methods),
+                    })
+                    .map_err(|source| BootstrapError::Selector {
+                        literal: grant.literal.to_string(),
+                        source,
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        self.spawn_request_process_under_inner(anchor, identity, &compiled)
+    }
+
+    /// Spawn a request Process under `anchor` with pre-parsed request grants.
+    pub fn spawn_request_process_under_with_compiled_request_grants(
+        &self,
+        anchor: ProcessId,
+        identity: IdentityRef,
+        grants: &[CompiledRequestGrantTemplate],
+    ) -> Result<ProcessId, BootstrapError> {
+        let parsed: Vec<_> = grants
+            .iter()
+            .map(|grant| ParsedRequestGrantTemplate {
+                selector: grant.selector.clone(),
+                methods: Some(grant.methods),
+            })
+            .collect();
+        self.spawn_request_process_under_inner(anchor, identity, &parsed)
+    }
+
+    fn spawn_request_process_under_inner(
+        &self,
+        anchor: ProcessId,
+        identity: IdentityRef,
+        grants: &[ParsedRequestGrantTemplate],
+    ) -> Result<ProcessId, BootstrapError> {
+        // Resolve every covering grant before allocating the child so a
+        // rejection leaves no Process or grant behind.
+        let anchor_grants = self.kernel.registry.grants_of(anchor);
+        let mut planned: Vec<(ResourceSelector, Rights)> = Vec::with_capacity(anchor_grants.len());
+        for grant in grants {
+            let selector = &grant.selector;
+            // covers_cap matches on verb + scheme + segments; the anchor pattern
+            // must be at least as broad as the declared one.
+            let covering = anchor_grants.iter().find(|g| {
+                let requested = grant.methods.unwrap_or(g.rights.methods);
+                !requested.is_empty()
+                    && requested.is_subset_of(g.rights.methods)
+                    && g.selector.pattern.covers_cap(&selector.pattern)
+            });
+            match covering {
+                Some(g) => {
+                    let rights = Rights::new(
+                        grant.methods.unwrap_or(g.rights.methods),
+                        RightFlags::empty(),
+                    );
+                    planned.push((selector.clone(), rights));
+                }
+                None => {
+                    return Err(BootstrapError::CapabilityCeiling {
+                        literal: selector.pattern.to_string(),
+                    });
+                }
+            }
+        }
 
         let child = self.kernel.processes.fresh_id();
-        let mut entry = ProcessEntry::new(child, Some(self.root), identity);
+        let mut entry = ProcessEntry::new(child, Some(anchor), identity);
         entry.status = ProcessStatus::Running;
-        self.kernel.processes.insert(entry);
 
-        // One attenuated grant per declared capability literal — the runtime
-        // ceiling. The caller must pass the canonical capability grammar
-        // (`perform://effect/...`, `read://state/...`, etc.); malformed entries
-        // reject the request so bad task ceilings are explicit and fail closed.
-        for selector in selectors {
-            let grant = Grant {
-                id: self.kernel.registry.next_grant_id(),
+        for (selector, rights) in planned {
+            entry.attached_grants.push(Grant {
+                id: self.kernel.processes.fresh_attached_grant_id(),
                 holder: child,
                 selector,
-                rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
+                rights,
                 constraints: ConstraintSet::empty(),
                 expires: Expiry::Never,
-            };
-            self.kernel.registry.register_grant(grant);
+            });
         }
+        self.kernel.processes.insert(entry);
         Ok(child)
     }
 
@@ -675,6 +776,7 @@ fn method_bitmap_for_verb(
                     "write" => {
                         method.name == "write" || method.name == "append" || method.name == "delete"
                     }
+                    "append" => method.name == "append",
                     "subscribe" => method.name == "subscribe",
                     "spawn" | "act-as" => false,
                     _ => false,
@@ -1014,7 +1116,11 @@ mod tests {
         let boot = Bootstrap::in_memory();
         // Spawn a child request Process, then finalize it.
         let child = boot
-            .spawn_request_process(nexus_types::IdentityRef::ROOT, &[])
+            .spawn_request_process_under_with_request_grants(
+                boot.root,
+                nexus_types::IdentityRef::ROOT,
+                &[],
+            )
             .unwrap();
         boot.finalize_process(child).await.unwrap();
         assert_eq!(
@@ -1074,7 +1180,11 @@ mod tests {
         let state: nexus_state::Backend = Arc::new(nexus_state::InMemoryBackend::new());
         let boot = Bootstrap::from_kernel(crate::Kernel::with_backends(state, facts));
         let child = boot
-            .spawn_request_process(nexus_types::IdentityRef::ROOT, &[])
+            .spawn_request_process_under_with_request_grants(
+                boot.root,
+                nexus_types::IdentityRef::ROOT,
+                &[],
+            )
             .unwrap();
 
         let err = boot.finalize_process(child).await.unwrap_err();
@@ -1113,18 +1223,222 @@ mod tests {
     }
 
     #[test]
-    fn request_process_rejects_malformed_declared_capability_before_insert() {
+    fn request_process_rejects_malformed_request_grant_before_insert() {
         let boot = Bootstrap::in_memory();
         let before = boot.kernel.processes.all_ids().len();
         let err = boot
-            .spawn_request_process(nexus_types::IdentityRef::ROOT, &["effect://x/post"])
+            .spawn_request_process_under_with_request_grants(
+                boot.root,
+                nexus_types::IdentityRef::ROOT,
+                &[RequestGrantTemplate {
+                    literal: "effect://x/post",
+                    methods: MethodBitmap::method(0),
+                }],
+            )
             .unwrap_err();
         assert!(matches!(err, BootstrapError::Selector { .. }));
         assert_eq!(
             boot.kernel.processes.all_ids().len(),
             before,
-            "malformed task ceilings must not leave a child process behind"
+            "malformed request grants must not leave a child process behind"
         );
+    }
+
+    /// Register a Process holding exactly `selectors` as grants, to act as a
+    /// restricted authority anchor in tests.
+    fn restricted_anchor(boot: &Bootstrap, selectors: &[&str]) -> nexus_types::ProcessId {
+        let anchor = boot.kernel.processes.fresh_id();
+        let mut entry = ProcessEntry::new(anchor, Some(boot.root), nexus_types::IdentityRef::ROOT);
+        entry.status = ProcessStatus::Running;
+        boot.kernel.processes.insert(entry);
+        for sel in selectors {
+            let grant = Grant {
+                id: boot.kernel.registry.next_grant_id(),
+                holder: anchor,
+                selector: ResourceSelector::parse(sel).expect("anchor selector parses"),
+                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+                constraints: ConstraintSet::empty(),
+                expires: Expiry::Never,
+            };
+            boot.kernel.registry.register_grant(grant);
+        }
+        anchor
+    }
+
+    #[test]
+    fn root_anchor_covers_every_request_grant_template() {
+        let boot = Bootstrap::in_memory();
+        let child = boot
+            .spawn_request_process_under_with_request_grants(
+                boot.root,
+                nexus_types::IdentityRef::ROOT,
+                &[
+                    RequestGrantTemplate {
+                        literal: "perform://effect/x/post",
+                        methods: MethodBitmap::method(0),
+                    },
+                    RequestGrantTemplate {
+                        literal: "read://state/memory/alice/x",
+                        methods: MethodBitmap::method(0),
+                    },
+                ],
+            )
+            .expect("root anchor covers all request grant templates");
+        assert!(
+            boot.kernel.registry.grants_of(child).is_empty(),
+            "request Process grants must not be registered in the global grant table"
+        );
+        let grants = boot.kernel.processes.attached_grants(child);
+        assert_eq!(grants.len(), 2, "one grant per request grant template");
+    }
+
+    #[test]
+    fn restricted_anchor_rejects_capability_outside_ceiling_fail_closed() {
+        // An anchor holding only inference authority must reject a request
+        // grant outside that ceiling.
+        let boot = Bootstrap::in_memory();
+        let anchor = restricted_anchor(&boot, &["perform://effect/inference/**"]);
+        let before = boot.kernel.processes.all_ids().len();
+
+        // Covered capability is fine.
+        boot.spawn_request_process_under_with_request_grants(
+            anchor,
+            nexus_types::IdentityRef::ROOT,
+            &[RequestGrantTemplate {
+                literal: "perform://effect/inference/infer",
+                methods: MethodBitmap::method(0),
+            }],
+        )
+        .expect("request grant within anchor ceiling is accepted");
+
+        // Rejected declarations must not allocate a child Process.
+        let mid = boot.kernel.processes.all_ids().len();
+        let err = boot
+            .spawn_request_process_under_with_request_grants(
+                anchor,
+                nexus_types::IdentityRef::ROOT,
+                &[RequestGrantTemplate {
+                    literal: "perform://effect/proc/spawn",
+                    methods: MethodBitmap::method(0),
+                }],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, BootstrapError::CapabilityCeiling { .. }),
+            "request grant outside anchor ceiling must be rejected"
+        );
+        assert_eq!(
+            boot.kernel.processes.all_ids().len(),
+            mid,
+            "a rejected over-broad request grant must not leave a child process behind"
+        );
+        assert!(mid > before, "the covered spawn did create a child");
+    }
+
+    #[test]
+    fn restricted_anchor_rejects_when_one_of_several_caps_exceeds_ceiling() {
+        // The whole spawn fails if any request grant exceeds the anchor; the
+        // covered ones must not be partially granted.
+        let boot = Bootstrap::in_memory();
+        let anchor = restricted_anchor(&boot, &["perform://effect/inference/**"]);
+        let before = boot.kernel.processes.all_ids().len();
+        let err = boot
+            .spawn_request_process_under_with_request_grants(
+                anchor,
+                nexus_types::IdentityRef::ROOT,
+                &[
+                    RequestGrantTemplate {
+                        literal: "perform://effect/inference/infer",
+                        methods: MethodBitmap::method(0),
+                    },
+                    RequestGrantTemplate {
+                        literal: "write://state/vault/alice/x",
+                        methods: MethodBitmap::method(0),
+                    },
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(err, BootstrapError::CapabilityCeiling { .. }));
+        assert_eq!(
+            boot.kernel.processes.all_ids().len(),
+            before,
+            "a partially-uncovered declared set must spawn nothing"
+        );
+    }
+
+    #[test]
+    fn request_grant_template_narrows_anchor_method_rights() {
+        let boot = Bootstrap::in_memory();
+        let anchor = boot.kernel.processes.fresh_id();
+        let mut entry = ProcessEntry::new(anchor, Some(boot.root), nexus_types::IdentityRef::ROOT);
+        entry.status = ProcessStatus::Running;
+        boot.kernel.processes.insert(entry);
+        boot.kernel.registry.register_grant(Grant {
+            id: boot.kernel.registry.next_grant_id(),
+            holder: anchor,
+            selector: ResourceSelector::parse("perform://effect/echo/**").unwrap(),
+            rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
+            constraints: ConstraintSet::empty(),
+            expires: Expiry::Never,
+        });
+
+        let child = boot
+            .spawn_request_process_under_with_request_grants(
+                anchor,
+                nexus_types::IdentityRef::ROOT,
+                &[RequestGrantTemplate {
+                    literal: "perform://effect/echo/say",
+                    methods: MethodBitmap::method(0),
+                }],
+            )
+            .unwrap();
+        let grants = boot.kernel.processes.attached_grants(child);
+        assert_eq!(grants.len(), 1);
+        assert!(grants[0].rights.methods.allows(0));
+        assert!(!grants[0].rights.methods.allows(1));
+    }
+
+    #[test]
+    fn compiled_request_grant_template_uses_anchor_backstop() {
+        let boot = Bootstrap::in_memory();
+        let anchor = boot.kernel.processes.fresh_id();
+        let mut entry = ProcessEntry::new(anchor, Some(boot.root), nexus_types::IdentityRef::ROOT);
+        entry.status = ProcessStatus::Running;
+        boot.kernel.processes.insert(entry);
+        boot.kernel.registry.register_grant(Grant {
+            id: boot.kernel.registry.next_grant_id(),
+            holder: anchor,
+            selector: ResourceSelector::parse("perform://effect/echo/**").unwrap(),
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            constraints: ConstraintSet::empty(),
+            expires: Expiry::Never,
+        });
+
+        let compiled = CompiledRequestGrantTemplate {
+            selector: ResourceSelector::parse("perform://effect/echo/say").unwrap(),
+            methods: MethodBitmap::method(0),
+        };
+        let child = boot
+            .spawn_request_process_under_with_compiled_request_grants(
+                anchor,
+                nexus_types::IdentityRef::ROOT,
+                &[compiled],
+            )
+            .unwrap();
+        assert_eq!(boot.kernel.processes.attached_grants(child).len(), 1);
+
+        let overbroad = CompiledRequestGrantTemplate {
+            selector: ResourceSelector::parse("perform://effect/echo/say").unwrap(),
+            methods: MethodBitmap::method(1),
+        };
+        assert!(matches!(
+            boot.spawn_request_process_under_with_compiled_request_grants(
+                anchor,
+                nexus_types::IdentityRef::ROOT,
+                &[overbroad],
+            ),
+            Err(BootstrapError::CapabilityCeiling { .. })
+        ));
     }
 
     #[tokio::test]

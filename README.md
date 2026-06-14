@@ -3,86 +3,72 @@
 Nexus is a capability runtime for model-backed applications. It maps model
 inference, tool calls, memory, state, and outside systems into `effect://` and
 `state://` resources so programs access them through handles compiled by
-`open()`. Model backends, tool processes, and state stores remain behind
-resource bindings and drivers.
+`open()`. Model backends, tool processes, state stores, and external programs
+remain behind resource bindings, drivers, or Provider/Source projections.
 
 Nexus supplies the execution boundary between model calls, tool execution,
 long-lived state, and external protocols. Model training, application UI, and
-business logic stay outside this runtime. Infer, embed, rerank, and plan are
-effect resources; MCP, file, terminal, and fetch-style tools are effect
-resources; extensions connect as providers or sources; program front ends lower
-to execution graphs. Every access goes through the same `Resource / Interface /
-Driver`, `open()` handle, and capability-check path.
+business logic stay outside this runtime. Every access goes through the same
+`Resource / Interface / Driver`, `open()` handle, and capability-check path.
 
 Chinese documentation: [README.zh-CN.md](README.zh-CN.md)
 
-## Implemented Surface
+## Implemented Features
 
 - Model execution: `effect://inference/*` supports infer, embed, rerank, and
-  plan; the router selects backends by capability, modality, group policy,
+  plan. Model routing selects backends by capability, modality, group policy,
   retry, and fallback.
 - Tool access: MCP tools, files, terminal commands, fetch, time, events, locks,
-  blobs, tensors, approvals, and compression are registered as effect
-  resources.
+  blobs, tensors, approvals, and compression are registered as effect resources.
 - Memory and context: the memory driver combines the state backend, vector
   index, and ranker; context assembly and compression are separate effects.
-- Extensions: installed extensions project remote effects as providers or
-  inbound event streams as sources.
+- External programs: external programs connect as Provider or Source
+  projections through the external gateway.
 - Capability boundary: `open()` compiles resource paths, grants, policies, and
   bindings into process-owned handles; spawned processes receive attenuated
   rights.
-- Program front ends: Rust `DoNode`, Plan documents, and structured protobuf
-  `Program` submissions lower to one execution graph and one executor.
+- Program execution: Rust `DoNode`, Plan documents, and the protobuf `Program`
+  AST lower to one execution graph and one executor.
 
 ## Status
 
-This repository is an early Rust workspace for the Nexus capability runtime and
-gateways. The implementation currently enforces these public compatibility
-rules:
+The core runtime and the external Provider/Source gateway are implemented.
+Nexus has not shipped a first release, and the current gateway/config/protobuf
+contract is defined by the external Provider/Source model.
 
-- resource path grammar rejects `@param` suffixes such as
-  `effect://memory/recall@scope=user`;
-- gRPC `GatewayService.Submit` accepts a structured protobuf `Program`;
-- capability literals use the verb form, such as
-  `perform://effect/inference/infer`; resource paths keep the `effect://...`
-  shape.
+External access has one role model:
+
+- Provider projections expose remote effect handlers.
+- Source projections emit inbound events and can receive outbound commands.
+- gRPC and WebSocket are transport implementations for the same external
+  Provider/Source gateway.
+
+MCP exposes selected Nexus effects as MCP tools. It does not create another
+external role.
 
 ## Documentation
 
 Public manuals:
 
-Install mdBook when needed:
-
 ```sh
 cargo install mdbook
-```
-
-- English: read [docs/src/README.md](docs/src/README.md), or build with:
-
-```sh
 mdbook build docs
-```
-
-- Chinese: read [docs/zh-CN/src/README.md](docs/zh-CN/src/README.md), or build
-  with:
-
-```sh
 mdbook build docs/zh-CN
 ```
 
-For a local browser preview, run `mdbook serve docs` or
-`mdbook serve docs/zh-CN`. The Chinese book declares `language = "zh-CN"` and
-loads `docs/zh-CN/theme/cjk.css` for CJK fonts and line height.
+- English: [docs/src/README.md](docs/src/README.md)
+- Chinese: [docs/zh-CN/src/README.md](docs/zh-CN/src/README.md)
 
-Generate and check Rust API documentation:
+For a local browser preview, run `mdbook serve docs` or
+`mdbook serve docs/zh-CN`.
+
+Generate Rust API documentation:
 
 ```sh
 RUSTDOCFLAGS='-W missing-docs' cargo doc --workspace --no-deps
 ```
 
-Then open `target/doc/index.html` in a browser. Crate pages are under
-`target/doc/<crate_name>/index.html`, with hyphens converted to underscores;
-for example, `nexus-sdk` is available at `target/doc/nexus_sdk/index.html`.
+Rustdoc output is written to `target/doc/index.html`.
 
 ## Architecture
 
@@ -97,50 +83,41 @@ Process
   producing Outcome and Fact
 ```
 
-Nexus separates the runtime into four planes:
+Nexus separates the runtime into four code paths:
 
-- Control plane: registry, naming, admission, policy compilation, binding
+- Control path: registry, naming, admission, policy compilation, binding
   resolution, and `open()` handle compilation.
-- Data plane: fixed-cost execution over `Process`, `Handle`, `Operation`, and
+- Data path: fixed-cost execution over `Process`, `Handle`, `Operation`, and
   `Fact`.
-- Extension plane: external providers, sources, drivers, and protocol adapters.
-- Program plane: durable `Do<A>` programs and the execution graph.
-
-The control plane handles parsing and compilation. The data plane executes
-compiled objects.
+- External adapters: Providers, Sources, drivers, and protocol adapters.
+- Program execution: durable `Do<A>` programs and the execution graph.
 
 ## Workspace
 
 | Crate | Purpose |
 | --- | --- |
-| `nexus-types` | Core IDs, paths, values, capabilities, operations, audit types. |
+| `nexus-types` | Core IDs, paths, values, capabilities, operations, audit types, and external Provider/Source data. |
 | `nexus-graph` | Durable `Do<A>` program IR and execution graph compiler. |
 | `nexus-state` | State backend traits and in-memory implementation. |
 | `nexus-kernel` | Process, handle, registry, policy, executor, recovery, facts. |
 | `nexus-storage-redb` | Persistent redb-backed state and FactStore. |
 | `nexus-actors` | Standard in-process drivers and providers. |
-| `nexus-gateway` | Shared gateway abstraction over submitted programs. |
-| `nexus-gateway-grpc` | gRPC `GatewayService` adapter using `nexus-proto`. |
-| `nexus-gateway-websocket` | WebSocket gateway adapter. |
-| `nexus-gateway-mcp` | MCP server-side gateway adapter. |
+| `nexus-gateway` | Shared session admission, flow-control, taint, and audit code for external protocol adapters. |
+| `nexus-gateway-grpc` | External Provider/Source gRPC adapter using `nexus-proto`. |
+| `nexus-gateway-websocket` | External Provider/Source WebSocket adapter. |
+| `nexus-gateway-mcp` | MCP server-side adapter for selected Nexus effects. |
 | `nexus-proto` | Protobuf schema and hand-vendored prost/tonic bindings. |
-| `nexus-console` | Management-domain gateway for the web console backend. HTTP covers bootstrap/auth only; Console WS is the post-login management path. |
+| `nexus-console` | Gateway for Web Console management actions. |
 | `nexus-daemon` | `nexusd`, the long-running host process. |
 | `nexus-sdk` | Convenience exports for embedding and tests. |
-| `nexus-plan`, `nexus-sim` | Planning and simulation scaffolding. |
+| `nexus-plan`, `nexus-sim` | Planning and simulation crates. |
 
 ## Requirements
 
 - Rust 1.95 or newer.
 - Cargo from the matching stable toolchain.
-- No local `protoc` installation is required. `nexus-proto` ships vendored
+- No local `protoc` installation is required. `nexus-proto` includes vendored
   prost/tonic Rust bindings.
-
-Check the local toolchain:
-
-```sh
-cargo --version
-```
 
 ## Build And Test
 
@@ -170,117 +147,82 @@ Start the daemon:
 cargo run -p nexus-daemon -- up
 ```
 
-`nexusd` launches the host process. Runtime management goes through the console
-gateway.
+`nexusd` launches the host process. Runtime management goes through Console
+WebSocket.
 
 Default addresses from `nexus.toml.example`:
 
 - Console listener: `127.0.0.1:9000`
-- gRPC gateway: `127.0.0.1:9100`
-- Program WebSocket gateway: `127.0.0.1:9200`
+- External gRPC gateway: `127.0.0.1:9444`
+- External WebSocket gateway: `127.0.0.1:9200`
 
 On first boot, if no console root account exists and no bootstrap credentials
 are configured, `nexusd` prints a one-time root password to stderr.
 
 ## Configuration
 
-`nexus.toml` is bootstrap configuration. It controls storage, gateway listen
-addresses, root bootstrap credentials, and bounded console resource limits:
+`nexus.toml` is bootstrap configuration. It controls storage, listener bind
+addresses, root bootstrap credentials, external gateway limits, gateway
+transport-security settings, and Console resource limits.
 
-- `[storage]`: `redb` persistent storage or in-memory storage.
-- `[server]`: console, gRPC, and WebSocket bind addresses.
-- `[console.root]`: optional preseeded root credentials.
-- `[console.auth]`: session TTL, session count, and Argon2 verification
-  concurrency limits.
-- `[console.ws]`: Console WebSocket frame, connection, idle, rate,
-  subscription, result-size, and event backpressure limits.
+- `[server]`: Console, external gRPC, and external WebSocket bind addresses.
+- `[external_gateway.grpc]`: Provider/Source session limits for external gRPC.
+- `[external_gateway.grpc.transport_security]`: external gRPC transport
+  boundary.
+- `[external_gateway.websocket]`: Provider/Source session limits for external
+  WebSocket.
+- `[external_gateway.websocket.transport]`: WebSocket frame, idle, first-frame,
+  and connection limits.
+- `[external_gateway.websocket.transport_security]`: external WebSocket plain
+  listener boundary.
+- `[console.*]`: console root credentials, auth/session limits, WebSocket
+  limits, and transport security.
 
-Runtime configuration, provider setup, model routing, groups, bindings, and
-policy-managed state belong in Nexus state and are managed through the console
-gateway. The console auth/WS settings are deployment capacity knobs. Capability
-checks, step-up gates, Origin/Host validation, path-specific admission, action
-registry validation, and secret redaction remain enforced by runtime paths.
+Runtime configuration, provider setup, model routing, groups, bindings, external
+program installations, Provider projections, Source projections, and
+policy-managed state belong in Nexus state and are managed through Console
+WebSocket.
 
 ## External Interfaces
 
-Detailed connection docs are in the manual: [Gateways](docs/src/gateways.md),
-[Program Gateways](docs/src/program-gateways.md), and
-[Console Protocol](docs/src/console-protocol.md).
+Detailed connection docs are in [Gateways](docs/src/gateways.md), [External
+Gateway](docs/src/external-gateway.md), and [Console Protocol](docs/src/console-protocol.md).
 
 ### Console
 
-`nexus-console` is the management-domain gateway for Web Console. Management
-actions use the same authorization, state, CAS, and audit surfaces as the rest
-of the runtime. When a management action invokes a runtime effect, that effect
-is a standard capability-scoped Operation.
+`nexus-console` is the gateway for Web Console management actions. HTTP covers
+health and authentication. Console WebSocket handles snapshots, config
+read/write/CAS, runtime inspect, subscriptions, trace/fact streams, external
+program lifecycle actions, pairing actions, logout, and console
+user/role/session management after login.
 
-The current interface shape is:
+### External Gateway
 
-- HTTP: `GET /health`, `POST /api/auth/login`,
-  `POST /api/auth/key/challenge`, `POST /api/auth/key/login`, and
-  `POST /api/auth/step-up`.
-- Console WebSocket: the post-login management path for snapshot, config
-  read/write/CAS, runtime inspect, subscriptions, trace/fact streams,
-  `ExtensionInstallation*` lifecycle actions, pairing actions, logout, and
-  console user/role/session management.
+External programs connect as Provider or Source projections. The daemon owns
+session admission, generation checks, flow control, dedupe, command
+idempotency, and inbound taint stamping.
 
-Post-login management runs on Console WebSocket. HTTP remains the health and
-authentication entry point.
+External gRPC serves the Provider/Source session stream on
+`[server].external_grpc_addr` or `NEXUS_EXTERNAL_GRPC_ADDR`.
 
-### Extension Protocol
-
-Extensions are described as one `ExtensionInstallationDef` plus one or more
-single-role `ExtensionProjectionDef`s. The installation is the lifecycle,
-transport, pairing, credential, and shared-config unit. Projection roles are
-Provider, which exposes `effect://...` capabilities through remote Bindings,
-and Source, which emits inbound events into a declared state stream.
+External WebSocket serves the same Provider/Source session frames on
+`[server].external_websocket_addr` or `NEXUS_EXTERNAL_WEBSOCKET_ADDR`.
 
 Control state uses these prefixes:
 
 ```text
-state://kernel/extension-installations/<installation_id>
-state://kernel/extension-projections/<installation_id>/<projection_id>
-state://kernel/extension-pairings/<pairing_id>
-state://kernel/extension-sessions/<installation_id>/<role>
-state://kernel/extension-revocations/<installation_id>
+state://kernel/external-installations/<installation_id>
+state://kernel/external-projections/<installation_id>/<projection_id>
+state://kernel/external-pairings/<pairing_id>
+state://kernel/external-sessions/<installation_id>/<role>
+state://kernel/external-credential-revocations/<installation_id>
 ```
-
-Out-of-process extensions connect with the extension gRPC/WebSocket protocol:
-`RoleSessionClientHello { installation_id, projection_id, ... }`,
-daemon-selected `SessionContext`, `RoleReady`, AEAD-protected business/control
-frames, and Provider `Invoke` / Source `InboundEvent` frames. Pairing inputs use
-`installation_id`; secrets stay on the one-shot display edge. Operation input,
-state, Facts, and traces receive only redacted metadata or references.
-
-### gRPC And Proto
-
-The primary external program submission API is `GatewayService` in
-`crates/nexus-proto/proto/nexus/v1/gateway.proto`.
-
-```proto
-service GatewayService {
-  rpc Submit(SubmitRequest) returns (SubmitResponse);
-  rpc Health(HealthRequest) returns (HealthResponse);
-}
-```
-
-`SubmitRequest.program` is a structured protobuf `Program`.
-
-`nexus-proto` is the wire schema source for Rust gateway code and for generated
-clients such as mobile Kotlin/Swift packages.
-
-### WebSocket
-
-`nexus-gateway-websocket` serves the program-submission WebSocket gateway and
-adapts WebSocket frames to the shared gateway abstraction. It is separate from
-the Console WebSocket described above, and it uses the same request process,
-taint, policy, fact, and handle path as other program gateways.
 
 ### MCP
 
-`nexus-gateway-mcp` exposes selected Nexus effects as MCP tools only when each
-tool is bound to an explicit required capability. MCP calls are translated into
-standard gateway submissions.
+`nexus-gateway-mcp` exposes selected Nexus effects as MCP tools only when the
+underlying effect resource has an explicit publish capability. MCP calls are
+translated into standard capability-scoped operations.
 
 ## Path And Capability Rules
 
@@ -312,13 +254,13 @@ resource segments, or policy/config state.
 ## Development Notes
 
 - Keep parsing, discovery, policy source handling, and schema work in the
-  control plane.
-- Keep the data plane limited to compiled IDs, handles, driver plans, policy
+  control path.
+- Keep the data path limited to compiled IDs, handles, driver plans, policy
   snapshots, operations, outcomes, and facts.
-- External protocol crates should remain thin adapters over `nexus-gateway` or
-  the kernel extension registration/runtime surfaces.
-- Breaking runtime or protocol changes should update proto, vendored bindings, conversions,
-  tests, and docs in the same change.
+- External protocol crates should remain thin adapters over the gateway,
+  console, or kernel runtime APIs.
+- Protocol changes should update proto, vendored bindings, conversions, tests,
+  examples, and public docs in the same change.
 
 ## License
 

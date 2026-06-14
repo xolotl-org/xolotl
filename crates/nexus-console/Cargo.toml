@@ -19,6 +19,7 @@ getrandom = "0.4.2"
 hmac = "0.13.0"
 nexus-graph = { version = "0.1.0", path = "../nexus-graph" }
 nexus-actors = { version = "0.1.0", path = "../nexus-actors" }
+nexus-gateway = { version = "0.1.0", path = "../nexus-gateway" }
 nexus-kernel = { version = "0.1.0", path = "../nexus-kernel" }
 nexus-state = { version = "0.1.0", path = "../nexus-state" }
 nexus-types = { version = "0.1.0", path = "../nexus-types" }

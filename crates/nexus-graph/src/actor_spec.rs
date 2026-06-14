@@ -303,7 +303,7 @@ mod tests {
             name: "n".into(),
             declared_capabilities: vec!["perform://effect/fs/**".into()],
             declared_states: vec!["state://memory/alice/*".into()],
-            subscriptions: vec!["state://events/extensions/chat_bridge/source".into()],
+            subscriptions: vec!["state://events/external/chat_bridge/source".into()],
             capabilities: CapSet::new(),
             budget: BudgetSpec::default(),
         };

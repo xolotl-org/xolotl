@@ -1444,6 +1444,7 @@ dependencies = [
  "getrandom 0.4.2",
  "hmac",
  "nexus-actors",
+ "nexus-gateway",
  "nexus-graph",
  "nexus-kernel",
  "nexus-state",
@@ -1464,15 +1465,23 @@ name = "nexus-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "axum",
+ "blake3",
  "dotenvy",
+ "getrandom 0.4.2",
  "nexus-actors",
  "nexus-console",
  "nexus-gateway",
  "nexus-gateway-grpc",
  "nexus-gateway-websocket",
+ "nexus-kernel",
+ "nexus-proto",
  "nexus-sdk",
  "nexus-storage-redb",
+ "nexus-types",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tonic",
@@ -1485,9 +1494,19 @@ name = "nexus-gateway"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
+ "getrandom 0.4.2",
+ "nexus-actors",
  "nexus-graph",
  "nexus-kernel",
+ "nexus-proto",
+ "nexus-state",
  "nexus-types",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "subtle",
  "thiserror",
  "tokio",
 ]
@@ -1496,11 +1515,13 @@ dependencies = [
 name = "nexus-gateway-grpc"
 version = "0.1.0"
 dependencies = [
+ "nexus-actors",
  "nexus-gateway",
  "nexus-graph",
  "nexus-kernel",
  "nexus-proto",
  "nexus-types",
+ "prost",
  "tokio",
  "tonic",
 ]
@@ -1514,6 +1535,7 @@ dependencies = [
  "nexus-kernel",
  "nexus-types",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]
@@ -1523,13 +1545,20 @@ name = "nexus-gateway-websocket"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "blake3",
  "futures",
+ "nexus-actors",
  "nexus-gateway",
  "nexus-graph",
  "nexus-kernel",
+ "nexus-proto",
+ "nexus-types",
+ "prost",
+ "rmp-serde",
  "serde",
  "serde_json",
  "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -2166,7 +2195,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -2752,6 +2783,7 @@ dependencies = [
  "socket2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",

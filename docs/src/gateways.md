@@ -1,68 +1,64 @@
 # Gateways
 
-This page is the ingress map for `nexusd`. Use it to choose the listener and
-protocol for a client. Protocol details live on separate pages:
+This page maps `nexusd` listener addresses to client protocols.
 
-- [Program Gateways](program-gateways.md): external clients submit `Program` or
-  `DoNode` work through gRPC, WebSocket, or MCP adapters.
-- [Console Protocol](console-protocol.md): console clients authenticate and run
-  management actions through HTTP auth and Console WebSocket.
+External programs have one role model: they connect as Provider or Source
+projections. gRPC and WebSocket are transport implementations for the same
+external gateway.
 
 ## Entry Points
 
-A channel starts when its `[server]` config field is set, or when the matching
-environment variable is set. `nexus.toml.example` enables the three listeners
-below. The gRPC listener is compiled by the `grpc` feature, which is enabled in
-the default `nexus-daemon` build.
+A listener starts when its `[server]` config field is set, or when the matching
+environment variable is set. gRPC listeners are compiled by the `grpc` feature,
+which is enabled in the default `nexus-daemon` build.
 
-| Surface | Config field | Environment variable | Route or service | Encoding |
+| Entry point | Config field | Environment variable | Route or service | Encoding |
 | --- | --- | --- | --- | --- |
 | Console HTTP | `console_addr` | `NEXUS_CONSOLE_ADDR` | `/health`, `/api/auth/*` | HTTP JSON |
 | Console WebSocket | `console_addr` | `NEXUS_CONSOLE_ADDR` | `/ws` | MessagePack, `msgpack+nexus-console-v1` |
-| Program gRPC | `grpc_addr` | `NEXUS_GRPC_ADDR` | `nexus.v1.GatewayService` | Protobuf |
-| Program WebSocket | `ws_addr` | `NEXUS_WS_ADDR` | `/ws` | Text JSON |
+| External gRPC | `external_grpc_addr` | `NEXUS_EXTERNAL_GRPC_ADDR` | `nexus.v1.external.ExternalService.Session` | Protobuf |
+| External WebSocket | `external_websocket_addr` | `NEXUS_EXTERNAL_WEBSOCKET_ADDR` | `/ws` | Binary protobuf frames |
 
-Console WebSocket and Program WebSocket both mount `/ws`. They are selected by
+Console WebSocket and external WebSocket both mount `/ws`. They are selected by
 listener address and frame encoding:
 
-- Console WebSocket uses `[server].console_addr` and binary MessagePack frames.
-- Program WebSocket uses `[server].ws_addr` and text JSON frames.
+- Console WebSocket uses `[server].console_addr` and MessagePack console
+  frames.
+- External WebSocket uses `[server].external_websocket_addr` and binary
+  Provider/Source session frames.
 
-## Which Surface To Use
+## Which Entry Point To Use
 
-| Need | Surface |
+| Need | Entry point |
 | --- | --- |
 | Run management actions, inspect runtime state, manage users, manage sessions, subscribe to state or audit streams | Console Protocol |
-| Submit structured programs from a cross-language client | Program gRPC |
-| Submit JSON `DoNode` values from Rust-side tools or repository-local tests | Program WebSocket |
-| Publish selected Nexus effects as MCP tools with explicit required capabilities | MCP gateway |
+| Connect an external program that provides effect handlers | External gateway as Provider |
+| Connect an external program that emits inbound events or receives outbound commands | External gateway as Source |
+| Publish selected Nexus effects as MCP tools through explicit publish capabilities | MCP |
 
-## Request Boundary
+## External Gateway
 
-Program gateways use the shared `Gateway` trait:
+External gateway sessions are described in [External Gateway](external-gateway.md).
+Provider and Source are the only external projection roles.
 
-1. validate the presented token;
-2. map the token to a request identity such as `process://alice`;
-3. create an attenuated request Process;
-4. convert the protocol payload into a `DoNode` program;
-5. run the program through the executor and return an `Outcome`.
+The daemon owns session admission and authority:
 
-The host declares the capabilities a request may reach and opens exposed
-resource handles when it builds an `InProcessGateway`. Network adapters handle
-transport, auth-frame parsing, structural conversion, and gateway audit tags.
+1. the external program sends `RoleSessionClientHello`;
+2. the daemon loads the installation, projection, pairing, and approved session
+   state;
+3. the daemon sends `SessionContext` with authoritative generations and limits;
+4. the external program replies with `RoleReady`;
+5. business frames flow only after the session is ready.
 
-Console Protocol uses `nexus-console`. HTTP is limited to health and
-authentication. Logged-in management uses descriptor-named actions and streams
-over Console WebSocket, with authorization, CAS, visibility gates, and audit
-records handled by the same runtime surfaces used elsewhere.
+Provider readiness registers projected bindings for that ready session. Source
+events are admitted only after generation checks, schema checks, dedupe,
+capacity checks, rate checks, and policy checks pass.
 
-## Extension Ingress
+## Console Protocol
 
-Extensions are declared as an installation plus one or more projections. A
-Provider projection exposes effect handlers through remote bindings. A Source
-projection emits inbound events into a declared state stream. Pairing,
-credential generation, revocation floor, session context, and business frames
-are represented as typed data in `nexus-types` and `nexus-proto`.
+Console HTTP is limited to health and authentication. Logged-in management uses
+Console WebSocket with authorization, CAS, visibility gates, and audit records.
 
-Secrets stay on the one-shot display edge. Operation input, state, Facts, and
-traces receive only redacted metadata or references.
+Console transport security is daemon-owned: `production_tls`,
+`trusted_reverse_proxy`, `local_trusted`, and explicit unsafe modes are
+configured in `[console.transport_security]`.

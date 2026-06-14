@@ -20,17 +20,27 @@ grpc = ["dep:nexus-gateway-grpc", "dep:tonic"]
 
 [dependencies]
 anyhow = "1.0.102"
+async-trait = "0.1.89"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+blake3 = "1.8.5"
 dotenvy = "0.15.7"
+getrandom = "0.4.2"
 nexus-actors = { version = "0.1.0", path = "../nexus-actors" }
 nexus-console = { version = "0.1.0", path = "../nexus-console" }
 nexus-gateway = { version = "0.1.0", path = "../nexus-gateway" }
 nexus-gateway-grpc = { version = "0.1.0", path = "../nexus-gateway-grpc", optional = true }
 nexus-gateway-websocket = { version = "0.1.0", path = "../nexus-gateway-websocket" }
+nexus-kernel = { version = "0.1.0", path = "../nexus-kernel" }
 nexus-sdk = { version = "0.1.0", path = "../nexus-sdk" }
 nexus-storage-redb = { version = "0.1.0", path = "../nexus-storage-redb" }
+nexus-types = { version = "0.1.0", path = "../nexus-types" }
 serde = { version = "1.0.228", features = ["derive"] }
-tokio = { version = "1.52.3", features = ["rt", "sync", "macros", "rt-multi-thread", "signal"] }
+serde_json = "1.0.145"
+tokio = { version = "1.52.3", features = ["rt", "sync", "macros", "rt-multi-thread", "signal", "time"] }
 toml = "1.1.2"
-tonic = { version = "0.14.6", default-features = false, features = ["server"], optional = true }
+tonic = { version = "0.14.6", default-features = false, features = ["server", "tls-ring"], optional = true }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+nexus-proto = { version = "0.1.0", path = "../nexus-proto" }

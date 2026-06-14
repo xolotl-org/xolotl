@@ -1,7 +1,4 @@
 //! Kernel process inspection driver.
-//!
-//! The Console reaches runtime state through this effect, so inspect
-//! reads are capability-gated Operations and recorded in the Fact stream.
 
 use async_trait::async_trait;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};

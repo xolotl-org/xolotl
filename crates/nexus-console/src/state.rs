@@ -8,6 +8,7 @@
 use nexus_kernel::Bootstrap;
 use nexus_state::Backend;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -101,6 +102,8 @@ pub struct ConsoleState {
     pub pairing_display: PairingDisplayEdge,
     /// WebSocket runtime limits and counters.
     pub ws: ConsoleWsRuntime,
+    /// Transport security and proxy/origin policy.
+    pub transport_security: ConsoleTransportSecurityConfig,
 }
 
 impl ConsoleState {
@@ -111,6 +114,7 @@ impl ConsoleState {
             PairingDisplayEdge::default(),
             ConsoleAuthConfig::default(),
             ConsoleWsConfig::default(),
+            ConsoleTransportSecurityConfig::default(),
         )
     }
 
@@ -121,15 +125,17 @@ impl ConsoleState {
             pairing_display,
             ConsoleAuthConfig::default(),
             ConsoleWsConfig::default(),
+            ConsoleTransportSecurityConfig::default(),
         )
     }
 
-    /// Build console state with custom pairing display, auth, and WS tuning.
+    /// Build console state with custom pairing display, auth, WS tuning, and transport security.
     pub fn with_pairing_display_and_config(
         boot: Arc<Bootstrap>,
         pairing_display: PairingDisplayEdge,
         auth: ConsoleAuthConfig,
         ws: ConsoleWsConfig,
+        transport_security: ConsoleTransportSecurityConfig,
     ) -> Self {
         let state = boot.kernel.state.clone();
         Self {
@@ -138,6 +144,7 @@ impl ConsoleState {
             auth: ConsoleAuth::new(auth),
             pairing_display,
             ws: ConsoleWsRuntime::new(ws),
+            transport_security: transport_security.bounded(),
         }
     }
 
@@ -160,13 +167,135 @@ impl ConsoleState {
         pairing_display: PairingDisplayEdge,
         auth: ConsoleAuthConfig,
         ws: ConsoleWsConfig,
+        transport_security: ConsoleTransportSecurityConfig,
     ) -> Arc<Self> {
         Arc::new(Self::with_pairing_display_and_config(
             boot,
             pairing_display,
             auth,
             ws,
+            transport_security,
         ))
+    }
+}
+
+/// Console transport security mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsoleTransportSecurityMode {
+    /// Gateway terminates TLS/WSS itself.
+    ProductionTls,
+    /// TLS is terminated by a registered reverse proxy.
+    TrustedReverseProxy,
+    /// Local-only trusted transport such as loopback or UDS.
+    LocalTrusted,
+    /// Explicitly unsafe plain HTTP/WS transport.
+    UnsafePlaintext,
+    /// Test-only disabled transport checks.
+    DisabledForTest,
+}
+
+impl ConsoleTransportSecurityMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProductionTls => "production_tls",
+            Self::TrustedReverseProxy => "trusted_reverse_proxy",
+            Self::LocalTrusted => "local_trusted",
+            Self::UnsafePlaintext => "unsafe_plaintext",
+            Self::DisabledForTest => "disabled_for_test",
+        }
+    }
+}
+
+/// Explicit unsafe transport relaxations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsoleUnsafeTransportRelaxation {
+    AllowPlaintext,
+    IgnoreOriginPort,
+    RelaxedOrigin,
+}
+
+impl ConsoleUnsafeTransportRelaxation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowPlaintext => "allow_plaintext",
+            Self::IgnoreOriginPort => "ignore_origin_port",
+            Self::RelaxedOrigin => "relaxed_origin",
+        }
+    }
+}
+
+/// Trusted reverse proxy handling for Console HTTP/WS traffic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConsoleTrustedProxyConfig {
+    pub peers: Vec<IpAddr>,
+    pub honor_x_forwarded_proto: bool,
+    pub honor_x_forwarded_host: bool,
+    pub honor_x_forwarded_for: bool,
+}
+
+impl Default for ConsoleTrustedProxyConfig {
+    fn default() -> Self {
+        Self {
+            peers: Vec::new(),
+            honor_x_forwarded_proto: true,
+            honor_x_forwarded_host: true,
+            honor_x_forwarded_for: true,
+        }
+    }
+}
+
+/// Transport security and proxy/origin policy for Console endpoints.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConsoleTransportSecurityConfig {
+    pub mode: ConsoleTransportSecurityMode,
+    pub trusted_proxy: ConsoleTrustedProxyConfig,
+    pub unsafe_relaxations: Vec<ConsoleUnsafeTransportRelaxation>,
+}
+
+impl Default for ConsoleTransportSecurityConfig {
+    fn default() -> Self {
+        Self {
+            mode: ConsoleTransportSecurityMode::ProductionTls,
+            trusted_proxy: ConsoleTrustedProxyConfig::default(),
+            unsafe_relaxations: Vec::new(),
+        }
+    }
+}
+
+impl ConsoleTransportSecurityConfig {
+    pub fn bounded(mut self) -> Self {
+        self.unsafe_relaxations.sort_by_key(|r| r.as_str());
+        self.unsafe_relaxations.dedup();
+        self.trusted_proxy.peers.sort();
+        self.trusted_proxy.peers.dedup();
+        self
+    }
+
+    pub fn is_unsafe(&self) -> bool {
+        matches!(self.mode, ConsoleTransportSecurityMode::UnsafePlaintext)
+            || !self.unsafe_relaxations.is_empty()
+    }
+
+    pub fn ignore_origin_port(&self) -> bool {
+        self.unsafe_relaxations
+            .contains(&ConsoleUnsafeTransportRelaxation::IgnoreOriginPort)
+    }
+
+    pub fn relaxed_origin(&self) -> bool {
+        self.unsafe_relaxations
+            .contains(&ConsoleUnsafeTransportRelaxation::RelaxedOrigin)
+    }
+
+    pub fn trusts_peer(&self, peer: Option<IpAddr>) -> bool {
+        matches!(self.mode, ConsoleTransportSecurityMode::TrustedReverseProxy)
+            && peer.is_some_and(|ip| self.trusted_proxy.peers.contains(&ip))
+    }
+
+    pub fn unsafe_relaxation_names(&self) -> Vec<String> {
+        self.unsafe_relaxations
+            .iter()
+            .map(|r| r.as_str().to_string())
+            .collect()
     }
 }
 

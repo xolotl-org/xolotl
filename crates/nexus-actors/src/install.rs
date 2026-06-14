@@ -37,12 +37,12 @@ pub struct StandardConfig {
     /// Enable the network fetch provider.
     pub enable_fetch: bool,
     /// MCP tools to mount as sandboxed Providers. Each entry registers
-    /// one concrete `effect://mcp-tool/<server>/<tool>` Resource. Empty means no
+    /// one concrete `effect://external-provider/<server>/<tool>` Resource. Empty means no
     /// MCP tools. The offline baseline backs entries with deterministic echo
     /// clients; runtime integrations can call `register_mcp_tool` with a
     /// stdio/SSE client.
     pub mcp_tools: Vec<McpToolMount>,
-    /// One-shot display edge for extension pairing secrets. The secret does not
+    /// One-shot display edge for external pairing secrets. The secret does not
     /// enter Operation input/outcome, state, or Facts.
     pub pairing_display: PairingDisplayEdge,
 }
@@ -229,7 +229,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
     ] {
         register_single_effect(boot, path, crate::tensor::TENSOR_METHODS, tensor.clone())?;
     }
-    // Register the extension process-lifecycle driver.
+    // Register the external process-lifecycle driver.
     let proc: Arc<dyn Driver> = Arc::new(crate::proc::ProcDriver::new(state.clone()));
     for path in [
         "effect://proc/spawn",
@@ -240,17 +240,17 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
     ] {
         register_single_effect(boot, path, crate::proc::PROC_METHODS, proc.clone())?;
     }
-    // Register extension pairing management as capability-scoped effects.
+    // Register external pairing management as capability-scoped effects.
     let pairing: Arc<dyn Driver> = Arc::new(PairingDriver::with_display_edge(
         state.clone(),
         config.pairing_display.clone(),
     ));
     for path in [
-        "effect://extension/pairing/create",
-        "effect://extension/pairing/approve",
-        "effect://extension/pairing/deny",
-        "effect://extension/pairing/replace",
-        "effect://extension/revoke",
+        "effect://external/pairing/create",
+        "effect://external/pairing/approve",
+        "effect://external/pairing/deny",
+        "effect://external/pairing/replace",
+        "effect://external/revoke",
     ] {
         register_single_effect(boot, path, PAIRING_METHODS, pairing.clone())?;
     }
@@ -303,7 +303,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
         )?;
     }
     // Mount each configured MCP tool as a sandboxed Provider at
-    // `effect://mcp-tool/<server>/<tool>`.
+    // `effect://external-provider/<server>/<tool>`.
     for mount in &config.mcp_tools {
         register_mcp_tool(
             boot,
@@ -403,7 +403,7 @@ impl Driver for SingleMethodDriver {
 }
 
 /// Register one MCP tool as a sandboxed Provider at
-/// `effect://mcp-tool/<server>/<tool>`. Each tool call is an Operation, so
+/// `effect://external-provider/<server>/<tool>`. Each tool call is an Operation, so
 /// taint / audit / budget apply. `client` supplies the MCP transport:
 /// [`crate::mcp::EchoMcpClient`] for tests, or a stdio/SSE client for live
 /// integrations.
@@ -417,8 +417,8 @@ pub fn register_mcp_tool(
     validate_mcp_path_segment("server", server)?;
     validate_mcp_path_segment("tool", tool)?;
     // Every MCP effect lives under the sandbox prefix
-    // `effect://mcp-tool/<id>/*`.
-    let path = format!("effect://mcp-tool/{server}/{tool}");
+    // `effect://external-provider/<id>/*`.
+    let path = format!("effect://external-provider/{server}/{tool}");
     Ok(boot.register_effect(
         &path,
         if streaming {
@@ -647,12 +647,12 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_tools_are_off_by_default() {
-        // With no `mcp_tools`, no `effect://mcp-tool/*` resource is registered;
+        // With no `mcp_tools`, no `effect://external-provider/*` resource is registered;
         // existing assemblies are unaffected.
         let boot = Bootstrap::in_memory();
         assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
         let name = nexus_types::ResourceName::new(
-            nexus_types::Path::parse("effect://mcp-tool/files/list_dir").unwrap(),
+            nexus_types::Path::parse("effect://external-provider/files/list_dir").unwrap(),
         );
         assert!(
             boot.kernel.registry.resolve_resource(&name).is_err(),
@@ -672,7 +672,7 @@ mod tests {
         assert!(install_standard(&boot, &config).is_ok());
 
         let name = nexus_types::ResourceName::new(
-            nexus_types::Path::parse("effect://mcp-tool/files/list_dir").unwrap(),
+            nexus_types::Path::parse("effect://external-provider/files/list_dir").unwrap(),
         );
         // Resolvable under its sandbox prefix.
         assert!(
@@ -680,7 +680,7 @@ mod tests {
             "MCP resource resolvable"
         );
         let aggregate_call = nexus_types::ResourceName::new(
-            nexus_types::Path::parse("effect://mcp-tool/files/call").unwrap(),
+            nexus_types::Path::parse("effect://external-provider/files/call").unwrap(),
         );
         assert!(
             boot.kernel
@@ -798,16 +798,16 @@ mod tests {
     }
 
     #[test]
-    fn extension_pairing_effects_are_registered_as_distinct_resources() {
+    fn external_pairing_effects_are_registered_as_distinct_resources() {
         let boot = Bootstrap::in_memory();
         assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
 
         for path in [
-            "effect://extension/pairing/create",
-            "effect://extension/pairing/approve",
-            "effect://extension/pairing/deny",
-            "effect://extension/pairing/replace",
-            "effect://extension/revoke",
+            "effect://external/pairing/create",
+            "effect://external/pairing/approve",
+            "effect://external/pairing/deny",
+            "effect://external/pairing/replace",
+            "effect://external/revoke",
         ] {
             let name = nexus_types::ResourceName::new(nexus_types::Path::parse(path).unwrap());
             assert!(
@@ -862,7 +862,7 @@ mod tests {
         assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
 
         let name = nexus_types::ResourceName::new(
-            nexus_types::Path::parse("effect://extension/pairing/create").unwrap(),
+            nexus_types::Path::parse("effect://external/pairing/create").unwrap(),
         );
         let handle = boot.open_for(boot.root, &name, "perform").unwrap();
         let ex = boot.kernel.executor_for(boot.root);

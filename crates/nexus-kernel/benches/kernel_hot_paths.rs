@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use nexus_kernel::{
     Bootstrap, DataPlane, Driver, DriverContext, DriverError, DriverPlan, EchoDriver, FastPath,
-    Handle, HandleState, HandleTable, MethodSpec, OpenRequest,
+    Handle, HandleState, HandleTable, MethodSpec, OpenRequest, RequestGrantTemplate,
 };
 use nexus_types::{
     ConstraintSet, DecisionTag, DriverId, Expiry, Fact, Grant, HandleId, IdentityRef, MethodBitmap,
@@ -165,7 +165,7 @@ fn conditional_dataplane_fixture_with_input(
         .resolve_resource(&name)
         .expect("registered effect must resolve");
     let child = boot
-        .spawn_request_process(IdentityRef::ROOT, &[])
+        .spawn_request_process_under_with_request_grants(boot.root, IdentityRef::ROOT, &[])
         .expect("child process must spawn");
     let grant = Grant {
         id: boot.kernel.registry.next_grant_id(),
@@ -584,11 +584,64 @@ fn bench_fact_sink(c: &mut Criterion) {
     group.finish();
 }
 
+// Cost of spawning a request Process under the root anchor. Request grants are
+// attached to the Process, so the global grant registry is not written on this
+// path. Measure 1, 4, and 16 request grant templates.
+fn bench_request_spawn(c: &mut Criterion) {
+    const CAPS: &[&str] = &[
+        "perform://effect/inference/infer",
+        "read://state/memory/alice/recent",
+        "write://state/chat/telegram/out",
+        "perform://effect/memory/recall",
+        "perform://effect/blob/read",
+        "perform://effect/time/now",
+        "subscribe://state/events/extensions/x/y",
+        "perform://effect/fetch/get",
+        "read://state/memory/alice/persona",
+        "perform://effect/embed/run",
+        "write://state/memory/alice/learned",
+        "perform://effect/rank/score",
+        "perform://effect/approval/ask",
+        "read://state/kernel/routing/inference",
+        "perform://effect/compress/summarize",
+        "perform://effect/deliberation/run",
+    ];
+
+    let mut group = c.benchmark_group("request_spawn");
+    for &k in &[1usize, 4, 16] {
+        let grants: Vec<RequestGrantTemplate<'_>> = CAPS[..k]
+            .iter()
+            .map(|literal| RequestGrantTemplate {
+                literal,
+                methods: MethodBitmap::method(0),
+            })
+            .collect();
+        group.bench_function(format!("request_grants_{k}"), |b| {
+            b.iter_batched(
+                Bootstrap::in_memory,
+                |boot| {
+                    let child = boot
+                        .spawn_request_process_under_with_request_grants(
+                            boot.root,
+                            IdentityRef::ROOT,
+                            black_box(&grants),
+                        )
+                        .expect("root anchor covers request grant templates");
+                    black_box(child);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_open,
     bench_handle_table,
     bench_dataplane,
-    bench_fact_sink
+    bench_fact_sink,
+    bench_request_spawn
 );
 criterion_main!(benches);

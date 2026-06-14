@@ -1,9 +1,9 @@
-//! Extension pairing & secure envelope: the pairing state driver and
+//! External pairing & secure envelope: the pairing state driver and
 //! the credential layer that makes a session's frames confidential,
 //! authenticated, and tamper-evident.
 //!
 //! An installation holds a pre-shared key (`installation_psk`). Each frame the
-//! extension sends is wrapped in a [`SecureExtensionEnvelope`] whose frame body
+//! role client sends is wrapped in a [`SecureEnvelope`] whose frame body
 //! is AEAD ciphertext and whose AAD binds role, session, sequence, binding
 //! generation, and credential generation. Fail-closed invariants: no
 //! credential → no Ready session; a frame whose AEAD tag doesn't verify, or
@@ -19,7 +19,8 @@ use hkdf::Hkdf;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};
 use nexus_state::Backend;
 use nexus_types::{
-    ExtensionInstallationDef, ManifestDef, MethodId, Outcome, OutputMode, Path, Purity, Role, Value,
+    ExternalInstallationDef, Failure, ManifestDef, MethodId, Outcome, OutputMode, Path, Purity,
+    Role, Value,
 };
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
@@ -27,10 +28,14 @@ use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// Default replay window size for secure external envelopes.
+pub const DEFAULT_SECURE_ENVELOPE_REPLAY_WINDOW: usize = 64;
+const MAX_SECURE_ENVELOPE_REPLAY_WINDOW: usize = 128;
+
 /// Internal method names in registration order. `install_standard` exposes each
 /// one as a separate Resource with public method `invoke`:
-/// `effect://extension/pairing/create`, `/approve`, `/deny`, `/replace`, and
-/// `effect://extension/revoke`.
+/// `effect://external/pairing/create`, `/approve`, `/deny`, `/replace`, and
+/// `effect://external/revoke`.
 pub const PAIRING_METHODS: &[MethodSpec] = &[
     MethodSpec::new("create", Purity::Effectful, MethodSpec::UNARY_ASYNC),
     MethodSpec::new("approve", Purity::Effectful, MethodSpec::UNARY_ASYNC),
@@ -46,7 +51,7 @@ const STATE_EXPIRED: &str = "expired";
 const STATE_REPLACED: &str = "replaced";
 const STATE_REVOKED: &str = "revoked";
 
-/// Drives the extension-pairing management effects. It persists only
+/// Drives external pairing management effects. It persists only
 /// hashes and status records in the state plane; raw pairing secrets stay at the
 /// display/transport edge.
 pub struct PairingDriver {
@@ -95,7 +100,7 @@ impl PairingDriver {
     /// This is intentionally not a Driver method and therefore not callable as
     /// an Operation: the secret must not appear in Fact input/outcome. Console
     /// and pairing transports use this one-shot edge after the standard
-    /// `effect://extension/pairing/create|replace` Operation has recorded only
+    /// `effect://external/pairing/create|replace` Operation has recorded only
     /// the hash/checksum.
     pub fn take_display_secret(&self, pairing_id: &str) -> Option<String> {
         self.display_edge.take_display_secret(pairing_id)
@@ -107,20 +112,20 @@ impl PairingDriver {
 
     fn pairing_path(id: &str) -> Result<Path, DriverError> {
         validate_id_segment(id, "pairing_id")?;
-        Path::parse(&format!("state://kernel/extension-pairings/{id}"))
+        Path::parse(&format!("state://kernel/external-pairings/{id}"))
             .map_err(|e| DriverError::Other(format!("invalid pairing id {id:?}: {e}")))
     }
 
     fn session_path(id: &str, role: &str) -> Result<Path, DriverError> {
         validate_id_segment(id, "installation_id")?;
         validate_id_segment(role, "role")?;
-        Path::parse(&format!("state://kernel/extension-sessions/{id}/{role}"))
+        Path::parse(&format!("state://kernel/external-sessions/{id}/{role}"))
             .map_err(|e| DriverError::Other(format!("invalid installation id {id:?}: {e}")))
     }
 
     fn installation_path(id: &str) -> Result<Path, DriverError> {
         validate_id_segment(id, "installation_id")?;
-        Path::parse(&format!("state://kernel/extension-installations/{id}"))
+        Path::parse(&format!("state://kernel/external-installations/{id}"))
             .map_err(|e| DriverError::Other(format!("invalid installation id {id:?}: {e}")))
     }
 
@@ -132,8 +137,10 @@ impl PairingDriver {
 
     fn revoke_path(id: &str) -> Result<Path, DriverError> {
         validate_id_segment(id, "installation_id")?;
-        Path::parse(&format!("state://kernel/extension-revocations/{id}"))
-            .map_err(|e| DriverError::Other(format!("invalid installation id {id:?}: {e}")))
+        Path::parse(&format!(
+            "state://kernel/external-credential-revocations/{id}"
+        ))
+        .map_err(|e| DriverError::Other(format!("invalid installation id {id:?}: {e}")))
     }
 
     async fn read_record(&self, id: &str) -> Result<BTreeMap<String, Value>, DriverError> {
@@ -175,16 +182,16 @@ impl PairingDriver {
             .await
             .map_err(|e| DriverError::Other(e.to_string()))?
         {
-            let def: ExtensionInstallationDef =
-                decode_state_value(&value, "ExtensionInstallationDef")?;
+            let def: ExternalInstallationDef =
+                decode_state_value(&value, "ExternalInstallationDef")?;
             if def.id != installation_id {
                 return Err(DriverError::Other(format!(
-                    "ExtensionInstallationDef.id {:?} does not match installation_id {:?}",
+                    "ExternalInstallationDef.id {:?} does not match installation_id {:?}",
                     def.id, installation_id
                 )));
             }
             def.validate_admission().map_err(|e| {
-                DriverError::Other(format!("ExtensionInstallationDef admission failed: {e}"))
+                DriverError::Other(format!("ExternalInstallationDef admission failed: {e}"))
             })?;
             return Ok(PairingScope {
                 roles: installation_roles(&def)?,
@@ -208,7 +215,7 @@ impl PairingDriver {
         }
 
         Err(DriverError::Other(format!(
-            "pairing requires an installed ExtensionInstallationDef state://kernel/extension-installations/{installation_id} \
+            "pairing requires an installed ExternalInstallationDef state://kernel/external-installations/{installation_id} \
              or ManifestDef state://kernel/manifests/{}",
             manifest_platform.unwrap_or(installation_id)
         )))
@@ -234,7 +241,9 @@ impl Driver for PairingDriver {
         match method.get() {
             // create: allocate a pairing intent and persist only a secret hash.
             0 => {
-                reject_inline_secret(&m)?;
+                if let Some(outcome) = reject_inline_secret(&m) {
+                    return Ok(outcome);
+                }
                 reject_unknown_fields(
                     &m,
                     "pairing.create",
@@ -284,8 +293,8 @@ impl Driver for PairingDriver {
                 self.stage_display_secret(&pairing_id, secret);
                 Ok(out)
             }
-            // approve: terminally approve the intent and project provider/source
-            // role state under state://kernel/extension-sessions/*.
+            // approve: terminally approve the intent and project external
+            // Provider/Source session state.
             1 => {
                 let pairing_id = required_str(&m, "pairing_id")?;
                 let mut record = self.read_record(pairing_id).await?;
@@ -374,7 +383,9 @@ impl Driver for PairingDriver {
             }
             // replace: mark the old intent replaced and create a fresh intent.
             3 => {
-                reject_inline_secret(&m)?;
+                if let Some(outcome) = reject_inline_secret(&m) {
+                    return Ok(outcome);
+                }
                 reject_unknown_fields(
                     &m,
                     "pairing.replace",
@@ -449,11 +460,11 @@ impl Driver for PairingDriver {
                 self.stage_display_secret(&replacement_id, secret);
                 Ok(out)
             }
-            // revoke: invalidate an extension installation.
+            // revoke: invalidate an external installation.
             4 => {
                 reject_unknown_fields(
                     &m,
-                    "extension.revoke",
+                    "external.revoke",
                     &["installation_id", "credential_generation_floor"],
                 )?;
                 let installation_id = required_str(&m, "installation_id")?;
@@ -597,7 +608,7 @@ fn ensure_roles_allowed(roles: &[String], allowed: &[String]) -> Result<(), Driv
     for role in roles {
         if !matches!(role.as_str(), "provider" | "source") {
             return Err(DriverError::Other(format!(
-                "unknown extension role {role:?}"
+                "unknown external role {role:?}"
             )));
         }
         if !allowed.iter().any(|allowed| allowed == role) {
@@ -609,13 +620,13 @@ fn ensure_roles_allowed(roles: &[String], allowed: &[String]) -> Result<(), Driv
     Ok(())
 }
 
-fn reject_inline_secret(m: &BTreeMap<String, Value>) -> Result<(), DriverError> {
+fn reject_inline_secret(m: &BTreeMap<String, Value>) -> Option<Outcome> {
     if m.contains_key("pairing_secret") {
-        return Err(DriverError::Other(
-            "pairing_secret must be generated by PairingDriver and exposed only through the display edge".into(),
-        ));
+        return Some(Outcome::Fail(Failure::InvalidInput {
+            reason: "pairing_secret must be generated by PairingDriver and exposed only through the display edge".into(),
+        }));
     }
-    Ok(())
+    None
 }
 
 fn reject_unknown_fields(
@@ -649,7 +660,7 @@ fn reject_inline_install_fields(
     ] {
         if m.contains_key(key) {
             return Err(DriverError::Other(format!(
-                "{method} must reference an existing ExtensionInstallationDef or ManifestDef; field {key:?} is not accepted"
+                "{method} must reference an existing ExternalInstallationDef or ManifestDef; field {key:?} is not accepted"
             )));
         }
     }
@@ -774,7 +785,7 @@ fn manifest_roles(def: &ManifestDef) -> Result<Vec<String>, DriverError> {
     }
 }
 
-fn installation_roles(def: &ExtensionInstallationDef) -> Result<Vec<String>, DriverError> {
+fn installation_roles(def: &ExternalInstallationDef) -> Result<Vec<String>, DriverError> {
     let mut roles = Vec::new();
     for projection in &def.projections {
         let role = role_name(projection.role).to_string();
@@ -784,7 +795,7 @@ fn installation_roles(def: &ExtensionInstallationDef) -> Result<Vec<String>, Dri
     }
     if roles.is_empty() {
         Err(DriverError::Other(
-            "ExtensionInstallationDef must declare at least one projection role".into(),
+            "ExternalInstallationDef must declare at least one projection role".into(),
         ))
     } else {
         Ok(roles)
@@ -828,7 +839,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn hash_secret(secret: &str) -> String {
     let mut h = Hasher::new();
-    h.update(b"nexus-extension-pairing-secret-v1");
+    h.update(b"nexus-external-pairing-secret-v1");
     h.update(secret.as_bytes());
     h.finalize().to_hex().to_string()
 }
@@ -839,7 +850,7 @@ fn display_checksum(secret: &str) -> String {
 
 fn credential_hash(installation_id: &str, pairing_id: &str, generation: i64) -> String {
     let mut h = Hasher::new();
-    h.update(b"nexus-extension-credential-record-v1");
+    h.update(b"nexus-external-credential-record-v1");
     h.update(installation_id.as_bytes());
     h.update(pairing_id.as_bytes());
     h.update(&generation.to_le_bytes());
@@ -850,7 +861,7 @@ fn credential_hash(installation_id: &str, pairing_id: &str, generation: i64) -> 
 /// never serialized into a Fact or a model-readable Value — it lives only in the
 /// daemon's credential store and at the transport boundary.
 #[derive(Clone)]
-pub struct ExtensionCredential {
+pub struct ExternalCredential {
     /// Installation this credential belongs to.
     pub installation_id: String,
     /// The current credential generation; a revoke bumps it.
@@ -858,7 +869,7 @@ pub struct ExtensionCredential {
     psk: [u8; 32],
 }
 
-impl ExtensionCredential {
+impl ExternalCredential {
     /// Mint a credential from raw PSK bytes (e.g. from a pairing exchange).
     pub fn new(installation_id: impl Into<String>, generation: u64, psk: [u8; 32]) -> Self {
         Self {
@@ -890,7 +901,7 @@ impl ExtensionCredential {
 
     /// Seal `payload` into an AEAD envelope. Convenience form for
     /// tests and callers that do not need to override the default AAD.
-    pub fn seal(&self, payload: &[u8]) -> Result<SecureExtensionEnvelope, EnvelopeError> {
+    pub fn seal(&self, payload: &[u8]) -> Result<SecureEnvelope, EnvelopeError> {
         self.seal_with_aad(payload, EnvelopeAad::default())
     }
 
@@ -902,7 +913,7 @@ impl ExtensionCredential {
         &self,
         payload: &[u8],
         aad: EnvelopeAad,
-    ) -> Result<SecureExtensionEnvelope, EnvelopeError> {
+    ) -> Result<SecureEnvelope, EnvelopeError> {
         let mut nonce_prefix = [0u8; 12];
         getrandom::fill(&mut nonce_prefix).map_err(|_| EnvelopeError::Crypto)?;
         let seq = aad.seq;
@@ -916,7 +927,7 @@ impl ExtensionCredential {
                 },
             )
             .map_err(|_| EnvelopeError::Crypto)?;
-        Ok(SecureExtensionEnvelope {
+        Ok(SecureEnvelope {
             installation_id: self.installation_id.clone(),
             generation: self.generation,
             aad,
@@ -930,7 +941,7 @@ impl ExtensionCredential {
     /// the AEAD tag must verify. Returns plaintext on success.
     pub fn open<'a>(
         &self,
-        env: &SecureExtensionEnvelope,
+        env: &SecureEnvelope,
         valid_floor: u64,
     ) -> Result<Vec<u8>, EnvelopeError> {
         if env.installation_id != self.installation_id {
@@ -953,9 +964,39 @@ impl ExtensionCredential {
             .map_err(|_| EnvelopeError::BadAead)
     }
 
+    /// Verify and open `env` through `replay_window`.
+    pub fn open_with_replay_window(
+        &self,
+        env: &SecureEnvelope,
+        valid_floor: u64,
+        replay_window: &mut SecureEnvelopeReplayWindow,
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        validate_envelope_aad(env)?;
+        let decision = replay_window.check(env.aad.seq)?;
+        let plaintext = self.open(env, valid_floor)?;
+        replay_window.commit(decision);
+        Ok(plaintext)
+    }
+
+    /// Verify and open `env` after checking the accepted key epoch.
+    pub fn open_with_replay_window_and_epoch_gate(
+        &self,
+        env: &SecureEnvelope,
+        valid_floor: u64,
+        replay_window: &mut SecureEnvelopeReplayWindow,
+        epoch_gate: &SecureEnvelopeEpochGate,
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        validate_envelope_aad(env)?;
+        epoch_gate.check(&env.aad)?;
+        let decision = replay_window.check(env.aad.seq)?;
+        let plaintext = self.open(env, valid_floor)?;
+        replay_window.commit(decision);
+        Ok(plaintext)
+    }
+
     fn cipher(&self, aad: &EnvelopeAad) -> Result<ChaCha20Poly1305, EnvelopeError> {
         let hk = Hkdf::<Sha256>::new(
-            Some(b"nexus/extension/session-envelope/chacha20poly1305/v1"),
+            Some(b"nexus/external/session-envelope/chacha20poly1305/v1"),
             &self.psk,
         );
         let mut key = [0u8; 32];
@@ -968,7 +1009,156 @@ impl ExtensionCredential {
     }
 }
 
-/// Authenticated data for one secure extension frame. These fields remain
+/// Bounded replay window for one secure external envelope stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecureEnvelopeReplayWindow {
+    window_size: usize,
+    highest: Option<u64>,
+    seen: u128,
+}
+
+impl Default for SecureEnvelopeReplayWindow {
+    fn default() -> Self {
+        Self {
+            window_size: DEFAULT_SECURE_ENVELOPE_REPLAY_WINDOW,
+            highest: None,
+            seen: 0,
+        }
+    }
+}
+
+impl SecureEnvelopeReplayWindow {
+    /// Create a replay window with `window_size` sequence numbers.
+    pub fn new(window_size: usize) -> Result<Self, EnvelopeError> {
+        if window_size == 0 || window_size > MAX_SECURE_ENVELOPE_REPLAY_WINDOW {
+            return Err(EnvelopeError::InvalidReplayWindow);
+        }
+        Ok(Self {
+            window_size,
+            highest: None,
+            seen: 0,
+        })
+    }
+
+    /// Accept `seq` and record it in the replay window.
+    pub fn accept(&mut self, seq: u64) -> Result<(), EnvelopeError> {
+        let decision = self.check(seq)?;
+        self.commit(decision);
+        Ok(())
+    }
+
+    fn check(&self, seq: u64) -> Result<ReplayWindowDecision, EnvelopeError> {
+        let Some(highest) = self.highest else {
+            if seq >= self.window_size as u64 {
+                return Err(EnvelopeError::SequenceTooFarAhead);
+            }
+            return Ok(ReplayWindowDecision::First(seq));
+        };
+
+        if seq > highest {
+            let advance = seq - highest;
+            if advance >= self.window_size as u64 {
+                return Err(EnvelopeError::SequenceTooFarAhead);
+            }
+            return Ok(ReplayWindowDecision::Advance(advance));
+        }
+
+        let offset = highest - seq;
+        if offset >= self.window_size as u64 {
+            return Err(EnvelopeError::SequenceTooOld);
+        }
+        let bit = 1u128 << offset;
+        if self.seen & bit != 0 {
+            return Err(EnvelopeError::Replay);
+        }
+        Ok(ReplayWindowDecision::Within(offset))
+    }
+
+    fn commit(&mut self, decision: ReplayWindowDecision) {
+        match decision {
+            ReplayWindowDecision::First(seq) => {
+                self.highest = Some(seq);
+                self.seen = 1;
+            }
+            ReplayWindowDecision::Advance(advance) => {
+                self.highest = self.highest.map(|highest| highest + advance);
+                self.seen = ((self.seen << advance) | 1) & self.mask();
+            }
+            ReplayWindowDecision::Within(offset) => {
+                self.seen |= 1u128 << offset;
+                self.seen &= self.mask();
+            }
+        }
+    }
+
+    fn mask(&self) -> u128 {
+        if self.window_size == MAX_SECURE_ENVELOPE_REPLAY_WINDOW {
+            u128::MAX
+        } else {
+            (1u128 << self.window_size) - 1
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplayWindowDecision {
+    First(u64),
+    Advance(u64),
+    Within(u64),
+}
+
+/// Key-epoch policy for secure external envelopes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecureEnvelopeEpochGate {
+    current_key_epoch: u64,
+    drain_frame_types: Vec<String>,
+}
+
+impl Default for SecureEnvelopeEpochGate {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl SecureEnvelopeEpochGate {
+    /// Create a gate for the current session key epoch.
+    pub fn new(current_key_epoch: u64) -> Self {
+        Self {
+            current_key_epoch,
+            drain_frame_types: vec!["control.config_ack".into()],
+        }
+    }
+
+    /// Add an old-epoch frame type accepted during drain.
+    pub fn with_drain_frame_type(mut self, frame_type: impl Into<String>) -> Self {
+        let frame_type = frame_type.into();
+        if !frame_type.trim().is_empty() && !self.drain_frame_types.contains(&frame_type) {
+            self.drain_frame_types.push(frame_type);
+        }
+        self
+    }
+
+    /// Return true when `aad` may be opened under the epoch policy.
+    pub fn check(&self, aad: &EnvelopeAad) -> Result<(), EnvelopeError> {
+        if aad.key_epoch == self.current_key_epoch {
+            return Ok(());
+        }
+        if aad.key_epoch > self.current_key_epoch {
+            return Err(EnvelopeError::InvalidKeyEpoch);
+        }
+        if self
+            .drain_frame_types
+            .iter()
+            .any(|frame_type| frame_type == &aad.frame_type)
+        {
+            Ok(())
+        } else {
+            Err(EnvelopeError::InvalidKeyEpoch)
+        }
+    }
+}
+
+/// Authenticated data for one secure external frame. These fields remain
 /// plaintext and are covered by the AEAD tag.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnvelopeAad {
@@ -988,6 +1178,10 @@ pub struct EnvelopeAad {
     pub binding_generation: u64,
     /// Credential generation observed by the sender.
     pub credential_generation: u64,
+    /// Hash of the negotiated session transcript.
+    pub transcript_hash: Vec<u8>,
+    /// Session key epoch used to seal this frame.
+    pub key_epoch: u64,
 }
 
 impl Default for EnvelopeAad {
@@ -1001,6 +1195,8 @@ impl Default for EnvelopeAad {
             frame_type: "frame".into(),
             binding_generation: 0,
             credential_generation: 0,
+            transcript_hash: Vec::new(),
+            key_epoch: 0,
         }
     }
 }
@@ -1008,7 +1204,7 @@ impl Default for EnvelopeAad {
 /// An AEAD-protected frame envelope. The ciphertext is the serialized
 /// business/control frame; AAD binds the envelope to the session/generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SecureExtensionEnvelope {
+pub struct SecureEnvelope {
     /// Installation id the envelope is for.
     pub installation_id: String,
     /// Credential generation used to seal the frame.
@@ -1033,23 +1229,56 @@ pub enum EnvelopeError {
     /// The AEAD tag did not verify (tampered, wrong key, wrong AAD, or wrong
     /// generation).
     BadAead,
+    /// The authenticated metadata is not a valid external frame header.
+    InvalidAad,
+    /// The frame sequence number was already accepted.
+    Replay,
+    /// The frame sequence number is older than the retained replay window.
+    SequenceTooOld,
+    /// The frame sequence number is too far ahead of the accepted window.
+    SequenceTooFarAhead,
+    /// The replay window size is outside the supported range.
+    InvalidReplayWindow,
+    /// The envelope key epoch is not accepted for this session.
+    InvalidKeyEpoch,
+}
+
+fn validate_envelope_aad(env: &SecureEnvelope) -> Result<(), EnvelopeError> {
+    let aad = &env.aad;
+    if aad.version != 1
+        || aad.projection_id.is_empty()
+        || aad.role.is_empty()
+        || aad.session_id.is_empty()
+        || aad.frame_type.is_empty()
+        || aad.credential_generation != env.generation
+        || aad.transcript_hash.len() != 32
+    {
+        return Err(EnvelopeError::InvalidAad);
+    }
+    Ok(())
 }
 
 fn aad_bytes(installation_id: &str, generation: u64, aad: &EnvelopeAad) -> Vec<u8> {
-    [
-        b"nexus-secure-extension-envelope-v1".as_slice(),
-        installation_id.as_bytes(),
-        &generation.to_le_bytes(),
-        &aad.version.to_le_bytes(),
-        aad.projection_id.as_bytes(),
-        aad.role.as_bytes(),
-        aad.session_id.as_bytes(),
-        &aad.seq.to_le_bytes(),
-        aad.frame_type.as_bytes(),
-        &aad.binding_generation.to_le_bytes(),
-        &aad.credential_generation.to_le_bytes(),
-    ]
-    .concat()
+    let mut out = Vec::new();
+    aad_push_bytes(&mut out, b"nexus-secure-external-envelope-v1");
+    aad_push_bytes(&mut out, installation_id.as_bytes());
+    aad_push_bytes(&mut out, &generation.to_le_bytes());
+    aad_push_bytes(&mut out, &aad.version.to_le_bytes());
+    aad_push_bytes(&mut out, aad.projection_id.as_bytes());
+    aad_push_bytes(&mut out, aad.role.as_bytes());
+    aad_push_bytes(&mut out, aad.session_id.as_bytes());
+    aad_push_bytes(&mut out, &aad.seq.to_le_bytes());
+    aad_push_bytes(&mut out, aad.frame_type.as_bytes());
+    aad_push_bytes(&mut out, &aad.binding_generation.to_le_bytes());
+    aad_push_bytes(&mut out, &aad.credential_generation.to_le_bytes());
+    aad_push_bytes(&mut out, &aad.transcript_hash);
+    aad_push_bytes(&mut out, &aad.key_epoch.to_le_bytes());
+    out
+}
+
+fn aad_push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(bytes);
 }
 
 fn nonce_bytes(prefix: &[u8; 12], seq: u64) -> [u8; 12] {
@@ -1076,20 +1305,20 @@ mod tests {
         (PairingDriver::new(state.clone()), state)
     }
 
-    fn extension_installation(id: &str, role: Role) -> Value {
+    fn external_installation(id: &str, role: Role) -> Value {
         let projection = match role {
-            Role::Provider => nexus_types::ExtensionProjectionDef {
+            Role::Provider => nexus_types::ExternalProjectionDef {
                 id: "provider".into(),
                 role,
-                namespace: Some(Path::parse(&format!("effect://plugin/{id}")).unwrap()),
+                namespace: Some(Path::parse(&format!("effect://external-provider/{id}")).unwrap()),
                 provides: vec![EffectCapability::new(
-                    format!("effect://plugin/{id}/search"),
+                    format!("effect://external-provider/{id}/search"),
                     Purity::Idempotent,
                 )],
                 emits: None,
                 version: 1,
             },
-            Role::Source => nexus_types::ExtensionProjectionDef {
+            Role::Source => nexus_types::ExternalProjectionDef {
                 id: "source".into(),
                 role,
                 namespace: None,
@@ -1098,11 +1327,20 @@ mod tests {
                     sink: nexus_types::sandboxed_source_event_sink_path(id, "source").unwrap(),
                     purity: Purity::Effectful,
                     event_schema: None,
+                    max_inline_payload_bytes: 65_536,
+                    capacity: nexus_types::external::StreamCapacity {
+                        max_events: 1024,
+                        on_overflow: nexus_types::external::OverflowPolicy::DropOldest,
+                    },
+                    rate_limit: None,
+                    commands: false,
+                    command_schema: None,
+                    command_result_schema: None,
                 }),
                 version: 1,
             },
         };
-        let def = ExtensionInstallationDef {
+        let def = ExternalInstallationDef {
             id: id.into(),
             platform: id.into(),
             transport: Transport::Stdio {
@@ -1118,11 +1356,11 @@ mod tests {
         serde_json::from_value(serde_json::to_value(def).unwrap()).unwrap()
     }
 
-    async fn install_extension(state: &Backend, id: &str, role: Role) {
+    async fn install_external(state: &Backend, id: &str, role: Role) {
         state
             .write_set(
-                &Path::parse(&format!("state://kernel/extension-installations/{id}")).unwrap(),
-                extension_installation(id, role),
+                &Path::parse(&format!("state://kernel/external-installations/{id}")).unwrap(),
+                external_installation(id, role),
             )
             .await
             .unwrap();
@@ -1159,7 +1397,7 @@ mod tests {
     #[tokio::test]
     async fn pairing_create_persists_hash_without_secret() {
         let (driver, state) = driver();
-        install_extension(&state, "ext-1", Role::Provider).await;
+        install_external(&state, "ext-1", Role::Provider).await;
         let mut input = BTreeMap::new();
         input.insert("pairing_id".into(), Value::Str("pair-1".into()));
         input.insert("installation_id".into(), Value::Str("ext-1".into()));
@@ -1182,7 +1420,7 @@ mod tests {
         assert_eq!(record.get("state"), Some(&Value::Str(STATE_CREATED.into())));
         assert!(!record.contains_key("pairing_secret"));
         let stored = state
-            .read(&Path::parse("state://kernel/extension-pairings/pair-1").unwrap())
+            .read(&Path::parse("state://kernel/external-pairings/pair-1").unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -1200,7 +1438,7 @@ mod tests {
         let mut input = BTreeMap::new();
         input.insert("pairing_id".into(), Value::Str("pair-secret".into()));
         input.insert("pairing_secret".into(), Value::Str("secret".into()));
-        let err = driver
+        let out = driver
             .call(
                 MethodId::new(0),
                 Value::Map(input),
@@ -1208,12 +1446,12 @@ mod tests {
                 &ctx(),
             )
             .await
-            .unwrap_err();
-        assert!(matches!(err, DriverError::Other(_)));
+            .unwrap();
+        assert!(matches!(out, Outcome::Fail(Failure::InvalidInput { .. })));
     }
 
     #[tokio::test]
-    async fn pairing_create_requires_installed_extension_scope() {
+    async fn pairing_create_requires_installed_external_scope() {
         let (driver, _) = driver();
         let mut input = BTreeMap::new();
         input.insert("pairing_id".into(), Value::Str("pair-missing".into()));
@@ -1233,7 +1471,7 @@ mod tests {
     #[tokio::test]
     async fn pairing_create_rejects_unknown_identity_field() {
         let (driver, state) = driver();
-        install_extension(&state, "ext-unknown-field", Role::Provider).await;
+        install_external(&state, "ext-unknown-field", Role::Provider).await;
         let mut input = BTreeMap::new();
         input.insert("pairing_id".into(), Value::Str("pair-unknown-field".into()));
         input.insert(
@@ -1256,7 +1494,7 @@ mod tests {
     #[tokio::test]
     async fn pairing_create_rejects_explicit_empty_allowed_roles() {
         let (driver, state) = driver();
-        install_extension(&state, "ext-empty-role", Role::Provider).await;
+        install_external(&state, "ext-empty-role", Role::Provider).await;
         let mut input = BTreeMap::new();
         input.insert("pairing_id".into(), Value::Str("pair-empty-role".into()));
         input.insert(
@@ -1277,9 +1515,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_projects_provider_extension_state() {
+    async fn approve_projects_provider_external_state() {
         let (driver, state) = driver();
-        install_extension(&state, "ext-2", Role::Provider).await;
+        install_external(&state, "ext-2", Role::Provider).await;
         let mut create = BTreeMap::new();
         create.insert("pairing_id".into(), Value::Str("pair-2".into()));
         create.insert("installation_id".into(), Value::Str("ext-2".into()));
@@ -1309,7 +1547,7 @@ mod tests {
             .await
             .unwrap();
         let ext = state
-            .read(&Path::parse("state://kernel/extension-sessions/ext-2/provider").unwrap())
+            .read(&Path::parse("state://kernel/external-sessions/ext-2/provider").unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -1321,7 +1559,7 @@ mod tests {
     #[tokio::test]
     async fn pairing_scope_can_come_from_multi_projection_installation() {
         let (driver, state) = driver();
-        let install = nexus_types::ExtensionInstallationDef {
+        let install = nexus_types::ExternalInstallationDef {
             id: "instant_messaging_platform".into(),
             platform: "instant_messaging_platform".into(),
             transport: Transport::Grpc { endpoint: None },
@@ -1329,7 +1567,7 @@ mod tests {
             config_schema: Value::Null,
             config: Value::Null,
             projections: vec![
-                nexus_types::ExtensionProjectionDef {
+                nexus_types::ExternalProjectionDef {
                     id: "source".into(),
                     role: Role::Source,
                     namespace: None,
@@ -1342,17 +1580,27 @@ mod tests {
                         .unwrap(),
                         purity: Purity::Effectful,
                         event_schema: None,
+                        max_inline_payload_bytes: 65_536,
+                        capacity: nexus_types::external::StreamCapacity {
+                            max_events: 1024,
+                            on_overflow: nexus_types::external::OverflowPolicy::DropOldest,
+                        },
+                        rate_limit: None,
+                        commands: false,
+                        command_schema: None,
+                        command_result_schema: None,
                     }),
                     version: 1,
                 },
-                nexus_types::ExtensionProjectionDef {
+                nexus_types::ExternalProjectionDef {
                     id: "provider".into(),
                     role: Role::Provider,
                     namespace: Some(
-                        Path::parse("effect://plugin/instant_messaging_platform").unwrap(),
+                        Path::parse("effect://external-provider/instant_messaging_platform")
+                            .unwrap(),
                     ),
                     provides: vec![EffectCapability::new(
-                        "effect://plugin/instant_messaging_platform/send_text",
+                        "effect://external-provider/instant_messaging_platform/send_text",
                         Purity::Effectful,
                     )],
                     emits: None,
@@ -1363,7 +1611,7 @@ mod tests {
         };
         state
             .write_set(
-                &Path::parse("state://kernel/extension-installations/instant_messaging_platform")
+                &Path::parse("state://kernel/external-installations/instant_messaging_platform")
                     .unwrap(),
                 serde_json::from_value(serde_json::to_value(install).unwrap()).unwrap(),
             )
@@ -1420,7 +1668,7 @@ mod tests {
             state
                 .read(
                     &Path::parse(
-                        "state://kernel/extension-sessions/instant_messaging_platform/source",
+                        "state://kernel/external-sessions/instant_messaging_platform/source",
                     )
                     .unwrap(),
                 )
@@ -1432,7 +1680,7 @@ mod tests {
             state
                 .read(
                     &Path::parse(
-                        "state://kernel/extension-sessions/instant_messaging_platform/provider",
+                        "state://kernel/external-sessions/instant_messaging_platform/provider",
                     )
                     .unwrap(),
                 )
@@ -1445,7 +1693,7 @@ mod tests {
     #[tokio::test]
     async fn approve_requires_sas_verified() {
         let (driver, state) = driver();
-        install_extension(&state, "ext-sas", Role::Provider).await;
+        install_external(&state, "ext-sas", Role::Provider).await;
         let mut create = BTreeMap::new();
         create.insert("pairing_id".into(), Value::Str("pair-sas".into()));
         create.insert("installation_id".into(), Value::Str("ext-sas".into()));
@@ -1480,7 +1728,7 @@ mod tests {
     #[tokio::test]
     async fn approve_rejects_frontend_claim_fields() {
         let (driver, state) = driver();
-        install_extension(&state, "ext-claim", Role::Provider).await;
+        install_external(&state, "ext-claim", Role::Provider).await;
         let mut create = BTreeMap::new();
         create.insert("pairing_id".into(), Value::Str("pair-claim".into()));
         create.insert("installation_id".into(), Value::Str("ext-claim".into()));
@@ -1512,7 +1760,7 @@ mod tests {
     #[tokio::test]
     async fn approve_rejects_roles_outside_allowed_set() {
         let (driver, state) = driver();
-        install_extension(&state, "ext-role", Role::Provider).await;
+        install_external(&state, "ext-role", Role::Provider).await;
         let mut create = BTreeMap::new();
         create.insert("pairing_id".into(), Value::Str("pair-role".into()));
         create.insert("installation_id".into(), Value::Str("ext-role".into()));
@@ -1547,7 +1795,7 @@ mod tests {
     #[tokio::test]
     async fn approve_terminalizes_expired_intent() {
         let (driver, state) = driver();
-        install_extension(&state, "ext-exp", Role::Provider).await;
+        install_external(&state, "ext-exp", Role::Provider).await;
         let mut create = BTreeMap::new();
         create.insert("pairing_id".into(), Value::Str("pair-exp".into()));
         create.insert("installation_id".into(), Value::Str("ext-exp".into()));
@@ -1578,7 +1826,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, DriverError::Other(_)));
         let stored = state
-            .read(&Path::parse("state://kernel/extension-pairings/pair-exp").unwrap())
+            .read(&Path::parse("state://kernel/external-pairings/pair-exp").unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -1591,7 +1839,7 @@ mod tests {
     #[tokio::test]
     async fn replace_terminalizes_old_intent_and_creates_new_one() {
         let (driver, state) = driver();
-        install_extension(&state, "ext-3", Role::Provider).await;
+        install_external(&state, "ext-3", Role::Provider).await;
         let mut create = BTreeMap::new();
         create.insert("pairing_id".into(), Value::Str("pair-3".into()));
         create.insert("installation_id".into(), Value::Str("ext-3".into()));
@@ -1620,7 +1868,7 @@ mod tests {
             .await
             .unwrap();
         let old = state
-            .read(&Path::parse("state://kernel/extension-pairings/pair-3").unwrap())
+            .read(&Path::parse("state://kernel/external-pairings/pair-3").unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -1629,7 +1877,7 @@ mod tests {
             Some(&Value::Str(STATE_REPLACED.into()))
         );
         let new = state
-            .read(&Path::parse("state://kernel/extension-pairings/pair-3b").unwrap())
+            .read(&Path::parse("state://kernel/external-pairings/pair-3b").unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -1655,7 +1903,7 @@ mod tests {
             .await
             .unwrap();
         let revoked = state
-            .read(&Path::parse("state://kernel/extension-revocations/ext-4").unwrap())
+            .read(&Path::parse("state://kernel/external-credential-revocations/ext-4").unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -1664,9 +1912,24 @@ mod tests {
         assert_eq!(m.get("credential_generation_floor"), Some(&Value::Int(7)));
     }
 
+    fn valid_aad(seq: u64) -> EnvelopeAad {
+        EnvelopeAad {
+            projection_id: "provider".into(),
+            role: "provider".into(),
+            session_id: "session-1".into(),
+            seq,
+            frame_type: "invoke".into(),
+            binding_generation: 1,
+            credential_generation: 1,
+            transcript_hash: vec![0x42; 32],
+            key_epoch: 1,
+            ..EnvelopeAad::default()
+        }
+    }
+
     #[test]
     fn seal_then_open_roundtrips() {
-        let cred = ExtensionCredential::from_pairing("inst-1", "hunter2", 1);
+        let cred = ExternalCredential::from_pairing("inst-1", "hunter2", 1);
         let env = cred.seal(b"hello frame").unwrap();
         assert_ne!(env.ciphertext, b"hello frame");
         assert_eq!(cred.open(&env, 0).unwrap(), b"hello frame");
@@ -1674,7 +1937,7 @@ mod tests {
 
     #[test]
     fn tampered_ciphertext_fails_aead() {
-        let cred = ExtensionCredential::from_pairing("inst-1", "hunter2", 1);
+        let cred = ExternalCredential::from_pairing("inst-1", "hunter2", 1);
         let mut env = cred.seal(b"transfer $10").unwrap();
         env.ciphertext[0] ^= 0x01;
         assert_eq!(cred.open(&env, 0), Err(EnvelopeError::BadAead));
@@ -1682,7 +1945,7 @@ mod tests {
 
     #[test]
     fn tampered_aad_fails_aead() {
-        let cred = ExtensionCredential::from_pairing("inst-1", "hunter2", 1);
+        let cred = ExternalCredential::from_pairing("inst-1", "hunter2", 1);
         let mut env = cred
             .seal_with_aad(
                 b"transfer $10",
@@ -1701,16 +1964,24 @@ mod tests {
     }
 
     #[test]
+    fn tampered_key_epoch_fails_aead() {
+        let cred = ExternalCredential::from_pairing("inst-1", "hunter2", 1);
+        let mut env = cred.seal_with_aad(b"invoke", valid_aad(3)).unwrap();
+        env.aad.key_epoch = env.aad.key_epoch.saturating_add(1);
+        assert_eq!(cred.open(&env, 0), Err(EnvelopeError::BadAead));
+    }
+
+    #[test]
     fn wrong_psk_fails_aead() {
-        let real = ExtensionCredential::from_pairing("inst-1", "secret", 1);
-        let attacker = ExtensionCredential::from_pairing("inst-1", "guess", 1);
+        let real = ExternalCredential::from_pairing("inst-1", "secret", 1);
+        let attacker = ExternalCredential::from_pairing("inst-1", "guess", 1);
         let env = attacker.seal(b"frame").unwrap();
         assert_eq!(real.open(&env, 0), Err(EnvelopeError::BadAead));
     }
 
     #[test]
     fn revoked_generation_is_rejected() {
-        let cred = ExtensionCredential::from_pairing("inst-1", "s", 2);
+        let cred = ExternalCredential::from_pairing("inst-1", "s", 2);
         let env = cred.seal(b"frame").unwrap();
         // Valid floor raised to 5 (after a revoke) → gen-2 envelope refused.
         assert_eq!(cred.open(&env, 5), Err(EnvelopeError::RevokedGeneration));
@@ -1721,7 +1992,7 @@ mod tests {
         // An attacker who captures a gen-1 envelope can't just bump the
         // generation field to dodge the floor — the AEAD AAD/key binds the
         // generation.
-        let cred = ExtensionCredential::from_pairing("inst-1", "s", 1);
+        let cred = ExternalCredential::from_pairing("inst-1", "s", 1);
         let mut env = cred.seal(b"frame").unwrap();
         env.generation = 9; // forge a higher generation
         assert_eq!(cred.open(&env, 5), Err(EnvelopeError::BadAead));
@@ -1729,9 +2000,174 @@ mod tests {
 
     #[test]
     fn wrong_installation_is_rejected() {
-        let cred = ExtensionCredential::from_pairing("inst-1", "s", 1);
+        let cred = ExternalCredential::from_pairing("inst-1", "s", 1);
         let mut env = cred.seal(b"frame").unwrap();
         env.installation_id = "inst-2".into();
         assert_eq!(cred.open(&env, 0), Err(EnvelopeError::WrongInstallation));
+    }
+
+    #[test]
+    fn replay_window_accepts_first_sequence() {
+        let cred = ExternalCredential::from_pairing("inst-1", "hunter2", 1);
+        let env = cred.seal_with_aad(b"frame-0", valid_aad(0)).unwrap();
+        let mut replay_window = SecureEnvelopeReplayWindow::default();
+
+        assert_eq!(
+            cred.open_with_replay_window(&env, 0, &mut replay_window)
+                .unwrap(),
+            b"frame-0"
+        );
+    }
+
+    #[test]
+    fn replay_window_rejects_duplicate_sequence() {
+        let cred = ExternalCredential::from_pairing("inst-1", "hunter2", 1);
+        let env = cred.seal_with_aad(b"frame-0", valid_aad(0)).unwrap();
+        let mut replay_window = SecureEnvelopeReplayWindow::default();
+
+        cred.open_with_replay_window(&env, 0, &mut replay_window)
+            .unwrap();
+        assert_eq!(
+            cred.open_with_replay_window(&env, 0, &mut replay_window),
+            Err(EnvelopeError::Replay)
+        );
+    }
+
+    #[test]
+    fn replay_window_accepts_out_of_order_once() {
+        let cred = ExternalCredential::from_pairing("inst-1", "hunter2", 1);
+        let mut replay_window = SecureEnvelopeReplayWindow::new(4).unwrap();
+        let env0 = cred.seal_with_aad(b"frame-0", valid_aad(0)).unwrap();
+        let env2 = cred.seal_with_aad(b"frame-2", valid_aad(2)).unwrap();
+        let env1 = cred.seal_with_aad(b"frame-1", valid_aad(1)).unwrap();
+
+        cred.open_with_replay_window(&env0, 0, &mut replay_window)
+            .unwrap();
+        cred.open_with_replay_window(&env2, 0, &mut replay_window)
+            .unwrap();
+        assert_eq!(
+            cred.open_with_replay_window(&env1, 0, &mut replay_window)
+                .unwrap(),
+            b"frame-1"
+        );
+        assert_eq!(
+            cred.open_with_replay_window(&env1, 0, &mut replay_window),
+            Err(EnvelopeError::Replay)
+        );
+    }
+
+    #[test]
+    fn replay_window_rejects_too_old_sequence() {
+        let cred = ExternalCredential::from_pairing("inst-1", "hunter2", 1);
+        let mut replay_window = SecureEnvelopeReplayWindow::new(4).unwrap();
+        let env0 = cred.seal_with_aad(b"frame-0", valid_aad(0)).unwrap();
+        let env3 = cred.seal_with_aad(b"frame-3", valid_aad(3)).unwrap();
+        let env6 = cred.seal_with_aad(b"frame-6", valid_aad(6)).unwrap();
+
+        cred.open_with_replay_window(&env0, 0, &mut replay_window)
+            .unwrap();
+        cred.open_with_replay_window(&env3, 0, &mut replay_window)
+            .unwrap();
+        cred.open_with_replay_window(&env6, 0, &mut replay_window)
+            .unwrap();
+        assert_eq!(
+            cred.open_with_replay_window(&env0, 0, &mut replay_window),
+            Err(EnvelopeError::SequenceTooOld)
+        );
+    }
+
+    #[test]
+    fn replay_window_rejects_too_far_ahead_sequence() {
+        let cred = ExternalCredential::from_pairing("inst-1", "hunter2", 1);
+        let mut replay_window = SecureEnvelopeReplayWindow::new(4).unwrap();
+        let env0 = cred.seal_with_aad(b"frame-0", valid_aad(0)).unwrap();
+        let env4 = cred.seal_with_aad(b"frame-4", valid_aad(4)).unwrap();
+
+        cred.open_with_replay_window(&env0, 0, &mut replay_window)
+            .unwrap();
+        assert_eq!(
+            cred.open_with_replay_window(&env4, 0, &mut replay_window),
+            Err(EnvelopeError::SequenceTooFarAhead)
+        );
+    }
+
+    #[test]
+    fn replay_window_does_not_commit_bad_aead() {
+        let cred = ExternalCredential::from_pairing("inst-1", "hunter2", 1);
+        let env = cred.seal_with_aad(b"frame-0", valid_aad(0)).unwrap();
+        let mut tampered = env.clone();
+        tampered.aad.binding_generation = 2;
+        let mut replay_window = SecureEnvelopeReplayWindow::default();
+
+        assert_eq!(
+            cred.open_with_replay_window(&tampered, 0, &mut replay_window),
+            Err(EnvelopeError::BadAead)
+        );
+        assert_eq!(
+            cred.open_with_replay_window(&env, 0, &mut replay_window)
+                .unwrap(),
+            b"frame-0"
+        );
+    }
+
+    #[test]
+    fn replay_window_requires_session_aad_shape() {
+        let cred = ExternalCredential::from_pairing("inst-1", "hunter2", 1);
+        let env = cred.seal(b"frame-0").unwrap();
+        let mut replay_window = SecureEnvelopeReplayWindow::default();
+
+        assert_eq!(
+            cred.open_with_replay_window(&env, 0, &mut replay_window),
+            Err(EnvelopeError::InvalidAad)
+        );
+    }
+
+    #[test]
+    fn epoch_gate_rejects_old_business_frames_after_rekey() {
+        let cred = ExternalCredential::from_pairing("inst-1", "hunter2", 1);
+        let mut aad = valid_aad(0);
+        aad.key_epoch = 1;
+        aad.frame_type = "invoke".into();
+        let env = cred.seal_with_aad(b"invoke", aad).unwrap();
+        let mut replay_window = SecureEnvelopeReplayWindow::default();
+        let epoch_gate = SecureEnvelopeEpochGate::new(2);
+
+        assert_eq!(
+            cred.open_with_replay_window_and_epoch_gate(&env, 0, &mut replay_window, &epoch_gate),
+            Err(EnvelopeError::InvalidKeyEpoch)
+        );
+    }
+
+    #[test]
+    fn epoch_gate_rejects_old_generic_control_frames_after_rekey() {
+        let cred = ExternalCredential::from_pairing("inst-1", "hunter2", 1);
+        let mut aad = valid_aad(0);
+        aad.key_epoch = 1;
+        aad.frame_type = "control".into();
+        let env = cred.seal_with_aad(b"close", aad).unwrap();
+        let mut replay_window = SecureEnvelopeReplayWindow::default();
+        let epoch_gate = SecureEnvelopeEpochGate::new(2);
+
+        assert_eq!(
+            cred.open_with_replay_window_and_epoch_gate(&env, 0, &mut replay_window, &epoch_gate),
+            Err(EnvelopeError::InvalidKeyEpoch)
+        );
+    }
+
+    #[test]
+    fn epoch_gate_allows_old_drain_config_ack_frames_after_rekey() {
+        let cred = ExternalCredential::from_pairing("inst-1", "hunter2", 1);
+        let mut aad = valid_aad(0);
+        aad.key_epoch = 1;
+        aad.frame_type = "control.config_ack".into();
+        let env = cred.seal_with_aad(b"ack", aad).unwrap();
+        let mut replay_window = SecureEnvelopeReplayWindow::default();
+        let epoch_gate = SecureEnvelopeEpochGate::new(2);
+
+        assert_eq!(
+            cred.open_with_replay_window_and_epoch_gate(&env, 0, &mut replay_window, &epoch_gate)
+                .unwrap(),
+            b"ack"
+        );
     }
 }

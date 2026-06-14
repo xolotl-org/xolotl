@@ -2,9 +2,9 @@
 
 Nexus separates mutable state from the Fact stream.
 
-## State Plane
+## State Path
 
-The `state://` plane is served by a `StateBackend`. Data-plane state access is
+The `state://` path is served by a `StateBackend`. State access is
 exposed through state-driver Operations: `read`, `write`, `append`, `delete`,
 and `list`.
 
@@ -12,10 +12,9 @@ Because state access goes through Operations, capability checks, residual
 policy, taint propagation, and audit apply to state reads and writes just like
 they apply to other effects.
 
-Subscriptions are currently exposed through the event bus facade
-`effect://events/subscribe`, which uses the same state backend subscription
-channel underneath. Executor `Wait(Signal)` nodes also wait on that backend
-subscription channel.
+Subscriptions use the event bus facade `effect://events/subscribe`, backed by
+the same state backend subscription channel. Executor `Wait(Signal)` nodes also
+wait on that backend subscription channel.
 
 ## Tainted Values
 

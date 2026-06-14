@@ -1,15 +1,15 @@
 // @generated — hand-maintained to match `tonic-prost-build` output for
-// `proto/nexus/v1/extension.proto` (package `nexus.v1.extension`). `include!`d
-// into the `nexus::v1::extension` module. Keep in sync with the `.proto` spec.
+// `proto/nexus/v1/external.proto` (package `nexus.v1.external`). `include!`d
+// into the `nexus::v1::external` module. Keep in sync with the `.proto` spec.
 
 /// Top-level frame envelope.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ExtensionFrame {
-    #[prost(oneof = "extension_frame::Frame", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
-    pub frame: ::core::option::Option<extension_frame::Frame>,
+pub struct ExternalFrame {
+    #[prost(oneof = "external_frame::Frame", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12")]
+    pub frame: ::core::option::Option<external_frame::Frame>,
 }
-/// Nested message and enum types in `ExtensionFrame`.
-pub mod extension_frame {
+/// Nested message and enum types in `ExternalFrame`.
+pub mod external_frame {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Frame {
         #[prost(message, tag = "1")]
@@ -31,15 +31,56 @@ pub mod extension_frame {
         #[prost(message, tag = "9")]
         InvokeResult(super::InvokeResult),
         #[prost(message, tag = "10")]
-        PluginReady(super::PluginReady),
+        ProviderReady(super::ProviderReady),
         #[prost(message, tag = "11")]
         Control(super::ControlFrame),
+        #[prost(message, tag = "12")]
+        SecureEnvelope(super::SecureEnvelope),
     }
 }
-/// Stage 1: extension reports identity plus locally observed generations/hash.
+/// AEAD-protected business/control frame envelope.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SecureEnvelope {
+    #[prost(string, tag = "1")]
+    pub installation_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub generation: u64,
+    #[prost(message, optional, tag = "3")]
+    pub aad: ::core::option::Option<EnvelopeAad>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub nonce_prefix: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "5")]
+    pub ciphertext: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EnvelopeAad {
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    #[prost(string, tag = "2")]
+    pub projection_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub role: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "5")]
+    pub seq: u64,
+    /// Authenticated frame discriminator. Control frames use control.<kind>,
+    /// for example control.config_ack.
+    #[prost(string, tag = "6")]
+    pub frame_type: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "7")]
+    pub binding_generation: u64,
+    #[prost(uint64, tag = "8")]
+    pub credential_generation: u64,
+    #[prost(bytes = "vec", tag = "9")]
+    pub transcript_hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "10")]
+    pub key_epoch: u64,
+}
+/// Stage 1: the role client reports identity plus locally observed generations/hash.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RoleSessionClientHello {
-    #[prost(enumeration = "ExtensionRole", tag = "1")]
+    #[prost(enumeration = "ExternalRole", tag = "1")]
     pub role: i32,
     #[prost(string, tag = "2")]
     pub installation_id: ::prost::alloc::string::String,
@@ -59,7 +100,7 @@ pub struct SessionContext {
     pub installation_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub projection_id: ::prost::alloc::string::String,
-    #[prost(enumeration = "ExtensionRole", tag = "3")]
+    #[prost(enumeration = "ExternalRole", tag = "3")]
     pub role: i32,
     #[prost(string, tag = "4")]
     pub registry_hash: ::prost::alloc::string::String,
@@ -68,21 +109,23 @@ pub struct SessionContext {
     #[prost(uint64, tag = "6")]
     pub binding_generation: u64,
     #[prost(uint64, tag = "7")]
-    pub extension_config_version: u64,
+    pub installation_config_version: u64,
     #[prost(uint64, tag = "8")]
     pub projection_version: u64,
     #[prost(uint64, tag = "9")]
     pub presentation_config_generation: u64,
     #[prost(uint64, tag = "10")]
     pub alias_catalog_generation: u64,
+    #[prost(string, tag = "11")]
+    pub session_id: ::prost::alloc::string::String,
 }
-/// Stage 3: extension confirms it has aligned to the daemon-selected context.
+/// Stage 3: the role client confirms it has aligned to the daemon-selected context.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RoleReady {
     #[prost(message, optional, tag = "1")]
     pub accepted_context: ::core::option::Option<SessionContext>,
 }
-/// Bridge → Daemon: source event occurred.
+/// Source client to daemon: source event occurred.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InboundEvent {
     #[prost(string, tag = "1")]
@@ -94,8 +137,12 @@ pub struct InboundEvent {
     /// Lightweight presentation/alias generation tags.
     #[prost(message, optional, tag = "4")]
     pub observed: ::core::option::Option<ObservedGenerations>,
+    #[prost(string, optional, tag = "5")]
+    pub stream_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, optional, tag = "6")]
+    pub seq: ::core::option::Option<u64>,
 }
-/// Daemon → Bridge: execute this action through the connector.
+/// Daemon to Source client: execute this action through the connector.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OutboundCommand {
     #[prost(string, tag = "1")]
@@ -114,7 +161,7 @@ pub struct ObservedGenerations {
     #[prost(uint64, tag = "2")]
     pub alias_catalog_generation: u64,
 }
-/// Bridge → Daemon: command execution result.
+/// Source client to daemon: command execution result.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CommandResult {
     #[prost(string, tag = "1")]
@@ -132,7 +179,7 @@ pub mod command_result {
         Error(super::ErrorInfo),
     }
 }
-/// Daemon → Bridge: event acknowledgment.
+/// Daemon to Source client: event acknowledgment.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EventAck {
     #[prost(string, tag = "1")]
@@ -142,7 +189,7 @@ pub struct EventAck {
     #[prost(string, optional, tag = "3")]
     pub reject_reason: ::core::option::Option<::prost::alloc::string::String>,
 }
-/// Daemon → Plugin: invoke an effect.
+/// Daemon to Provider client: invoke an effect.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Invoke {
     #[prost(string, tag = "1")]
@@ -158,7 +205,7 @@ pub struct Invoke {
     #[prost(uint64, optional, tag = "6")]
     pub method_id: ::core::option::Option<u64>,
 }
-/// Plugin → Daemon: invocation result.
+/// Provider client to daemon: invocation result.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InvokeResult {
     #[prost(string, tag = "1")]
@@ -176,9 +223,9 @@ pub mod invoke_result {
         Error(super::ErrorInfo),
     }
 }
-/// Plugin → Daemon: initialization complete, declare capabilities.
+/// Provider client to daemon: initialization complete, declare capabilities.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginReady {
+pub struct ProviderReady {
     #[prost(message, repeated, tag = "1")]
     pub provides: ::prost::alloc::vec::Vec<EffectHandlerSpec>,
 }
@@ -193,7 +240,7 @@ pub struct EffectHandlerSpec {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ControlFrame {
-    #[prost(oneof = "control_frame::Kind", tags = "1, 2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "control_frame::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
     pub kind: ::core::option::Option<control_frame::Kind>,
 }
 /// Nested message and enum types in `ControlFrame`.
@@ -209,14 +256,16 @@ pub mod control_frame {
         #[prost(message, tag = "4")]
         PresentationProfileUpdate(super::PresentationProfileUpdate),
         #[prost(message, tag = "5")]
-        ExtensionConfigUpdate(super::ExtensionConfigUpdate),
+        InstallationConfigUpdate(super::InstallationConfigUpdate),
         #[prost(message, tag = "6")]
         PresentationConfigUpdate(super::PresentationConfigUpdate),
         #[prost(message, tag = "7")]
         ConfigAck(super::ConfigAck),
+        #[prost(message, tag = "8")]
+        ProviderCancel(super::ProviderCancel),
     }
 }
-/// Extension → daemon: report what this end can render.
+/// Role client to daemon: report what this end can render.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PresentationProfileUpdate {
     #[prost(uint64, tag = "1")]
@@ -226,15 +275,15 @@ pub struct PresentationProfileUpdate {
     #[prost(message, optional, tag = "3")]
     pub profile: ::core::option::Option<super::Value>,
 }
-/// Daemon → extension: authority config update, via  CAS.
+/// Daemon to role client: authority config update, via CAS.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ExtensionConfigUpdate {
+pub struct InstallationConfigUpdate {
     #[prost(uint64, tag = "1")]
     pub config_version: u64,
     #[prost(message, optional, tag = "2")]
     pub config: ::core::option::Option<super::Value>,
 }
-/// Daemon → extension: presentation-only config, never grants capability.
+/// Daemon to role client: presentation-only config, never grants capability.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PresentationConfigUpdate {
     #[prost(uint64, tag = "1")]
@@ -244,7 +293,7 @@ pub struct PresentationConfigUpdate {
     #[prost(message, optional, tag = "3")]
     pub config: ::core::option::Option<super::Value>,
 }
-/// Extension → daemon: how a config/presentation update was applied.
+/// Role client to daemon: how a config/presentation update was applied.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ConfigAck {
     #[prost(enumeration = "ConfigAxis", tag = "1")]
@@ -274,6 +323,14 @@ pub struct FlowControl {
     #[prost(enumeration = "FlowSignal", tag = "1")]
     pub signal: i32,
 }
+/// Daemon to Provider client: cancel a pending invocation.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ProviderCancel {
+    #[prost(string, tag = "1")]
+    pub invocation_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ErrorInfo {
     #[prost(string, tag = "1")]
@@ -284,29 +341,29 @@ pub struct ErrorInfo {
     pub details:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
-/// Role projected by an extension, orthogonal to transport and trust.
+/// Role projected by an external program, orthogonal to transport and trust.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
-pub enum ExtensionRole {
+pub enum ExternalRole {
     Unspecified = 0,
-    /// Source: provides a state:// inbound event stream (chat bridge, webhook).
+    /// Source: provides a state:// inbound event stream.
     Source = 1,
     /// Provider: registers effect:// handlers (plugin, MCP server, remote device).
     Provider = 2,
 }
-impl ExtensionRole {
+impl ExternalRole {
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            Self::Unspecified => "EXTENSION_ROLE_UNSPECIFIED",
-            Self::Source => "EXTENSION_ROLE_SOURCE",
-            Self::Provider => "EXTENSION_ROLE_PROVIDER",
+            Self::Unspecified => "EXTERNAL_ROLE_UNSPECIFIED",
+            Self::Source => "EXTERNAL_ROLE_SOURCE",
+            Self::Provider => "EXTERNAL_ROLE_PROVIDER",
         }
     }
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
-            "EXTENSION_ROLE_UNSPECIFIED" => Some(Self::Unspecified),
-            "EXTENSION_ROLE_SOURCE" => Some(Self::Source),
-            "EXTENSION_ROLE_PROVIDER" => Some(Self::Provider),
+            "EXTERNAL_ROLE_UNSPECIFIED" => Some(Self::Unspecified),
+            "EXTERNAL_ROLE_SOURCE" => Some(Self::Source),
+            "EXTERNAL_ROLE_PROVIDER" => Some(Self::Provider),
             _ => None,
         }
     }
@@ -367,7 +424,7 @@ impl FlowSignal {
 #[repr(i32)]
 pub enum ConfigAxis {
     Unspecified = 0,
-    ExtensionConfig = 1,
+    InstallationConfig = 1,
     PresentationConfig = 2,
 }
 /// Result of applying a config/presentation update.
@@ -378,7 +435,7 @@ pub enum ApplyStatus {
     Applied = 1,
     Rejected = 2,
 }
-/// Why an extension rejected an update.
+/// Why a role client rejected an update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum RejectReason {
@@ -389,7 +446,7 @@ pub enum RejectReason {
     Unsupported = 4,
 }
 /// Generated server implementations.
-pub mod extension_service_server {
+pub mod external_service_server {
     #![allow(
         unused_variables,
         dead_code,
@@ -398,29 +455,29 @@ pub mod extension_service_server {
         clippy::let_unit_value
     )]
     use tonic::codegen::*;
-    /// Generated trait containing gRPC methods that should be implemented for use with ExtensionServiceServer.
+    /// Generated trait containing gRPC methods that should be implemented for use with ExternalServiceServer.
     #[async_trait]
-    pub trait ExtensionService: std::marker::Send + std::marker::Sync + 'static {
+    pub trait ExternalService: std::marker::Send + std::marker::Sync + 'static {
         /// Server streaming response type for the Session method.
         type SessionStream: tonic::codegen::tokio_stream::Stream<
-                Item = std::result::Result<super::ExtensionFrame, tonic::Status>,
+                Item = std::result::Result<super::ExternalFrame, tonic::Status>,
             > + std::marker::Send
             + 'static;
         async fn session(
             &self,
-            request: tonic::Request<tonic::Streaming<super::ExtensionFrame>>,
+            request: tonic::Request<tonic::Streaming<super::ExternalFrame>>,
         ) -> std::result::Result<tonic::Response<Self::SessionStream>, tonic::Status>;
     }
-    /// ExtensionService — daemon-side gRPC service (out-of-process Sources/Providers connect to it).
+    /// External gRPC service for Provider and Source sessions.
     #[derive(Debug)]
-    pub struct ExtensionServiceServer<T> {
+    pub struct ExternalServiceServer<T> {
         inner: Arc<T>,
         accept_compression_encodings: EnabledCompressionEncodings,
         send_compression_encodings: EnabledCompressionEncodings,
         max_decoding_message_size: Option<usize>,
         max_encoding_message_size: Option<usize>,
     }
-    impl<T> ExtensionServiceServer<T> {
+    impl<T> ExternalServiceServer<T> {
         pub fn new(inner: T) -> Self {
             Self::from_arc(Arc::new(inner))
         }
@@ -460,9 +517,9 @@ pub mod extension_service_server {
             self
         }
     }
-    impl<T, B> tonic::codegen::Service<http::Request<B>> for ExtensionServiceServer<T>
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for ExternalServiceServer<T>
     where
-        T: ExtensionService,
+        T: ExternalService,
         B: Body + std::marker::Send + 'static,
         B::Error: Into<StdError> + std::marker::Send + 'static,
     {
@@ -477,23 +534,23 @@ pub mod extension_service_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
-                "/nexus.v1.extension.ExtensionService/Session" => {
+                "/nexus.v1.external.ExternalService/Session" => {
                     #[allow(non_camel_case_types)]
-                    struct SessionSvc<T: ExtensionService>(pub Arc<T>);
-                    impl<T: ExtensionService>
-                        tonic::server::StreamingService<super::ExtensionFrame> for SessionSvc<T>
+                    struct SessionSvc<T: ExternalService>(pub Arc<T>);
+                    impl<T: ExternalService>
+                        tonic::server::StreamingService<super::ExternalFrame> for SessionSvc<T>
                     {
-                        type Response = super::ExtensionFrame;
+                        type Response = super::ExternalFrame;
                         type ResponseStream = T::SessionStream;
                         type Future =
                             BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
                         fn call(
                             &mut self,
-                            request: tonic::Request<tonic::Streaming<super::ExtensionFrame>>,
+                            request: tonic::Request<tonic::Streaming<super::ExternalFrame>>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as ExtensionService>::session(&inner, request).await
+                                <T as ExternalService>::session(&inner, request).await
                             };
                             Box::pin(fut)
                         }
@@ -536,7 +593,7 @@ pub mod extension_service_server {
             }
         }
     }
-    impl<T> Clone for ExtensionServiceServer<T> {
+    impl<T> Clone for ExternalServiceServer<T> {
         fn clone(&self) -> Self {
             let inner = self.inner.clone();
             Self {
@@ -549,13 +606,13 @@ pub mod extension_service_server {
         }
     }
     /// Generated gRPC service name
-    pub const SERVICE_NAME: &str = "nexus.v1.extension.ExtensionService";
-    impl<T> tonic::server::NamedService for ExtensionServiceServer<T> {
+    pub const SERVICE_NAME: &str = "nexus.v1.external.ExternalService";
+    impl<T> tonic::server::NamedService for ExternalServiceServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
 /// Generated client implementations.
-pub mod extension_service_client {
+pub mod external_service_client {
     #![allow(
         unused_variables,
         dead_code,
@@ -565,12 +622,12 @@ pub mod extension_service_client {
     )]
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
-    /// ExtensionService client.
+    /// ExternalService client.
     #[derive(Debug, Clone)]
-    pub struct ExtensionServiceClient<T> {
+    pub struct ExternalServiceClient<T> {
         inner: tonic::client::Grpc<T>,
     }
-    impl ExtensionServiceClient<tonic::transport::Channel> {
+    impl ExternalServiceClient<tonic::transport::Channel> {
         /// Attempt to create a new client by connecting to a given endpoint.
         pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
         where
@@ -581,7 +638,7 @@ pub mod extension_service_client {
             Ok(Self::new(conn))
         }
     }
-    impl<T> ExtensionServiceClient<T>
+    impl<T> ExternalServiceClient<T>
     where
         T: tonic::client::GrpcService<tonic::body::Body>,
         T::Error: Into<StdError>,
@@ -599,7 +656,7 @@ pub mod extension_service_client {
         pub fn with_interceptor<F>(
             inner: T,
             interceptor: F,
-        ) -> ExtensionServiceClient<InterceptedService<T, F>>
+        ) -> ExternalServiceClient<InterceptedService<T, F>>
         where
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
@@ -612,7 +669,7 @@ pub mod extension_service_client {
             <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
                 Into<StdError> + std::marker::Send + std::marker::Sync,
         {
-            ExtensionServiceClient::new(InterceptedService::new(inner, interceptor))
+            ExternalServiceClient::new(InterceptedService::new(inner, interceptor))
         }
         #[must_use]
         pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
@@ -636,9 +693,9 @@ pub mod extension_service_client {
         }
         pub async fn session(
             &mut self,
-            request: impl tonic::IntoStreamingRequest<Message = super::ExtensionFrame>,
+            request: impl tonic::IntoStreamingRequest<Message = super::ExternalFrame>,
         ) -> std::result::Result<
-            tonic::Response<tonic::codec::Streaming<super::ExtensionFrame>>,
+            tonic::Response<tonic::codec::Streaming<super::ExternalFrame>>,
             tonic::Status,
         > {
             self.inner.ready().await.map_err(|e| {
@@ -646,11 +703,11 @@ pub mod extension_service_client {
             })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/nexus.v1.extension.ExtensionService/Session",
+                "/nexus.v1.external.ExternalService/Session",
             );
             let mut req = request.into_streaming_request();
             req.extensions_mut().insert(GrpcMethod::new(
-                "nexus.v1.extension.ExtensionService",
+                "nexus.v1.external.ExternalService",
                 "Session",
             ));
             self.inner.streaming(req, path, codec).await

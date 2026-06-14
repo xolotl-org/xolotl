@@ -2,13 +2,13 @@
 
 Nexus 把可变状态和事实流分开。
 
-## 状态平面
+## 状态路径
 
-`state://` 平面由 `StateBackend` 服务。数据平面的状态访问通过标准状态驱动暴露为操作：`read`、`write`、`append`、`delete` 和 `list`。
+`state://` 路径由 `StateBackend` 服务。状态访问通过标准状态驱动暴露为操作：`read`、`write`、`append`、`delete` 和 `list`。
 
 因为状态访问走操作路径，能力检查、剩余策略、污点传播和审计会像其它效果一样应用到状态读写。
 
-订阅当前通过事件总线门面 `effect://events/subscribe` 暴露，底层使用同一个状态后端订阅通道。执行器的 `Wait(Signal)` 节点也等待这个后端订阅通道。
+订阅通过事件总线门面 `effect://events/subscribe` 暴露，底层使用同一个状态后端订阅通道。执行器的 `Wait(Signal)` 节点也等待这个后端订阅通道。
 
 ## 带污点的值
 

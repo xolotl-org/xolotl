@@ -270,7 +270,15 @@ impl Capability {
 fn is_capability_verb(verb: &str) -> bool {
     matches!(
         verb,
-        "*" | "perform" | "read" | "write" | "subscribe" | "spawn" | "act-as" | "delegate"
+        "*" | "perform"
+            | "publish"
+            | "read"
+            | "write"
+            | "append"
+            | "subscribe"
+            | "spawn"
+            | "act-as"
+            | "delegate"
     )
 }
 
@@ -280,9 +288,9 @@ fn validate_capability_scheme(verb: &str, scheme: &str) -> Result<(), CapError> 
     }
     let expected = match verb {
         "perform" => Some("effect"),
-        "read" | "write" | "subscribe" => Some("state"),
+        "read" | "write" | "append" | "subscribe" => Some("state"),
         "spawn" | "act-as" => Some("process"),
-        "delegate" => None,
+        "publish" | "delegate" => None,
         _ => None,
     };
     if let Some(expected) = expected
@@ -459,6 +467,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_publish_cap() {
+        let c = Capability::parse("publish://effect/search/run").unwrap();
+        assert_eq!(c.verb, "publish");
+        assert!(c.covers("publish", &p("effect://search/run")));
+        assert!(!c.covers("perform", &p("effect://search/run")));
+    }
+
+    #[test]
+    fn parse_state_append_cap() {
+        let c = Capability::parse("append://state/events/topic").unwrap();
+        assert_eq!(c.verb, "append");
+        assert!(c.covers("append", &p("state://events/topic")));
+        assert!(!c.covers("write", &p("state://events/topic")));
+    }
+
+    #[test]
     fn parse_with_predicate() {
         let c = Capability::parse("perform://effect/x/post@account=alice").unwrap();
         let pred = c.predicate.as_ref().unwrap();
@@ -471,7 +495,6 @@ mod tests {
     fn resource_paths_and_noncanonical_verbs_are_not_capabilities() {
         assert!(Capability::parse("effect://x/post").is_err());
         assert!(Capability::parse("state://memory/alice").is_err());
-        assert!(Capability::parse("append://state/events/topic").is_err());
         assert!(Capability::parse("read://effect/x/post").is_err());
         assert!(Capability::parse("perform://state/memory/alice").is_err());
     }

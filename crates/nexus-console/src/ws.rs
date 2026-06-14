@@ -2,8 +2,8 @@
 //!
 //! This is the post-login control path. Frames carry descriptor-named protocol
 //! actions (`ActionCall`) and streams (`StreamCall`). Dispatch goes through
-//! kernel/auth management surfaces and Operation/Fact paths, not
-//! through a raw `{target, method, input}` shell.
+//! kernel/auth management surfaces and audited runtime helpers, not through a
+//! raw `{target, method, input}` shell.
 
 use crate::auth::{self, ConsolePrincipal, SessionSummary};
 use crate::mgmt::{self, MgmtError};
@@ -14,18 +14,17 @@ use crate::protocol::{
     ACTION_ACCESS_USER_READ, ACTION_ACCESS_USER_WRITE_CAS, ACTION_AUDIT_FACTS_RECENT,
     ACTION_AUTHORITY_ACTION_MATRIX, ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE,
     ACTION_AUTHORITY_RESOURCE_ACCESS, ACTION_AUTHORITY_WHY_DENIED, ACTION_CONFIG_LIST,
-    ACTION_CONFIG_READ, ACTION_CONFIG_WRITE_CAS, ACTION_EXTENSIONS_INSTALLATION_INSTALL,
-    ACTION_EXTENSIONS_INSTALLATION_REVOKE, ACTION_EXTENSIONS_INSTALLATION_START,
-    ACTION_EXTENSIONS_INSTALLATION_STOP, ACTION_EXTENSIONS_INSTALLATION_UPDATE,
-    ACTION_HEALTH_SUMMARY, ACTION_LINEAGE_FACT_BY_OPERATION, ACTION_LINEAGE_FACT_READ,
-    ACTION_LINEAGE_TRACE_READ, ACTION_PAIRING_APPROVE, ACTION_PAIRING_CREATE, ACTION_PAIRING_DENY,
-    ACTION_PAIRING_REPLACE, ACTION_PROTOCOL_DESCRIBE, ACTION_PROTOCOL_REGISTRY_SNAPSHOT,
-    ACTION_PROTOCOL_SCHEMA_GET, ACTION_REGISTRY_COVERAGE_REPORT, ACTION_RUNTIME_PROCESS_INSPECT,
-    ACTION_SECRET_CATALOG, ACTION_SECRET_REVEAL, ACTION_STATE_SNAPSHOT,
-    ACTION_VISIBILITY_AUTHORITY_DESCRIBE, ACTION_VISIBILITY_STATE_LIST,
-    ACTION_VISIBILITY_STATE_READ, ActionCall, ActionDescriptor, ActionResult, ClientFrame,
-    ConsoleErrorCode, ConsoleEvent, JsonBytes, PrincipalSummary, RequiredAuthority,
-    STREAM_AUDIT_FACTS, STREAM_STATE_WATCH, ServerFrame, StreamCall,
+    ACTION_CONFIG_READ, ACTION_CONFIG_WRITE_CAS, ACTION_EXTERNAL_INSTALLATION_INSTALL,
+    ACTION_EXTERNAL_INSTALLATION_REVOKE, ACTION_EXTERNAL_INSTALLATION_START,
+    ACTION_EXTERNAL_INSTALLATION_STOP, ACTION_EXTERNAL_INSTALLATION_UPDATE, ACTION_HEALTH_SUMMARY,
+    ACTION_LINEAGE_FACT_BY_OPERATION, ACTION_LINEAGE_FACT_READ, ACTION_LINEAGE_TRACE_READ,
+    ACTION_PAIRING_APPROVE, ACTION_PAIRING_CREATE, ACTION_PAIRING_DENY, ACTION_PAIRING_REPLACE,
+    ACTION_PROTOCOL_DESCRIBE, ACTION_PROTOCOL_REGISTRY_SNAPSHOT, ACTION_PROTOCOL_SCHEMA_GET,
+    ACTION_REGISTRY_COVERAGE_REPORT, ACTION_RUNTIME_PROCESS_INSPECT, ACTION_SECRET_CATALOG,
+    ACTION_SECRET_REVEAL, ACTION_STATE_SNAPSHOT, ACTION_VISIBILITY_AUTHORITY_DESCRIBE,
+    ACTION_VISIBILITY_STATE_LIST, ACTION_VISIBILITY_STATE_READ, ActionCall, ActionDescriptor,
+    ActionResult, ClientFrame, ConsoleErrorCode, ConsoleEvent, JsonBytes, PrincipalSummary,
+    RequiredAuthority, STREAM_AUDIT_FACTS, STREAM_STATE_WATCH, ServerFrame, StreamCall,
 };
 use crate::state::{
     ConsoleState, ConsoleWsLimit, HARD_MAX_WS_FACT_LIMIT, HARD_MAX_WS_FRAME_BYTES,
@@ -37,9 +36,10 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
 use nexus_graph::{DoNode, OperationTemplate};
+use nexus_kernel::RequestGrantTemplate;
 use nexus_state::StateEvent;
 use nexus_types::{
-    Capability, ExtensionInstallationDef, NodeId, OperationId, Outcome, OutputMode, Path, ProcSpec,
+    Capability, ExternalInstallationDef, NodeId, OperationId, Outcome, OutputMode, Path, ProcSpec,
     ProcessId, ResourceName, RestartPolicy, TaintSet, Transport, Value,
 };
 use serde::Serialize;
@@ -59,8 +59,8 @@ pub async fn upgrade(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(st): State<Arc<ConsoleState>>,
 ) -> Response {
-    let source_addr = crate::source_addr(&headers, Some(peer));
-    if let Err(message) = validate_upgrade_headers_audited(&st, &headers, &source_addr) {
+    let source_addr = crate::verified_source_addr(&headers, Some(peer), &st.transport_security);
+    if let Err(message) = validate_upgrade_headers_audited(&st, &headers, Some(peer)) {
         return (StatusCode::FORBIDDEN, message).into_response();
     }
     if let Err(limit) = st.ws.try_acquire_source(&source_addr) {
@@ -877,25 +877,25 @@ async fn dispatch_call(
             out
         }
         ACTION_HEALTH_SUMMARY => health_summary(sess, principal).await?,
-        ACTION_EXTENSIONS_INSTALLATION_INSTALL | ACTION_EXTENSIONS_INSTALLATION_UPDATE => {
+        ACTION_EXTERNAL_INSTALLATION_INSTALL | ACTION_EXTERNAL_INSTALLATION_UPDATE => {
             let mut input = input_map(input_value(&call.input)?)?;
             let id = string_arg(&mut input, "id")?;
             let def = value_arg(&mut input, "def")?;
             let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
-            validate_path_segment(&id, "extension installation id")?;
+            validate_path_segment(&id, "external installation id")?;
             validate_extension_installation_def(&id, &def)?;
             mgmt::write_config(
                 &sess.state,
                 principal,
-                &format!("state://kernel/extension-installations/{id}"),
+                &format!("state://kernel/external-installations/{id}"),
                 def,
                 expected_version,
             )
             .await?;
             return Ok(ActionResult::empty(server_rev(sess)));
         }
-        ACTION_EXTENSIONS_INSTALLATION_START => {
+        ACTION_EXTERNAL_INSTALLATION_START => {
             let mut input = input_map(input_value(&call.input)?)?;
             let id = string_arg(&mut input, "id")?;
             require_step_up(principal)?;
@@ -906,11 +906,11 @@ async fn dispatch_call(
             .map_err(|e| ConsoleError::BadRequest(format!("proc spec conversion failed: {e}")))?;
             invoke_effect(sess, principal, "effect://proc/spawn", value).await?
         }
-        ACTION_EXTENSIONS_INSTALLATION_STOP => {
+        ACTION_EXTERNAL_INSTALLATION_STOP => {
             let mut input = input_map(input_value(&call.input)?)?;
             let id = string_arg(&mut input, "id")?;
             require_step_up(principal)?;
-            validate_path_segment(&id, "extension installation id")?;
+            validate_path_segment(&id, "external installation id")?;
             invoke_effect(
                 sess,
                 principal,
@@ -919,19 +919,19 @@ async fn dispatch_call(
             )
             .await?
         }
-        ACTION_EXTENSIONS_INSTALLATION_REVOKE => {
+        ACTION_EXTERNAL_INSTALLATION_REVOKE => {
             let mut input = input_map(input_value(&call.input)?)?;
             let installation_id = string_arg(&mut input, "installation_id")?;
             let credential_generation_floor =
                 optional_i64_arg(&mut input, "credential_generation_floor")?;
             require_step_up(principal)?;
-            validate_path_segment(&installation_id, "extension installation id")?;
+            validate_path_segment(&installation_id, "external installation id")?;
             let mut m = BTreeMap::new();
             m.insert("installation_id".into(), Value::Str(installation_id));
             if let Some(floor) = credential_generation_floor {
                 m.insert("credential_generation_floor".into(), Value::Int(floor));
             }
-            invoke_effect(sess, principal, "effect://extension/revoke", Value::Map(m)).await?
+            invoke_effect(sess, principal, "effect://external/revoke", Value::Map(m)).await?
         }
         ACTION_PAIRING_CREATE => {
             let mut input_map = input_map(input_value(&call.input)?)?;
@@ -942,7 +942,7 @@ async fn dispatch_call(
             pairing_action(
                 sess,
                 principal,
-                "effect://extension/pairing/create",
+                "effect://external/pairing/create",
                 input,
                 reveal_display_secret,
             )
@@ -957,7 +957,7 @@ async fn dispatch_call(
             invoke_effect(
                 sess,
                 principal,
-                "effect://extension/pairing/approve",
+                "effect://external/pairing/approve",
                 map_value([
                     ("pairing_id", Value::Str(pairing_id)),
                     (
@@ -976,7 +976,7 @@ async fn dispatch_call(
             invoke_effect(
                 sess,
                 principal,
-                "effect://extension/pairing/deny",
+                "effect://external/pairing/deny",
                 map_value([("pairing_id", Value::Str(pairing_id))]),
             )
             .await?
@@ -990,7 +990,7 @@ async fn dispatch_call(
             pairing_action(
                 sess,
                 principal,
-                "effect://extension/pairing/replace",
+                "effect://external/pairing/replace",
                 input,
                 reveal_display_secret,
             )
@@ -1022,7 +1022,7 @@ async fn subscribe(
     }
     if stream.since_rev.is_some() {
         return Err(ConsoleError::BadRequest(
-            "stream resume via since_rev is not supported by live-only console streams yet".into(),
+            "since_rev is invalid for live-only console streams".into(),
         ));
     }
 
@@ -1290,10 +1290,22 @@ async fn run_state_op(
     let identity = nexus_kernel::intern_identity(&identity_path);
     let verb = capability_verb_for_state_method(method);
     let cap = format!("{verb}://{}", capability_target(&path));
+    let methods = sess
+        .state
+        .boot
+        .request_method_bitmap(&target, verb)
+        .map_err(|e| ConsoleError::Operation(e.to_string()))?;
     let process = sess
         .state
         .boot
-        .spawn_request_process(identity, &[&cap])
+        .spawn_request_process_under_with_request_grants(
+            sess.state.boot.root,
+            identity,
+            &[RequestGrantTemplate {
+                literal: &cap,
+                methods,
+            }],
+        )
         .map_err(|e| ConsoleError::Operation(e.to_string()))?;
     let handle = sess
         .state
@@ -1323,29 +1335,62 @@ async fn process_inspect(
     limit: usize,
 ) -> Result<Value, ConsoleError> {
     require_process_inspect(principal)?;
-    let mut input = BTreeMap::new();
-    if let Some(process) = process {
-        input.insert("process".into(), Value::Int(process as i64));
+    let limit = bounded_limit(
+        limit,
+        sess.state.ws.config().max_fact_limit,
+        HARD_MAX_WS_FACT_LIMIT,
+    );
+    let process_ids = match process {
+        Some(process) => vec![ProcessId::new(process)],
+        None => sess.state.boot.kernel.processes.all_ids(),
+    };
+    let mut rows = Vec::with_capacity(process_ids.len());
+    for process in process_ids {
+        let mut row = BTreeMap::new();
+        row.insert(
+            "process".into(),
+            Value::Int(u64_to_i64_saturating(process.get())),
+        );
+        if let Some(status) = sess.state.boot.kernel.processes.status(process) {
+            row.insert("status".into(), Value::Str(format!("{status:?}")));
+            row.insert("terminal".into(), Value::Bool(status.is_terminal()));
+        } else {
+            row.insert("status".into(), Value::Str("Unknown".into()));
+        }
+        if let Some(identity) = sess.state.boot.kernel.processes.identity(process) {
+            row.insert(
+                "identity".into(),
+                Value::Int(u64_to_i64_saturating(identity.get())),
+            );
+        }
+        let children = sess
+            .state
+            .boot
+            .kernel
+            .processes
+            .children_of(process)
+            .into_iter()
+            .map(|child| Value::Int(u64_to_i64_saturating(child.get())))
+            .collect();
+        row.insert("children".into(), Value::List(children));
+        let facts = sess.state.boot.kernel.facts.facts_of(process)?;
+        row.insert("fact_count".into(), Value::Int(facts.len() as i64));
+        if include_recent_facts {
+            row.insert(
+                "recent_facts".into(),
+                Value::List(
+                    facts
+                        .into_iter()
+                        .rev()
+                        .take(limit)
+                        .map(fact_value)
+                        .collect(),
+                ),
+            );
+        }
+        rows.push(Value::Map(row));
     }
-    input.insert(
-        "include_recent_facts".into(),
-        Value::Bool(include_recent_facts),
-    );
-    input.insert(
-        "limit".into(),
-        Value::Int(bounded_limit(
-            limit,
-            sess.state.ws.config().max_fact_limit,
-            HARD_MAX_WS_FACT_LIMIT,
-        ) as i64),
-    );
-    invoke_effect(
-        sess,
-        principal,
-        "effect://kernel/process/inspect",
-        Value::Map(input),
-    )
-    .await
+    Ok(Value::List(rows))
 }
 
 async fn recent_facts(
@@ -1417,7 +1462,7 @@ async fn trace_read(
         Value::Str(if partial {
             "trace result is paged; request the next page to continue reconstruction".into()
         } else {
-            "trace projection currently exposes fact order only; span tree, state revision, and endpoint indexes are not materialized".into()
+            "trace result is a fact-order projection; use lineage fact and operation indexes for detailed records".into()
         }),
     );
     Ok(Value::Map(out))
@@ -1578,8 +1623,6 @@ fn authority_action_row(principal: &ConsolePrincipal, descriptor: &ActionDescrip
     let visibility_gate = action_needs_visibility_gate(descriptor);
     let status = if descriptor.status == protocol::ImplementationStatus::BlockedByCustody {
         "blocked_by_custody"
-    } else if descriptor.status != protocol::ImplementationStatus::Implemented {
-        "declared"
     } else if !authority_ok {
         if conditional_authority {
             "conditional_authority"
@@ -1747,28 +1790,24 @@ async fn proc_spec_from_installation(
     principal: &ConsolePrincipal,
     id: &str,
 ) -> Result<ProcSpec, ConsoleError> {
-    validate_path_segment(id, "extension installation id")?;
-    let installation_path = format!("state://kernel/extension-installations/{id}");
+    validate_path_segment(id, "external installation id")?;
+    let installation_path = format!("state://kernel/external-installations/{id}");
     let value = mgmt::inspect(&sess.state, principal, &installation_path)
         .await?
-        .ok_or_else(|| {
-            ConsoleError::BadRequest("extension installation is not installed".into())
-        })?;
+        .ok_or_else(|| ConsoleError::BadRequest("external installation is not installed".into()))?;
     let json = serde_json::to_value(&value).map_err(|e| {
-        ConsoleError::BadRequest(format!(
-            "ExtensionInstallationDef serialization failed: {e}"
-        ))
+        ConsoleError::BadRequest(format!("ExternalInstallationDef serialization failed: {e}"))
     })?;
-    let def: ExtensionInstallationDef = serde_json::from_value(json).map_err(|e| {
-        ConsoleError::BadRequest(format!("ExtensionInstallationDef is malformed: {e}"))
+    let def: ExternalInstallationDef = serde_json::from_value(json).map_err(|e| {
+        ConsoleError::BadRequest(format!("ExternalInstallationDef is malformed: {e}"))
     })?;
     if def.id != id {
         return Err(ConsoleError::BadRequest(
-            "ExtensionInstallationDef id does not match requested installation id".into(),
+            "ExternalInstallationDef id does not match requested installation id".into(),
         ));
     }
     def.validate_admission().map_err(|e| {
-        ConsoleError::BadRequest(format!("ExtensionInstallationDef admission failed: {e}"))
+        ConsoleError::BadRequest(format!("ExternalInstallationDef admission failed: {e}"))
     })?;
     Ok(proc_spec_from_transport(def.id, def.transport))
 }
@@ -1810,12 +1849,24 @@ async fn invoke_effect(
     }
     let identity = nexus_kernel::intern_identity(&identity_path);
     let cap = format!("perform://{}", capability_target(&path));
+    let target = ResourceName::new(path);
+    let methods = sess
+        .state
+        .boot
+        .request_method_bitmap(&target, "perform")
+        .map_err(|e| ConsoleError::Operation(e.to_string()))?;
     let process = sess
         .state
         .boot
-        .spawn_request_process(identity, &[&cap])
+        .spawn_request_process_under_with_request_grants(
+            sess.state.boot.root,
+            identity,
+            &[RequestGrantTemplate {
+                literal: &cap,
+                methods,
+            }],
+        )
         .map_err(|e| ConsoleError::Operation(e.to_string()))?;
-    let target = ResourceName::new(path);
     let handle = sess
         .state
         .boot
@@ -2229,7 +2280,11 @@ fn state_event(ev: StateEvent) -> ConsoleEvent {
     }
 }
 
-fn validate_upgrade_headers(headers: &HeaderMap) -> Result<(), String> {
+fn validate_upgrade_headers(
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    transport: &crate::ConsoleTransportSecurityConfig,
+) -> Result<(), String> {
     if let Some(path) = headers.get(":path").and_then(|h| h.to_str().ok())
         && path != "/ws"
     {
@@ -2239,26 +2294,116 @@ fn validate_upgrade_headers(headers: &HeaderMap) -> Result<(), String> {
         .get(header::ORIGIN)
         .and_then(|h| h.to_str().ok())
         .ok_or_else(|| "console websocket origin header is required".to_string())?;
-    let host = headers
+    let origin = OriginParts::parse(origin)?;
+    let trusted_proxy = transport.trusts_peer(peer.map(|p| p.ip()));
+    let external_host = external_host(headers, trusted_proxy, transport)?;
+    let external = OriginParts::parse_host(external_host)?;
+
+    if transport.relaxed_origin() {
+        return Ok(());
+    }
+    if !origin.host.eq_ignore_ascii_case(external.host) {
+        return Err("console websocket origin is not allowed".into());
+    }
+    if !transport.ignore_origin_port() && origin.port != external.port {
+        return Err("console websocket origin port is not allowed".into());
+    }
+    if let Some(proto) = external_forwarded_proto(headers, trusted_proxy, transport)
+        && origin.scheme != proto
+    {
+        return Err("console websocket origin scheme is not allowed".into());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct OriginParts<'a> {
+    scheme: &'a str,
+    host: &'a str,
+    port: Option<u16>,
+}
+
+impl<'a> OriginParts<'a> {
+    fn parse(origin: &'a str) -> Result<Self, String> {
+        let (scheme, rest) = origin
+            .split_once("://")
+            .ok_or_else(|| "console websocket origin is malformed".to_string())?;
+        if !matches!(scheme, "http" | "https") {
+            return Err("console websocket origin scheme is unsupported".into());
+        }
+        let authority = rest
+            .split('/')
+            .next()
+            .ok_or_else(|| "console websocket origin is malformed".to_string())?;
+        let mut parsed = Self::parse_host(authority)?;
+        parsed.scheme = scheme;
+        Ok(parsed)
+    }
+
+    fn parse_host(authority: &'a str) -> Result<Self, String> {
+        let authority = authority.trim();
+        if authority.is_empty() {
+            return Err("console websocket host header is required".into());
+        }
+        let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
+            let (host, rest) = stripped
+                .split_once(']')
+                .ok_or_else(|| "console websocket host header is malformed".to_string())?;
+            let port = rest.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
+            (host, port)
+        } else if let Some((host, port)) = authority.rsplit_once(':') {
+            if port.chars().all(|c| c.is_ascii_digit()) {
+                (host, port.parse::<u16>().ok())
+            } else {
+                (authority, None)
+            }
+        } else {
+            (authority, None)
+        };
+        if host.is_empty() {
+            return Err("console websocket host header is malformed".into());
+        }
+        Ok(Self {
+            scheme: "",
+            host,
+            port,
+        })
+    }
+}
+
+fn external_host<'a>(
+    headers: &'a HeaderMap,
+    trusted_proxy: bool,
+    transport: &crate::ConsoleTransportSecurityConfig,
+) -> Result<&'a str, String> {
+    if trusted_proxy
+        && transport.trusted_proxy.honor_x_forwarded_host
+        && let Some(host) = headers
+            .get("x-forwarded-host")
+            .and_then(|h| h.to_str().ok())
+    {
+        return Ok(host.split(',').next().unwrap_or(host).trim());
+    }
+    headers
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| "console websocket host header is required".to_string())?;
-    let origin_host = origin
-        .strip_prefix("https://")
-        .or_else(|| origin.strip_prefix("http://"))
-        .and_then(|rest| rest.split('/').next())
-        .ok_or_else(|| "console websocket origin is malformed".to_string())?;
-    // Strip port from both sides before comparison — port is not an origin
-    // security boundary for same-origin WebSocket upgrades. Keeping ports
-    // breaks dev setups where the page is served on :8080 and the proxy
-    // reaches the backend on :9000.
-    let origin_host = origin_host.rsplit(':').next_back().unwrap_or(origin_host);
-    let host = host.rsplit(':').next_back().unwrap_or(host);
-    if origin_host.eq_ignore_ascii_case(host) {
-        Ok(())
-    } else {
-        Err("console websocket origin is not allowed".into())
+        .ok_or_else(|| "console websocket host header is required".to_string())
+}
+
+fn external_forwarded_proto<'a>(
+    headers: &'a HeaderMap,
+    trusted_proxy: bool,
+    transport: &crate::ConsoleTransportSecurityConfig,
+) -> Option<&'a str> {
+    if !(trusted_proxy && transport.trusted_proxy.honor_x_forwarded_proto) {
+        return None;
     }
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| matches!(*value, "http" | "https"))
 }
 
 fn server_rev(sess: &WsSession) -> u64 {
@@ -2270,7 +2415,11 @@ fn registry_rev(_sess: &WsSession) -> u64 {
 }
 
 fn protocol_metadata(sess: &WsSession) -> protocol::ProtocolMetadata {
-    protocol::protocol_metadata(server_rev(sess), registry_rev(sess))
+    let mut metadata = protocol::protocol_metadata(server_rev(sess), registry_rev(sess));
+    metadata.transport_security_mode = sess.state.transport_security.mode.as_str().into();
+    metadata.unsafe_transport = sess.state.transport_security.is_unsafe();
+    metadata.unsafe_transport_relaxations = sess.state.transport_security.unsafe_relaxation_names();
+    metadata
 }
 
 fn ensure_observable_state_path(path: &Path) -> Result<(), ConsoleError> {
@@ -2325,11 +2474,12 @@ fn blocked_visibility_target(raw: &str) -> String {
 fn validate_upgrade_headers_audited(
     state: &Arc<ConsoleState>,
     headers: &HeaderMap,
-    source_addr: &str,
+    peer: Option<SocketAddr>,
 ) -> Result<(), String> {
-    let result = validate_upgrade_headers(headers);
+    let result = validate_upgrade_headers(headers, peer, &state.transport_security);
     if result.is_err() {
-        record_ws_audit(state, None, Some(source_addr), "protocol_error");
+        let source_addr = crate::verified_source_addr(headers, peer, &state.transport_security);
+        record_ws_audit(state, None, Some(&source_addr), "origin_denied");
     }
     result
 }
@@ -2455,12 +2605,12 @@ fn require_config_write_safety(
             segs.get(1).map(|s| s.as_str()),
             Some(
                 "console"
-                    | "extensions"
-                    | "extension-installations"
-                    | "extension-projections"
-                    | "extension-pairings"
-                    | "extension-sessions"
-                    | "extension-revocations"
+                    | "external"
+                    | "external-installations"
+                    | "external-projections"
+                    | "external-pairings"
+                    | "external-sessions"
+                    | "external-credential-revocations"
                     | "procs"
             )
         );
@@ -2547,7 +2697,6 @@ fn authority_why(
     let mut why = Vec::new();
     match status {
         "blocked_by_custody" => why.push("secret custody backend is not registered".into()),
-        "declared" => why.push("descriptor is declared but not implemented".into()),
         "denied" if !authority_ok => why.push("principal lacks required authority".into()),
         "conditional_authority" if conditional_authority => {
             why.push("matching grant is predicate-bound and needs concrete action input".into())
@@ -2705,20 +2854,18 @@ fn optional_usize_arg(
 
 fn validate_extension_installation_def(id: &str, value: &Value) -> Result<(), ConsoleError> {
     let json = serde_json::to_value(value).map_err(|e| {
-        ConsoleError::BadRequest(format!(
-            "ExtensionInstallationDef serialization failed: {e}"
-        ))
+        ConsoleError::BadRequest(format!("ExternalInstallationDef serialization failed: {e}"))
     })?;
-    let def: ExtensionInstallationDef = serde_json::from_value(json).map_err(|e| {
-        ConsoleError::BadRequest(format!("ExtensionInstallationDef is malformed: {e}"))
+    let def: ExternalInstallationDef = serde_json::from_value(json).map_err(|e| {
+        ConsoleError::BadRequest(format!("ExternalInstallationDef is malformed: {e}"))
     })?;
     if def.id != id {
         return Err(ConsoleError::BadRequest(
-            "ExtensionInstallationDef id does not match requested installation id".into(),
+            "ExternalInstallationDef id does not match requested installation id".into(),
         ));
     }
     def.validate_admission().map_err(|e| {
-        ConsoleError::BadRequest(format!("ExtensionInstallationDef admission failed: {e}"))
+        ConsoleError::BadRequest(format!("ExternalInstallationDef admission failed: {e}"))
     })
 }
 
@@ -2727,16 +2874,16 @@ fn validate_config_write_value_for_path(path: &str, value: &Value) -> Result<(),
     let segs = parsed.segments();
     if parsed.scheme() == "state"
         && segs.first().map(|s| s.as_str()) == Some("kernel")
-        && segs.get(1).map(|s| s.as_str()) == Some("extension-installations")
+        && segs.get(1).map(|s| s.as_str()) == Some("external-installations")
     {
         let Some(id) = segs.get(2) else {
             return Err(ConsoleError::BadRequest(
-                "ExtensionInstallationDef writes must target state://kernel/extension-installations/<id>".into(),
+                "ExternalInstallationDef writes must target state://kernel/external-installations/<id>".into(),
             ));
         };
         if segs.len() != 3 {
             return Err(ConsoleError::BadRequest(
-                "ExtensionInstallationDef writes must target exactly one installation id".into(),
+                "ExternalInstallationDef writes must target exactly one installation id".into(),
             ));
         }
         validate_extension_installation_def(id, value)?;
@@ -2800,11 +2947,14 @@ mod tests {
         BootstrapOutcome, LoginRequest, RootProvisioning, StepUpRequest, bootstrap_root_account,
     };
     use crate::protocol::*;
-    use crate::state::{ConsoleWsConfig, ConsoleWsRuntime};
+    use crate::state::{
+        ConsoleTransportSecurityConfig, ConsoleTransportSecurityMode, ConsoleTrustedProxyConfig,
+        ConsoleUnsafeTransportRelaxation, ConsoleWsConfig, ConsoleWsRuntime,
+    };
     use nexus_actors::{PairingDisplayEdge, StandardConfig, install_standard};
     use nexus_kernel::Bootstrap;
     use nexus_types::{
-        EffectCapability, ExtensionProjectionDef, Purity, Role, Transport, TrustLevel,
+        EffectCapability, ExternalProjectionDef, Purity, Role, Transport, TrustLevel,
     };
     use std::collections::BTreeMap;
 
@@ -3023,7 +3173,7 @@ mod tests {
     }
 
     fn extension_installation(id: &str, version: u64) -> Value {
-        let def = ExtensionInstallationDef {
+        let def = ExternalInstallationDef {
             id: id.into(),
             platform: id.into(),
             transport: Transport::Stdio {
@@ -3033,12 +3183,12 @@ mod tests {
             trust: TrustLevel::Sandboxed,
             config_schema: Value::Null,
             config: Value::Null,
-            projections: vec![ExtensionProjectionDef {
+            projections: vec![ExternalProjectionDef {
                 id: "provider".into(),
                 role: Role::Provider,
-                namespace: Some(Path::parse(&format!("effect://plugin/{id}")).unwrap()),
+                namespace: Some(Path::parse(&format!("effect://external-provider/{id}")).unwrap()),
                 provides: vec![EffectCapability::new(
-                    format!("effect://plugin/{id}/search"),
+                    format!("effect://external-provider/{id}/search"),
                     Purity::Idempotent,
                 )],
                 emits: None,
@@ -3228,10 +3378,10 @@ mod tests {
         let st = console_state();
         let headers = HeaderMap::new();
 
-        let err = validate_upgrade_headers_audited(&st, &headers, "127.0.0.1").unwrap_err();
+        let err = validate_upgrade_headers_audited(&st, &headers, None).unwrap_err();
 
         assert!(err.contains("origin"));
-        assert!(audit_outcomes(&st, "console_ws").contains(&"protocol_error".into()));
+        assert!(audit_outcomes(&st, "console_ws").contains(&"origin_denied".into()));
     }
 
     #[tokio::test]
@@ -3376,7 +3526,7 @@ mod tests {
             ),
             call(ACTION_HEALTH_SUMMARY, Value::Null),
             call(
-                ACTION_EXTENSIONS_INSTALLATION_START,
+                ACTION_EXTERNAL_INSTALLATION_START,
                 map_value([("id", Value::Str("acme".into()))]),
             ),
             call(
@@ -3423,7 +3573,7 @@ mod tests {
             &mut sess,
             &principal,
             call(
-                ACTION_EXTENSIONS_INSTALLATION_INSTALL,
+                ACTION_EXTERNAL_INSTALLATION_INSTALL,
                 map_value([
                     ("id", Value::Str("acme".into())),
                     ("def", extension_installation("acme", 0)),
@@ -3740,7 +3890,7 @@ mod tests {
             &mut sess,
             &principal,
             call(
-                ACTION_EXTENSIONS_INSTALLATION_INSTALL,
+                ACTION_EXTERNAL_INSTALLATION_INSTALL,
                 map_value([
                     ("id", Value::Str("pairable".into())),
                     ("def", extension_installation("pairable", 0)),
@@ -3807,7 +3957,7 @@ mod tests {
                 map_value([
                     (
                         "path",
-                        Value::Str("state://kernel/extension-installations/acme".into()),
+                        Value::Str("state://kernel/external-installations/acme".into()),
                     ),
                     ("value", extension_installation("acme", 0)),
                     ("expected_version", Value::Null),
@@ -3837,14 +3987,14 @@ mod tests {
         };
         provider.insert(
             "namespace".into(),
-            Value::Str("effect://plugin/other".into()),
+            Value::Str("effect://external-provider/other".into()),
         );
 
         let err = dispatch_call(
             &mut sess,
             &principal,
             call(
-                ACTION_EXTENSIONS_INSTALLATION_INSTALL,
+                ACTION_EXTERNAL_INSTALLATION_INSTALL,
                 map_value([
                     ("id", Value::Str("acme".into())),
                     ("def", bad.clone()),
@@ -3857,7 +4007,7 @@ mod tests {
         assert!(matches!(err, ConsoleError::BadRequest(_)));
         assert_eq!(
             st.state
-                .read(&Path::parse("state://kernel/extension-installations/acme").unwrap())
+                .read(&Path::parse("state://kernel/external-installations/acme").unwrap())
                 .await
                 .unwrap(),
             None
@@ -3871,7 +4021,7 @@ mod tests {
                 map_value([
                     (
                         "path",
-                        Value::Str("state://kernel/extension-installations/acme".into()),
+                        Value::Str("state://kernel/external-installations/acme".into()),
                     ),
                     ("value", bad),
                     ("expected_version", Value::Null),
@@ -3883,7 +4033,7 @@ mod tests {
         assert!(matches!(err, ConsoleError::BadRequest(_)));
         assert_eq!(
             st.state
-                .read(&Path::parse("state://kernel/extension-installations/acme").unwrap())
+                .read(&Path::parse("state://kernel/external-installations/acme").unwrap())
                 .await
                 .unwrap(),
             None
@@ -4186,20 +4336,78 @@ mod tests {
     }
 
     #[test]
-    fn origin_host_must_match() {
+    fn origin_host_and_port_must_match_by_default() {
         let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, "console.local".parse().unwrap());
-        headers.insert(header::ORIGIN, "https://console.local".parse().unwrap());
-        assert!(validate_upgrade_headers(&headers).is_ok());
-        headers.insert(header::ORIGIN, "https://attacker.local".parse().unwrap());
-        assert!(validate_upgrade_headers(&headers).is_err());
+        headers.insert(header::HOST, "console.local:9443".parse().unwrap());
+        headers.insert(
+            header::ORIGIN,
+            "https://console.local:9443".parse().unwrap(),
+        );
+        let cfg = ConsoleTransportSecurityConfig::default();
+        assert!(validate_upgrade_headers(&headers, None, &cfg).is_ok());
+        headers.insert(
+            header::ORIGIN,
+            "https://console.local:8080".parse().unwrap(),
+        );
+        assert!(validate_upgrade_headers(&headers, None, &cfg).is_err());
+        headers.insert(
+            header::ORIGIN,
+            "https://attacker.local:9443".parse().unwrap(),
+        );
+        assert!(validate_upgrade_headers(&headers, None, &cfg).is_err());
+    }
+
+    #[test]
+    fn ignore_origin_port_relaxation_allows_only_port_mismatch() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "console.local:9443".parse().unwrap());
+        headers.insert(
+            header::ORIGIN,
+            "https://console.local:8080".parse().unwrap(),
+        );
+        let cfg = ConsoleTransportSecurityConfig {
+            unsafe_relaxations: vec![ConsoleUnsafeTransportRelaxation::IgnoreOriginPort],
+            ..ConsoleTransportSecurityConfig::default()
+        };
+        assert!(validate_upgrade_headers(&headers, None, &cfg).is_ok());
+        headers.insert(
+            header::ORIGIN,
+            "https://attacker.local:8080".parse().unwrap(),
+        );
+        assert!(validate_upgrade_headers(&headers, None, &cfg).is_err());
+    }
+
+    #[test]
+    fn trusted_proxy_uses_forwarded_external_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:9000".parse().unwrap());
+        headers.insert(
+            header::ORIGIN,
+            "https://console.example.com".parse().unwrap(),
+        );
+        headers.insert("x-forwarded-host", "console.example.com".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        let proxy_ip = "127.0.0.1".parse().unwrap();
+        let cfg = ConsoleTransportSecurityConfig {
+            mode: ConsoleTransportSecurityMode::TrustedReverseProxy,
+            trusted_proxy: ConsoleTrustedProxyConfig {
+                peers: vec![proxy_ip],
+                ..ConsoleTrustedProxyConfig::default()
+            },
+            unsafe_relaxations: Vec::new(),
+        };
+        let peer = SocketAddr::new(proxy_ip, 12345);
+        assert!(validate_upgrade_headers(&headers, Some(peer), &cfg).is_ok());
+        let untrusted_peer = SocketAddr::new("127.0.0.2".parse().unwrap(), 12345);
+        assert!(validate_upgrade_headers(&headers, Some(untrusted_peer), &cfg).is_err());
     }
 
     #[test]
     fn origin_and_host_are_required() {
         let mut headers = HeaderMap::new();
-        assert!(validate_upgrade_headers(&headers).is_err());
+        let cfg = ConsoleTransportSecurityConfig::default();
+        assert!(validate_upgrade_headers(&headers, None, &cfg).is_err());
         headers.insert(header::ORIGIN, "https://console.local".parse().unwrap());
-        assert!(validate_upgrade_headers(&headers).is_err());
+        assert!(validate_upgrade_headers(&headers, None, &cfg).is_err());
     }
 }

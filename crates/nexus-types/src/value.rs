@@ -397,7 +397,7 @@ pub enum Failure {
         /// Validation failure detail.
         reason: String,
     },
-    /// Extension point for errors not represented by a stable variant yet.
+    /// Fallback for errors not represented by a stable variant yet.
     Custom {
         /// Stable custom error class.
         kind: String,

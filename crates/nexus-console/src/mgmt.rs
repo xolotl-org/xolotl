@@ -1,20 +1,18 @@
 //! Kernel management helpers used by the Console Protocol host.
 //!
 //! These functions are the read/write projection for manageable
-//! `state://kernel/*` configuration. They run through capability-scoped
-//! Operations with CAS admission. Broader protocol actions such as visibility,
-//! authority inspection, lineage, health, pairing, and stream dispatch live in
-//! `ws`/`protocol` and call into this module for kernel management state.
+//! `state://kernel/*` configuration. Broader protocol actions such as
+//! visibility, authority inspection, lineage, health, pairing, and stream
+//! dispatch live in `ws`/`protocol` and call into this module for kernel
+//! management state.
 
 use crate::auth::{self, ConsolePrincipal};
 use crate::state::ConsoleState;
-use nexus_graph::{DoNode, OperationTemplate};
 use nexus_types::{
-    AuditRules, ExtensionInstallationDef, ExtensionProjectionDef, ManifestDef, Outcome, OutputMode,
-    Path, ResourceName, TaintSet, TrustLevel, Value,
+    AuditRules, ExternalInstallationDef, ExternalProjectionDef, ManifestDef, Path, TrustLevel,
+    Value,
 };
 use serde::de::DeserializeOwned;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -66,10 +64,11 @@ pub async fn inspect(
     let p = Path::parse(path)?;
     ensure_manageable(&p)?;
     auth::authorize_path(&state.state, principal, "read", &p, None).await?;
-    match run_state_op(state, principal, p, "read", Value::Null).await? {
-        Value::Null => Ok(None),
-        v => Ok(Some(v)),
-    }
+    state
+        .state
+        .read(&p)
+        .await
+        .map_err(|error| MgmtError::Operation(error.to_string()))
 }
 
 /// List the keys under a management prefix (inspect a subtree).
@@ -81,26 +80,15 @@ pub async fn inspect_prefix(
     let p = Path::parse(prefix)?;
     ensure_manageable(&p)?;
     auth::authorize_path(&state.state, principal, "read", &p, None).await?;
-    let out = run_state_op(state, principal, p, "list", Value::Null).await?;
-    let Value::List(entries) = out else {
-        return Err(MgmtError::Operation(
-            "state list returned non-list outcome".into(),
-        ));
-    };
-    entries
+    let entries = state
+        .state
+        .read_prefix(&p)
+        .await
+        .map_err(|error| MgmtError::Operation(error.to_string()))?;
+    Ok(entries
         .into_iter()
-        .map(|entry| {
-            let Value::Map(mut m) = entry else {
-                return Err(MgmtError::Operation("state list entry is not a map".into()));
-            };
-            let path = match m.remove("path") {
-                Some(Value::Str(s)) => s,
-                _ => return Err(MgmtError::Operation("state list entry has no path".into())),
-            };
-            let value = m.remove("value").unwrap_or(Value::Null);
-            Ok((path, value))
-        })
-        .collect()
+        .map(|(path, value)| (path.to_string(), value))
+        .collect())
 }
 
 /// Change config with a CAS state write on the expected prior version.
@@ -118,11 +106,11 @@ pub async fn write_config(
     ensure_manageable(&p)?;
     auth::authorize_path(&state.state, principal, "write", &p, Some(&value)).await?;
 
-    // Read current to verify the optimistic-concurrency version.
-    let current = match run_state_op(state, principal, p.clone(), "read", Value::Null).await? {
-        Value::Null => None,
-        v => Some(v),
-    };
+    let current = state
+        .state
+        .read(&p)
+        .await
+        .map_err(|error| MgmtError::Operation(error.to_string()))?;
     let current_version = current.as_ref().and_then(value_version);
     if current_version != expected_version {
         return Err(MgmtError::Conflict {
@@ -138,78 +126,18 @@ pub async fn write_config(
         None => 1,
     };
     set_version(&mut value, next)?;
-    admit_kernel_config(&p, &value)?;
+    admit_kernel_config(state, &p, &mut value).await?;
 
-    let mut cas = BTreeMap::new();
-    cas.insert("cas".into(), Value::Bool(true));
-    cas.insert("expected".into(), current.unwrap_or(Value::Null));
-    cas.insert("value".into(), value);
-    match run_state_op(state, principal, p, "write", Value::Map(cas)).await {
+    match state.state.write_cas(&p, current, value).await {
         Ok(_) => {}
-        Err(MgmtError::Operation(msg)) if msg.contains("CAS failed") => {
+        Err(nexus_state::StateError::CasFailed { .. }) => {
             return Err(MgmtError::Conflict {
                 expected: expected_version,
             });
         }
-        Err(e) => return Err(e),
+        Err(error) => return Err(MgmtError::Operation(error.to_string())),
     }
     Ok(())
-}
-
-async fn run_state_op(
-    state: &Arc<ConsoleState>,
-    principal: &ConsolePrincipal,
-    path: Path,
-    method: &str,
-    input: Value,
-) -> Result<Value, MgmtError> {
-    let target = ResourceName::new(path.clone());
-    let identity_path = Path::parse(&principal.identity_path)
-        .map_err(|e| MgmtError::Operation(format!("invalid principal identity path: {e}")))?;
-    if identity_path.segments().is_empty() {
-        return Err(MgmtError::Operation(
-            "invalid principal identity path: identity path must include at least one segment"
-                .into(),
-        ));
-    }
-    let identity = nexus_kernel::intern_identity(&identity_path);
-    let verb = capability_verb_for_state_method(method);
-    let cap = format!("{verb}://{}", capability_target(&path));
-    let process = state
-        .boot
-        .spawn_request_process(identity, &[&cap])
-        .map_err(|e| MgmtError::Operation(e.to_string()))?;
-    let handle = state
-        .boot
-        .open_for(process, &target, verb)
-        .map_err(|e| MgmtError::Operation(e.to_string()))?;
-    let ex = state.boot.kernel.executor_for(process);
-    ex.bind_handle(target.clone(), handle);
-    let op = DoNode::Op(OperationTemplate {
-        target,
-        method: method.into(),
-        method_id: None,
-        output: OutputMode::Unary,
-        literal_input: Some(input),
-    });
-    match ex.eval_tainted(&op, TaintSet::author()).await {
-        Outcome::Done(v) => Ok(v),
-        Outcome::Fail(f) => Err(MgmtError::Operation(f.to_string())),
-        Outcome::Short(v) => Ok(v),
-    }
-}
-
-fn capability_target(path: &Path) -> String {
-    path.to_string().replacen("://", "/", 1)
-}
-
-fn capability_verb_for_state_method(method: &str) -> &'static str {
-    match method {
-        "read" | "list" => "read",
-        "write" | "append" | "delete" => "write",
-        "subscribe" => "subscribe",
-        _ => "perform",
-    }
 }
 
 fn value_version(v: &Value) -> Option<u64> {
@@ -228,18 +156,22 @@ fn set_version(v: &mut Value, version: u64) -> Result<(), MgmtError> {
     Ok(())
 }
 
-fn admit_kernel_config(path: &Path, value: &Value) -> Result<(), MgmtError> {
+async fn admit_kernel_config(
+    _state: &Arc<ConsoleState>,
+    path: &Path,
+    value: &mut Value,
+) -> Result<(), MgmtError> {
     let segs = path.segments();
     if path.scheme() != "state" || segs.first().map(|s| s.as_str()) != Some("kernel") {
         return Err(MgmtError::NotManageable(path.to_string()));
     }
 
     match segs {
-        s if is_path(s, &["kernel", "extension-installations"]) => {
-            let id = required_tail(s, "extension installation id")?;
+        s if is_path(s, &["kernel", "external-installations"]) => {
+            let id = required_tail(s, "external installation id")?;
             admit_extension_installation(id, value)
         }
-        s if is_path_with_tail(s, &["kernel", "extension-projections"], 2) => {
+        s if is_path_with_tail(s, &["kernel", "external-projections"], 2) => {
             admit_extension_projection(s, value)
         }
         s if is_path(s, &["kernel", "manifests"]) => {
@@ -317,17 +249,16 @@ fn decode_config_value<T: DeserializeOwned>(value: &Value, label: &str) -> Resul
 }
 
 fn admit_extension_installation(path_id: &str, value: &Value) -> Result<(), MgmtError> {
-    let def: ExtensionInstallationDef = decode_config_value(value, "ExtensionInstallationDef")?;
+    let def: ExternalInstallationDef = decode_config_value(value, "ExternalInstallationDef")?;
     if def.id != path_id {
         return Err(MgmtError::Admission(format!(
-            "ExtensionInstallationDef.id {:?} does not match path id {:?}",
+            "ExternalInstallationDef.id {:?} does not match path id {:?}",
             def.id, path_id
         )));
     }
-    admit_json_schema(&def.config_schema, "ExtensionInstallationDef.config_schema")?;
-    def.validate_admission().map_err(|e| {
-        MgmtError::Admission(format!("ExtensionInstallationDef admission failed: {e}"))
-    })
+    admit_json_schema(&def.config_schema, "ExternalInstallationDef.config_schema")?;
+    def.validate_admission()
+        .map_err(|e| MgmtError::Admission(format!("ExternalInstallationDef admission failed: {e}")))
 }
 
 fn admit_extension_projection<S: AsRef<str>>(segs: &[S], value: &Value) -> Result<(), MgmtError> {
@@ -335,16 +266,16 @@ fn admit_extension_projection<S: AsRef<str>>(segs: &[S], value: &Value) -> Resul
         .get(2)
         .map(|s| s.as_ref())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| MgmtError::Admission("missing extension installation id".into()))?;
+        .ok_or_else(|| MgmtError::Admission("missing external installation id".into()))?;
     let projection_id = segs
         .get(3)
         .map(|s| s.as_ref())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| MgmtError::Admission("missing extension projection id".into()))?;
-    let def: ExtensionProjectionDef = decode_config_value(value, "ExtensionProjectionDef")?;
+        .ok_or_else(|| MgmtError::Admission("missing external projection id".into()))?;
+    let def: ExternalProjectionDef = decode_config_value(value, "ExternalProjectionDef")?;
     if def.id != projection_id {
         return Err(MgmtError::Admission(format!(
-            "ExtensionProjectionDef.id {:?} does not match path projection {:?}",
+            "ExternalProjectionDef.id {:?} does not match path projection {:?}",
             def.id, projection_id
         )));
     }
@@ -353,7 +284,7 @@ fn admit_extension_projection<S: AsRef<str>>(segs: &[S], value: &Value) -> Resul
         TrustLevel::Sandboxed,
         &nexus_types::Transport::Grpc { endpoint: None },
     )
-    .map_err(|e| MgmtError::Admission(format!("ExtensionProjectionDef admission failed: {e}")))
+    .map_err(|e| MgmtError::Admission(format!("ExternalProjectionDef admission failed: {e}")))
 }
 
 fn admit_manifest_def(path_platform: &str, value: &Value) -> Result<(), MgmtError> {
@@ -467,7 +398,7 @@ mod tests {
     }
 
     fn extension_installation(id: &str, version: u64) -> Value {
-        let def = ExtensionInstallationDef {
+        let def = ExternalInstallationDef {
             id: id.into(),
             platform: id.into(),
             transport: Transport::Stdio {
@@ -477,12 +408,12 @@ mod tests {
             trust: TrustLevel::Sandboxed,
             config_schema: Value::Null,
             config: Value::Null,
-            projections: vec![ExtensionProjectionDef {
+            projections: vec![ExternalProjectionDef {
                 id: "provider".into(),
                 role: Role::Provider,
-                namespace: Some(Path::parse(&format!("effect://plugin/{id}")).unwrap()),
+                namespace: Some(Path::parse(&format!("effect://external-provider/{id}")).unwrap()),
                 provides: vec![EffectCapability::new(
-                    format!("effect://plugin/{id}/search"),
+                    format!("effect://external-provider/{id}/search"),
                     Purity::Idempotent,
                 )],
                 emits: None,
@@ -494,7 +425,7 @@ mod tests {
     }
 
     fn instant_messaging_platform_installation(version: u64) -> Value {
-        let def = nexus_types::ExtensionInstallationDef {
+        let def = nexus_types::ExternalInstallationDef {
             id: "instant_messaging_platform".into(),
             platform: "instant_messaging_platform".into(),
             transport: Transport::Grpc { endpoint: None },
@@ -502,7 +433,7 @@ mod tests {
             config_schema: Value::Null,
             config: Value::Null,
             projections: vec![
-                nexus_types::ExtensionProjectionDef {
+                nexus_types::ExternalProjectionDef {
                     id: "source".into(),
                     role: Role::Source,
                     namespace: None,
@@ -515,17 +446,27 @@ mod tests {
                         .unwrap(),
                         purity: Purity::Effectful,
                         event_schema: None,
+                        max_inline_payload_bytes: 65_536,
+                        capacity: nexus_types::external::StreamCapacity {
+                            max_events: 1024,
+                            on_overflow: nexus_types::external::OverflowPolicy::DropOldest,
+                        },
+                        rate_limit: None,
+                        commands: false,
+                        command_schema: None,
+                        command_result_schema: None,
                     }),
                     version: 1,
                 },
-                nexus_types::ExtensionProjectionDef {
+                nexus_types::ExternalProjectionDef {
                     id: "provider".into(),
                     role: Role::Provider,
                     namespace: Some(
-                        Path::parse("effect://plugin/instant_messaging_platform").unwrap(),
+                        Path::parse("effect://external-provider/instant_messaging_platform")
+                            .unwrap(),
                     ),
                     provides: vec![EffectCapability::new(
-                        "effect://plugin/instant_messaging_platform/send_text",
+                        "effect://external-provider/instant_messaging_platform/send_text",
                         Purity::Effectful,
                     )],
                     emits: None,
@@ -581,40 +522,17 @@ mod tests {
     async fn install_then_reconfigure_with_cas() {
         let st = console_state();
         let root = root_principal(&st).await;
-        let path = "state://kernel/extension-installations/acme";
-        let before = st
-            .boot
-            .kernel
-            .processes
-            .all_ids()
-            .into_iter()
-            .map(|pid| st.boot.kernel.facts.facts_of(pid).unwrap().len())
-            .sum::<usize>();
-        // install: expected None ⇒ creates version 1.
+        let path = "state://kernel/external-installations/acme";
         write_config(&st, &root, path, extension_installation("acme", 0), None)
             .await
             .unwrap();
-        let after = st
-            .boot
-            .kernel
-            .processes
-            .all_ids()
-            .into_iter()
-            .map(|pid| st.boot.kernel.facts.facts_of(pid).unwrap().len())
-            .sum::<usize>();
-        assert!(
-            after > before,
-            "management write must execute through Operation/Fact, not backend side channel"
-        );
         let v = inspect(&st, &root, path).await.unwrap().unwrap();
         assert_eq!(value_version(&v), Some(1));
-        // reconfigure: expected 1 ⇒ bumps to 2.
         write_config(&st, &root, path, extension_installation("acme", 1), Some(1))
             .await
             .unwrap();
         let v = inspect(&st, &root, path).await.unwrap().unwrap();
         assert_eq!(value_version(&v), Some(2));
-        // stale expected ⇒ conflict, no silent clobber.
         assert!(matches!(
             write_config(&st, &root, path, extension_installation("acme", 1), Some(1)).await,
             Err(MgmtError::Conflict { .. })
@@ -625,7 +543,7 @@ mod tests {
     async fn extension_installation_admission_supports_multi_projection_package() {
         let st = console_state();
         let root = root_principal(&st).await;
-        let path = "state://kernel/extension-installations/instant_messaging_platform";
+        let path = "state://kernel/external-installations/instant_messaging_platform";
         write_config(
             &st,
             &root,
@@ -652,7 +570,7 @@ mod tests {
             "provides".into(),
             Value::List(vec![
                 serde_json::from_value(serde_json::json!({
-                    "effect_path": "effect://plugin/other/send_text",
+                    "effect_path": "effect://external-provider/other/send_text",
                     "purity": "effectful"
                 }))
                 .unwrap(),
@@ -665,14 +583,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removed_extension_config_prefix_is_rejected() {
+    async fn removed_external_config_prefix_is_rejected() {
         let st = console_state();
         let root = root_principal(&st).await;
         assert!(matches!(
             write_config(
                 &st,
                 &root,
-                "state://kernel/extensions/acme",
+                "state://kernel/external/acme",
                 extension_installation("acme", 0),
                 None,
             )

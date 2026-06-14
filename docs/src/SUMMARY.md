@@ -8,7 +8,7 @@
 - [Programs And Replay](programs-and-replay.md)
 - [State And Facts](state-and-facts.md)
 - [Gateways](gateways.md)
-  - [Program Gateways](program-gateways.md)
+  - [External Gateway](external-gateway.md)
   - [Console Protocol](console-protocol.md)
 - [Configuration](configuration.md)
 - [API Reference](api-reference.md)

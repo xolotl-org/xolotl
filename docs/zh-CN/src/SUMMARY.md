@@ -9,7 +9,7 @@
 - [程序与重放](programs-and-replay.md)
 - [状态与事实记录](state-and-facts.md)
 - [网关](gateways.md)
-  - [程序网关](program-gateways.md)
+  - [External Gateway](external-gateway.md)
   - [控制台协议](console-protocol.md)
 - [配置](configuration.md)
 - [API 参考](api-reference.md)

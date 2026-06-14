@@ -31,15 +31,14 @@
 | 策略快照 | `PolicySnapshot` | 策略源编译后的不可变表示。 |
 | 剩余策略 | residual policy | 打开时无法完全决定、需要执行时再检查的策略部分。 |
 | 准入 | admission | 请求或状态路径进入运行时前的允许/拒绝判断。 |
-| 控制平面 | control plane | 解析、校验、名称解析、策略编译和绑定解析所在的平面。 |
-| 数据平面 | data plane | 用已编译句柄执行操作的热路径。 |
-| 扩展平面 | extension plane | 把外部系统映射到运行时模型的平面。 |
-| 程序平面 | program plane | 表示并推进可恢复工作的平面。 |
-| 提供方 | Provider | 暴露效果处理器的扩展角色。 |
-| 来源 | Source | 把入站事件写入状态流的扩展角色。 |
+| 控制路径 | control path | 解析、校验、名称解析、策略编译和绑定解析所在的代码路径。 |
+| 数据路径 | data path | 用已编译句柄执行操作的热路径。 |
+| 外部适配 | external adapters | 把外部系统映射到运行时模型的协议适配代码。 |
+| 程序执行 | program execution | 表示并推进可恢复工作的执行路径。 |
+| 提供方 | Provider | 暴露效果处理器的外接角色。 |
+| 来源 | Source | 把入站事件写入状态流的外接角色。 |
 | 网关 | gateway | 把外部协议适配为 Nexus 进程执行的组件。 |
 | 控制台 | console | 管理运行时状态和会话的 Web 控制台后端及其协议。 |
-| 程序网关 | program gateway | 接收外部程序提交，并通过 `Gateway` trait（特征）运行 `DoNode` 的入口。 |
 | 控制台协议 | Console Protocol | 控制台客户端使用的 HTTP 认证和 MessagePack WebSocket 管理协议。 |
 | 状态 | state | 通过 `state://` 和状态驱动访问的可变数据。 |
 | 状态流 | state stream | 来源投影或订阅使用的状态事件序列。 |
