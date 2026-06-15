@@ -67,3 +67,19 @@ during recovery.
 | `nexus-sdk` | Embedded facade and public re-exports. |
 | `nexus-plan` | Plan document parsing and lowering. |
 | `nexus-sim` | Deterministic simulation and replay helpers. |
+
+## Actor Cargo Features
+
+`nexus-actors` contains the standard in-process Drivers and Providers. A binary
+can compile only the modules it needs.
+
+The default `standard` feature builds the standard in-process Drivers and
+Providers. `standard-core` builds the core standard Drivers and Providers plus
+external session code; it does not build `fetch`, `fs`, `terminal`, or `mcp`.
+`external-session` builds only the session handling and `SecureEnvelope` code
+used by gateway adapters for external Provider and Source endpoints.
+
+Enable `fetch`, `fs`, `terminal`, or `mcp` when the binary should register those
+in-process effects. Changing these features changes which implementations are
+compiled and registered. It does not change Resource, Interface, Binding, or
+Operation semantics.

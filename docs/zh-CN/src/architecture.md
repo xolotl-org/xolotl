@@ -54,3 +54,17 @@ Nexus 让执行热路径保持很小：
 | `nexus-sdk` | 嵌入式门面和公开重导出。 |
 | `nexus-plan` | 计划文档解析和转换。 |
 | `nexus-sim` | 确定性仿真和重放辅助工具。 |
+
+## Actor Cargo Feature 选择
+
+`nexus-actors` 包含标准进程内 Driver 和 Provider。某个二进制不需要全部实现时，可以
+用 Cargo feature 减少编译进来的模块。
+
+默认 `standard` 编译标准进程内 Driver 和 Provider。`standard-core` 编译核心标准
+Driver/Provider 与 external session 代码；不编译 `fetch`、`fs`、`terminal` 或
+`mcp`。`external-session` 只编译 gateway 适配器用于 external Provider 和 Source
+endpoint 的 session 处理代码与 `SecureEnvelope` 代码。
+
+需要注册对应进程内 effect 时，启用 `fetch`、`fs`、`terminal` 或 `mcp`。改变这些
+feature 只改变哪些实现会被编译和注册，不改变 Resource、Interface、Binding 或
+Operation 语义。

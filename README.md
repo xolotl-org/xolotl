@@ -112,6 +112,11 @@ Nexus separates the runtime into four code paths:
 | `nexus-sdk` | Convenience exports for embedding and tests. |
 | `nexus-plan`, `nexus-sim` | Planning and simulation crates. |
 
+`nexus-actors` uses Cargo features to choose which modules are built. The
+default `standard` feature builds the standard in-process Drivers and
+Providers. Gateway crates use only `external-session`, which contains session
+handling for external Provider and Source endpoints.
+
 ## Requirements
 
 - Rust 1.95 or newer.

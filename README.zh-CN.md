@@ -95,6 +95,10 @@ Process
 | `nexus-sdk` | 嵌入和测试用便捷导出。 |
 | `nexus-plan`, `nexus-sim` | 规划与仿真 crate。 |
 
+`nexus-actors` 使用 Cargo feature 选择要编译的模块。默认 `standard` 会编译标准进程内
+Driver 和 Provider。gateway 相关 crate 只启用 `external-session`，其中包含
+external Provider 和 Source endpoint 的 session 处理代码。
+
 ## 环境要求
 
 - Rust 1.95 或更新版本。
