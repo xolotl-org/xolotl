@@ -12,7 +12,7 @@ description.workspace = true
 workspace = true
 
 [dependencies]
-nexus-actors.workspace = true
+nexus-actors = { workspace = true, features = ["standard"] }
 nexus-gateway.workspace = true
 nexus-graph.workspace = true
 nexus-kernel.workspace = true

@@ -12,7 +12,7 @@ description = "gRPC protocol adapter for Nexus"
 workspace = true
 
 [dependencies]
-nexus-actors.workspace = true
+nexus-actors = { workspace = true, default-features = false, features = ["external-session"] }
 nexus-gateway.workspace = true
 nexus-proto.workspace = true
 nexus-types.workspace = true

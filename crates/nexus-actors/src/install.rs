@@ -5,6 +5,8 @@
 //! path, each exposing a single `invoke` method, so `perform://effect/foo/bar`
 //! grants exactly that effect path.
 
+#[cfg(feature = "mcp")]
+use crate::mcp::{MCP_STREAM_TOOL_METHODS, MCP_TOOL_METHODS, McpToolDriver};
 use crate::{
     approval::{APPROVAL_METHODS, ApprovalDriver},
     blob::{BLOB_METHODS, BlobDriver},
@@ -15,7 +17,6 @@ use crate::{
     inference::{EchoBackend, INFERENCE_METHODS, InferenceDriver},
     inspect::{INSPECT_METHODS, KernelInspectDriver},
     lock::{LOCK_METHODS, LockDriver},
-    mcp::{MCP_STREAM_TOOL_METHODS, MCP_TOOL_METHODS, McpToolDriver},
     memory::{MEMORY_METHODS, MemoryDriver},
     pairing::{PAIRING_METHODS, PairingDisplayEdge, PairingDriver},
     rank::{RANK_METHODS, RankerDriver},
@@ -36,6 +37,7 @@ pub struct StandardConfig {
     pub terminal_allowlist: Vec<String>,
     /// Enable the network fetch provider.
     pub enable_fetch: bool,
+    #[cfg(feature = "mcp")]
     /// MCP tools to mount as sandboxed Providers. Each entry registers
     /// one concrete `effect://external-provider/<server>/<tool>` Resource. Empty means no
     /// MCP tools. The offline baseline backs entries with deterministic echo
@@ -48,6 +50,7 @@ pub struct StandardConfig {
 }
 
 /// One MCP host-side tool mount.
+#[cfg(feature = "mcp")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpToolMount {
     /// MCP server namespace segment.
@@ -70,6 +73,7 @@ pub enum InstallError {
         /// Effect path being registered.
         path: String,
     },
+    #[cfg(feature = "mcp")]
     /// MCP server or tool segment is not safe for a resource path.
     #[error("invalid MCP {label} path segment: {segment:?}")]
     InvalidMcpPathSegment {
@@ -86,6 +90,7 @@ impl From<BootstrapError> for InstallError {
     }
 }
 
+#[cfg(feature = "mcp")]
 impl McpToolMount {
     /// Create a unary MCP tool mount.
     pub fn new(server: impl Into<String>, tool: impl Into<String>) -> Self {
@@ -278,6 +283,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
         Arc::new(crate::state::StateDriver::new(state.clone())),
     )?;
 
+    #[cfg(feature = "fs")]
     if let Some(root) = &config.fs_root {
         let fs: Arc<dyn Driver> = Arc::new(crate::fs::FsDriver::new(root.clone(), state.clone()));
         for path in [
@@ -290,6 +296,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
             register_single_effect(boot, path, crate::fs::FS_METHODS, fs.clone())?;
         }
     }
+    #[cfg(feature = "terminal")]
     if !config.terminal_allowlist.is_empty() {
         register_single_effect(
             boot,
@@ -300,6 +307,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
             )),
         )?;
     }
+    #[cfg(feature = "fetch")]
     if config.enable_fetch {
         register_single_effect(
             boot,
@@ -308,8 +316,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
             Arc::new(crate::fetch::FetchDriver::new(state.clone())),
         )?;
     }
-    // Mount each configured MCP tool as a sandboxed Provider at
-    // `effect://external-provider/<server>/<tool>`.
+    #[cfg(feature = "mcp")]
     for mount in &config.mcp_tools {
         register_mcp_tool(
             boot,
@@ -413,6 +420,7 @@ impl Driver for SingleMethodDriver {
 /// taint / audit / budget apply. `client` supplies the MCP transport:
 /// [`crate::mcp::EchoMcpClient`] for tests, or a stdio/SSE client for live
 /// integrations.
+#[cfg(feature = "mcp")]
 pub fn register_mcp_tool(
     boot: &Bootstrap,
     server: &str,
@@ -436,6 +444,7 @@ pub fn register_mcp_tool(
     )?)
 }
 
+#[cfg(feature = "mcp")]
 fn validate_mcp_path_segment(label: &'static str, segment: &str) -> Result<(), InstallError> {
     if segment.is_empty() || segment.contains('/') || segment.contains('@') {
         return Err(InstallError::InvalidMcpPathSegment {
@@ -651,6 +660,7 @@ mod tests {
         assert!(matches!(err, nexus_kernel::OpenError::ReservedPath(_)));
     }
 
+    #[cfg(feature = "mcp")]
     #[tokio::test]
     async fn mcp_tools_are_off_by_default() {
         // With no `mcp_tools`, no `effect://external-provider/*` resource is registered;
@@ -666,6 +676,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mcp")]
     #[tokio::test]
     async fn registered_mcp_tool_resolves_and_invokes_end_to_end() {
         // A configured MCP tool is reachable through the standard
@@ -718,6 +729,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "mcp")]
     #[test]
     fn mcp_tool_registration_rejects_bad_path_segments() {
         let boot = Bootstrap::in_memory();

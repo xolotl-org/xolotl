@@ -15,7 +15,7 @@ workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 getrandom.workspace = true
-nexus-actors.workspace = true
+nexus-actors = { workspace = true, default-features = false, features = ["external-session"] }
 nexus-graph.workspace = true
 nexus-kernel.workspace = true
 nexus-proto.workspace = true

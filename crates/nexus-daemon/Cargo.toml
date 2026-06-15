@@ -27,7 +27,7 @@ async-trait.workspace = true
 blake3.workspace = true
 dotenvy.workspace = true
 getrandom.workspace = true
-nexus-actors.workspace = true
+nexus-actors = { workspace = true, features = ["standard"] }
 nexus-console.workspace = true
 nexus-gateway.workspace = true
 nexus-gateway-grpc = { workspace = true, optional = true }

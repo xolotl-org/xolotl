@@ -61,7 +61,7 @@ unwrap_in_result = "deny"
 unwrap_used = "deny"
 
 [workspace.dependencies]
-nexus-actors = { version = "0.1.0", path = "crates/nexus-actors" }
+nexus-actors = { version = "0.1.0", path = "crates/nexus-actors", default-features = false }
 nexus-console = { version = "0.1.0", path = "crates/nexus-console" }
 nexus-gateway = { version = "0.1.0", path = "crates/nexus-gateway" }
 nexus-gateway-grpc = { version = "0.1.0", path = "crates/nexus-gateway-grpc" }

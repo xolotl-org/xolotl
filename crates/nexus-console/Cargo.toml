@@ -20,7 +20,7 @@ ed25519-dalek.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
-nexus-actors.workspace = true
+nexus-actors = { workspace = true, features = ["standard"] }
 nexus-graph.workspace = true
 nexus-kernel.workspace = true
 nexus-state.workspace = true
