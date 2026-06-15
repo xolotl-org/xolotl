@@ -3385,7 +3385,7 @@ impl GatewayRuntime {
         session: &GatewaySession,
         submission: GatewaySubmission,
     ) -> Result<GatewayInputStreamStart, GatewayError> {
-        let profile = self.runtime_snapshot();
+        let profile = self.profile_snapshot();
         validate_current_session(&profile, session)?;
         let now_ms = now_millis();
         let mut idempotency = match reserve_submission_idempotency_if_present(
@@ -3405,12 +3405,12 @@ impl GatewayRuntime {
             None => None,
         };
         if let Err(e) = validate_submit_options(&submission.options, &profile.limits, now_ms) {
-            release_submission_idempotency_reservation(
+            return release_submission_idempotency_reservation_and_fail(
                 &self.boot.kernel.state,
                 idempotency.as_deref(),
+                e,
             )
-            .await?;
-            return Err(e);
+            .await;
         }
 
         let GatewaySubmission {
@@ -3420,11 +3420,25 @@ impl GatewayRuntime {
             options,
         } = submission.clone();
         let GatewaySubmissionBody::InputStream(open) = body else {
-            return Err(GatewayError::Rejected(
-                "stream admission requires a stream_open body".into(),
-            ));
+            return release_submission_idempotency_reservation_and_fail(
+                &self.boot.kernel.state,
+                idempotency.as_deref(),
+                GatewayError::Rejected("stream admission requires a stream_open body".into()),
+            )
+            .await;
         };
-        let surface = validate_input_stream_open_request(&profile, session, &surface_id, &open)?;
+        let surface =
+            match validate_input_stream_open_request(&profile, session, &surface_id, &open) {
+                Ok(surface) => surface,
+                Err(e) => {
+                    return release_submission_idempotency_reservation_and_fail(
+                        &self.boot.kernel.state,
+                        idempotency.as_deref(),
+                        e,
+                    )
+                    .await;
+                }
+            };
         let mut surface_ids = BTreeSet::new();
         surface_ids.insert(surface.surface_id.clone());
         let program = stream_open_admission_program(surface, requested_output);
@@ -3438,12 +3452,12 @@ impl GatewayRuntime {
         ) {
             Ok(admission) => admission,
             Err(e) => {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_deref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         };
         if admission.requires_idempotency && idempotency.is_none() {
@@ -3483,12 +3497,12 @@ impl GatewayRuntime {
         ) {
             Ok(charge) => charge,
             Err(e) => {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_deref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         };
         let budget_guard = match self
@@ -3497,12 +3511,12 @@ impl GatewayRuntime {
         {
             Ok(guard) => guard,
             Err(e) => {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_deref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         };
         let admission_guard = match self.requests.try_admit(
@@ -3513,12 +3527,12 @@ impl GatewayRuntime {
         ) {
             Ok(guard) => guard,
             Err(e) => {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_deref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         };
         let accepted = match self.requests.new_acceptance(
@@ -3527,23 +3541,23 @@ impl GatewayRuntime {
         ) {
             Ok(accepted) => accepted,
             Err(e) => {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_deref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         };
         let (request_process, executor) = match self.executor_for(&profile, session, &surface_ids) {
             Ok(ex) => ex,
             Err(e) => {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_deref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         };
         let entry = GatewayRequestEntry {
@@ -3566,12 +3580,12 @@ impl GatewayRuntime {
         {
             Ok(guard) => guard,
             Err(e) => {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_deref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         };
         Ok(GatewayInputStreamStart::Accepted(
@@ -3632,12 +3646,12 @@ impl GatewayRuntime {
         {
             Ok(lowered) => lowered,
             Err(e) => {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_deref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         };
         let admission = match inspect_program(
@@ -3650,12 +3664,12 @@ impl GatewayRuntime {
         ) {
             Ok(admission) => admission,
             Err(e) => {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_deref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         };
         if lowered.validate_program_payloads {
@@ -3670,12 +3684,12 @@ impl GatewayRuntime {
             )
             .await
             {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_deref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         }
         if admission.requires_idempotency && idempotency.is_none() {
@@ -3797,10 +3811,6 @@ impl GatewayRuntime {
     }
 
     fn profile_snapshot(&self) -> Arc<CompiledGatewayProfile> {
-        self.state.read().profile.clone()
-    }
-
-    fn runtime_snapshot(&self) -> Arc<CompiledGatewayProfile> {
         self.state.read().profile.clone()
     }
 
@@ -3990,13 +4000,8 @@ impl Gateway for GatewayRuntime {
         submission: GatewaySubmission,
         accepted_sender: Option<tokio::sync::oneshot::Sender<GatewayAccepted>>,
     ) -> Result<GatewaySubmitResult, GatewayError> {
-        let profile = self.runtime_snapshot();
-        if session.profile_name != profile.profile_name || session.profile_rev != profile.revision {
-            return Err(GatewayError::Rejected(
-                "gateway session was issued by a different profile snapshot".into(),
-            ));
-        }
-        profile.session_identity_path(session)?;
+        let profile = self.profile_snapshot();
+        validate_current_session(&profile, session)?;
         let now_ms = now_millis();
         let mut idempotency = match reserve_submission_idempotency_if_present(
             &self.boot.kernel.state,
@@ -4013,12 +4018,12 @@ impl Gateway for GatewayRuntime {
             None => None,
         };
         if let Err(e) = validate_submit_options(&submission.options, &profile.limits, now_ms) {
-            release_submission_idempotency_reservation(
+            return release_submission_idempotency_reservation_and_fail(
                 &self.boot.kernel.state,
                 idempotency.as_ref(),
+                e,
             )
-            .await?;
-            return Err(e);
+            .await;
         }
         let lowered = match lower_submission(
             submission.clone(),
@@ -4030,12 +4035,12 @@ impl Gateway for GatewayRuntime {
         {
             Ok(lowered) => lowered,
             Err(e) => {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_ref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         };
         let admission = match inspect_program(
@@ -4048,12 +4053,12 @@ impl Gateway for GatewayRuntime {
         ) {
             Ok(admission) => admission,
             Err(e) => {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_ref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         };
         if lowered.validate_program_payloads {
@@ -4068,12 +4073,12 @@ impl Gateway for GatewayRuntime {
             )
             .await
             {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_ref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         }
         if admission.requires_idempotency && idempotency.is_none() {
@@ -4107,12 +4112,12 @@ impl Gateway for GatewayRuntime {
         ) {
             Ok(guard) => guard,
             Err(e) => {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_ref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         };
         let admission_guard = match self.requests.try_admit(
@@ -4123,12 +4128,12 @@ impl Gateway for GatewayRuntime {
         ) {
             Ok(guard) => guard,
             Err(e) => {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_ref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         };
         let accepted = match self.requests.new_acceptance(
@@ -4137,23 +4142,23 @@ impl Gateway for GatewayRuntime {
         ) {
             Ok(accepted) => accepted,
             Err(e) => {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_ref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         };
         let (request_process, ex) = match self.executor_for(&profile, session, &surface_ids) {
             Ok(ex) => ex,
             Err(e) => {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_ref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         };
         let entry = GatewayRequestEntry {
@@ -4176,12 +4181,12 @@ impl Gateway for GatewayRuntime {
         {
             Ok(guard) => guard,
             Err(e) => {
-                release_submission_idempotency_reservation(
+                return release_submission_idempotency_reservation_and_fail(
                     &self.boot.kernel.state,
                     idempotency.as_ref(),
+                    e,
                 )
-                .await?;
-                return Err(e);
+                .await;
             }
         };
         if let Some(sender) = accepted_sender {
@@ -4256,7 +4261,7 @@ impl Gateway for GatewayRuntime {
         session: &GatewaySession,
         request: IssueObjectUploadTicketRequest,
     ) -> Result<GatewayObjectUploadTicket, GatewayError> {
-        let profile = self.runtime_snapshot();
+        let profile = self.profile_snapshot();
         validate_current_session(&profile, session)?;
         let surface = profile
             .surface_by_id(&request.surface_id)
@@ -4307,7 +4312,7 @@ impl Gateway for GatewayRuntime {
         session: &GatewaySession,
         request: CommitObjectUploadRequest,
     ) -> Result<CommitObjectUploadResponse, GatewayError> {
-        let profile = self.runtime_snapshot();
+        let profile = self.profile_snapshot();
         validate_current_session(&profile, session)?;
         commit_object_upload_with_profile(
             &self.boot.kernel.state,
@@ -5110,6 +5115,15 @@ async fn release_submission_idempotency_reservation(
         .write_delete(&reservation.path)
         .await
         .map_err(|e| GatewayError::Rejected(format!("idempotency release failed: {e}")))
+}
+
+async fn release_submission_idempotency_reservation_and_fail<T>(
+    state: &nexus_state::Backend,
+    reservation: Option<&GatewayIdempotencyReservation>,
+    error: GatewayError,
+) -> Result<T, GatewayError> {
+    release_submission_idempotency_reservation(state, reservation).await?;
+    Err(error)
 }
 
 fn initial_idempotency_material(

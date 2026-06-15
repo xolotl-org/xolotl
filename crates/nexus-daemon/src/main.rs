@@ -23,69 +23,78 @@ mod config;
 
 use anyhow::Result;
 use config::NexusConfig;
+#[cfg(feature = "external-gateway")]
 use nexus_actors::endpoint::{
     EndpointSession, SourceIngest, SourceIngestError, ingest_source_event,
 };
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 use nexus_actors::endpoint::{
     ProviderInvocationError, ProviderInvocationRegistry, ProviderInvocationResolve,
     SourceCommandError, SourceCommandRegister, SourceCommandRegistry, SourceCommandResolve,
     validate_json_schema,
 };
-#[cfg(all(feature = "grpc", test))]
+#[cfg(all(feature = "external-grpc", test))]
 use nexus_actors::pairing::EnvelopeAad;
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 use nexus_actors::pairing::{
     ExternalCredential, SecureEnvelope, SecureEnvelopeEpochGate, SecureEnvelopeReplayWindow,
 };
 use nexus_actors::{PairingDisplayEdge, StandardConfig, install_standard};
 use nexus_console::{BootstrapOutcome, ConsoleState, RootProvisioning};
+#[cfg(feature = "external-gateway")]
 use nexus_gateway::GatewayTransportSecurityConfig;
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-websocket")]
 use nexus_gateway_websocket::{
     ExternalWebSocketConfig, ExternalWebSocketOutbound, ExternalWebSocketService,
 };
+#[cfg(feature = "external-gateway")]
 use nexus_kernel::PolicySnapshot;
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 use nexus_kernel::driver::{DriverDescriptor, DriverError, RemoteEndpoint, RemoteInvokeDispatch};
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 use nexus_kernel::{EchoDriver, Registry};
-use nexus_sdk::{Backend, Bootstrap, FactSink, Kernel, Path, Value};
+use nexus_sdk::{Backend, Bootstrap, FactSink, Kernel};
+#[cfg(feature = "external-gateway")]
+use nexus_sdk::{Path, Value};
 use nexus_storage_redb::RedbStore;
+#[cfg(feature = "external-gateway")]
 use nexus_types::external::{
     AckStatus, EventAck, ExternalInstallationDef, ExternalProjectionDef, InboundEvent,
     ObservedGenerations, Role, RoleSessionClientHello, SessionContext,
 };
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 use nexus_types::external::{
     CommandResult, ConfigAxis, ControlFrame, EffectCapability, Invoke, InvokeResult,
     OutboundCommand, ProviderReady,
 };
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 use nexus_types::{
     Binding, CostModel, DriverRef, Interface, InterfaceFamily, InterfaceSet, Metadata, Method,
     MethodId, ModalitySet, OutputModeSet, Resource, ResourceDescriptor, ResourceKind, ResourceName,
     ResourceSelector, SchemaId, Transport,
 };
+#[cfg(feature = "external-gateway")]
 use nexus_types::{IdentityRef, ResourceId};
+#[cfg(feature = "external-gateway")]
 use std::collections::BTreeMap;
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 use std::collections::HashMap;
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 use std::collections::btree_map::Entry;
 use std::io::IsTerminal;
 use std::sync::Arc;
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 use std::time::Duration;
+#[cfg(feature = "external-gateway")]
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 use tokio::sync::oneshot;
 
 const CONSOLE_ADDR_ENV: &str = "NEXUS_CONSOLE_ADDR";
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-websocket")]
 const EXTERNAL_WEBSOCKET_ADDR_ENV: &str = "NEXUS_EXTERNAL_WEBSOCKET_ADDR";
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-grpc")]
 const EXTERNAL_GRPC_ADDR_ENV: &str = "NEXUS_EXTERNAL_GRPC_ADDR";
 
 const USAGE: &str = "\
@@ -256,9 +265,9 @@ async fn serve() -> Result<()> {
         tracing::info!("{CONSOLE_ADDR_ENV} unset; console disabled");
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-websocket")]
     start_external_websocket(&cfg, &boot, &mut handles).await?;
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     start_external_grpc(&cfg, &boot, &mut handles).await?;
 
     // Mark the daemon ready.
@@ -271,6 +280,7 @@ async fn serve() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "external-gateway")]
 fn external_registry_hash_value(
     installation: &ExternalInstallationDef,
     projection: &ExternalProjectionDef,
@@ -279,7 +289,7 @@ fn external_registry_hash_value(
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-websocket")]
 async fn start_external_websocket(
     cfg: &NexusConfig,
     boot: &Arc<Bootstrap>,
@@ -318,7 +328,7 @@ async fn start_external_websocket(
     Ok(())
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-grpc")]
 async fn start_external_grpc(
     cfg: &NexusConfig,
     boot: &Arc<Bootstrap>,
@@ -364,7 +374,7 @@ async fn start_external_grpc(
     Ok(())
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-grpc")]
 fn grpc_server_builder(
     security: &config::GatewayListenerSecurity,
 ) -> Result<tonic::transport::Server> {
@@ -377,7 +387,7 @@ fn grpc_server_builder(
     Ok(server)
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-grpc")]
 fn tonic_server_tls_config(
     tls: &config::GatewayListenerTlsMaterial,
 ) -> Result<tonic::transport::ServerTlsConfig> {
@@ -394,7 +404,7 @@ fn tonic_server_tls_config(
     Ok(config)
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 pub struct DaemonExternalSessionHandler {
     state: Backend,
     registry: Registry,
@@ -410,7 +420,7 @@ pub struct DaemonExternalSessionHandler {
         Arc<std::sync::Mutex<BTreeMap<SecureReplayKey, SecureEnvelopeReplayWindow>>>,
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 #[derive(Clone)]
 struct ExternalAuthority {
     context: SessionContext,
@@ -419,13 +429,13 @@ struct ExternalAuthority {
     key_epoch: u64,
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 struct ExternalSessionState {
     credential_generation: u64,
     key_epoch: u64,
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ProviderSessionKey {
     installation_id: String,
@@ -433,7 +443,7 @@ struct ProviderSessionKey {
     session_id: String,
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 #[derive(Clone)]
 struct ProviderSessionRecord {
     endpoint_id: nexus_types::EndpointId,
@@ -442,7 +452,7 @@ struct ProviderSessionRecord {
     ready_endpoints: HashMap<ProviderEndpointKey, Path>,
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ProviderEndpointKey {
     resource_id: ResourceId,
@@ -450,7 +460,7 @@ struct ProviderEndpointKey {
     binding_generation: u64,
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 impl ProviderEndpointKey {
     fn from_dispatch(dispatch: RemoteInvokeDispatch) -> Self {
         Self {
@@ -461,7 +471,7 @@ impl ProviderEndpointKey {
     }
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct SourceSessionKey {
     installation_id: String,
@@ -469,13 +479,13 @@ struct SourceSessionKey {
     session_id: String,
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 struct SourceSessionRecord {
     context: SessionContext,
     outbound: ExternalSessionOutbound,
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct SecureReplayKey {
     installation_id: String,
@@ -485,7 +495,7 @@ struct SecureReplayKey {
     key_epoch: u64,
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 struct ProviderRoleEndpoint {
     state: Backend,
     context: SessionContext,
@@ -497,38 +507,46 @@ struct ProviderRoleEndpoint {
     session_limits: config::ExternalGatewaySessionLimits,
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 #[derive(Clone)]
 enum ExternalSessionOutbound {
+    #[cfg(feature = "external-grpc")]
     Grpc(nexus_gateway_grpc::ExternalOutbound),
+    #[cfg(feature = "external-websocket")]
     WebSocket(ExternalWebSocketOutbound),
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 impl ExternalSessionOutbound {
     async fn send_invoke(&self, invoke: Invoke) -> Result<(), tonic::Status> {
         match self {
+            #[cfg(feature = "external-grpc")]
             Self::Grpc(outbound) => outbound.send_invoke(invoke).await,
+            #[cfg(feature = "external-websocket")]
             Self::WebSocket(outbound) => outbound.send_invoke(invoke).await,
         }
     }
 
     async fn send_outbound_command(&self, command: OutboundCommand) -> Result<(), tonic::Status> {
         match self {
+            #[cfg(feature = "external-grpc")]
             Self::Grpc(outbound) => outbound.send_outbound_command(command).await,
+            #[cfg(feature = "external-websocket")]
             Self::WebSocket(outbound) => outbound.send_outbound_command(command).await,
         }
     }
 
     async fn send_control(&self, frame: ControlFrame) -> Result<(), tonic::Status> {
         match self {
+            #[cfg(feature = "external-grpc")]
             Self::Grpc(outbound) => outbound.send_control(frame).await,
+            #[cfg(feature = "external-websocket")]
             Self::WebSocket(outbound) => outbound.send_control(frame).await,
         }
     }
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 #[async_trait::async_trait]
 impl RemoteEndpoint for ProviderRoleEndpoint {
     async fn invoke(
@@ -636,7 +654,7 @@ impl RemoteEndpoint for ProviderRoleEndpoint {
     }
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 impl ProviderRoleEndpoint {
     fn admit_invoke<'a>(
         &self,
@@ -694,7 +712,7 @@ impl ProviderRoleEndpoint {
     }
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn remove_provider_invocation_pending(
     provider_invocations: &Arc<std::sync::Mutex<ProviderInvocationRegistry>>,
     provider_waiters: &Arc<std::sync::Mutex<BTreeMap<String, oneshot::Sender<InvokeResult>>>>,
@@ -714,7 +732,7 @@ fn remove_provider_invocation_pending(
         .ok();
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 async fn await_provider_result(
     rx: oneshot::Receiver<InvokeResult>,
     deadline_ms: Option<i64>,
@@ -735,14 +753,14 @@ async fn await_provider_result(
     }
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderAwaitError {
     DeadlineExceeded,
     ProviderUnavailable,
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 impl ProviderAwaitError {
     fn into_driver_error(self) -> DriverError {
         match self {
@@ -756,7 +774,7 @@ impl ProviderAwaitError {
     }
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn remove_source_command_pending(
     source_commands: &Arc<std::sync::Mutex<SourceCommandRegistry>>,
     source_waiters: &Arc<std::sync::Mutex<BTreeMap<String, oneshot::Sender<CommandResult>>>>,
@@ -771,7 +789,7 @@ fn remove_source_command_pending(
     remove_source_command_waiter(source_waiters, command_id);
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn remove_source_command_waiter(
     source_waiters: &Arc<std::sync::Mutex<BTreeMap<String, oneshot::Sender<CommandResult>>>>,
     command_id: &str,
@@ -784,7 +802,7 @@ fn remove_source_command_waiter(
         .ok();
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn remove_source_command_waiters(
     source_waiters: &Arc<std::sync::Mutex<BTreeMap<String, oneshot::Sender<CommandResult>>>>,
     command_ids: Vec<String>,
@@ -802,7 +820,7 @@ fn remove_source_command_waiters(
         .ok();
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn schedule_source_command_deadline(
     source_commands: Arc<std::sync::Mutex<SourceCommandRegistry>>,
     source_waiters: Arc<std::sync::Mutex<BTreeMap<String, oneshot::Sender<CommandResult>>>>,
@@ -821,9 +839,9 @@ fn schedule_source_command_deadline(
     });
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 impl DaemonExternalSessionHandler {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "external-grpc"))]
     fn new(state: Backend, registry: Registry, source_dedupe_window_ms: u64) -> Self {
         Self::with_limits(
             state,
@@ -858,7 +876,7 @@ impl DaemonExternalSessionHandler {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "external-grpc"))]
     fn install_external_credential(&self, credential: ExternalCredential) {
         self.external_credentials.lock().unwrap().insert(
             (credential.installation_id.clone(), credential.generation),
@@ -866,7 +884,7 @@ impl DaemonExternalSessionHandler {
         );
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "external-grpc"))]
     async fn register_provider_invoke(
         &self,
         invoke: &Invoke,
@@ -1056,10 +1074,9 @@ impl DaemonExternalSessionHandler {
     }
 }
 
-#[cfg(feature = "grpc")]
-#[tonic::async_trait]
-impl nexus_gateway_grpc::ExternalSessionHandler for DaemonExternalSessionHandler {
-    async fn adjudicate_session(
+#[cfg(feature = "external-gateway")]
+impl DaemonExternalSessionHandler {
+    async fn adjudicate_external_session(
         &self,
         hello: &RoleSessionClientHello,
     ) -> Result<SessionContext, tonic::Status> {
@@ -1071,17 +1088,7 @@ impl nexus_gateway_grpc::ExternalSessionHandler for DaemonExternalSessionHandler
         Ok(authority)
     }
 
-    async fn on_ready(
-        &self,
-        session: &EndpointSession,
-        context: SessionContext,
-        outbound: nexus_gateway_grpc::ExternalOutbound,
-    ) -> Result<(), tonic::Status> {
-        self.register_ready_session(session, context, ExternalSessionOutbound::Grpc(outbound))
-            .await
-    }
-
-    async fn on_closed(
+    async fn close_external_session(
         &self,
         _session: &EndpointSession,
         context: SessionContext,
@@ -1150,7 +1157,7 @@ impl nexus_gateway_grpc::ExternalSessionHandler for DaemonExternalSessionHandler
         Ok(())
     }
 
-    async fn on_inbound_event(
+    async fn handle_inbound_event(
         &self,
         event: InboundEvent,
         session: &EndpointSession,
@@ -1193,7 +1200,7 @@ impl nexus_gateway_grpc::ExternalSessionHandler for DaemonExternalSessionHandler
         }
     }
 
-    async fn on_command_result(
+    async fn handle_command_result(
         &self,
         result: CommandResult,
         session: &EndpointSession,
@@ -1243,7 +1250,7 @@ impl nexus_gateway_grpc::ExternalSessionHandler for DaemonExternalSessionHandler
             .map_err(|_| tonic::Status::unavailable("source command receiver closed"))
     }
 
-    async fn on_invoke_result(
+    async fn handle_invoke_result(
         &self,
         result: InvokeResult,
         session: &EndpointSession,
@@ -1298,7 +1305,7 @@ impl nexus_gateway_grpc::ExternalSessionHandler for DaemonExternalSessionHandler
             .map_err(|_| tonic::Status::unavailable("provider invocation receiver closed"))
     }
 
-    async fn on_provider_ready(
+    async fn handle_provider_ready(
         &self,
         ready: ProviderReady,
         _session: &EndpointSession,
@@ -1341,7 +1348,7 @@ impl nexus_gateway_grpc::ExternalSessionHandler for DaemonExternalSessionHandler
         Ok(())
     }
 
-    async fn on_control(
+    async fn handle_control(
         &self,
         frame: ControlFrame,
         _session: &EndpointSession,
@@ -1362,7 +1369,7 @@ impl nexus_gateway_grpc::ExternalSessionHandler for DaemonExternalSessionHandler
         validate_external_control_frame(&frame, &context)
     }
 
-    async fn open_secure_envelope(
+    async fn open_external_secure_envelope(
         &self,
         envelope: &SecureEnvelope,
         _session: &EndpointSession,
@@ -1412,14 +1419,98 @@ impl nexus_gateway_grpc::ExternalSessionHandler for DaemonExternalSessionHandler
     }
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-grpc")]
+#[tonic::async_trait]
+impl nexus_gateway_grpc::ExternalSessionHandler for DaemonExternalSessionHandler {
+    async fn adjudicate_session(
+        &self,
+        hello: &RoleSessionClientHello,
+    ) -> Result<SessionContext, tonic::Status> {
+        self.adjudicate_external_session(hello).await
+    }
+
+    async fn on_ready(
+        &self,
+        session: &EndpointSession,
+        context: SessionContext,
+        outbound: nexus_gateway_grpc::ExternalOutbound,
+    ) -> Result<(), tonic::Status> {
+        self.register_ready_session(session, context, ExternalSessionOutbound::Grpc(outbound))
+            .await
+    }
+
+    async fn on_closed(
+        &self,
+        session: &EndpointSession,
+        context: SessionContext,
+    ) -> Result<(), tonic::Status> {
+        self.close_external_session(session, context).await
+    }
+
+    async fn on_inbound_event(
+        &self,
+        event: InboundEvent,
+        session: &EndpointSession,
+        context: SessionContext,
+    ) -> Result<EventAck, tonic::Status> {
+        self.handle_inbound_event(event, session, context).await
+    }
+
+    async fn on_command_result(
+        &self,
+        result: CommandResult,
+        session: &EndpointSession,
+        context: SessionContext,
+    ) -> Result<(), tonic::Status> {
+        self.handle_command_result(result, session, context).await
+    }
+
+    async fn on_invoke_result(
+        &self,
+        result: InvokeResult,
+        session: &EndpointSession,
+        context: SessionContext,
+    ) -> Result<(), tonic::Status> {
+        self.handle_invoke_result(result, session, context).await
+    }
+
+    async fn on_provider_ready(
+        &self,
+        ready: ProviderReady,
+        session: &EndpointSession,
+        context: SessionContext,
+    ) -> Result<(), tonic::Status> {
+        self.handle_provider_ready(ready, session, context).await
+    }
+
+    async fn on_control(
+        &self,
+        frame: ControlFrame,
+        session: &EndpointSession,
+        context: SessionContext,
+    ) -> Result<(), tonic::Status> {
+        self.handle_control(frame, session, context).await
+    }
+
+    async fn open_secure_envelope(
+        &self,
+        envelope: &SecureEnvelope,
+        session: &EndpointSession,
+        context: SessionContext,
+    ) -> Result<Vec<u8>, tonic::Status> {
+        self.open_external_secure_envelope(envelope, session, context)
+            .await
+    }
+}
+
+#[cfg(feature = "external-websocket")]
 #[tonic::async_trait]
 impl nexus_gateway_websocket::ExternalWebSocketSessionHandler for DaemonExternalSessionHandler {
     async fn adjudicate_session(
         &self,
         hello: &RoleSessionClientHello,
     ) -> Result<SessionContext, tonic::Status> {
-        nexus_gateway_grpc::ExternalSessionHandler::adjudicate_session(self, hello).await
+        self.adjudicate_external_session(hello).await
     }
 
     async fn on_ready(
@@ -1441,7 +1532,7 @@ impl nexus_gateway_websocket::ExternalWebSocketSessionHandler for DaemonExternal
         session: &EndpointSession,
         context: SessionContext,
     ) -> Result<(), tonic::Status> {
-        nexus_gateway_grpc::ExternalSessionHandler::on_closed(self, session, context).await
+        self.close_external_session(session, context).await
     }
 
     async fn on_inbound_event(
@@ -1450,8 +1541,7 @@ impl nexus_gateway_websocket::ExternalWebSocketSessionHandler for DaemonExternal
         session: &EndpointSession,
         context: SessionContext,
     ) -> Result<EventAck, tonic::Status> {
-        nexus_gateway_grpc::ExternalSessionHandler::on_inbound_event(self, event, session, context)
-            .await
+        self.handle_inbound_event(event, session, context).await
     }
 
     async fn on_command_result(
@@ -1460,10 +1550,7 @@ impl nexus_gateway_websocket::ExternalWebSocketSessionHandler for DaemonExternal
         session: &EndpointSession,
         context: SessionContext,
     ) -> Result<(), tonic::Status> {
-        nexus_gateway_grpc::ExternalSessionHandler::on_command_result(
-            self, result, session, context,
-        )
-        .await
+        self.handle_command_result(result, session, context).await
     }
 
     async fn on_invoke_result(
@@ -1472,8 +1559,7 @@ impl nexus_gateway_websocket::ExternalWebSocketSessionHandler for DaemonExternal
         session: &EndpointSession,
         context: SessionContext,
     ) -> Result<(), tonic::Status> {
-        nexus_gateway_grpc::ExternalSessionHandler::on_invoke_result(self, result, session, context)
-            .await
+        self.handle_invoke_result(result, session, context).await
     }
 
     async fn on_provider_ready(
@@ -1482,8 +1568,7 @@ impl nexus_gateway_websocket::ExternalWebSocketSessionHandler for DaemonExternal
         session: &EndpointSession,
         context: SessionContext,
     ) -> Result<(), tonic::Status> {
-        nexus_gateway_grpc::ExternalSessionHandler::on_provider_ready(self, ready, session, context)
-            .await
+        self.handle_provider_ready(ready, session, context).await
     }
 
     async fn on_control(
@@ -1492,7 +1577,7 @@ impl nexus_gateway_websocket::ExternalWebSocketSessionHandler for DaemonExternal
         session: &EndpointSession,
         context: SessionContext,
     ) -> Result<(), tonic::Status> {
-        nexus_gateway_grpc::ExternalSessionHandler::on_control(self, frame, session, context).await
+        self.handle_control(frame, session, context).await
     }
 
     async fn open_secure_envelope(
@@ -1501,14 +1586,12 @@ impl nexus_gateway_websocket::ExternalWebSocketSessionHandler for DaemonExternal
         session: &EndpointSession,
         context: SessionContext,
     ) -> Result<Vec<u8>, tonic::Status> {
-        nexus_gateway_grpc::ExternalSessionHandler::open_secure_envelope(
-            self, envelope, session, context,
-        )
-        .await
+        self.open_external_secure_envelope(envelope, session, context)
+            .await
     }
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 impl DaemonExternalSessionHandler {
     async fn register_ready_session(
         &self,
@@ -1579,7 +1662,7 @@ impl DaemonExternalSessionHandler {
     }
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 async fn load_external_authority(
     state: &Backend,
     installation_id: &str,
@@ -1619,7 +1702,7 @@ async fn load_external_authority(
     })
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn provider_capability_index(
     projection: &ExternalProjectionDef,
 ) -> Result<BTreeMap<Path, EffectCapability>, tonic::Status> {
@@ -1639,7 +1722,7 @@ fn provider_capability_index(
     Ok(capabilities)
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 async fn load_external_installation(
     state: &Backend,
     installation_id: &str,
@@ -1671,7 +1754,7 @@ async fn load_external_installation(
     Ok(installation)
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 async fn load_external_session(
     state: &Backend,
     installation_id: &str,
@@ -1716,7 +1799,7 @@ async fn load_external_session(
     })
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 async fn ensure_external_not_revoked(
     state: &Backend,
     installation_id: &str,
@@ -1770,7 +1853,7 @@ async fn ensure_external_not_revoked(
     Ok(())
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn external_registry_hash(
     installation: &ExternalInstallationDef,
     projection: &ExternalProjectionDef,
@@ -1779,7 +1862,7 @@ fn external_registry_hash(
         .map_err(|_| tonic::Status::failed_precondition("external registry is invalid"))
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn credential_generation_from_record(
     record: &std::collections::BTreeMap<String, Value>,
 ) -> Result<u64, tonic::Status> {
@@ -1797,7 +1880,7 @@ fn credential_generation_from_record(
     Ok(generation as u64)
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn key_epoch_from_record(
     record: &std::collections::BTreeMap<String, Value>,
 ) -> Result<u64, tonic::Status> {
@@ -1817,7 +1900,7 @@ fn key_epoch_from_record(
     Ok(epoch as u64)
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn role_slug(role: Role) -> &'static str {
     match role {
         Role::Provider => "provider",
@@ -1825,6 +1908,7 @@ fn role_slug(role: Role) -> &'static str {
     }
 }
 
+#[cfg(feature = "external-gateway")]
 fn is_valid_external_path_segment(segment: &str) -> bool {
     let mut chars = segment.chars();
     match chars.next() {
@@ -1834,7 +1918,7 @@ fn is_valid_external_path_segment(segment: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn validate_external_path_segment(segment: &str, label: &'static str) -> Result<(), tonic::Status> {
     if is_valid_external_path_segment(segment) {
         Ok(())
@@ -1845,7 +1929,7 @@ fn validate_external_path_segment(segment: &str, label: &'static str) -> Result<
     }
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn provider_session_key(context: &SessionContext) -> ProviderSessionKey {
     ProviderSessionKey {
         installation_id: context.installation_id.clone(),
@@ -1854,7 +1938,7 @@ fn provider_session_key(context: &SessionContext) -> ProviderSessionKey {
     }
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn source_session_key(context: &SessionContext) -> SourceSessionKey {
     SourceSessionKey {
         installation_id: context.installation_id.clone(),
@@ -1863,7 +1947,7 @@ fn source_session_key(context: &SessionContext) -> SourceSessionKey {
     }
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn remove_secure_replay_windows_for_context(
     replay_windows: &std::sync::Mutex<BTreeMap<SecureReplayKey, SecureEnvelopeReplayWindow>>,
     context: &SessionContext,
@@ -1881,7 +1965,7 @@ fn remove_secure_replay_windows_for_context(
     Ok(())
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn context_matches_authority(authority: &SessionContext, context: &SessionContext) -> bool {
     !context.session_id.trim().is_empty()
         && authority.installation_id == context.installation_id
@@ -1896,7 +1980,7 @@ fn context_matches_authority(authority: &SessionContext, context: &SessionContex
         && authority.alias_catalog_generation == context.alias_catalog_generation
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn new_external_session_id() -> Result<String, tonic::Status> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes)
@@ -1904,7 +1988,7 @@ fn new_external_session_id() -> Result<String, tonic::Status> {
     Ok(format!("s_{}", hex_lower(&bytes)))
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -1915,7 +1999,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn register_provider_bindings(
     registry: &Registry,
     ready: &ProviderReady,
@@ -1940,7 +2024,7 @@ fn register_provider_bindings(
     Ok(ready_endpoints)
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn register_provider_binding(
     registry: &Registry,
     effect_path: &str,
@@ -2022,17 +2106,17 @@ fn register_provider_binding(
     ))
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn strip_scheme(path: &str) -> String {
     path.replacen("://", "/", 1)
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn status_to_driver_error(status: tonic::Status) -> DriverError {
     DriverError::Transport(status.message().to_string())
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn validate_provider_ready(
     ready: &ProviderReady,
     projection: &ExternalProjectionDef,
@@ -2079,7 +2163,7 @@ fn validate_provider_ready(
     Ok(())
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn validate_external_control_frame(
     frame: &ControlFrame,
     context: &SessionContext,
@@ -2122,6 +2206,7 @@ fn validate_external_control_frame(
     }
 }
 
+#[cfg(feature = "external-gateway")]
 fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2129,7 +2214,7 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn source_ingest_status(error: SourceIngestError) -> tonic::Status {
     match error {
         SourceIngestError::Session(_)
@@ -2161,6 +2246,7 @@ fn source_ingest_status(error: SourceIngestError) -> tonic::Status {
     }
 }
 
+#[cfg(feature = "external-gateway")]
 fn source_ingest_rejection_ack(event_id: String, error: &SourceIngestError) -> Option<EventAck> {
     let reason = match error {
         SourceIngestError::InvalidEventId => "invalid_event_id",
@@ -2193,7 +2279,7 @@ fn source_ingest_rejection_ack(event_id: String, error: &SourceIngestError) -> O
     })
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn provider_invocation_status(error: ProviderInvocationError) -> tonic::Status {
     match error {
         ProviderInvocationError::InvocationNotFound
@@ -2223,7 +2309,7 @@ fn provider_invocation_status(error: ProviderInvocationError) -> tonic::Status {
     }
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn provider_invocation_error_removes_entry(error: &ProviderInvocationError) -> bool {
     matches!(
         error,
@@ -2233,17 +2319,17 @@ fn provider_invocation_error_removes_entry(error: &ProviderInvocationError) -> b
     )
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn source_command_status(error: SourceCommandError) -> tonic::Status {
     source_command_error_status(error, "source command result rejected")
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn source_command_dispatch_status(error: SourceCommandError) -> tonic::Status {
     source_command_error_status(error, "source command rejected")
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn source_command_error_status(error: SourceCommandError, message: &'static str) -> tonic::Status {
     match error {
         SourceCommandError::CommandNotFound
@@ -2267,7 +2353,7 @@ fn source_command_error_status(error: SourceCommandError, message: &'static str)
     }
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn source_command_error_removes_entry(error: &SourceCommandError) -> bool {
     matches!(
         error,
@@ -2277,7 +2363,7 @@ fn source_command_error_removes_entry(error: &SourceCommandError) -> bool {
     )
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-gateway")]
 fn log_external_transport_security(
     label: &'static str,
     addr: &str,
@@ -2322,6 +2408,7 @@ async fn wait_for_shutdown() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "external-grpc")]
     use serde_json::json;
 
     #[tokio::test]
@@ -2331,17 +2418,17 @@ mod tests {
         assert!(boot.kernel.registry.resource_count() >= 5);
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     fn external_installation_value() -> Value {
         source_external_installation_value(false)
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     fn source_external_installation_value(commands: bool) -> Value {
         serde_json::from_value(source_external_installation_json(commands)).unwrap()
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     fn source_external_installation_json(commands: bool) -> serde_json::Value {
         json!({
             "id": "chat",
@@ -2372,7 +2459,7 @@ mod tests {
         })
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     fn provider_external_installation_value() -> Value {
         serde_json::from_value(json!({
             "id": "chat",
@@ -2402,7 +2489,7 @@ mod tests {
         .unwrap()
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     async fn write_external_session(
         state: &Backend,
         installation_id: &str,
@@ -2419,7 +2506,7 @@ mod tests {
         .await;
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     async fn write_external_session_with_key_epoch(
         state: &Backend,
         installation_id: &str,
@@ -2447,7 +2534,7 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     fn external_outbound_channel() -> (
         nexus_gateway_grpc::ExternalOutbound,
         tokio::sync::mpsc::Receiver<
@@ -2458,7 +2545,7 @@ mod tests {
         (nexus_gateway_grpc::ExternalOutbound::from_sender(tx), rx)
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     async fn write_external_revocation(
         state: &Backend,
         installation_id: &str,
@@ -2481,7 +2568,7 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     fn hello_from_context(context: &SessionContext) -> RoleSessionClientHello {
         RoleSessionClientHello {
             role: context.role,
@@ -2496,12 +2583,12 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     fn secure_envelope_aad(context: &SessionContext, seq: u64) -> EnvelopeAad {
         secure_envelope_aad_with(context, seq, "control.config_ack", 0)
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     fn secure_envelope_aad_with(
         context: &SessionContext,
         seq: u64,
@@ -2522,7 +2609,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_adjudicates_from_installation_state() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -2563,7 +2650,7 @@ mod tests {
         assert_ne!(context.registry_hash, "client-observed");
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_requires_approved_role_session() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -2596,7 +2683,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_rejects_revoked_role_session() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -2631,7 +2718,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_ingests_source_event() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -2695,7 +2782,7 @@ mod tests {
         assert_eq!(rows[0].1, Value::List(vec![Value::Str("hello".into())]));
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[test]
     fn source_ingest_event_errors_are_rejected_acks() {
         let policy = source_ingest_rejection_ack(
@@ -2741,7 +2828,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_returns_rejected_ack_for_source_schema_error() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -2808,7 +2895,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_gates_external_control_frames() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -2931,7 +3018,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_resolves_only_registered_source_commands() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -3074,7 +3161,7 @@ mod tests {
         assert!(handler.source_waiters.lock().unwrap().is_empty());
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_expires_pending_source_commands() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -3163,7 +3250,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_enforces_source_command_in_flight_limit() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -3247,7 +3334,7 @@ mod tests {
         assert!(outbound_rx.try_recv().is_err());
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_enforces_source_command_rate_limit() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -3331,7 +3418,7 @@ mod tests {
         assert!(outbound_rx.try_recv().is_err());
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_rejects_source_commands_when_projection_disables_them() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -3393,7 +3480,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_drains_source_commands_on_close() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -3478,7 +3565,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_resolves_only_registered_provider_invocations() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -3584,7 +3671,7 @@ mod tests {
         assert!(handler.provider_waiters.lock().unwrap().is_empty());
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_rolls_back_provider_invocation_on_waiter_duplicate() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -3646,7 +3733,7 @@ mod tests {
         assert_eq!(handler.provider_waiters.lock().unwrap().len(), 1);
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_enforces_provider_invocation_in_flight_limit() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -3718,7 +3805,7 @@ mod tests {
         assert_eq!(handler.provider_waiters.lock().unwrap().len(), 1);
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_enforces_provider_identity_in_flight_limit() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -3790,7 +3877,7 @@ mod tests {
         assert_eq!(handler.provider_waiters.lock().unwrap().len(), 1);
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_enforces_provider_effect_in_flight_limit() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -3862,7 +3949,7 @@ mod tests {
         assert_eq!(handler.provider_waiters.lock().unwrap().len(), 1);
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_opens_secure_envelope_with_installed_credential() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -3926,7 +4013,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_rejects_old_epoch_business_envelope_after_rekey() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -3999,7 +4086,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_clears_secure_replay_state_on_close() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -4061,7 +4148,7 @@ mod tests {
         assert!(handler.secure_replay_windows.lock().unwrap().is_empty());
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_rejects_secure_envelope_without_credential() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -4114,7 +4201,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_external_handler_validates_provider_ready_against_projection() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -4247,7 +4334,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_provider_ready_registers_remote_endpoint_binding() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -4462,7 +4549,7 @@ mod tests {
         assert!(boot.kernel.registry.remote_endpoint(endpoint_id).is_none());
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn daemon_provider_endpoint_times_out_pending_invocation() {
         let boot = Arc::new(Bootstrap::in_memory());
@@ -4584,7 +4671,7 @@ mod tests {
         assert!(handler.provider_waiters.lock().unwrap().is_empty());
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[tokio::test]
     async fn provider_waiter_drop_reports_provider_unavailable() {
         let (tx, rx) = oneshot::channel();

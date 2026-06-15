@@ -13,10 +13,10 @@ name = "nexusd"
 path = "src/main.rs"
 
 [features]
-default = ["grpc"]
-# gRPC gateway. `nexus-proto`'s bindings are vendored (no `protoc` needed), so
-# this is on by default. Disable it for a smaller build without gRPC clients.
-grpc = ["dep:nexus-gateway-grpc", "dep:tonic"]
+default = ["external-grpc", "external-websocket"]
+external-gateway = ["dep:tonic"]
+external-grpc = ["external-gateway", "dep:nexus-gateway-grpc", "tonic/server", "tonic/tls-ring"]
+external-websocket = ["external-gateway", "dep:nexus-gateway-websocket"]
 
 [dependencies]
 anyhow = "1.0.102"
@@ -29,7 +29,7 @@ nexus-actors = { version = "0.1.0", path = "../nexus-actors" }
 nexus-console = { version = "0.1.0", path = "../nexus-console" }
 nexus-gateway = { version = "0.1.0", path = "../nexus-gateway" }
 nexus-gateway-grpc = { version = "0.1.0", path = "../nexus-gateway-grpc", optional = true }
-nexus-gateway-websocket = { version = "0.1.0", path = "../nexus-gateway-websocket" }
+nexus-gateway-websocket = { version = "0.1.0", path = "../nexus-gateway-websocket", optional = true }
 nexus-kernel = { version = "0.1.0", path = "../nexus-kernel" }
 nexus-sdk = { version = "0.1.0", path = "../nexus-sdk" }
 nexus-storage-redb = { version = "0.1.0", path = "../nexus-storage-redb" }
@@ -38,7 +38,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tokio = { version = "1.52.3", features = ["rt", "sync", "macros", "rt-multi-thread", "signal", "time"] }
 toml = "1.1.2"
-tonic = { version = "0.14.6", default-features = false, features = ["server", "tls-ring"], optional = true }
+tonic = { version = "0.14.6", default-features = false, optional = true }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 

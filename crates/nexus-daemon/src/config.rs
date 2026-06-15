@@ -14,10 +14,12 @@ use nexus_console::{
     ConsoleAuthConfig, ConsoleTransportSecurityConfig, ConsoleTransportSecurityMode,
     ConsoleTrustedProxyConfig, ConsoleUnsafeTransportRelaxation, ConsoleWsConfig,
 };
+#[cfg(feature = "external-gateway")]
 use nexus_gateway::{
     GatewayTransportSecurityConfig, GatewayTransportSecurityMode, GatewayTrustedProxyConfig,
     GatewayUnsafeTransportRelaxation,
 };
+#[cfg(feature = "external-websocket")]
 use nexus_gateway_websocket::{
     DEFAULT_FIRST_FRAME_TIMEOUT_MS as DEFAULT_EXTERNAL_WS_FIRST_FRAME_TIMEOUT_MS,
     DEFAULT_IDLE_TIMEOUT_MS as DEFAULT_EXTERNAL_WS_IDLE_TIMEOUT_MS,
@@ -25,25 +27,41 @@ use nexus_gateway_websocket::{
     DEFAULT_MAX_FRAME_BYTES as DEFAULT_EXTERNAL_WS_MAX_FRAME_BYTES, ExternalWebSocketConfig,
 };
 use serde::Deserialize;
-#[cfg(any(feature = "grpc", test))]
+#[cfg(any(feature = "external-grpc", all(test, feature = "external-gateway")))]
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
+#[cfg(feature = "external-gateway")]
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(feature = "external-gateway")]
 pub const DEFAULT_EXTERNAL_SOURCE_DEDUPE_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+#[cfg(feature = "external-gateway")]
 pub const HARD_EXTERNAL_SOURCE_DEDUPE_WINDOW_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+#[cfg(feature = "external-gateway")]
 pub const DEFAULT_EXTERNAL_PROVIDER_MAX_IN_FLIGHT_INVOCATIONS: usize = 1024;
+#[cfg(feature = "external-gateway")]
 pub const HARD_EXTERNAL_PROVIDER_MAX_IN_FLIGHT_INVOCATIONS: usize = 65_536;
+#[cfg(feature = "external-gateway")]
 pub const DEFAULT_EXTERNAL_PROVIDER_MAX_IN_FLIGHT_PER_IDENTITY: usize = 256;
+#[cfg(feature = "external-gateway")]
 pub const HARD_EXTERNAL_PROVIDER_MAX_IN_FLIGHT_PER_IDENTITY: usize = 65_536;
+#[cfg(feature = "external-gateway")]
 pub const DEFAULT_EXTERNAL_PROVIDER_MAX_IN_FLIGHT_PER_EFFECT: usize = 256;
+#[cfg(feature = "external-gateway")]
 pub const HARD_EXTERNAL_PROVIDER_MAX_IN_FLIGHT_PER_EFFECT: usize = 65_536;
+#[cfg(feature = "external-gateway")]
 pub const DEFAULT_EXTERNAL_SOURCE_MAX_IN_FLIGHT_COMMANDS: usize = 1024;
+#[cfg(feature = "external-gateway")]
 pub const HARD_EXTERNAL_SOURCE_MAX_IN_FLIGHT_COMMANDS: usize = 65_536;
+#[cfg(feature = "external-gateway")]
 pub const DEFAULT_EXTERNAL_SOURCE_COMMAND_RATE_LIMIT_WINDOW_MS: u64 = 60_000;
+#[cfg(feature = "external-gateway")]
 pub const HARD_EXTERNAL_SOURCE_COMMAND_RATE_LIMIT_WINDOW_MS: u64 = 600_000;
+#[cfg(feature = "external-gateway")]
 pub const DEFAULT_EXTERNAL_SOURCE_COMMAND_RATE_LIMIT_MAX: usize = 600;
+#[cfg(feature = "external-gateway")]
 pub const HARD_EXTERNAL_SOURCE_COMMAND_RATE_LIMIT_MAX: usize = 65_536;
 
 /// Bootstrap-only config loaded by `nexusd`: storage, listeners, console root
@@ -59,6 +77,7 @@ pub struct NexusConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub console: ConsoleConfig,
+    #[cfg(feature = "external-gateway")]
     #[serde(default)]
     pub external_gateway: ExternalGatewayConfig,
 }
@@ -95,25 +114,29 @@ pub struct ServerConfig {
     /// Console HTTP and Console WebSocket listener address.
     pub console_addr: Option<String>,
     /// External Provider/Source gRPC listener address.
-    #[allow(dead_code)]
+    #[cfg(feature = "external-grpc")]
     pub external_grpc_addr: Option<String>,
     /// External Provider/Source WebSocket listener address.
+    #[cfg(feature = "external-websocket")]
     pub external_websocket_addr: Option<String>,
     /// Reserved for a standalone health endpoint.
     #[allow(dead_code)]
     pub health_addr: Option<String>,
 }
 
+#[cfg(feature = "external-gateway")]
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalGatewayConfig {
+    #[cfg(feature = "external-grpc")]
     #[serde(default)]
-    #[allow(dead_code)]
     pub grpc: ExternalGatewayGrpcConfig,
+    #[cfg(feature = "external-websocket")]
     #[serde(default)]
     pub websocket: ExternalGatewayWebSocketConfig,
 }
 
+#[cfg(feature = "external-gateway")]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ExternalGatewaySessionLimits {
     pub source_dedupe_window_ms: u64,
@@ -125,6 +148,7 @@ pub struct ExternalGatewaySessionLimits {
     pub source_command_rate_limit_max: usize,
 }
 
+#[cfg(feature = "external-gateway")]
 impl Default for ExternalGatewaySessionLimits {
     fn default() -> Self {
         Self {
@@ -143,6 +167,7 @@ impl Default for ExternalGatewaySessionLimits {
     }
 }
 
+#[cfg(feature = "external-gateway")]
 impl ExternalGatewaySessionLimits {
     pub fn bounded(mut self) -> Self {
         self.source_dedupe_window_ms = clamp_or_default_u64(
@@ -184,11 +209,11 @@ impl ExternalGatewaySessionLimits {
     }
 }
 
+#[cfg(feature = "external-grpc")]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalGatewayGrpcConfig {
     #[serde(default)]
-    #[cfg_attr(not(feature = "grpc"), allow(dead_code))]
     pub transport_security: GatewayTransportSecurityTuning,
     #[serde(default = "default_external_source_dedupe_window_ms")]
     pub source_dedupe_window_ms: u64,
@@ -206,6 +231,7 @@ pub struct ExternalGatewayGrpcConfig {
     pub source_command_rate_limit_max: usize,
 }
 
+#[cfg(feature = "external-grpc")]
 impl Default for ExternalGatewayGrpcConfig {
     fn default() -> Self {
         let limits = ExternalGatewaySessionLimits::default();
@@ -222,6 +248,7 @@ impl Default for ExternalGatewayGrpcConfig {
     }
 }
 
+#[cfg(feature = "external-grpc")]
 impl ExternalGatewayGrpcConfig {
     pub fn session_limits(&self) -> ExternalGatewaySessionLimits {
         ExternalGatewaySessionLimits::from(self).bounded()
@@ -244,6 +271,7 @@ impl ExternalGatewayGrpcConfig {
     }
 }
 
+#[cfg(feature = "external-websocket")]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalGatewayWebSocketConfig {
@@ -267,6 +295,7 @@ pub struct ExternalGatewayWebSocketConfig {
     pub source_command_rate_limit_max: usize,
 }
 
+#[cfg(feature = "external-websocket")]
 impl Default for ExternalGatewayWebSocketConfig {
     fn default() -> Self {
         let limits = ExternalGatewaySessionLimits::default();
@@ -284,6 +313,7 @@ impl Default for ExternalGatewayWebSocketConfig {
     }
 }
 
+#[cfg(feature = "external-websocket")]
 impl ExternalGatewayWebSocketConfig {
     pub fn session_limits(&self) -> ExternalGatewaySessionLimits {
         ExternalGatewaySessionLimits::from(self).bounded()
@@ -307,6 +337,7 @@ impl ExternalGatewayWebSocketConfig {
     }
 }
 
+#[cfg(feature = "external-grpc")]
 impl From<&ExternalGatewayGrpcConfig> for ExternalGatewaySessionLimits {
     fn from(config: &ExternalGatewayGrpcConfig) -> Self {
         Self {
@@ -321,6 +352,7 @@ impl From<&ExternalGatewayGrpcConfig> for ExternalGatewaySessionLimits {
     }
 }
 
+#[cfg(feature = "external-websocket")]
 impl From<&ExternalGatewayWebSocketConfig> for ExternalGatewaySessionLimits {
     fn from(config: &ExternalGatewayWebSocketConfig) -> Self {
         Self {
@@ -335,6 +367,7 @@ impl From<&ExternalGatewayWebSocketConfig> for ExternalGatewaySessionLimits {
     }
 }
 
+#[cfg(feature = "external-gateway")]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayTransportSecurityTuning {
@@ -356,6 +389,7 @@ pub struct GatewayTransportSecurityTuning {
     pub client_trust_roots: Vec<String>,
 }
 
+#[cfg(feature = "external-gateway")]
 impl Default for GatewayTransportSecurityTuning {
     fn default() -> Self {
         Self {
@@ -372,15 +406,16 @@ impl Default for GatewayTransportSecurityTuning {
     }
 }
 
+#[cfg(feature = "external-gateway")]
 #[derive(Debug, Clone)]
 pub struct GatewayListenerSecurity {
     pub listen_addr: SocketAddr,
     pub config: GatewayTransportSecurityConfig,
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     pub tls: Option<GatewayListenerTlsMaterial>,
 }
 
-#[cfg(feature = "grpc")]
+#[cfg(feature = "external-grpc")]
 #[derive(Debug, Clone)]
 pub struct GatewayListenerTlsMaterial {
     pub certificate_chain_pem: Vec<u8>,
@@ -388,7 +423,9 @@ pub struct GatewayListenerTlsMaterial {
     pub client_trust_roots_pem: Vec<u8>,
 }
 
+#[cfg(feature = "external-gateway")]
 impl GatewayTransportSecurityTuning {
+    #[cfg(feature = "external-websocket")]
     pub fn validate_plain_listener(
         &self,
         label: &str,
@@ -397,7 +434,7 @@ impl GatewayTransportSecurityTuning {
         self.validate_plain_listener_inner(label, listen_addr, cfg!(test))
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     pub fn validate_grpc_listener(
         &self,
         label: &str,
@@ -406,6 +443,7 @@ impl GatewayTransportSecurityTuning {
         self.validate_grpc_listener_inner(label, listen_addr, cfg!(test))
     }
 
+    #[cfg(feature = "external-websocket")]
     fn validate_plain_listener_inner(
         &self,
         label: &str,
@@ -453,12 +491,12 @@ impl GatewayTransportSecurityTuning {
         Ok(GatewayListenerSecurity {
             listen_addr,
             config,
-            #[cfg(feature = "grpc")]
+            #[cfg(feature = "external-grpc")]
             tls: None,
         })
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     fn validate_grpc_listener_inner(
         &self,
         label: &str,
@@ -569,7 +607,7 @@ impl GatewayTransportSecurityTuning {
         Ok(())
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     fn load_tls_material(
         &self,
         label: &str,
@@ -603,6 +641,7 @@ impl GatewayTransportSecurityTuning {
     }
 }
 
+#[cfg(feature = "external-websocket")]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalGatewayWebSocketTransportTuning {
@@ -616,6 +655,7 @@ pub struct ExternalGatewayWebSocketTransportTuning {
     pub max_connections: usize,
 }
 
+#[cfg(feature = "external-websocket")]
 impl Default for ExternalGatewayWebSocketTransportTuning {
     fn default() -> Self {
         Self {
@@ -628,6 +668,7 @@ impl Default for ExternalGatewayWebSocketTransportTuning {
     }
 }
 
+#[cfg(feature = "external-websocket")]
 impl ExternalGatewayWebSocketTransportTuning {
     pub fn bounded(mut self) -> Self {
         self.max_frame_bytes = clamp_or_default(
@@ -654,6 +695,7 @@ impl ExternalGatewayWebSocketTransportTuning {
     }
 }
 
+#[cfg(feature = "external-websocket")]
 impl From<ExternalGatewayWebSocketTransportTuning> for ExternalWebSocketConfig {
     fn from(value: ExternalGatewayWebSocketTransportTuning) -> Self {
         let value = value.bounded();
@@ -668,42 +710,52 @@ impl From<ExternalGatewayWebSocketTransportTuning> for ExternalWebSocketConfig {
     }
 }
 
+#[cfg(feature = "external-gateway")]
 fn default_external_source_dedupe_window_ms() -> u64 {
     DEFAULT_EXTERNAL_SOURCE_DEDUPE_WINDOW_MS
 }
 
+#[cfg(feature = "external-gateway")]
 fn default_external_provider_max_in_flight_invocations() -> usize {
     DEFAULT_EXTERNAL_PROVIDER_MAX_IN_FLIGHT_INVOCATIONS
 }
 
+#[cfg(feature = "external-gateway")]
 fn default_external_provider_max_in_flight_per_identity() -> usize {
     DEFAULT_EXTERNAL_PROVIDER_MAX_IN_FLIGHT_PER_IDENTITY
 }
 
+#[cfg(feature = "external-gateway")]
 fn default_external_provider_max_in_flight_per_effect() -> usize {
     DEFAULT_EXTERNAL_PROVIDER_MAX_IN_FLIGHT_PER_EFFECT
 }
 
+#[cfg(feature = "external-gateway")]
 fn default_external_source_max_in_flight_commands() -> usize {
     DEFAULT_EXTERNAL_SOURCE_MAX_IN_FLIGHT_COMMANDS
 }
 
+#[cfg(feature = "external-gateway")]
 fn default_external_source_command_rate_limit_window_ms() -> u64 {
     DEFAULT_EXTERNAL_SOURCE_COMMAND_RATE_LIMIT_WINDOW_MS
 }
 
+#[cfg(feature = "external-gateway")]
 fn default_external_source_command_rate_limit_max() -> usize {
     DEFAULT_EXTERNAL_SOURCE_COMMAND_RATE_LIMIT_MAX
 }
 
+#[cfg(feature = "external-gateway")]
 fn default_gateway_transport_security_mode() -> String {
     "local_trusted".into()
 }
 
+#[cfg(feature = "external-gateway")]
 fn non_empty_path(path: Option<&str>) -> Option<&str> {
     path.map(str::trim).filter(|path| !path.is_empty())
 }
 
+#[cfg(feature = "external-gateway")]
 fn ensure_file(path: &str, label: &str) -> Result<()> {
     if !Path::new(path).is_file() {
         anyhow::bail!("{label} '{path}' must be an existing file");
@@ -729,18 +781,22 @@ fn clamp_or_default_u64(value: u64, default: u64, hard_max: u64) -> u64 {
     }
 }
 
+#[cfg(feature = "external-websocket")]
 fn default_external_ws_max_frame_bytes() -> usize {
     DEFAULT_EXTERNAL_WS_MAX_FRAME_BYTES
 }
 
+#[cfg(feature = "external-websocket")]
 fn default_external_ws_first_frame_timeout_ms() -> u64 {
     DEFAULT_EXTERNAL_WS_FIRST_FRAME_TIMEOUT_MS
 }
 
+#[cfg(feature = "external-websocket")]
 fn default_external_ws_idle_timeout_ms() -> u64 {
     DEFAULT_EXTERNAL_WS_IDLE_TIMEOUT_MS
 }
 
+#[cfg(feature = "external-websocket")]
 fn default_external_ws_max_connections() -> usize {
     DEFAULT_EXTERNAL_WS_MAX_CONNECTIONS
 }
@@ -1071,6 +1127,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "external-gateway")]
     fn temp_config_file(name: &str, contents: &[u8]) -> String {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1248,9 +1305,9 @@ unknown_section = true
         assert_config_rejects_unknown_field(
             r#"
 [server]
-program_rpc_addr = "127.0.0.1:9100"
+unknown_addr = "127.0.0.1:9100"
 "#,
-            "program_rpc_addr",
+            "unknown_addr",
         );
         assert_config_rejects_unknown_field(
             r#"
@@ -1261,6 +1318,7 @@ max_frame_bytez = 1024
         );
     }
 
+    #[cfg(all(feature = "external-grpc", feature = "external-websocket"))]
     #[test]
     fn example_config_uses_declared_fields() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../nexus.toml.example");
@@ -1268,6 +1326,7 @@ max_frame_bytez = 1024
         toml::from_str::<NexusConfig>(&content).unwrap();
     }
 
+    #[cfg(feature = "external-websocket")]
     #[test]
     fn gateway_transport_security_defaults_to_loopback_only() {
         let cfg = GatewayTransportSecurityTuning::default();
@@ -1289,6 +1348,7 @@ max_frame_bytez = 1024
         assert!(err.to_string().contains("loopback"));
     }
 
+    #[cfg(all(feature = "external-grpc", feature = "external-websocket"))]
     #[test]
     fn config_file_accepts_external_gateway_listeners() {
         let cfg: NexusConfig = toml::from_str(
@@ -1353,7 +1413,7 @@ mode = "local_trusted"
         let ws_transport: ExternalWebSocketConfig = websocket.transport.into();
         assert_eq!(ws_transport, ExternalWebSocketConfig::default());
 
-        #[cfg(feature = "grpc")]
+        #[cfg(feature = "external-grpc")]
         {
             let listener = cfg
                 .external_gateway
@@ -1385,6 +1445,7 @@ mode = "local_trusted"
         );
     }
 
+    #[cfg(feature = "external-websocket")]
     #[test]
     fn config_file_accepts_external_gateway_trusted_proxy_transport_security() {
         let cfg: NexusConfig = toml::from_str(
@@ -1413,6 +1474,7 @@ honor_x_forwarded_for = true
         );
     }
 
+    #[cfg(feature = "external-websocket")]
     #[test]
     fn external_gateway_plain_listener_trusted_proxy_requires_peer() {
         let cfg: NexusConfig = toml::from_str(
@@ -1432,7 +1494,7 @@ mode = "trusted_reverse_proxy"
         assert!(err.to_string().contains("trusted_proxy_peers"));
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[test]
     fn external_gateway_grpc_trusted_proxy_requires_peer() {
         let cfg: NexusConfig = toml::from_str(
@@ -1452,6 +1514,7 @@ mode = "trusted_reverse_proxy"
         assert!(err.to_string().contains("trusted_proxy_peers"));
     }
 
+    #[cfg(feature = "external-websocket")]
     #[test]
     fn external_gateway_disabled_for_test_is_rejected_outside_tests() {
         let cfg: NexusConfig = toml::from_str(
@@ -1471,6 +1534,7 @@ mode = "disabled_for_test"
         assert!(err.to_string().contains("only valid in tests"));
     }
 
+    #[cfg(feature = "external-websocket")]
     #[test]
     fn external_gateway_plain_listener_tls_modes_fail_closed() {
         let cert = temp_config_file("cert.pem", b"certificate");
@@ -1514,7 +1578,7 @@ client_trust_roots = ["{root}"]
         assert!(err.to_string().contains("requires a TLS listener"));
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[test]
     fn external_gateway_grpc_tls_modes_require_material() {
         let cfg: NexusConfig = toml::from_str(
@@ -1554,7 +1618,7 @@ private_key_path = "{key}"
         assert!(err.to_string().contains("client_trust_roots"));
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[test]
     fn external_gateway_grpc_tls_modes_load_certificate_material() {
         let cert = temp_config_file("cert.pem", b"certificate");
@@ -1582,7 +1646,7 @@ private_key_path = "{key}"
         assert!(listener.tls.is_some());
     }
 
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "external-grpc")]
     #[test]
     fn external_gateway_grpc_mtls_requires_and_loads_client_roots() {
         let cert = temp_config_file("cert.pem", b"certificate");
@@ -1652,6 +1716,7 @@ event_send_timeout_ms = 250
         assert_eq!(ws.event_send_timeout, Duration::from_millis(250));
     }
 
+    #[cfg(feature = "external-websocket")]
     #[test]
     fn external_gateway_websocket_transport_config_is_bounded() {
         let cfg: NexusConfig = toml::from_str(
@@ -1697,6 +1762,7 @@ max_connections = 999999999999
         );
     }
 
+    #[cfg(all(feature = "external-grpc", feature = "external-websocket"))]
     #[test]
     fn external_gateway_limits_are_bounded() {
         let cfg: NexusConfig = toml::from_str(
@@ -1735,6 +1801,7 @@ source_command_rate_limit_max = 999999999999
         );
     }
 
+    #[cfg(all(feature = "external-grpc", feature = "external-websocket"))]
     fn hard_external_gateway_session_limits() -> ExternalGatewaySessionLimits {
         ExternalGatewaySessionLimits {
             source_dedupe_window_ms: HARD_EXTERNAL_SOURCE_DEDUPE_WINDOW_MS,

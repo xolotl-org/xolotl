@@ -156,6 +156,10 @@ Default addresses from `nexus.toml.example`:
 - External gRPC gateway: `127.0.0.1:9444`
 - External WebSocket gateway: `127.0.0.1:9200`
 
+`nexus-daemon` enables `external-grpc` and `external-websocket` by default.
+Each transport can be built on its own with `--no-default-features --features
+external-grpc` or `--no-default-features --features external-websocket`.
+
 On first boot, if no console root account exists and no bootstrap credentials
 are configured, `nexusd` prints a one-time root password to stderr.
 

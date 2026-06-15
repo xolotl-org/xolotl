@@ -9,8 +9,10 @@ external gateway.
 ## Entry Points
 
 A listener starts when its `[server]` config field is set, or when the matching
-environment variable is set. gRPC listeners are compiled by the `grpc` feature,
-which is enabled in the default `nexus-daemon` build.
+environment variable is set. `nexus-daemon` enables `external-grpc` and
+`external-websocket` by default; either transport can be built alone with
+`--no-default-features --features external-grpc` or `--no-default-features
+--features external-websocket`.
 
 | Entry point | Config field | Environment variable | Route or service | Encoding |
 | --- | --- | --- | --- | --- |

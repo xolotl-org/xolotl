@@ -137,6 +137,11 @@ cargo run -p nexus-daemon -- up
 - External gRPC gateway：`127.0.0.1:9444`
 - External WebSocket gateway：`127.0.0.1:9200`
 
+`nexus-daemon` 默认启用 `external-grpc` 和 `external-websocket`。可以用
+`--no-default-features --features external-grpc` 或
+`--no-default-features --features external-websocket` 只构建其中一种
+transport。
+
 首次启动时，如果状态中没有控制台 root 账号，也没有配置预置凭据，`nexusd` 会把一次性 root 密码打印到 stderr。
 
 ## 配置

@@ -6,7 +6,7 @@
 
 ## 接入口
 
-当 `[server]` 中的配置字段存在，或对应环境变量存在时，`nexusd` 会启动该通道。gRPC 监听需要 `grpc` feature；默认 `nexus-daemon` 构建已启用。
+当 `[server]` 中的配置字段存在，或对应环境变量存在时，`nexusd` 会启动该通道。`nexus-daemon` 默认启用 `external-grpc` 和 `external-websocket`；可以用 `--no-default-features --features external-grpc` 或 `--no-default-features --features external-websocket` 只构建其中一种 transport。
 
 | 接口 | 配置字段 | 环境变量 | 路径或服务 | 编码 |
 | --- | --- | --- | --- | --- |
