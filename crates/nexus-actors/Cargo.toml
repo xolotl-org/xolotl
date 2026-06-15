@@ -9,28 +9,28 @@ repository.workspace = true
 description = "Standard in-process Drivers and Providers for Nexus"
 
 [dependencies]
-async-trait = "0.1.89"
-blake3 = "1.8.5"
-chacha20poly1305 = "0.10.1"
-getrandom = "0.4.2"
-glob = "0.3.3"
-hkdf = "0.13.0"
-nexus-graph = { version = "0.1.0", path = "../nexus-graph" }
-nexus-kernel = { version = "0.1.0", path = "../nexus-kernel" }
-nexus-state = { version = "0.1.0", path = "../nexus-state" }
-nexus-types = { version = "0.1.0", path = "../nexus-types" }
-parking_lot = "0.12.5"
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-sha2 = "0.11.0"
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["rt", "sync", "macros", "time", "fs", "process", "io-util"] }
-url = "2.5.8"
+async-trait.workspace = true
+blake3.workspace = true
+chacha20poly1305 = { workspace = true, features = ["alloc"] }
+getrandom.workspace = true
+glob.workspace = true
+hkdf.workspace = true
+nexus-graph.workspace = true
+nexus-kernel.workspace = true
+nexus-state.workspace = true
+nexus-types.workspace = true
+parking_lot.workspace = true
+reqwest = { workspace = true, features = ["rustls"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "fs", "process", "io-util"] }
+url.workspace = true
 
 [dev-dependencies]
-criterion = "0.8.2"
-tempfile = "3.27.0"
+criterion.workspace = true
+tempfile.workspace = true
 
 [[bench]]
 name = "standard_drivers"

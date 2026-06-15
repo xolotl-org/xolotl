@@ -34,7 +34,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use futures::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use nexus_graph::{DoNode, OperationTemplate};
 use nexus_kernel::RequestGrantTemplate;
 use nexus_state::StateEvent;

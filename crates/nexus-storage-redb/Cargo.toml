@@ -9,19 +9,19 @@ repository.workspace = true
 description = "redb-backed persistent storage adapters for Nexus state and the FactStore"
 
 [dependencies]
-async-trait = "0.1.89"
-nexus-kernel = { version = "0.1.0", path = "../nexus-kernel" }
-nexus-state = { version = "0.1.0", path = "../nexus-state" }
-nexus-types = { version = "0.1.0", path = "../nexus-types" }
-parking_lot = "0.12.5"
-redb = "4.1.0"
-serde_json = "1.0.150"
-tokio = { version = "1.52.3", features = ["sync"] }
+async-trait.workspace = true
+nexus-kernel.workspace = true
+nexus-state.workspace = true
+nexus-types.workspace = true
+parking_lot.workspace = true
+redb.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
-criterion = "0.8.2"
-tempfile = "3.27.0"
-tokio = { version = "1.52.3", features = ["rt", "sync", "macros", "time", "test-util"] }
+criterion.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "test-util"] }
 
 [[bench]]
 name = "redb_storage"

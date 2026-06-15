@@ -9,18 +9,12 @@ repository.workspace = true
 description = "WebSocket protocol adapter for Nexus"
 
 [dependencies]
-axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "ws"] }
-blake3 = "1.8.5"
-futures = "0.3.32"
-nexus-actors = { version = "0.1.0", path = "../nexus-actors" }
-nexus-gateway = { version = "0.1.0", path = "../nexus-gateway" }
-nexus-graph = { version = "0.1.0", path = "../nexus-graph" }
-nexus-kernel = { version = "0.1.0", path = "../nexus-kernel" }
-nexus-proto = { version = "0.1.0", path = "../nexus-proto" }
-nexus-types = { version = "0.1.0", path = "../nexus-types" }
-prost = "0.14.1"
-rmp-serde = "1.3.1"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-tokio = { version = "1.52.3", features = ["rt", "sync", "time", "macros"] }
-tonic = { version = "0.14.6", default-features = false, features = ["codegen"] }
+axum = { workspace = true, features = ["http1", "tokio", "ws"] }
+futures-util.workspace = true
+nexus-actors.workspace = true
+nexus-gateway.workspace = true
+nexus-proto.workspace = true
+nexus-types.workspace = true
+prost.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tonic = { workspace = true, features = ["codegen"] }

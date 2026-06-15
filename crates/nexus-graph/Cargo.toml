@@ -9,14 +9,14 @@ repository.workspace = true
 description = "Nexus single execution IR (ExecutionGraph) + Do<A> front-end + Do→Graph compiler"
 
 [dependencies]
-nexus-types = { path = "../nexus-types" }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-blake3 = "1.8.5"
-thiserror = "2.0.18"
+nexus-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
-criterion = "0.8.2"
+criterion.workspace = true
 
 [[bench]]
 name = "graph_hot_paths"

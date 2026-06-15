@@ -12,7 +12,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use futures::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use nexus_actors::endpoint::{EndpointSession, SessionPhase, SessionReject};
 use nexus_actors::pairing::SecureEnvelope;
 use nexus_gateway::{

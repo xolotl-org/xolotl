@@ -14,15 +14,15 @@ description.workspace = true
 # under `proto/` remain the canonical wire schema; keep the two in sync.
 
 [dependencies]
-nexus-graph = { version = "0.1.0", path = "../nexus-graph" }
-nexus-types = { version = "0.1.0", path = "../nexus-types" }
-prost = "0.14.4"
-thiserror = "2.0.18"
-tonic = { version = "0.14.6", default-features = false, features = ["codegen", "router", "transport"] }
-tonic-prost = "0.14.6"
+nexus-graph.workspace = true
+nexus-types.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+tonic = { workspace = true, features = ["codegen", "router", "transport"] }
+tonic-prost.workspace = true
 
 [dev-dependencies]
-criterion = "0.8.2"
+criterion.workspace = true
 
 [[bench]]
 name = "wire_conversion"

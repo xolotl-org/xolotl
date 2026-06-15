@@ -9,12 +9,10 @@ repository.workspace = true
 description = "gRPC protocol adapter for Nexus"
 
 [dependencies]
-nexus-actors = { version = "0.1.0", path = "../nexus-actors" }
-nexus-gateway = { version = "0.1.0", path = "../nexus-gateway" }
-nexus-graph = { version = "0.1.0", path = "../nexus-graph" }
-nexus-kernel = { version = "0.1.0", path = "../nexus-kernel" }
-nexus-proto = { version = "0.1.0", path = "../nexus-proto" }
-nexus-types = { version = "0.1.0", path = "../nexus-types" }
-prost = "0.14.4"
-tokio = { version = "1.52.3", features = ["rt", "sync"] }
-tonic = { version = "0.14.6", default-features = false, features = ["codegen", "transport", "tls-ring"] }
+nexus-actors.workspace = true
+nexus-gateway.workspace = true
+nexus-proto.workspace = true
+nexus-types.workspace = true
+prost.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+tonic = { workspace = true, features = ["codegen", "transport", "tls-ring"] }

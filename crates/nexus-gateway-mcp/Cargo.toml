@@ -9,13 +9,12 @@ repository.workspace = true
 description = "MCP protocol adapter for Nexus"
 
 [dependencies]
-nexus-gateway = { version = "0.1.0", path = "../nexus-gateway" }
-nexus-graph = { version = "0.1.0", path = "../nexus-graph" }
-nexus-kernel = { version = "0.1.0", path = "../nexus-kernel" }
-nexus-types = { version = "0.1.0", path = "../nexus-types" }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-thiserror = "2.0.18"
+nexus-gateway.workspace = true
+nexus-kernel.workspace = true
+nexus-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros"] }
