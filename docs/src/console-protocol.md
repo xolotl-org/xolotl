@@ -193,12 +193,24 @@ Implemented action families include:
 | Family | Examples |
 | --- | --- |
 | Protocol and registry | `protocol.describe`, `protocol.registry.snapshot`, `protocol.action_descriptor.get`, `protocol.schema.get` compatibility alias, `registry.coverage.report` |
+| Resource and edit descriptors | `resource.type.list`, `resource.type.describe`, `resource.view.describe`, `graph.type.describe` |
 | Authority and visibility | `authority.principal.effective`, `authority.action.matrix`, `visibility.authority.describe`, `visibility.state.read`, `visibility.state.list` |
 | Secret custody | `secret.catalog`, `secret.reveal` |
 | State and config | `state.snapshot`, `config.read`, `config.list`, `config.write_cas` |
 | Console access | `access.user.*`, `access.role.*`, `access.session.*`, `access.session.current.logout` |
 | Runtime, audit, and lineage | `runtime.process.inspect`, `audit.facts.recent`, `lineage.trace.read`, `lineage.fact.read`, `lineage.fact.by_operation`, `health.summary` |
 | External programs and pairing | `external.installation.*`, `pairing.create`, `pairing.approve`, `pairing.deny`, `pairing.replace` |
+
+Resource and graph descriptors provide shape-independent semantic metadata:
+resource types, fields, views, revisions, relationships, graph node types, ports,
+edges, and validation hooks. They do not name UI widgets or bypass the fixed
+action descriptors used for validation, authorization, CAS, and audit.
+
+The registry may advertise planned actions. Current planned edit-envelope
+actions include `change_set.create`, `change_set.update`,
+`change_set.validate`, `change_set.diff`, `change_set.dry_run`,
+`change_set.apply`, and `change_set.discard`; planned actions are discoverable
+but not executable.
 
 Streams:
 

@@ -13,14 +13,18 @@ use crate::protocol::{
     ACTION_ACCESS_SESSION_REVOKE_USER, ACTION_ACCESS_USER_DISABLE, ACTION_ACCESS_USER_LIST,
     ACTION_ACCESS_USER_READ, ACTION_ACCESS_USER_WRITE_CAS, ACTION_AUDIT_FACTS_RECENT,
     ACTION_AUTHORITY_ACTION_MATRIX, ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE,
-    ACTION_AUTHORITY_RESOURCE_ACCESS, ACTION_AUTHORITY_WHY_DENIED, ACTION_CONFIG_LIST,
-    ACTION_CONFIG_READ, ACTION_CONFIG_WRITE_CAS, ACTION_EXTERNAL_INSTALLATION_INSTALL,
-    ACTION_EXTERNAL_INSTALLATION_REVOKE, ACTION_EXTERNAL_INSTALLATION_START,
-    ACTION_EXTERNAL_INSTALLATION_STOP, ACTION_EXTERNAL_INSTALLATION_UPDATE, ACTION_HEALTH_SUMMARY,
+    ACTION_AUTHORITY_RESOURCE_ACCESS, ACTION_AUTHORITY_WHY_DENIED, ACTION_CHANGE_SET_APPLY,
+    ACTION_CHANGE_SET_CREATE, ACTION_CHANGE_SET_DIFF, ACTION_CHANGE_SET_DISCARD,
+    ACTION_CHANGE_SET_DRY_RUN, ACTION_CHANGE_SET_UPDATE, ACTION_CHANGE_SET_VALIDATE,
+    ACTION_CONFIG_LIST, ACTION_CONFIG_READ, ACTION_CONFIG_WRITE_CAS,
+    ACTION_EXTERNAL_INSTALLATION_INSTALL, ACTION_EXTERNAL_INSTALLATION_REVOKE,
+    ACTION_EXTERNAL_INSTALLATION_START, ACTION_EXTERNAL_INSTALLATION_STOP,
+    ACTION_EXTERNAL_INSTALLATION_UPDATE, ACTION_GRAPH_TYPE_DESCRIBE, ACTION_HEALTH_SUMMARY,
     ACTION_LINEAGE_FACT_BY_OPERATION, ACTION_LINEAGE_FACT_READ, ACTION_LINEAGE_TRACE_READ,
     ACTION_PAIRING_APPROVE, ACTION_PAIRING_CREATE, ACTION_PAIRING_DENY, ACTION_PAIRING_REPLACE,
     ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET, ACTION_PROTOCOL_DESCRIBE,
     ACTION_PROTOCOL_REGISTRY_SNAPSHOT, ACTION_PROTOCOL_SCHEMA_GET, ACTION_REGISTRY_COVERAGE_REPORT,
+    ACTION_RESOURCE_TYPE_DESCRIBE, ACTION_RESOURCE_TYPE_LIST, ACTION_RESOURCE_VIEW_DESCRIBE,
     ACTION_RUNTIME_PROCESS_INSPECT, ACTION_SECRET_CATALOG, ACTION_SECRET_REVEAL,
     ACTION_STATE_SNAPSHOT, ACTION_VISIBILITY_AUTHORITY_DESCRIBE, ACTION_VISIBILITY_STATE_LIST,
     ACTION_VISIBILITY_STATE_READ, ActionCall, ActionDescriptor, ActionResult, ClientFrame,
@@ -543,6 +547,38 @@ async fn dispatch_call(
         }
         ACTION_REGISTRY_COVERAGE_REPORT => {
             protocol::coverage_report_value(server_rev(sess), registry_rev(sess))
+        }
+        ACTION_RESOURCE_TYPE_LIST => protocol::resource_type_list_value(),
+        ACTION_RESOURCE_TYPE_DESCRIBE => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let resource_type = string_arg(&mut input, "resource_type")?;
+            protocol::resource_type_descriptor_value(&resource_type).ok_or_else(|| {
+                ConsoleError::BadRequest(format!("unknown resource type: {resource_type}"))
+            })?
+        }
+        ACTION_RESOURCE_VIEW_DESCRIBE => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let view = string_arg(&mut input, "view")?;
+            protocol::resource_view_descriptor_value(&view)
+                .ok_or_else(|| ConsoleError::BadRequest(format!("unknown resource view: {view}")))?
+        }
+        ACTION_GRAPH_TYPE_DESCRIBE => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let graph_type = string_arg(&mut input, "graph_type")?;
+            protocol::graph_type_descriptor_value(&graph_type).ok_or_else(|| {
+                ConsoleError::BadRequest(format!("unknown graph type: {graph_type}"))
+            })?
+        }
+        ACTION_CHANGE_SET_CREATE
+        | ACTION_CHANGE_SET_UPDATE
+        | ACTION_CHANGE_SET_VALIDATE
+        | ACTION_CHANGE_SET_DIFF
+        | ACTION_CHANGE_SET_DRY_RUN
+        | ACTION_CHANGE_SET_APPLY
+        | ACTION_CHANGE_SET_DISCARD => {
+            return Err(ConsoleError::BadRequest(format!(
+                "planned console action is not implemented: {action}"
+            )));
         }
         ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE => authority_principal_effective(principal),
         ACTION_AUTHORITY_ACTION_MATRIX => {
@@ -1633,6 +1669,8 @@ fn authority_action_row(principal: &ConsolePrincipal, descriptor: &ActionDescrip
     let visibility_gate = action_needs_visibility_gate(descriptor);
     let status = if descriptor.status == protocol::ImplementationStatus::BlockedByCustody {
         "blocked_by_custody"
+    } else if descriptor.status == protocol::ImplementationStatus::Planned {
+        "planned"
     } else if !authority_ok {
         if conditional_authority {
             "conditional_authority"
@@ -2742,6 +2780,7 @@ fn authority_why(
     let mut why = Vec::new();
     match status {
         "blocked_by_custody" => why.push("secret custody backend is not registered".into()),
+        "planned" => why.push("descriptor is planned and not executable".into()),
         "denied" if !authority_ok => why.push("principal lacks required authority".into()),
         "conditional_authority" if conditional_authority => {
             why.push("matching grant is predicate-bound and needs concrete action input".into())
@@ -3800,6 +3839,141 @@ mod tests {
                 matches!(m.get("action"), Some(Value::Str(a)) if a == ACTION_VISIBILITY_STATE_READ)
                     && matches!(m.get("status"), Some(Value::Str(s)) if s == "visibility_gate_required")
             })
+        }));
+    }
+
+    #[tokio::test]
+    async fn dispatches_shape_independent_descriptor_actions() {
+        let st = console_state();
+        let (_token, principal, _password) = root_login(&st).await;
+        let mut sess = test_session(st, principal.clone());
+
+        let result = dispatch_call(
+            &mut sess,
+            &principal,
+            call(ACTION_RESOURCE_TYPE_LIST, Value::Null),
+        )
+        .await;
+        let list = match result {
+            Ok(result) => match result.output {
+                Some(output) => output.to_value(),
+                None => panic!("resource type list output missing"),
+            },
+            Err(error) => panic!("resource type list failed: {error:?}"),
+        };
+        assert!(matches!(list, Value::List(items) if !items.is_empty()));
+
+        let result = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_RESOURCE_TYPE_DESCRIBE,
+                map_value([("resource_type", Value::Str("access.user".into()))]),
+            ),
+        )
+        .await;
+        let descriptor = match result {
+            Ok(result) => match result.output {
+                Some(output) => output.to_value(),
+                None => panic!("resource type descriptor output missing"),
+            },
+            Err(error) => panic!("resource type descriptor failed: {error:?}"),
+        };
+        let Value::Map(descriptor) = descriptor else {
+            panic!("expected resource descriptor map")
+        };
+        let Some(Value::List(fields)) = descriptor.get("fields") else {
+            panic!("resource descriptor fields missing")
+        };
+        assert!(fields.iter().any(|field| {
+            field.as_map().is_some_and(|map| {
+                matches!(map.get("semantic_kind"), Some(Value::Str(kind)) if kind == "resource_ref")
+            })
+        }));
+
+        let result = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_RESOURCE_VIEW_DESCRIBE,
+                map_value([("view", Value::Str("access.users".into()))]),
+            ),
+        )
+        .await;
+        let view = match result {
+            Ok(result) => match result.output {
+                Some(output) => output.to_value(),
+                None => panic!("resource view descriptor output missing"),
+            },
+            Err(error) => panic!("resource view descriptor failed: {error:?}"),
+        };
+        assert!(
+            matches!(view, Value::Map(map) if map.get("resource_type") == Some(&Value::Str("access.user".into())))
+        );
+
+        let result = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_GRAPH_TYPE_DESCRIBE,
+                map_value([("graph_type", Value::Str("plan.workflow".into()))]),
+            ),
+        )
+        .await;
+        let graph = match result {
+            Ok(result) => match result.output {
+                Some(output) => output.to_value(),
+                None => panic!("graph type descriptor output missing"),
+            },
+            Err(error) => panic!("graph type descriptor failed: {error:?}"),
+        };
+        assert!(
+            matches!(graph, Value::Map(map) if matches!(map.get("node_types"), Some(Value::List(nodes)) if !nodes.is_empty()))
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_change_set_actions_are_not_executable() {
+        let st = console_state();
+        let (_token, principal, _password) = root_login(&st).await;
+        let mut sess = test_session(st, principal.clone());
+        let result = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_CHANGE_SET_CREATE,
+                map_value([("registry_rev", Value::Int(1))]),
+            ),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ConsoleError::BadRequest(message))
+                if message == "planned console action is not implemented: change_set.create"
+        ));
+
+        let result = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_AUTHORITY_ACTION_MATRIX,
+                map_value([("domain", Value::Str("change_set".into()))]),
+            ),
+        )
+        .await;
+        let matrix = match result {
+            Ok(result) => match result.output {
+                Some(output) => output.to_value(),
+                None => panic!("authority matrix output missing"),
+            },
+            Err(error) => panic!("authority matrix failed: {error:?}"),
+        };
+        let Value::List(rows) = matrix else {
+            panic!("expected matrix rows")
+        };
+        assert!(rows.iter().all(|row| {
+            row.as_map()
+                .is_some_and(|map| map.get("status") == Some(&Value::Str("planned".into())))
         }));
     }
 

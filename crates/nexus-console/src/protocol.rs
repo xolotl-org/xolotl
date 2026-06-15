@@ -25,6 +25,28 @@ pub const ACTION_PROTOCOL_SCHEMA_GET: &str = "protocol.schema.get";
 pub const ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET: &str = "protocol.action_descriptor.get";
 /// Return action/stream coverage status by domain.
 pub const ACTION_REGISTRY_COVERAGE_REPORT: &str = "registry.coverage.report";
+/// List resource types with semantic edit descriptors.
+pub const ACTION_RESOURCE_TYPE_LIST: &str = "resource.type.list";
+/// Describe one resource type for schema-driven clients.
+pub const ACTION_RESOURCE_TYPE_DESCRIBE: &str = "resource.type.describe";
+/// Describe one resource view for tables, pickers, timelines, and graph projections.
+pub const ACTION_RESOURCE_VIEW_DESCRIBE: &str = "resource.view.describe";
+/// Create a semantic change-set draft.
+pub const ACTION_CHANGE_SET_CREATE: &str = "change_set.create";
+/// Update a semantic change-set draft.
+pub const ACTION_CHANGE_SET_UPDATE: &str = "change_set.update";
+/// Validate a semantic change-set draft.
+pub const ACTION_CHANGE_SET_VALIDATE: &str = "change_set.validate";
+/// Return the redacted diff for a semantic change-set draft.
+pub const ACTION_CHANGE_SET_DIFF: &str = "change_set.diff";
+/// Dry-run a semantic change-set draft.
+pub const ACTION_CHANGE_SET_DRY_RUN: &str = "change_set.dry_run";
+/// Apply a semantic change-set draft.
+pub const ACTION_CHANGE_SET_APPLY: &str = "change_set.apply";
+/// Discard a semantic change-set draft.
+pub const ACTION_CHANGE_SET_DISCARD: &str = "change_set.discard";
+/// Describe one graph type for semantic graph projections.
+pub const ACTION_GRAPH_TYPE_DESCRIBE: &str = "graph.type.describe";
 /// Return the caller's effective principal and authority.
 pub const ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE: &str = "authority.principal.effective";
 /// Return the authority matrix for visible actions.
@@ -512,6 +534,27 @@ pub struct FieldDescriptor {
     pub kind: String,
     /// Whether the field is required.
     pub required: bool,
+    /// Stable semantic field identity used across schema revisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_id: Option<String>,
+    /// Shape-independent semantic kind, never a concrete UI component name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_kind: Option<String>,
+    /// Resource type referenced by this field when it is a resource reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_target_type: Option<String>,
+    /// Sensitivity marker for persistence, logging, and display policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitivity: Option<String>,
+    /// Whether clients must treat the field as read-only.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
+    /// Whether the field is computed by the server.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub computed: bool,
+    /// Whether the field remains accepted but should not be used for new edits.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deprecated: bool,
 }
 
 /// High-level descriptor kind for Console Protocol actions.
@@ -548,6 +591,8 @@ pub enum RiskLevel {
 pub enum ImplementationStatus {
     /// Action/stream is implemented.
     Implemented,
+    /// Descriptor is discoverable but not yet executable.
+    Planned,
     /// Descriptor is intentionally unavailable because custody rules block it.
     BlockedByCustody,
 }
@@ -657,15 +702,14 @@ pub fn protocol_metadata_to_value(metadata: ProtocolMetadata) -> Value {
 pub fn coverage_report_value(server_rev: u64, registry_rev: u64) -> Value {
     let actions = action_descriptors();
     let streams = stream_descriptors();
-    let mut domains: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
+    let mut domains: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
     for action in &actions {
         let entry = domains.entry(action.domain.clone()).or_default();
         entry.0 += 1;
-        if action.status == ImplementationStatus::Implemented {
-            entry.1 += 1;
-        }
-        if action.status == ImplementationStatus::BlockedByCustody {
-            entry.2 += 1;
+        match action.status {
+            ImplementationStatus::Implemented => entry.1 += 1,
+            ImplementationStatus::Planned => entry.2 += 1,
+            ImplementationStatus::BlockedByCustody => entry.3 += 1,
         }
     }
     for stream in &streams {
@@ -677,14 +721,17 @@ pub fn coverage_report_value(server_rev: u64, registry_rev: u64) -> Value {
     }
     let domain_rows = domains
         .into_iter()
-        .map(|(domain, (declared, implemented, custody_blocked))| {
-            let mut row = BTreeMap::new();
-            row.insert("domain".into(), Value::Str(domain));
-            row.insert("declared".into(), Value::Int(declared as i64));
-            row.insert("implemented".into(), Value::Int(implemented as i64));
-            row.insert("custody_blocked".into(), Value::Int(custody_blocked as i64));
-            Value::Map(row)
-        })
+        .map(
+            |(domain, (declared, implemented, planned, custody_blocked))| {
+                let mut row = BTreeMap::new();
+                row.insert("domain".into(), Value::Str(domain));
+                row.insert("declared".into(), Value::Int(declared as i64));
+                row.insert("implemented".into(), Value::Int(implemented as i64));
+                row.insert("planned".into(), Value::Int(planned as i64));
+                row.insert("custody_blocked".into(), Value::Int(custody_blocked as i64));
+                Value::Map(row)
+            },
+        )
         .collect();
     let mut root = BTreeMap::new();
     root.insert(
@@ -718,6 +765,397 @@ pub fn descriptor_value(action_id: &str) -> Option<Value> {
         .into_iter()
         .find(|d| d.id == action_id)
         .map(to_value)
+}
+
+/// Return resource type summaries visible through the semantic edit contract.
+pub fn resource_type_list_value() -> Value {
+    Value::List(
+        [
+            resource_type_summary(
+                "config.entry",
+                "Config entry",
+                "config.entries",
+                ACTION_CONFIG_READ,
+                Some(ACTION_CONFIG_WRITE_CAS),
+                ImplementationStatus::Implemented,
+            ),
+            resource_type_summary(
+                "access.user",
+                "Console user",
+                "access.users",
+                ACTION_ACCESS_USER_READ,
+                Some(ACTION_ACCESS_USER_WRITE_CAS),
+                ImplementationStatus::Implemented,
+            ),
+            resource_type_summary(
+                "access.role",
+                "Console role",
+                "access.roles",
+                ACTION_ACCESS_ROLE_READ,
+                Some(ACTION_ACCESS_ROLE_WRITE_CAS),
+                ImplementationStatus::Implemented,
+            ),
+            resource_type_summary(
+                "access.session",
+                "Console session",
+                "access.sessions",
+                ACTION_ACCESS_SESSION_LIST,
+                Some(ACTION_ACCESS_SESSION_REVOKE),
+                ImplementationStatus::Implemented,
+            ),
+            resource_type_summary(
+                "external.installation",
+                "External installation",
+                "external.installations",
+                ACTION_CONFIG_READ,
+                Some(ACTION_EXTERNAL_INSTALLATION_UPDATE),
+                ImplementationStatus::Implemented,
+            ),
+            resource_type_summary(
+                "plan.workflow",
+                "Plan workflow",
+                "plan.workflows",
+                "plans.plan.read",
+                Some("plans.plan.write_cas"),
+                ImplementationStatus::Planned,
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
+/// Return one resource type descriptor encoded as a Nexus value.
+pub fn resource_type_descriptor_value(resource_type: &str) -> Option<Value> {
+    match resource_type {
+        "config.entry" => Some(resource_type_descriptor(
+            "config.entry",
+            "Config entry",
+            "config.entries",
+            ACTION_CONFIG_READ,
+            Some(ACTION_CONFIG_LIST),
+            Some(ACTION_CONFIG_WRITE_CAS),
+            None,
+            ImplementationStatus::Implemented,
+            vec![
+                semantic_contract_field("path", "path", true, "path", "management_state", false),
+                semantic_contract_field(
+                    "value",
+                    "value",
+                    true,
+                    "json_value",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "expected_version",
+                    "u64|null",
+                    false,
+                    "revision",
+                    "public_control",
+                    false,
+                ),
+            ],
+            vec!["path", "expected_version"],
+        )),
+        "access.user" => Some(resource_type_descriptor(
+            "access.user",
+            "Console user",
+            "access.users",
+            ACTION_ACCESS_USER_READ,
+            Some(ACTION_ACCESS_USER_LIST),
+            Some(ACTION_ACCESS_USER_WRITE_CAS),
+            None,
+            ImplementationStatus::Implemented,
+            vec![
+                semantic_contract_field(
+                    "username",
+                    "string",
+                    true,
+                    "resource_ref",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "status",
+                    "string",
+                    false,
+                    "enum",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "roles",
+                    "list<string>",
+                    false,
+                    "resource_ref",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "grants",
+                    "list<string>",
+                    false,
+                    "json_value",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "authn",
+                    "map",
+                    false,
+                    "json_value",
+                    "secret_metadata",
+                    false,
+                ),
+            ],
+            vec!["username", "status"],
+        )),
+        "access.role" => Some(resource_type_descriptor(
+            "access.role",
+            "Console role",
+            "access.roles",
+            ACTION_ACCESS_ROLE_READ,
+            Some(ACTION_ACCESS_ROLE_LIST),
+            Some(ACTION_ACCESS_ROLE_WRITE_CAS),
+            None,
+            ImplementationStatus::Implemented,
+            vec![
+                semantic_contract_field(
+                    "role",
+                    "string",
+                    true,
+                    "resource_ref",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "grants",
+                    "list<string>",
+                    false,
+                    "json_value",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field("frozen", "bool", false, "enum", "management_state", false),
+            ],
+            vec!["role", "frozen"],
+        )),
+        "access.session" => Some(resource_type_descriptor(
+            "access.session",
+            "Console session",
+            "access.sessions",
+            ACTION_ACCESS_SESSION_LIST,
+            Some(ACTION_ACCESS_SESSION_LIST),
+            Some(ACTION_ACCESS_SESSION_REVOKE),
+            None,
+            ImplementationStatus::Implemented,
+            vec![
+                semantic_contract_field(
+                    "sid",
+                    "string",
+                    true,
+                    "resource_ref",
+                    "management_state",
+                    true,
+                ),
+                semantic_contract_field(
+                    "username",
+                    "string",
+                    false,
+                    "resource_ref",
+                    "management_state",
+                    true,
+                ),
+                semantic_contract_field("mfa_level", "u8", false, "enum", "public_control", true),
+                semantic_contract_field(
+                    "expires_at_ms",
+                    "i64",
+                    false,
+                    "duration",
+                    "public_control",
+                    true,
+                ),
+            ],
+            vec!["sid", "username", "mfa_level"],
+        )),
+        "external.installation" => Some(resource_type_descriptor(
+            "external.installation",
+            "External installation",
+            "external.installations",
+            ACTION_CONFIG_READ,
+            None,
+            Some(ACTION_EXTERNAL_INSTALLATION_UPDATE),
+            None,
+            ImplementationStatus::Implemented,
+            vec![
+                semantic_contract_field(
+                    "id",
+                    "string",
+                    true,
+                    "resource_ref",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "def",
+                    "value",
+                    true,
+                    "json_value",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "expected_version",
+                    "u64|null",
+                    false,
+                    "revision",
+                    "public_control",
+                    false,
+                ),
+            ],
+            vec!["id"],
+        )),
+        "plan.workflow" => Some(resource_type_descriptor(
+            "plan.workflow",
+            "Plan workflow",
+            "plan.workflows",
+            "plans.plan.read",
+            Some("plans.plan.list"),
+            Some("plans.plan.write_cas"),
+            Some("plans.plan.validate"),
+            ImplementationStatus::Planned,
+            vec![
+                semantic_contract_field(
+                    "plan",
+                    "string",
+                    true,
+                    "resource_ref",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "graph",
+                    "graph",
+                    true,
+                    "graph_model",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "expected_version",
+                    "u64|null",
+                    false,
+                    "revision",
+                    "public_control",
+                    false,
+                ),
+            ],
+            vec!["plan"],
+        )),
+        _ => None,
+    }
+}
+
+/// Return one fixed resource view descriptor encoded as a Nexus value.
+pub fn resource_view_descriptor_value(view: &str) -> Option<Value> {
+    match view {
+        "config.entries" => Some(resource_view_descriptor(
+            "config.entries",
+            "config.entry",
+            ACTION_CONFIG_LIST,
+            STREAM_STATE_WATCH,
+            vec!["path", "value_kind", "revision"],
+        )),
+        "access.users" => Some(resource_view_descriptor(
+            "access.users",
+            "access.user",
+            ACTION_ACCESS_USER_LIST,
+            STREAM_STATE_WATCH,
+            vec!["username", "status", "mfa_level", "roles"],
+        )),
+        "access.roles" => Some(resource_view_descriptor(
+            "access.roles",
+            "access.role",
+            ACTION_ACCESS_ROLE_LIST,
+            STREAM_STATE_WATCH,
+            vec!["role", "grant_count", "frozen"],
+        )),
+        "access.sessions" => Some(resource_view_descriptor(
+            "access.sessions",
+            "access.session",
+            ACTION_ACCESS_SESSION_LIST,
+            STREAM_AUDIT_FACTS,
+            vec!["sid", "username", "mfa_level", "expires_at_ms"],
+        )),
+        "external.installations" => Some(resource_view_descriptor(
+            "external.installations",
+            "external.installation",
+            ACTION_CONFIG_LIST,
+            STREAM_STATE_WATCH,
+            vec!["id", "status", "proc", "generation"],
+        )),
+        "plan.workflows" => Some(resource_view_descriptor(
+            "plan.workflows",
+            "plan.workflow",
+            "plans.plan.list",
+            STREAM_STATE_WATCH,
+            vec!["plan", "status", "revision"],
+        )),
+        _ => None,
+    }
+}
+
+/// Return one graph type descriptor encoded as a Nexus value.
+pub fn graph_type_descriptor_value(graph_type: &str) -> Option<Value> {
+    if graph_type != "plan.workflow" {
+        return None;
+    }
+    let node_types = Value::List(vec![
+        graph_node_type("input", vec![], vec!["value"], "plans.plan.validate"),
+        graph_node_type(
+            "approval",
+            vec!["request"],
+            vec!["approved", "denied"],
+            "approval.respond",
+        ),
+        graph_node_type(
+            "action",
+            vec!["input"],
+            vec!["output"],
+            "plans.plan.validate",
+        ),
+        graph_node_type(
+            "condition",
+            vec!["input"],
+            vec!["true", "false"],
+            "plans.plan.validate",
+        ),
+        graph_node_type("export", vec!["input"], vec![], "artifacts.export.create"),
+    ]);
+    Some(value_map([
+        ("graph_type", Value::Str("plan.workflow".into())),
+        ("resource_type", Value::Str("plan.workflow".into())),
+        ("status", to_value(ImplementationStatus::Planned)),
+        ("node_types", node_types),
+        (
+            "edge_types",
+            Value::List(vec![value_map([
+                ("edge_type", Value::Str("data".into())),
+                ("compatible_ports", Value::List(vec![Value::Str("value".into()), Value::Str("input".into())])),
+            ])]),
+        ),
+        ("validation_action", Value::Str("plans.plan.validate".into())),
+        ("compile_action", Value::Null),
+        ("apply_action", Value::Str("plans.plan.write_cas".into())),
+        (
+            "notes",
+            Value::List(vec![
+                Value::Str("graph.type.describe is a descriptor only; graph execution still uses fixed actions".into()),
+                Value::Str("no raw operation, raw effect, or raw state node type is allowed".into()),
+            ]),
+        ),
+    ]))
 }
 
 /// Return the secret custody catalog exposed by `secret.catalog`.
@@ -871,6 +1309,117 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             vec![],
             schema("registry.coverage.input", "null", vec![], vec![]),
             schema("registry.coverage.output", "map", vec![], vec![]),
+        ),
+        action(
+            ACTION_RESOURCE_TYPE_LIST,
+            "resource",
+            ActionKind::View,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::ManagementState, false),
+            vec![],
+            schema("resource.type_list.input", "null", vec![], vec![]),
+            schema("resource.type_list.output", "list", vec![], vec![]),
+        ),
+        action(
+            ACTION_RESOURCE_TYPE_DESCRIBE,
+            "resource",
+            ActionKind::View,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::ManagementState, false),
+            vec![],
+            schema(
+                "resource.type_describe.input",
+                "map",
+                vec![semantic_field(
+                    "resource_type",
+                    "string",
+                    true,
+                    "resource_ref",
+                )],
+                vec!["returns semantic edit metadata for one resource type"],
+            ),
+            schema("resource.type_descriptor.output", "map", vec![], vec![]),
+        ),
+        action(
+            ACTION_RESOURCE_VIEW_DESCRIBE,
+            "resource",
+            ActionKind::View,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::ManagementState, false),
+            vec![],
+            schema(
+                "resource.view_describe.input",
+                "map",
+                vec![semantic_field("view", "string", true, "resource_ref")],
+                vec!["returns query/projection metadata for one fixed resource view"],
+            ),
+            schema("resource.view_descriptor.output", "map", vec![], vec![]),
+        ),
+        planned_action(
+            ACTION_CHANGE_SET_CREATE,
+            "change_set",
+            ActionKind::Mutation,
+            vec![
+                semantic_field("base_snapshot_rev", "u64", false, "revision"),
+                semantic_field("registry_rev", "u64", true, "revision"),
+            ],
+            "change_set.create is planned; use domain validate/write_cas actions until it is implemented",
+        ),
+        planned_action(
+            ACTION_CHANGE_SET_UPDATE,
+            "change_set",
+            ActionKind::Mutation,
+            vec![
+                semantic_field("change_set", "value", true, "json_value"),
+                semantic_field("ops", "list<change_op>", true, "json_value"),
+            ],
+            "change_set.update is planned; clients must not treat local drafts as server facts",
+        ),
+        planned_action(
+            ACTION_CHANGE_SET_VALIDATE,
+            "change_set",
+            ActionKind::View,
+            vec![semantic_field("change_set", "value", true, "json_value")],
+            "change_set.validate is planned; use domain-specific validate actions until available",
+        ),
+        planned_action(
+            ACTION_CHANGE_SET_DIFF,
+            "change_set",
+            ActionKind::View,
+            vec![semantic_field("change_set", "value", true, "json_value")],
+            "change_set.diff is planned; clients should compute local redacted diffs as a UX aid",
+        ),
+        planned_action(
+            ACTION_CHANGE_SET_DRY_RUN,
+            "change_set",
+            ActionKind::View,
+            vec![semantic_field("change_set", "value", true, "json_value")],
+            "change_set.dry_run is planned; dry-run results cannot replace apply-time authorization",
+        ),
+        planned_action(
+            ACTION_CHANGE_SET_APPLY,
+            "change_set",
+            ActionKind::Mutation,
+            vec![semantic_field("change_set", "value", true, "json_value")],
+            "change_set.apply is planned; apply must re-run every action gate, MFA, CAS, policy, and audit check",
+        ),
+        planned_action(
+            ACTION_CHANGE_SET_DISCARD,
+            "change_set",
+            ActionKind::Mutation,
+            vec![semantic_field("change_set", "value", true, "json_value")],
+            "change_set.discard is planned; local drafts remain client-side until server support lands",
+        ),
+        action(
+            ACTION_GRAPH_TYPE_DESCRIBE,
+            "graph",
+            ActionKind::View,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::ManagementState, false),
+            vec![],
+            schema(
+                "graph.type_describe.input",
+                "map",
+                vec![semantic_field("graph_type", "string", true, "resource_ref")],
+                vec!["returns node/port/edge metadata for one fixed graph type"],
+            ),
+            schema("graph.type_descriptor.output", "map", vec![], vec![]),
         ),
         action(
             ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE,
@@ -1490,6 +2039,26 @@ fn secret_action(
     d
 }
 
+fn planned_action(
+    id: &str,
+    domain: &str,
+    kind: ActionKind,
+    fields: Vec<FieldDescriptor>,
+    note: &str,
+) -> ActionDescriptor {
+    let mut d = action(
+        id,
+        domain,
+        kind,
+        ActionPolicy::new(RiskLevel::Elevated, VisibilityTier::ManagementState, false),
+        vec![],
+        schema(&format!("{id}.input"), "map", fields, vec![note]),
+        schema(&format!("{id}.output"), "map", vec![], vec![note]),
+    );
+    d.status = ImplementationStatus::Planned;
+    d
+}
+
 fn action(
     id: &str,
     domain: &str,
@@ -1540,6 +2109,22 @@ fn field(name: &str, kind: &str, required: bool) -> FieldDescriptor {
         name: name.into(),
         kind: kind.into(),
         required,
+        stable_id: None,
+        semantic_kind: None,
+        ref_target_type: None,
+        sensitivity: None,
+        read_only: false,
+        computed: false,
+        deprecated: false,
+    }
+}
+
+fn semantic_field(name: &str, kind: &str, required: bool, semantic_kind: &str) -> FieldDescriptor {
+    FieldDescriptor {
+        semantic_kind: Some(semantic_kind.into()),
+        stable_id: Some(name.into()),
+        sensitivity: Some("public_control".into()),
+        ..field(name, kind, required)
     }
 }
 
@@ -1549,6 +2134,197 @@ fn secret_row(path: &str, class: SecretClass, policy: &str) -> Value {
     row.insert("class".into(), to_value(class));
     row.insert("policy".into(), Value::Str(policy.into()));
     Value::Map(row)
+}
+
+fn resource_type_summary(
+    resource_type: &str,
+    title: &str,
+    default_view: &str,
+    read_action: &str,
+    update_action: Option<&str>,
+    status: ImplementationStatus,
+) -> Value {
+    value_map([
+        ("resource_type", Value::Str(resource_type.into())),
+        ("title", Value::Str(title.into())),
+        ("default_view", Value::Str(default_view.into())),
+        ("read_action", Value::Str(read_action.into())),
+        (
+            "update_action",
+            update_action.map_or(Value::Null, |action| Value::Str(action.into())),
+        ),
+        ("status", to_value(status)),
+    ])
+}
+
+fn resource_type_descriptor(
+    resource_type: &str,
+    title: &str,
+    default_view: &str,
+    read_action: &str,
+    list_action: Option<&str>,
+    update_action: Option<&str>,
+    validate_action: Option<&str>,
+    status: ImplementationStatus,
+    fields: Vec<Value>,
+    display_fields: Vec<&str>,
+) -> Value {
+    value_map([
+        ("resource_type", Value::Str(resource_type.into())),
+        ("title", Value::Str(title.into())),
+        ("status", to_value(status)),
+        ("default_view", Value::Str(default_view.into())),
+        ("read_action", Value::Str(read_action.into())),
+        (
+            "list_action",
+            list_action.map_or(Value::Null, |action| Value::Str(action.into())),
+        ),
+        (
+            "update_action",
+            update_action.map_or(Value::Null, |action| Value::Str(action.into())),
+        ),
+        (
+            "validate_action",
+            validate_action.map_or(Value::Null, |action| Value::Str(action.into())),
+        ),
+        ("revision_field", Value::Str("expected_version".into())),
+        ("fields", Value::List(fields)),
+        (
+            "display_fields",
+            Value::List(
+                display_fields
+                    .into_iter()
+                    .map(|field| Value::Str(field.into()))
+                    .collect(),
+            ),
+        ),
+        (
+            "notes",
+            Value::List(vec![Value::Str(
+                "descriptor supplies semantic edit metadata only; every write still calls the fixed action descriptor".into(),
+            )]),
+        ),
+    ])
+}
+
+fn semantic_contract_field(
+    name: &str,
+    kind: &str,
+    required: bool,
+    semantic_kind: &str,
+    sensitivity: &str,
+    read_only: bool,
+) -> Value {
+    value_map([
+        ("name", Value::Str(name.into())),
+        ("kind", Value::Str(kind.into())),
+        ("required", Value::Bool(required)),
+        ("stable_id", Value::Str(name.into())),
+        ("semantic_kind", Value::Str(semantic_kind.into())),
+        ("sensitivity", Value::Str(sensitivity.into())),
+        ("read_only", Value::Bool(read_only)),
+        ("computed", Value::Bool(false)),
+        ("deprecated", Value::Bool(false)),
+    ])
+}
+
+fn resource_view_descriptor(
+    view: &str,
+    resource_type: &str,
+    read_action: &str,
+    refresh_stream: &str,
+    projection_fields: Vec<&str>,
+) -> Value {
+    value_map([
+        ("view", Value::Str(view.into())),
+        ("resource_type", Value::Str(resource_type.into())),
+        ("read_action", Value::Str(read_action.into())),
+        ("query_schema", Value::Str(format!("{view}.query"))),
+        (
+            "projection_schema",
+            Value::Str(format!("{view}.projection")),
+        ),
+        ("pagination", Value::Str("offset_or_cursor".into())),
+        (
+            "filtering",
+            Value::List(vec![
+                Value::Str("domain_fixed".into()),
+                Value::Str("text".into()),
+            ]),
+        ),
+        (
+            "sorting",
+            Value::List(vec![Value::Str("stable_display_field".into())]),
+        ),
+        ("refresh_stream", Value::Str(refresh_stream.into())),
+        (
+            "projection_fields",
+            Value::List(
+                projection_fields
+                    .into_iter()
+                    .map(|field| Value::Str(field.into()))
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn graph_node_type(
+    node_type: &str,
+    input_ports: Vec<&str>,
+    output_ports: Vec<&str>,
+    backing_action: &str,
+) -> Value {
+    value_map([
+        ("node_type", Value::Str(node_type.into())),
+        (
+            "params_schema",
+            Value::Str(format!("graph.plan_workflow.{node_type}.params")),
+        ),
+        (
+            "input_ports",
+            Value::List(
+                input_ports
+                    .into_iter()
+                    .map(|port| graph_port(port, "input"))
+                    .collect(),
+            ),
+        ),
+        (
+            "output_ports",
+            Value::List(
+                output_ports
+                    .into_iter()
+                    .map(|port| graph_port(port, "output"))
+                    .collect(),
+            ),
+        ),
+        ("backing_action", Value::Str(backing_action.into())),
+        ("risk", to_value(RiskLevel::Elevated)),
+    ])
+}
+
+fn graph_port(name: &str, direction: &str) -> Value {
+    value_map([
+        ("name", Value::Str(name.into())),
+        ("direction", Value::Str(direction.into())),
+        ("value_type", Value::Str("value".into())),
+        ("cardinality", Value::Str("one".into())),
+        ("required", Value::Bool(direction == "input")),
+    ])
+}
+
+fn value_map(items: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
+    Value::Map(
+        items
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+    )
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn to_value<T: Serialize>(value: T) -> Value {
@@ -1629,8 +2405,60 @@ mod tests {
             "health",
             "external",
             "pairing",
+            "resource",
+            "change_set",
+            "graph",
         ] {
             assert!(domains.contains(required), "missing domain {required}");
+        }
+    }
+
+    #[test]
+    fn edit_descriptors_are_shape_independent() {
+        let Some(Value::Map(descriptor)) = resource_type_descriptor_value("access.user") else {
+            panic!("missing access.user resource descriptor")
+        };
+        let Some(Value::List(fields)) = descriptor.get("fields") else {
+            panic!("resource descriptor must include fields")
+        };
+        assert!(fields.iter().any(|field| {
+            field.as_map().is_some_and(|map| {
+                matches!(map.get("semantic_kind"), Some(Value::Str(kind)) if kind == "resource_ref")
+            })
+        }));
+        let Some(Value::Map(graph)) = graph_type_descriptor_value("plan.workflow") else {
+            panic!("missing plan.workflow graph descriptor")
+        };
+        assert_eq!(
+            graph.get("status"),
+            Some(&to_value(ImplementationStatus::Planned))
+        );
+        assert!(matches!(graph.get("node_types"), Some(Value::List(nodes)) if !nodes.is_empty()));
+    }
+
+    #[test]
+    fn change_set_actions_are_discoverable_but_planned() {
+        let actions = action_descriptors();
+        for id in [
+            ACTION_CHANGE_SET_CREATE,
+            ACTION_CHANGE_SET_UPDATE,
+            ACTION_CHANGE_SET_VALIDATE,
+            ACTION_CHANGE_SET_DIFF,
+            ACTION_CHANGE_SET_DRY_RUN,
+            ACTION_CHANGE_SET_APPLY,
+            ACTION_CHANGE_SET_DISCARD,
+        ] {
+            let Some(action) = actions.iter().find(|action| action.id == id) else {
+                panic!("missing descriptor {id}")
+            };
+            assert_eq!(action.status, ImplementationStatus::Planned);
+            assert!(
+                action
+                    .input
+                    .fields
+                    .iter()
+                    .all(|field| field.semantic_kind.is_some())
+            );
         }
     }
 

@@ -181,12 +181,22 @@ unsafe relaxation。
 | 动作族 | 示例 |
 | --- | --- |
 | 协议和注册表 | `protocol.describe`、`protocol.registry.snapshot`、`protocol.action_descriptor.get`、`protocol.schema.get` 兼容 alias、`registry.coverage.report` |
+| 资源与编辑描述符 | `resource.type.list`、`resource.type.describe`、`resource.view.describe`、`graph.type.describe` |
 | 授权和可见性 | `authority.principal.effective`、`authority.action.matrix`、`visibility.authority.describe`、`visibility.state.read`、`visibility.state.list` |
 | 敏感值托管 | `secret.catalog`、`secret.reveal` |
 | 状态和配置 | `state.snapshot`、`config.read`、`config.list`、`config.write_cas` |
 | 控制台访问 | `access.user.*`、`access.role.*`、`access.session.*`、`access.session.current.logout` |
 | 运行时、审计和来源链 | `runtime.process.inspect`、`audit.facts.recent`、`lineage.trace.read`、`lineage.fact.read`、`lineage.fact.by_operation`、`health.summary` |
 | 外部程序和配对 | `external.installation.*`、`pairing.create`、`pairing.approve`、`pairing.deny`、`pairing.replace` |
+
+资源和图描述符提供与编辑器形态无关的语义元数据：资源类型、字段、视图、
+revision、关系、图节点类型、port、edge 和校验 hook。它们不指定 UI 组件，
+也不能绕过用于校验、授权、CAS 和审计的固定 action descriptor。
+
+注册表可能发布规划中的 action。当前规划中的编辑 envelope 包括
+`change_set.create`、`change_set.update`、`change_set.validate`、
+`change_set.diff`、`change_set.dry_run`、`change_set.apply` 和
+`change_set.discard`；规划 action 可发现但不可执行。
 
 流：
 
