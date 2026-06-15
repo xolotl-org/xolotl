@@ -26,6 +26,10 @@
 | `/api/auth/key/login` | `POST` | 提交公钥签名并完成登录。 |
 | `/api/auth/step-up` | `POST` | 使用现有 bearer session 提升 MFA 等级。 |
 
+认证路由要求 `Origin` 和 `Host` 请求头。origin 的 host、port 以及可信 forwarded
+scheme 必须匹配控制台 listener 对外可见的 host。公钥登录还要求 JSON 里的 `origin`
+字段与请求 `Origin` 头完全一致；该值会绑定进签名 transcript。
+
 密码登录请求：
 
 ```json
@@ -82,7 +86,7 @@ HTTP 认证错误映射：
 
 - `Origin` 请求头存在且可解析；
 - `Host` 请求头存在；
-- 去掉端口后，origin host 与 host 匹配；
+- origin host 和 port 与对外可见 host 匹配；
 - 存在 `:path` 时，其值为 `/ws`；
 - 来源级连接限制仍有容量。
 
@@ -99,7 +103,7 @@ HTTP 认证错误映射：
 
 ## 会话顺序
 
-推荐客户端顺序：
+客户端必须按以下顺序：
 
 1. 通过 HTTP 登录，保存 `LoginResponse.token`。
 2. 打开控制台 `/ws`。
@@ -111,7 +115,8 @@ HTTP 认证错误映射：
 7. 使用 `ClientFrame::Call { id, call }` 调用动作，或使用
    `ClientFrame::Subscribe { id, stream }` 订阅流。
 
-动作调用、订阅和取消订阅都需要先完成 `Auth`。之后的每个请求在分发前都会重新校验 session id。
+`Auth`、动作调用、订阅和取消订阅都要求先完成 `Hello`。动作调用、订阅和取消订阅还需要先完成
+`Auth`。之后的每个请求在分发前都会重新校验 session id。
 
 ## 客户端帧
 
@@ -149,7 +154,7 @@ HTTP 认证错误映射：
 | `stream` | 流 ID，例如 `state.watch` 或 `audit.facts.stream`。 |
 | `input` | 流过滤条件的 JSON 字符串。 |
 | `scope`、`justification`、`ttl_ms` | 受保护流需要的可见性元数据。 |
-| `since_rev` | 可选恢复游标。 |
+| `since_rev` | 预留游标；当前控制台流是 live-only，传入该字段会被拒绝。 |
 
 ## 服务端帧
 
@@ -168,13 +173,14 @@ HTTP 认证错误映射：
 ## 动作和流
 
 可用动作与流会通过 `ProtocolMetadata` 发布，也可以用 `protocol.describe`
-或 `protocol.registry.snapshot` 获取。
+或 `protocol.registry.snapshot` 获取。这些 metadata 响应会包含 listener 的实际传输安全模式和
+unsafe relaxation。
 
 已实现动作族包括：
 
 | 动作族 | 示例 |
 | --- | --- |
-| 协议和注册表 | `protocol.describe`、`protocol.registry.snapshot`、`protocol.schema.get`、`registry.coverage.report` |
+| 协议和注册表 | `protocol.describe`、`protocol.registry.snapshot`、`protocol.action_descriptor.get`、`protocol.schema.get` 兼容 alias、`registry.coverage.report` |
 | 授权和可见性 | `authority.principal.effective`、`authority.action.matrix`、`visibility.authority.describe`、`visibility.state.read`、`visibility.state.list` |
 | 敏感值托管 | `secret.catalog`、`secret.reveal` |
 | 状态和配置 | `state.snapshot`、`config.read`、`config.list`、`config.write_cas` |

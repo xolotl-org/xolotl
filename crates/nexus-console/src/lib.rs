@@ -80,6 +80,7 @@ async fn api_login(
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, String)> {
     let source = verified_source_addr(&headers, Some(peer), &st.transport_security);
+    validate_http_auth_origin(&st, &headers, Some(peer), &source)?;
     let response = st
         .auth
         .login(&st.boot, body, source)
@@ -95,6 +96,8 @@ async fn api_key_challenge(
     Json(body): Json<KeyChallengeRequest>,
 ) -> Result<Json<KeyChallengeResponse>, (StatusCode, String)> {
     let source = verified_source_addr(&headers, Some(peer), &st.transport_security);
+    let request_origin = validate_http_auth_origin(&st, &headers, Some(peer), &source)?;
+    validate_key_login_origin(&st, &source, &body.origin, &request_origin)?;
     let response = st
         .auth
         .begin_key_login(&st.boot, body, source)
@@ -110,6 +113,8 @@ async fn api_key_login(
     Json(body): Json<KeyLoginRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, String)> {
     let source = verified_source_addr(&headers, Some(peer), &st.transport_security);
+    let request_origin = validate_http_auth_origin(&st, &headers, Some(peer), &source)?;
+    validate_key_login_origin(&st, &source, &body.origin, &request_origin)?;
     let response = st
         .auth
         .finish_key_login(&st.boot, body, source)
@@ -125,6 +130,7 @@ async fn api_step_up(
     Json(body): Json<StepUpRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, String)> {
     let source = verified_source_addr(&headers, Some(peer), &st.transport_security);
+    validate_http_auth_origin(&st, &headers, Some(peer), &source)?;
     let bearer = match auth::bearer_from_headers(&headers) {
         Ok(bearer) => bearer,
         Err(e) => {
@@ -189,6 +195,38 @@ fn record_http_auth_audit(
     });
 }
 
+fn validate_http_auth_origin(
+    st: &Arc<ConsoleState>,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    source: &str,
+) -> Result<String, (StatusCode, String)> {
+    match ws::validate_http_auth_headers(headers, peer, &st.transport_security) {
+        Ok(origin) => Ok(origin),
+        Err(message) => {
+            record_http_auth_audit(st, "console_credential", Some(source), "origin_denied");
+            Err((StatusCode::FORBIDDEN, message))
+        }
+    }
+}
+
+fn validate_key_login_origin(
+    st: &Arc<ConsoleState>,
+    source: &str,
+    body_origin: &str,
+    request_origin: &str,
+) -> Result<(), (StatusCode, String)> {
+    if body_origin.trim() == request_origin {
+        Ok(())
+    } else {
+        record_http_auth_audit(st, "console_credential", Some(source), "origin_mismatch");
+        Err((
+            StatusCode::FORBIDDEN,
+            "public-key login origin must match request origin".into(),
+        ))
+    }
+}
+
 pub(crate) fn auth_error(e: AuthError) -> (StatusCode, String) {
     match &e {
         AuthError::MissingBearer | AuthError::InvalidSession | AuthError::InvalidChallenge => {
@@ -210,11 +248,22 @@ pub(crate) fn auth_error(e: AuthError) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
     use nexus_actors::{StandardConfig, install_standard};
     use nexus_kernel::Bootstrap;
     use nexus_types::{OutcomeRef, Value};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
+
+    fn auth_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("console.local"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://console.local"),
+        );
+        headers
+    }
 
     fn audit_outcomes(st: &ConsoleState, event: &str) -> Vec<String> {
         st.boot
@@ -294,19 +343,82 @@ mod tests {
         let st = ConsoleState::shared(boot);
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
 
-        let err = api_step_up(
+        let result = api_step_up(
             State(st.clone()),
             ConnectInfo(peer),
-            HeaderMap::new(),
+            auth_headers(),
             Json(StepUpRequest {
                 password: None,
                 totp_code: None,
             }),
         )
-        .await
-        .unwrap_err();
+        .await;
+        let err = match result {
+            Ok(_) => {
+                assert!(false, "step-up without bearer must fail");
+                return;
+            }
+            Err(err) => err,
+        };
 
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
         assert!(audit_outcomes(&st, "console_credential").contains(&"missing_bearer".into()));
+    }
+
+    #[tokio::test]
+    async fn http_auth_origin_is_required() {
+        let boot = Arc::new(Bootstrap::in_memory());
+        let st = ConsoleState::shared(boot);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+
+        let result = api_login(
+            State(st.clone()),
+            ConnectInfo(peer),
+            HeaderMap::new(),
+            Json(LoginRequest {
+                username: "root".into(),
+                password: "password".into(),
+                totp_code: None,
+            }),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => {
+                assert!(false, "auth request without origin must fail");
+                return;
+            }
+            Err(err) => err,
+        };
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(audit_outcomes(&st, "console_credential").contains(&"origin_denied".into()));
+    }
+
+    #[tokio::test]
+    async fn key_login_body_origin_must_match_request_origin() {
+        let boot = Arc::new(Bootstrap::in_memory());
+        let st = ConsoleState::shared(boot);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+
+        let result = api_key_challenge(
+            State(st.clone()),
+            ConnectInfo(peer),
+            auth_headers(),
+            Json(KeyChallengeRequest {
+                username: "root".into(),
+                origin: "https://other.local".into(),
+            }),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => {
+                assert!(false, "mismatched key login origin must fail");
+                return;
+            }
+            Err(err) => err,
+        };
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(audit_outcomes(&st, "console_credential").contains(&"origin_mismatch".into()));
     }
 }

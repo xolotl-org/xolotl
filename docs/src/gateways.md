@@ -61,6 +61,8 @@ capacity checks, rate checks, and policy checks pass.
 Console HTTP is limited to health and authentication. Logged-in management uses
 Console WebSocket with authorization, CAS, visibility gates, and audit records.
 
-Console transport security is daemon-owned: `production_tls`,
-`trusted_reverse_proxy`, `local_trusted`, and explicit unsafe modes are
-configured in `[console.transport_security]`.
+Console transport security is daemon-owned and configured in
+`[console.transport_security]`. The current console listener is plain:
+`local_trusted` is valid only on loopback, `trusted_reverse_proxy` is used when
+TLS terminates at a trusted front proxy, and `production_tls` fails closed until
+the console listener has daemon-owned TLS material.

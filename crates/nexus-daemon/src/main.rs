@@ -40,7 +40,9 @@ use nexus_actors::pairing::{
     ExternalCredential, SecureEnvelope, SecureEnvelopeEpochGate, SecureEnvelopeReplayWindow,
 };
 use nexus_actors::{PairingDisplayEdge, StandardConfig, install_standard};
-use nexus_console::{BootstrapOutcome, ConsoleState, RootProvisioning};
+use nexus_console::{
+    BootstrapOutcome, ConsoleState, ConsoleTransportSecurityConfig, RootProvisioning,
+};
 #[cfg(feature = "external-gateway")]
 use nexus_gateway::GatewayTransportSecurityConfig;
 #[cfg(feature = "external-websocket")]
@@ -274,15 +276,18 @@ async fn serve() -> Result<()> {
         .clone()
         .or_else(|| std::env::var(CONSOLE_ADDR_ENV).ok())
     {
-        let listener = TcpListener::bind(&addr).await?;
+        let security = cfg
+            .console
+            .transport_security
+            .validate_plain_listener("console", &addr)?;
+        let listener = TcpListener::bind(security.listen_addr).await?;
+        log_console_transport_security(&addr, &security.config);
         let state = ConsoleState::shared_with_pairing_display_and_config(
             boot.clone(),
             pairing_display.clone(),
             cfg.console.auth.clone().into(),
             cfg.console.ws.clone().into(),
-            cfg.console
-                .transport_security
-                .to_console_transport_security_config()?,
+            security.config,
         );
         tracing::info!(%addr, "console (management Gateway) listening");
         handles.push(tokio::spawn(async move {
@@ -2403,6 +2408,19 @@ fn source_command_error_removes_entry(error: &SourceCommandError) -> bool {
             | SourceCommandError::ResultTooLarge
             | SourceCommandError::Schema(_)
     )
+}
+
+fn log_console_transport_security(addr: &str, config: &ConsoleTransportSecurityConfig) {
+    if config.is_unsafe() {
+        tracing::warn!(
+            %addr,
+            mode = config.mode.as_str(),
+            unsafe_relaxations = ?config.unsafe_relaxation_names(),
+            "console unsafe transport enabled"
+        );
+    } else {
+        tracing::info!(%addr, mode = config.mode.as_str(), "console transport");
+    }
 }
 
 #[cfg(feature = "external-gateway")]

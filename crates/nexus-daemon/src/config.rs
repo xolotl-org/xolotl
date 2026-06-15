@@ -29,9 +29,7 @@ use nexus_gateway_websocket::{
 use serde::Deserialize;
 #[cfg(any(feature = "external-grpc", all(test, feature = "external-gateway")))]
 use std::fs;
-use std::net::IpAddr;
-#[cfg(feature = "external-gateway")]
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
@@ -828,6 +826,12 @@ pub struct ConsoleTransportSecurityTuning {
     pub unsafe_relaxations: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConsoleListenerSecurity {
+    pub listen_addr: SocketAddr,
+    pub config: ConsoleTransportSecurityConfig,
+}
+
 impl Default for ConsoleTransportSecurityTuning {
     fn default() -> Self {
         Self {
@@ -842,7 +846,66 @@ impl Default for ConsoleTransportSecurityTuning {
 }
 
 impl ConsoleTransportSecurityTuning {
+    pub fn validate_plain_listener(
+        &self,
+        label: &str,
+        listen_addr: &str,
+    ) -> Result<ConsoleListenerSecurity> {
+        self.validate_plain_listener_inner(label, listen_addr, cfg!(test))
+    }
+
+    fn validate_plain_listener_inner(
+        &self,
+        label: &str,
+        listen_addr: &str,
+        allow_disabled_for_test: bool,
+    ) -> Result<ConsoleListenerSecurity> {
+        let listen_addr = listen_addr.parse::<SocketAddr>().with_context(|| {
+            format!("{label} listen address '{listen_addr}' must be an IP socket address")
+        })?;
+        let config = self.to_console_transport_security_config_inner(allow_disabled_for_test)?;
+        match config.mode {
+            ConsoleTransportSecurityMode::ProductionTls => {
+                anyhow::bail!(
+                    "{label} production_tls requires a TLS listener; configure trusted_reverse_proxy, local_trusted, or unsafe_plaintext for the current plain listener"
+                );
+            }
+            ConsoleTransportSecurityMode::TrustedReverseProxy => {
+                if config.trusted_proxy.peers.is_empty() {
+                    anyhow::bail!(
+                        "{label} trusted_reverse_proxy requires at least one trusted_proxy_peers entry"
+                    );
+                }
+            }
+            ConsoleTransportSecurityMode::LocalTrusted => {
+                if !listen_addr.ip().is_loopback() {
+                    anyhow::bail!("{label} local_trusted requires a loopback listen address");
+                }
+            }
+            ConsoleTransportSecurityMode::UnsafePlaintext => {}
+            ConsoleTransportSecurityMode::DisabledForTest => {
+                if !allow_disabled_for_test {
+                    anyhow::bail!(
+                        "{label} transport security mode disabled_for_test is only valid in tests"
+                    );
+                }
+            }
+        }
+        Ok(ConsoleListenerSecurity {
+            listen_addr,
+            config,
+        })
+    }
+
+    #[cfg(test)]
     pub fn to_console_transport_security_config(&self) -> Result<ConsoleTransportSecurityConfig> {
+        self.to_console_transport_security_config_inner(cfg!(test))
+    }
+
+    fn to_console_transport_security_config_inner(
+        &self,
+        allow_disabled_for_test: bool,
+    ) -> Result<ConsoleTransportSecurityConfig> {
         let mode = match self.mode.as_str() {
             "production_tls" => ConsoleTransportSecurityMode::ProductionTls,
             "trusted_reverse_proxy" => ConsoleTransportSecurityMode::TrustedReverseProxy,
@@ -851,7 +914,8 @@ impl ConsoleTransportSecurityTuning {
             "disabled_for_test" => ConsoleTransportSecurityMode::DisabledForTest,
             other => anyhow::bail!("unknown console transport security mode '{other}'"),
         };
-        if matches!(mode, ConsoleTransportSecurityMode::DisabledForTest) && !cfg!(test) {
+        if matches!(mode, ConsoleTransportSecurityMode::DisabledForTest) && !allow_disabled_for_test
+        {
             anyhow::bail!(
                 "console transport security mode disabled_for_test is only valid in tests"
             );
@@ -1265,6 +1329,62 @@ mode = "trusted_reverse_proxy"
             .to_console_transport_security_config()
             .unwrap_err();
         assert!(err.to_string().contains("trusted_proxy_peers"));
+    }
+
+    #[test]
+    fn console_plain_listener_rejects_production_tls() {
+        let parsed = toml::from_str::<NexusConfig>(
+            r#"
+[console.transport_security]
+mode = "production_tls"
+"#,
+        );
+        let cfg = match parsed {
+            Ok(cfg) => cfg,
+            Err(error) => {
+                assert!(false, "unexpected config parse error: {error}");
+                return;
+            }
+        };
+
+        let result = cfg
+            .console
+            .transport_security
+            .validate_plain_listener("console", "127.0.0.1:9000");
+        assert!(result.is_err());
+        let message = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(message.contains("production_tls requires a TLS listener"));
+    }
+
+    #[test]
+    fn console_local_trusted_requires_loopback_listener() {
+        let parsed = toml::from_str::<NexusConfig>(
+            r#"
+[console.transport_security]
+mode = "local_trusted"
+"#,
+        );
+        let cfg = match parsed {
+            Ok(cfg) => cfg,
+            Err(error) => {
+                assert!(false, "unexpected config parse error: {error}");
+                return;
+            }
+        };
+
+        let result = cfg
+            .console
+            .transport_security
+            .validate_plain_listener("console", "0.0.0.0:9000");
+        assert!(result.is_err());
+        let message = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(message.contains("local_trusted requires a loopback listen address"));
     }
 
     #[test]

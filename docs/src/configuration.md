@@ -145,11 +145,14 @@ Console transport security is configured separately:
 
 ```toml
 [console.transport_security]
-mode = "production_tls"
+mode = "local_trusted"
 ```
 
-The default production mode is `production_tls`. Use `trusted_reverse_proxy`
-when TLS terminates at a trusted front proxy.
+The daemon console listener is currently a plain listener. Use `local_trusted`
+only with a loopback `console_addr`, or use `trusted_reverse_proxy` when TLS
+terminates at a trusted front proxy and `trusted_proxy_peers` lists the direct
+proxy peer addresses. `production_tls` fails closed for this listener until
+daemon-owned console TLS material is configured.
 
 ## Runtime Configuration
 

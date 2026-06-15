@@ -83,11 +83,12 @@ global_session_limit = 10000
 # argon2_concurrency defaults to available CPU parallelism.
 # argon2_concurrency = 4
 
-# Optional Console transport security. Defaults to production_tls semantics.
-# If TLS is terminated by nginx/Caddy/Envoy/Ingress, use trusted_reverse_proxy
-# and list the proxy peer(s). Only those peers may supply X-Forwarded-* headers.
+# Optional Console transport security. The daemon console listener is plain.
+# Use local_trusted for loopback-only development, or trusted_reverse_proxy when
+# nginx/Caddy/Envoy/Ingress terminates TLS. production_tls fails closed here
+# until the console listener is configured with daemon-owned TLS material.
 [console.transport_security]
-mode = "production_tls" # production_tls | trusted_reverse_proxy | local_trusted | unsafe_plaintext | disabled_for_test
+mode = "local_trusted" # production_tls | trusted_reverse_proxy | local_trusted | unsafe_plaintext | disabled_for_test
 # trusted_proxy_peers = ["127.0.0.1"]
 # honor_x_forwarded_proto = true
 # honor_x_forwarded_host = true

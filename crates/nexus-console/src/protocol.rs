@@ -19,8 +19,10 @@ pub const WIRE_ENCODING: &str = "msgpack+nexus-console-v1";
 pub const ACTION_PROTOCOL_DESCRIBE: &str = "protocol.describe";
 /// Return a registry snapshot for clients that cache descriptors.
 pub const ACTION_PROTOCOL_REGISTRY_SNAPSHOT: &str = "protocol.registry.snapshot";
-/// Return one schema descriptor by id.
+/// Return one action descriptor by action id.
 pub const ACTION_PROTOCOL_SCHEMA_GET: &str = "protocol.schema.get";
+/// Return one action descriptor by action id.
+pub const ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET: &str = "protocol.action_descriptor.get";
 /// Return action/stream coverage status by domain.
 pub const ACTION_REGISTRY_COVERAGE_REPORT: &str = "registry.coverage.report";
 /// Return the caller's effective principal and authority.
@@ -166,7 +168,7 @@ pub struct StreamCall {
     /// Optional temporary authority duration for scoped streaming.
     #[serde(default)]
     pub ttl_ms: Option<u64>,
-    /// Optional state/fact revision cursor for resume.
+    /// Reserved revision cursor; current console streams are live-only.
     #[serde(default)]
     pub since_rev: Option<u64>,
 }
@@ -615,9 +617,40 @@ pub fn protocol_metadata(server_rev: u64, registry_rev: u64) -> ProtocolMetadata
     }
 }
 
+/// Build protocol metadata for a concrete console listener.
+pub fn protocol_metadata_for_transport(
+    server_rev: u64,
+    registry_rev: u64,
+    transport: &crate::state::ConsoleTransportSecurityConfig,
+) -> ProtocolMetadata {
+    let mut metadata = protocol_metadata(server_rev, registry_rev);
+    metadata.transport_security_mode = transport.mode.as_str().into();
+    metadata.unsafe_transport = transport.is_unsafe();
+    metadata.unsafe_transport_relaxations = transport.unsafe_relaxation_names();
+    metadata
+}
+
 /// Build protocol metadata and convert it into a Nexus [`Value`].
 pub fn protocol_metadata_value(server_rev: u64, registry_rev: u64) -> Value {
     to_value(protocol_metadata(server_rev, registry_rev))
+}
+
+/// Build concrete-listener protocol metadata and convert it into a Nexus [`Value`].
+pub fn protocol_metadata_value_for_transport(
+    server_rev: u64,
+    registry_rev: u64,
+    transport: &crate::state::ConsoleTransportSecurityConfig,
+) -> Value {
+    to_value(protocol_metadata_for_transport(
+        server_rev,
+        registry_rev,
+        transport,
+    ))
+}
+
+/// Convert protocol metadata into a Nexus [`Value`].
+pub fn protocol_metadata_to_value(metadata: ProtocolMetadata) -> Value {
+    to_value(metadata)
 }
 
 /// Build the coverage report view described by the console protocol contract.
@@ -752,6 +785,7 @@ pub fn stream_descriptors() -> Vec<StreamDescriptor> {
                 vec![
                     "vault patterns are rejected and must use secret custody actions",
                     "business-data streams require StreamCall.scope, justification, and ttl_ms",
+                    "StreamCall.since_rev is reserved; current streams are live-only",
                 ],
             ),
             event: schema("stream.state_watch.event", "console_event", vec![], vec![]),
@@ -767,7 +801,10 @@ pub fn stream_descriptors() -> Vec<StreamDescriptor> {
                 "stream.audit_facts.input",
                 "map",
                 vec![field("process", "u64", false)],
-                vec!["audit/fact streams require StreamCall.scope, justification, and ttl_ms"],
+                vec![
+                    "audit/fact streams require StreamCall.scope, justification, and ttl_ms",
+                    "StreamCall.since_rev is reserved; current streams are live-only",
+                ],
             ),
             event: schema("stream.audit_facts.event", "console_event", vec![], vec![]),
         },
@@ -805,7 +842,24 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
                 "protocol.schema_get.input",
                 "map",
                 vec![field("action", "string", true)],
-                vec![],
+                vec![
+                    "compatibility alias for protocol.action_descriptor.get",
+                    "returns an action descriptor, not an arbitrary schema id",
+                ],
+            ),
+            schema("protocol.action_descriptor", "map", vec![], vec![]),
+        ),
+        action(
+            ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET,
+            "protocol",
+            ActionKind::Protocol,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::PublicControl, false),
+            vec![],
+            schema(
+                "protocol.action_descriptor_get.input",
+                "map",
+                vec![field("action", "string", true)],
+                vec!["returns an action descriptor for the supplied action id"],
             ),
             schema("protocol.action_descriptor", "map", vec![], vec![]),
         ),
@@ -1007,7 +1061,10 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
                     field("value", "value", true),
                     field("expected_version", "u64|null", false),
                 ],
-                vec![],
+                vec![
+                    "state://kernel/{console,external,external-installations,external-projections,external-pairings,external-sessions,external-credential-revocations,procs}/** requires MFA step-up",
+                    "prefer dedicated access.*, external.installation.*, and pairing.* actions for typed management writes",
+                ],
             ),
             schema("protocol.empty", "null", vec![], vec![]),
         ),

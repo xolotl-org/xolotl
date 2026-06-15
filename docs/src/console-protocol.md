@@ -30,6 +30,12 @@ Console HTTP routes are provided by `nexus-console::router`:
 | `/api/auth/key/login` | `POST` | Submit the public-key signature and finish login. |
 | `/api/auth/step-up` | `POST` | Raise MFA level for an existing bearer session. |
 
+Authentication routes require `Origin` and `Host` headers. The origin host,
+port, and trusted forwarded scheme must match the externally visible host for
+the console listener. Public-key login additionally requires the JSON `origin`
+field to exactly match the request `Origin` header; that value is bound into the
+signed transcript.
+
 Password login request:
 
 ```json
@@ -87,7 +93,7 @@ checks:
 
 - `Origin` header is present and parseable;
 - `Host` header is present;
-- origin host matches host after port stripping;
+- origin host and port match the externally visible host;
 - `:path`, when present, is `/ws`;
 - source-level connection limits have capacity.
 
@@ -107,7 +113,7 @@ outer MessagePack frame.
 
 ## Session Sequence
 
-Recommended client sequence:
+Required client sequence:
 
 1. Log in through HTTP and keep `LoginResponse.token`.
 2. Open the console WebSocket at `/ws`.
@@ -119,8 +125,9 @@ Recommended client sequence:
 7. Send `ClientFrame::Call { id, call }` for actions, or
    `ClientFrame::Subscribe { id, stream }` for streams.
 
-Calls, subscriptions, and unsubscriptions require successful `Auth`. Each later
-request revalidates the session id before dispatch.
+`Auth`, calls, subscriptions, and unsubscriptions require an accepted `Hello`.
+Calls, subscriptions, and unsubscriptions also require successful `Auth`. Each
+later request revalidates the session id before dispatch.
 
 ## Client Frames
 
@@ -158,7 +165,7 @@ request revalidates the session id before dispatch.
 | `stream` | Stream id, such as `state.watch` or `audit.facts.stream`. |
 | `input` | JSON string for stream filters. |
 | `scope`, `justification`, `ttl_ms` | Visibility metadata required by protected streams. |
-| `since_rev` | Optional resume cursor. |
+| `since_rev` | Reserved cursor; current console streams are live-only and reject it. |
 
 ## Server Frames
 
@@ -177,13 +184,15 @@ request revalidates the session id before dispatch.
 ## Actions And Streams
 
 Available actions and streams are advertised through `ProtocolMetadata` and can
-also be fetched with `protocol.describe` or `protocol.registry.snapshot`.
+also be fetched with `protocol.describe` or `protocol.registry.snapshot`. Those
+metadata responses include the listener's actual transport-security mode and
+unsafe relaxations.
 
 Implemented action families include:
 
 | Family | Examples |
 | --- | --- |
-| Protocol and registry | `protocol.describe`, `protocol.registry.snapshot`, `protocol.schema.get`, `registry.coverage.report` |
+| Protocol and registry | `protocol.describe`, `protocol.registry.snapshot`, `protocol.action_descriptor.get`, `protocol.schema.get` compatibility alias, `registry.coverage.report` |
 | Authority and visibility | `authority.principal.effective`, `authority.action.matrix`, `visibility.authority.describe`, `visibility.state.read`, `visibility.state.list` |
 | Secret custody | `secret.catalog`, `secret.reveal` |
 | State and config | `state.snapshot`, `config.read`, `config.list`, `config.write_cas` |

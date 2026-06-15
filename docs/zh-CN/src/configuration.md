@@ -117,10 +117,13 @@ External WebSocket 是 plain listener。外部 TLS 终止使用 `trusted_reverse
 
 ```toml
 [console.transport_security]
-mode = "production_tls"
+mode = "local_trusted"
 ```
 
-默认生产模式是 `production_tls`。如果 TLS 由可信前置代理终止，使用 `trusted_reverse_proxy`。
+daemon 的控制台 listener 当前是 plain listener。`local_trusted` 只用于 loopback
+`console_addr`；如果 TLS 由可信前置代理终止，使用 `trusted_reverse_proxy`，并在
+`trusted_proxy_peers` 中列出直连代理地址。除非控制台 listener 配置了 daemon
+持有的 TLS material，否则 `production_tls` 会 fail closed。
 
 ## 运行时配置
 

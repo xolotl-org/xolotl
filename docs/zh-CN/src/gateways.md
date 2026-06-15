@@ -47,4 +47,7 @@ Provider ready 后会为该 ready session 注册投影 binding。Source event �
 
 控制台 HTTP 只负责健康检查和认证。登录后的管理功能通过 Console WebSocket 执行，带授权、CAS、可见性门槛和审计记录。
 
-控制台传输安全由 daemon 持有：`production_tls`、`trusted_reverse_proxy`、`local_trusted` 和显式 unsafe mode 通过 `[console.transport_security]` 配置。
+控制台传输安全由 daemon 持有，并通过 `[console.transport_security]` 配置。当前控制台
+listener 是 plain listener：`local_trusted` 只允许 loopback，TLS 在可信前置代理终止时使用
+`trusted_reverse_proxy`，除非控制台 listener 配置了 daemon 持有的 TLS material，否则
+`production_tls` 会 fail closed。

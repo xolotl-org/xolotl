@@ -19,12 +19,13 @@ use crate::protocol::{
     ACTION_EXTERNAL_INSTALLATION_STOP, ACTION_EXTERNAL_INSTALLATION_UPDATE, ACTION_HEALTH_SUMMARY,
     ACTION_LINEAGE_FACT_BY_OPERATION, ACTION_LINEAGE_FACT_READ, ACTION_LINEAGE_TRACE_READ,
     ACTION_PAIRING_APPROVE, ACTION_PAIRING_CREATE, ACTION_PAIRING_DENY, ACTION_PAIRING_REPLACE,
-    ACTION_PROTOCOL_DESCRIBE, ACTION_PROTOCOL_REGISTRY_SNAPSHOT, ACTION_PROTOCOL_SCHEMA_GET,
-    ACTION_REGISTRY_COVERAGE_REPORT, ACTION_RUNTIME_PROCESS_INSPECT, ACTION_SECRET_CATALOG,
-    ACTION_SECRET_REVEAL, ACTION_STATE_SNAPSHOT, ACTION_VISIBILITY_AUTHORITY_DESCRIBE,
-    ACTION_VISIBILITY_STATE_LIST, ACTION_VISIBILITY_STATE_READ, ActionCall, ActionDescriptor,
-    ActionResult, ClientFrame, ConsoleErrorCode, ConsoleEvent, JsonBytes, PrincipalSummary,
-    RequiredAuthority, STREAM_AUDIT_FACTS, STREAM_STATE_WATCH, ServerFrame, StreamCall,
+    ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET, ACTION_PROTOCOL_DESCRIBE,
+    ACTION_PROTOCOL_REGISTRY_SNAPSHOT, ACTION_PROTOCOL_SCHEMA_GET, ACTION_REGISTRY_COVERAGE_REPORT,
+    ACTION_RUNTIME_PROCESS_INSPECT, ACTION_SECRET_CATALOG, ACTION_SECRET_REVEAL,
+    ACTION_STATE_SNAPSHOT, ACTION_VISIBILITY_AUTHORITY_DESCRIBE, ACTION_VISIBILITY_STATE_LIST,
+    ACTION_VISIBILITY_STATE_READ, ActionCall, ActionDescriptor, ActionResult, ClientFrame,
+    ConsoleErrorCode, ConsoleEvent, JsonBytes, PrincipalSummary, RequiredAuthority,
+    STREAM_AUDIT_FACTS, STREAM_STATE_WATCH, ServerFrame, StreamCall,
 };
 use crate::state::{
     ConsoleState, ConsoleWsLimit, HARD_MAX_WS_FACT_LIMIT, HARD_MAX_WS_FRAME_BYTES,
@@ -88,6 +89,7 @@ struct WsSession {
     state: Arc<ConsoleState>,
     principal: Option<ConsolePrincipal>,
     sid: Option<String>,
+    hello_accepted: bool,
     source_addr: String,
     counted_user: Option<String>,
     subscriptions: BTreeMap<u64, SubscriptionHandle>,
@@ -151,6 +153,7 @@ async fn session(socket: WebSocket, state: Arc<ConsoleState>, source_addr: Strin
         state,
         principal: None,
         sid: None,
+        hello_accepted: false,
         source_addr,
         counted_user: None,
         subscriptions: BTreeMap::new(),
@@ -289,9 +292,42 @@ fn should_close_after_reply(sess: &WsSession, reply: &ServerFrame) -> bool {
             ))
 }
 
+fn require_hello(sess: &WsSession, id: Option<u64>) -> Option<ServerFrame> {
+    if sess.hello_accepted {
+        None
+    } else {
+        Some(hello_sequence_error(
+            sess,
+            id,
+            "console websocket hello is required before authentication or calls",
+        ))
+    }
+}
+
+fn hello_sequence_error(sess: &WsSession, id: Option<u64>, message: &str) -> ServerFrame {
+    record_ws_audit(
+        &sess.state,
+        sess.principal.as_ref(),
+        Some(&sess.source_addr),
+        "protocol_error",
+    );
+    ServerFrame::Error {
+        id,
+        code: ConsoleErrorCode::BadFrame,
+        message: message.into(),
+    }
+}
+
 async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
     match frame {
         ClientFrame::Hello { hello } => {
+            if sess.hello_accepted {
+                return hello_sequence_error(
+                    sess,
+                    None,
+                    "console websocket hello already accepted",
+                );
+            }
             if hello.protocol_version != protocol::PROTOCOL_VERSION {
                 record_ws_audit(
                     &sess.state,
@@ -329,58 +365,67 @@ async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
                     ),
                 };
             }
+            sess.hello_accepted = true;
             ServerFrame::HelloAccepted {
                 metadata: protocol_metadata(sess),
             }
         }
-        ClientFrame::Auth { token } => match sess
-            .state
-            .auth
-            .authenticate_token(&sess.state.boot, &token)
-            .await
-        {
-            Ok(principal) => {
-                let Some(sid) = bearer_sid(Some(&token)).map(str::to_string) else {
+        ClientFrame::Auth { token } => {
+            if let Some(frame) = require_hello(sess, None) {
+                return frame;
+            }
+            match sess
+                .state
+                .auth
+                .authenticate_token(&sess.state.boot, &token)
+                .await
+            {
+                Ok(principal) => {
+                    let Some(sid) = bearer_sid(Some(&token)).map(str::to_string) else {
+                        record_ws_audit(&sess.state, None, Some(&sess.source_addr), "auth_failed");
+                        return ServerFrame::Error {
+                            id: None,
+                            code: ConsoleErrorCode::Unauthorized,
+                            message: "invalid session".into(),
+                        };
+                    };
+                    if let Err(limit) = sess
+                        .state
+                        .ws
+                        .try_replace_user(sess.counted_user.as_deref(), &principal.username)
+                    {
+                        record_ws_audit(
+                            &sess.state,
+                            Some(&principal),
+                            Some(&sess.source_addr),
+                            "rate_limited",
+                        );
+                        return ServerFrame::Error {
+                            id: None,
+                            code: ConsoleErrorCode::RateLimited,
+                            message: ws_limit_message(limit),
+                        };
+                    }
+                    let summary = PrincipalSummary::from(&principal);
+                    sess.counted_user = Some(principal.username.clone());
+                    sess.principal = Some(principal);
+                    sess.sid = Some(sid);
+                    ServerFrame::Authenticated {
+                        principal: summary,
+                        metadata: protocol_metadata(sess),
+                    }
+                }
+                Err(e) => {
                     record_ws_audit(&sess.state, None, Some(&sess.source_addr), "auth_failed");
-                    return ServerFrame::Error {
-                        id: None,
-                        code: ConsoleErrorCode::Unauthorized,
-                        message: "invalid session".into(),
-                    };
-                };
-                if let Err(limit) = sess
-                    .state
-                    .ws
-                    .try_replace_user(sess.counted_user.as_deref(), &principal.username)
-                {
-                    record_ws_audit(
-                        &sess.state,
-                        Some(&principal),
-                        Some(&sess.source_addr),
-                        "rate_limited",
-                    );
-                    return ServerFrame::Error {
-                        id: None,
-                        code: ConsoleErrorCode::RateLimited,
-                        message: ws_limit_message(limit),
-                    };
-                }
-                let summary = PrincipalSummary::from(&principal);
-                sess.counted_user = Some(principal.username.clone());
-                sess.principal = Some(principal);
-                sess.sid = Some(sid);
-                ServerFrame::Authenticated {
-                    principal: summary,
-                    metadata: protocol_metadata(sess),
+                    auth_error_frame(None, e)
                 }
             }
-            Err(e) => {
-                record_ws_audit(&sess.state, None, Some(&sess.source_addr), "auth_failed");
-                auth_error_frame(None, e)
-            }
-        },
+        }
         ClientFrame::Ping { nonce } => ServerFrame::Pong { nonce },
         ClientFrame::Call { id, call } => {
+            if let Some(frame) = require_hello(sess, Some(id)) {
+                return frame;
+            }
             let principal = match authenticated_principal(sess, Some(id)).await {
                 Ok(p) => p,
                 Err(frame) => return frame,
@@ -399,6 +444,9 @@ async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
             }
         }
         ClientFrame::Subscribe { id, stream } => {
+            if let Some(frame) = require_hello(sess, Some(id)) {
+                return frame;
+            }
             let principal = match authenticated_principal(sess, None).await {
                 Ok(p) => p,
                 Err(frame) => return frame,
@@ -420,6 +468,9 @@ async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
             }
         }
         ClientFrame::Unsubscribe { id } => {
+            if let Some(frame) = require_hello(sess, Some(id)) {
+                return frame;
+            }
             if let Err(frame) = authenticated_principal(sess, Some(id)).await {
                 return frame;
             }
@@ -481,9 +532,9 @@ async fn dispatch_call(
     let action = call.action.clone();
     let out = match action.as_str() {
         ACTION_PROTOCOL_DESCRIBE | ACTION_PROTOCOL_REGISTRY_SNAPSHOT => {
-            protocol::protocol_metadata_value(server_rev(sess), registry_rev(sess))
+            protocol::protocol_metadata_to_value(protocol_metadata(sess))
         }
-        ACTION_PROTOCOL_SCHEMA_GET => {
+        ACTION_PROTOCOL_SCHEMA_GET | ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET => {
             let mut input = input_map(input_value(&call.input)?)?;
             let action_id = string_arg(&mut input, "action")?;
             protocol::descriptor_value(&action_id).ok_or_else(|| {
@@ -2267,30 +2318,47 @@ fn validate_upgrade_headers(
     {
         return Err("unexpected console websocket path".into());
     }
+    validate_origin_headers("console websocket", headers, peer, transport).map(|_| ())
+}
+
+pub(crate) fn validate_http_auth_headers(
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    transport: &crate::ConsoleTransportSecurityConfig,
+) -> Result<String, String> {
+    validate_origin_headers("console http auth", headers, peer, transport)
+}
+
+fn validate_origin_headers(
+    label: &str,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    transport: &crate::ConsoleTransportSecurityConfig,
+) -> Result<String, String> {
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| "console websocket origin header is required".to_string())?;
-    let origin = OriginParts::parse(origin)?;
+        .ok_or_else(|| format!("{label} origin header is required"))?;
+    let parsed_origin = OriginParts::parse(origin, label)?;
     let trusted_proxy = transport.trusts_peer(peer.map(|p| p.ip()));
-    let external_host = external_host(headers, trusted_proxy, transport)?;
-    let external = OriginParts::parse_host(external_host)?;
+    let external_host = external_host(label, headers, trusted_proxy, transport)?;
+    let external = OriginParts::parse_host(external_host, label)?;
 
     if transport.relaxed_origin() {
-        return Ok(());
+        return Ok(origin.into());
     }
-    if !origin.host.eq_ignore_ascii_case(external.host) {
-        return Err("console websocket origin is not allowed".into());
+    if !parsed_origin.host.eq_ignore_ascii_case(external.host) {
+        return Err(format!("{label} origin is not allowed"));
     }
-    if !transport.ignore_origin_port() && origin.port != external.port {
-        return Err("console websocket origin port is not allowed".into());
+    if !transport.ignore_origin_port() && parsed_origin.port != external.port {
+        return Err(format!("{label} origin port is not allowed"));
     }
     if let Some(proto) = external_forwarded_proto(headers, trusted_proxy, transport)
-        && origin.scheme != proto
+        && parsed_origin.scheme != proto
     {
-        return Err("console websocket origin scheme is not allowed".into());
+        return Err(format!("{label} origin scheme is not allowed"));
     }
-    Ok(())
+    Ok(origin.into())
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2301,31 +2369,30 @@ struct OriginParts<'a> {
 }
 
 impl<'a> OriginParts<'a> {
-    fn parse(origin: &'a str) -> Result<Self, String> {
+    fn parse(origin: &'a str, label: &str) -> Result<Self, String> {
         let (scheme, rest) = origin
             .split_once("://")
-            .ok_or_else(|| "console websocket origin is malformed".to_string())?;
+            .ok_or_else(|| format!("{label} origin is malformed"))?;
         if !matches!(scheme, "http" | "https") {
-            return Err("console websocket origin scheme is unsupported".into());
+            return Err(format!("{label} origin scheme is unsupported"));
         }
-        let authority = rest
-            .split('/')
-            .next()
-            .ok_or_else(|| "console websocket origin is malformed".to_string())?;
-        let mut parsed = Self::parse_host(authority)?;
+        if rest.contains('/') {
+            return Err(format!("{label} origin is malformed"));
+        }
+        let mut parsed = Self::parse_host(rest, label)?;
         parsed.scheme = scheme;
         Ok(parsed)
     }
 
-    fn parse_host(authority: &'a str) -> Result<Self, String> {
+    fn parse_host(authority: &'a str, label: &str) -> Result<Self, String> {
         let authority = authority.trim();
         if authority.is_empty() {
-            return Err("console websocket host header is required".into());
+            return Err(format!("{label} host header is required"));
         }
         let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
             let (host, rest) = stripped
                 .split_once(']')
-                .ok_or_else(|| "console websocket host header is malformed".to_string())?;
+                .ok_or_else(|| format!("{label} host header is malformed"))?;
             let port = rest.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
             (host, port)
         } else if let Some((host, port)) = authority.rsplit_once(':') {
@@ -2338,7 +2405,7 @@ impl<'a> OriginParts<'a> {
             (authority, None)
         };
         if host.is_empty() {
-            return Err("console websocket host header is malformed".into());
+            return Err(format!("{label} host header is malformed"));
         }
         Ok(Self {
             scheme: "",
@@ -2349,6 +2416,7 @@ impl<'a> OriginParts<'a> {
 }
 
 fn external_host<'a>(
+    label: &str,
     headers: &'a HeaderMap,
     trusted_proxy: bool,
     transport: &crate::ConsoleTransportSecurityConfig,
@@ -2364,7 +2432,7 @@ fn external_host<'a>(
     headers
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| "console websocket host header is required".to_string())
+        .ok_or_else(|| format!("{label} host header is required"))
 }
 
 fn external_forwarded_proto<'a>(
@@ -2392,11 +2460,11 @@ fn registry_rev(_sess: &WsSession) -> u64 {
 }
 
 fn protocol_metadata(sess: &WsSession) -> protocol::ProtocolMetadata {
-    let mut metadata = protocol::protocol_metadata(server_rev(sess), registry_rev(sess));
-    metadata.transport_security_mode = sess.state.transport_security.mode.as_str().into();
-    metadata.unsafe_transport = sess.state.transport_security.is_unsafe();
-    metadata.unsafe_transport_relaxations = sess.state.transport_security.unsafe_relaxation_names();
-    metadata
+    protocol::protocol_metadata_for_transport(
+        server_rev(sess),
+        registry_rev(sess),
+        &sess.state.transport_security,
+    )
 }
 
 fn ensure_observable_state_path(path: &Path) -> Result<(), ConsoleError> {
@@ -2921,7 +2989,8 @@ fn bearer_sid(bearer: Option<&str>) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::auth::{
-        BootstrapOutcome, LoginRequest, RootProvisioning, StepUpRequest, bootstrap_root_account,
+        BootstrapOutcome, ConsoleAuthConfig, LoginRequest, RootProvisioning, StepUpRequest,
+        bootstrap_root_account,
     };
     use crate::protocol::*;
     use crate::state::{
@@ -3003,6 +3072,7 @@ mod tests {
             state: st,
             principal: Some(principal),
             sid: Some("not-used".into()),
+            hello_accepted: true,
             source_addr: "test".into(),
             counted_user: None,
             subscriptions: BTreeMap::new(),
@@ -3027,6 +3097,7 @@ mod tests {
             state: st,
             principal: None,
             sid: None,
+            hello_accepted: false,
             source_addr: "test".into(),
             counted_user: None,
             subscriptions: BTreeMap::new(),
@@ -3337,9 +3408,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_and_calls_require_accepted_hello() {
+        let st = console_state();
+        let mut sess = unauth_session(st.clone());
+        let reply = handle_frame(
+            &mut sess,
+            ClientFrame::Auth {
+                token: "bad-token".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            reply,
+            ServerFrame::Error {
+                id: None,
+                code: ConsoleErrorCode::BadFrame,
+                ..
+            }
+        ));
+
+        let reply = handle_frame(
+            &mut sess,
+            ClientFrame::Call {
+                id: 42,
+                call: call(ACTION_PROTOCOL_DESCRIBE, Value::Null),
+            },
+        )
+        .await;
+        assert!(matches!(
+            reply,
+            ServerFrame::Error {
+                id: Some(42),
+                code: ConsoleErrorCode::BadFrame,
+                ..
+            }
+        ));
+        assert!(audit_outcomes(&st, "console_ws").contains(&"protocol_error".into()));
+    }
+
+    #[tokio::test]
     async fn unsubscribe_requires_authenticated_session() {
         let st = console_state();
         let mut sess = unauth_session(st);
+        sess.hello_accepted = true;
         let reply = handle_frame(&mut sess, ClientFrame::Unsubscribe { id: 99 }).await;
         assert!(matches!(
             reply,
@@ -3587,6 +3698,62 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(output_value(facts), Value::List(_)));
+    }
+
+    #[tokio::test]
+    async fn protocol_metadata_actions_use_session_transport_security() {
+        let pairing_display = PairingDisplayEdge::default();
+        let boot = Arc::new(Bootstrap::in_memory());
+        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
+        let st = ConsoleState::shared_with_pairing_display_and_config(
+            boot,
+            pairing_display,
+            ConsoleAuthConfig::default(),
+            ConsoleWsConfig::default(),
+            ConsoleTransportSecurityConfig {
+                mode: ConsoleTransportSecurityMode::UnsafePlaintext,
+                ..ConsoleTransportSecurityConfig::default()
+            },
+        );
+        let principal = root_principal();
+        let mut sess = test_session(st, principal.clone());
+        let result = dispatch_call(
+            &mut sess,
+            &principal,
+            call(ACTION_PROTOCOL_DESCRIBE, Value::Null),
+        )
+        .await;
+        let output = match result {
+            Ok(result) => match result.output {
+                Some(output) => match output.try_to_value() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        assert!(false, "metadata output must decode: {error}");
+                        return;
+                    }
+                },
+                None => {
+                    assert!(false, "metadata output is missing");
+                    return;
+                }
+            },
+            Err(error) => {
+                assert!(false, "metadata action failed: {error:?}");
+                return;
+            }
+        };
+        let Some(map) = output.as_map() else {
+            assert!(false, "metadata output must be a map");
+            return;
+        };
+        assert_eq!(
+            map.get("transport_security_mode").and_then(Value::as_str),
+            Some("unsafe_plaintext")
+        );
+        assert_eq!(
+            map.get("unsafe_transport").and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[tokio::test]
@@ -4267,6 +4434,7 @@ mod tests {
             state: st,
             principal: Some(principal.clone()),
             sid: Some("not-used".into()),
+            hello_accepted: true,
             source_addr: "test".into(),
             counted_user: None,
             subscriptions: BTreeMap::new(),
