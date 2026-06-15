@@ -519,10 +519,7 @@ async fn dispatch_call(
                 principal,
                 Some(&sess.source_addr),
                 "secret_reveal_blocked",
-                call.scope.as_deref(),
-                call.justification.as_deref(),
-                call.ttl_ms,
-                None,
+                VisibilityAuditDetails::action(&call, None),
             )?;
             return Err(ConsoleError::BadRequest(
                 "no revealable secret custody backend is registered; non-recoverable and one-time secrets must be reset, rotated, or recreated".into(),
@@ -539,10 +536,7 @@ async fn dispatch_call(
                     principal,
                     Some(&sess.source_addr),
                     "state_read_blocked",
-                    call.scope.as_deref(),
-                    call.justification.as_deref(),
-                    call.ttl_ms,
-                    Some(&target),
+                    VisibilityAuditDetails::action(&call, Some(&target)),
                 )?;
                 return Err(e);
             }
@@ -551,13 +545,9 @@ async fn dispatch_call(
                 principal,
                 Some(&sess.source_addr),
                 "state_read",
-                call.scope.as_deref(),
-                call.justification.as_deref(),
-                call.ttl_ms,
-                Some(&path),
+                VisibilityAuditDetails::action(&call, Some(&path)),
             )?;
-            let out = visibility_state_read(sess, principal, &path).await?;
-            out
+            visibility_state_read(sess, principal, &path).await?
         }
         ACTION_VISIBILITY_STATE_LIST => {
             require_visibility_access(principal, &call)?;
@@ -571,10 +561,7 @@ async fn dispatch_call(
                     principal,
                     Some(&sess.source_addr),
                     "state_list_blocked",
-                    call.scope.as_deref(),
-                    call.justification.as_deref(),
-                    call.ttl_ms,
-                    Some(&target),
+                    VisibilityAuditDetails::action(&call, Some(&target)),
                 )?;
                 return Err(e);
             }
@@ -583,13 +570,9 @@ async fn dispatch_call(
                 principal,
                 Some(&sess.source_addr),
                 "state_list",
-                call.scope.as_deref(),
-                call.justification.as_deref(),
-                call.ttl_ms,
-                Some(&prefix),
+                VisibilityAuditDetails::action(&call, Some(&prefix)),
             )?;
-            let out = visibility_state_list(sess, principal, &prefix, limit).await?;
-            out
+            visibility_state_list(sess, principal, &prefix, limit).await?
         }
         ACTION_STATE_SNAPSHOT => snapshot(sess, principal, &call).await?,
         ACTION_CONFIG_READ => {
@@ -778,12 +761,9 @@ async fn dispatch_call(
                 principal,
                 Some(&sess.source_addr),
                 "runtime_process_inspect",
-                call.scope.as_deref(),
-                call.justification.as_deref(),
-                call.ttl_ms,
-                target.as_deref(),
+                VisibilityAuditDetails::action(&call, target.as_deref()),
             )?;
-            let out = process_inspect(
+            process_inspect(
                 sess,
                 principal,
                 process,
@@ -794,8 +774,7 @@ async fn dispatch_call(
                     HARD_MAX_WS_FACT_LIMIT,
                 ),
             )
-            .await?;
-            out
+            .await?
         }
         ACTION_AUDIT_FACTS_RECENT => {
             require_visibility_access(principal, &call)?;
@@ -810,12 +789,9 @@ async fn dispatch_call(
                 principal,
                 Some(&sess.source_addr),
                 "audit_facts_recent",
-                call.scope.as_deref(),
-                call.justification.as_deref(),
-                call.ttl_ms,
-                Some(&target),
+                VisibilityAuditDetails::action(&call, Some(&target)),
             )?;
-            let out = recent_facts(
+            recent_facts(
                 sess,
                 principal,
                 process,
@@ -825,8 +801,7 @@ async fn dispatch_call(
                     HARD_MAX_WS_FACT_LIMIT,
                 ),
             )
-            .await?;
-            out
+            .await?
         }
         ACTION_LINEAGE_TRACE_READ => {
             require_visibility_access(principal, &call)?;
@@ -840,12 +815,9 @@ async fn dispatch_call(
                 principal,
                 Some(&sess.source_addr),
                 "lineage_trace_read",
-                call.scope.as_deref(),
-                call.justification.as_deref(),
-                call.ttl_ms,
-                Some(&target),
+                VisibilityAuditDetails::action(&call, Some(&target)),
             )?;
-            let out = trace_read(
+            trace_read(
                 sess,
                 principal,
                 process,
@@ -856,8 +828,7 @@ async fn dispatch_call(
                     HARD_MAX_WS_TRACE_LIMIT,
                 ),
             )
-            .await?;
-            out
+            .await?
         }
         ACTION_LINEAGE_FACT_READ | ACTION_LINEAGE_FACT_BY_OPERATION => {
             require_visibility_access(principal, &call)?;
@@ -868,13 +839,9 @@ async fn dispatch_call(
                 principal,
                 Some(&sess.source_addr),
                 "lineage_fact_read",
-                call.scope.as_deref(),
-                call.justification.as_deref(),
-                call.ttl_ms,
-                Some(&format!("operation:{op_id}")),
+                VisibilityAuditDetails::action(&call, Some(&format!("operation:{op_id}"))),
             )?;
-            let out = lineage_fact_read(sess, principal, op_id).await?;
-            out
+            lineage_fact_read(sess, principal, op_id).await?
         }
         ACTION_HEALTH_SUMMARY => health_summary(sess, principal).await?,
         ACTION_EXTERNAL_INSTALLATION_INSTALL | ACTION_EXTERNAL_INSTALLATION_UPDATE => {
@@ -1034,15 +1001,13 @@ async fn subscribe(
             ensure_observable_state_path(&pattern)?;
             auth::authorize_path(&sess.state.state, principal, "subscribe", &pattern, None).await?;
             let mut rx = sess.state.state.subscribe(&pattern).await?;
+            let target = pattern.to_string();
             record_visibility_audit(
                 &sess.state,
                 principal,
                 Some(&sess.source_addr),
                 "state_watch",
-                stream.scope.as_deref(),
-                stream.justification.as_deref(),
-                stream.ttl_ms,
-                Some(&pattern.to_string()),
+                VisibilityAuditDetails::stream(&stream, Some(&target)),
             )?;
             let event_tx = sess.event_tx.clone();
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
@@ -1084,10 +1049,7 @@ async fn subscribe(
                 principal,
                 Some(&sess.source_addr),
                 "audit_facts_stream",
-                stream.scope.as_deref(),
-                stream.justification.as_deref(),
-                stream.ttl_ms,
-                Some(&target),
+                VisibilityAuditDetails::stream(&stream, Some(&target)),
             )?;
             let event_tx = sess.event_tx.clone();
             let state = sess.state.clone();
@@ -1219,10 +1181,7 @@ async fn snapshot(
                         principal,
                         Some(&sess.source_addr),
                         "state_snapshot_runtime_facts",
-                        call.scope.as_deref(),
-                        call.justification.as_deref(),
-                        call.ttl_ms,
-                        Some("runtime.processes"),
+                        VisibilityAuditDetails::action(call, Some("runtime.processes")),
                     )?;
                 }
                 let runtime =
@@ -1900,17 +1859,11 @@ fn bounded_limit(requested: usize, configured: usize, hard: usize) -> usize {
 }
 
 fn usize_to_i64_saturating(value: usize) -> i64 {
-    match i64::try_from(value) {
-        Ok(value) => value,
-        Err(_) => i64::MAX,
-    }
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn u64_to_i64_saturating(value: u64) -> i64 {
-    match i64::try_from(value) {
-        Ok(value) => value,
-        Err(_) => i64::MAX,
-    }
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 async fn send<S>(tx: &mut S, frame: ServerFrame) -> Result<(), ()>
@@ -2114,30 +2067,54 @@ fn record_ws_audit(
     });
 }
 
+struct VisibilityAuditDetails<'a> {
+    scope: Option<&'a str>,
+    justification: Option<&'a str>,
+    ttl_ms: Option<u64>,
+    target: Option<&'a str>,
+}
+
+impl<'a> VisibilityAuditDetails<'a> {
+    fn action(call: &'a ActionCall, target: Option<&'a str>) -> Self {
+        Self {
+            scope: call.scope.as_deref(),
+            justification: call.justification.as_deref(),
+            ttl_ms: call.ttl_ms,
+            target,
+        }
+    }
+
+    fn stream(stream: &'a StreamCall, target: Option<&'a str>) -> Self {
+        Self {
+            scope: stream.scope.as_deref(),
+            justification: stream.justification.as_deref(),
+            ttl_ms: stream.ttl_ms,
+            target,
+        }
+    }
+}
+
 fn record_visibility_audit(
     state: &Arc<ConsoleState>,
     principal: &ConsolePrincipal,
     source_addr: Option<&str>,
     outcome: &'static str,
-    scope: Option<&str>,
-    justification: Option<&str>,
-    ttl_ms: Option<u64>,
-    target: Option<&str>,
+    audit: VisibilityAuditDetails<'_>,
 ) -> Result<(), ConsoleError> {
     let mut details = BTreeMap::new();
-    if let Some(scope) = scope {
+    if let Some(scope) = audit.scope {
         details.insert("scope".into(), Value::Str(scope.to_string()));
     }
-    if let Some(justification) = justification {
+    if let Some(justification) = audit.justification {
         details.insert(
             "justification".into(),
             Value::Str(justification.to_string()),
         );
     }
-    if let Some(ttl_ms) = ttl_ms {
-        details.insert("ttl_ms".into(), Value::Int(ttl_ms as i64));
+    if let Some(ttl_ms) = audit.ttl_ms {
+        details.insert("ttl_ms".into(), Value::Int(u64_to_i64_saturating(ttl_ms)));
     }
-    if let Some(target) = target {
+    if let Some(target) = audit.target {
         details.insert("target".into(), Value::Str(target.to_string()));
     }
     state
@@ -3082,10 +3059,12 @@ mod tests {
             &principal,
             Some("test"),
             "state_read",
-            Some("scope"),
-            Some("justification"),
-            Some(1000),
-            Some("state://chat/source/messages/1"),
+            VisibilityAuditDetails {
+                scope: Some("scope"),
+                justification: Some("justification"),
+                ttl_ms: Some(1000),
+                target: Some("state://chat/source/messages/1"),
+            },
         )
         .unwrap_err();
 

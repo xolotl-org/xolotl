@@ -8,6 +8,9 @@ authors.workspace = true
 repository.workspace = true
 description = "MCP protocol adapter for Nexus"
 
+[lints]
+workspace = true
+
 [dependencies]
 nexus-gateway.workspace = true
 nexus-kernel.workspace = true

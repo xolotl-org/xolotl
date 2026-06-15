@@ -60,7 +60,6 @@ impl RedbStateBackend {
         }
     }
 
-    #[allow(clippy::result_large_err)]
     fn record_history_in_txn(
         &self,
         txn: &redb::WriteTransaction,
@@ -69,7 +68,6 @@ impl RedbStateBackend {
         Self::record_history_at_millis_in_txn(txn, event, self.next_millis())
     }
 
-    #[allow(clippy::result_large_err)]
     fn record_history_at_millis_in_txn(
         txn: &redb::WriteTransaction,
         event: &StateEvent,
@@ -119,10 +117,7 @@ impl RedbStateBackend {
 fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| match i64::try_from(d.as_millis()) {
-            Ok(ms) => ms,
-            Err(_) => i64::MAX,
-        })
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -201,7 +196,6 @@ fn history_key_parts(key: &[u8]) -> StateResult<(Path, i64)> {
 /// in `STATE_VALUES_TABLE`; bare `Value` encodings are rejected so provenance is
 /// never silently dropped. We build the JSON by hand (this crate doesn't depend
 /// on `serde` derive directly).
-#[allow(clippy::result_large_err)]
 fn encode_envelope(value: &Value, taint: &TaintSet) -> Result<Vec<u8>, StateError> {
     let json = serde_json::json!({
         "__nexus_env": 1,
@@ -365,8 +359,8 @@ impl StateBackend for RedbStateBackend {
             if actual != expected {
                 return Err(StateError::CasFailed {
                     path: path.to_string(),
-                    expected,
-                    actual,
+                    expected: expected.map(Box::new),
+                    actual: actual.map(Box::new),
                 });
             }
             let bytes = encode_envelope(&new, &taint)?;

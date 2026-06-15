@@ -29,6 +29,34 @@ pub struct ExecOutput {
     pub output_taint: TaintSet,
 }
 
+/// Execution knobs derived by the executor after handle/open planning.
+#[derive(Clone, Copy, Debug)]
+pub struct ExecuteParams {
+    /// Method bit position used for rights and spawn-derived handles.
+    pub method_index: u32,
+    /// Replay class recorded on the resulting fact.
+    pub replay: nexus_types::ReplayClass,
+    /// Output modes declared by the selected method.
+    pub supports: OutputModeSet,
+    /// Whether list-shaped batches are part of the method contract.
+    pub batchable: bool,
+    /// Wall-clock timestamp assigned to emitted facts.
+    pub now_millis: i64,
+    /// Whether a deterministic operation's fact should be recorded.
+    pub record: bool,
+}
+
+struct CompletedFact<'a> {
+    op: &'a Operation,
+    resource: nexus_types::ResourceId,
+    replay: nexus_types::ReplayClass,
+    now_millis: i64,
+    decision: DecisionTag,
+    outcome: &'a Outcome,
+    taint: &'a TaintSet,
+    batchable: bool,
+}
+
 /// The data plane: a handle table and a fact sink. Shared behind a lock;
 /// the lock is held only for the table lookup, released before the (async)
 /// driver call.
@@ -87,39 +115,22 @@ impl DataPlane {
     ) -> ExecOutput {
         self.execute_batchable(
             op,
-            method_index,
-            replay,
-            supports,
-            false,
-            now_millis,
-            record,
+            ExecuteParams {
+                method_index,
+                replay,
+                supports,
+                batchable: false,
+                now_millis,
+                record,
+            },
         )
         .await
     }
 
     /// Execute one operation while passing the method's `batchable` declaration
     /// into the driver context.
-    pub async fn execute_batchable(
-        &self,
-        op: &Operation,
-        method_index: u32,
-        replay: nexus_types::ReplayClass,
-        supports: OutputModeSet,
-        batchable: bool,
-        now_millis: i64,
-        record: bool,
-    ) -> ExecOutput {
-        self.execute_inner(
-            op,
-            method_index,
-            replay,
-            supports,
-            batchable,
-            now_millis,
-            record,
-            false,
-        )
-        .await
+    pub async fn execute_batchable(&self, op: &Operation, params: ExecuteParams) -> ExecOutput {
+        self.execute_inner(op, params, false).await
     }
 
     /// Record a pre-dispatch denial for an Operation that has already resolved
@@ -142,14 +153,17 @@ impl DataPlane {
     async fn execute_inner(
         &self,
         op: &Operation,
-        method_index: u32,
-        replay: nexus_types::ReplayClass,
-        supports: OutputModeSet,
-        batchable: bool,
-        now_millis: i64,
-        record: bool,
+        params: ExecuteParams,
         async_child: bool,
     ) -> ExecOutput {
+        let ExecuteParams {
+            method_index,
+            replay,
+            supports,
+            batchable,
+            now_millis,
+            record,
+        } = params;
         // Resolve the handle, clone the dispatch plan + fast-path, and capture
         // the resource id — all under a short read lock. The driver call
         // happens after the lock is dropped so concurrent ops on other handles
@@ -315,16 +329,16 @@ impl DataPlane {
                             nexus_types::ReplayClass::IdempotentEffect
                                 | nexus_types::ReplayClass::NonIdempotentEffect
                         ))
-                        && let Err(e) = self.facts.complete(self.completed_fact(
+                        && let Err(e) = self.facts.complete(self.completed_fact(CompletedFact {
                             op,
-                            resolved.resource,
+                            resource: resolved.resource,
                             replay,
                             now_millis,
-                            DecisionTag::Ok,
-                            &short,
-                            &op.taint,
+                            decision: DecisionTag::Ok,
+                            outcome: &short,
+                            taint: &op.taint,
                             batchable,
-                        ))
+                        }))
                     {
                         tracing::error!(?e, op = ?op.id, "idempotent-dedup fact record failed");
                     }
@@ -421,15 +435,7 @@ impl DataPlane {
             _ => {}
         };
         let async_result = if matches!(op.output, OutputMode::AsyncProcess) && !async_child {
-            Some(self.start_async_process(
-                op,
-                method_index,
-                replay,
-                supports,
-                batchable,
-                record,
-                &resolved,
-            ))
+            Some(self.start_async_process(op, params, &resolved))
         } else {
             None
         };
@@ -525,16 +531,16 @@ impl DataPlane {
         // it: log it and let crash recovery reconcile from the begun (fsync'd)
         // pending record. The caller still gets the real outcome.
         if do_record
-            && let Err(e) = self.facts.complete(self.completed_fact(
+            && let Err(e) = self.facts.complete(self.completed_fact(CompletedFact {
                 op,
-                resolved.resource,
+                resource: resolved.resource,
                 replay,
                 now_millis,
                 decision,
-                &outcome,
-                &fact_taint,
+                outcome: &outcome,
+                taint: &fact_taint,
                 batchable,
-            ))
+            }))
         {
             tracing::error!(?e, op = ?op.id, "post-effect fact completion failed; recovery will reconcile");
         }
@@ -593,16 +599,16 @@ impl DataPlane {
         // failures must record a Fact for why-not and retry decisions. A record
         // failure on the deny path is logged; the effect was never issued, so
         // there is nothing unsafe to reconcile.
-        let fact = self.completed_fact(
+        let fact = self.completed_fact(CompletedFact {
             op,
-            resource.unwrap_or_else(|| nexus_types::ResourceId::new(0)),
+            resource: resource.unwrap_or_else(|| nexus_types::ResourceId::new(0)),
             replay,
             now_millis,
-            tag,
-            &Outcome::Fail(failure.clone()),
-            &op.taint,
-            false,
-        );
+            decision: tag,
+            outcome: &Outcome::Fail(failure.clone()),
+            taint: &op.taint,
+            batchable: false,
+        });
         if let Err(e) = self.facts.complete(fact) {
             tracing::error!(?e, op = ?op.id, "deny-path fact record failed");
         }
@@ -637,17 +643,17 @@ impl DataPlane {
         }
     }
 
-    fn completed_fact(
-        &self,
-        op: &Operation,
-        resource: nexus_types::ResourceId,
-        replay: nexus_types::ReplayClass,
-        now_millis: i64,
-        decision: DecisionTag,
-        outcome: &Outcome,
-        taint: &TaintSet,
-        batchable: bool,
-    ) -> Fact {
+    fn completed_fact(&self, input: CompletedFact<'_>) -> Fact {
+        let CompletedFact {
+            op,
+            resource,
+            replay,
+            now_millis,
+            decision,
+            outcome,
+            taint,
+            batchable,
+        } = input;
         let outcome_ref = match outcome {
             Outcome::Done(v) | Outcome::Short(v) => OutcomeRef::of_ref(v),
             Outcome::Fail(_) => OutcomeRef::None,
@@ -736,13 +742,16 @@ impl DataPlane {
     fn start_async_process(
         &self,
         op: &Operation,
-        method_index: u32,
-        replay: nexus_types::ReplayClass,
-        supports: OutputModeSet,
-        batchable: bool,
-        _record: bool,
+        params: ExecuteParams,
         resolved: &Resolved,
     ) -> Outcome {
+        let ExecuteParams {
+            method_index,
+            replay,
+            supports,
+            batchable,
+            ..
+        } = params;
         let Some(processes) = self.processes.clone() else {
             return Outcome::Fail(Failure::policy(
                 "async-process",
@@ -843,12 +852,14 @@ impl DataPlane {
             }
             let outcome = Box::pin(child_dp.execute_inner(
                 &child_op,
-                method_index,
-                replay,
-                supports,
-                batchable,
-                crate::executor::now_millis(),
-                true,
+                ExecuteParams {
+                    method_index,
+                    replay,
+                    supports,
+                    batchable,
+                    now_millis: crate::executor::now_millis(),
+                    record: true,
+                },
                 true,
             ))
             .await
@@ -891,14 +902,18 @@ impl DataPlane {
         });
 
         Outcome::Done(async_ref_value(
-            op.process,
-            child,
-            resolved.resource,
-            op.method,
-            child_handle,
-            &proc_path,
-            &status_path,
-            &outcome_path,
+            AsyncRefMeta {
+                parent: op.process,
+                child,
+                resource: resolved.resource,
+                method: op.method,
+                handle: child_handle,
+            },
+            AsyncRefPaths {
+                proc_path: &proc_path,
+                status_path: &status_path,
+                outcome_path: &outcome_path,
+            },
         ))
     }
 }
@@ -945,29 +960,43 @@ fn async_outcome_path(process: nexus_types::ProcessId) -> Result<Path, nexus_typ
         .try_push("outcome")
 }
 
-fn async_ref_value(
+struct AsyncRefMeta {
     parent: nexus_types::ProcessId,
     child: nexus_types::ProcessId,
     resource: nexus_types::ResourceId,
     method: nexus_types::MethodId,
     handle: nexus_types::HandleId,
-    proc_path: &Path,
-    status_path: &Path,
-    outcome_path: &Path,
-) -> Value {
+}
+
+struct AsyncRefPaths<'a> {
+    proc_path: &'a Path,
+    status_path: &'a Path,
+    outcome_path: &'a Path,
+}
+
+fn async_ref_value(meta: AsyncRefMeta, paths: AsyncRefPaths<'_>) -> Value {
     let mut m = BTreeMap::new();
     m.insert("kind".into(), Value::Str("executor_resource".into()));
-    m.insert("path".into(), Value::Str(proc_path.to_string()));
-    m.insert("parent_process".into(), Value::Int(parent.get() as i64));
-    m.insert("process".into(), Value::Int(child.get() as i64));
-    m.insert("resource".into(), Value::Int(resource.get() as i64));
-    m.insert("method".into(), Value::Int(method.get() as i64));
+    m.insert("path".into(), Value::Str(paths.proc_path.to_string()));
+    m.insert(
+        "parent_process".into(),
+        Value::Int(meta.parent.get() as i64),
+    );
+    m.insert("process".into(), Value::Int(meta.child.get() as i64));
+    m.insert("resource".into(), Value::Int(meta.resource.get() as i64));
+    m.insert("method".into(), Value::Int(meta.method.get() as i64));
     m.insert(
         "handle".into(),
-        Value::Str(format!("{}.{}", handle.index, handle.generation)),
+        Value::Str(format!("{}.{}", meta.handle.index, meta.handle.generation)),
     );
-    m.insert("status_path".into(), Value::Str(status_path.to_string()));
-    m.insert("outcome_path".into(), Value::Str(outcome_path.to_string()));
+    m.insert(
+        "status_path".into(),
+        Value::Str(paths.status_path.to_string()),
+    );
+    m.insert(
+        "outcome_path".into(),
+        Value::Str(paths.outcome_path.to_string()),
+    );
     Value::Map(m)
 }
 
@@ -1384,12 +1413,14 @@ mod tests {
         let out = dp
             .execute_batchable(
                 &op(id, 7, input),
-                0,
-                ReplayClass::Deterministic,
-                SUPPORTS_UNARY,
-                true,
-                0,
-                true,
+                ExecuteParams {
+                    method_index: 0,
+                    replay: ReplayClass::Deterministic,
+                    supports: SUPPORTS_UNARY,
+                    batchable: true,
+                    now_millis: 0,
+                    record: true,
+                },
             )
             .await;
         assert!(matches!(out.outcome, Outcome::Done(Value::List(_))));

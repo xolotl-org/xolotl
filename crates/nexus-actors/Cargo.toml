@@ -8,6 +8,9 @@ authors.workspace = true
 repository.workspace = true
 description = "Standard in-process Drivers and Providers for Nexus"
 
+[lints]
+workspace = true
+
 [dependencies]
 async-trait.workspace = true
 blake3.workspace = true

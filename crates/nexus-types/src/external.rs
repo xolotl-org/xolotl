@@ -189,6 +189,9 @@ pub enum ExternalAdmissionError {
         /// Sink path supplied by the projection.
         actual: Box<Path>,
     },
+    /// Required sandboxed source event sink could not be built.
+    #[error("sandboxed source event sink path is malformed: {0}")]
+    MalformedSandboxEventSinkPath(String),
     /// Provider effect path could not be parsed.
     #[error("provider effect path is malformed: {0}")]
     MalformedEffectPath(String),
@@ -432,16 +435,13 @@ pub fn sandboxed_source_event_sink_path(
 ) -> Result<Path, ExternalAdmissionError> {
     validate_installation_id(installation_id)?;
     validate_projection_id(projection_id)?;
-    Ok(Path::try_new("state")
-        .expect("static scheme is valid")
-        .try_push("events")
-        .expect("static segment is valid")
-        .try_push("external")
-        .expect("static segment is valid")
-        .try_push(installation_id)
-        .expect("validated installation id is a valid path segment")
-        .try_push(projection_id)
-        .expect("validated projection id is a valid path segment"))
+
+    Path::try_new("state")
+        .and_then(|path| path.try_push("events"))
+        .and_then(|path| path.try_push("external"))
+        .and_then(|path| path.try_push(installation_id))
+        .and_then(|path| path.try_push(projection_id))
+        .map_err(|error| ExternalAdmissionError::MalformedSandboxEventSinkPath(error.to_string()))
 }
 
 fn transport_name(t: &Transport) -> &'static str {

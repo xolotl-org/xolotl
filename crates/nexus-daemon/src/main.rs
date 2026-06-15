@@ -81,7 +81,9 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 #[cfg(feature = "external-gateway")]
 use std::collections::btree_map::Entry;
-use std::io::IsTerminal;
+use std::fmt;
+use std::io::{IsTerminal, Write};
+use std::process::ExitCode;
 use std::sync::Arc;
 #[cfg(feature = "external-gateway")]
 use std::time::Duration;
@@ -108,30 +110,62 @@ Usage:
 
 Management is the Web Console's job; the command line only launches.";
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+    match dispatch_main() {
+        Ok(code) => code,
+        Err(error) => {
+            let _ = write_stderr_line(format_args!("nexusd: {error:#}"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn dispatch_main() -> Result<ExitCode> {
     // Command-line dispatch is hand-rolled to keep the daemon's dependency set
     // minimal.
     match std::env::args().nth(1).as_deref() {
         Some("--version") | Some("-V") => {
-            println!("nexusd {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
+            write_stdout_line(format_args!("nexusd {}", env!("CARGO_PKG_VERSION")))?;
+            Ok(ExitCode::SUCCESS)
         }
         Some("--help") | Some("-h") => {
-            println!("{USAGE}");
-            Ok(())
+            write_stdout_line(format_args!("{USAGE}"))?;
+            Ok(ExitCode::SUCCESS)
         }
         Some("info") => {
-            println!("nexus {} runtime kernel", env!("CARGO_PKG_VERSION"));
-            println!("management: Web Console only; the command line only launches the host");
-            Ok(())
+            write_stdout_line(format_args!(
+                "nexus {} runtime kernel",
+                env!("CARGO_PKG_VERSION")
+            ))?;
+            write_stdout_line(format_args!(
+                "management: Web Console only; the command line only launches the host"
+            ))?;
+            Ok(ExitCode::SUCCESS)
         }
         // Default and explicit `up` both launch the host.
-        None | Some("up") => run(),
+        None | Some("up") => {
+            run()?;
+            Ok(ExitCode::SUCCESS)
+        }
         Some(other) => {
-            eprintln!("nexusd: unknown command '{other}'\n\n{USAGE}");
-            std::process::exit(2);
+            write_stderr_line(format_args!("nexusd: unknown command '{other}'\n\n{USAGE}"))?;
+            Ok(ExitCode::from(2))
         }
     }
+}
+
+fn write_stdout_line(args: fmt::Arguments<'_>) -> std::io::Result<()> {
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    stdout.write_fmt(args)?;
+    stdout.write_all(b"\n")
+}
+
+fn write_stderr_line(args: fmt::Arguments<'_>) -> std::io::Result<()> {
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    stderr.write_fmt(args)?;
+    stderr.write_all(b"\n")
 }
 
 /// Launch the long-running host process. Owns the tokio runtime so the
@@ -214,12 +248,7 @@ async fn serve() -> Result<()> {
             tracing::info!(%username, "console root account bootstrapped from config");
         }
         BootstrapOutcome::CreatedRandomPassword { username, password } => {
-            eprintln!();
-            eprintln!("Nexus Console bootstrap account created");
-            eprintln!("username: {username}");
-            eprintln!("password: {password}");
-            eprintln!("Change this password after first login and enable MFA.");
-            eprintln!();
+            write_bootstrap_credentials(&username, &password)?;
         }
     }
 
@@ -278,6 +307,17 @@ async fn serve() -> Result<()> {
     }
     tracing::info!("graceful shutdown");
     Ok(())
+}
+
+fn write_bootstrap_credentials(username: &str, password: &str) -> std::io::Result<()> {
+    write_stderr_line(format_args!(""))?;
+    write_stderr_line(format_args!("Nexus Console bootstrap account created"))?;
+    write_stderr_line(format_args!("username: {username}"))?;
+    write_stderr_line(format_args!("password: {password}"))?;
+    write_stderr_line(format_args!(
+        "Change this password after first login and enable MFA."
+    ))?;
+    write_stderr_line(format_args!(""))
 }
 
 #[cfg(feature = "external-gateway")]
@@ -1103,9 +1143,11 @@ impl DaemonExternalSessionHandler {
                     .get(&key)
                     .is_some_and(|record| record.context == context)
                 {
-                    let record = sessions.remove(&key).expect("provider session present");
+                    let record = sessions.remove(&key);
                     drop(sessions);
-                    self.registry.unregister_endpoint(record.endpoint_id);
+                    if let Some(record) = record {
+                        self.registry.unregister_endpoint(record.endpoint_id);
+                    }
                 } else {
                     drop(sessions);
                 }

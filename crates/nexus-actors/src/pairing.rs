@@ -939,11 +939,7 @@ impl ExternalCredential {
     /// Verify an envelope against this credential: the
     /// installation must match, the generation must be ≥ the valid floor, and
     /// the AEAD tag must verify. Returns plaintext on success.
-    pub fn open<'a>(
-        &self,
-        env: &SecureEnvelope,
-        valid_floor: u64,
-    ) -> Result<Vec<u8>, EnvelopeError> {
+    pub fn open(&self, env: &SecureEnvelope, valid_floor: u64) -> Result<Vec<u8>, EnvelopeError> {
         if env.installation_id != self.installation_id {
             return Err(EnvelopeError::WrongInstallation);
         }

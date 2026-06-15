@@ -768,7 +768,17 @@ impl Executor {
 
         let out = self
             .data_plane
-            .execute_batchable(&op, method_index, replay, supports, batchable, now, record)
+            .execute_batchable(
+                &op,
+                crate::dataplane::ExecuteParams {
+                    method_index,
+                    replay,
+                    supports,
+                    batchable,
+                    now_millis: now,
+                    record,
+                },
+            )
             .await;
 
         // Settle against actual cost. The actual token count is taken

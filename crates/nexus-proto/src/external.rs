@@ -447,13 +447,6 @@ pub enum RejectReason {
 }
 /// Generated server implementations.
 pub mod external_service_server {
-    #![allow(
-        unused_variables,
-        dead_code,
-        missing_docs,
-        clippy::wildcard_imports,
-        clippy::let_unit_value
-    )]
     use tonic::codegen::*;
     /// Generated trait containing gRPC methods that should be implemented for use with ExternalServiceServer.
     #[async_trait]
@@ -535,7 +528,6 @@ pub mod external_service_server {
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
                 "/nexus.v1.external.ExternalService/Session" => {
-                    #[allow(non_camel_case_types)]
                     struct SessionSvc<T: ExternalService>(pub Arc<T>);
                     impl<T: ExternalService>
                         tonic::server::StreamingService<super::ExternalFrame> for SessionSvc<T>
@@ -613,13 +605,6 @@ pub mod external_service_server {
 }
 /// Generated client implementations.
 pub mod external_service_client {
-    #![allow(
-        unused_variables,
-        dead_code,
-        missing_docs,
-        clippy::wildcard_imports,
-        clippy::let_unit_value
-    )]
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
     /// ExternalService client.

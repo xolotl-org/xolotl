@@ -8,6 +8,9 @@ authors.workspace = true
 repository.workspace = true
 description = "gRPC protocol adapter for Nexus"
 
+[lints]
+workspace = true
+
 [dependencies]
 nexus-actors.workspace = true
 nexus-gateway.workspace = true

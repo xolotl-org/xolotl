@@ -1086,13 +1086,15 @@ async fn reserve_source_dedup(
             path,
             pending,
         })),
-        Err(StateError::CasFailed { actual, .. }) => match source_dedup_status(actual.as_ref())? {
-            Some(SourceDedupStatus::Accepted) => Ok(SourceDedupReservation::Duplicate),
-            Some(SourceDedupStatus::Pending) => Err(SourceIngestError::Backpressured),
-            None => Err(SourceIngestError::State(
-                "source dedup reservation changed unexpectedly".into(),
-            )),
-        },
+        Err(StateError::CasFailed { actual, .. }) => {
+            match source_dedup_status(actual.as_deref())? {
+                Some(SourceDedupStatus::Accepted) => Ok(SourceDedupReservation::Duplicate),
+                Some(SourceDedupStatus::Pending) => Err(SourceIngestError::Backpressured),
+                None => Err(SourceIngestError::State(
+                    "source dedup reservation changed unexpectedly".into(),
+                )),
+            }
+        }
         Err(e) => Err(SourceIngestError::State(e.to_string())),
     }
 }

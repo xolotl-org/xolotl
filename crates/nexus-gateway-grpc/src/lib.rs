@@ -362,7 +362,7 @@ where
                 .await?;
             let inner = ext::ExternalFrame::decode(plaintext.as_slice())
                 .map_err(|_| Status::invalid_argument("bad secure envelope payload"))?;
-            validate_secure_external_inner_frame_type(&inner, &frame_type)
+            validate_secure_external_inner_frame_type(&inner, frame_type)
                 .map_err(external_frame_status)?;
             let inner = inner
                 .frame

@@ -119,7 +119,13 @@ pub enum BootstrapError {
     Fact(#[from] crate::FactError),
     /// Writing bootstrap state failed.
     #[error("state write failed: {0}")]
-    State(#[from] nexus_state::StateError),
+    State(#[source] Box<nexus_state::StateError>),
+}
+
+impl From<nexus_state::StateError> for BootstrapError {
+    fn from(source: nexus_state::StateError) -> Self {
+        Self::State(Box::new(source))
+    }
 }
 
 /// Assembly-time method descriptor. Output support is explicit: no

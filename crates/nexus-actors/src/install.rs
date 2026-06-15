@@ -63,7 +63,7 @@ pub struct McpToolMount {
 pub enum InstallError {
     /// Kernel bootstrap registration failed.
     #[error("bootstrap registration failed: {0}")]
-    Bootstrap(#[from] BootstrapError),
+    Bootstrap(#[source] Box<BootstrapError>),
     /// Effect path could not be matched to an internal method descriptor.
     #[error("standard effect path {path:?} has no matching method")]
     MethodNotFound {
@@ -78,6 +78,12 @@ pub enum InstallError {
         /// Invalid segment value.
         segment: String,
     },
+}
+
+impl From<BootstrapError> for InstallError {
+    fn from(source: BootstrapError) -> Self {
+        Self::Bootstrap(Box::new(source))
+    }
 }
 
 impl McpToolMount {

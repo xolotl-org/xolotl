@@ -23,9 +23,9 @@ pub enum StateError {
         /// Canonical path that failed the CAS check.
         path: String,
         /// Value the caller expected to be present before the write.
-        expected: Option<Value>,
+        expected: Option<Box<Value>>,
         /// Value found by the backend at write time.
-        actual: Option<Value>,
+        actual: Option<Box<Value>>,
     },
     /// Serialization or deserialization failed while encoding backend data.
     #[error("serialization: {0}")]

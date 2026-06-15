@@ -156,16 +156,14 @@ impl ProcDriver {
                 "proc {id:?} is already running"
             )));
         }
-        if let Some(Value::Map(status)) = self.read_status(id).await? {
-            match status.get("phase").and_then(Value::as_str) {
-                Some(PHASE_STARTING | PHASE_READY | PHASE_DRAINING) => {
-                    return Err(DriverError::Other(format!(
-                        "proc {id:?} is already in phase {:?}",
-                        status.get("phase").and_then(Value::as_str)
-                    )));
-                }
-                _ => {}
-            }
+        if let Some(Value::Map(status)) = self.read_status(id).await?
+            && let Some(PHASE_STARTING | PHASE_READY | PHASE_DRAINING) =
+                status.get("phase").and_then(Value::as_str)
+        {
+            return Err(DriverError::Other(format!(
+                "proc {id:?} is already in phase {:?}",
+                status.get("phase").and_then(Value::as_str)
+            )));
         }
         Ok(())
     }

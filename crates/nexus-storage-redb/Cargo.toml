@@ -8,6 +8,9 @@ authors.workspace = true
 repository.workspace = true
 description = "redb-backed persistent storage adapters for Nexus state and the FactStore"
 
+[lints]
+workspace = true
+
 [dependencies]
 async-trait.workspace = true
 nexus-kernel.workspace = true

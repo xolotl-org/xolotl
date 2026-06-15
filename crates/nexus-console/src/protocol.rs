@@ -689,27 +689,28 @@ pub fn descriptor_value(action_id: &str) -> Option<Value> {
 
 /// Return the secret custody catalog exposed by `secret.catalog`.
 pub fn secret_catalog_value() -> Value {
-    let mut rows = Vec::new();
-    rows.push(secret_row(
-        "state://vault/console/*/password",
-        SecretClass::NonRecoverableSecret,
-        "password hashes are verifiable, not reversible; root may reset credentials",
-    ));
-    rows.push(secret_row(
-        "state://vault/console/sessions/*",
-        SecretClass::NonRecoverableSecret,
-        "session token hashes are revocable, not revealable",
-    ));
-    rows.push(secret_row(
-        "state://vault/console/*/totp",
-        SecretClass::NonRecoverableSecret,
-        "TOTP seeds are custody secrets; root may rotate/reset",
-    ));
-    rows.push(secret_row(
-        "pairing.display_secret",
-        SecretClass::OneTimeSecret,
-        "pairing display secrets are available only on the create/replace edge",
-    ));
+    let rows = vec![
+        secret_row(
+            "state://vault/console/*/password",
+            SecretClass::NonRecoverableSecret,
+            "password hashes are verifiable, not reversible; root may reset credentials",
+        ),
+        secret_row(
+            "state://vault/console/sessions/*",
+            SecretClass::NonRecoverableSecret,
+            "session token hashes are revocable, not revealable",
+        ),
+        secret_row(
+            "state://vault/console/*/totp",
+            SecretClass::NonRecoverableSecret,
+            "TOTP seeds are custody secrets; root may rotate/reset",
+        ),
+        secret_row(
+            "pairing.display_secret",
+            SecretClass::OneTimeSecret,
+            "pairing display secrets are available only on the create/replace edge",
+        ),
+    ];
     Value::List(rows)
 }
 
@@ -780,9 +781,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_PROTOCOL_DESCRIBE,
             "protocol",
             ActionKind::Protocol,
-            RiskLevel::Low,
-            VisibilityTier::PublicControl,
-            false,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::PublicControl, false),
             vec![],
             schema("protocol.empty", "null", vec![], vec![]),
             schema("protocol.metadata", "map", vec![], vec![]),
@@ -791,9 +790,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_PROTOCOL_REGISTRY_SNAPSHOT,
             "protocol",
             ActionKind::Protocol,
-            RiskLevel::Low,
-            VisibilityTier::PublicControl,
-            false,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::PublicControl, false),
             vec![],
             schema("protocol.empty", "null", vec![], vec![]),
             schema("protocol.metadata", "map", vec![], vec![]),
@@ -802,9 +799,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_PROTOCOL_SCHEMA_GET,
             "protocol",
             ActionKind::Protocol,
-            RiskLevel::Low,
-            VisibilityTier::PublicControl,
-            false,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::PublicControl, false),
             vec![],
             schema(
                 "protocol.schema_get.input",
@@ -818,9 +813,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_REGISTRY_COVERAGE_REPORT,
             "registry",
             ActionKind::View,
-            RiskLevel::Low,
-            VisibilityTier::ManagementState,
-            false,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::ManagementState, false),
             vec![],
             schema("registry.coverage.input", "null", vec![], vec![]),
             schema("registry.coverage.output", "map", vec![], vec![]),
@@ -829,9 +822,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE,
             "authority",
             ActionKind::View,
-            RiskLevel::Low,
-            VisibilityTier::ManagementState,
-            false,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::ManagementState, false),
             vec![],
             schema(
                 "authority.principal_effective.input",
@@ -850,9 +841,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_AUTHORITY_ACTION_MATRIX,
             "authority",
             ActionKind::View,
-            RiskLevel::Low,
-            VisibilityTier::ManagementState,
-            false,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::ManagementState, false),
             vec![],
             schema(
                 "authority.action_matrix.input",
@@ -869,9 +858,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_AUTHORITY_RESOURCE_ACCESS,
             "authority",
             ActionKind::View,
-            RiskLevel::Low,
-            VisibilityTier::ManagementState,
-            false,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::ManagementState, false),
             vec![],
             schema(
                 "authority.resource_access.input",
@@ -885,9 +872,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_AUTHORITY_WHY_DENIED,
             "authority",
             ActionKind::View,
-            RiskLevel::Low,
-            VisibilityTier::ManagementState,
-            false,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::ManagementState, false),
             vec![],
             schema(
                 "authority.why_denied.input",
@@ -901,9 +886,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_VISIBILITY_AUTHORITY_DESCRIBE,
             "visibility",
             ActionKind::Visibility,
-            RiskLevel::Low,
-            VisibilityTier::PublicControl,
-            false,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::PublicControl, false),
             vec![],
             schema("visibility.authority.input", "null", vec![], vec![]),
             schema("visibility.authority.output", "map", vec![], vec![]),
@@ -912,9 +895,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_VISIBILITY_STATE_READ,
             "visibility",
             ActionKind::Visibility,
-            RiskLevel::Elevated,
-            VisibilityTier::BusinessData,
-            true,
+            ActionPolicy::new(RiskLevel::Elevated, VisibilityTier::BusinessData, true),
             vec![authority("read", "state://**")],
             schema(
                 "visibility.state_read.input",
@@ -931,9 +912,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_VISIBILITY_STATE_LIST,
             "visibility",
             ActionKind::Visibility,
-            RiskLevel::Elevated,
-            VisibilityTier::BusinessData,
-            true,
+            ActionPolicy::new(RiskLevel::Elevated, VisibilityTier::BusinessData, true),
             vec![authority("read", "state://**")],
             schema(
                 "visibility.state_list.input",
@@ -951,17 +930,13 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
         ),
         secret_action(
             ACTION_SECRET_CATALOG,
-            RiskLevel::Low,
-            VisibilityTier::SecretMetadata,
-            false,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::SecretMetadata, false),
             None,
             ImplementationStatus::Implemented,
         ),
         secret_action(
             ACTION_SECRET_REVEAL,
-            RiskLevel::BreakGlass,
-            VisibilityTier::SecretPlaintext,
-            true,
+            ActionPolicy::new(RiskLevel::BreakGlass, VisibilityTier::SecretPlaintext, true),
             Some(SecretClass::RevealableSecret),
             ImplementationStatus::BlockedByCustody,
         ),
@@ -969,9 +944,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_STATE_SNAPSHOT,
             "state",
             ActionKind::View,
-            RiskLevel::Elevated,
-            VisibilityTier::ManagementState,
-            false,
+            ActionPolicy::new(RiskLevel::Elevated, VisibilityTier::ManagementState, false),
             vec![
                 authority("read", "state://kernel/**"),
                 authority("perform", "effect://kernel/console/users"),
@@ -996,9 +969,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_CONFIG_READ,
             "config",
             ActionKind::View,
-            RiskLevel::Low,
-            VisibilityTier::ManagementState,
-            false,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::ManagementState, false),
             vec![authority("read", "state://kernel/**")],
             schema(
                 "config.read.input",
@@ -1012,9 +983,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_CONFIG_LIST,
             "config",
             ActionKind::View,
-            RiskLevel::Low,
-            VisibilityTier::ManagementState,
-            false,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::ManagementState, false),
             vec![authority("read", "state://kernel/**")],
             schema(
                 "config.list.input",
@@ -1028,9 +997,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_CONFIG_WRITE_CAS,
             "config",
             ActionKind::Mutation,
-            RiskLevel::Elevated,
-            VisibilityTier::ManagementState,
-            false,
+            ActionPolicy::new(RiskLevel::Elevated, VisibilityTier::ManagementState, false),
             vec![authority("write", "state://kernel/**")],
             schema(
                 "config.write_cas.input",
@@ -1110,9 +1077,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_RUNTIME_PROCESS_INSPECT,
             "runtime",
             ActionKind::View,
-            RiskLevel::Elevated,
-            VisibilityTier::ProtectedPayload,
-            true,
+            ActionPolicy::new(RiskLevel::Elevated, VisibilityTier::ProtectedPayload, true),
             vec![authority("perform", "effect://kernel/process/inspect")],
             schema(
                 "runtime.process_inspect.input",
@@ -1130,9 +1095,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_AUDIT_FACTS_RECENT,
             "audit",
             ActionKind::View,
-            RiskLevel::Elevated,
-            VisibilityTier::ProtectedPayload,
-            true,
+            ActionPolicy::new(RiskLevel::Elevated, VisibilityTier::ProtectedPayload, true),
             vec![authority("read", "state://fact/**")],
             schema(
                 "audit.facts_recent.input",
@@ -1149,9 +1112,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_LINEAGE_TRACE_READ,
             "lineage",
             ActionKind::View,
-            RiskLevel::Elevated,
-            VisibilityTier::ProtectedPayload,
-            true,
+            ActionPolicy::new(RiskLevel::Elevated, VisibilityTier::ProtectedPayload, true),
             vec![authority("read", "state://fact/**")],
             schema(
                 "lineage.trace_read.input",
@@ -1176,9 +1137,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_LINEAGE_FACT_READ,
             "lineage",
             ActionKind::View,
-            RiskLevel::Elevated,
-            VisibilityTier::ProtectedPayload,
-            true,
+            ActionPolicy::new(RiskLevel::Elevated, VisibilityTier::ProtectedPayload, true),
             vec![authority("read", "state://fact/**")],
             schema(
                 "lineage.fact_read.input",
@@ -1199,9 +1158,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_LINEAGE_FACT_BY_OPERATION,
             "lineage",
             ActionKind::View,
-            RiskLevel::Elevated,
-            VisibilityTier::ProtectedPayload,
-            true,
+            ActionPolicy::new(RiskLevel::Elevated, VisibilityTier::ProtectedPayload, true),
             vec![authority("read", "state://fact/**")],
             schema(
                 "lineage.fact_by_operation.input",
@@ -1222,9 +1179,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_HEALTH_SUMMARY,
             "health",
             ActionKind::View,
-            RiskLevel::Low,
-            VisibilityTier::ManagementState,
-            false,
+            ActionPolicy::new(RiskLevel::Low, VisibilityTier::ManagementState, false),
             vec![authority("read", "state://kernel/**")],
             schema("health.summary.input", "null", vec![], vec![]),
             schema("health.summary.output", "map", vec![], vec![]),
@@ -1293,6 +1248,23 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
     ]
 }
 
+#[derive(Clone)]
+struct ActionPolicy {
+    risk: RiskLevel,
+    visibility: VisibilityTier,
+    requires_step_up: bool,
+}
+
+impl ActionPolicy {
+    const fn new(risk: RiskLevel, visibility: VisibilityTier, requires_step_up: bool) -> Self {
+        Self {
+            risk,
+            visibility,
+            requires_step_up,
+        }
+    }
+}
+
 fn access_action(
     id: &str,
     kind: ActionKind,
@@ -1304,13 +1276,15 @@ fn access_action(
         id,
         "access",
         kind,
-        if requires_step_up {
-            RiskLevel::Elevated
-        } else {
-            RiskLevel::Low
-        },
-        VisibilityTier::ManagementState,
-        requires_step_up,
+        ActionPolicy::new(
+            if requires_step_up {
+                RiskLevel::Elevated
+            } else {
+                RiskLevel::Low
+            },
+            VisibilityTier::ManagementState,
+            requires_step_up,
+        ),
         required_authority,
         schema(&format!("{id}.input"), "map", fields, vec![]),
         schema(&format!("{id}.output"), "value", vec![], vec![]),
@@ -1380,9 +1354,11 @@ fn extension_action(
         id,
         "external",
         ActionKind::Mutation,
-        RiskLevel::Elevated,
-        VisibilityTier::ManagementState,
-        requires_step_up,
+        ActionPolicy::new(
+            RiskLevel::Elevated,
+            VisibilityTier::ManagementState,
+            requires_step_up,
+        ),
         required_authority,
         schema(&format!("{id}.input"), "map", fields, vec![]),
         schema(&format!("{id}.output"), "value", vec![], vec![]),
@@ -1419,9 +1395,7 @@ fn pairing_action(id: &str, fields: Vec<FieldDescriptor>) -> ActionDescriptor {
         id,
         "pairing",
         ActionKind::Mutation,
-        RiskLevel::Elevated,
-        VisibilityTier::ManagementState,
-        true,
+        ActionPolicy::new(RiskLevel::Elevated, VisibilityTier::ManagementState, true),
         pairing_authority(id),
         schema(&format!("{id}.input"), "map", fields, vec![]),
         schema(&format!("{id}.output"), "value", vec![], vec![]),
@@ -1441,9 +1415,7 @@ fn pairing_authority(id: &str) -> Vec<RequiredAuthority> {
 
 fn secret_action(
     id: &str,
-    risk: RiskLevel,
-    visibility: VisibilityTier,
-    requires_step_up: bool,
+    policy: ActionPolicy,
     secret_class: Option<SecretClass>,
     status: ImplementationStatus,
 ) -> ActionDescriptor {
@@ -1451,9 +1423,7 @@ fn secret_action(
         id,
         "secret",
         ActionKind::Secret,
-        risk,
-        visibility,
-        requires_step_up,
+        policy,
         vec![],
         schema(&format!("{id}.input"), "map", vec![], vec![]),
         schema(&format!("{id}.output"), "value", vec![], vec![]),
@@ -1467,9 +1437,7 @@ fn action(
     id: &str,
     domain: &str,
     kind: ActionKind,
-    risk: RiskLevel,
-    visibility: VisibilityTier,
-    requires_step_up: bool,
+    policy: ActionPolicy,
     required_authority: Vec<RequiredAuthority>,
     input: SchemaDescriptor,
     output: SchemaDescriptor,
@@ -1478,11 +1446,11 @@ fn action(
         id: id.into(),
         domain: domain.into(),
         kind,
-        risk,
+        risk: policy.risk,
         status: ImplementationStatus::Implemented,
-        visibility,
+        visibility: policy.visibility,
         secret_class: None,
-        requires_step_up,
+        requires_step_up: policy.requires_step_up,
         required_authority,
         input,
         output,

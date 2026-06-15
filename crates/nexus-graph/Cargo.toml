@@ -8,6 +8,9 @@ authors.workspace = true
 repository.workspace = true
 description = "Nexus single execution IR (ExecutionGraph) + Do<A> front-end + Do→Graph compiler"
 
+[lints]
+workspace = true
+
 [dependencies]
 nexus-types.workspace = true
 serde.workspace = true

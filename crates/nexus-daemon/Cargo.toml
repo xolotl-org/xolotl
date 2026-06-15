@@ -8,6 +8,9 @@ authors.workspace = true
 repository.workspace = true
 description = "nexusd — the long-running Nexus host process"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "nexusd"
 path = "src/main.rs"

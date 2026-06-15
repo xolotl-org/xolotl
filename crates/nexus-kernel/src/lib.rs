@@ -45,7 +45,7 @@ pub use bootstrap::{
     Bootstrap, BootstrapError, CompiledRequestGrantTemplate, GatewayAudit, MethodSpec,
     RequestGrantTemplate,
 };
-pub use dataplane::{DataPlane, ExecOutput};
+pub use dataplane::{DataPlane, ExecOutput, ExecuteParams};
 pub use driver::{
     DispatchEntry, Driver, DriverContext, DriverDescriptor, DriverError, DriverPlan, DynDriver,
     EchoDriver, FnDriver,

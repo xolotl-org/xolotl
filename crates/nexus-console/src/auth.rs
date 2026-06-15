@@ -362,10 +362,8 @@ impl ConsoleAuth {
     /// Create an auth service with bounded tuning and a decoy password hash.
     pub fn new(config: ConsoleAuthConfig) -> Self {
         let config = config.bounded();
-        let decoy_phc = match hash_password_with_salt("invalid-password", &[0x42; 16]) {
-            Ok(phc) => phc,
-            Err(_) => String::new(),
-        };
+        let decoy_phc =
+            hash_password_with_salt("invalid-password", &[0x42; 16]).unwrap_or_default();
         Self {
             argon2_slots: Semaphore::new(config.argon2_concurrency),
             config,
@@ -1609,11 +1607,11 @@ impl KeyChallengeRecord {
 async fn read_user(state: &Backend, username: &str) -> Result<Option<UserRecord>, AuthError> {
     validate_username(username)?;
     let path = Path::parse(&format!("{USERS_PREFIX}/{username}"))?;
-    Ok(state
+    state
         .read(&path)
         .await?
         .map(|v| UserRecord::from_value(username, &v))
-        .transpose()?)
+        .transpose()
 }
 
 async fn write_user(state: &Backend, user: &UserRecord) -> Result<(), AuthError> {
@@ -1625,11 +1623,11 @@ async fn write_user(state: &Backend, user: &UserRecord) -> Result<(), AuthError>
 
 async fn read_session(state: &Backend, path: &str) -> Result<Option<SessionRecord>, AuthError> {
     let sid = path.rsplit('/').next().ok_or(AuthError::InvalidSession)?;
-    Ok(state
+    state
         .read(&Path::parse(path)?)
         .await?
         .map(|v| SessionRecord::from_value(sid, &v))
-        .transpose()?)
+        .transpose()
 }
 
 async fn write_session(
@@ -1649,11 +1647,11 @@ async fn read_key_challenge(
 ) -> Result<Option<KeyChallengeRecord>, AuthError> {
     validate_session_id(challenge_id).map_err(|_| AuthError::InvalidChallenge)?;
     let path = key_challenge_path(challenge_id);
-    Ok(state
+    state
         .read(&Path::parse(&path)?)
         .await?
         .map(|v| KeyChallengeRecord::from_value(challenge_id, &v))
-        .transpose()?)
+        .transpose()
 }
 
 async fn write_key_challenge(
@@ -1713,10 +1711,10 @@ async fn sweep_expired_sessions(state: &Backend, now: i64) -> Result<(), AuthErr
             .next()
             .unwrap_or_default()
             .to_string();
-        if let Ok(session) = SessionRecord::from_value(&sid, &value) {
-            if session.expires_at <= now || session.idle_expires_at <= now {
-                revoke_session(state, &sid).await?;
-            }
+        if let Ok(session) = SessionRecord::from_value(&sid, &value)
+            && (session.expires_at <= now || session.idle_expires_at <= now)
+        {
+            revoke_session(state, &sid).await?;
         }
     }
     Ok(())

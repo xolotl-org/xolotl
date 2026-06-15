@@ -2212,9 +2212,9 @@ pub struct GatewaySubmitResult {
 /// Result of admitting the first `SubmitStream` frame.
 pub enum GatewayInputStreamStart {
     /// A new stream request was admitted and chunks may now be delivered.
-    Accepted(GatewayAcceptedInputStream),
+    Accepted(Box<GatewayAcceptedInputStream>),
     /// The idempotency record was already completed; no chunks are needed.
-    Replay(GatewaySubmitResult),
+    Replay(Box<GatewaySubmitResult>),
 }
 
 /// Runtime-owned admission context for one accepted client input stream.
@@ -3399,7 +3399,7 @@ impl GatewayRuntime {
         .await?
         {
             Some(SubmissionIdempotency::Replay(result)) => {
-                return Ok(GatewayInputStreamStart::Replay(*result));
+                return Ok(GatewayInputStreamStart::Replay(result));
             }
             Some(SubmissionIdempotency::Reserved(reservation)) => Some(reservation),
             None => None,
@@ -3472,7 +3472,7 @@ impl GatewayRuntime {
             .await?
             {
                 Some(SubmissionIdempotency::Replay(result)) => {
-                    return Ok(GatewayInputStreamStart::Replay(*result));
+                    return Ok(GatewayInputStreamStart::Replay(result));
                 }
                 Some(SubmissionIdempotency::Reserved(reservation)) => Some(reservation),
                 None => {
@@ -3588,7 +3588,7 @@ impl GatewayRuntime {
                 .await;
             }
         };
-        Ok(GatewayInputStreamStart::Accepted(
+        Ok(GatewayInputStreamStart::Accepted(Box::new(
             GatewayAcceptedInputStream {
                 accepted,
                 open,
@@ -3603,7 +3603,7 @@ impl GatewayRuntime {
                 request_process,
                 executor,
             },
-        ))
+        )))
     }
 
     /// Complete an accepted input stream and run it through the same request
@@ -3672,8 +3672,8 @@ impl GatewayRuntime {
                 .await;
             }
         };
-        if lowered.validate_program_payloads {
-            if let Err(e) = reject_invalid_program_values(
+        if lowered.validate_program_payloads
+            && let Err(e) = reject_invalid_program_values(
                 &lowered.program,
                 lowered.program_provenance.as_ref(),
                 &self.boot.kernel.state,
@@ -3683,14 +3683,13 @@ impl GatewayRuntime {
                 &submission.options,
             )
             .await
-            {
-                return release_submission_idempotency_reservation_and_fail(
-                    &self.boot.kernel.state,
-                    idempotency.as_deref(),
-                    e,
-                )
-                .await;
-            }
+        {
+            return release_submission_idempotency_reservation_and_fail(
+                &self.boot.kernel.state,
+                idempotency.as_deref(),
+                e,
+            )
+            .await;
         }
         if admission.requires_idempotency && idempotency.is_none() {
             return Err(GatewayError::Rejected(
@@ -4061,8 +4060,8 @@ impl Gateway for GatewayRuntime {
                 .await;
             }
         };
-        if lowered.validate_program_payloads {
-            if let Err(e) = reject_invalid_program_values(
+        if lowered.validate_program_payloads
+            && let Err(e) = reject_invalid_program_values(
                 &lowered.program,
                 lowered.program_provenance.as_ref(),
                 &self.boot.kernel.state,
@@ -4072,14 +4071,13 @@ impl Gateway for GatewayRuntime {
                 &submission.options,
             )
             .await
-            {
-                return release_submission_idempotency_reservation_and_fail(
-                    &self.boot.kernel.state,
-                    idempotency.as_ref(),
-                    e,
-                )
-                .await;
-            }
+        {
+            return release_submission_idempotency_reservation_and_fail(
+                &self.boot.kernel.state,
+                idempotency.as_ref(),
+                e,
+            )
+            .await;
         }
         if admission.requires_idempotency && idempotency.is_none() {
             idempotency = match reserve_submission_idempotency_if_present(
@@ -4744,12 +4742,8 @@ fn gateway_budget_charge_for_stream_open(
     options: &SubmitOptions,
     now_ms: i64,
 ) -> Result<GatewayBudgetCharge, GatewayError> {
-    let stream_items = open
-        .max_items
-        .unwrap_or_else(|| limits.max_stream_items as u64);
-    let bytes_in = open
-        .max_bytes
-        .unwrap_or_else(|| limits.max_stream_bytes as u64);
+    let stream_items = open.max_items.unwrap_or(limits.max_stream_items as u64);
+    let bytes_in = open.max_bytes.unwrap_or(limits.max_stream_bytes as u64);
     let declared_inline = stream_items.saturating_mul(open.max_inline_item_bytes);
     let estimated_cost_micro_usd =
         estimate_gateway_stream_cost(boot, surface, bytes_in, stream_items)?;
@@ -9036,7 +9030,7 @@ mod tests {
             Err(GatewayError::Rejected(_))
         ));
 
-        gw.fail_input_stream_submission(stream, "test")
+        gw.fail_input_stream_submission(*stream, "test")
             .await
             .unwrap();
     }
@@ -9071,7 +9065,7 @@ mod tests {
         };
         let accepted = stream.accepted().clone();
         let result = gw
-            .complete_input_stream_submission(stream, Value::Str("stream text".into()), None)
+            .complete_input_stream_submission(*stream, Value::Str("stream text".into()), None)
             .await
             .unwrap();
 

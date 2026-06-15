@@ -7,9 +7,6 @@
 //! `protoc`.
 //! If you change a `.proto`, mirror the change in the matching `.rs` module.
 
-#![allow(clippy::all)]
-#![allow(missing_docs)]
-
 pub mod nexus {
     pub mod v1 {
         include!("common.rs");

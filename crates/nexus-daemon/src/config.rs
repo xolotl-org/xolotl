@@ -119,9 +119,6 @@ pub struct ServerConfig {
     /// External Provider/Source WebSocket listener address.
     #[cfg(feature = "external-websocket")]
     pub external_websocket_addr: Option<String>,
-    /// Reserved for a standalone health endpoint.
-    #[allow(dead_code)]
-    pub health_addr: Option<String>,
 }
 
 #[cfg(feature = "external-gateway")]
@@ -763,7 +760,7 @@ fn ensure_file(path: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "external-gateway")]
 fn clamp_or_default(value: usize, default: usize, hard_max: usize) -> usize {
     if value == 0 {
         default
@@ -772,7 +769,7 @@ fn clamp_or_default(value: usize, default: usize, hard_max: usize) -> usize {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "external-gateway")]
 fn clamp_or_default_u64(value: u64, default: u64, hard_max: u64) -> u64 {
     if value == 0 {
         default

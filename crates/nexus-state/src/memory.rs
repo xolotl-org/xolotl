@@ -170,8 +170,8 @@ impl StateBackend for InMemoryBackend {
         if actual != expected {
             return Err(StateError::CasFailed {
                 path: path.to_string(),
-                expected,
-                actual,
+                expected: expected.map(Box::new),
+                actual: actual.map(Box::new),
             });
         }
         let tv = TaintedValue::new(new.clone(), taint.clone());
