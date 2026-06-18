@@ -42,7 +42,7 @@ pub struct ExecuteParams {
     pub batchable: bool,
     /// Wall-clock timestamp assigned to emitted facts.
     pub now_millis: i64,
-    /// Whether a deterministic operation's fact should be recorded.
+    /// Whether a deterministic operation records a fact.
     pub record: bool,
 }
 
@@ -561,7 +561,7 @@ impl DataPlane {
 
         // Cache a successful IdempotentEffect outcome under its key so a later
         // op with the same key dedupes to it. Failures are not cached —
-        // a retry of a failed idempotent op should re-attempt.
+        // Failed idempotent operations are re-attempted.
         if let Some(key) = idem_key
             && outcome.is_success()
             && let Err(e) = self.write_idempotent_outcome(&key, &outcome).await

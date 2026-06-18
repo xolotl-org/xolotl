@@ -431,7 +431,7 @@ pub enum RejectReason {
 /// Generated server implementations.
 pub mod external_service_server {
     use tonic::codegen::*;
-    /// Generated trait containing gRPC methods that should be implemented for use with ExternalServiceServer.
+    /// Generated trait containing gRPC methods for ExternalServiceServer.
     #[async_trait]
     pub trait ExternalService: std::marker::Send + std::marker::Sync + 'static {
         /// Server streaming response type for the Session method.

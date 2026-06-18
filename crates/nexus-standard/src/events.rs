@@ -27,7 +27,7 @@ pub(crate) const EVENTS_METHODS: &[MethodSpec] = &[
 
 /// Upper bound on events forwarded to one streaming subscriber before the
 /// driver returns, so a subscribe Operation always terminates. A caller
-/// may lower it via `max_events`; long-lived ingest should use a Source.
+/// may lower it via `max_events`; long-lived ingest uses a Source.
 const DEFAULT_STREAM_LIMIT: usize = 1024;
 
 /// Drives the event bus actions.

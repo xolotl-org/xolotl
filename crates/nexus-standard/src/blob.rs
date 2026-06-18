@@ -57,7 +57,7 @@ impl BlobDriver {
     }
 
     /// Drop one persisted reference to `hash`. Returns true when the count
-    /// reached zero and the caller should physically delete the bytes.
+    /// reached zero and the caller deletes the bytes.
     async fn decref(&self, hash: &str) -> Result<bool, DriverError> {
         let path = Self::refcount_path(hash)?;
         loop {

@@ -16,7 +16,7 @@ use std::sync::Arc;
 /// Validates a path's semantic correctness for a given scheme.
 ///
 /// Implementations must be `Send + Sync` (they may be called from any
-/// executor thread). They should be cheap — O(1) in path depth, no I/O.
+/// executor thread) and cheap: O(1) in path depth, with no I/O.
 pub trait PathValidator: Send + Sync + 'static {
     /// Validate `path`. Return `Ok(())` if the path is valid for this
     /// scheme, or a `Failure::PathInvalid` otherwise.

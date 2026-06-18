@@ -92,12 +92,16 @@ Process
 | `nexus-proto` | Protobuf schema 和随仓库提供的 prost/tonic 绑定。 |
 | `nexus-console` | Web 控制台管理动作的 gateway。 |
 | `nexus-daemon` | 长期运行的宿主进程 `nexusd`。 |
-| `nexus-sdk` | 嵌入和测试用便捷导出。 |
+| `nexus-sdk` | 最小嵌入式运行时门面和便捷导出。 |
 | `nexus-plan`, `nexus-sim` | 规划与仿真 crate。 |
 
 `nexus-standard` 使用 Cargo feature 选择要编译的模块。默认 `standard` 会编译标准进程内
 实现。gateway 相关 crate 只启用 `external-session`，其中包含
 external Provider 和 Source endpoint 的 session 处理代码。
+
+`nexus-sdk` 默认只构建最小内存内核。嵌入式宿主通过 `NexusBuilder` 提供自己的状态后端
+和事实记录接收端。标准 Provider 通过 SDK 的 `standard` feature 或 `nexus-standard`
+安装入口接入。
 
 ## 环境要求
 
@@ -157,7 +161,7 @@ transport。
 - `[external_gateway.grpc.transport_security]`：external gRPC 传输边界。
 - `[external_gateway.websocket]`：external WebSocket 的 Provider/Source session 限制。
 - `[external_gateway.websocket.transport]`：WebSocket frame、idle、first-frame 和连接数限制。
-- `[external_gateway.websocket.transport_security]`：external WebSocket plain listener 传输边界。
+- `[external_gateway.websocket.transport_security]`：external WebSocket 明文监听器的传输边界。
 - `[console.*]`：控制台 root 凭据、认证/会话限制、WebSocket 限制和传输安全。
 
 运行时配置、Provider 设置、模型路由、组、绑定、外部程序安装、Provider projection、Source projection 和策略管理状态都属于 Nexus state，并通过 Console WebSocket 管理。
@@ -217,14 +221,14 @@ read://state/memory/alice/thread
 write://state/kernel/config
 ```
 
-路径参数会被拒绝。选项应放进结构化值、显式资源段或策略/配置 state。
+路径参数会被拒绝。选项放进结构化值、显式资源段或策略/配置 state。
 
 ## 开发说明
 
-- 解析、发现、策略源处理和 schema 工作应保持在控制路径。
+- 解析、发现、策略源处理和 schema 工作保持在控制路径。
 - 数据路径只处理已编译 ID、句柄、driver plan、policy snapshot、operation、outcome 和 fact。
-- 外部协议 crate 应保持为 gateway、console 或 kernel runtime API 的薄适配器。
-- 协议变更应同时更新 proto、随仓库绑定、转换、测试、示例和公开文档。
+- 外部协议 crate 保持为 gateway、console 或 kernel runtime API 的薄适配器。
+- 协议变更同时更新 proto、随仓库绑定、转换、测试、示例和公开文档。
 
 ## 许可证
 

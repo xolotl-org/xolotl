@@ -7,7 +7,7 @@
 
 use nexus_graph::{DoNode, OperationTemplate, StepRef};
 use nexus_types::{
-    Capability, OutputMode, Path, PathRegistry, ProcessId, ResourceName, Value, default_registry,
+    OutputMode, Path, PathRegistry, ProcessId, ResourceName, Value, default_registry,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -126,17 +126,6 @@ pub enum Step {
         /// Steps executed under `identity`.
         body: Vec<Step>,
     },
-    /// Spawn a child Process: a kernel Operation on `effect://kernel/spawn`.
-    Spawn {
-        /// Optional identity path for the child process.
-        #[serde(default)]
-        identity: Option<String>,
-        /// Capability literals forming the child capability ceiling.
-        #[serde(default)]
-        capabilities: Vec<String>,
-        /// Child process program body.
-        body: Vec<Step>,
-    },
     /// Resource acquire/use/release idiom: `release` runs on success or failure.
     Bracket {
         /// Step that acquires the resource.
@@ -202,9 +191,6 @@ pub enum PlanError {
     /// A `${name}` binding dependency graph contains a cycle.
     #[error("reference cycle detected involving step: {0}")]
     Cycle(String),
-    /// A capability literal is malformed or targets the wrong path scheme.
-    #[error("invalid capability literal `{0}`: {1}")]
-    Capability(String, String),
     /// A step target path is malformed or uses the wrong scheme for its kind.
     #[error("invalid {kind} target `{target}`: {reason}")]
     Target {
@@ -259,30 +245,10 @@ fn validate_plan(plan: &Plan) -> Result<(), PlanError> {
         validate_step_target(step, &path_registry)?;
     }
 
-    // Acting/spawn identities must be real identity paths, not bare schemes.
+    // Acting identities must be real identity paths, not bare schemes.
     for step in &all {
-        match step {
-            Step::Acting { identity, .. } => {
-                validate_identity_literal("acting identity", identity)?
-            }
-            Step::Spawn {
-                identity: Some(identity),
-                ..
-            } => validate_identity_literal("spawn identity", identity)?,
-            _ => {}
-        }
-    }
-
-    // Spawn capability ceilings must use capability literals, not resource
-    // paths. The kernel spawn path attenuates these again, but Plan compilation
-    // is the first fail-closed boundary.
-    for step in &all {
-        if let Step::Spawn { capabilities, .. } = step {
-            for capability in capabilities {
-                let parsed = Capability::parse(capability)
-                    .map_err(|e| PlanError::Capability(capability.clone(), e.to_string()))?;
-                validate_capability_scheme(capability, &parsed)?;
-            }
+        if let Step::Acting { identity, .. } = step {
+            validate_identity_literal("acting identity", identity)?;
         }
     }
 
@@ -367,33 +333,6 @@ fn validate_identity_literal(kind: &'static str, literal: &str) -> Result<(), Pl
     Ok(())
 }
 
-fn validate_capability_scheme(literal: &str, capability: &Capability) -> Result<(), PlanError> {
-    let Some(expected_scheme) = expected_scheme_for_capability_verb(&capability.verb) else {
-        return Ok(());
-    };
-    if capability.scheme == expected_scheme || capability.scheme == "*" || capability.scheme == "**"
-    {
-        return Ok(());
-    }
-    Err(PlanError::Capability(
-        literal.to_string(),
-        format!(
-            "`{}` capability must target {}://, got {}://",
-            capability.verb, expected_scheme, capability.scheme
-        ),
-    ))
-}
-
-fn expected_scheme_for_capability_verb(verb: &str) -> Option<&'static str> {
-    match verb {
-        "perform" => Some("effect"),
-        "read" | "write" | "subscribe" => Some("state"),
-        "spawn" | "act-as" => Some("process"),
-        "*" => None,
-        _ => None,
-    }
-}
-
 /// DFS three-color cycle detection over the binding dependency graph.
 fn detect_cycle(graph: &BTreeMap<String, Vec<String>>) -> Result<(), PlanError> {
     #[derive(Clone, Copy, PartialEq)]
@@ -443,7 +382,7 @@ fn collect_all_steps<'a>(steps: &'a [Step], out: &mut Vec<&'a Step>) {
                 collect_all_steps(left, out);
                 collect_all_steps(right, out);
             }
-            Step::Acting { body, .. } | Step::Spawn { body, .. } => {
+            Step::Acting { body, .. } => {
                 collect_all_steps(body, out);
             }
             Step::Bracket { acquire, body, .. } => {
@@ -528,9 +467,7 @@ fn independent(a: &Step, b: &Step) -> bool {
 }
 
 /// Whether a step is a plain value step eligible for auto-parallel pairing.
-/// Control steps (`then`/`on_fail`) and compound steps (parallel/race/acting/
-/// spawn/bracket/subscribe) are never auto-paired; this is intentionally
-/// conservative.
+/// Control steps and compound steps are never auto-paired.
 fn is_mergeable(step: &Step) -> bool {
     matches!(
         step,
@@ -649,29 +586,6 @@ fn step_to_do(process: ProcessId, step: &Step) -> Result<DoNode, PlanError> {
         Step::Pure { value } => DoNode::pure(json_to_value(value)),
         Step::Acting { identity, body } => {
             DoNode::acting(Path::parse(identity)?, compile_steps(process, body)?)
-        }
-        Step::Spawn {
-            identity,
-            capabilities,
-            body,
-        } => {
-            // Spawn is a kernel Operation; the child program + start record are
-            // the operation input. The body compiles to a Do<A> carried inline.
-            let mut m = BTreeMap::new();
-            if let Some(id) = identity {
-                m.insert("identity".into(), Value::Str(id.clone()));
-            }
-            m.insert(
-                "capabilities".into(),
-                Value::List(capabilities.iter().map(|c| Value::Str(c.clone())).collect()),
-            );
-            // Serialize the child program so the kernel spawn driver can compile
-            // and run it under the new Process.
-            let child = compile_steps(process, body)?;
-            let child_json =
-                serde_json::to_string(&child).map_err(|e| PlanError::Json(e.to_string()))?;
-            m.insert("program".into(), Value::Str(child_json));
-            op("effect://kernel/spawn", "invoke", Some(Value::Map(m)))?
         }
         Step::Bracket {
             acquire,
@@ -901,74 +815,6 @@ mod tests {
                 if kind == "acting identity" && target == "alice"
             ),
             "acting identity should be rejected"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn spawn_targets_kernel_resource() -> anyhow::Result<()> {
-        let node = compile_test(&plan(vec![Step::Spawn {
-            identity: Some("process://child".into()),
-            capabilities: vec!["perform://effect/x/post".into()],
-            body: vec![Step::Pure {
-                value: serde_json::json!(1),
-            }],
-        }]))?;
-        match node {
-            DoNode::Op(t) => ensure!(
-                t.target.path().to_string() == "effect://kernel/spawn",
-                "unexpected target: {}",
-                t.target.path()
-            ),
-            other => bail!("expected operation node, got {other:?}"),
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn spawn_capabilities_must_be_canonical_literals() -> anyhow::Result<()> {
-        let bad = plan(vec![Step::Spawn {
-            identity: Some("process://child".into()),
-            capabilities: vec!["effect://x/post".into()],
-            body: vec![Step::Pure {
-                value: serde_json::json!(1),
-            }],
-        }]);
-        ensure!(
-            matches!(
-            compile_test(&bad),
-            Err(PlanError::Capability(literal, _)) if literal == "effect://x/post"
-            ),
-            "non-canonical capability should be rejected"
-        );
-
-        let good = plan(vec![Step::Spawn {
-            identity: Some("process://child".into()),
-            capabilities: vec!["perform://effect/x/post".into()],
-            body: vec![Step::Pure {
-                value: serde_json::json!(1),
-            }],
-        }]);
-        compile_test(&good)?;
-        Ok(())
-    }
-
-    #[test]
-    fn spawn_identity_must_be_shaped_path() -> anyhow::Result<()> {
-        let bad = plan(vec![Step::Spawn {
-            identity: Some("child".into()),
-            capabilities: vec!["perform://effect/x/post".into()],
-            body: vec![Step::Pure {
-                value: serde_json::json!(1),
-            }],
-        }]);
-        ensure!(
-            matches!(
-            compile_test(&bad),
-            Err(PlanError::Target { kind, target, .. })
-                if kind == "spawn identity" && target == "child"
-            ),
-            "spawn identity should be rejected"
         );
         Ok(())
     }

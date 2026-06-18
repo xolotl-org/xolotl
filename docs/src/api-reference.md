@@ -37,6 +37,10 @@ For embedding:
 - `nexus-types`
 - `nexus-kernel`
 
+`nexus-sdk` is minimal by default. Use `NexusBuilder` to supply host-owned state
+and fact backends. The SDK `standard` feature exposes the standard in-process
+provider package installation API.
+
 For protocol adapters:
 
 - `nexus-gateway`
@@ -63,7 +67,7 @@ The current public API docs are expected to build without missing-doc warnings:
 RUSTDOCFLAGS='-W missing-docs' cargo doc --workspace --no-deps
 ```
 
-Doc tests should also stay runnable:
+Run doc tests with:
 
 ```sh
 cargo test --doc --workspace

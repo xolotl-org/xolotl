@@ -13,7 +13,22 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::auth::{AuthError, ConsoleAuth, ConsoleAuthConfig};
-use nexus_standard::PairingDisplayEdge;
+
+/// Host-provided sink for one-time pairing display secrets.
+pub trait PairingSecretDisplay: Send + Sync + 'static {
+    /// Consume and remove the display secret for `pairing_id`.
+    fn take_display_secret(&self, pairing_id: &str) -> Option<String>;
+}
+
+/// Empty display sink for hosts without pairing support.
+#[derive(Default)]
+pub struct NoPairingSecretDisplay;
+
+impl PairingSecretDisplay for NoPairingSecretDisplay {
+    fn take_display_secret(&self, _pairing_id: &str) -> Option<String> {
+        None
+    }
+}
 
 /// Default maximum WebSocket frame size.
 pub const DEFAULT_WS_MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -99,7 +114,7 @@ pub struct ConsoleState {
     /// Authentication service.
     pub(crate) auth: ConsoleAuth,
     /// One-time pairing display edge.
-    pub(crate) pairing_display: PairingDisplayEdge,
+    pub(crate) pairing_display: Arc<dyn PairingSecretDisplay>,
     /// WebSocket runtime limits and counters.
     pub(crate) ws: ConsoleWsRuntime,
     /// Transport security and proxy/origin policy.
@@ -112,7 +127,7 @@ impl ConsoleState {
     pub(crate) fn new(boot: Arc<Bootstrap>) -> Result<Self, AuthError> {
         Self::with_pairing_display_and_config(
             boot.clone(),
-            PairingDisplayEdge::default(),
+            Arc::new(NoPairingSecretDisplay),
             ConsoleAuthConfig::default(),
             ConsoleWsConfig::default(),
             ConsoleTransportSecurityConfig::default(),
@@ -123,11 +138,11 @@ impl ConsoleState {
     #[cfg(test)]
     pub(crate) fn with_pairing_display(
         boot: Arc<Bootstrap>,
-        pairing_display: PairingDisplayEdge,
+        pairing_display: Arc<dyn PairingSecretDisplay>,
     ) -> Result<Self, AuthError> {
         Self::with_pairing_display_and_config(
             boot.clone(),
-            pairing_display.clone(),
+            pairing_display,
             ConsoleAuthConfig::default(),
             ConsoleWsConfig::default(),
             ConsoleTransportSecurityConfig::default(),
@@ -137,7 +152,7 @@ impl ConsoleState {
     /// Build console state with custom pairing display, auth, WS tuning, and transport security.
     pub(crate) fn with_pairing_display_and_config(
         boot: Arc<Bootstrap>,
-        pairing_display: PairingDisplayEdge,
+        pairing_display: Arc<dyn PairingSecretDisplay>,
         auth: ConsoleAuthConfig,
         ws: ConsoleWsConfig,
         transport_security: ConsoleTransportSecurityConfig,
@@ -163,7 +178,7 @@ impl ConsoleState {
     #[cfg(test)]
     pub(crate) fn shared_with_pairing_display(
         boot: Arc<Bootstrap>,
-        pairing_display: PairingDisplayEdge,
+        pairing_display: Arc<dyn PairingSecretDisplay>,
     ) -> Result<Arc<Self>, AuthError> {
         Ok(Arc::new(Self::with_pairing_display(boot, pairing_display)?))
     }
@@ -171,7 +186,7 @@ impl ConsoleState {
     /// Build reference-counted console state with full custom tuning.
     pub fn shared_with_pairing_display_and_config(
         boot: Arc<Bootstrap>,
-        pairing_display: PairingDisplayEdge,
+        pairing_display: Arc<dyn PairingSecretDisplay>,
         auth: ConsoleAuthConfig,
         ws: ConsoleWsConfig,
         transport_security: ConsoleTransportSecurityConfig,

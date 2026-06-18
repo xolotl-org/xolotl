@@ -20,7 +20,6 @@ ed25519-dalek = { workspace = true, default-features = false, features = ["fast"
 futures-util = { workspace = true, default-features = false, features = ["sink", "std"] }
 getrandom = { workspace = true, default-features = false }
 hmac = { workspace = true, default-features = false }
-nexus-standard = { workspace = true, default-features = false, features = ["standard"] }
 nexus-graph.workspace = true
 nexus-kernel.workspace = true
 nexus-state.workspace = true
@@ -38,6 +37,7 @@ tracing = { workspace = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
 criterion = { workspace = true, default-features = false, features = ["cargo_bench_support"] }
+nexus-standard = { workspace = true, default-features = false, features = ["standard"] }
 
 [[bench]]
 name = "console_protocol"

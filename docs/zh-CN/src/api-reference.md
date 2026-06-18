@@ -37,6 +37,9 @@ nexus-standard   -> target/doc/nexus_standard/index.html
 - `nexus-types`
 - `nexus-kernel`
 
+`nexus-sdk` 默认保持最小化。用 `NexusBuilder` 接入宿主持有的状态和事实记录后端。
+SDK 的 `standard` feature 提供标准进程内 Provider 安装 API。
+
 协议适配器：
 
 - `nexus-gateway`
@@ -57,7 +60,7 @@ session、submission、limit 和运行时状态。
 
 ## 文档质量检查
 
-公开 API 文档应该能在缺失文档警告提升为错误时构建：
+公开 API 文档在缺失文档警告提升为错误时构建：
 
 ```sh
 RUSTDOCFLAGS='-W missing-docs' cargo doc --workspace --no-deps

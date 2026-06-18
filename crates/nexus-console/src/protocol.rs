@@ -6,7 +6,7 @@
 
 use nexus_types::Value;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::OnceLock};
 
 /// Current Console Protocol major wire version.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -578,7 +578,7 @@ pub struct FieldDescriptor {
     /// Whether the field is computed by the server.
     #[serde(default, skip_serializing_if = "is_false")]
     pub computed: bool,
-    /// Whether the field remains accepted but should not be used for new edits.
+    /// Whether the field remains accepted while excluded from new edits.
     #[serde(default, skip_serializing_if = "is_false")]
     pub deprecated: bool,
 }
@@ -617,7 +617,7 @@ pub enum RiskLevel {
 pub enum ImplementationStatus {
     /// Action/stream is implemented.
     Implemented,
-    /// Descriptor is discoverable but not yet executable.
+    /// Descriptor is discoverable but not executable.
     Planned,
     /// Descriptor is intentionally unavailable because custody rules block it.
     BlockedByCustody,
@@ -769,10 +769,18 @@ pub(crate) fn coverage_report_value(server_rev: u64, registry_rev: u64) -> Value
 
 /// Return one action descriptor encoded as a Nexus value.
 pub(crate) fn descriptor_value(action_id: &str) -> Option<Value> {
-    action_descriptors()
-        .into_iter()
+    action_descriptor_registry()
+        .iter()
         .find(|d| d.id == action_id)
         .map(to_value)
+}
+
+/// Return one action descriptor status.
+pub(crate) fn action_status(action_id: &str) -> Option<ImplementationStatus> {
+    action_descriptor_registry()
+        .iter()
+        .find(|d| d.id == action_id)
+        .map(|d| d.status.clone())
 }
 
 /// Return resource type summaries visible through the semantic edit contract.
@@ -1503,6 +1511,15 @@ pub fn stream_descriptors() -> Vec<StreamDescriptor> {
 
 /// Return the static action descriptor registry.
 pub fn action_descriptors() -> Vec<ActionDescriptor> {
+    action_descriptor_registry().to_vec()
+}
+
+fn action_descriptor_registry() -> &'static [ActionDescriptor] {
+    static ACTION_DESCRIPTORS: OnceLock<Vec<ActionDescriptor>> = OnceLock::new();
+    ACTION_DESCRIPTORS.get_or_init(build_action_descriptors)
+}
+
+fn build_action_descriptors() -> Vec<ActionDescriptor> {
     vec![
         action(
             ACTION_PROTOCOL_DESCRIBE,
@@ -1595,7 +1612,6 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
                 semantic_field("base_snapshot_rev", "u64", false, "revision"),
                 semantic_field("registry_rev", "u64", true, "revision"),
             ],
-            "change_set.create is planned; use domain validate/write_cas actions until it is implemented",
         ),
         planned_action(
             ACTION_CHANGE_SET_UPDATE,
@@ -1605,42 +1621,36 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
                 semantic_field("change_set", "value", true, "json_value"),
                 semantic_field("ops", "list<change_op>", true, "json_value"),
             ],
-            "change_set.update is planned; clients must not treat local drafts as server facts",
         ),
         planned_action(
             ACTION_CHANGE_SET_VALIDATE,
             "change_set",
             ActionKind::View,
             vec![semantic_field("change_set", "value", true, "json_value")],
-            "change_set.validate is planned; use domain-specific validate actions until available",
         ),
         planned_action(
             ACTION_CHANGE_SET_DIFF,
             "change_set",
             ActionKind::View,
             vec![semantic_field("change_set", "value", true, "json_value")],
-            "change_set.diff is planned; clients should compute local redacted diffs as a UX aid",
         ),
         planned_action(
             ACTION_CHANGE_SET_DRY_RUN,
             "change_set",
             ActionKind::View,
             vec![semantic_field("change_set", "value", true, "json_value")],
-            "change_set.dry_run is planned; dry-run results cannot replace apply-time authorization",
         ),
         planned_action(
             ACTION_CHANGE_SET_APPLY,
             "change_set",
             ActionKind::Mutation,
             vec![semantic_field("change_set", "value", true, "json_value")],
-            "change_set.apply is planned; apply must re-run every action gate, MFA, CAS, policy, and audit check",
         ),
         planned_action(
             ACTION_CHANGE_SET_DISCARD,
             "change_set",
             ActionKind::Mutation,
             vec![semantic_field("change_set", "value", true, "json_value")],
-            "change_set.discard is planned; local drafts remain client-side until server support lands",
         ),
         action(
             ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE,
@@ -2479,7 +2489,6 @@ fn planned_action(
     domain: &str,
     kind: ActionKind,
     fields: Vec<FieldDescriptor>,
-    note: &str,
 ) -> ActionDescriptor {
     let mut d = action(
         id,
@@ -2487,8 +2496,18 @@ fn planned_action(
         kind,
         ActionPolicy::new(RiskLevel::Elevated, VisibilityTier::ManagementState, false),
         vec![],
-        schema(&format!("{id}.input"), "map", fields, vec![note]),
-        schema(&format!("{id}.output"), "map", vec![], vec![note]),
+        schema(
+            &format!("{id}.input"),
+            "map",
+            fields,
+            vec!["descriptor is discoverable but not executable"],
+        ),
+        schema(
+            &format!("{id}.output"),
+            "map",
+            vec![],
+            vec!["descriptor is discoverable but not executable"],
+        ),
     );
     d.status = ImplementationStatus::Planned;
     d

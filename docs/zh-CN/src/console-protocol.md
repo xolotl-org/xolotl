@@ -27,7 +27,7 @@
 | `/api/auth/step-up` | `POST` | 使用现有 bearer session 提升 MFA 等级。 |
 
 认证路由要求 `Origin` 和 `Host` 请求头。origin 的 host、port 以及可信 forwarded
-scheme 必须匹配控制台 listener 对外可见的 host。公钥登录还要求 JSON 里的 `origin`
+scheme 必须匹配控制台监听器对外可见的 host。公钥登录还要求 JSON 里的 `origin`
 字段与请求 `Origin` 头完全一致；该值会绑定进签名 transcript。
 
 密码登录请求：
@@ -173,8 +173,8 @@ HTTP 认证错误映射：
 ## 动作和流
 
 可用动作与流会通过 `ProtocolMetadata` 发布，也可以用 `protocol.describe`
-或 `protocol.registry.snapshot` 获取。这些 metadata 响应会包含 listener 的实际传输安全模式和
-unsafe relaxation。
+或 `protocol.registry.snapshot` 获取。这些元数据响应会包含监听器的实际传输安全模式和
+不安全传输放宽项。
 
 已实现动作族包括：
 
@@ -191,7 +191,11 @@ unsafe relaxation。
 | 进程内 Provider/Source projection 声明 | `projection.in_process.list`、`projection.in_process.read`、`projection.in_process.write_cas` |
 | Inference 路由 | `inference.backend.*`、`inference.model.*`、`inference.group.*`、`inference.routing.*` |
 
-泛用 `config.*` action 会拒绝已经有专用 action family 的运行时配置路径。对这些
+上表只列出可执行的动作族。每个 action 描述符还包含
+`implementation_status`；状态为 `planned` 或 `blocked_by_custody` 的描述符
+只用于覆盖范围统计和授权解释，直接发起 `Call` 会返回错误。
+
+泛用 `config.*` action 会拒绝已经有专用动作族的运行时配置路径。对这些
 路径使用 `access.*`、`external.*`、`projection.in_process.*`、`inference.*` 和
 `pairing.*`，让校验、授权、CAS 和审计绑定到声明的资源类型。
 External projection 是 external installation 声明的一部分，仍通过
@@ -199,12 +203,7 @@ External projection 是 external installation 声明的一部分，仍通过
 
 资源和图描述符提供与编辑器形态无关的语义元数据：资源类型、字段、视图、
 revision、关系、图节点类型、port、edge 和校验 hook。它们不指定 UI 组件，
-也不能绕过用于校验、授权、CAS 和审计的固定 action descriptor。
-
-注册表可能发布规划中的 action。当前规划中的编辑 envelope 包括
-`change_set.create`、`change_set.update`、`change_set.validate`、
-`change_set.diff`、`change_set.dry_run`、`change_set.apply` 和
-`change_set.discard`；规划 action 可发现但不可执行。
+也不能绕过用于校验、授权、CAS 和审计的固定 action 描述符。
 
 流：
 

@@ -1261,7 +1261,7 @@ pub struct ObjectStoreProof {
 /// Request to issue a short-lived object upload ticket for one surface.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IssueObjectUploadTicketRequest {
-    /// Surface the future object reference will be submitted through.
+    /// Surface used when submitting the reserved object reference.
     pub surface_id: String,
     /// Optional submission token the ticket is bound to.
     pub submission_token: Option<String>,
@@ -1496,8 +1496,8 @@ pub trait Gateway: Send + Sync {
     /// Record gateway-local audit metadata for an inbound request.
     ///
     /// The default implementation is a no-op for test gateways. Production
-    /// gateways should forward the record to the kernel audit path so protocol
-    /// authentication and admission decisions remain visible.
+    /// gateways forward the record to the kernel audit path so protocol
+    /// authentication and admission decisions are visible.
     fn record_gateway_audit(&self, _audit: GatewayAudit<'_>) -> Result<(), String> {
         Ok(())
     }
@@ -2146,7 +2146,7 @@ impl GatewayRuntime {
     /// Whether the active profile can authenticate at least one credential.
     ///
     /// Closed profiles compile successfully so listeners can start fail-closed,
-    /// but they should not report production readiness.
+    /// but do not report production readiness.
     pub fn is_ready(&self) -> bool {
         self.profile_snapshot().has_authenticating_credentials()
     }

@@ -11,8 +11,12 @@ description.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+standard = ["dep:nexus-standard", "nexus-standard/standard"]
+
 [dependencies]
-nexus-standard = { workspace = true, default-features = false, features = ["standard"] }
+nexus-standard = { workspace = true, default-features = false, optional = true }
 nexus-graph.workspace = true
 nexus-kernel.workspace = true
 nexus-plan.workspace = true

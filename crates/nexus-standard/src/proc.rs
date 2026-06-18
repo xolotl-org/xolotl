@@ -41,7 +41,7 @@ pub(crate) const PROC_METHODS: &[MethodSpec] = &[
 pub(crate) const PHASE_STARTING: &str = "starting";
 /// External process is ready to serve endpoint traffic.
 pub(crate) const PHASE_READY: &str = "ready";
-/// External process is draining and should not receive new work.
+/// External process is draining and rejects new work.
 pub(crate) const PHASE_DRAINING: &str = "draining";
 /// External process is stopped.
 pub(crate) const PHASE_DEAD: &str = "dead";

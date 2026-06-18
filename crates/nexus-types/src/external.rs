@@ -655,7 +655,7 @@ pub enum Backoff {
         base_ms: u64,
         /// Maximum delay in milliseconds.
         cap_ms: u64,
-        /// Whether jitter should be applied.
+        /// Whether jitter is applied.
         jitter: bool,
     },
 }
@@ -818,7 +818,7 @@ pub enum ControlFrame {
     },
     /// Daemon-to-role-client graceful or forced shutdown request.
     Shutdown {
-        /// Whether the endpoint should attempt graceful shutdown.
+        /// Whether the endpoint attempts graceful shutdown.
         graceful: bool,
         /// Shutdown timeout in milliseconds.
         timeout_ms: u64,

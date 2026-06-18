@@ -26,11 +26,11 @@ cargo run -p nexus-daemon -- up
 
 对应配置字段缺失时，`nexusd` 还会读取 `NEXUS_CONSOLE_ADDR`、`NEXUS_EXTERNAL_GRPC_ADDR` 和 `NEXUS_EXTERNAL_WEBSOCKET_ADDR`。配置字段和环境变量都缺失时，该监听保持关闭。
 
-`[external_gateway.grpc]` 配置 external gRPC listener 的 Provider/Source session 限制。
+`[external_gateway.grpc]` 配置 external gRPC 监听器的 Provider/Source session 限制。
 
-`[external_gateway.websocket]` 配置 external WebSocket listener 的同一组 Provider/Source session 限制。
+`[external_gateway.websocket]` 配置 external WebSocket 监听器的同一组 Provider/Source session 限制。
 
-`[external_gateway.websocket.transport]` 配置 WebSocket frame size、first-frame timeout、idle timeout 和总连接数。
+`[external_gateway.websocket.transport]` 配置 WebSocket frame 大小、first-frame 超时、idle 超时和总连接数。
 
 `[console.root]` 可预置 root 凭据。
 
@@ -76,9 +76,9 @@ max_connections = 256
 
 `provider_max_in_flight_invocations`、`provider_max_in_flight_per_identity` 和 `provider_max_in_flight_per_effect` 限制每个 ready Provider session 的 pending invoke。
 
-`source_max_in_flight_commands`、`source_command_rate_limit_window_ms` 和 `source_command_rate_limit_max` 限制每个 ready Source session 和每个 Source projection 的 outbound command dispatch。
+`source_max_in_flight_commands`、`source_command_rate_limit_window_ms` 和 `source_command_rate_limit_max` 限制每个 ready Source session 和每个 Source projection 的 outbound command 分发。
 
-Source event payload-size limit、stream capacity、overflow behavior 和 event-ingress rate limit 在每个 Source projection 上声明。
+Source event 的 payload 大小限制、stream 容量、溢出行为和 event-ingress 速率限制在每个 Source projection 上声明。
 
 ## 传输安全
 
@@ -111,7 +111,7 @@ mode = "local_trusted"
 # unsafe_relaxations = ["ignore_origin_port"]
 ```
 
-External WebSocket 是 plain listener。外部 TLS 终止使用 `trusted_reverse_proxy`，仅 loopback 部署使用 `local_trusted`，否则必须显式 `unsafe_plaintext`。`production_tls` 和 `mtls` 对该 listener fail closed。
+External WebSocket 是明文监听器。外部 TLS 终止使用 `trusted_reverse_proxy`，仅 loopback 部署使用 `local_trusted`，否则必须显式 `unsafe_plaintext`。`production_tls` 和 `mtls` 在该明文监听器上会拒绝启动。
 
 控制台传输安全单独配置：
 
@@ -120,14 +120,14 @@ External WebSocket 是 plain listener。外部 TLS 终止使用 `trusted_reverse
 mode = "local_trusted"
 ```
 
-daemon 的控制台 listener 当前是 plain listener。`local_trusted` 只用于 loopback
+daemon 的控制台监听器当前是明文监听器。`local_trusted` 只用于 loopback
 `console_addr`；如果 TLS 由可信前置代理终止，使用 `trusted_reverse_proxy`，并在
-`trusted_proxy_peers` 中列出直连代理地址。除非控制台 listener 配置了 daemon
-持有的 TLS material，否则 `production_tls` 会 fail closed。
+`trusted_proxy_peers` 中列出直连代理地址。除非控制台监听器配置了 daemon
+持有的 TLS 材料，否则 `production_tls` 会拒绝启动。
 
 ## 运行时配置
 
-运行时 Provider 设置、模型路由、组、绑定、进程内 Provider/Source projection 声明、外部 Provider/Source installation 声明和策略管理状态都属于 Nexus state，并通过 Console WebSocket action 管理。External projection 是 installation 声明的一部分。External 声明使用 `external.*`，inference 声明使用 `inference.*`，进程内 projection 声明使用 `projection.in_process.*`。泛用 `config.*` action 会拒绝已经有专用 action family 的运行时配置路径。
+运行时 Provider 设置、模型路由、组、绑定、进程内 Provider/Source projection 声明、外部 Provider/Source installation 声明和策略管理状态都属于 Nexus state，并通过 Console WebSocket action 管理。External projection 是 installation 声明的一部分。External 声明使用 `external.*`，inference 声明使用 `inference.*`，进程内 projection 声明使用 `projection.in_process.*`。泛用 `config.*` action 会拒绝已经有专用动作族的运行时配置路径。
 
 `nexus-standard` Cargo feature 决定哪些进程内实现被编译进宿主二进制。可选进程内 projection 声明位于
 `state://kernel/projections/in-process/<id>`。

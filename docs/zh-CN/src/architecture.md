@@ -51,9 +51,15 @@ Nexus 让执行热路径保持很小：
 | `nexus-proto` | Protobuf 模式定义和随仓库提供的 Rust 绑定。 |
 | `nexus-console` | Web 控制台管理动作的 gateway。 |
 | `nexus-daemon` | 长期运行的宿主进程 `nexusd`。 |
-| `nexus-sdk` | 进程内嵌入式内核门面。 |
+| `nexus-sdk` | 最小进程内嵌入式内核门面。 |
 | `nexus-plan` | 计划文档解析和转换。 |
 | `nexus-sim` | 确定性仿真和重放辅助工具。 |
+
+## 嵌入式宿主
+
+`nexus-sdk` 默认构建最小内存内核。`NexusBuilder` 允许嵌入式宿主在构建 `Bootstrap`
+前提供自己的状态后端和事实记录接收端。SDK 的 `standard` feature 提供标准包安装 API，
+供包含标准进程内 Provider 的宿主使用。嵌入方仍可替换策略来源、driver 和宿主装配。
 
 ## 标准包 feature 选择
 

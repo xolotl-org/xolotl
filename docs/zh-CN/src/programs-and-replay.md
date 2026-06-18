@@ -6,7 +6,7 @@ Nexus 用图表示可持久执行的工作。
 
 主要 Rust 入口形态是 `DoNode`。它支持纯值、操作、命名步骤、分支、汇合、身份切换、等待、失败和结构化组合。
 
-计划文档由 `nexus-plan` 解析，并转换为同样的 `DoNode` 形态。`nexus-proto` 中的结构化 protobuf `Program` 类型是同一可执行形态的 wire-safe 表示，并可无损转换为 `DoNode`。
+计划文档由 `nexus-plan` 解析，并转换为同样的 `DoNode` 形态。`nexus-proto` 中的结构化 protobuf `Program` 类型是同一可执行形态的线缆表示，并可无损转换为 `DoNode`。
 
 ## 执行图
 

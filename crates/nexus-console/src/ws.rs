@@ -13,19 +13,16 @@ use crate::protocol::{
     ACTION_ACCESS_SESSION_REVOKE_USER, ACTION_ACCESS_USER_DISABLE, ACTION_ACCESS_USER_LIST,
     ACTION_ACCESS_USER_READ, ACTION_ACCESS_USER_WRITE_CAS, ACTION_AUDIT_FACTS_RECENT,
     ACTION_AUTHORITY_ACTION_MATRIX, ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE,
-    ACTION_AUTHORITY_RESOURCE_ACCESS, ACTION_AUTHORITY_WHY_DENIED, ACTION_CHANGE_SET_APPLY,
-    ACTION_CHANGE_SET_CREATE, ACTION_CHANGE_SET_DIFF, ACTION_CHANGE_SET_DISCARD,
-    ACTION_CHANGE_SET_DRY_RUN, ACTION_CHANGE_SET_UPDATE, ACTION_CHANGE_SET_VALIDATE,
-    ACTION_CONFIG_LIST, ACTION_CONFIG_READ, ACTION_CONFIG_WRITE_CAS,
-    ACTION_EXTERNAL_INSTALLATION_INSTALL, ACTION_EXTERNAL_INSTALLATION_LIST,
-    ACTION_EXTERNAL_INSTALLATION_READ, ACTION_EXTERNAL_INSTALLATION_REVOKE,
-    ACTION_EXTERNAL_INSTALLATION_START, ACTION_EXTERNAL_INSTALLATION_STOP,
-    ACTION_EXTERNAL_INSTALLATION_UPDATE, ACTION_EXTERNAL_MANIFEST_LIST,
-    ACTION_EXTERNAL_MANIFEST_READ, ACTION_EXTERNAL_MANIFEST_WRITE_CAS, ACTION_HEALTH_SUMMARY,
-    ACTION_INFERENCE_BACKEND_LIST, ACTION_INFERENCE_BACKEND_READ,
-    ACTION_INFERENCE_BACKEND_WRITE_CAS, ACTION_INFERENCE_GROUP_LIST, ACTION_INFERENCE_GROUP_READ,
-    ACTION_INFERENCE_GROUP_WRITE_CAS, ACTION_INFERENCE_MODEL_LIST, ACTION_INFERENCE_MODEL_READ,
-    ACTION_INFERENCE_MODEL_WRITE_CAS, ACTION_INFERENCE_ROUTING_READ,
+    ACTION_AUTHORITY_RESOURCE_ACCESS, ACTION_AUTHORITY_WHY_DENIED, ACTION_CONFIG_LIST,
+    ACTION_CONFIG_READ, ACTION_CONFIG_WRITE_CAS, ACTION_EXTERNAL_INSTALLATION_INSTALL,
+    ACTION_EXTERNAL_INSTALLATION_LIST, ACTION_EXTERNAL_INSTALLATION_READ,
+    ACTION_EXTERNAL_INSTALLATION_REVOKE, ACTION_EXTERNAL_INSTALLATION_START,
+    ACTION_EXTERNAL_INSTALLATION_STOP, ACTION_EXTERNAL_INSTALLATION_UPDATE,
+    ACTION_EXTERNAL_MANIFEST_LIST, ACTION_EXTERNAL_MANIFEST_READ,
+    ACTION_EXTERNAL_MANIFEST_WRITE_CAS, ACTION_HEALTH_SUMMARY, ACTION_INFERENCE_BACKEND_LIST,
+    ACTION_INFERENCE_BACKEND_READ, ACTION_INFERENCE_BACKEND_WRITE_CAS, ACTION_INFERENCE_GROUP_LIST,
+    ACTION_INFERENCE_GROUP_READ, ACTION_INFERENCE_GROUP_WRITE_CAS, ACTION_INFERENCE_MODEL_LIST,
+    ACTION_INFERENCE_MODEL_READ, ACTION_INFERENCE_MODEL_WRITE_CAS, ACTION_INFERENCE_ROUTING_READ,
     ACTION_INFERENCE_ROUTING_WRITE_CAS, ACTION_LINEAGE_FACT_READ, ACTION_LINEAGE_TRACE_READ,
     ACTION_PAIRING_APPROVE, ACTION_PAIRING_CREATE, ACTION_PAIRING_DENY, ACTION_PAIRING_REPLACE,
     ACTION_PROJECTION_IN_PROCESS_LIST, ACTION_PROJECTION_IN_PROCESS_READ,
@@ -551,6 +548,14 @@ async fn dispatch_call(
     call: ActionCall,
 ) -> Result<ActionResult, ConsoleError> {
     let action = call.action.clone();
+    if matches!(
+        protocol::action_status(&action),
+        Some(protocol::ImplementationStatus::Planned)
+    ) {
+        return Err(ConsoleError::BadRequest(format!(
+            "console action is not executable: {action}"
+        )));
+    }
     let out = match action.as_str() {
         ACTION_PROTOCOL_DESCRIBE | ACTION_PROTOCOL_REGISTRY_SNAPSHOT => {
             protocol::protocol_metadata_to_value(protocol_metadata(sess))
@@ -578,17 +583,6 @@ async fn dispatch_call(
             let view = string_arg(&mut input, "view")?;
             protocol::resource_view_descriptor_value(&view)
                 .ok_or_else(|| ConsoleError::BadRequest(format!("unknown resource view: {view}")))?
-        }
-        ACTION_CHANGE_SET_CREATE
-        | ACTION_CHANGE_SET_UPDATE
-        | ACTION_CHANGE_SET_VALIDATE
-        | ACTION_CHANGE_SET_DIFF
-        | ACTION_CHANGE_SET_DRY_RUN
-        | ACTION_CHANGE_SET_APPLY
-        | ACTION_CHANGE_SET_DISCARD => {
-            return Err(ConsoleError::BadRequest(format!(
-                "planned console action is not implemented: {action}"
-            )));
         }
         ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE => authority_principal_effective(principal),
         ACTION_AUTHORITY_ACTION_MATRIX => {
@@ -3173,7 +3167,7 @@ fn authority_why(
     let mut why = Vec::new();
     match status {
         "blocked_by_custody" => why.push("secret custody backend is not registered".into()),
-        "planned" => why.push("descriptor is planned and not executable".into()),
+        "planned" => why.push("descriptor is discoverable but not executable".into()),
         "denied" if !authority_ok => why.push("principal lacks required authority".into()),
         "conditional_authority" if conditional_authority => {
             why.push("matching grant is predicate-bound and needs concrete action input".into())
@@ -3409,7 +3403,7 @@ mod tests {
     use crate::protocol::*;
     use crate::state::{
         ConsoleTransportSecurityConfig, ConsoleTransportSecurityMode, ConsoleTrustedProxyConfig,
-        ConsoleUnsafeTransportRelaxation, ConsoleWsConfig, ConsoleWsRuntime,
+        ConsoleUnsafeTransportRelaxation, ConsoleWsConfig, ConsoleWsRuntime, PairingSecretDisplay,
     };
     use anyhow::{Context, bail, ensure};
     use nexus_kernel::Bootstrap;
@@ -3419,6 +3413,12 @@ mod tests {
         InferenceBackendDef, Purity, Role, Transport, TrustLevel,
     };
     use std::collections::BTreeMap;
+
+    impl PairingSecretDisplay for PairingDisplayEdge {
+        fn take_display_secret(&self, pairing_id: &str) -> Option<String> {
+            PairingDisplayEdge::take_display_secret(self, pairing_id)
+        }
+    }
 
     fn json_bytes(value: &Value) -> anyhow::Result<JsonBytes> {
         Ok(JsonBytes::try_from_value(value)?)
@@ -3468,7 +3468,7 @@ mod tests {
         let boot = Arc::new(Bootstrap::in_memory());
         let config = StandardConfig::default().with_pairing_display(pairing_display.clone());
         install_standard(&boot, &config).context("install standard package")?;
-        ConsoleState::shared_with_pairing_display(boot, pairing_display)
+        ConsoleState::shared_with_pairing_display(boot, Arc::new(pairing_display))
             .context("create console state")
     }
 
@@ -4235,7 +4235,7 @@ mod tests {
         install_standard(&boot, &StandardConfig::default()).context("install standard package")?;
         let st = ConsoleState::shared_with_pairing_display_and_config(
             boot,
-            pairing_display,
+            Arc::new(pairing_display),
             ConsoleAuthConfig::default(),
             ConsoleWsConfig::default(),
             ConsoleTransportSecurityConfig {
@@ -4386,7 +4386,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planned_change_set_actions_are_not_executable() -> anyhow::Result<()> {
+    async fn planned_actions_are_discoverable_not_executable() -> anyhow::Result<()> {
         let st = console_state()?;
         let (_token, principal, _password) = root_login(&st).await?;
         let mut sess = test_session(st, principal.clone());
@@ -4401,11 +4401,11 @@ mod tests {
         .await;
         ensure!(
             matches!(
-            result,
-            Err(ConsoleError::BadRequest(message))
-                if message == "planned console action is not implemented: change_set.create"
+                result,
+                Err(ConsoleError::BadRequest(message))
+                    if message == "console action is not executable: change_set.create"
             ),
-            "planned change-set create was executable"
+            "planned action executed"
         );
 
         let matrix = output_value(
@@ -4427,7 +4427,7 @@ mod tests {
                 row.as_map()
                     .is_some_and(|map| map.get("status") == Some(&Value::Str("planned".into())))
             }),
-            "change-set matrix contained a non-planned row"
+            "planned domain status mismatch"
         );
         Ok(())
     }

@@ -332,7 +332,7 @@ impl GatewayProfile {
         }
     }
 
-    /// Explicit closed profile for listeners that should start but reject all
+    /// Explicit closed profile for listeners that start while rejecting all
     /// clients until deployment config supplies credentials and surfaces.
     pub fn closed(profile_name: impl Into<String>) -> Self {
         Self::new(profile_name)

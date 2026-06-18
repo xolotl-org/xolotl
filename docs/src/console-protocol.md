@@ -203,6 +203,11 @@ Implemented action families include:
 | In-process Provider/Source projection declarations | `projection.in_process.list`, `projection.in_process.read`, `projection.in_process.write_cas` |
 | Inference routing | `inference.backend.*`, `inference.model.*`, `inference.group.*`, `inference.routing.*` |
 
+The table lists executable action families. Action descriptors also carry
+`implementation_status`; descriptors with `planned` or `blocked_by_custody`
+status are discoverable for coverage and authority explanation, and direct
+`Call` execution returns an error.
+
 Generic `config.*` actions reject runtime config paths that have dedicated
 action families. Use `access.*`, `external.*`, `projection.in_process.*`,
 `inference.*`, and `pairing.*` for those paths so validation, authorization,
@@ -214,12 +219,6 @@ Resource and graph descriptors provide shape-independent semantic metadata:
 resource types, fields, views, revisions, relationships, graph node types, ports,
 edges, and validation hooks. They do not name UI widgets or bypass the fixed
 action descriptors used for validation, authorization, CAS, and audit.
-
-The registry may advertise planned actions. Current planned edit-envelope
-actions include `change_set.create`, `change_set.update`,
-`change_set.validate`, `change_set.diff`, `change_set.dry_run`,
-`change_set.apply`, and `change_set.discard`; planned actions are discoverable
-but not executable.
 
 Streams:
 

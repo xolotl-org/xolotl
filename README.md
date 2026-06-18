@@ -110,13 +110,18 @@ Nexus separates the runtime into four code paths:
 | `nexus-proto` | Protobuf schema and hand-vendored prost/tonic bindings. |
 | `nexus-console` | Gateway for Web Console management actions. |
 | `nexus-daemon` | `nexusd`, the long-running host process. |
-| `nexus-sdk` | Convenience exports for embedding and tests. |
+| `nexus-sdk` | Minimal embedded runtime facade and convenience exports. |
 | `nexus-plan`, `nexus-sim` | Planning and simulation crates. |
 
 `nexus-standard` uses Cargo features to choose which modules are built. The
 default `standard` feature builds the standard in-process implementations.
 Gateway crates use only `external-session`, which contains session
 handling for external Provider and Source endpoints.
+
+`nexus-sdk` defaults to a minimal in-memory kernel. Embedded hosts use
+`NexusBuilder` to provide their own state backend and fact sink. Standard
+providers are installed explicitly by enabling the SDK `standard` feature or by
+calling `nexus-standard` directly.
 
 ## Requirements
 
@@ -273,10 +278,10 @@ resource segments, or policy/config state.
   control path.
 - Keep the data path limited to compiled IDs, handles, driver plans, policy
   snapshots, operations, outcomes, and facts.
-- External protocol crates should remain thin adapters over the gateway,
-  console, or kernel runtime APIs.
-- Protocol changes should update proto, vendored bindings, conversions, tests,
-  examples, and public docs in the same change.
+- External protocol crates stay thin adapters over the gateway, console, or
+  kernel runtime APIs.
+- Protocol changes update proto, vendored bindings, conversions, tests,
+  examples, and public docs together.
 
 ## License
 

@@ -1,6 +1,6 @@
-# HTTP Inference Provider
+# HTTP 推理 Provider
 
-HTTP inference provider 挂在标准 Provider inference effect 后面：
+HTTP 推理 Provider 挂在标准 Provider inference effect 后面：
 
 ```text
 effect://inference/infer
@@ -9,7 +9,7 @@ effect://inference/embed
 effect://inference/rerank
 ```
 
-backend 会把这些 effect 转成一个 HTTP inference API dialect。当前支持：
+backend 会把这些 effect 转成一个 HTTP 推理 API dialect。当前支持：
 
 - OpenAI Responses
 - OpenAI Chat Completions
@@ -17,14 +17,14 @@ backend 会把这些 effect 转成一个 HTTP inference API dialect。当前支�
 - Gemini GenerateContent
 
 dialect 描述 HTTP API 形态。DeepSeek、OpenRouter、vLLM、Ollama 兼容部署等
-OpenAI-compatible 服务可以使用 OpenAI Chat Completions dialect，并配置自己的
+OpenAI 兼容服务可以使用 OpenAI Chat Completions dialect，并配置自己的
 `base_url` 和 `provider_model`。
 
-## Cargo Features
+## Cargo feature
 
-HTTP inference provider 代码需要显式启用。
+HTTP 推理 Provider 代码需要显式启用。
 
-启用全部 HTTP inference dialect：
+启用全部 HTTP 推理 dialect：
 
 ```toml
 nexus-standard = {
@@ -60,7 +60,7 @@ cargo run -p nexus-daemon --features openai-chat
 
 ## 运行时状态
 
-HTTP inference provider 配置是运行时状态，通过 Console Protocol action 管理：
+HTTP 推理 Provider 配置是运行时状态，通过 Console Protocol action 管理：
 
 ```text
 state://kernel/inference/backends/<backend_id>
@@ -125,13 +125,13 @@ model 声明示例：
 }
 ```
 
-启用 HTTP inference provider feature 后，inference 调用必须有运行时 provider 状态。缺少
-inference 状态是错误。未启用 HTTP inference provider feature 的构建使用离线 baseline
+启用 HTTP 推理 Provider feature 后，inference 调用必须有运行时 provider 状态。缺少
+inference 状态是错误。未启用 HTTP 推理 Provider feature 的构建使用离线 baseline
 backend。
 
 ## 边界
 
-当前 HTTP inference provider 发送纯文本请求。`Blob`、`Tensor`、`Frame` 和 inline bytes
+当前 HTTP 推理 Provider 发送纯文本请求。`Blob`、`Tensor`、`Frame` 和 inline bytes
 会在 HTTP 请求前被拒绝。
 
 请求中的 provider tool 字段会被拒绝。工具调用必须通过 Nexus effect 和策略执行。

@@ -3,7 +3,7 @@
 //!
 //! Retains an in-memory event history per path so `ReadMode::Range` and
 //! `ReadMode::At` queries round-trip end-to-end. The history
-//! grows unbounded; persistent deployments should use a backend that owns its
+//! grows unbounded; persistent deployments use a backend that owns its
 //! retention policy.
 
 use crate::backend::{

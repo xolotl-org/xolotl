@@ -24,7 +24,8 @@ mod config;
 use anyhow::Result;
 use config::NexusConfig;
 use nexus_console::{
-    BootstrapOutcome, ConsoleState, ConsoleTransportSecurityConfig, RootProvisioning,
+    BootstrapOutcome, ConsoleState, ConsoleTransportSecurityConfig, PairingSecretDisplay,
+    RootProvisioning,
 };
 #[cfg(feature = "external-gateway")]
 use nexus_gateway::GatewayTransportSecurityConfig;
@@ -301,7 +302,7 @@ async fn serve() -> Result<()> {
         log_console_transport_security(&addr, &security.config);
         let state = ConsoleState::shared_with_pairing_display_and_config(
             boot.clone(),
-            pairing_display.clone(),
+            Arc::new(StandardPairingSecretDisplay(pairing_display.clone())),
             cfg.console.auth.clone().into(),
             cfg.console.ws.clone().into(),
             security.config,
@@ -334,6 +335,14 @@ async fn serve() -> Result<()> {
 
 fn standard_config(pairing_display: PairingDisplayEdge) -> StandardConfig {
     StandardConfig::default().with_pairing_display(pairing_display)
+}
+
+struct StandardPairingSecretDisplay(PairingDisplayEdge);
+
+impl PairingSecretDisplay for StandardPairingSecretDisplay {
+    fn take_display_secret(&self, pairing_id: &str) -> Option<String> {
+        self.0.take_display_secret(pairing_id)
+    }
 }
 
 async fn start_in_process_projection_reconciler(

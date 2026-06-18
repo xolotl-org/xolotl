@@ -136,7 +136,7 @@ impl ConsoleAuthConfig {
 pub enum BootstrapOutcome {
     /// A root account already exists.
     AlreadyPresent,
-    /// Root was created and a one-time random password should be displayed.
+    /// Root was created with a one-time random password for display.
     CreatedRandomPassword {
         /// Created username.
         username: String,

@@ -64,9 +64,18 @@ during recovery.
 | `nexus-proto` | Protobuf schema and vendored Rust bindings. |
 | `nexus-console` | Gateway for Web Console management actions. |
 | `nexus-daemon` | `nexusd`, the long-running host process. |
-| `nexus-sdk` | Embedded facade for in-process kernel use. |
+| `nexus-sdk` | Minimal embedded facade for in-process kernel use. |
 | `nexus-plan` | Plan document parsing and lowering. |
 | `nexus-sim` | Deterministic simulation and replay helpers. |
+
+## Embedded Hosts
+
+`nexus-sdk` builds a minimal in-memory kernel by default. `NexusBuilder` lets
+embedded hosts provide their own state backend and fact sink before the
+`Bootstrap` is seeded. The SDK `standard` feature exposes the standard package
+installation API for hosts that include the standard in-process providers.
+Embedders can still provide their own policy sources, drivers, and host
+assembly.
 
 ## Standard Package Features
 

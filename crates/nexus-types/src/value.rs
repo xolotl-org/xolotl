@@ -26,7 +26,7 @@ pub enum Value {
     List(Vec<Value>),
     /// String-keyed map of nested values.
     Map(BTreeMap<String, Value>),
-    /// Small binary payload. Large payloads should use [`Value::Blob`].
+    /// Small binary payload. Large payloads use [`Value::Blob`].
     Bytes(#[serde(with = "serde_bytes")] Vec<u8>),
     /// Reference to large opaque content (image / audio / video / file).
     /// Never inlined into a Fact.
@@ -349,7 +349,7 @@ pub enum Failure {
     /// broker records `approved`), re-executing the operation passes. Carries
     /// the approval key to wait on and a human-readable reason.
     ApprovalPending {
-        /// State key or broker key the process should wait on.
+        /// State key or broker key the process waits on.
         approval_key: String,
         /// Human-readable approval reason.
         reason: String,

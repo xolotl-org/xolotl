@@ -20,7 +20,7 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// Create a frame for `node` with the value that should flow into it.
+    /// Create a frame for `node` with its input value.
     pub fn new(node: NodeId, input: Value) -> Self {
         Self { node, input }
     }

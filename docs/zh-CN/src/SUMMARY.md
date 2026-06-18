@@ -11,7 +11,7 @@
 - [网关](gateways.md)
   - [External Gateway](external-gateway.md)
   - [控制台协议](console-protocol.md)
-- [HTTP Inference Provider](http-inference-providers.md)
+- [HTTP 推理 Provider](http-inference-providers.md)
 - [配置](configuration.md)
 - [API 参考](api-reference.md)
 - [文档策略](documentation-policy.md)

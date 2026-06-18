@@ -1,6 +1,6 @@
 # Documentation Policy
 
-Public documentation should be readable from this repository alone.
+Public documentation is readable from this repository alone.
 
 ## What Goes Where
 
@@ -21,7 +21,7 @@ over a long prose explanation when behavior can be demonstrated directly.
 
 ## Rustdoc Rules
 
-Rustdoc should describe implemented behavior and public contracts:
+Rustdoc describes implemented behavior and public contracts:
 
 - what the item is;
 - when to use it;
@@ -30,8 +30,8 @@ Rustdoc should describe implemented behavior and public contracts:
 - replay, taint, or durability implications when relevant;
 - links to real Rust items such as [`TypeName`] when useful.
 
-Rustdoc should rely on public files, public Rust items, and generated API docs.
-Readers should be able to understand a page from those materials.
+Rustdoc relies on public files, public Rust items, and generated API docs.
+Readers can understand a page from those materials.
 
 ## Guard Checks
 
