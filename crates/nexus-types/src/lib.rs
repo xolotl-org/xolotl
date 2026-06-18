@@ -20,25 +20,28 @@
 //! - [`operation`] — `Operation`/`OperationId`/`Fact` data-plane records.
 //! - [`process`]   — `Process`/lifecycle/`Outcome`.
 //! - [`external`] — external installation/projection manifests and wire frames.
-//! - [`device`]    — provider summary DTOs (`Transport`/`TrustLevel`/…).
 //! - [`chat`]      — chat message DTOs used by inference.
-//! - [`skill`]     — `Skill`/`SkillScope`: knowledge + procedure unit.
+//! - [`inference`] — inference backend and routing declarations.
+//! - [`in_process_projection`] — in-process projection declarations.
+//! - [`kernel_config`] — shared `state://kernel/*` config admission.
 //! - [`validate`]  — path semantic validation.
 
 pub mod audit;
 pub mod cap;
 pub mod chat;
-pub mod device;
 pub mod external;
+mod external_descriptor;
 pub mod grant;
 pub mod idempotency;
 pub mod ids;
+pub mod in_process_projection;
+pub mod inference;
+pub mod kernel_config;
 pub mod operation;
 pub mod path;
 pub mod process;
 pub mod replay;
 pub mod resource;
-pub mod skill;
 pub mod taint;
 pub mod trace;
 pub mod validate;
@@ -47,16 +50,16 @@ pub mod value;
 pub use audit::{AuditRules, AuditTag};
 pub use cap::{CapError, CapSet, Capability, PredOp, Predicate};
 pub use chat::{ChatMessage, ChatMetadata, ContentPart, MessageRole, estimate_tokens};
-pub use device::{EffectCapability, EffectProvider, ProviderStatus, Transport, TrustLevel};
 pub use external::{
     AckStatus, ApplyStatus, Backoff, CommandResult, ConfigAxis, ControlFrame, DaemonContact,
-    DaemonContacts, EffectHandlerSpec, ErrorInfo, EventAck, EventSource, ExternalInstallationDef,
+    DaemonContacts, ErrorInfo, EventAck, EventSource, ExternalInstallationDef,
     ExternalProjectionDef, ExternalTransport, FlowSignal, InboundEvent, Invoke, InvokeResult,
     JsonSchema, ManifestDef, ObservedGenerations, OutboundCommand, OverflowPolicy, PairingPayload,
-    PairingPayloadError, ProcSpec, ProviderReady, RejectReason, RestartPolicy, Role, RoleReady,
+    PairingPayloadError, ProcSpec, RejectReason, RestartPolicy, Role, RoleReady,
     RoleSessionClientHello, SessionContext, SourceRateLimit, StreamCapacity,
     sandboxed_source_event_sink_path,
 };
+pub use external_descriptor::{EffectCapability, Transport, TrustLevel};
 pub use grant::{
     ConstraintSet, DeriveKind, Expiry, Grant, MethodBitmap, ResourceSelector, RightFlags, Rights,
 };
@@ -64,6 +67,13 @@ pub use ids::{
     BindingId, CausalPosition, DriverId, EndpointId, GrantId, GraphId, HandleId, IdentityRef,
     InterfaceId, MethodId, NodeId, ProcessId, ResourceId, SchemaId, Timestamp,
 };
+pub use in_process_projection::{InProcessProjectionConfigError, InProcessProjectionDef};
+pub use inference::{
+    InferenceApiDialect, InferenceAuthRef, InferenceBackendDef, InferenceConfigError,
+    InferenceGroupDef, InferenceGroupPolicy, InferenceMethodSet, InferenceModelCapabilities,
+    InferenceModelDef, InferenceRoutingDef, MAX_INFERENCE_ROUTING_RETRIES,
+};
+pub use kernel_config::{KernelConfigAdmission, KernelConfigAdmissionError, admit_kernel_config};
 pub use operation::{
     BatchSummary, DecisionTag, Fact, Operation, OperationId, OutcomeRef, ValueRef,
 };
@@ -80,7 +90,6 @@ pub use resource::{
     Metadata, Method, ModalitySet, OutputMode, OutputModeSet, Resource, ResourceDescriptor,
     ResourceKind, ResourceName,
 };
-pub use skill::{Skill, SkillScope};
 pub use taint::{TaintSet, TaintSource};
 pub use trace::{Span, SpanId, TraceContext, TraceId};
 pub use validate::{PathRegistry, PathValidator, default_registry};
@@ -133,41 +142,56 @@ pub fn is_fact_reserved(path: &Path) -> bool {
 
 #[cfg(test)]
 mod workspace_contract_guard_tests {
+    use anyhow::{Context, ensure};
     use std::path::{Path as FsPath, PathBuf};
 
-    fn workspace_root() -> PathBuf {
+    fn workspace_root() -> anyhow::Result<PathBuf> {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(FsPath::parent)
             .map(FsPath::to_path_buf)
-            .expect("nexus-types must live under crates/nexus-types")
+            .context("nexus-types must live under crates/nexus-types")
     }
 
-    fn collect_rust_sources(dir: &FsPath, out: &mut Vec<PathBuf>) {
-        let entries = std::fs::read_dir(dir).expect("source directory must be readable");
+    fn collect_rust_sources(dir: &FsPath, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+        let entries = std::fs::read_dir(dir)
+            .with_context(|| format!("source directory must be readable: {}", dir.display()))?;
         for entry in entries {
-            let entry = entry.expect("source directory entry must be readable");
+            let entry = entry.with_context(|| {
+                format!("source directory entry must be readable: {}", dir.display())
+            })?;
             let path = entry.path();
             if path.is_dir() {
-                collect_rust_sources(&path, out);
+                collect_rust_sources(&path, out)?;
             } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
                 out.push(path);
             }
         }
+        Ok(())
     }
 
-    fn rust_sources() -> Vec<PathBuf> {
+    fn rust_sources() -> anyhow::Result<Vec<PathBuf>> {
         let mut sources = Vec::new();
-        collect_rust_sources(&workspace_root().join("crates"), &mut sources);
-        sources
+        collect_rust_sources(&workspace_root()?.join("crates"), &mut sources)?;
+        Ok(sources)
     }
 
     #[test]
-    fn crate_roots_forbid_unsafe_code() {
-        let crates_dir = workspace_root().join("crates");
+    fn crate_roots_forbid_unsafe_code() -> anyhow::Result<()> {
+        let crates_dir = workspace_root()?.join("crates");
         let mut missing = Vec::new();
-        for entry in std::fs::read_dir(&crates_dir).expect("crates directory must be readable") {
-            let entry = entry.expect("crate directory entry must be readable");
+        for entry in std::fs::read_dir(&crates_dir).with_context(|| {
+            format!(
+                "crates directory must be readable: {}",
+                crates_dir.display()
+            )
+        })? {
+            let entry = entry.with_context(|| {
+                format!(
+                    "crate directory entry must be readable: {}",
+                    crates_dir.display()
+                )
+            })?;
             let path = entry.path();
             if !path.is_dir() {
                 continue;
@@ -176,21 +200,23 @@ mod workspace_contract_guard_tests {
                 if !root.exists() {
                     continue;
                 }
-                let text = std::fs::read_to_string(&root).expect("crate root must be UTF-8");
+                let text = std::fs::read_to_string(&root)
+                    .with_context(|| format!("crate root must be UTF-8: {}", root.display()))?;
                 if !text.contains("#![forbid(unsafe_code)]") {
                     missing.push(root.display().to_string());
                 }
             }
         }
-        assert!(
+        ensure!(
             missing.is_empty(),
             "crate roots must opt into the workspace safety baseline:\n{}",
             missing.join("\n")
         );
+        Ok(())
     }
 
     #[test]
-    fn workspace_sources_have_no_placeholder_macros_or_unsafe_markers() {
+    fn workspace_sources_have_no_placeholder_macros_or_unsafe_markers() -> anyhow::Result<()> {
         let forbidden = [
             ["todo", "!"].concat(),
             ["unimplemented", "!"].concat(),
@@ -202,25 +228,28 @@ mod workspace_contract_guard_tests {
             ["allow", "(unsafe_code)"].concat(),
         ];
         let mut hits = Vec::new();
-        for path in rust_sources() {
-            let text = std::fs::read_to_string(&path).expect("Rust source must be UTF-8");
+        for path in rust_sources()? {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("Rust source must be UTF-8: {}", path.display()))?;
             for pattern in &forbidden {
                 if text.contains(pattern) {
                     hits.push(format!("{} contains {pattern:?}", path.display()));
                 }
             }
         }
-        assert!(
+        ensure!(
             hits.is_empty(),
             "workspace sources must keep the safety baseline:\n{}",
             hits.join("\n")
         );
+        Ok(())
     }
 
     #[test]
-    fn data_plane_hot_path_has_no_control_plane_lookups_or_path_parsing() {
-        let path = workspace_root().join("crates/nexus-kernel/src/dataplane.rs");
-        let text = std::fs::read_to_string(&path).expect("dataplane source must be UTF-8");
+    fn data_plane_hot_path_has_no_control_plane_lookups_or_path_parsing() -> anyhow::Result<()> {
+        let path = workspace_root()?.join("crates/nexus-kernel/src/dataplane.rs");
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("dataplane source must be UTF-8: {}", path.display()))?;
         let production = text.split("#[cfg(test)]").next().unwrap_or(&text);
         let forbidden = [
             "Path::parse",
@@ -240,10 +269,11 @@ mod workspace_contract_guard_tests {
             .filter(|pattern| production.contains(**pattern))
             .map(|pattern| format!("{} contains {pattern:?}", path.display()))
             .collect::<Vec<_>>();
-        assert!(
+        ensure!(
             hits.is_empty(),
             "data-plane production code must keep / hot-path inputs precompiled:\n{}",
             hits.join("\n")
         );
+        Ok(())
     }
 }

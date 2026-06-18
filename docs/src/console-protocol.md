@@ -192,14 +192,23 @@ Implemented action families include:
 
 | Family | Examples |
 | --- | --- |
-| Protocol and registry | `protocol.describe`, `protocol.registry.snapshot`, `protocol.action_descriptor.get`, `protocol.schema.get` compatibility alias, `registry.coverage.report` |
-| Resource and edit descriptors | `resource.type.list`, `resource.type.describe`, `resource.view.describe`, `graph.type.describe` |
+| Protocol and registry | `protocol.describe`, `protocol.registry.snapshot`, `protocol.action_descriptor.get`, `registry.coverage.report` |
+| Resource and edit descriptors | `resource.type.list`, `resource.type.describe`, `resource.view.describe` |
 | Authority and visibility | `authority.principal.effective`, `authority.action.matrix`, `visibility.authority.describe`, `visibility.state.read`, `visibility.state.list` |
 | Secret custody | `secret.catalog`, `secret.reveal` |
-| State and config | `state.snapshot`, `config.read`, `config.list`, `config.write_cas` |
+| State and config | `state.snapshot`, `config.read`, `config.list`, `config.write_cas` for config without a dedicated action |
 | Console access | `access.user.*`, `access.role.*`, `access.session.*`, `access.session.current.logout` |
-| Runtime, audit, and lineage | `runtime.process.inspect`, `audit.facts.recent`, `lineage.trace.read`, `lineage.fact.read`, `lineage.fact.by_operation`, `health.summary` |
-| External programs and pairing | `external.installation.*`, `pairing.create`, `pairing.approve`, `pairing.deny`, `pairing.replace` |
+| Runtime, audit, and lineage | `runtime.process.inspect`, `audit.facts.recent`, `lineage.trace.read`, `lineage.fact.read`, `health.summary` |
+| External programs and pairing | `external.manifest.*`, `external.installation.*`, `pairing.create`, `pairing.approve`, `pairing.deny`, `pairing.replace` |
+| In-process Provider/Source projection declarations | `projection.in_process.list`, `projection.in_process.read`, `projection.in_process.write_cas` |
+| Inference routing | `inference.backend.*`, `inference.model.*`, `inference.group.*`, `inference.routing.*` |
+
+Generic `config.*` actions reject runtime config paths that have dedicated
+action families. Use `access.*`, `external.*`, `projection.in_process.*`,
+`inference.*`, and `pairing.*` for those paths so validation, authorization,
+CAS, and audit stay tied to the declared resource type.
+External projections remain part of their external installation declaration and
+are managed through `external.installation.*`.
 
 Resource and graph descriptors provide shape-independent semantic metadata:
 resource types, fields, views, revisions, relationships, graph node types, ports,

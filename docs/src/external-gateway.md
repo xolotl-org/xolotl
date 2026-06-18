@@ -6,9 +6,10 @@ same session protocol.
 
 ## Roles
 
-Provider sessions expose remote effect handlers. A ready Provider reports the
-projected effects it can serve; the daemon registers those bindings for that
-ready session and dispatches invocations only for registered effects.
+Provider sessions expose remote effect handlers declared by the selected
+installation projection. After `RoleReady` confirms the daemon-selected session
+context, the daemon registers those projection bindings for the ready session
+and dispatches invocations only for registered effects.
 
 Source sessions emit inbound events and can receive outbound commands from the
 daemon. Source events enter the same schema, policy, capacity, dedupe, and taint
@@ -105,8 +106,9 @@ business frames can flow.
 
 ## Provider Flow
 
-Provider invokes are sent only for projected effects reported by the ready
-session, and invoke input must match the Provider projection's `input_schema`.
+Provider invokes are sent only for projected effects declared by the
+installation projection and registered for the ready session. Invoke input must
+match the Provider projection's `input_schema`.
 Provider results are accepted only for daemon-registered in-flight invocations.
 The result must arrive on the same ready Provider session generation before the
 invocation deadline and within the registered result size limit.

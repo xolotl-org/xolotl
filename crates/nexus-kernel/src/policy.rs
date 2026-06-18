@@ -462,6 +462,7 @@ impl PolicySource for CapabilityPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, ensure};
     use nexus_state::{Backend, InMemoryBackend};
     use nexus_types::cap::Predicate;
     use std::collections::BTreeMap;
@@ -481,42 +482,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_snapshot_allows_and_is_unconditional() {
+    async fn empty_snapshot_allows_and_is_unconditional() -> anyhow::Result<()> {
         let snap = PolicySnapshot::empty();
-        assert!(snap.is_empty());
-        assert_eq!(snap.check(&ctx(&Value::Null)).await, PolicyDecision::Allow);
+        ensure!(snap.is_empty(), "empty snapshot should report empty");
+        let decision = snap.check(&ctx(&Value::Null)).await;
+        ensure!(
+            decision == PolicyDecision::Allow,
+            "empty snapshot should allow, got {decision:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn constraint_check_is_fail_closed() {
+    async fn constraint_check_is_fail_closed() -> anyhow::Result<()> {
         let cs = ConstraintSet {
-            predicates: vec![Predicate::parse("account=alice").unwrap()],
+            predicates: vec![Predicate::parse("account=alice").context("predicate did not parse")?],
         };
         let snap = PolicySnapshot::new(vec![Arc::new(ConstraintCheck { constraints: cs })]);
         let mut m = BTreeMap::new();
         m.insert("account".into(), Value::Str("alice".into()));
-        assert_eq!(
-            snap.check(&ctx(&Value::Map(m))).await,
-            PolicyDecision::Allow
+        let allowed = snap.check(&ctx(&Value::Map(m))).await;
+        ensure!(
+            allowed == PolicyDecision::Allow,
+            "matching constraint should allow, got {allowed:?}"
         );
         // Missing field → denied.
-        assert!(matches!(
-            snap.check(&ctx(&Value::Null)).await,
-            PolicyDecision::Deny { .. }
-        ));
+        let denied = snap.check(&ctx(&Value::Null)).await;
+        ensure!(
+            matches!(denied, PolicyDecision::Deny { .. }),
+            "missing constraint input should deny, got {denied:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn first_non_allow_short_circuits() {
+    async fn first_non_allow_short_circuits() -> anyhow::Result<()> {
         let snap = PolicySnapshot::new(vec![Arc::new(ApprovalCheck::always("k", "needs ok"))]);
-        assert!(matches!(
-            snap.check(&ctx(&Value::Null)).await,
-            PolicyDecision::Ask { .. }
-        ));
+        let decision = snap.check(&ctx(&Value::Null)).await;
+        ensure!(
+            matches!(decision, PolicyDecision::Ask { .. }),
+            "approval check should ask, got {decision:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn approval_resolves_to_allow_once_approved() {
+    async fn approval_resolves_to_allow_once_approved() -> anyhow::Result<()> {
         // A gate backed by a registry asks until the broker records a decision:
         // approved means Allow, denied means Deny.
         let reg = ApprovalRegistry::new();
@@ -526,32 +537,48 @@ mod tests {
             reg.clone(),
         ))]);
         // Pending → Ask.
-        assert!(matches!(
-            snap.check(&ctx(&Value::Null)).await,
-            PolicyDecision::Ask { .. }
-        ));
+        let pending = snap.check(&ctx(&Value::Null)).await;
+        ensure!(
+            matches!(pending, PolicyDecision::Ask { .. }),
+            "pending approval should ask, got {pending:?}"
+        );
         // Approved → Allow (the suspended op would now pass on retry).
         reg.set("pay-1", ApprovalDecision::Approved);
-        assert!(snap.check(&ctx(&Value::Null)).await.is_allow());
+        let approved = snap.check(&ctx(&Value::Null)).await;
+        ensure!(
+            approved.is_allow(),
+            "approved request should allow, got {approved:?}"
+        );
         // Denied → Deny.
         reg.set("pay-1", ApprovalDecision::Denied);
-        assert!(matches!(
-            snap.check(&ctx(&Value::Null)).await,
-            PolicyDecision::Deny { .. }
-        ));
+        let denied = snap.check(&ctx(&Value::Null)).await;
+        ensure!(
+            matches!(denied, PolicyDecision::Deny { .. }),
+            "denied approval should deny, got {denied:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rate_limit_denies_past_the_window_budget() {
+    async fn rate_limit_denies_past_the_window_budget() -> anyhow::Result<()> {
         let snap = PolicySnapshot::new(vec![Arc::new(RateLimitCheck::new(2, 1000, state()))]);
         // Two allowed in the window…
-        assert!(snap.check(&ctx(&Value::Null)).await.is_allow());
-        assert!(snap.check(&ctx(&Value::Null)).await.is_allow());
+        let first = snap.check(&ctx(&Value::Null)).await;
+        ensure!(
+            first.is_allow(),
+            "first rate-limit hit should allow, got {first:?}"
+        );
+        let second = snap.check(&ctx(&Value::Null)).await;
+        ensure!(
+            second.is_allow(),
+            "second rate-limit hit should allow, got {second:?}"
+        );
         // …third denied.
-        assert!(matches!(
-            snap.check(&ctx(&Value::Null)).await,
-            PolicyDecision::Deny { .. }
-        ));
+        let third = snap.check(&ctx(&Value::Null)).await;
+        ensure!(
+            matches!(third, PolicyDecision::Deny { .. }),
+            "third rate-limit hit should deny, got {third:?}"
+        );
         // After the window slides past all prior hits, allowed again.
         let later = CheckCtx {
             input: &Value::Null,
@@ -559,11 +586,16 @@ mod tests {
             now_millis: 2000,
             target: ResourceId::new(1),
         };
-        assert!(snap.check(&later).await.is_allow());
+        let later = snap.check(&later).await;
+        ensure!(
+            later.is_allow(),
+            "post-window hit should allow, got {later:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rate_limit_is_keyed_by_target_and_acting() {
+    async fn rate_limit_is_keyed_by_target_and_acting() -> anyhow::Result<()> {
         // Different targets and acting identities each get their own window.
         let snap = PolicySnapshot::new(vec![Arc::new(RateLimitCheck::new(1, 1000, state()))]);
         let alice = CheckCtx {
@@ -584,20 +616,28 @@ mod tests {
             now_millis: 0,
             target: ResourceId::new(2),
         };
-        assert!(snap.check(&alice).await.is_allow());
+        let alice_first = snap.check(&alice).await;
+        ensure!(alice_first.is_allow(), "alice first hit should allow");
         // Alice's second is denied…
-        assert!(matches!(
-            snap.check(&alice).await,
-            PolicyDecision::Deny { .. }
-        ));
+        let alice_second = snap.check(&alice).await;
+        ensure!(
+            matches!(alice_second, PolicyDecision::Deny { .. }),
+            "alice second hit should deny, got {alice_second:?}"
+        );
         // …but the same acting identity on a different target has its own budget.
-        assert!(snap.check(&other_target).await.is_allow());
+        let other = snap.check(&other_target).await;
+        ensure!(other.is_allow(), "other target should allow, got {other:?}");
         // Bob (different acting) still has his own budget too.
-        assert!(snap.check(&bob).await.is_allow());
+        let bob = snap.check(&bob).await;
+        ensure!(
+            bob.is_allow(),
+            "different acting identity should allow, got {bob:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rate_limit_sliding_window_evicts_old_hits() {
+    async fn rate_limit_sliding_window_evicts_old_hits() -> anyhow::Result<()> {
         // A true sliding window: a hit at t=0 and one at t=600 with max=2,
         // window=1000. At t=1100 the t=0 hit has slid out, so one more fits.
         let rl = RateLimitCheck::new(2, 1000, state());
@@ -608,19 +648,27 @@ mod tests {
             now_millis: t,
             target: ResourceId::new(1),
         };
-        assert!(rl.evaluate(&mk(0)).await.is_allow());
-        assert!(rl.evaluate(&mk(600)).await.is_allow());
+        let first = rl.evaluate(&mk(0)).await;
+        ensure!(first.is_allow(), "first hit should allow, got {first:?}");
+        let second = rl.evaluate(&mk(600)).await;
+        ensure!(second.is_allow(), "second hit should allow, got {second:?}");
         // t=700: both still in window → denied.
-        assert!(matches!(
-            rl.evaluate(&mk(700)).await,
-            PolicyDecision::Deny { .. }
-        ));
+        let denied = rl.evaluate(&mk(700)).await;
+        ensure!(
+            matches!(denied, PolicyDecision::Deny { .. }),
+            "in-window excess hit should deny, got {denied:?}"
+        );
         // t=1100: t=0 evicted (1100-1000=100 cutoff), only t=600 remains → allowed.
-        assert!(rl.evaluate(&mk(1100)).await.is_allow());
+        let later = rl.evaluate(&mk(1100)).await;
+        ensure!(
+            later.is_allow(),
+            "post-eviction hit should allow, got {later:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rate_limit_persists_window_across_check_instances() {
+    async fn rate_limit_persists_window_across_check_instances() -> anyhow::Result<()> {
         let state = state();
         let a = RateLimitCheck::new(1, 1000, state.clone());
         let b = RateLimitCheck::new(1, 1000, state);
@@ -632,15 +680,18 @@ mod tests {
             target: ResourceId::new(1),
         };
 
-        assert!(a.evaluate(&mk(0)).await.is_allow());
-        assert!(matches!(
-            b.evaluate(&mk(1)).await,
-            PolicyDecision::Deny { .. }
-        ));
+        let first = a.evaluate(&mk(0)).await;
+        ensure!(first.is_allow(), "first persisted hit should allow");
+        let second = b.evaluate(&mk(1)).await;
+        ensure!(
+            matches!(second, PolicyDecision::Deny { .. }),
+            "second persisted hit should deny, got {second:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn rate_limit_persists_evicted_window() {
+    async fn rate_limit_persists_evicted_window() -> anyhow::Result<()> {
         let state = state();
         let rl = RateLimitCheck::new(2, 1000, state.clone());
         let input = Value::Null;
@@ -651,36 +702,48 @@ mod tests {
             target: ResourceId::new(1),
         };
 
-        assert!(rl.evaluate(&mk(0)).await.is_allow());
-        assert!(rl.evaluate(&mk(600)).await.is_allow());
-        assert!(matches!(
-            rl.evaluate(&mk(700)).await,
-            PolicyDecision::Deny { .. }
-        ));
-        assert!(rl.evaluate(&mk(1100)).await.is_allow());
-
-        let path = rate_limit_path(ResourceId::new(1), nexus_types::IdentityRef::ROOT).unwrap();
-        assert_eq!(
-            state.read(&path).await.unwrap(),
-            Some(Value::List(vec![Value::Int(600), Value::Int(1100)]))
+        let first = rl.evaluate(&mk(0)).await;
+        ensure!(first.is_allow(), "first hit should allow");
+        let second = rl.evaluate(&mk(600)).await;
+        ensure!(second.is_allow(), "second hit should allow");
+        let denied = rl.evaluate(&mk(700)).await;
+        ensure!(
+            matches!(denied, PolicyDecision::Deny { .. }),
+            "in-window excess hit should deny, got {denied:?}"
         );
+        let later = rl.evaluate(&mk(1100)).await;
+        ensure!(later.is_allow(), "post-eviction hit should allow");
+
+        let path = rate_limit_path(ResourceId::new(1), nexus_types::IdentityRef::ROOT)
+            .context("rate limit path failed")?;
+        let stored = state
+            .read(&path)
+            .await
+            .context("rate limit state read failed")?;
+        ensure!(
+            stored == Some(Value::List(vec![Value::Int(600), Value::Int(1100)])),
+            "stored rate-limit window mismatch: {stored:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn rate_limit_uses_documented_state_path() {
-        assert_eq!(
-            rate_limit_path(ResourceId::new(7), nexus_types::IdentityRef::new(9))
-                .unwrap()
-                .to_string(),
-            "state://kernel/ratelimit/resource:7/identity:9"
+    fn rate_limit_uses_documented_state_path() -> anyhow::Result<()> {
+        let path = rate_limit_path(ResourceId::new(7), nexus_types::IdentityRef::new(9))
+            .context("rate limit path failed")?;
+        ensure!(
+            path.to_string() == "state://kernel/ratelimit/resource:7/identity:9",
+            "rate-limit state path mismatch: {path}"
         );
+        Ok(())
     }
 
     #[test]
-    fn snapshots_merge_residuals() {
+    fn snapshots_merge_residuals() -> anyhow::Result<()> {
         let a = PolicySnapshot::new(vec![Arc::new(RateLimitCheck::new(5, 1000, state()))]);
         let b = PolicySnapshot::new(vec![Arc::new(ApprovalCheck::always("k", "r"))]);
         let merged = a.merge(b);
-        assert_eq!(merged.len(), 2);
+        ensure!(merged.len() == 2, "merged snapshot length mismatch");
+        Ok(())
     }
 }

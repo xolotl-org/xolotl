@@ -368,6 +368,7 @@ pub fn why_not(facts: &[nexus_types::Fact], op: nexus_types::OperationId) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, bail, ensure};
     use nexus_graph::{DoNode, OperationTemplate, StepRef};
     use nexus_types::OutputMode;
 
@@ -386,30 +387,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scripted_driver_returns_queued_outcomes() {
+    async fn scripted_driver_returns_queued_outcomes() -> anyhow::Result<()> {
         let sim = Sim::new();
         let driver = Arc::new(ScriptedDriver::new("model"));
         driver.enqueue_done(Value::Str("first".into()));
-        let name = sim
-            .scripted_effect("effect://model/x", driver.clone())
-            .unwrap();
-        let handle = sim.boot.open_for(sim.boot.root, &name, "perform").unwrap();
+        let name = sim.scripted_effect("effect://model/x", driver.clone())?;
+        let handle = sim.boot.open_for(sim.boot.root, &name, "perform")?;
         let ex = sim.boot.kernel.executor_for(sim.boot.root);
         ex.bind_handle(name.clone(), handle);
         let out = ex.eval(&run_prog(name)).await;
-        assert_eq!(out, Outcome::Done(Value::Str("first".into())));
-        assert_eq!(driver.calls().len(), 1);
+        ensure!(
+            out == Outcome::Done(Value::Str("first".into())),
+            "unexpected scripted outcome: {out:?}"
+        );
+        ensure!(driver.calls().len() == 1, "unexpected call count");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn injected_failure_routes_through_or_else_recovery_step() {
+    async fn injected_failure_routes_through_or_else_recovery_step() -> anyhow::Result<()> {
         let sim = Sim::new();
         let driver = Arc::new(ScriptedDriver::new("primary"));
         driver.enqueue(Outcome::Fail(nexus_types::Failure::Cancelled));
-        let name = sim
-            .scripted_effect("effect://primary/fallible", driver.clone())
-            .unwrap();
-        let handle = sim.boot.open_for(sim.boot.root, &name, "perform").unwrap();
+        let name = sim.scripted_effect("effect://primary/fallible", driver.clone())?;
+        let handle = sim.boot.open_for(sim.boot.root, &name, "perform")?;
         let ex = sim.boot.kernel.executor_for(sim.boot.root);
         ex.bind_handle(name.clone(), handle);
         ex.steps.install(sim.boot.root, "fallback", |v, _| match v {
@@ -422,51 +423,57 @@ mod tests {
         let prog = run_prog(name).or_else(StepRef::new(sim.boot.root, "fallback"));
         let out = ex.eval(&prog).await;
 
-        assert_eq!(out, Outcome::Done(Value::Str("fallback".into())));
-        assert_eq!(driver.calls().len(), 1);
-        let facts = sim.boot.kernel.facts.facts_of(sim.boot.root).unwrap();
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].decision, nexus_types::DecisionTag::DriverError);
+        ensure!(
+            out == Outcome::Done(Value::Str("fallback".into())),
+            "unexpected recovery outcome: {out:?}"
+        );
+        ensure!(driver.calls().len() == 1, "unexpected call count");
+        let facts = sim.boot.kernel.facts.facts_of(sim.boot.root)?;
+        ensure!(facts.len() == 1, "unexpected fact count: {}", facts.len());
+        ensure!(
+            facts[0].decision == nexus_types::DecisionTag::DriverError,
+            "unexpected decision: {:?}",
+            facts[0].decision
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn replay_report_counts_recorded_facts() {
+    async fn replay_report_counts_recorded_facts() -> anyhow::Result<()> {
         let sim = Sim::new();
         let driver = Arc::new(ScriptedDriver::new("m"));
         driver.enqueue_done(Value::Int(1));
-        let name = sim.scripted_effect("effect://m/x", driver).unwrap();
-        let handle = sim.boot.open_for(sim.boot.root, &name, "perform").unwrap();
+        let name = sim.scripted_effect("effect://m/x", driver)?;
+        let handle = sim.boot.open_for(sim.boot.root, &name, "perform")?;
         let ex = sim.boot.kernel.executor_for(sim.boot.root);
         ex.bind_handle(name.clone(), handle);
         ex.eval(&run_prog(name)).await;
-        let report = replay_report(&sim.boot.kernel.facts, sim.boot.root).unwrap();
-        assert_eq!(
-            report.skipped, 1,
-            "one completed effect ⇒ skipped on replay"
+        let report = replay_report(&sim.boot.kernel.facts, sim.boot.root)?;
+        ensure!(
+            report.skipped == 1,
+            "one completed effect should be skipped on replay"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn budget_denial_records_fact_without_calling_scripted_driver() {
+    async fn budget_denial_records_fact_without_calling_scripted_driver() -> anyhow::Result<()> {
         let sim = Sim::new();
         let driver = Arc::new(ScriptedDriver::new("costly"));
         driver.enqueue_done(Value::Int(99));
-        let name = sim
-            .boot
-            .register_effect_with_cost(
-                "effect://costly/call",
-                &[nexus_kernel::MethodSpec::new(
-                    "invoke",
-                    nexus_types::Purity::Effectful,
-                    nexus_kernel::MethodSpec::UNARY_ASYNC,
-                )],
-                driver.clone(),
-                nexus_types::CostModel {
-                    flat_micro_usd: 1_000,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let name = sim.boot.register_effect_with_cost(
+            "effect://costly/call",
+            &[nexus_kernel::MethodSpec::new(
+                "invoke",
+                nexus_types::Purity::Effectful,
+                nexus_kernel::MethodSpec::UNARY_ASYNC,
+            )],
+            driver.clone(),
+            nexus_types::CostModel {
+                flat_micro_usd: 1_000,
+                ..Default::default()
+            },
+        )?;
         sim.boot.kernel.processes.set_budget_spec(
             sim.boot.root,
             nexus_types::BudgetSpec {
@@ -474,7 +481,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let handle = sim.boot.open_for(sim.boot.root, &name, "perform").unwrap();
+        let handle = sim.boot.open_for(sim.boot.root, &name, "perform")?;
         let ex = sim.boot.kernel.executor_for(sim.boot.root);
         ex.bind_handle(name.clone(), handle);
 
@@ -484,46 +491,53 @@ mod tests {
 
         match out {
             Outcome::Fail(nexus_types::Failure::BudgetExhausted { dim }) => {
-                assert_eq!(dim, "daily_micro_usd");
+                ensure!(
+                    dim == "daily_micro_usd",
+                    "unexpected budget dimension: {dim}"
+                );
             }
-            other => panic!("expected budget denial, got {other:?}"),
+            other => bail!("expected budget denial, got {other:?}"),
         }
-        assert!(
+        ensure!(
             driver.calls().is_empty(),
             "budget denial must happen before the scripted driver is invoked"
         );
-        let facts = sim.boot.kernel.facts.facts_of(sim.boot.root).unwrap();
-        assert_eq!(facts.len(), 1);
-        assert_eq!(
-            facts[0].decision,
-            nexus_types::DecisionTag::RejectedByPolicy
+        let facts = sim.boot.kernel.facts.facts_of(sim.boot.root)?;
+        ensure!(facts.len() == 1, "unexpected fact count: {}", facts.len());
+        ensure!(
+            facts[0].decision == nexus_types::DecisionTag::RejectedByPolicy,
+            "unexpected decision: {:?}",
+            facts[0].decision
         );
-        assert_eq!(facts[0].handle, handle);
-        assert_ne!(facts[0].resource, nexus_types::ResourceId::new(0));
-        assert_eq!(
-            facts[0].replay,
-            nexus_types::ReplayClass::NonIdempotentEffect
+        ensure!(facts[0].handle == handle, "unexpected fact handle");
+        ensure!(
+            facts[0].resource != nexus_types::ResourceId::new(0),
+            "fact resource should be assigned"
         );
+        ensure!(
+            facts[0].replay == nexus_types::ReplayClass::NonIdempotentEffect,
+            "unexpected replay class: {:?}",
+            facts[0].replay
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn idempotent_duplicate_short_circuits_driver_and_records_attempt() {
+    async fn idempotent_duplicate_short_circuits_driver_and_records_attempt() -> anyhow::Result<()>
+    {
         let sim = Sim::new();
         let driver = Arc::new(ScriptedDriver::new("idempotent"));
         driver.enqueue_done(Value::Str("created".into()));
-        let name = sim
-            .boot
-            .register_effect(
-                "effect://orders/create",
-                &[nexus_kernel::MethodSpec::new(
-                    "invoke",
-                    nexus_types::Purity::Idempotent,
-                    nexus_kernel::MethodSpec::UNARY_ASYNC,
-                )],
-                driver.clone(),
-            )
-            .unwrap();
-        let handle = sim.boot.open_for(sim.boot.root, &name, "perform").unwrap();
+        let name = sim.boot.register_effect(
+            "effect://orders/create",
+            &[nexus_kernel::MethodSpec::new(
+                "invoke",
+                nexus_types::Purity::Idempotent,
+                nexus_kernel::MethodSpec::UNARY_ASYNC,
+            )],
+            driver.clone(),
+        )?;
+        let handle = sim.boot.open_for(sim.boot.root, &name, "perform")?;
         let ex = sim.boot.kernel.executor_for(sim.boot.root);
         ex.bind_handle(name.clone(), handle);
         let mut input = std::collections::BTreeMap::new();
@@ -533,55 +547,76 @@ mod tests {
         let first = ex.eval(&prog).await;
         let second = ex.eval(&prog).await;
 
-        assert_eq!(first, Outcome::Done(Value::Str("created".into())));
-        assert_eq!(second, Outcome::Done(Value::Str("created".into())));
-        assert_eq!(
-            driver.calls().len(),
-            1,
+        ensure!(
+            first == Outcome::Done(Value::Str("created".into())),
+            "unexpected first outcome: {first:?}"
+        );
+        ensure!(
+            second == Outcome::Done(Value::Str("created".into())),
+            "unexpected second outcome: {second:?}"
+        );
+        ensure!(
+            driver.calls().len() == 1,
             "the replayed node must use the idempotency cache"
         );
-        let facts = sim.boot.kernel.facts.facts_of(sim.boot.root).unwrap();
-        assert_eq!(facts.len(), 1, "same OperationId updates the same Fact");
-        assert_eq!(facts[0].decision, nexus_types::DecisionTag::Ok);
-        assert_eq!(facts[0].replay, nexus_types::ReplayClass::IdempotentEffect);
+        let facts = sim.boot.kernel.facts.facts_of(sim.boot.root)?;
+        ensure!(facts.len() == 1, "same OperationId updates the same fact");
+        ensure!(
+            facts[0].decision == nexus_types::DecisionTag::Ok,
+            "unexpected decision: {:?}",
+            facts[0].decision
+        );
+        ensure!(
+            facts[0].replay == nexus_types::ReplayClass::IdempotentEffect,
+            "unexpected replay class: {:?}",
+            facts[0].replay
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn sim_clock_now_reflects_advance_and_set() {
+    async fn sim_clock_now_reflects_advance_and_set() -> anyhow::Result<()> {
         let ctx = DriverContext::new(nexus_types::IdentityRef::ROOT, ProcessId::new(1));
         let clock = SimClock::new(1_000);
         // `now` (method 0) reads the starting time.
         let out = clock
             .call(MethodId::new(0), Value::Null, OutputMode::Unary, &ctx)
-            .await
-            .unwrap();
-        assert_eq!(out, Outcome::Done(Value::Int(1_000)));
+            .await?;
+        ensure!(
+            out == Outcome::Done(Value::Int(1_000)),
+            "unexpected initial clock output: {out:?}"
+        );
 
         // `advance` moves it forward; `now` sees the new time.
-        assert_eq!(clock.advance(500), 1_500);
+        ensure!(clock.advance(500) == 1_500, "unexpected advanced time");
         let out = clock
             .call(MethodId::new(0), Value::Null, OutputMode::Unary, &ctx)
-            .await
-            .unwrap();
-        assert_eq!(out, Outcome::Done(Value::Int(1_500)));
+            .await?;
+        ensure!(
+            out == Outcome::Done(Value::Int(1_500)),
+            "unexpected advanced clock output: {out:?}"
+        );
 
         // `sleep` (method 1) advances virtual time without real waiting.
         let mut m = std::collections::BTreeMap::new();
         m.insert("millis".into(), Value::Int(250));
         let out = clock
             .call(MethodId::new(1), Value::Map(m), OutputMode::Unary, &ctx)
-            .await
-            .unwrap();
-        assert_eq!(out, Outcome::Done(Value::Null));
-        assert_eq!(clock.now(), 1_750);
+            .await?;
+        ensure!(
+            out == Outcome::Done(Value::Null),
+            "unexpected sleep output: {out:?}"
+        );
+        ensure!(clock.now() == 1_750, "unexpected time after sleep");
 
         // `set` pins absolute time.
         clock.set(42);
-        assert_eq!(clock.now(), 42);
+        ensure!(clock.now() == 42, "unexpected set time");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn crash_after_n_stops_at_the_nth_call() {
+    async fn crash_after_n_stops_at_the_nth_call() -> anyhow::Result<()> {
         let ctx = DriverContext::new(nexus_types::IdentityRef::ROOT, ProcessId::new(1));
         let crasher = CrashAfter::arc(Arc::new(nexus_kernel::EchoDriver), 2);
         // First two calls delegate to EchoDriver and succeed.
@@ -591,28 +626,35 @@ mod tests {
         let b = crasher
             .call(MethodId::new(0), Value::Int(2), OutputMode::Unary, &ctx)
             .await;
-        assert_eq!(a.unwrap(), Outcome::Done(Value::Int(1)));
-        assert_eq!(b.unwrap(), Outcome::Done(Value::Int(2)));
-        assert!(!crasher.has_crashed());
-        assert_eq!(crasher.calls_made(), 2);
+        ensure!(
+            a? == Outcome::Done(Value::Int(1)),
+            "unexpected first delegated output"
+        );
+        ensure!(
+            b? == Outcome::Done(Value::Int(2)),
+            "unexpected second delegated output"
+        );
+        ensure!(!crasher.has_crashed(), "driver should not have crashed yet");
+        ensure!(crasher.calls_made() == 2, "unexpected call count");
 
         // Third call crashes (distinctive transport error), and so does the next.
         let c = crasher
             .call(MethodId::new(0), Value::Int(3), OutputMode::Unary, &ctx)
             .await;
-        assert!(
+        ensure!(
             matches!(c, Err(DriverError::Transport(_))),
             "Nth+1 call crashes"
         );
-        assert!(crasher.has_crashed());
+        ensure!(crasher.has_crashed(), "driver should be crashed");
         let d = crasher
             .call(MethodId::new(0), Value::Int(4), OutputMode::Unary, &ctx)
             .await;
-        assert!(d.is_err(), "stays crashed after the crash point");
+        ensure!(d.is_err(), "stays crashed after the crash point");
+        Ok(())
     }
 
     #[test]
-    fn why_not_explains_a_denied_fact() {
+    fn why_not_explains_a_denied_fact() -> anyhow::Result<()> {
         use nexus_types::ids::NodeId;
         use nexus_types::{
             DecisionTag, Fact, HandleId, IdentityRef, MethodId, OperationId, OutcomeRef, Path,
@@ -623,7 +665,7 @@ mod tests {
         // A residual policy rejected an outbound op whose input touched the vault.
         let mut taint = TaintSet::of(TaintSource::ModelOutput);
         taint.add(TaintSource::Protected {
-            path: Path::parse("state://vault/alice/x").unwrap(),
+            path: Path::parse("state://vault/alice/x")?,
         });
         let fact = Fact {
             id: op,
@@ -642,12 +684,16 @@ mod tests {
             timestamp: Timestamp::millis(1),
         };
 
-        let why = why_not(&[fact], op).expect("a recorded fact yields a WhyNot");
-        assert_eq!(why.decision, DecisionTag::RejectedByPolicy);
-        assert!(!why.was_allowed());
-        assert!(why.tainted_protected, "lineage touched a protected source");
-        assert!(why.tainted_untrusted, "lineage also carried model output");
-        assert!(
+        let why = why_not(&[fact], op).context("missing why-not explanation")?;
+        ensure!(
+            why.decision == DecisionTag::RejectedByPolicy,
+            "unexpected decision: {:?}",
+            why.decision
+        );
+        ensure!(!why.was_allowed(), "denied fact should not be allowed");
+        ensure!(why.tainted_protected, "lineage touched a protected source");
+        ensure!(why.tainted_untrusted, "lineage also carried model output");
+        ensure!(
             why.explanation.contains("protected source"),
             "{}",
             why.explanation
@@ -655,6 +701,10 @@ mod tests {
 
         // No Fact for an unrelated op ⇒ no explanation (cursor never reached it).
         let other = OperationId::new(ProcessId::new(7), NodeId::new(99), 0);
-        assert!(why_not(&[], other).is_none());
+        ensure!(
+            why_not(&[], other).is_none(),
+            "unrelated op should have no explanation"
+        );
+        Ok(())
     }
 }

@@ -2,22 +2,11 @@
 
 //! `nexus-sdk` — embedded façade.
 //!
-//! Re-exports the public surface and provides a one-call [`nexus`] constructor
-//! for applications embedding the kernel in-process, plus [`Nexus`] — a thin
-//! wrapper that opens a resource, binds it, and runs a program.
+//! Re-exports the embedded kernel surface and provides a one-call [`nexus`]
+//! constructor for applications embedding the kernel in-process, plus
+//! [`Nexus`] — a thin wrapper that opens a resource, binds it, and runs a
+//! program.
 
-pub use nexus_actors::{InstallError, StandardConfig, install_standard};
-pub use nexus_gateway::{
-    BearerToken, BearerTokenHash, CommitObjectUploadRequest, CommitObjectUploadResponse, Gateway,
-    GatewayAuthMethod, GatewayCredential, GatewayCredentialKind, GatewayDescriptor,
-    GatewayDirectInput, GatewayError, GatewayIdentityMapping, GatewayLimitProfile, GatewayModality,
-    GatewayObjectUploadTicket, GatewayPayloadProvenance, GatewayPrincipalSurfaceBinding,
-    GatewayProfile, GatewayProfileRev, GatewayRuntime, GatewaySession, GatewayStreamChunk,
-    GatewayStreamDirection, GatewayStreamEnd, GatewayStreamOpenRequest, GatewaySubmission,
-    GatewaySubmissionBody, GatewaySurface, GatewaySurfaceDescriptor, GatewaySurfaceKind,
-    IssueObjectUploadTicketRequest, ObjectStoreProof, PresentedCredential, ProgramInspection,
-    ProgramSubmission, SubmitOptions, VerifiedPrincipal,
-};
 pub use nexus_graph::{
     DoNode, ExecutionGraph, GraphCursor, NodeKind, OperationTemplate, StepRef, compile_do,
 };
@@ -26,6 +15,7 @@ pub use nexus_kernel::{
     FactStore, Handle, HandleTable, Kernel, OpenError, Registry,
 };
 pub use nexus_plan::{Plan, PlanError, Step, WriteModeSpec, compile_for, parse_json, parse_yaml};
+pub use nexus_standard::{InstallError, StandardConfig, install_standard};
 pub use nexus_state::{
     Backend, InMemoryBackend, StateBackend, StateError, StateEvent, StateResult, merge_values,
 };
@@ -39,7 +29,7 @@ use std::sync::Arc;
 
 /// One-call constructor: a [`Bootstrap`] with the standard provider set
 /// installed (inference, memory, time, blob, approval, events, lock,
-/// deliberation). fs/terminal/fetch are opt-in via [`StandardConfig`].
+/// deliberation).
 pub fn nexus() -> Result<Bootstrap, InstallError> {
     let boot = Bootstrap::in_memory();
     install_standard(&boot, &StandardConfig::default())?;
@@ -95,41 +85,47 @@ impl Nexus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{anyhow, ensure};
 
-    #[tokio::test]
-    async fn one_call_constructor_has_standard_providers() {
-        let Ok(nx) = Nexus::new() else {
-            panic!("Nexus::new should install standard providers");
-        };
-        let prog = DoNode::Op(OperationTemplate {
-            target: ResourceName::new(Path::parse("effect://inference/infer").unwrap()),
-            method: "invoke".into(),
-            method_id: None,
-            output: nexus_types::OutputMode::Unary,
-            literal_input: Some(Value::Str("hello".into())),
-        });
-        let out = nx.run(&["effect://inference/infer"], prog).await;
-        assert!(matches!(out, Outcome::Done(_)));
+    fn p(path: &str) -> anyhow::Result<Path> {
+        Path::parse(path).map_err(|error| anyhow!("path parse failed for {path}: {error}"))
     }
 
     #[tokio::test]
-    async fn plan_compiles_and_runs() {
-        let Ok(nx) = Nexus::new() else {
-            panic!("Nexus::new should install standard providers");
-        };
+    async fn one_call_constructor_has_standard_providers() -> anyhow::Result<()> {
+        let nx = Nexus::new()?;
+        let prog = DoNode::Op(OperationTemplate {
+            target: ResourceName::new(p("effect://time/now")?),
+            method: "invoke".into(),
+            method_id: None,
+            output: nexus_types::OutputMode::Unary,
+            literal_input: Some(Value::Null),
+        });
+        let out = nx.run(&["effect://time/now"], prog).await;
+        ensure!(
+            matches!(out, Outcome::Done(_)),
+            "unexpected outcome: {out:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_compiles_and_runs() -> anyhow::Result<()> {
+        let nx = Nexus::new()?;
         let plan = Plan {
             id: "p".into(),
             version: 1,
             description: None,
             steps: vec![Step::Perform {
-                target: "effect://inference/infer".into(),
-                input: Some(serde_json::json!("greet me")),
+                target: "effect://time/now".into(),
+                input: Some(serde_json::Value::Null),
             }],
         };
-        let out = nx
-            .run_plan(&["effect://inference/infer"], &plan)
-            .await
-            .unwrap();
-        assert!(matches!(out, Outcome::Done(_)));
+        let out = nx.run_plan(&["effect://time/now"], &plan).await?;
+        ensure!(
+            matches!(out, Outcome::Done(_)),
+            "unexpected outcome: {out:?}"
+        );
+        Ok(())
     }
 }

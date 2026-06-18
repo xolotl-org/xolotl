@@ -1,5 +1,6 @@
+use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion};
 use nexus_kernel::{
     Bootstrap, DataPlane, Driver, DriverContext, DriverError, DriverPlan, EchoDriver, FastPath,
     Handle, HandleState, HandleTable, MethodSpec, OpenRequest, RequestGrantTemplate,
@@ -11,10 +12,57 @@ use nexus_types::{
     TaintSet, Timestamp, Value, ValueRef,
 };
 use std::hint::black_box;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::runtime::{Builder, Runtime};
 
 const FIXED_OPEN_MILLIS: i64 = 1_700_000_000_000;
+
+#[derive(Default)]
+struct BenchFailure {
+    errors: Mutex<Vec<String>>,
+}
+
+impl BenchFailure {
+    fn record(&self, err: anyhow::Error) {
+        let mut errors = match self.errors.lock() {
+            Ok(errors) => errors,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        errors.push(format!("{err:?}"));
+    }
+
+    fn finish(&self) -> anyhow::Result<()> {
+        let mut errors = match self.errors.lock() {
+            Ok(errors) => errors,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let errors = std::mem::take(&mut *errors);
+        if errors.is_empty() {
+            return Ok(());
+        }
+        bail!(
+            "benchmark reported {} error(s):\n{}",
+            errors.len(),
+            errors.join("\n")
+        )
+    }
+}
+
+fn capture_result<T>(failure: &BenchFailure, result: anyhow::Result<T>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(err) => {
+            failure.record(err);
+            None
+        }
+    }
+}
+
+fn capture_condition(failure: &BenchFailure, condition: bool, message: &'static str) {
+    if !condition {
+        failure.record(anyhow!(message));
+    }
+}
 
 struct OpenFixture {
     boot: Bootstrap,
@@ -24,38 +72,39 @@ struct OpenFixture {
 }
 
 impl OpenFixture {
-    fn new(effect_path: &str) -> Self {
+    fn new(effect_path: &str) -> anyhow::Result<Self> {
         let boot = Bootstrap::in_memory();
-        let name = register_echo_effect(&boot, effect_path, Purity::Pure);
+        let name = register_echo_effect(&boot, effect_path, Purity::Pure)?;
         let resource = boot
             .kernel
             .registry
             .resolve_resource(&name)
-            .expect("registered effect must resolve");
+            .context("registered effect did not resolve")?;
         let process = boot.root;
-        Self {
+        Ok(Self {
             boot,
             process,
             resource,
             path: name.path().clone(),
-        }
+        })
     }
 
-    fn with_many_grants(effect_path: &str, grants: usize) -> Self {
+    fn with_many_grants(effect_path: &str, grants: usize) -> anyhow::Result<Self> {
         let boot = Bootstrap::in_memory();
-        let name = register_echo_effect(&boot, effect_path, Purity::Pure);
+        let name = register_echo_effect(&boot, effect_path, Purity::Pure)?;
         let resource = boot
             .kernel
             .registry
             .resolve_resource(&name)
-            .expect("registered effect must resolve");
+            .context("registered effect did not resolve")?;
         let process = ProcessId::new(99_001);
         for i in 0..grants {
+            let selector = ResourceSelector::parse(&format!("perform://effect/irrelevant/g{i}"))
+                .with_context(|| format!("irrelevant grant selector {i} did not parse"))?;
             boot.kernel.registry.register_grant(Grant {
                 id: boot.kernel.registry.next_grant_id(),
                 holder: process,
-                selector: ResourceSelector::parse(&format!("perform://effect/irrelevant/g{i}"))
-                    .expect("irrelevant selector must parse"),
+                selector,
                 rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
                 constraints: ConstraintSet::empty(),
                 expires: Expiry::Never,
@@ -65,21 +114,21 @@ impl OpenFixture {
             id: boot.kernel.registry.next_grant_id(),
             holder: process,
             selector: ResourceSelector::parse("perform://effect/bench/open-many-grants")
-                .expect("matching selector must parse"),
+                .context("matching grant selector did not parse")?,
             rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
         });
-        Self {
+        Ok(Self {
             boot,
             process,
             resource,
             path: name.path().clone(),
-        }
+        })
     }
 
-    fn open_at(&self, handles: &mut HandleTable, now_millis: i64) -> HandleId {
-        nexus_kernel::open_resource(
+    fn open_at(&self, handles: &mut HandleTable, now_millis: i64) -> anyhow::Result<HandleId> {
+        let handle = nexus_kernel::open_resource(
             &self.boot.kernel.registry,
             handles,
             OpenRequest {
@@ -92,7 +141,8 @@ impl OpenFixture {
                 now_millis,
             },
         )
-        .expect("open must succeed")
+        .context("open resource failed")?;
+        Ok(handle)
     }
 }
 
@@ -116,37 +166,43 @@ impl Driver for ChunkDriver {
     }
 }
 
-fn register_echo_effect(boot: &Bootstrap, path: &str, purity: Purity) -> ResourceName {
-    boot.register_effect(
-        path,
-        &[MethodSpec::new(
-            "invoke",
-            purity,
-            OutputModeSet::UNARY | OutputModeSet::ASYNC_PROCESS,
-        )],
-        Arc::new(EchoDriver),
-    )
-    .expect("effect registration must succeed")
+fn register_echo_effect(
+    boot: &Bootstrap,
+    path: &str,
+    purity: Purity,
+) -> anyhow::Result<ResourceName> {
+    let name = boot
+        .register_effect(
+            path,
+            &[MethodSpec::new(
+                "invoke",
+                purity,
+                OutputModeSet::UNARY | OutputModeSet::ASYNC_PROCESS,
+            )],
+            Arc::new(EchoDriver),
+        )
+        .context("effect registration failed")?;
+    Ok(name)
 }
 
-fn unconstrained_dataplane_fixture(effect_path: &str) -> (DataPlane, Operation) {
+fn unconstrained_dataplane_fixture(effect_path: &str) -> anyhow::Result<(DataPlane, Operation)> {
     let boot = Bootstrap::in_memory();
-    let name = register_echo_effect(&boot, effect_path, Purity::Pure);
+    let name = register_echo_effect(&boot, effect_path, Purity::Pure)?;
     let handle = boot
         .open_for(boot.root, &name, "perform")
-        .expect("root open must succeed");
+        .context("root open failed")?;
     let op = operation(boot.root, handle, 0, Value::Int(42));
-    (boot.kernel.data_plane(), op)
+    Ok((boot.kernel.data_plane(), op))
 }
 
-fn conditional_dataplane_fixture() -> (DataPlane, Operation) {
+fn conditional_dataplane_fixture() -> anyhow::Result<(DataPlane, Operation)> {
     conditional_dataplane_fixture_with_input(
         "effect://bench/conditional",
         Value::Str("acme".into()),
     )
 }
 
-fn conditional_denied_dataplane_fixture() -> (DataPlane, Operation) {
+fn conditional_denied_dataplane_fixture() -> anyhow::Result<(DataPlane, Operation)> {
     conditional_dataplane_fixture_with_input(
         "effect://bench/conditional-denied",
         Value::Str("other".into()),
@@ -156,17 +212,17 @@ fn conditional_denied_dataplane_fixture() -> (DataPlane, Operation) {
 fn conditional_dataplane_fixture_with_input(
     effect_path: &str,
     tenant: Value,
-) -> (DataPlane, Operation) {
+) -> anyhow::Result<(DataPlane, Operation)> {
     let boot = Bootstrap::in_memory();
-    let name = register_echo_effect(&boot, effect_path, Purity::Pure);
+    let name = register_echo_effect(&boot, effect_path, Purity::Pure)?;
     let resource = boot
         .kernel
         .registry
         .resolve_resource(&name)
-        .expect("registered effect must resolve");
+        .context("registered effect did not resolve")?;
     let child = boot
         .spawn_request_process_under_with_request_grants(boot.root, IdentityRef::ROOT, &[])
-        .expect("child process must spawn");
+        .context("child process did not spawn")?;
     let grant = Grant {
         id: boot.kernel.registry.next_grant_id(),
         holder: child,
@@ -174,11 +230,12 @@ fn conditional_dataplane_fixture_with_input(
             "perform://{}",
             effect_path.replacen("://", "/", 1)
         ))
-        .expect("selector must parse"),
+        .context("conditional grant selector did not parse")?,
         rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
         constraints: ConstraintSet {
             predicates: vec![
-                nexus_types::Predicate::parse("tenant=acme").expect("predicate must parse"),
+                nexus_types::Predicate::parse("tenant=acme")
+                    .context("conditional grant predicate did not parse")?,
             ],
         },
         expires: Expiry::Never,
@@ -199,30 +256,30 @@ fn conditional_dataplane_fixture_with_input(
             now_millis: FIXED_OPEN_MILLIS,
         },
     )
-    .expect("constrained open must succeed");
+    .context("constrained open failed")?;
     drop(handles);
 
     let input = Value::Map([("tenant".into(), tenant)].into());
     let op = operation(child, handle, 0, input);
-    (boot.kernel.data_plane(), op)
+    Ok((boot.kernel.data_plane(), op))
 }
 
-fn idempotent_dataplane_fixture() -> (DataPlane, Operation) {
+fn idempotent_dataplane_fixture() -> anyhow::Result<(DataPlane, Operation)> {
     let boot = Bootstrap::in_memory();
-    let name = register_echo_effect(&boot, "effect://bench/idempotent", Purity::Idempotent);
+    let name = register_echo_effect(&boot, "effect://bench/idempotent", Purity::Idempotent)?;
     let handle = boot
         .open_for(boot.root, &name, "perform")
-        .expect("root open must succeed");
+        .context("root open failed")?;
     let op = operation(
         boot.root,
         handle,
         0,
         Value::Str("dedupe-keyed-input".into()),
     );
-    (boot.kernel.data_plane(), op)
+    Ok((boot.kernel.data_plane(), op))
 }
 
-fn collect_dataplane_fixture(chunks: usize) -> (DataPlane, Operation) {
+fn collect_dataplane_fixture(chunks: usize) -> anyhow::Result<(DataPlane, Operation)> {
     let boot = Bootstrap::in_memory();
     let name = boot
         .register_effect(
@@ -234,13 +291,13 @@ fn collect_dataplane_fixture(chunks: usize) -> (DataPlane, Operation) {
             )],
             Arc::new(ChunkDriver { chunks }),
         )
-        .expect("streaming effect registration must succeed");
+        .context("streaming effect registration failed")?;
     let handle = boot
         .open_for(boot.root, &name, "perform")
-        .expect("root open must succeed");
+        .context("root open failed")?;
     let mut op = operation(boot.root, handle, 0, Value::Null);
     op.output = OutputMode::Collect { limit: chunks };
-    (boot.kernel.data_plane(), op)
+    Ok((boot.kernel.data_plane(), op))
 }
 
 fn bench_handle(process: ProcessId, resource: ResourceId) -> Handle {
@@ -307,27 +364,31 @@ fn fact(process: ProcessId, node: u32, complete: bool) -> Fact {
     }
 }
 
-fn runtime() -> Runtime {
-    Builder::new_multi_thread()
+fn runtime() -> anyhow::Result<Runtime> {
+    let runtime = Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
-        .expect("tokio runtime must build")
+        .context("tokio runtime did not build")?;
+    Ok(runtime)
 }
 
-fn bench_open(c: &mut Criterion) {
+fn bench_open(c: &mut Criterion) -> anyhow::Result<()> {
     let mut group = c.benchmark_group("kernel/open");
+    let failure = BenchFailure::default();
 
     group.bench_function("open_resource_cold_compile", |b| {
         b.iter_batched_ref(
             || {
-                (
-                    OpenFixture::new("effect://bench/open-cold"),
-                    HandleTable::new(),
-                )
+                capture_result(&failure, OpenFixture::new("effect://bench/open-cold"))
+                    .map(|fixture| (fixture, HandleTable::new()))
             },
-            |(fixture, handles)| {
-                black_box(fixture.open_at(handles, FIXED_OPEN_MILLIS));
+            |batch| {
+                if let Some(handle) = batch.as_mut().and_then(|(fixture, handles)| {
+                    capture_result(&failure, fixture.open_at(handles, FIXED_OPEN_MILLIS))
+                }) {
+                    black_box(handle);
+                }
             },
             BatchSize::SmallInput,
         );
@@ -336,13 +397,22 @@ fn bench_open(c: &mut Criterion) {
     group.bench_function("open_resource_cache_hit_fixed_time", |b| {
         b.iter_batched_ref(
             || {
-                let fixture = OpenFixture::new("effect://bench/open-hit");
+                let fixture =
+                    capture_result(&failure, OpenFixture::new("effect://bench/open-hit"))?;
                 let mut warm_handles = HandleTable::new();
-                fixture.open_at(&mut warm_handles, FIXED_OPEN_MILLIS);
-                (fixture, HandleTable::new())
+                let handle = capture_result(
+                    &failure,
+                    fixture.open_at(&mut warm_handles, FIXED_OPEN_MILLIS),
+                )?;
+                black_box(handle);
+                Some((fixture, HandleTable::new()))
             },
-            |(fixture, handles)| {
-                black_box(fixture.open_at(handles, FIXED_OPEN_MILLIS));
+            |batch| {
+                if let Some(handle) = batch.as_mut().and_then(|(fixture, handles)| {
+                    capture_result(&failure, fixture.open_at(handles, FIXED_OPEN_MILLIS))
+                }) {
+                    black_box(handle);
+                }
             },
             BatchSize::SmallInput,
         );
@@ -351,13 +421,22 @@ fn bench_open(c: &mut Criterion) {
     group.bench_function("open_resource_cache_miss_fresh_time", |b| {
         b.iter_batched_ref(
             || {
-                let fixture = OpenFixture::new("effect://bench/open-fresh-time");
+                let fixture =
+                    capture_result(&failure, OpenFixture::new("effect://bench/open-fresh-time"))?;
                 let mut warm_handles = HandleTable::new();
-                fixture.open_at(&mut warm_handles, FIXED_OPEN_MILLIS);
-                (fixture, HandleTable::new())
+                let handle = capture_result(
+                    &failure,
+                    fixture.open_at(&mut warm_handles, FIXED_OPEN_MILLIS),
+                )?;
+                black_box(handle);
+                Some((fixture, HandleTable::new()))
             },
-            |(fixture, handles)| {
-                black_box(fixture.open_at(handles, FIXED_OPEN_MILLIS + 1));
+            |batch| {
+                if let Some(handle) = batch.as_mut().and_then(|(fixture, handles)| {
+                    capture_result(&failure, fixture.open_at(handles, FIXED_OPEN_MILLIS + 1))
+                }) {
+                    black_box(handle);
+                }
             },
             BatchSize::SmallInput,
         );
@@ -366,31 +445,42 @@ fn bench_open(c: &mut Criterion) {
     group.bench_function("open_resource_cold_many_grants_4096", |b| {
         b.iter_batched_ref(
             || {
-                (
+                capture_result(
+                    &failure,
                     OpenFixture::with_many_grants("effect://bench/open-many-grants", 4_096),
-                    HandleTable::new(),
                 )
+                .map(|fixture| (fixture, HandleTable::new()))
             },
-            |(fixture, handles)| {
-                black_box(fixture.open_at(handles, FIXED_OPEN_MILLIS));
+            |batch| {
+                if let Some(handle) = batch.as_mut().and_then(|(fixture, handles)| {
+                    capture_result(&failure, fixture.open_at(handles, FIXED_OPEN_MILLIS))
+                }) {
+                    black_box(handle);
+                }
             },
             BatchSize::SmallInput,
         );
     });
 
     group.finish();
+    failure.finish()
 }
 
-fn bench_handle_table(c: &mut Criterion) {
+fn bench_handle_table(c: &mut Criterion) -> anyhow::Result<()> {
     let mut group = c.benchmark_group("kernel/handle_table");
+    let failure = BenchFailure::default();
 
     group.bench_function("get_16384_live_handles", |b| {
         let (table, ids) = populated_handle_table(16_384);
         let mut index = 0usize;
         b.iter(|| {
             index = (index + 1021) % ids.len();
-            let handle = table.get(black_box(ids[index])).expect("handle must exist");
-            black_box(handle.resource);
+            match table.get(black_box(ids[index])) {
+                Some(handle) => {
+                    black_box(handle.resource);
+                }
+                None => failure.record(anyhow!("handle must exist")),
+            }
         });
     });
 
@@ -399,7 +489,7 @@ fn bench_handle_table(c: &mut Criterion) {
             || populated_handle_table(1),
             |(mut table, ids)| {
                 let old = ids[0];
-                assert!(table.revoke(old));
+                capture_condition(&failure, table.revoke(old), "handle revoke failed");
                 let new = table.insert(bench_handle(ProcessId::new(2), ResourceId::new(2)));
                 black_box(new);
             },
@@ -408,14 +498,22 @@ fn bench_handle_table(c: &mut Criterion) {
     });
 
     group.finish();
+    failure.finish()
 }
 
-fn bench_dataplane(c: &mut Criterion) {
-    let rt = runtime();
+fn bench_dataplane(c: &mut Criterion) -> anyhow::Result<()> {
+    let rt = runtime()?;
     let mut group = c.benchmark_group("kernel/dataplane");
+    let failure = BenchFailure::default();
 
     group.bench_function("execute_unconditional_echo_no_fact", |b| {
-        let (plane, op) = unconstrained_dataplane_fixture("effect://bench/dataplane-hot");
+        let (plane, op) = match unconstrained_dataplane_fixture("effect://bench/dataplane-hot") {
+            Ok(fixture) => fixture,
+            Err(err) => {
+                failure.record(err);
+                return;
+            }
+        };
         b.iter(|| {
             let out = rt.block_on(plane.execute(
                 black_box(&op),
@@ -430,7 +528,13 @@ fn bench_dataplane(c: &mut Criterion) {
     });
 
     group.bench_function("execute_conditional_constraint_no_fact", |b| {
-        let (plane, op) = conditional_dataplane_fixture();
+        let (plane, op) = match conditional_dataplane_fixture() {
+            Ok(fixture) => fixture,
+            Err(err) => {
+                failure.record(err);
+                return;
+            }
+        };
         b.iter(|| {
             let out = rt.block_on(plane.execute(
                 black_box(&op),
@@ -445,7 +549,13 @@ fn bench_dataplane(c: &mut Criterion) {
     });
 
     group.bench_function("execute_conditional_constraint_denied", |b| {
-        let (plane, op) = conditional_denied_dataplane_fixture();
+        let (plane, op) = match conditional_denied_dataplane_fixture() {
+            Ok(fixture) => fixture,
+            Err(err) => {
+                failure.record(err);
+                return;
+            }
+        };
         b.iter(|| {
             let out = rt.block_on(plane.execute(
                 black_box(&op),
@@ -460,7 +570,14 @@ fn bench_dataplane(c: &mut Criterion) {
     });
 
     group.bench_function("execute_unconditional_echo_with_fact", |b| {
-        let (plane, base_op) = unconstrained_dataplane_fixture("effect://bench/dataplane-fact");
+        let (plane, base_op) =
+            match unconstrained_dataplane_fixture("effect://bench/dataplane-fact") {
+                Ok(fixture) => fixture,
+                Err(err) => {
+                    failure.record(err);
+                    return;
+                }
+            };
         let mut node = 0u32;
         b.iter(|| {
             node = node.wrapping_add(1);
@@ -479,7 +596,13 @@ fn bench_dataplane(c: &mut Criterion) {
     });
 
     group.bench_function("execute_idempotent_effect_dedup_hit", |b| {
-        let (plane, op) = idempotent_dataplane_fixture();
+        let (plane, op) = match idempotent_dataplane_fixture() {
+            Ok(fixture) => fixture,
+            Err(err) => {
+                failure.record(err);
+                return;
+            }
+        };
         let first = rt.block_on(plane.execute(
             &op,
             0,
@@ -488,7 +611,10 @@ fn bench_dataplane(c: &mut Criterion) {
             FIXED_OPEN_MILLIS,
             false,
         ));
-        assert!(first.outcome.is_success());
+        if !first.outcome.is_success() {
+            failure.record(anyhow!("first idempotent run failed: {:?}", first.outcome));
+            return;
+        }
         b.iter(|| {
             let out = rt.block_on(plane.execute(
                 black_box(&op),
@@ -503,7 +629,13 @@ fn bench_dataplane(c: &mut Criterion) {
     });
 
     group.bench_function("execute_collect_stream_32_chunks", |b| {
-        let (plane, base_op) = collect_dataplane_fixture(32);
+        let (plane, base_op) = match collect_dataplane_fixture(32) {
+            Ok(fixture) => fixture,
+            Err(err) => {
+                failure.record(err);
+                return;
+            }
+        };
         let mut node = 0u32;
         b.iter(|| {
             node = node.wrapping_add(1);
@@ -522,20 +654,34 @@ fn bench_dataplane(c: &mut Criterion) {
     });
 
     group.bench_function("execute_unconditional_echo_concurrent_64", |b| {
-        let (plane, op) = unconstrained_dataplane_fixture("effect://bench/dataplane-concurrent");
+        let (plane, op) =
+            match unconstrained_dataplane_fixture("effect://bench/dataplane-concurrent") {
+                Ok(fixture) => fixture,
+                Err(err) => {
+                    failure.record(err);
+                    return;
+                }
+            };
         b.iter(|| {
-            rt.block_on(run_concurrent_echo(
+            if let Err(err) = rt.block_on(run_concurrent_echo(
                 black_box(plane.clone()),
                 black_box(op.clone()),
                 64,
-            ));
+            )) {
+                failure.record(err);
+            }
         });
     });
 
     group.finish();
+    failure.finish()
 }
 
-async fn run_concurrent_echo(plane: DataPlane, op: Operation, workers: usize) {
+async fn run_concurrent_echo(
+    plane: DataPlane,
+    op: Operation,
+    workers: usize,
+) -> anyhow::Result<()> {
     let mut tasks = Vec::with_capacity(workers);
     for i in 0..workers {
         let plane = plane.clone();
@@ -555,18 +701,22 @@ async fn run_concurrent_echo(plane: DataPlane, op: Operation, workers: usize) {
         }));
     }
     for task in tasks {
-        let out = task.await.expect("concurrent dataplane task must join");
+        let out = task
+            .await
+            .context("concurrent dataplane task did not join")?;
         match out.outcome {
             Outcome::Done(value) => {
                 black_box(value);
             }
-            other => panic!("expected successful echo outcome, got {other:?}"),
+            other => bail!("expected successful echo outcome, got {other:?}"),
         }
     }
+    Ok(())
 }
 
-fn bench_fact_sink(c: &mut Criterion) {
+fn bench_fact_sink(c: &mut Criterion) -> anyhow::Result<()> {
     let mut group = c.benchmark_group("kernel/fact_sink");
+    let failure = BenchFailure::default();
 
     group.bench_function("in_memory_non_idempotent_begin_complete", |b| {
         let (sink, _) = nexus_kernel::FactSink::in_memory();
@@ -574,20 +724,29 @@ fn bench_fact_sink(c: &mut Criterion) {
         let mut node = 0u32;
         b.iter(|| {
             node = node.wrapping_add(1);
-            sink.begin(fact(process, node, false))
-                .expect("begin fact must succeed");
-            sink.complete(fact(process, node, true))
-                .expect("complete fact must succeed");
+            if let Err(err) = sink
+                .begin(fact(process, node, false))
+                .context("begin fact failed")
+            {
+                failure.record(err);
+            }
+            if let Err(err) = sink
+                .complete(fact(process, node, true))
+                .context("complete fact failed")
+            {
+                failure.record(err);
+            }
         });
     });
 
     group.finish();
+    failure.finish()
 }
 
 // Cost of spawning a request Process under the root anchor. Request grants are
 // attached to the Process, so the global grant registry is not written on this
 // path. Measure 1, 4, and 16 request grant templates.
-fn bench_request_spawn(c: &mut Criterion) {
+fn bench_request_spawn(c: &mut Criterion) -> anyhow::Result<()> {
     const CAPS: &[&str] = &[
         "perform://effect/inference/infer",
         "read://state/memory/alice/recent",
@@ -608,6 +767,7 @@ fn bench_request_spawn(c: &mut Criterion) {
     ];
 
     let mut group = c.benchmark_group("request_spawn");
+    let failure = BenchFailure::default();
     for &k in &[1usize, 4, 16] {
         let grants: Vec<RequestGrantTemplate<'_>> = CAPS[..k]
             .iter()
@@ -620,28 +780,33 @@ fn bench_request_spawn(c: &mut Criterion) {
             b.iter_batched(
                 Bootstrap::in_memory,
                 |boot| {
-                    let child = boot
-                        .spawn_request_process_under_with_request_grants(
+                    if let Some(child) = capture_result(
+                        &failure,
+                        boot.spawn_request_process_under_with_request_grants(
                             boot.root,
                             IdentityRef::ROOT,
                             black_box(&grants),
                         )
-                        .expect("root anchor covers request grant templates");
-                    black_box(child);
+                        .context("request process spawn failed"),
+                    ) {
+                        black_box(child);
+                    }
                 },
                 BatchSize::SmallInput,
             );
         });
     }
     group.finish();
+    failure.finish()
 }
 
-criterion_group!(
-    benches,
-    bench_open,
-    bench_handle_table,
-    bench_dataplane,
-    bench_fact_sink,
-    bench_request_spawn
-);
-criterion_main!(benches);
+fn main() -> anyhow::Result<()> {
+    let mut criterion = Criterion::default().configure_from_args();
+    bench_open(&mut criterion).context("kernel/open benchmarks failed")?;
+    bench_handle_table(&mut criterion).context("kernel/handle_table benchmarks failed")?;
+    bench_dataplane(&mut criterion).context("kernel/dataplane benchmarks failed")?;
+    bench_fact_sink(&mut criterion).context("kernel/fact_sink benchmarks failed")?;
+    bench_request_spawn(&mut criterion).context("request_spawn benchmarks failed")?;
+    criterion.final_summary();
+    Ok(())
+}

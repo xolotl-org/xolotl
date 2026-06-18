@@ -12,10 +12,10 @@ use crate::path::Path;
 use crate::replay::Purity;
 use crate::value::Value;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-pub use crate::device::{EffectCapability, Transport, TrustLevel};
+pub use crate::external_descriptor::{EffectCapability, Transport, TrustLevel};
 
 /// A JSON Schema, modeled as a [`Value`] (object) to stay wasm-safe and avoid
 /// a schema-library dependency. Used as a config contract.
@@ -149,6 +149,9 @@ pub enum ExternalAdmissionError {
     /// Provider projection declared no capabilities.
     #[error("provider projection must declare at least one provided effect")]
     ProviderWithoutCapabilities,
+    /// Provider projection declared the same effect more than once.
+    #[error("provider projection effect {0:?} is duplicated")]
+    DuplicateProviderEffect(String),
     /// Provider projection also declared source events.
     #[error("provider projection must not declare a source event stream")]
     ProviderWithEventSource,
@@ -245,10 +248,16 @@ impl ExternalProjectionDef {
                 if trust == TrustLevel::Sandboxed {
                     validate_sandbox_namespace(installation_id, namespace)?;
                 }
+                let mut effects = BTreeSet::new();
                 for cap in &self.provides {
                     let effect = Path::parse(&cap.effect_path).map_err(|_| {
                         ExternalAdmissionError::MalformedEffectPath(cap.effect_path.clone())
                     })?;
+                    if !effects.insert(effect.clone()) {
+                        return Err(ExternalAdmissionError::DuplicateProviderEffect(
+                            cap.effect_path.clone(),
+                        ));
+                    }
                     if !namespace.is_prefix_of(&effect) {
                         return Err(ExternalAdmissionError::NamespaceEscape {
                             namespace: Box::new(namespace.clone()),
@@ -864,26 +873,6 @@ pub enum ControlFrame {
     },
 }
 
-/// Provider readiness entry reported by a remote endpoint.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct EffectHandlerSpec {
-    /// Effect resource path the endpoint can handle.
-    pub path: String,
-    /// Declared replay safety for this handler.
-    pub purity: Purity,
-    /// Optional human-readable description.
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
-/// Provider frame declaring that startup is complete.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ProviderReady {
-    /// Runtime handler set reported by the endpoint.
-    #[serde(default)]
-    pub provides: Vec<EffectHandlerSpec>,
-}
-
 /// Provider data frame: one remote Operation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Invoke {
@@ -1032,6 +1021,26 @@ pub struct SourceRateLimit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, ensure};
+    use std::fmt::Debug;
+
+    fn check_eq<T>(actual: T, expected: T, label: &str) -> anyhow::Result<()>
+    where
+        T: Debug + PartialEq,
+    {
+        ensure!(
+            actual == expected,
+            "{label}: expected {expected:?}, got {actual:?}"
+        );
+        Ok(())
+    }
+
+    fn emits_mut(projection: &mut ExternalProjectionDef) -> anyhow::Result<&mut EventSource> {
+        projection
+            .emits
+            .as_mut()
+            .context("source projection has no emits")
+    }
 
     fn test_source_capacity() -> StreamCapacity {
         StreamCapacity {
@@ -1044,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn installation_with_source_and_provider_projections_is_admitted() {
+    fn installation_with_source_and_provider_projections_is_admitted() -> anyhow::Result<()> {
         let install = ExternalInstallationDef {
             id: "instant_messaging_platform".into(),
             platform: "instant_messaging_platform".into(),
@@ -1063,7 +1072,7 @@ mod tests {
                             "instant_messaging_platform",
                             "source",
                         )
-                        .unwrap(),
+                        .context("build source sink")?,
                         purity: Purity::Effectful,
                         event_schema: None,
                         max_inline_payload_bytes: 65_536,
@@ -1080,7 +1089,7 @@ mod tests {
                     role: Role::Provider,
                     namespace: Some(
                         Path::parse("effect://external-provider/instant_messaging_platform")
-                            .unwrap(),
+                            .context("parse provider namespace")?,
                     ),
                     provides: vec![EffectCapability::new(
                         "effect://external-provider/instant_messaging_platform/send_text",
@@ -1092,16 +1101,22 @@ mod tests {
             ],
             version: 1,
         };
-        assert_eq!(install.validate_admission(), Ok(()));
+        check_eq(
+            install.validate_admission(),
+            Ok(()),
+            "installation admission",
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn installation_rejects_duplicate_projection_ids() {
+    fn installation_rejects_duplicate_projection_ids() -> anyhow::Result<()> {
         let projection = ExternalProjectionDef {
             id: "provider".into(),
             role: Role::Provider,
             namespace: Some(
-                Path::parse("effect://external-provider/instant_messaging_platform").unwrap(),
+                Path::parse("effect://external-provider/instant_messaging_platform")
+                    .context("parse provider namespace")?,
             ),
             provides: vec![EffectCapability::new(
                 "effect://external-provider/instant_messaging_platform/send_text",
@@ -1120,16 +1135,18 @@ mod tests {
             projections: vec![projection.clone(), projection],
             version: 1,
         };
-        assert_eq!(
+        check_eq(
             install.validate_admission(),
             Err(ExternalAdmissionError::DuplicateProjectionId(
-                "provider".into()
-            ))
-        );
+                "provider".into(),
+            )),
+            "duplicate projection admission",
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn sandbox_provider_admission_is_structural_and_fail_closed() {
+    fn sandbox_provider_admission_is_structural_and_fail_closed() -> anyhow::Result<()> {
         let valid = ExternalProjectionDef {
             id: "provider".into(),
             role: Role::Provider,
@@ -1138,72 +1155,106 @@ mod tests {
                 Purity::Idempotent,
             )],
             emits: None,
-            namespace: Some(Path::parse("effect://external-provider/acme").unwrap()),
+            namespace: Some(
+                Path::parse("effect://external-provider/acme")
+                    .context("parse provider namespace")?,
+            ),
             version: 1,
         };
-        assert_eq!(
+        check_eq(
             valid.validate_admission(
                 "acme",
                 TrustLevel::Sandboxed,
                 &Transport::Stdio {
                     command: Some("acme-plugin".into()),
-                    args: vec![]
-                }
+                    args: vec![],
+                },
             ),
-            Ok(())
-        );
+            Ok(()),
+            "valid sandbox provider",
+        )?;
 
         let mut sibling_escape = valid.clone();
         sibling_escape.provides[0].effect_path =
             "effect://external-provider/acmeevil/search".into();
-        assert!(matches!(
-            sibling_escape.validate_admission(
-                "acme",
-                TrustLevel::Sandboxed,
-                &Transport::Stdio {
-                    command: Some("acme-plugin".into()),
-                    args: vec![]
-                }
+        ensure!(
+            matches!(
+                sibling_escape.validate_admission(
+                    "acme",
+                    TrustLevel::Sandboxed,
+                    &Transport::Stdio {
+                        command: Some("acme-plugin".into()),
+                        args: vec![]
+                    }
+                ),
+                Err(ExternalAdmissionError::NamespaceEscape { .. })
             ),
-            Err(ExternalAdmissionError::NamespaceEscape { .. })
-        ));
+            "sibling namespace escape was accepted"
+        );
 
         let mut bad_namespace = valid.clone();
-        bad_namespace.namespace = Some(Path::parse("effect://x/acme").unwrap());
-        assert_eq!(
+        bad_namespace.namespace =
+            Some(Path::parse("effect://x/acme").context("parse bad namespace")?);
+        check_eq(
             bad_namespace.validate_admission(
                 "acme",
                 TrustLevel::Sandboxed,
                 &Transport::Stdio {
                     command: Some("acme-plugin".into()),
-                    args: vec![]
-                }
+                    args: vec![],
+                },
             ),
-            Err(ExternalAdmissionError::BadSandboxNamespace)
-        );
+            Err(ExternalAdmissionError::BadSandboxNamespace),
+            "bad sandbox namespace",
+        )?;
+
+        let mut duplicate = valid.clone();
+        duplicate.provides.push(EffectCapability::new(
+            "effect://external-provider/acme/search",
+            Purity::Idempotent,
+        ));
+        check_eq(
+            duplicate.validate_admission(
+                "acme",
+                TrustLevel::Sandboxed,
+                &Transport::Stdio {
+                    command: Some("acme-plugin".into()),
+                    args: vec![],
+                },
+            ),
+            Err(ExternalAdmissionError::DuplicateProviderEffect(
+                "effect://external-provider/acme/search".into(),
+            )),
+            "duplicate provider effect",
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn projection_role_shape_is_fail_closed() {
+    fn projection_role_shape_is_fail_closed() -> anyhow::Result<()> {
         let provider_without_caps = ExternalProjectionDef {
             id: "provider".into(),
             role: Role::Provider,
             provides: vec![],
             emits: None,
-            namespace: Some(Path::parse("effect://external-provider/acme").unwrap()),
+            namespace: Some(
+                Path::parse("effect://external-provider/acme")
+                    .context("parse provider namespace")?,
+            ),
             version: 1,
         };
-        assert_eq!(
+        check_eq(
             provider_without_caps.validate_admission(
                 "acme",
                 TrustLevel::Sandboxed,
                 &Transport::Stdio {
                     command: Some("acme-plugin".into()),
-                    args: vec![]
-                }
+                    args: vec![],
+                },
             ),
-            Err(ExternalAdmissionError::ProviderWithoutCapabilities)
-        );
+            Err(ExternalAdmissionError::ProviderWithoutCapabilities),
+            "provider without caps",
+        )?;
 
         let source_with_caps = ExternalProjectionDef {
             id: "source".into(),
@@ -1213,7 +1264,8 @@ mod tests {
                 Purity::Effectful,
             )],
             emits: Some(EventSource {
-                sink: sandboxed_source_event_sink_path("bridge", "source").unwrap(),
+                sink: sandboxed_source_event_sink_path("bridge", "source")
+                    .context("build source sink")?,
                 purity: Purity::Effectful,
                 event_schema: None,
                 max_inline_payload_bytes: 65_536,
@@ -1226,26 +1278,29 @@ mod tests {
             namespace: None,
             version: 1,
         };
-        assert_eq!(
+        check_eq(
             source_with_caps.validate_admission(
                 "bridge",
                 TrustLevel::Sandboxed,
                 &Transport::WebSocket {
-                    endpoint: Some("wss://example.test".into())
-                }
+                    endpoint: Some("wss://example.test".into()),
+                },
             ),
-            Err(ExternalAdmissionError::SourceWithCapabilities)
-        );
+            Err(ExternalAdmissionError::SourceWithCapabilities),
+            "source with caps",
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn sandbox_source_event_sink_is_canonical_and_fail_closed() {
+    fn sandbox_source_event_sink_is_canonical_and_fail_closed() -> anyhow::Result<()> {
         let valid = ExternalProjectionDef {
             id: "source".into(),
             role: Role::Source,
             provides: vec![],
             emits: Some(EventSource {
-                sink: sandboxed_source_event_sink_path("bridge", "source").unwrap(),
+                sink: sandboxed_source_event_sink_path("bridge", "source")
+                    .context("build source sink")?,
                 purity: Purity::Effectful,
                 event_schema: None,
                 max_inline_payload_bytes: 65_536,
@@ -1258,39 +1313,46 @@ mod tests {
             namespace: None,
             version: 1,
         };
-        assert_eq!(
+        check_eq(
             valid.validate_admission(
                 "bridge",
                 TrustLevel::Sandboxed,
                 &Transport::WebSocket {
-                    endpoint: Some("wss://example.test".into())
-                }
+                    endpoint: Some("wss://example.test".into()),
+                },
             ),
-            Ok(())
-        );
+            Ok(()),
+            "valid sandbox source",
+        )?;
 
         let mut bad = valid.clone();
-        bad.emits.as_mut().unwrap().sink = Path::parse("state://chat/bridge/events").unwrap();
-        assert!(matches!(
-            bad.validate_admission(
-                "bridge",
-                TrustLevel::Sandboxed,
-                &Transport::WebSocket {
-                    endpoint: Some("wss://example.test".into())
-                }
+        emits_mut(&mut bad)?.sink =
+            Path::parse("state://chat/bridge/events").context("parse bad source sink")?;
+        ensure!(
+            matches!(
+                bad.validate_admission(
+                    "bridge",
+                    TrustLevel::Sandboxed,
+                    &Transport::WebSocket {
+                        endpoint: Some("wss://example.test".into())
+                    }
+                ),
+                Err(ExternalAdmissionError::BadSandboxEventSink { .. })
             ),
-            Err(ExternalAdmissionError::BadSandboxEventSink { .. })
-        ));
+            "bad sandbox event sink was accepted"
+        );
+        Ok(())
     }
 
     #[test]
-    fn source_commands_require_command_schemas() {
+    fn source_commands_require_command_schemas() -> anyhow::Result<()> {
         let source = ExternalProjectionDef {
             id: "source".into(),
             role: Role::Source,
             provides: vec![],
             emits: Some(EventSource {
-                sink: sandboxed_source_event_sink_path("bridge", "source").unwrap(),
+                sink: sandboxed_source_event_sink_path("bridge", "source")
+                    .context("build source sink")?,
                 purity: Purity::Effectful,
                 event_schema: None,
                 max_inline_payload_bytes: 65_536,
@@ -1307,26 +1369,29 @@ mod tests {
             version: 1,
         };
 
-        assert_eq!(
+        check_eq(
             source.validate_admission(
                 "bridge",
                 TrustLevel::Sandboxed,
                 &Transport::WebSocket {
-                    endpoint: Some("wss://example.test".into())
-                }
+                    endpoint: Some("wss://example.test".into()),
+                },
             ),
-            Err(ExternalAdmissionError::SourceCommandsWithoutSchemas)
-        );
+            Err(ExternalAdmissionError::SourceCommandsWithoutSchemas),
+            "source commands without schemas",
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn source_capacity_and_rate_limit_admission_is_fail_closed() {
+    fn source_capacity_and_rate_limit_admission_is_fail_closed() -> anyhow::Result<()> {
         let mut source = ExternalProjectionDef {
             id: "source".into(),
             role: Role::Source,
             provides: vec![],
             emits: Some(EventSource {
-                sink: sandboxed_source_event_sink_path("bridge", "source").unwrap(),
+                sink: sandboxed_source_event_sink_path("bridge", "source")
+                    .context("build source sink")?,
                 purity: Purity::Effectful,
                 event_schema: None,
                 max_inline_payload_bytes: 65_536,
@@ -1340,33 +1405,35 @@ mod tests {
             version: 1,
         };
 
-        source.emits.as_mut().unwrap().max_inline_payload_bytes = 0;
-        assert_eq!(
+        emits_mut(&mut source)?.max_inline_payload_bytes = 0;
+        check_eq(
             source.validate_admission(
                 "bridge",
                 TrustLevel::Sandboxed,
                 &Transport::WebSocket {
-                    endpoint: Some("wss://example.test".into())
-                }
+                    endpoint: Some("wss://example.test".into()),
+                },
             ),
-            Err(ExternalAdmissionError::InvalidSourcePayloadLimit)
-        );
+            Err(ExternalAdmissionError::InvalidSourcePayloadLimit),
+            "invalid source payload limit",
+        )?;
 
-        let emits = source.emits.as_mut().unwrap();
+        let emits = emits_mut(&mut source)?;
         emits.max_inline_payload_bytes = 65_536;
         emits.capacity.max_events = 0;
-        assert_eq!(
+        check_eq(
             source.validate_admission(
                 "bridge",
                 TrustLevel::Sandboxed,
                 &Transport::WebSocket {
-                    endpoint: Some("wss://example.test".into())
-                }
+                    endpoint: Some("wss://example.test".into()),
+                },
             ),
-            Err(ExternalAdmissionError::InvalidSourceCapacity)
-        );
+            Err(ExternalAdmissionError::InvalidSourceCapacity),
+            "invalid source capacity",
+        )?;
 
-        let emits = source.emits.as_mut().unwrap();
+        let emits = emits_mut(&mut source)?;
         emits.capacity = StreamCapacity {
             max_events: 10,
             on_overflow: OverflowPolicy::Backpressure {
@@ -1374,43 +1441,47 @@ mod tests {
                 resume_threshold: 5,
             },
         };
-        assert_eq!(
+        check_eq(
             source.validate_admission(
                 "bridge",
                 TrustLevel::Sandboxed,
                 &Transport::WebSocket {
-                    endpoint: Some("wss://example.test".into())
-                }
+                    endpoint: Some("wss://example.test".into()),
+                },
             ),
-            Err(ExternalAdmissionError::InvalidSourceBackpressureThresholds)
-        );
+            Err(ExternalAdmissionError::InvalidSourceBackpressureThresholds),
+            "invalid source backpressure",
+        )?;
 
-        let emits = source.emits.as_mut().unwrap();
+        let emits = emits_mut(&mut source)?;
         emits.capacity = test_source_capacity();
         emits.rate_limit = Some(SourceRateLimit {
             window_ms: 0,
             max_events: 1,
         });
-        assert_eq!(
+        check_eq(
             source.validate_admission(
                 "bridge",
                 TrustLevel::Sandboxed,
                 &Transport::WebSocket {
-                    endpoint: Some("wss://example.test".into())
-                }
+                    endpoint: Some("wss://example.test".into()),
+                },
             ),
-            Err(ExternalAdmissionError::InvalidSourceRateLimit)
-        );
+            Err(ExternalAdmissionError::InvalidSourceRateLimit),
+            "invalid source rate limit",
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn source_event_sink_must_be_local_concrete_state_path() {
+    fn source_event_sink_must_be_local_concrete_state_path() -> anyhow::Result<()> {
         let source = ExternalProjectionDef {
             id: "source".into(),
             role: Role::Source,
             provides: vec![],
             emits: Some(EventSource {
-                sink: Path::parse("state://events/full/source").unwrap(),
+                sink: Path::parse("state://events/full/source")
+                    .context("parse full-trust source sink")?,
                 purity: Purity::Effectful,
                 event_schema: None,
                 max_inline_payload_bytes: 65_536,
@@ -1423,41 +1494,50 @@ mod tests {
             namespace: None,
             version: 1,
         };
-        assert_eq!(
+        check_eq(
             source.validate_admission(
                 "bridge",
                 TrustLevel::Full,
-                &Transport::Grpc { endpoint: None }
+                &Transport::Grpc { endpoint: None },
             ),
-            Ok(())
-        );
+            Ok(()),
+            "valid full-trust source",
+        )?;
 
         let mut wildcard = source.clone();
-        wildcard.emits.as_mut().unwrap().sink = Path::parse("state://events/**").unwrap();
-        assert!(matches!(
-            wildcard.validate_admission(
-                "bridge",
-                TrustLevel::Full,
-                &Transport::Grpc { endpoint: None }
+        emits_mut(&mut wildcard)?.sink =
+            Path::parse("state://events/**").context("parse wildcard sink")?;
+        ensure!(
+            matches!(
+                wildcard.validate_admission(
+                    "bridge",
+                    TrustLevel::Full,
+                    &Transport::Grpc { endpoint: None }
+                ),
+                Err(ExternalAdmissionError::BadSourceEventSink { .. })
             ),
-            Err(ExternalAdmissionError::BadSourceEventSink { .. })
-        ));
+            "wildcard event sink was accepted"
+        );
 
         let mut clustered = source.clone();
-        clustered.emits.as_mut().unwrap().sink =
-            Path::parse("path://phone/state/events/full/source").unwrap();
-        assert!(matches!(
-            clustered.validate_admission(
-                "bridge",
-                TrustLevel::Full,
-                &Transport::Grpc { endpoint: None }
+        emits_mut(&mut clustered)?.sink =
+            Path::parse("path://phone/state/events/full/source").context("parse clustered sink")?;
+        ensure!(
+            matches!(
+                clustered.validate_admission(
+                    "bridge",
+                    TrustLevel::Full,
+                    &Transport::Grpc { endpoint: None }
+                ),
+                Err(ExternalAdmissionError::BadSourceEventSink { .. })
             ),
-            Err(ExternalAdmissionError::BadSourceEventSink { .. })
-        ));
+            "clustered event sink was accepted"
+        );
+        Ok(())
     }
 
     #[test]
-    fn trust_transport_combo_is_fail_closed() {
+    fn trust_transport_combo_is_fail_closed() -> anyhow::Result<()> {
         let full_stdio = ExternalInstallationDef {
             id: "local-tool".into(),
             platform: "local-tool".into(),
@@ -1471,7 +1551,9 @@ mod tests {
             projections: vec![ExternalProjectionDef {
                 id: "provider".into(),
                 role: Role::Provider,
-                namespace: Some(Path::parse("effect://local-tool").unwrap()),
+                namespace: Some(
+                    Path::parse("effect://local-tool").context("parse local namespace")?,
+                ),
                 provides: vec![EffectCapability::new(
                     "effect://local-tool/run",
                     Purity::Effectful,
@@ -1481,27 +1563,33 @@ mod tests {
             }],
             version: 1,
         };
-        assert!(matches!(
+        ensure!(
+            matches!(
             full_stdio.validate_admission(),
             Err(ExternalAdmissionError::FullTrustTransport(t)) if t == "stdio"
-        ));
+            ),
+            "full-trust stdio was accepted"
+        );
 
         let mut sandbox_in_process = full_stdio.clone();
         sandbox_in_process.id = "tool".into();
         sandbox_in_process.trust = TrustLevel::Sandboxed;
         sandbox_in_process.transport = Transport::InProcess;
-        sandbox_in_process.projections[0].namespace =
-            Some(Path::parse("effect://external-provider/tool").unwrap());
+        sandbox_in_process.projections[0].namespace = Some(
+            Path::parse("effect://external-provider/tool").context("parse sandbox namespace")?,
+        );
         sandbox_in_process.projections[0].provides[0].effect_path =
             "effect://external-provider/tool/run".into();
-        assert_eq!(
+        check_eq(
             sandbox_in_process.validate_admission(),
-            Err(ExternalAdmissionError::InProcessSandbox)
-        );
+            Err(ExternalAdmissionError::InProcessSandbox),
+            "sandbox in-process admission",
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn control_frame_config_ack_roundtrip() {
+    fn control_frame_config_ack_roundtrip() -> anyhow::Result<()> {
         let f = ControlFrame::ConfigAck {
             axis: ConfigAxis::PresentationConfig,
             version: 7,
@@ -1509,13 +1597,14 @@ mod tests {
                 reason: RejectReason::ProfileMismatch,
             },
         };
-        let s = serde_json::to_string(&f).unwrap();
-        let back: ControlFrame = serde_json::from_str(&s).unwrap();
-        assert_eq!(f, back);
+        let s = serde_json::to_string(&f)?;
+        let back: ControlFrame = serde_json::from_str(&s)?;
+        check_eq(f, back, "control frame serde")?;
+        Ok(())
     }
 
     #[test]
-    fn handshake_three_stages_roundtrip() {
+    fn handshake_three_stages_roundtrip() -> anyhow::Result<()> {
         let hello = RoleSessionClientHello {
             role: Role::Provider,
             installation_id: "inst-1".into(),
@@ -1540,16 +1629,17 @@ mod tests {
         let ready = RoleReady {
             accepted_context: ctx,
         };
-        let hello_back: RoleSessionClientHello =
-            serde_json::from_str(&serde_json::to_string(&hello).unwrap()).unwrap();
-        let ready_back: RoleReady =
-            serde_json::from_str(&serde_json::to_string(&ready).unwrap()).unwrap();
-        assert_eq!(hello, hello_back);
-        assert_eq!(ready, ready_back);
+        let hello_json = serde_json::to_string(&hello)?;
+        let hello_back: RoleSessionClientHello = serde_json::from_str(&hello_json)?;
+        let ready_json = serde_json::to_string(&ready)?;
+        let ready_back: RoleReady = serde_json::from_str(&ready_json)?;
+        check_eq(hello, hello_back, "client hello serde")?;
+        check_eq(ready, ready_back, "role ready serde")?;
+        Ok(())
     }
 
     #[test]
-    fn invoke_result_carries_error() {
+    fn invoke_result_carries_error() -> anyhow::Result<()> {
         let r = InvokeResult {
             invocation_id: "x".into(),
             outcome: Err(ErrorInfo {
@@ -1557,13 +1647,14 @@ mod tests {
                 message: "deadline".into(),
             }),
         };
-        let s = serde_json::to_string(&r).unwrap();
-        let back: InvokeResult = serde_json::from_str(&s).unwrap();
-        assert_eq!(r, back);
+        let s = serde_json::to_string(&r)?;
+        let back: InvokeResult = serde_json::from_str(&s)?;
+        check_eq(r, back, "invoke result serde")?;
+        Ok(())
     }
 
     #[test]
-    fn command_result_carries_error() {
+    fn command_result_carries_error() -> anyhow::Result<()> {
         let r = CommandResult {
             id: "cmd-1".into(),
             outcome: Err(ErrorInfo {
@@ -1571,13 +1662,14 @@ mod tests {
                 message: "failed".into(),
             }),
         };
-        let s = serde_json::to_string(&r).unwrap();
-        let back: CommandResult = serde_json::from_str(&s).unwrap();
-        assert_eq!(r, back);
+        let s = serde_json::to_string(&r)?;
+        let back: CommandResult = serde_json::from_str(&s)?;
+        check_eq(r, back, "command result serde")?;
+        Ok(())
     }
 
     #[test]
-    fn pairing_payload_requires_contacts_and_valid_authorities() {
+    fn pairing_payload_requires_contacts_and_valid_authorities() -> anyhow::Result<()> {
         let payload = PairingPayload {
             version: 1,
             pairing_id: "pair-1".into(),
@@ -1605,11 +1697,12 @@ mod tests {
             expires_at: Timestamp::millis(1),
             display_checksum: "abcd".into(),
         };
-        assert_eq!(payload.validate(), Ok(()));
+        check_eq(payload.validate(), Ok(()), "pairing payload validation")?;
+        Ok(())
     }
 
     #[test]
-    fn pairing_payload_rejects_missing_contacts_and_scheme_authority() {
+    fn pairing_payload_rejects_missing_contacts_and_scheme_authority() -> anyhow::Result<()> {
         let empty = PairingPayload {
             version: 1,
             pairing_id: "pair-1".into(),
@@ -1620,7 +1713,11 @@ mod tests {
             expires_at: Timestamp::millis(1),
             display_checksum: "abcd".into(),
         };
-        assert_eq!(empty.validate(), Err(PairingPayloadError::MissingContacts));
+        check_eq(
+            empty.validate(),
+            Err(PairingPayloadError::MissingContacts),
+            "missing contacts",
+        )?;
 
         let bad = DaemonContact {
             transport: ExternalTransport::WebSocket,
@@ -1629,6 +1726,11 @@ mod tests {
             tls_name: None,
             priority: 1,
         };
-        assert_eq!(bad.validate(), Err(PairingPayloadError::BadAuthority));
+        check_eq(
+            bad.validate(),
+            Err(PairingPayloadError::BadAuthority),
+            "bad authority",
+        )?;
+        Ok(())
     }
 }

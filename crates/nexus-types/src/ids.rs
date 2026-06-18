@@ -162,6 +162,7 @@ impl Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::ensure;
 
     #[test]
     fn handle_id_distinguishes_generations() {
@@ -174,11 +175,13 @@ mod tests {
     }
 
     #[test]
-    fn id_serde_is_transparent() {
+    fn id_serde_is_transparent() -> anyhow::Result<()> {
         let p = ProcessId::new(42);
-        assert_eq!(serde_json::to_string(&p).unwrap(), "42");
-        let back: ProcessId = serde_json::from_str("42").unwrap();
-        assert_eq!(p, back);
+        let json = serde_json::to_string(&p)?;
+        ensure!(json == "42", "unexpected process id json: {json}");
+        let back: ProcessId = serde_json::from_str("42")?;
+        ensure!(p == back, "serde roundtrip changed process id");
+        Ok(())
     }
 
     #[test]

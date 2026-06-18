@@ -20,8 +20,6 @@ pub const ACTION_PROTOCOL_DESCRIBE: &str = "protocol.describe";
 /// Return a registry snapshot for clients that cache descriptors.
 pub const ACTION_PROTOCOL_REGISTRY_SNAPSHOT: &str = "protocol.registry.snapshot";
 /// Return one action descriptor by action id.
-pub const ACTION_PROTOCOL_SCHEMA_GET: &str = "protocol.schema.get";
-/// Return one action descriptor by action id.
 pub const ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET: &str = "protocol.action_descriptor.get";
 /// Return action/stream coverage status by domain.
 pub const ACTION_REGISTRY_COVERAGE_REPORT: &str = "registry.coverage.report";
@@ -45,8 +43,6 @@ pub const ACTION_CHANGE_SET_DRY_RUN: &str = "change_set.dry_run";
 pub const ACTION_CHANGE_SET_APPLY: &str = "change_set.apply";
 /// Discard a semantic change-set draft.
 pub const ACTION_CHANGE_SET_DISCARD: &str = "change_set.discard";
-/// Describe one graph type for semantic graph projections.
-pub const ACTION_GRAPH_TYPE_DESCRIBE: &str = "graph.type.describe";
 /// Return the caller's effective principal and authority.
 pub const ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE: &str = "authority.principal.effective";
 /// Return the authority matrix for visible actions.
@@ -103,8 +99,6 @@ pub const ACTION_AUDIT_FACTS_RECENT: &str = "audit.facts.recent";
 pub const ACTION_LINEAGE_TRACE_READ: &str = "lineage.trace.read";
 /// Read one Fact by id.
 pub const ACTION_LINEAGE_FACT_READ: &str = "lineage.fact.read";
-/// Read a Fact by operation id.
-pub const ACTION_LINEAGE_FACT_BY_OPERATION: &str = "lineage.fact.by_operation";
 /// Return high-level daemon/runtime health.
 pub const ACTION_HEALTH_SUMMARY: &str = "health.summary";
 /// Install an external installation descriptor.
@@ -117,6 +111,44 @@ pub const ACTION_EXTERNAL_INSTALLATION_START: &str = "external.installation.star
 pub const ACTION_EXTERNAL_INSTALLATION_STOP: &str = "external.installation.stop";
 /// Revoke an external installation and its projected authority.
 pub const ACTION_EXTERNAL_INSTALLATION_REVOKE: &str = "external.installation.revoke";
+/// List external installation descriptors.
+pub const ACTION_EXTERNAL_INSTALLATION_LIST: &str = "external.installation.list";
+/// Read one external installation descriptor.
+pub const ACTION_EXTERNAL_INSTALLATION_READ: &str = "external.installation.read";
+/// List external manifests.
+pub const ACTION_EXTERNAL_MANIFEST_LIST: &str = "external.manifest.list";
+/// Read one external manifest.
+pub const ACTION_EXTERNAL_MANIFEST_READ: &str = "external.manifest.read";
+/// Compare-and-swap one external manifest.
+pub const ACTION_EXTERNAL_MANIFEST_WRITE_CAS: &str = "external.manifest.write_cas";
+/// List in-process projection declarations.
+pub const ACTION_PROJECTION_IN_PROCESS_LIST: &str = "projection.in_process.list";
+/// Read one in-process projection declaration.
+pub const ACTION_PROJECTION_IN_PROCESS_READ: &str = "projection.in_process.read";
+/// Compare-and-swap one in-process projection declaration.
+pub const ACTION_PROJECTION_IN_PROCESS_WRITE_CAS: &str = "projection.in_process.write_cas";
+/// List inference backend declarations.
+pub const ACTION_INFERENCE_BACKEND_LIST: &str = "inference.backend.list";
+/// Read one inference backend declaration.
+pub const ACTION_INFERENCE_BACKEND_READ: &str = "inference.backend.read";
+/// Compare-and-swap one inference backend declaration.
+pub const ACTION_INFERENCE_BACKEND_WRITE_CAS: &str = "inference.backend.write_cas";
+/// List inference model declarations.
+pub const ACTION_INFERENCE_MODEL_LIST: &str = "inference.model.list";
+/// Read one inference model declaration.
+pub const ACTION_INFERENCE_MODEL_READ: &str = "inference.model.read";
+/// Compare-and-swap one inference model declaration.
+pub const ACTION_INFERENCE_MODEL_WRITE_CAS: &str = "inference.model.write_cas";
+/// List inference group declarations.
+pub const ACTION_INFERENCE_GROUP_LIST: &str = "inference.group.list";
+/// Read one inference group declaration.
+pub const ACTION_INFERENCE_GROUP_READ: &str = "inference.group.read";
+/// Compare-and-swap one inference group declaration.
+pub const ACTION_INFERENCE_GROUP_WRITE_CAS: &str = "inference.group.write_cas";
+/// Read inference routing declaration.
+pub const ACTION_INFERENCE_ROUTING_READ: &str = "inference.routing.read";
+/// Compare-and-swap inference routing declaration.
+pub const ACTION_INFERENCE_ROUTING_WRITE_CAS: &str = "inference.routing.write_cas";
 /// Create a pairing flow.
 pub const ACTION_PAIRING_CREATE: &str = "pairing.create";
 /// Approve a pending pairing flow.
@@ -258,25 +290,19 @@ impl Eq for JsonBytes {}
 
 impl Default for JsonBytes {
     fn default() -> Self {
-        Self::from_value(&Value::Null)
+        Self("null".into())
     }
 }
 
 impl JsonBytes {
     /// Serialize a Nexus value into the inner JSON string.
-    pub fn from_value(v: &Value) -> Self {
-        Self(serde_json::to_string(v).unwrap_or_default())
+    pub fn try_from_value(v: &Value) -> Result<Self, serde_json::Error> {
+        serde_json::to_string(v).map(Self)
     }
 
     /// Decode the inner JSON string into a Nexus value.
     pub fn try_to_value(&self) -> Result<Value, serde_json::Error> {
         serde_json::from_str(&self.0)
-    }
-
-    /// Decode the inner JSON string, returning [`Value::Null`] on malformed
-    /// input for tolerant projection paths.
-    pub fn to_value(&self) -> Value {
-        self.try_to_value().unwrap_or(Value::Null)
     }
 }
 
@@ -299,11 +325,11 @@ impl ActionResult {
     }
 
     /// Construct an action result carrying one Nexus value.
-    pub fn value(value: Value, server_rev: u64) -> Self {
-        Self {
-            output: Some(JsonBytes::from_value(&value)),
+    pub fn value(value: Value, server_rev: u64) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            output: Some(JsonBytes::try_from_value(&value)?),
             server_rev,
-        }
+        })
     }
 }
 
@@ -663,7 +689,7 @@ pub fn protocol_metadata(server_rev: u64, registry_rev: u64) -> ProtocolMetadata
 }
 
 /// Build protocol metadata for a concrete console listener.
-pub fn protocol_metadata_for_transport(
+pub(crate) fn protocol_metadata_for_transport(
     server_rev: u64,
     registry_rev: u64,
     transport: &crate::state::ConsoleTransportSecurityConfig,
@@ -675,31 +701,13 @@ pub fn protocol_metadata_for_transport(
     metadata
 }
 
-/// Build protocol metadata and convert it into a Nexus [`Value`].
-pub fn protocol_metadata_value(server_rev: u64, registry_rev: u64) -> Value {
-    to_value(protocol_metadata(server_rev, registry_rev))
-}
-
-/// Build concrete-listener protocol metadata and convert it into a Nexus [`Value`].
-pub fn protocol_metadata_value_for_transport(
-    server_rev: u64,
-    registry_rev: u64,
-    transport: &crate::state::ConsoleTransportSecurityConfig,
-) -> Value {
-    to_value(protocol_metadata_for_transport(
-        server_rev,
-        registry_rev,
-        transport,
-    ))
-}
-
 /// Convert protocol metadata into a Nexus [`Value`].
-pub fn protocol_metadata_to_value(metadata: ProtocolMetadata) -> Value {
+pub(crate) fn protocol_metadata_to_value(metadata: ProtocolMetadata) -> Value {
     to_value(metadata)
 }
 
 /// Build the coverage report view described by the console protocol contract.
-pub fn coverage_report_value(server_rev: u64, registry_rev: u64) -> Value {
+pub(crate) fn coverage_report_value(server_rev: u64, registry_rev: u64) -> Value {
     let actions = action_descriptors();
     let streams = stream_descriptors();
     let mut domains: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
@@ -760,7 +768,7 @@ pub fn coverage_report_value(server_rev: u64, registry_rev: u64) -> Value {
 }
 
 /// Return one action descriptor encoded as a Nexus value.
-pub fn descriptor_value(action_id: &str) -> Option<Value> {
+pub(crate) fn descriptor_value(action_id: &str) -> Option<Value> {
     action_descriptors()
         .into_iter()
         .find(|d| d.id == action_id)
@@ -768,7 +776,7 @@ pub fn descriptor_value(action_id: &str) -> Option<Value> {
 }
 
 /// Return resource type summaries visible through the semantic edit contract.
-pub fn resource_type_list_value() -> Value {
+pub(crate) fn resource_type_list_value() -> Value {
     Value::List(
         [
             resource_type_summary(
@@ -807,17 +815,57 @@ pub fn resource_type_list_value() -> Value {
                 "external.installation",
                 "External installation",
                 "external.installations",
-                ACTION_CONFIG_READ,
+                ACTION_EXTERNAL_INSTALLATION_READ,
                 Some(ACTION_EXTERNAL_INSTALLATION_UPDATE),
                 ImplementationStatus::Implemented,
             ),
             resource_type_summary(
-                "plan.workflow",
-                "Plan workflow",
-                "plan.workflows",
-                "plans.plan.read",
-                Some("plans.plan.write_cas"),
-                ImplementationStatus::Planned,
+                "external.manifest",
+                "External manifest",
+                "external.manifests",
+                ACTION_EXTERNAL_MANIFEST_READ,
+                Some(ACTION_EXTERNAL_MANIFEST_WRITE_CAS),
+                ImplementationStatus::Implemented,
+            ),
+            resource_type_summary(
+                "projection.in_process",
+                "In-process projection",
+                "projection.in_process",
+                ACTION_PROJECTION_IN_PROCESS_READ,
+                Some(ACTION_PROJECTION_IN_PROCESS_WRITE_CAS),
+                ImplementationStatus::Implemented,
+            ),
+            resource_type_summary(
+                "inference.backend",
+                "Inference backend",
+                "inference.backends",
+                ACTION_INFERENCE_BACKEND_READ,
+                Some(ACTION_INFERENCE_BACKEND_WRITE_CAS),
+                ImplementationStatus::Implemented,
+            ),
+            resource_type_summary(
+                "inference.model",
+                "Inference model",
+                "inference.models",
+                ACTION_INFERENCE_MODEL_READ,
+                Some(ACTION_INFERENCE_MODEL_WRITE_CAS),
+                ImplementationStatus::Implemented,
+            ),
+            resource_type_summary(
+                "inference.group",
+                "Inference group",
+                "inference.groups",
+                ACTION_INFERENCE_GROUP_READ,
+                Some(ACTION_INFERENCE_GROUP_WRITE_CAS),
+                ImplementationStatus::Implemented,
+            ),
+            resource_type_summary(
+                "inference.routing",
+                "Inference routing",
+                "inference.routing",
+                ACTION_INFERENCE_ROUTING_READ,
+                Some(ACTION_INFERENCE_ROUTING_WRITE_CAS),
+                ImplementationStatus::Implemented,
             ),
         ]
         .into_iter()
@@ -826,17 +874,21 @@ pub fn resource_type_list_value() -> Value {
 }
 
 /// Return one resource type descriptor encoded as a Nexus value.
-pub fn resource_type_descriptor_value(resource_type: &str) -> Option<Value> {
+pub(crate) fn resource_type_descriptor_value(resource_type: &str) -> Option<Value> {
     match resource_type {
         "config.entry" => Some(resource_type_descriptor(
-            "config.entry",
-            "Config entry",
-            "config.entries",
-            ACTION_CONFIG_READ,
-            Some(ACTION_CONFIG_LIST),
-            Some(ACTION_CONFIG_WRITE_CAS),
-            None,
-            ImplementationStatus::Implemented,
+            ResourceTypeDescriptorMeta {
+                resource_type: "config.entry",
+                title: "Config entry",
+                default_view: "config.entries",
+                status: ImplementationStatus::Implemented,
+            },
+            ResourceTypeDescriptorActions {
+                read: ACTION_CONFIG_READ,
+                list: Some(ACTION_CONFIG_LIST),
+                update: Some(ACTION_CONFIG_WRITE_CAS),
+                validate: None,
+            },
             vec![
                 semantic_contract_field("path", "path", true, "path", "management_state", false),
                 semantic_contract_field(
@@ -859,14 +911,18 @@ pub fn resource_type_descriptor_value(resource_type: &str) -> Option<Value> {
             vec!["path", "expected_version"],
         )),
         "access.user" => Some(resource_type_descriptor(
-            "access.user",
-            "Console user",
-            "access.users",
-            ACTION_ACCESS_USER_READ,
-            Some(ACTION_ACCESS_USER_LIST),
-            Some(ACTION_ACCESS_USER_WRITE_CAS),
-            None,
-            ImplementationStatus::Implemented,
+            ResourceTypeDescriptorMeta {
+                resource_type: "access.user",
+                title: "Console user",
+                default_view: "access.users",
+                status: ImplementationStatus::Implemented,
+            },
+            ResourceTypeDescriptorActions {
+                read: ACTION_ACCESS_USER_READ,
+                list: Some(ACTION_ACCESS_USER_LIST),
+                update: Some(ACTION_ACCESS_USER_WRITE_CAS),
+                validate: None,
+            },
             vec![
                 semantic_contract_field(
                     "username",
@@ -912,14 +968,18 @@ pub fn resource_type_descriptor_value(resource_type: &str) -> Option<Value> {
             vec!["username", "status"],
         )),
         "access.role" => Some(resource_type_descriptor(
-            "access.role",
-            "Console role",
-            "access.roles",
-            ACTION_ACCESS_ROLE_READ,
-            Some(ACTION_ACCESS_ROLE_LIST),
-            Some(ACTION_ACCESS_ROLE_WRITE_CAS),
-            None,
-            ImplementationStatus::Implemented,
+            ResourceTypeDescriptorMeta {
+                resource_type: "access.role",
+                title: "Console role",
+                default_view: "access.roles",
+                status: ImplementationStatus::Implemented,
+            },
+            ResourceTypeDescriptorActions {
+                read: ACTION_ACCESS_ROLE_READ,
+                list: Some(ACTION_ACCESS_ROLE_LIST),
+                update: Some(ACTION_ACCESS_ROLE_WRITE_CAS),
+                validate: None,
+            },
             vec![
                 semantic_contract_field(
                     "role",
@@ -942,14 +1002,18 @@ pub fn resource_type_descriptor_value(resource_type: &str) -> Option<Value> {
             vec!["role", "frozen"],
         )),
         "access.session" => Some(resource_type_descriptor(
-            "access.session",
-            "Console session",
-            "access.sessions",
-            ACTION_ACCESS_SESSION_LIST,
-            Some(ACTION_ACCESS_SESSION_LIST),
-            Some(ACTION_ACCESS_SESSION_REVOKE),
-            None,
-            ImplementationStatus::Implemented,
+            ResourceTypeDescriptorMeta {
+                resource_type: "access.session",
+                title: "Console session",
+                default_view: "access.sessions",
+                status: ImplementationStatus::Implemented,
+            },
+            ResourceTypeDescriptorActions {
+                read: ACTION_ACCESS_SESSION_LIST,
+                list: Some(ACTION_ACCESS_SESSION_LIST),
+                update: Some(ACTION_ACCESS_SESSION_REVOKE),
+                validate: None,
+            },
             vec![
                 semantic_contract_field(
                     "sid",
@@ -980,14 +1044,18 @@ pub fn resource_type_descriptor_value(resource_type: &str) -> Option<Value> {
             vec!["sid", "username", "mfa_level"],
         )),
         "external.installation" => Some(resource_type_descriptor(
-            "external.installation",
-            "External installation",
-            "external.installations",
-            ACTION_CONFIG_READ,
-            None,
-            Some(ACTION_EXTERNAL_INSTALLATION_UPDATE),
-            None,
-            ImplementationStatus::Implemented,
+            ResourceTypeDescriptorMeta {
+                resource_type: "external.installation",
+                title: "External installation",
+                default_view: "external.installations",
+                status: ImplementationStatus::Implemented,
+            },
+            ResourceTypeDescriptorActions {
+                read: ACTION_EXTERNAL_INSTALLATION_READ,
+                list: Some(ACTION_EXTERNAL_INSTALLATION_LIST),
+                update: Some(ACTION_EXTERNAL_INSTALLATION_UPDATE),
+                validate: None,
+            },
             vec![
                 semantic_contract_field(
                     "id",
@@ -1016,18 +1084,22 @@ pub fn resource_type_descriptor_value(resource_type: &str) -> Option<Value> {
             ],
             vec!["id"],
         )),
-        "plan.workflow" => Some(resource_type_descriptor(
-            "plan.workflow",
-            "Plan workflow",
-            "plan.workflows",
-            "plans.plan.read",
-            Some("plans.plan.list"),
-            Some("plans.plan.write_cas"),
-            Some("plans.plan.validate"),
-            ImplementationStatus::Planned,
+        "external.manifest" => Some(resource_type_descriptor(
+            ResourceTypeDescriptorMeta {
+                resource_type: "external.manifest",
+                title: "External manifest",
+                default_view: "external.manifests",
+                status: ImplementationStatus::Implemented,
+            },
+            ResourceTypeDescriptorActions {
+                read: ACTION_EXTERNAL_MANIFEST_READ,
+                list: Some(ACTION_EXTERNAL_MANIFEST_LIST),
+                update: Some(ACTION_EXTERNAL_MANIFEST_WRITE_CAS),
+                validate: None,
+            },
             vec![
                 semantic_contract_field(
-                    "plan",
+                    "platform",
                     "string",
                     true,
                     "resource_ref",
@@ -1035,10 +1107,10 @@ pub fn resource_type_descriptor_value(resource_type: &str) -> Option<Value> {
                     false,
                 ),
                 semantic_contract_field(
-                    "graph",
-                    "graph",
+                    "def",
+                    "value",
                     true,
-                    "graph_model",
+                    "json_value",
                     "management_state",
                     false,
                 ),
@@ -1051,14 +1123,211 @@ pub fn resource_type_descriptor_value(resource_type: &str) -> Option<Value> {
                     false,
                 ),
             ],
-            vec!["plan"],
+            vec!["platform"],
+        )),
+        "projection.in_process" => Some(resource_type_descriptor(
+            ResourceTypeDescriptorMeta {
+                resource_type: "projection.in_process",
+                title: "In-process projection",
+                default_view: "projection.in_process",
+                status: ImplementationStatus::Implemented,
+            },
+            ResourceTypeDescriptorActions {
+                read: ACTION_PROJECTION_IN_PROCESS_READ,
+                list: Some(ACTION_PROJECTION_IN_PROCESS_LIST),
+                update: Some(ACTION_PROJECTION_IN_PROCESS_WRITE_CAS),
+                validate: None,
+            },
+            vec![
+                semantic_contract_field(
+                    "id",
+                    "string",
+                    true,
+                    "resource_ref",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "def",
+                    "value",
+                    true,
+                    "json_value",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "expected_version",
+                    "u64|null",
+                    false,
+                    "revision",
+                    "public_control",
+                    false,
+                ),
+            ],
+            vec!["id", "implementation"],
+        )),
+        "inference.backend" => Some(resource_type_descriptor(
+            ResourceTypeDescriptorMeta {
+                resource_type: "inference.backend",
+                title: "Inference backend",
+                default_view: "inference.backends",
+                status: ImplementationStatus::Implemented,
+            },
+            ResourceTypeDescriptorActions {
+                read: ACTION_INFERENCE_BACKEND_READ,
+                list: Some(ACTION_INFERENCE_BACKEND_LIST),
+                update: Some(ACTION_INFERENCE_BACKEND_WRITE_CAS),
+                validate: None,
+            },
+            vec![
+                semantic_contract_field(
+                    "id",
+                    "string",
+                    true,
+                    "resource_ref",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "def",
+                    "value",
+                    true,
+                    "json_value",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "expected_version",
+                    "u64|null",
+                    false,
+                    "revision",
+                    "public_control",
+                    false,
+                ),
+            ],
+            vec!["id"],
+        )),
+        "inference.model" => Some(resource_type_descriptor(
+            ResourceTypeDescriptorMeta {
+                resource_type: "inference.model",
+                title: "Inference model",
+                default_view: "inference.models",
+                status: ImplementationStatus::Implemented,
+            },
+            ResourceTypeDescriptorActions {
+                read: ACTION_INFERENCE_MODEL_READ,
+                list: Some(ACTION_INFERENCE_MODEL_LIST),
+                update: Some(ACTION_INFERENCE_MODEL_WRITE_CAS),
+                validate: None,
+            },
+            vec![
+                semantic_contract_field(
+                    "id",
+                    "string",
+                    true,
+                    "resource_ref",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "def",
+                    "value",
+                    true,
+                    "json_value",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "expected_version",
+                    "u64|null",
+                    false,
+                    "revision",
+                    "public_control",
+                    false,
+                ),
+            ],
+            vec!["id"],
+        )),
+        "inference.group" => Some(resource_type_descriptor(
+            ResourceTypeDescriptorMeta {
+                resource_type: "inference.group",
+                title: "Inference group",
+                default_view: "inference.groups",
+                status: ImplementationStatus::Implemented,
+            },
+            ResourceTypeDescriptorActions {
+                read: ACTION_INFERENCE_GROUP_READ,
+                list: Some(ACTION_INFERENCE_GROUP_LIST),
+                update: Some(ACTION_INFERENCE_GROUP_WRITE_CAS),
+                validate: None,
+            },
+            vec![
+                semantic_contract_field(
+                    "name",
+                    "string",
+                    true,
+                    "resource_ref",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "def",
+                    "value",
+                    true,
+                    "json_value",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "expected_version",
+                    "u64|null",
+                    false,
+                    "revision",
+                    "public_control",
+                    false,
+                ),
+            ],
+            vec!["name"],
+        )),
+        "inference.routing" => Some(resource_type_descriptor(
+            ResourceTypeDescriptorMeta {
+                resource_type: "inference.routing",
+                title: "Inference routing",
+                default_view: "inference.routing",
+                status: ImplementationStatus::Implemented,
+            },
+            ResourceTypeDescriptorActions {
+                read: ACTION_INFERENCE_ROUTING_READ,
+                list: None,
+                update: Some(ACTION_INFERENCE_ROUTING_WRITE_CAS),
+                validate: None,
+            },
+            vec![
+                semantic_contract_field(
+                    "def",
+                    "value",
+                    true,
+                    "json_value",
+                    "management_state",
+                    false,
+                ),
+                semantic_contract_field(
+                    "expected_version",
+                    "u64|null",
+                    false,
+                    "revision",
+                    "public_control",
+                    false,
+                ),
+            ],
+            vec!["default_group"],
         )),
         _ => None,
     }
 }
 
 /// Return one fixed resource view descriptor encoded as a Nexus value.
-pub fn resource_view_descriptor_value(view: &str) -> Option<Value> {
+pub(crate) fn resource_view_descriptor_value(view: &str) -> Option<Value> {
     match view {
         "config.entries" => Some(resource_view_descriptor(
             "config.entries",
@@ -1091,75 +1360,58 @@ pub fn resource_view_descriptor_value(view: &str) -> Option<Value> {
         "external.installations" => Some(resource_view_descriptor(
             "external.installations",
             "external.installation",
-            ACTION_CONFIG_LIST,
+            ACTION_EXTERNAL_INSTALLATION_LIST,
             STREAM_STATE_WATCH,
             vec!["id", "status", "proc", "generation"],
         )),
-        "plan.workflows" => Some(resource_view_descriptor(
-            "plan.workflows",
-            "plan.workflow",
-            "plans.plan.list",
+        "external.manifests" => Some(resource_view_descriptor(
+            "external.manifests",
+            "external.manifest",
+            ACTION_EXTERNAL_MANIFEST_LIST,
             STREAM_STATE_WATCH,
-            vec!["plan", "status", "revision"],
+            vec!["platform", "version", "projection_count"],
+        )),
+        "projection.in_process" => Some(resource_view_descriptor(
+            "projection.in_process",
+            "projection.in_process",
+            ACTION_PROJECTION_IN_PROCESS_LIST,
+            STREAM_STATE_WATCH,
+            vec!["id", "role", "implementation", "provides", "version"],
+        )),
+        "inference.backends" => Some(resource_view_descriptor(
+            "inference.backends",
+            "inference.backend",
+            ACTION_INFERENCE_BACKEND_LIST,
+            STREAM_STATE_WATCH,
+            vec!["id", "dialect", "base_url", "version"],
+        )),
+        "inference.models" => Some(resource_view_descriptor(
+            "inference.models",
+            "inference.model",
+            ACTION_INFERENCE_MODEL_LIST,
+            STREAM_STATE_WATCH,
+            vec!["id", "backend_id", "provider_model", "version"],
+        )),
+        "inference.groups" => Some(resource_view_descriptor(
+            "inference.groups",
+            "inference.group",
+            ACTION_INFERENCE_GROUP_LIST,
+            STREAM_STATE_WATCH,
+            vec!["name", "policy", "models", "version"],
+        )),
+        "inference.routing" => Some(resource_view_descriptor(
+            "inference.routing",
+            "inference.routing",
+            ACTION_INFERENCE_ROUTING_READ,
+            STREAM_STATE_WATCH,
+            vec!["default_group", "max_retries", "version"],
         )),
         _ => None,
     }
 }
 
-/// Return one graph type descriptor encoded as a Nexus value.
-pub fn graph_type_descriptor_value(graph_type: &str) -> Option<Value> {
-    if graph_type != "plan.workflow" {
-        return None;
-    }
-    let node_types = Value::List(vec![
-        graph_node_type("input", vec![], vec!["value"], "plans.plan.validate"),
-        graph_node_type(
-            "approval",
-            vec!["request"],
-            vec!["approved", "denied"],
-            "approval.respond",
-        ),
-        graph_node_type(
-            "action",
-            vec!["input"],
-            vec!["output"],
-            "plans.plan.validate",
-        ),
-        graph_node_type(
-            "condition",
-            vec!["input"],
-            vec!["true", "false"],
-            "plans.plan.validate",
-        ),
-        graph_node_type("export", vec!["input"], vec![], "artifacts.export.create"),
-    ]);
-    Some(value_map([
-        ("graph_type", Value::Str("plan.workflow".into())),
-        ("resource_type", Value::Str("plan.workflow".into())),
-        ("status", to_value(ImplementationStatus::Planned)),
-        ("node_types", node_types),
-        (
-            "edge_types",
-            Value::List(vec![value_map([
-                ("edge_type", Value::Str("data".into())),
-                ("compatible_ports", Value::List(vec![Value::Str("value".into()), Value::Str("input".into())])),
-            ])]),
-        ),
-        ("validation_action", Value::Str("plans.plan.validate".into())),
-        ("compile_action", Value::Null),
-        ("apply_action", Value::Str("plans.plan.write_cas".into())),
-        (
-            "notes",
-            Value::List(vec![
-                Value::Str("graph.type.describe is a descriptor only; graph execution still uses fixed actions".into()),
-                Value::Str("no raw operation, raw effect, or raw state node type is allowed".into()),
-            ]),
-        ),
-    ]))
-}
-
 /// Return the secret custody catalog exposed by `secret.catalog`.
-pub fn secret_catalog_value() -> Value {
+pub(crate) fn secret_catalog_value() -> Value {
     let rows = vec![
         secret_row(
             "state://vault/console/*/password",
@@ -1186,7 +1438,7 @@ pub fn secret_catalog_value() -> Value {
 }
 
 /// Return root data authority and visibility-gate metadata.
-pub fn visibility_authority_value() -> Value {
+pub(crate) fn visibility_authority_value() -> Value {
     let mut root = BTreeMap::new();
     root.insert("root_can_view_all_business_data".into(), Value::Bool(true));
     root.insert(
@@ -1269,23 +1521,6 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             vec![],
             schema("protocol.empty", "null", vec![], vec![]),
             schema("protocol.metadata", "map", vec![], vec![]),
-        ),
-        action(
-            ACTION_PROTOCOL_SCHEMA_GET,
-            "protocol",
-            ActionKind::Protocol,
-            ActionPolicy::new(RiskLevel::Low, VisibilityTier::PublicControl, false),
-            vec![],
-            schema(
-                "protocol.schema_get.input",
-                "map",
-                vec![field("action", "string", true)],
-                vec![
-                    "compatibility alias for protocol.action_descriptor.get",
-                    "returns an action descriptor, not an arbitrary schema id",
-                ],
-            ),
-            schema("protocol.action_descriptor", "map", vec![], vec![]),
         ),
         action(
             ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET,
@@ -1406,20 +1641,6 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ActionKind::Mutation,
             vec![semantic_field("change_set", "value", true, "json_value")],
             "change_set.discard is planned; local drafts remain client-side until server support lands",
-        ),
-        action(
-            ACTION_GRAPH_TYPE_DESCRIBE,
-            "graph",
-            ActionKind::View,
-            ActionPolicy::new(RiskLevel::Low, VisibilityTier::ManagementState, false),
-            vec![],
-            schema(
-                "graph.type_describe.input",
-                "map",
-                vec![semantic_field("graph_type", "string", true, "resource_ref")],
-                vec!["returns node/port/edge metadata for one fixed graph type"],
-            ),
-            schema("graph.type_descriptor.output", "map", vec![], vec![]),
         ),
         action(
             ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE,
@@ -1600,7 +1821,7 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ACTION_CONFIG_WRITE_CAS,
             "config",
             ActionKind::Mutation,
-            ActionPolicy::new(RiskLevel::Elevated, VisibilityTier::ManagementState, false),
+            ActionPolicy::new(RiskLevel::Elevated, VisibilityTier::ManagementState, true),
             vec![authority("write", "state://kernel/**")],
             schema(
                 "config.write_cas.input",
@@ -1611,8 +1832,8 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
                     field("expected_version", "u64|null", false),
                 ],
                 vec![
-                    "state://kernel/{console,external,external-installations,external-projections,external-pairings,external-sessions,external-credential-revocations,procs}/** requires MFA step-up",
-                    "prefer dedicated access.*, external.installation.*, and pairing.* actions for typed management writes",
+                    "requires MFA step-up",
+                    "runtime config paths with dedicated actions must use access.*, external.*, projection.in_process.*, inference.*, or pairing.*",
                 ],
             ),
             schema("protocol.empty", "null", vec![], vec![]),
@@ -1761,27 +1982,6 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             ),
         ),
         action(
-            ACTION_LINEAGE_FACT_BY_OPERATION,
-            "lineage",
-            ActionKind::View,
-            ActionPolicy::new(RiskLevel::Elevated, VisibilityTier::ProtectedPayload, true),
-            vec![authority("read", "state://fact/**")],
-            schema(
-                "lineage.fact_by_operation.input",
-                "map",
-                vec![field("op_id", "operation_id", true)],
-                vec!["alias of lineage.fact.read for operation-centric clients"],
-            ),
-            schema(
-                "lineage.fact_by_operation.output",
-                "map",
-                vec![],
-                vec![
-                    "output includes partial/partial_reason when lineage projections are not fully materialized",
-                ],
-            ),
-        ),
-        action(
             ACTION_HEALTH_SUMMARY,
             "health",
             ActionKind::View,
@@ -1790,8 +1990,21 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
             schema("health.summary.input", "null", vec![], vec![]),
             schema("health.summary.output", "map", vec![], vec![]),
         ),
-        extension_action(
+        external_action(
+            ACTION_EXTERNAL_INSTALLATION_LIST,
+            ActionKind::View,
+            false,
+            vec![],
+        ),
+        external_action(
+            ACTION_EXTERNAL_INSTALLATION_READ,
+            ActionKind::View,
+            false,
+            vec![field("id", "string", true)],
+        ),
+        external_action(
             ACTION_EXTERNAL_INSTALLATION_INSTALL,
+            ActionKind::Mutation,
             true,
             vec![
                 field("id", "string", true),
@@ -1799,8 +2012,9 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
                 field("expected_version", "u64|null", false),
             ],
         ),
-        extension_action(
+        external_action(
             ACTION_EXTERNAL_INSTALLATION_UPDATE,
+            ActionKind::Mutation,
             true,
             vec![
                 field("id", "string", true),
@@ -1808,22 +2022,140 @@ pub fn action_descriptors() -> Vec<ActionDescriptor> {
                 field("expected_version", "u64|null", false),
             ],
         ),
-        extension_action(
+        external_action(
             ACTION_EXTERNAL_INSTALLATION_START,
+            ActionKind::Mutation,
             true,
             vec![field("id", "string", true)],
         ),
-        extension_action(
+        external_action(
             ACTION_EXTERNAL_INSTALLATION_STOP,
+            ActionKind::Mutation,
             true,
             vec![field("id", "string", true)],
         ),
-        extension_action(
+        external_action(
             ACTION_EXTERNAL_INSTALLATION_REVOKE,
+            ActionKind::Mutation,
             true,
             vec![
                 field("installation_id", "string", true),
-                field("credential_generation_floor", "i64", false),
+                field("credential_generation_floor", "u64", false),
+            ],
+        ),
+        external_action(
+            ACTION_EXTERNAL_MANIFEST_LIST,
+            ActionKind::View,
+            false,
+            vec![],
+        ),
+        external_action(
+            ACTION_EXTERNAL_MANIFEST_READ,
+            ActionKind::View,
+            false,
+            vec![field("platform", "string", true)],
+        ),
+        external_action(
+            ACTION_EXTERNAL_MANIFEST_WRITE_CAS,
+            ActionKind::Mutation,
+            true,
+            vec![
+                field("platform", "string", true),
+                field("def", "value", true),
+                field("expected_version", "u64|null", false),
+            ],
+        ),
+        projection_action(
+            ACTION_PROJECTION_IN_PROCESS_LIST,
+            ActionKind::View,
+            false,
+            vec![],
+        ),
+        projection_action(
+            ACTION_PROJECTION_IN_PROCESS_READ,
+            ActionKind::View,
+            false,
+            vec![field("id", "string", true)],
+        ),
+        projection_action(
+            ACTION_PROJECTION_IN_PROCESS_WRITE_CAS,
+            ActionKind::Mutation,
+            true,
+            vec![
+                field("id", "string", true),
+                field("def", "value", true),
+                field("expected_version", "u64|null", false),
+            ],
+        ),
+        inference_action(
+            ACTION_INFERENCE_BACKEND_LIST,
+            ActionKind::View,
+            false,
+            vec![],
+        ),
+        inference_action(
+            ACTION_INFERENCE_BACKEND_READ,
+            ActionKind::View,
+            false,
+            vec![field("id", "string", true)],
+        ),
+        inference_action(
+            ACTION_INFERENCE_BACKEND_WRITE_CAS,
+            ActionKind::Mutation,
+            true,
+            vec![
+                field("id", "string", true),
+                field("def", "value", true),
+                field("expected_version", "u64|null", false),
+            ],
+        ),
+        inference_action(ACTION_INFERENCE_MODEL_LIST, ActionKind::View, false, vec![]),
+        inference_action(
+            ACTION_INFERENCE_MODEL_READ,
+            ActionKind::View,
+            false,
+            vec![field("id", "string", true)],
+        ),
+        inference_action(
+            ACTION_INFERENCE_MODEL_WRITE_CAS,
+            ActionKind::Mutation,
+            true,
+            vec![
+                field("id", "string", true),
+                field("def", "value", true),
+                field("expected_version", "u64|null", false),
+            ],
+        ),
+        inference_action(ACTION_INFERENCE_GROUP_LIST, ActionKind::View, false, vec![]),
+        inference_action(
+            ACTION_INFERENCE_GROUP_READ,
+            ActionKind::View,
+            false,
+            vec![field("name", "string", true)],
+        ),
+        inference_action(
+            ACTION_INFERENCE_GROUP_WRITE_CAS,
+            ActionKind::Mutation,
+            true,
+            vec![
+                field("name", "string", true),
+                field("def", "value", true),
+                field("expected_version", "u64|null", false),
+            ],
+        ),
+        inference_action(
+            ACTION_INFERENCE_ROUTING_READ,
+            ActionKind::View,
+            false,
+            vec![],
+        ),
+        inference_action(
+            ACTION_INFERENCE_ROUTING_WRITE_CAS,
+            ActionKind::Mutation,
+            true,
+            vec![
+                field("def", "value", true),
+                field("expected_version", "u64|null", false),
             ],
         ),
         pairing_action(
@@ -1950,18 +2282,23 @@ fn access_authority(id: &str, kind: &ActionKind) -> Vec<RequiredAuthority> {
     }
 }
 
-fn extension_action(
+fn external_action(
     id: &str,
+    kind: ActionKind,
     requires_step_up: bool,
     fields: Vec<FieldDescriptor>,
 ) -> ActionDescriptor {
-    let required_authority = extension_authority(id);
+    let required_authority = external_authority(id);
     action(
         id,
         "external",
-        ActionKind::Mutation,
+        kind,
         ActionPolicy::new(
-            RiskLevel::Elevated,
+            if requires_step_up {
+                RiskLevel::Elevated
+            } else {
+                RiskLevel::Low
+            },
             VisibilityTier::ManagementState,
             requires_step_up,
         ),
@@ -1971,8 +2308,14 @@ fn extension_action(
     )
 }
 
-fn extension_authority(id: &str) -> Vec<RequiredAuthority> {
+fn external_authority(id: &str) -> Vec<RequiredAuthority> {
     match id {
+        ACTION_EXTERNAL_INSTALLATION_LIST | ACTION_EXTERNAL_INSTALLATION_READ => {
+            vec![authority(
+                "read",
+                "state://kernel/external-installations/**",
+            )]
+        }
         ACTION_EXTERNAL_INSTALLATION_INSTALL | ACTION_EXTERNAL_INSTALLATION_UPDATE => {
             vec![authority(
                 "write",
@@ -1983,17 +2326,109 @@ fn extension_authority(id: &str) -> Vec<RequiredAuthority> {
             authority("read", "state://kernel/external-installations/**"),
             authority("perform", "effect://proc/spawn"),
         ],
-        ACTION_EXTERNAL_INSTALLATION_STOP => {
-            vec![authority("perform", "effect://proc/kill")]
+        ACTION_EXTERNAL_INSTALLATION_STOP => vec![
+            authority("read", "state://kernel/external-installations/**"),
+            authority("perform", "effect://proc/kill"),
+        ],
+        ACTION_EXTERNAL_INSTALLATION_REVOKE => vec![
+            authority("read", "state://kernel/external-installations/**"),
+            authority("perform", "effect://external/revoke"),
+        ],
+        ACTION_EXTERNAL_MANIFEST_LIST | ACTION_EXTERNAL_MANIFEST_READ => {
+            vec![authority("read", "state://kernel/manifests/**")]
         }
-        ACTION_EXTERNAL_INSTALLATION_REVOKE => {
-            vec![authority("perform", "effect://external/revoke")]
+        ACTION_EXTERNAL_MANIFEST_WRITE_CAS => {
+            vec![authority("write", "state://kernel/manifests/**")]
         }
         _ => vec![authority(
-            "write",
+            "read",
             "state://kernel/external-installations/**",
         )],
     }
+}
+
+fn projection_action(
+    id: &str,
+    kind: ActionKind,
+    requires_step_up: bool,
+    fields: Vec<FieldDescriptor>,
+) -> ActionDescriptor {
+    action(
+        id,
+        "projection",
+        kind,
+        ActionPolicy::new(
+            if requires_step_up {
+                RiskLevel::Elevated
+            } else {
+                RiskLevel::Low
+            },
+            VisibilityTier::ManagementState,
+            requires_step_up,
+        ),
+        projection_authority(id),
+        schema(&format!("{id}.input"), "map", fields, vec![]),
+        schema(&format!("{id}.output"), "value", vec![], vec![]),
+    )
+}
+
+fn projection_authority(id: &str) -> Vec<RequiredAuthority> {
+    let (verb, target) = match id {
+        ACTION_PROJECTION_IN_PROCESS_LIST | ACTION_PROJECTION_IN_PROCESS_READ => {
+            ("read", "state://kernel/projections/in-process/**")
+        }
+        ACTION_PROJECTION_IN_PROCESS_WRITE_CAS => {
+            ("write", "state://kernel/projections/in-process/**")
+        }
+        _ => ("read", "state://kernel/projections/in-process/**"),
+    };
+    vec![authority(verb, target)]
+}
+
+fn inference_action(
+    id: &str,
+    kind: ActionKind,
+    requires_step_up: bool,
+    fields: Vec<FieldDescriptor>,
+) -> ActionDescriptor {
+    action(
+        id,
+        "inference",
+        kind,
+        ActionPolicy::new(
+            if requires_step_up {
+                RiskLevel::Elevated
+            } else {
+                RiskLevel::Low
+            },
+            VisibilityTier::ManagementState,
+            requires_step_up,
+        ),
+        inference_authority(id),
+        schema(&format!("{id}.input"), "map", fields, vec![]),
+        schema(&format!("{id}.output"), "value", vec![], vec![]),
+    )
+}
+
+fn inference_authority(id: &str) -> Vec<RequiredAuthority> {
+    let (verb, target) = match id {
+        ACTION_INFERENCE_BACKEND_LIST | ACTION_INFERENCE_BACKEND_READ => {
+            ("read", "state://kernel/inference/backends/**")
+        }
+        ACTION_INFERENCE_BACKEND_WRITE_CAS => ("write", "state://kernel/inference/backends/**"),
+        ACTION_INFERENCE_MODEL_LIST | ACTION_INFERENCE_MODEL_READ => {
+            ("read", "state://kernel/inference/models/**")
+        }
+        ACTION_INFERENCE_MODEL_WRITE_CAS => ("write", "state://kernel/inference/models/**"),
+        ACTION_INFERENCE_GROUP_LIST | ACTION_INFERENCE_GROUP_READ => {
+            ("read", "state://kernel/inference/groups/**")
+        }
+        ACTION_INFERENCE_GROUP_WRITE_CAS => ("write", "state://kernel/inference/groups/**"),
+        ACTION_INFERENCE_ROUTING_READ => ("read", "state://kernel/routing/inference"),
+        ACTION_INFERENCE_ROUTING_WRITE_CAS => ("write", "state://kernel/routing/inference"),
+        _ => ("read", "state://kernel/inference/**"),
+    };
+    vec![authority(verb, target)]
 }
 
 fn pairing_action(id: &str, fields: Vec<FieldDescriptor>) -> ActionDescriptor {
@@ -2157,35 +2592,49 @@ fn resource_type_summary(
     ])
 }
 
-fn resource_type_descriptor(
-    resource_type: &str,
-    title: &str,
-    default_view: &str,
-    read_action: &str,
-    list_action: Option<&str>,
-    update_action: Option<&str>,
-    validate_action: Option<&str>,
+struct ResourceTypeDescriptorMeta<'a> {
+    resource_type: &'a str,
+    title: &'a str,
+    default_view: &'a str,
     status: ImplementationStatus,
+}
+
+struct ResourceTypeDescriptorActions<'a> {
+    read: &'a str,
+    list: Option<&'a str>,
+    update: Option<&'a str>,
+    validate: Option<&'a str>,
+}
+
+fn resource_type_descriptor(
+    meta: ResourceTypeDescriptorMeta<'_>,
+    actions: ResourceTypeDescriptorActions<'_>,
     fields: Vec<Value>,
     display_fields: Vec<&str>,
 ) -> Value {
     value_map([
-        ("resource_type", Value::Str(resource_type.into())),
-        ("title", Value::Str(title.into())),
-        ("status", to_value(status)),
-        ("default_view", Value::Str(default_view.into())),
-        ("read_action", Value::Str(read_action.into())),
+        ("resource_type", Value::Str(meta.resource_type.into())),
+        ("title", Value::Str(meta.title.into())),
+        ("status", to_value(meta.status)),
+        ("default_view", Value::Str(meta.default_view.into())),
+        ("read_action", Value::Str(actions.read.into())),
         (
             "list_action",
-            list_action.map_or(Value::Null, |action| Value::Str(action.into())),
+            actions
+                .list
+                .map_or(Value::Null, |action| Value::Str(action.into())),
         ),
         (
             "update_action",
-            update_action.map_or(Value::Null, |action| Value::Str(action.into())),
+            actions
+                .update
+                .map_or(Value::Null, |action| Value::Str(action.into())),
         ),
         (
             "validate_action",
-            validate_action.map_or(Value::Null, |action| Value::Str(action.into())),
+            actions
+                .validate
+                .map_or(Value::Null, |action| Value::Str(action.into())),
         ),
         ("revision_field", Value::Str("expected_version".into())),
         ("fields", Value::List(fields)),
@@ -2269,51 +2718,6 @@ fn resource_view_descriptor(
     ])
 }
 
-fn graph_node_type(
-    node_type: &str,
-    input_ports: Vec<&str>,
-    output_ports: Vec<&str>,
-    backing_action: &str,
-) -> Value {
-    value_map([
-        ("node_type", Value::Str(node_type.into())),
-        (
-            "params_schema",
-            Value::Str(format!("graph.plan_workflow.{node_type}.params")),
-        ),
-        (
-            "input_ports",
-            Value::List(
-                input_ports
-                    .into_iter()
-                    .map(|port| graph_port(port, "input"))
-                    .collect(),
-            ),
-        ),
-        (
-            "output_ports",
-            Value::List(
-                output_ports
-                    .into_iter()
-                    .map(|port| graph_port(port, "output"))
-                    .collect(),
-            ),
-        ),
-        ("backing_action", Value::Str(backing_action.into())),
-        ("risk", to_value(RiskLevel::Elevated)),
-    ])
-}
-
-fn graph_port(name: &str, direction: &str) -> Value {
-    value_map([
-        ("name", Value::Str(name.into())),
-        ("direction", Value::Str(direction.into())),
-        ("value_type", Value::Str("value".into())),
-        ("cardinality", Value::Str("one".into())),
-        ("required", Value::Bool(direction == "input")),
-    ])
-}
-
 fn value_map(items: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
     Value::Map(
         items
@@ -2328,56 +2732,96 @@ fn is_false(value: &bool) -> bool {
 }
 
 fn to_value<T: Serialize>(value: T) -> Value {
-    serde_json::from_value(serde_json::to_value(value).unwrap_or(serde_json::Value::Null))
-        .unwrap_or(Value::Null)
+    let json = match serde_json::to_value(value) {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::error!(?error, "console protocol descriptor serialization failed");
+            return Value::Null;
+        }
+    };
+    match serde_json::from_value(json) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                "console protocol descriptor value conversion failed"
+            );
+            Value::Null
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, bail, ensure};
     use std::collections::BTreeSet;
 
+    fn find_action<'a>(
+        actions: &'a [ActionDescriptor],
+        id: &str,
+    ) -> anyhow::Result<&'a ActionDescriptor> {
+        actions
+            .iter()
+            .find(|action| action.id == id)
+            .with_context(|| format!("missing descriptor {id}"))
+    }
+
     #[test]
-    fn descriptors_include_root_visibility_and_no_raw_shell() {
+    fn descriptors_include_root_visibility_and_no_raw_shell() -> anyhow::Result<()> {
         let meta = protocol_metadata(1, 1);
-        assert!(meta.root_data_authority.root_can_view_all_business_data);
-        assert!(!meta.root_data_authority.bypasses_operation_fact_policy);
-        assert!(
+        ensure!(
+            meta.root_data_authority.root_can_view_all_business_data,
+            "root data authority did not include business data visibility"
+        );
+        ensure!(
+            !meta.root_data_authority.bypasses_operation_fact_policy,
+            "root data authority bypassed operation/fact policy"
+        );
+        ensure!(
             meta.actions
                 .iter()
-                .any(|a| a.id == ACTION_VISIBILITY_STATE_READ)
+                .any(|a| a.id == ACTION_VISIBILITY_STATE_READ),
+            "visibility state read action is missing"
         );
-        assert!(
+        ensure!(
             meta.actions
                 .iter()
-                .all(|a| !a.id.contains("raw") && !a.id.contains("shell"))
+                .all(|a| !a.id.contains("raw") && !a.id.contains("shell")),
+            "descriptor list exposed a raw or shell action"
         );
+        Ok(())
     }
 
     #[test]
-    fn secret_reveal_is_declared_but_custody_blocked() {
-        let reveal = action_descriptors()
-            .into_iter()
-            .find(|a| a.id == ACTION_SECRET_REVEAL)
-            .unwrap();
-        assert_eq!(reveal.status, ImplementationStatus::BlockedByCustody);
-        assert_eq!(reveal.secret_class, Some(SecretClass::RevealableSecret));
+    fn secret_reveal_is_declared_but_custody_blocked() -> anyhow::Result<()> {
+        let actions = action_descriptors();
+        let reveal = find_action(&actions, ACTION_SECRET_REVEAL)?;
+        ensure!(
+            reveal.status == ImplementationStatus::BlockedByCustody,
+            "secret reveal status was not custody-blocked"
+        );
+        ensure!(
+            reveal.secret_class == Some(SecretClass::RevealableSecret),
+            "secret reveal secret class mismatch"
+        );
+        Ok(())
     }
 
     #[test]
-    fn descriptors_are_unique_and_cover_core_domains() {
+    fn descriptors_are_unique_and_cover_core_domains() -> anyhow::Result<()> {
         let actions = action_descriptors();
         let streams = stream_descriptors();
         let mut ids = BTreeSet::new();
         for action in &actions {
-            assert!(
+            ensure!(
                 ids.insert(action.id.clone()),
                 "duplicate action {}",
                 action.id
             );
         }
         for stream in &streams {
-            assert!(
+            ensure!(
                 ids.insert(stream.id.clone()),
                 "duplicate stream {}",
                 stream.id
@@ -2404,40 +2848,38 @@ mod tests {
             "lineage",
             "health",
             "external",
+            "projection",
+            "inference",
             "pairing",
             "resource",
             "change_set",
-            "graph",
         ] {
-            assert!(domains.contains(required), "missing domain {required}");
+            ensure!(domains.contains(required), "missing domain {required}");
         }
+        Ok(())
     }
 
     #[test]
-    fn edit_descriptors_are_shape_independent() {
+    fn edit_descriptors_are_shape_independent() -> anyhow::Result<()> {
         let Some(Value::Map(descriptor)) = resource_type_descriptor_value("access.user") else {
-            panic!("missing access.user resource descriptor")
+            bail!("missing access.user resource descriptor");
         };
         let Some(Value::List(fields)) = descriptor.get("fields") else {
-            panic!("resource descriptor must include fields")
+            bail!("resource descriptor must include fields");
         };
-        assert!(fields.iter().any(|field| {
-            field.as_map().is_some_and(|map| {
+        ensure!(
+            fields.iter().any(|field| {
+                field.as_map().is_some_and(|map| {
                 matches!(map.get("semantic_kind"), Some(Value::Str(kind)) if kind == "resource_ref")
             })
-        }));
-        let Some(Value::Map(graph)) = graph_type_descriptor_value("plan.workflow") else {
-            panic!("missing plan.workflow graph descriptor")
-        };
-        assert_eq!(
-            graph.get("status"),
-            Some(&to_value(ImplementationStatus::Planned))
+            }),
+            "resource descriptor did not include resource_ref field"
         );
-        assert!(matches!(graph.get("node_types"), Some(Value::List(nodes)) if !nodes.is_empty()));
+        Ok(())
     }
 
     #[test]
-    fn change_set_actions_are_discoverable_but_planned() {
+    fn change_set_actions_are_discoverable_but_planned() -> anyhow::Result<()> {
         let actions = action_descriptors();
         for id in [
             ACTION_CHANGE_SET_CREATE,
@@ -2448,22 +2890,25 @@ mod tests {
             ACTION_CHANGE_SET_APPLY,
             ACTION_CHANGE_SET_DISCARD,
         ] {
-            let Some(action) = actions.iter().find(|action| action.id == id) else {
-                panic!("missing descriptor {id}")
-            };
-            assert_eq!(action.status, ImplementationStatus::Planned);
-            assert!(
+            let action = find_action(&actions, id)?;
+            ensure!(
+                action.status == ImplementationStatus::Planned,
+                "change-set action {id} was not planned"
+            );
+            ensure!(
                 action
                     .input
                     .fields
                     .iter()
-                    .all(|field| field.semantic_kind.is_some())
+                    .all(|field| field.semantic_kind.is_some()),
+                "change-set action {id} had a field without semantic_kind"
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn protected_payload_descriptors_require_step_up() {
+    fn protected_payload_descriptors_require_step_up() -> anyhow::Result<()> {
         for action in action_descriptors() {
             if matches!(
                 action.visibility,
@@ -2471,10 +2916,11 @@ mod tests {
                     | VisibilityTier::ProtectedPayload
                     | VisibilityTier::SecretPlaintext
             ) {
-                assert!(
+                ensure!(
                     action.requires_step_up,
                     "{} exposes {:?} without step-up",
-                    action.id, action.visibility
+                    action.id,
+                    action.visibility
                 );
             }
         }
@@ -2485,78 +2931,169 @@ mod tests {
                     | VisibilityTier::ProtectedPayload
                     | VisibilityTier::SecretPlaintext
             ) {
-                assert!(
+                ensure!(
                     stream.requires_step_up,
                     "{} exposes {:?} without step-up",
-                    stream.id, stream.visibility
+                    stream.id,
+                    stream.visibility
                 );
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn access_descriptors_match_runtime_authority_boundaries() {
+    fn access_descriptors_match_runtime_authority_boundaries() -> anyhow::Result<()> {
         let actions = action_descriptors();
-        let find = |id: &str| {
-            actions
-                .iter()
-                .find(|action| action.id == id)
-                .unwrap_or_else(|| panic!("missing descriptor {id}"))
-        };
 
-        let user_write = find(ACTION_ACCESS_USER_WRITE_CAS);
-        assert!(user_write.required_authority.iter().any(|required| {
-            required.verb == "write" && required.target == "state://kernel/console/users/**"
-        }));
-        let role_write = find(ACTION_ACCESS_ROLE_WRITE_CAS);
-        assert!(role_write.required_authority.iter().any(|required| {
-            required.verb == "write" && required.target == "state://kernel/console/roles/**"
-        }));
-        let session_revoke = find(ACTION_ACCESS_SESSION_REVOKE);
-        assert!(session_revoke.required_authority.iter().any(|required| {
-            required.verb == "write" && required.target == "state://kernel/console/sessions/**"
-        }));
-        assert!(
-            find(ACTION_ACCESS_SESSION_CURRENT_LOGOUT)
-                .required_authority
-                .is_empty()
+        let user_write = find_action(&actions, ACTION_ACCESS_USER_WRITE_CAS)?;
+        ensure!(
+            user_write.required_authority.iter().any(|required| {
+                required.verb == "write" && required.target == "state://kernel/console/users/**"
+            }),
+            "user write descriptor missing user write authority"
         );
+        let role_write = find_action(&actions, ACTION_ACCESS_ROLE_WRITE_CAS)?;
+        ensure!(
+            role_write.required_authority.iter().any(|required| {
+                required.verb == "write" && required.target == "state://kernel/console/roles/**"
+            }),
+            "role write descriptor missing role write authority"
+        );
+        let session_revoke = find_action(&actions, ACTION_ACCESS_SESSION_REVOKE)?;
+        ensure!(
+            session_revoke.required_authority.iter().any(|required| {
+                required.verb == "write" && required.target == "state://kernel/console/sessions/**"
+            }),
+            "session revoke descriptor missing session write authority"
+        );
+        ensure!(
+            find_action(&actions, ACTION_ACCESS_SESSION_CURRENT_LOGOUT)?
+                .required_authority
+                .is_empty(),
+            "current-session logout should not require explicit authority"
+        );
+        Ok(())
     }
 
     #[test]
-    fn extension_descriptors_match_runtime_authority_boundaries() {
+    fn external_descriptors_match_runtime_authority_boundaries() -> anyhow::Result<()> {
         let actions = action_descriptors();
-        let find = |id: &str| {
-            actions
-                .iter()
-                .find(|action| action.id == id)
-                .unwrap_or_else(|| panic!("missing descriptor {id}"))
-        };
 
-        let install = find(ACTION_EXTERNAL_INSTALLATION_INSTALL);
-        assert!(install.required_authority.iter().any(|required| {
-            required.verb == "write"
-                && required.target == "state://kernel/external-installations/**"
-        }));
-        let start = find(ACTION_EXTERNAL_INSTALLATION_START);
-        assert!(start.required_authority.iter().any(|required| {
-            required.verb == "read" && required.target == "state://kernel/external-installations/**"
-        }));
-        assert!(start.required_authority.iter().any(|required| {
-            required.verb == "perform" && required.target == "effect://proc/spawn"
-        }));
-        let stop = find(ACTION_EXTERNAL_INSTALLATION_STOP);
-        assert!(stop.required_authority.iter().any(|required| {
-            required.verb == "perform" && required.target == "effect://proc/kill"
-        }));
-        let revoke = find(ACTION_EXTERNAL_INSTALLATION_REVOKE);
-        assert!(revoke.required_authority.iter().any(|required| {
-            required.verb == "perform" && required.target == "effect://external/revoke"
-        }));
+        let install = find_action(&actions, ACTION_EXTERNAL_INSTALLATION_INSTALL)?;
+        ensure!(
+            install.required_authority.iter().any(|required| {
+                required.verb == "write"
+                    && required.target == "state://kernel/external-installations/**"
+            }),
+            "external install missing installation write authority"
+        );
+        let installation_read = find_action(&actions, ACTION_EXTERNAL_INSTALLATION_READ)?;
+        ensure!(
+            installation_read.required_authority.iter().any(|required| {
+                required.verb == "read"
+                    && required.target == "state://kernel/external-installations/**"
+            }),
+            "external installation read missing installation read authority"
+        );
+        let manifest_write = find_action(&actions, ACTION_EXTERNAL_MANIFEST_WRITE_CAS)?;
+        ensure!(
+            manifest_write.required_authority.iter().any(|required| {
+                required.verb == "write" && required.target == "state://kernel/manifests/**"
+            }),
+            "external manifest write missing manifest write authority"
+        );
+        let start = find_action(&actions, ACTION_EXTERNAL_INSTALLATION_START)?;
+        ensure!(
+            start.required_authority.iter().any(|required| {
+                required.verb == "read"
+                    && required.target == "state://kernel/external-installations/**"
+            }),
+            "external start missing installation read authority"
+        );
+        ensure!(
+            start.required_authority.iter().any(|required| {
+                required.verb == "perform" && required.target == "effect://proc/spawn"
+            }),
+            "external start missing proc spawn authority"
+        );
+        let stop = find_action(&actions, ACTION_EXTERNAL_INSTALLATION_STOP)?;
+        ensure!(
+            stop.required_authority.iter().any(|required| {
+                required.verb == "read"
+                    && required.target == "state://kernel/external-installations/**"
+            }),
+            "external stop missing installation read authority"
+        );
+        ensure!(
+            stop.required_authority.iter().any(|required| {
+                required.verb == "perform" && required.target == "effect://proc/kill"
+            }),
+            "external stop missing proc kill authority"
+        );
+        let revoke = find_action(&actions, ACTION_EXTERNAL_INSTALLATION_REVOKE)?;
+        ensure!(
+            revoke.required_authority.iter().any(|required| {
+                required.verb == "read"
+                    && required.target == "state://kernel/external-installations/**"
+            }),
+            "external revoke missing installation read authority"
+        );
+        ensure!(
+            revoke.required_authority.iter().any(|required| {
+                required.verb == "perform" && required.target == "effect://external/revoke"
+            }),
+            "external revoke missing external revoke authority"
+        );
+        Ok(())
     }
 
     #[test]
-    fn pairing_descriptors_use_specific_effect_authority() {
+    fn inference_descriptors_match_runtime_authority_boundaries() -> anyhow::Result<()> {
+        let actions = action_descriptors();
+
+        let backend = find_action(&actions, ACTION_INFERENCE_BACKEND_WRITE_CAS)?;
+        ensure!(
+            backend.required_authority.iter().any(|required| {
+                required.verb == "write"
+                    && required.target == "state://kernel/inference/backends/**"
+            }),
+            "inference backend write missing backend authority"
+        );
+        let model = find_action(&actions, ACTION_INFERENCE_MODEL_WRITE_CAS)?;
+        ensure!(
+            model.required_authority.iter().any(|required| {
+                required.verb == "write" && required.target == "state://kernel/inference/models/**"
+            }),
+            "inference model write missing model authority"
+        );
+        let group = find_action(&actions, ACTION_INFERENCE_GROUP_WRITE_CAS)?;
+        ensure!(
+            group.required_authority.iter().any(|required| {
+                required.verb == "write" && required.target == "state://kernel/inference/groups/**"
+            }),
+            "inference group write missing group authority"
+        );
+        let routing = find_action(&actions, ACTION_INFERENCE_ROUTING_WRITE_CAS)?;
+        ensure!(
+            routing.required_authority.iter().any(|required| {
+                required.verb == "write" && required.target == "state://kernel/routing/inference"
+            }),
+            "inference routing write missing routing authority"
+        );
+        let projection = find_action(&actions, ACTION_PROJECTION_IN_PROCESS_WRITE_CAS)?;
+        ensure!(
+            projection.required_authority.iter().any(|required| {
+                required.verb == "write"
+                    && required.target == "state://kernel/projections/in-process/**"
+            }),
+            "in-process projection write missing projection authority"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pairing_descriptors_use_specific_effect_authority() -> anyhow::Result<()> {
         let actions = action_descriptors();
         for (id, target) in [
             (ACTION_PAIRING_CREATE, "effect://external/pairing/create"),
@@ -2564,13 +3101,24 @@ mod tests {
             (ACTION_PAIRING_DENY, "effect://external/pairing/deny"),
             (ACTION_PAIRING_REPLACE, "effect://external/pairing/replace"),
         ] {
-            let action = actions
-                .iter()
-                .find(|action| action.id == id)
-                .unwrap_or_else(|| panic!("missing descriptor {id}"));
-            assert_eq!(action.required_authority.len(), 1);
-            assert_eq!(action.required_authority[0].verb, "perform");
-            assert_eq!(action.required_authority[0].target, target);
+            let action = find_action(&actions, id)?;
+            ensure!(
+                action.required_authority.len() == 1,
+                "pairing action {id} should have exactly one authority"
+            );
+            let authority = action
+                .required_authority
+                .first()
+                .context("pairing authority missing")?;
+            ensure!(
+                authority.verb == "perform",
+                "pairing action {id} should require perform"
+            );
+            ensure!(
+                authority.target == target,
+                "pairing action {id} target mismatch"
+            );
         }
+        Ok(())
     }
 }

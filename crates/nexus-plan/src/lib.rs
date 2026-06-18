@@ -1,36 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! `nexus-plan` — Plan compiler.
+//! Plan document compiler.
 //!
-//! A *Plan* is a YAML/JSON document describing a goal-directed pipeline of
-//! steps. The compiler turns a Plan into a [`DoNode`],
-//! which the kernel compiles to an `ExecutionGraph` and runs.
-//!
-//! Every step maps to runtime primitives. State and effect access are both
-//! `Operation`s on a Resource named by its `Path`, distinguished by the method
-//! (`read`/`write`/`append` for state access, `invoke` for
-//! `effect://`).
-//!
-//! `Step::Subscribe` lowers to an Operation with method `subscribe` on the
-//! supplied state path. That represents the compiler shape, not a guarantee
-//! that every installed state driver exposes such a method. The standard event
-//! bus exposes subscriptions through `effect://events/subscribe`.
-//!
-//! Step mappings:
-//! - `perform`: `Op(OperationTemplate { method: "invoke" })`
-//! - `read`: `Op(OperationTemplate { method: "read" })`
-//! - `subscribe`: `Op(OperationTemplate { method: "subscribe" })`
-//! - `write`: `Op(OperationTemplate { method: "write" })` or
-//!   `Op(OperationTemplate { method: "append" })`
-//! - `then`: `AndThen { d, then: StepRef }`
-//! - `on_fail`: `OrElse { d, or: StepRef }`
-//! - `parallel`: `Both(left, right)`
-//! - `race`: `Race(left, right)`
-//! - `let` / `use`: `Let { name, value, body }` / `Use(name)`
-//! - `pure`: `Pure(value)`
-//! - `acting`: `Acting { identity, body }`
-//! - `spawn`: `Op(OperationTemplate { target: effect://kernel/spawn })`
-//! - `bracket`: acquire, then run body and release; on failure, release.
+//! This crate parses YAML or JSON [`Plan`] documents and lowers them to
+//! [`DoNode`] programs for kernel execution.
 
 use nexus_graph::{DoNode, OperationTemplate, StepRef};
 use nexus_types::{
@@ -270,7 +243,7 @@ fn validate_plan(plan: &Plan) -> Result<(), PlanError> {
     collect_all_steps(&plan.steps, &mut all);
     let path_registry = default_registry();
 
-    // 1. Duplicate `let` binding names (across the whole step tree).
+    // Reject duplicate `let` binding names across the whole step tree.
     let mut seen = std::collections::BTreeSet::new();
     for step in &all {
         if let Step::Let { name, .. } = step
@@ -280,13 +253,13 @@ fn validate_plan(plan: &Plan) -> Result<(), PlanError> {
         }
     }
 
-    // 2. Operation targets must match their step kind.
-    //    This catches resource-path/capability confusion before lowering.
+    // Operation targets must match their step kind; this catches
+    // resource-path/capability confusion before lowering.
     for step in &all {
         validate_step_target(step, &path_registry)?;
     }
 
-    // 3. Acting/spawn identities must be real identity paths, not bare schemes.
+    // Acting/spawn identities must be real identity paths, not bare schemes.
     for step in &all {
         match step {
             Step::Acting { identity, .. } => {
@@ -300,9 +273,9 @@ fn validate_plan(plan: &Plan) -> Result<(), PlanError> {
         }
     }
 
-    // 4. Spawn capability ceilings must use  capability literals, not
-    //    resource paths. The kernel spawn path will attenuate these again, but
-    //    Plan compilation is the first fail-closed boundary.
+    // Spawn capability ceilings must use capability literals, not resource
+    // paths. The kernel spawn path attenuates these again, but Plan compilation
+    // is the first fail-closed boundary.
     for step in &all {
         if let Step::Spawn { capabilities, .. } = step {
             for capability in capabilities {
@@ -313,8 +286,7 @@ fn validate_plan(plan: &Plan) -> Result<(), PlanError> {
         }
     }
 
-    // 5. Reference cycle among `${...}`-linked bindings. Build edges
-    //    binding -> referenced-binding, then DFS for a back edge.
+    // Build binding reference edges and reject cycles among `${...}` links.
     let binders: std::collections::BTreeSet<String> = all
         .iter()
         .flat_map(|s| step_binds(s))
@@ -575,10 +547,7 @@ fn is_mergeable(step: &Step) -> bool {
 /// binding other steps in sequence via `Let`. Adjacent independent value steps
 /// are paired into `Both` for parallelism.
 ///
-/// Current implementation limit: parallelism is **pairwise and greedy
-/// left-to-right**, not a full topological reorder of the whole step list. A run
-/// of three independent steps `[A, B, C]` becomes `Let(Both(A, B), C)`, not a
-/// 3-way fan-out.
+/// Parallel pairing is local and left-to-right.
 fn compile_steps(process: ProcessId, steps: &[Step]) -> Result<DoNode, PlanError> {
     if steps.is_empty() {
         return Err(PlanError::Empty);
@@ -757,6 +726,7 @@ pub fn parse_json(src: &str) -> Result<Plan, PlanError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, bail, ensure};
 
     fn plan(steps: Vec<Step>) -> Plan {
         Plan {
@@ -776,61 +746,68 @@ mod tests {
     }
 
     #[test]
-    fn compile_single_perform() {
+    fn compile_single_perform() -> anyhow::Result<()> {
         let node = compile_test(&plan(vec![Step::Perform {
             target: "effect://x/post".into(),
             input: Some(serde_json::json!("hello")),
-        }]))
-        .unwrap();
+        }]))?;
         match node {
             DoNode::Op(t) => {
-                assert_eq!(t.target.path().to_string(), "effect://x/post");
-                assert_eq!(t.method, "invoke");
-                assert_eq!(t.literal_input, Some(Value::Str("hello".into())));
+                ensure!(
+                    t.target.path().to_string() == "effect://x/post",
+                    "unexpected target: {}",
+                    t.target.path()
+                );
+                ensure!(t.method == "invoke", "unexpected method: {}", t.method);
+                ensure!(
+                    t.literal_input == Some(Value::Str("hello".into())),
+                    "unexpected input: {:?}",
+                    t.literal_input
+                );
             }
-            _ => panic!("wrong node"),
+            other => bail!("expected operation node, got {other:?}"),
         }
+        Ok(())
     }
 
     #[test]
-    fn read_maps_to_value_read() {
+    fn read_maps_to_value_read() -> anyhow::Result<()> {
         let node = compile_test(&plan(vec![Step::Read {
             path: "state://memory/alice".into(),
             r#as: "v".into(),
-        }]))
-        .unwrap();
+        }]))?;
         match node {
-            DoNode::Op(t) => assert_eq!(t.method, "read"),
-            _ => panic!(),
+            DoNode::Op(t) => ensure!(t.method == "read", "unexpected method: {}", t.method),
+            other => bail!("expected operation node, got {other:?}"),
         }
+        Ok(())
     }
 
     #[test]
-    fn write_set_vs_append() {
+    fn write_set_vs_append() -> anyhow::Result<()> {
         let set = compile_test(&plan(vec![Step::Write {
             path: "state://x".into(),
             value: serde_json::json!(1),
             mode: WriteModeSpec::Set,
-        }]))
-        .unwrap();
+        }]))?;
         match set {
-            DoNode::Op(t) => assert_eq!(t.method, "write"),
-            _ => panic!(),
+            DoNode::Op(t) => ensure!(t.method == "write", "unexpected method: {}", t.method),
+            other => bail!("expected operation node, got {other:?}"),
         }
         let app = compile_test(&plan(vec![Step::Write {
             path: "state://log".into(),
             value: serde_json::json!("e"),
             mode: WriteModeSpec::Append,
-        }]))
-        .unwrap();
+        }]))?;
         match app {
-            DoNode::Op(t) => assert_eq!(t.method, "append"),
-            _ => panic!(),
+            DoNode::Op(t) => ensure!(t.method == "append", "unexpected method: {}", t.method),
+            other => bail!("expected operation node, got {other:?}"),
         }
+        Ok(())
     }
 
     #[test]
-    fn compile_chain_ends_in_or_else() {
+    fn compile_chain_ends_in_or_else() -> anyhow::Result<()> {
         let node = compile_test(&plan(vec![
             Step::Perform {
                 target: "effect://inference/infer".into(),
@@ -844,18 +821,25 @@ mod tests {
                 name: "ack".into(),
                 arg: None,
             },
-        ]))
-        .unwrap();
-        assert!(matches!(node, DoNode::OrElse { .. }));
+        ]))?;
+        ensure!(
+            matches!(node, DoNode::OrElse { .. }),
+            "expected OrElse node, got {node:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn empty_plan_errors() {
-        assert!(matches!(compile_test(&plan(vec![])), Err(PlanError::Empty)));
+    fn empty_plan_errors() -> anyhow::Result<()> {
+        ensure!(
+            matches!(compile_test(&plan(vec![])), Err(PlanError::Empty)),
+            "empty plan should be rejected"
+        );
+        Ok(())
     }
 
     #[test]
-    fn parallel_and_race_compile() {
+    fn parallel_and_race_compile() -> anyhow::Result<()> {
         let par = compile_test(&plan(vec![Step::Parallel {
             left: vec![Step::Perform {
                 target: "effect://x/a".into(),
@@ -865,9 +849,11 @@ mod tests {
                 target: "effect://x/b".into(),
                 input: None,
             }],
-        }]))
-        .unwrap();
-        assert!(matches!(par, DoNode::Both(_, _)));
+        }]))?;
+        ensure!(
+            matches!(par, DoNode::Both(_, _)),
+            "expected Both node, got {par:?}"
+        );
         let race = compile_test(&plan(vec![Step::Race {
             left: vec![Step::Perform {
                 target: "effect://x/a".into(),
@@ -877,56 +863,70 @@ mod tests {
                 target: "effect://x/b".into(),
                 input: None,
             }],
-        }]))
-        .unwrap();
-        assert!(matches!(race, DoNode::Race(_, _)));
+        }]))?;
+        ensure!(
+            matches!(race, DoNode::Race(_, _)),
+            "expected Race node, got {race:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn acting_compiles() {
+    fn acting_compiles() -> anyhow::Result<()> {
         let node = compile_test(&plan(vec![Step::Acting {
             identity: "process://alice".into(),
             body: vec![Step::Pure {
                 value: serde_json::json!(1),
             }],
-        }]))
-        .unwrap();
-        assert!(matches!(node, DoNode::Acting { .. }));
+        }]))?;
+        ensure!(
+            matches!(node, DoNode::Acting { .. }),
+            "expected Acting node, got {node:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn acting_identity_must_be_shaped_path() {
+    fn acting_identity_must_be_shaped_path() -> anyhow::Result<()> {
         let err = compile_test(&plan(vec![Step::Acting {
             identity: "alice".into(),
             body: vec![Step::Pure {
                 value: serde_json::json!(1),
             }],
         }]));
-        assert!(matches!(
+        ensure!(
+            matches!(
             err,
             Err(PlanError::Target { kind, target, .. })
                 if kind == "acting identity" && target == "alice"
-        ));
+            ),
+            "acting identity should be rejected"
+        );
+        Ok(())
     }
 
     #[test]
-    fn spawn_targets_kernel_resource() {
+    fn spawn_targets_kernel_resource() -> anyhow::Result<()> {
         let node = compile_test(&plan(vec![Step::Spawn {
             identity: Some("process://child".into()),
             capabilities: vec!["perform://effect/x/post".into()],
             body: vec![Step::Pure {
                 value: serde_json::json!(1),
             }],
-        }]))
-        .unwrap();
+        }]))?;
         match node {
-            DoNode::Op(t) => assert_eq!(t.target.path().to_string(), "effect://kernel/spawn"),
-            _ => panic!(),
+            DoNode::Op(t) => ensure!(
+                t.target.path().to_string() == "effect://kernel/spawn",
+                "unexpected target: {}",
+                t.target.path()
+            ),
+            other => bail!("expected operation node, got {other:?}"),
         }
+        Ok(())
     }
 
     #[test]
-    fn spawn_capabilities_must_be_canonical_literals() {
+    fn spawn_capabilities_must_be_canonical_literals() -> anyhow::Result<()> {
         let bad = plan(vec![Step::Spawn {
             identity: Some("process://child".into()),
             capabilities: vec!["effect://x/post".into()],
@@ -934,10 +934,13 @@ mod tests {
                 value: serde_json::json!(1),
             }],
         }]);
-        assert!(matches!(
+        ensure!(
+            matches!(
             compile_test(&bad),
             Err(PlanError::Capability(literal, _)) if literal == "effect://x/post"
-        ));
+            ),
+            "non-canonical capability should be rejected"
+        );
 
         let good = plan(vec![Step::Spawn {
             identity: Some("process://child".into()),
@@ -946,11 +949,12 @@ mod tests {
                 value: serde_json::json!(1),
             }],
         }]);
-        compile_test(&good).unwrap();
+        compile_test(&good)?;
+        Ok(())
     }
 
     #[test]
-    fn spawn_identity_must_be_shaped_path() {
+    fn spawn_identity_must_be_shaped_path() -> anyhow::Result<()> {
         let bad = plan(vec![Step::Spawn {
             identity: Some("child".into()),
             capabilities: vec!["perform://effect/x/post".into()],
@@ -958,34 +962,42 @@ mod tests {
                 value: serde_json::json!(1),
             }],
         }]);
-        assert!(matches!(
+        ensure!(
+            matches!(
             compile_test(&bad),
             Err(PlanError::Target { kind, target, .. })
                 if kind == "spawn identity" && target == "child"
-        ));
+            ),
+            "spawn identity should be rejected"
+        );
+        Ok(())
     }
 
     #[test]
-    fn subscribe_carries_step_in_input() {
+    fn subscribe_carries_step_in_input() -> anyhow::Result<()> {
         let node = compile_test(&plan(vec![Step::Subscribe {
             path: "state://events/chat".into(),
             step: StepRefSpec {
                 name: "react".into(),
                 arg: None,
             },
-        }]))
-        .unwrap();
+        }]))?;
         match node {
             DoNode::Op(t) => {
-                assert_eq!(t.method, "subscribe");
-                assert!(matches!(t.literal_input, Some(Value::Map(_))));
+                ensure!(t.method == "subscribe", "unexpected method: {}", t.method);
+                ensure!(
+                    matches!(t.literal_input, Some(Value::Map(_))),
+                    "unexpected input: {:?}",
+                    t.literal_input
+                );
             }
-            _ => panic!(),
+            other => bail!("expected operation node, got {other:?}"),
         }
+        Ok(())
     }
 
     #[test]
-    fn bracket_compiles_to_let_with_release() {
+    fn bracket_compiles_to_let_with_release() -> anyhow::Result<()> {
         let node = compile_test(&plan(vec![Step::Bracket {
             acquire: Box::new(Step::Perform {
                 target: "effect://lock/take".into(),
@@ -998,16 +1010,19 @@ mod tests {
                 name: "release".into(),
                 arg: None,
             },
-        }]))
-        .unwrap();
+        }]))?;
         match node {
-            DoNode::Let { body, .. } => assert!(matches!(*body, DoNode::OrElse { .. })),
-            _ => panic!("expected Let"),
+            DoNode::Let { body, .. } => ensure!(
+                matches!(*body, DoNode::OrElse { .. }),
+                "expected OrElse release body, got {body:?}"
+            ),
+            other => bail!("expected Let node, got {other:?}"),
         }
+        Ok(())
     }
 
     #[test]
-    fn yaml_round_trip_and_compile() {
+    fn yaml_round_trip_and_compile() -> anyhow::Result<()> {
         let src = r#"
 id: hi
 version: 1
@@ -1016,26 +1031,37 @@ steps:
     target: "effect://x/post"
     input: "hello"
 "#;
-        let plan = parse_yaml(src).unwrap();
-        assert_eq!(plan.id, "hi");
-        compile_test(&plan).unwrap();
+        let plan = parse_yaml(src)?;
+        ensure!(plan.id == "hi", "unexpected plan id: {}", plan.id);
+        compile_test(&plan)?;
+        Ok(())
     }
 
     #[test]
-    fn json_value_to_kernel_value() {
+    fn json_value_to_kernel_value() -> anyhow::Result<()> {
         let v = json_to_value(&serde_json::json!({"n": 7, "ok": true, "list": [1, 2]}));
         match v {
             Value::Map(m) => {
-                assert_eq!(m.get("n").unwrap(), &Value::Int(7));
-                assert_eq!(m.get("ok").unwrap(), &Value::Bool(true));
-                assert!(matches!(m.get("list").unwrap(), Value::List(_)));
+                ensure!(
+                    m.get("n").context("missing n")? == &Value::Int(7),
+                    "unexpected n"
+                );
+                ensure!(
+                    m.get("ok").context("missing ok")? == &Value::Bool(true),
+                    "unexpected ok"
+                );
+                ensure!(
+                    matches!(m.get("list").context("missing list")?, Value::List(_)),
+                    "unexpected list"
+                );
             }
-            _ => panic!("expected map"),
+            other => bail!("expected map value, got {other:?}"),
         }
+        Ok(())
     }
 
     #[test]
-    fn duplicate_let_name_rejected() {
+    fn duplicate_let_name_rejected() -> anyhow::Result<()> {
         let err = compile_test(&plan(vec![
             Step::Let {
                 name: "x".into(),
@@ -1046,21 +1072,31 @@ steps:
                 value: serde_json::json!(2),
             },
         ]));
-        assert!(matches!(err, Err(PlanError::DuplicateName(n)) if n == "x"));
+        ensure!(
+            matches!(err, Err(PlanError::DuplicateName(n)) if n == "x"),
+            "duplicate name should be rejected"
+        );
+        Ok(())
     }
 
     #[test]
-    fn extract_refs_finds_placeholders() {
+    fn extract_refs_finds_placeholders() -> anyhow::Result<()> {
         let v = serde_json::json!({"a": "${first}", "b": ["x", "${second}y"]});
         let mut refs = extract_refs(&v);
         refs.sort();
-        assert_eq!(refs, vec!["first".to_string(), "second".to_string()]);
-        assert!(extract_refs(&serde_json::json!("no refs here")).is_empty());
+        ensure!(
+            refs == vec!["first".to_string(), "second".to_string()],
+            "unexpected refs: {refs:?}"
+        );
+        ensure!(
+            extract_refs(&serde_json::json!("no refs here")).is_empty(),
+            "non-placeholder string should not produce refs"
+        );
+        Ok(())
     }
 
     #[test]
-    fn reference_cycle_rejected() {
-        // a -> b (a's value references ${b}) and b -> a forms a cycle.
+    fn reference_cycle_rejected() -> anyhow::Result<()> {
         let err = compile_test(&plan(vec![
             Step::Let {
                 name: "a".into(),
@@ -1071,12 +1107,15 @@ steps:
                 value: serde_json::json!("${a}"),
             },
         ]));
-        assert!(matches!(err, Err(PlanError::Cycle(_))));
+        ensure!(
+            matches!(err, Err(PlanError::Cycle(_))),
+            "cycle should be rejected"
+        );
+        Ok(())
     }
 
     #[test]
-    fn independent_steps_compile_to_both() {
-        // Two performs with no data dependency → Both.
+    fn independent_steps_compile_to_both() -> anyhow::Result<()> {
         let node = compile_test(&plan(vec![
             Step::Perform {
                 target: "effect://x/a".into(),
@@ -1086,14 +1125,16 @@ steps:
                 target: "effect://x/b".into(),
                 input: None,
             },
-        ]))
-        .unwrap();
-        assert!(matches!(node, DoNode::Both(_, _)));
+        ]))?;
+        ensure!(
+            matches!(node, DoNode::Both(_, _)),
+            "expected Both node, got {node:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn dependent_steps_stay_sequential() {
-        // B references ${a}, so it must run after A → stays a sequential Let.
+    fn dependent_steps_stay_sequential() -> anyhow::Result<()> {
         let node = compile_test(&plan(vec![
             Step::Let {
                 name: "a".into(),
@@ -1103,14 +1144,16 @@ steps:
                 target: "effect://x/b".into(),
                 input: Some(serde_json::json!("${a}")),
             },
-        ]))
-        .unwrap();
-        assert!(matches!(node, DoNode::Let { .. }));
+        ]))?;
+        ensure!(
+            matches!(node, DoNode::Let { .. }),
+            "expected Let node, got {node:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn three_independent_steps_pairwise_parallel() {
-        // Limitation: greedy pairwise, so [A,B,C] → Let(Both(A,B), C), not 3-way.
+    fn three_independent_steps_pairwise_parallel() -> anyhow::Result<()> {
         let node = compile_test(&plan(vec![
             Step::Perform {
                 target: "effect://x/a".into(),
@@ -1124,14 +1167,20 @@ steps:
                 target: "effect://x/c".into(),
                 input: None,
             },
-        ]))
-        .unwrap();
+        ]))?;
         match node {
             DoNode::Let { value, body, .. } => {
-                assert!(matches!(*value, DoNode::Both(_, _)));
-                assert!(matches!(*body, DoNode::Op(_)));
+                ensure!(
+                    matches!(*value, DoNode::Both(_, _)),
+                    "expected Both value, got {value:?}"
+                );
+                ensure!(
+                    matches!(*body, DoNode::Op(_)),
+                    "expected Op body, got {body:?}"
+                );
             }
-            _ => panic!("expected Let wrapping Both"),
+            other => bail!("expected Let wrapping Both, got {other:?}"),
         }
+        Ok(())
     }
 }

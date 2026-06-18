@@ -3,10 +3,10 @@
 #
 # This file contains daemon bootstrap settings: storage, listener addresses,
 # external Provider/Source gateway limits, console root bootstrap credentials,
-# and bounded console resource limits. Runtime
-# configuration for models, groups, routing, bindings, external program
-# installations, Provider projections, Source projections, and policy lives in
-# Nexus state and is managed through Console WebSocket.
+# and bounded console resource limits. Runtime configuration for models,
+# groups, routing, bindings, in-process projection declarations, external
+# Provider/Source installations, projections, and policy lives in Nexus state
+# and is managed through Console WebSocket.
 
 [storage]
 kind = "redb"           # "redb" (persistent) or "memory" (non-persistent)
@@ -39,8 +39,7 @@ mode = "local_trusted" # production_tls | mtls | trusted_reverse_proxy | local_t
 # unsafe_relaxations = ["ignore_origin_port"]
 
 [external_gateway.websocket]
-# External WebSocket accepts the same Provider and Source role sessions as
-# external gRPC. It is a transport choice, not a separate external role.
+# External WebSocket is another transport for Provider and Source role sessions.
 source_dedupe_window_ms = 86400000
 provider_max_in_flight_invocations = 1024
 provider_max_in_flight_per_identity = 256

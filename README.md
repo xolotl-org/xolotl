@@ -43,8 +43,9 @@ External access has one role model:
 - gRPC and WebSocket are transport implementations for the same external
   Provider/Source gateway.
 
-MCP exposes selected Nexus effects as MCP tools. It does not create another
-external role.
+MCP publishes selected Gateway publications as tools, resources, resource
+templates, and prompts. MCP requests are submitted through the same Gateway
+surfaces as other protocol adapters.
 
 ## Documentation
 
@@ -101,20 +102,20 @@ Nexus separates the runtime into four code paths:
 | `nexus-state` | State backend traits and in-memory implementation. |
 | `nexus-kernel` | Process, handle, registry, policy, executor, recovery, facts. |
 | `nexus-storage-redb` | Persistent redb-backed state and FactStore. |
-| `nexus-actors` | Standard in-process drivers and providers. |
+| `nexus-standard` | Standard in-process Provider and Source implementations. |
 | `nexus-gateway` | Shared session admission, flow-control, taint, and audit code for external protocol adapters. |
 | `nexus-gateway-grpc` | External Provider/Source gRPC adapter using `nexus-proto`. |
 | `nexus-gateway-websocket` | External Provider/Source WebSocket adapter. |
-| `nexus-gateway-mcp` | MCP server-side adapter for selected Nexus effects. |
+| `nexus-gateway-mcp` | MCP server-side adapter for selected Gateway publications. |
 | `nexus-proto` | Protobuf schema and hand-vendored prost/tonic bindings. |
 | `nexus-console` | Gateway for Web Console management actions. |
 | `nexus-daemon` | `nexusd`, the long-running host process. |
 | `nexus-sdk` | Convenience exports for embedding and tests. |
 | `nexus-plan`, `nexus-sim` | Planning and simulation crates. |
 
-`nexus-actors` uses Cargo features to choose which modules are built. The
-default `standard` feature builds the standard in-process Drivers and
-Providers. Gateway crates use only `external-session`, which contains session
+`nexus-standard` uses Cargo features to choose which modules are built. The
+default `standard` feature builds the standard in-process implementations.
+Gateway crates use only `external-session`, which contains session
 handling for external Provider and Source endpoints.
 
 ## Requirements
@@ -221,17 +222,23 @@ Control state uses these prefixes:
 
 ```text
 state://kernel/external-installations/<installation_id>
-state://kernel/external-projections/<installation_id>/<projection_id>
 state://kernel/external-pairings/<pairing_id>
 state://kernel/external-sessions/<installation_id>/<role>
 state://kernel/external-credential-revocations/<installation_id>
 ```
 
+Provider/Source projections are embedded in each external installation
+declaration.
+
 ### MCP
 
-`nexus-gateway-mcp` exposes selected Nexus effects as MCP tools only when the
-underlying effect resource has an explicit publish capability. MCP calls are
-translated into standard capability-scoped operations.
+`nexus-gateway-mcp` exposes selected Gateway publications as MCP tools,
+resources, resource templates, and prompts. Each publication references a
+Gateway surface; the surface must have an explicit publish capability, and MCP
+calls, reads, and prompt requests are translated into standard
+capability-scoped operations. The adapter negotiates `2025-11-25` first,
+supports completions from publication properties, and validates native MCP
+content blocks before returning them.
 
 ## Path And Capability Rules
 

@@ -86,6 +86,10 @@ impl Predicate {
                         raw
                     )));
                 }
+                if key == "until" || matches!(op, PredOp::Le | PredOp::Lt | PredOp::Ge | PredOp::Gt)
+                {
+                    parse_predicate_number(value)?;
+                }
                 return Ok(Self {
                     key: key.to_string(),
                     op,
@@ -99,8 +103,8 @@ impl Predicate {
         )))
     }
 
-    fn value_num(&self) -> Option<f64> {
-        self.value.trim_start_matches('$').parse::<f64>().ok()
+    fn value_num(&self) -> Result<f64, CapError> {
+        parse_predicate_number(&self.value)
     }
 
     /// True iff the request described by `input` (the op input value) at wall
@@ -111,7 +115,7 @@ impl Predicate {
         // field. `@until=<ts>` reads as "valid until <ts>", i.e. authorized
         // while `now <= ts`, regardless of the literal operator used.
         if self.key == "until" {
-            let Some(bound) = self.value_num() else {
+            let Ok(bound) = self.value_num() else {
                 return false;
             };
             return (now_millis as f64) <= bound;
@@ -127,12 +131,12 @@ impl Predicate {
             (PredOp::Ne, Value::Str(s)) => s.as_str() != self.value,
             // Numeric comparisons against int/float fields.
             (op, Value::Int(n)) => match self.value_num() {
-                Some(rhs) => Self::cmp_num(*n as f64, *op, rhs),
-                None => false,
+                Ok(rhs) => Self::cmp_num(*n as f64, *op, rhs),
+                Err(_) => false,
             },
             (op, Value::Float(n)) => match self.value_num() {
-                Some(rhs) => Self::cmp_num(n.0, *op, rhs),
-                None => false,
+                Ok(rhs) => Self::cmp_num(n.0, *op, rhs),
+                Err(_) => false,
             },
             _ => false,
         }
@@ -148,6 +152,13 @@ impl Predicate {
             PredOp::Gt => lhs > rhs,
         }
     }
+}
+
+fn parse_predicate_number(value: &str) -> Result<f64, CapError> {
+    value
+        .trim_start_matches('$')
+        .parse::<f64>()
+        .map_err(|error| CapError::Malformed(format!("invalid predicate number: {value}: {error}")))
 }
 
 impl std::fmt::Display for Predicate {
@@ -457,180 +468,330 @@ impl std::fmt::Display for Capability {
 mod tests {
     use super::*;
     use crate::path::p;
+    use anyhow::{Context, ensure};
 
     #[test]
-    fn parse_simple_cap() {
-        let c = Capability::parse("perform://effect/inference/infer").unwrap();
-        assert_eq!(c.verb, "perform");
-        assert_eq!(c.scheme, "effect");
-        assert_eq!(c.segments.len(), 2);
+    fn parse_simple_cap() -> anyhow::Result<()> {
+        let c = Capability::parse("perform://effect/inference/infer")?;
+        ensure!(c.verb == "perform", "unexpected verb: {}", c.verb);
+        ensure!(c.scheme == "effect", "unexpected scheme: {}", c.scheme);
+        ensure!(
+            c.segments.len() == 2,
+            "unexpected segments: {:?}",
+            c.segments
+        );
+        Ok(())
     }
 
     #[test]
-    fn parse_publish_cap() {
-        let c = Capability::parse("publish://effect/search/run").unwrap();
-        assert_eq!(c.verb, "publish");
-        assert!(c.covers("publish", &p("effect://search/run")));
-        assert!(!c.covers("perform", &p("effect://search/run")));
+    fn parse_publish_cap() -> anyhow::Result<()> {
+        let c = Capability::parse("publish://effect/search/run")?;
+        ensure!(c.verb == "publish", "unexpected verb: {}", c.verb);
+        ensure!(
+            c.covers("publish", &p("effect://search/run")?),
+            "publish did not cover path"
+        );
+        ensure!(
+            !c.covers("perform", &p("effect://search/run")?),
+            "publish covered perform"
+        );
+        Ok(())
     }
 
     #[test]
-    fn parse_state_append_cap() {
-        let c = Capability::parse("append://state/events/topic").unwrap();
-        assert_eq!(c.verb, "append");
-        assert!(c.covers("append", &p("state://events/topic")));
-        assert!(!c.covers("write", &p("state://events/topic")));
+    fn parse_state_append_cap() -> anyhow::Result<()> {
+        let c = Capability::parse("append://state/events/topic")?;
+        ensure!(c.verb == "append", "unexpected verb: {}", c.verb);
+        ensure!(
+            c.covers("append", &p("state://events/topic")?),
+            "append did not cover path"
+        );
+        ensure!(
+            !c.covers("write", &p("state://events/topic")?),
+            "append covered write"
+        );
+        Ok(())
     }
 
     #[test]
-    fn parse_with_predicate() {
-        let c = Capability::parse("perform://effect/x/post@account=alice").unwrap();
-        let pred = c.predicate.as_ref().unwrap();
-        assert_eq!(pred.key, "account");
-        assert_eq!(pred.op, PredOp::Eq);
-        assert_eq!(pred.value, "alice");
+    fn parse_with_predicate() -> anyhow::Result<()> {
+        let c = Capability::parse("perform://effect/x/post@account=alice")?;
+        let pred = c.predicate.as_ref().context("predicate missing")?;
+        ensure!(
+            pred.key == "account",
+            "unexpected predicate key: {}",
+            pred.key
+        );
+        ensure!(
+            pred.op == PredOp::Eq,
+            "unexpected predicate op: {:?}",
+            pred.op
+        );
+        ensure!(
+            pred.value == "alice",
+            "unexpected predicate value: {}",
+            pred.value
+        );
+        Ok(())
     }
 
     #[test]
-    fn resource_paths_and_noncanonical_verbs_are_not_capabilities() {
-        assert!(Capability::parse("effect://x/post").is_err());
-        assert!(Capability::parse("state://memory/alice").is_err());
-        assert!(Capability::parse("read://effect/x/post").is_err());
-        assert!(Capability::parse("perform://state/memory/alice").is_err());
+    fn resource_paths_and_noncanonical_verbs_are_not_capabilities() -> anyhow::Result<()> {
+        ensure!(
+            Capability::parse("effect://x/post").is_err(),
+            "resource path parsed as cap"
+        );
+        ensure!(
+            Capability::parse("state://memory/alice").is_err(),
+            "state resource path parsed as cap"
+        );
+        ensure!(
+            Capability::parse("read://effect/x/post").is_err(),
+            "read effect cap was accepted"
+        );
+        ensure!(
+            Capability::parse("perform://state/memory/alice").is_err(),
+            "perform state cap was accepted"
+        );
+        Ok(())
     }
 
     #[test]
-    fn predicated_cap_is_fail_closed_without_input() {
-        // `covers` (no input) must NOT authorize a predicated capability.
-        let c = Capability::parse("perform://effect/x/post@account=alice").unwrap();
-        assert!(!c.covers("perform", &p("effect://x/post")));
-        // Path matches but predicate cannot be evaluated → denied.
+    fn predicated_cap_is_fail_closed_without_input() -> anyhow::Result<()> {
+        let c = Capability::parse("perform://effect/x/post@account=alice")?;
+        ensure!(
+            !c.covers("perform", &p("effect://x/post")?),
+            "predicated cap authorized without input"
+        );
+        Ok(())
     }
 
     #[test]
-    fn predicate_eq_enforced_against_input() {
+    fn predicate_eq_enforced_against_input() -> anyhow::Result<()> {
         use crate::value::Value;
         use std::collections::BTreeMap;
-        let c = Capability::parse("perform://effect/x/post@account=alice").unwrap();
+        let c = Capability::parse("perform://effect/x/post@account=alice")?;
         let mut m = BTreeMap::new();
         m.insert("account".to_string(), Value::Str("alice".into()));
-        assert!(c.covers_with("perform", &p("effect://x/post"), &Value::Map(m.clone()), 0));
+        ensure!(
+            c.covers_with("perform", &p("effect://x/post")?, &Value::Map(m.clone()), 0),
+            "matching predicate was denied"
+        );
         m.insert("account".to_string(), Value::Str("bob".into()));
-        assert!(!c.covers_with("perform", &p("effect://x/post"), &Value::Map(m), 0));
-        // Missing field → denied.
-        assert!(!c.covers_with("perform", &p("effect://x/post"), &Value::Null, 0));
+        ensure!(
+            !c.covers_with("perform", &p("effect://x/post")?, &Value::Map(m), 0),
+            "mismatched predicate was allowed"
+        );
+        ensure!(
+            !c.covers_with("perform", &p("effect://x/post")?, &Value::Null, 0),
+            "missing predicate field was allowed"
+        );
+        Ok(())
     }
 
     #[test]
-    fn predicate_budget_le_enforced() {
+    fn predicate_budget_le_enforced() -> anyhow::Result<()> {
         use crate::value::Value;
         use std::collections::BTreeMap;
-        let c = Capability::parse("spawn://process/alice/*@budget<=$0.10").unwrap();
+        let c = Capability::parse("spawn://process/alice/*@budget<=$0.10")?;
         let mut m = BTreeMap::new();
         m.insert(
             "budget".to_string(),
             Value::Float(crate::value::FloatBits(0.05)),
         );
-        assert!(c.covers_with(
-            "spawn",
-            &p("process://alice/job"),
-            &Value::Map(m.clone()),
-            0
-        ));
+        ensure!(
+            c.covers_with(
+                "spawn",
+                &p("process://alice/job")?,
+                &Value::Map(m.clone()),
+                0
+            ),
+            "budget under limit was denied"
+        );
         m.insert(
             "budget".to_string(),
             Value::Float(crate::value::FloatBits(0.50)),
         );
-        assert!(!c.covers_with("spawn", &p("process://alice/job"), &Value::Map(m), 0));
+        ensure!(
+            !c.covers_with("spawn", &p("process://alice/job")?, &Value::Map(m), 0),
+            "budget over limit was allowed"
+        );
+        Ok(())
     }
 
     #[test]
-    fn predicate_until_is_time_bound() {
+    fn predicate_until_is_time_bound() -> anyhow::Result<()> {
         use crate::value::Value;
-        let c = Capability::parse("act-as://process/bob@until=1000").unwrap();
-        // now (500) <= until (1000) → still valid.
-        assert!(c.covers_with("act-as", &p("process://bob"), &Value::Null, 500));
-        // now (2000) > until (1000) → expired.
-        assert!(!c.covers_with("act-as", &p("process://bob"), &Value::Null, 2000));
+        let c = Capability::parse("act-as://process/bob@until=1000")?;
+        ensure!(
+            c.covers_with("act-as", &p("process://bob")?, &Value::Null, 500),
+            "valid until predicate was denied"
+        );
+        ensure!(
+            !c.covers_with("act-as", &p("process://bob")?, &Value::Null, 2000),
+            "expired until predicate was allowed"
+        );
+        Ok(())
     }
 
     #[test]
-    fn parse_omnipotent() {
-        let c = Capability::parse("*://**").unwrap();
-        assert_eq!(c.verb, "*");
-        // Either "*" or "**" is valid here — both are treated as the
-        // any-scheme wildcard by `covers`.
-        assert!(c.scheme == "*" || c.scheme == "**");
-        assert_eq!(c.segments, vec![SmolStr::from("**")]);
+    fn predicate_numeric_bounds_reject_bad_literals() -> anyhow::Result<()> {
+        ensure!(
+            Capability::parse("act-as://process/bob@until=soon").is_err(),
+            "bad until literal was accepted"
+        );
+        ensure!(
+            Capability::parse("spawn://process/alice/*@budget<=$many").is_err(),
+            "bad budget literal was accepted"
+        );
+        Ok(())
     }
 
     #[test]
-    fn covers_exact() {
-        let c = Capability::parse("perform://effect/x/post").unwrap();
-        assert!(c.covers("perform", &p("effect://x/post")));
-        assert!(!c.covers("perform", &p("effect://x/reply")));
-        assert!(!c.covers("read", &p("effect://x/post")));
+    fn parse_omnipotent() -> anyhow::Result<()> {
+        let c = Capability::parse("*://**")?;
+        ensure!(c.verb == "*", "unexpected omnipotent verb: {}", c.verb);
+        ensure!(
+            c.scheme == "*" || c.scheme == "**",
+            "unexpected omnipotent scheme: {}",
+            c.scheme
+        );
+        ensure!(
+            c.segments == vec![SmolStr::from("**")],
+            "unexpected omnipotent segments: {:?}",
+            c.segments
+        );
+        Ok(())
     }
 
     #[test]
-    fn omnipotent_covers_everything() {
-        let c = Capability::parse("*://**").unwrap();
-        assert!(c.covers("read", &p("state://memory/alice")));
-        assert!(c.covers("write", &p("state://kernel/registry")));
-        assert!(c.covers("perform", &p("effect://anything/here/and/now")));
-        assert!(c.covers("spawn", &p("process://child")));
+    fn covers_exact() -> anyhow::Result<()> {
+        let c = Capability::parse("perform://effect/x/post")?;
+        ensure!(
+            c.covers("perform", &p("effect://x/post")?),
+            "exact cap did not cover path"
+        );
+        ensure!(
+            !c.covers("perform", &p("effect://x/reply")?),
+            "exact cap covered sibling path"
+        );
+        ensure!(
+            !c.covers("read", &p("effect://x/post")?),
+            "perform cap covered read"
+        );
+        Ok(())
     }
 
     #[test]
-    fn covers_wildcard_segments() {
-        let c = Capability::parse("read://state/memory/alice/**").unwrap();
-        assert!(c.covers("read", &p("state://memory/alice/persona")));
-        assert!(c.covers("read", &p("state://memory/alice/episodic/2024/03")));
-        assert!(!c.covers("read", &p("state://memory/bob/persona")));
+    fn omnipotent_covers_everything() -> anyhow::Result<()> {
+        let c = Capability::parse("*://**")?;
+        ensure!(
+            c.covers("read", &p("state://memory/alice")?),
+            "omnipotent missed read"
+        );
+        ensure!(
+            c.covers("write", &p("state://kernel/registry")?),
+            "omnipotent missed write"
+        );
+        ensure!(
+            c.covers("perform", &p("effect://anything/here/and/now")?),
+            "omnipotent missed perform"
+        );
+        ensure!(
+            c.covers("spawn", &p("process://child")?),
+            "omnipotent missed spawn"
+        );
+        Ok(())
     }
 
     #[test]
-    fn capset_contains_all() {
+    fn covers_wildcard_segments() -> anyhow::Result<()> {
+        let c = Capability::parse("read://state/memory/alice/**")?;
+        ensure!(
+            c.covers("read", &p("state://memory/alice/persona")?),
+            "wildcard missed child"
+        );
+        ensure!(
+            c.covers("read", &p("state://memory/alice/episodic/2024/03")?),
+            "wildcard missed deep child"
+        );
+        ensure!(
+            !c.covers("read", &p("state://memory/bob/persona")?),
+            "wildcard covered different owner"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn capset_contains_all() -> anyhow::Result<()> {
         let s = CapSet::from_strs([
             "perform://effect/inference/infer",
             "perform://effect/x/post",
-        ])
-        .unwrap();
-        assert!(s.contains_all(&[
-            ("perform", p("effect://inference/infer")),
-            ("perform", p("effect://x/post")),
-        ]));
-        assert!(!s.contains_all(&[("perform", p("effect://x/reply"))]));
+        ])?;
+        ensure!(
+            s.contains_all(&[
+                ("perform", p("effect://inference/infer")?),
+                ("perform", p("effect://x/post")?),
+            ]),
+            "capset did not contain expected caps"
+        );
+        ensure!(
+            !s.contains_all(&[("perform", p("effect://x/reply")?)]),
+            "capset contained sibling cap"
+        );
+        Ok(())
     }
 
     #[test]
-    fn intersect_attenuation_with_omnipotent_parent() {
-        let parent = CapSet::from_strs(["*://**"]).unwrap();
+    fn intersect_attenuation_with_omnipotent_parent() -> anyhow::Result<()> {
+        let parent = CapSet::from_strs(["*://**"])?;
         let granted =
-            CapSet::from_strs(["perform://effect/x/post", "read://state/memory/alice/**"]).unwrap();
+            CapSet::from_strs(["perform://effect/x/post", "read://state/memory/alice/**"])?;
         let inter = parent.intersect(&granted);
-        assert_eq!(inter.len(), 2);
-        assert!(inter.contains("perform", &p("effect://x/post")));
+        ensure!(
+            inter.len() == 2,
+            "unexpected intersection size: {}",
+            inter.len()
+        );
+        ensure!(
+            inter.contains("perform", &p("effect://x/post")?),
+            "intersection missed granted cap"
+        );
+        Ok(())
     }
 
     #[test]
-    fn intersect_drops_uncovered() {
-        let parent = CapSet::from_strs(["perform://effect/inference/infer"]).unwrap();
+    fn intersect_drops_uncovered() -> anyhow::Result<()> {
+        let parent = CapSet::from_strs(["perform://effect/inference/infer"])?;
         let granted = CapSet::from_strs([
             "perform://effect/inference/infer",
             "perform://effect/x/post", // parent doesn't have this
-        ])
-        .unwrap();
+        ])?;
         let inter = parent.intersect(&granted);
-        assert_eq!(inter.len(), 1);
-        assert!(!inter.contains("perform", &p("effect://x/post")));
+        ensure!(
+            inter.len() == 1,
+            "unexpected intersection size: {}",
+            inter.len()
+        );
+        ensure!(
+            !inter.contains("perform", &p("effect://x/post")?),
+            "intersection kept uncovered cap"
+        );
+        Ok(())
     }
 
     #[test]
-    fn capability_subsumes_more_specific() {
-        let broader = Capability::parse("read://state/memory/**").unwrap();
-        let specific = Capability::parse("read://state/memory/alice/persona").unwrap();
-        assert!(broader.covers_cap(&specific));
-        assert!(!specific.covers_cap(&broader));
+    fn capability_subsumes_more_specific() -> anyhow::Result<()> {
+        let broader = Capability::parse("read://state/memory/**")?;
+        let specific = Capability::parse("read://state/memory/alice/persona")?;
+        ensure!(
+            broader.covers_cap(&specific),
+            "broader cap did not cover specific"
+        );
+        ensure!(
+            !specific.covers_cap(&broader),
+            "specific cap covered broader cap"
+        );
+        Ok(())
     }
 }

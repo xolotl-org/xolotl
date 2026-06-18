@@ -43,28 +43,37 @@ Nexus 让执行热路径保持很小：
 | `nexus-state` | 状态后端 trait（特征）和内存实现。 |
 | `nexus-kernel` | 注册表、策略、句柄表、执行路径、执行器、进程表、恢复和引导。 |
 | `nexus-storage-redb` | 基于 redb 的状态和事实记录存储。 |
-| `nexus-actors` | 标准进程内驱动和提供方。 |
+| `nexus-standard` | 标准进程内 Provider 和 Source 实现。 |
 | `nexus-gateway` | external 协议适配器共享的 session 准入、流控、taint 和 audit 代码。 |
 | `nexus-gateway-grpc` | External Provider/Source gRPC 适配器。 |
 | `nexus-gateway-websocket` | External Provider/Source WebSocket 适配器。 |
-| `nexus-gateway-mcp` | 把选定 Nexus effect 暴露为 MCP tool 的服务端适配器。 |
+| `nexus-gateway-mcp` | 把选定 Gateway publication kind 暴露为 MCP 对象的服务端适配器。 |
 | `nexus-proto` | Protobuf 模式定义和随仓库提供的 Rust 绑定。 |
 | `nexus-console` | Web 控制台管理动作的 gateway。 |
 | `nexus-daemon` | 长期运行的宿主进程 `nexusd`。 |
-| `nexus-sdk` | 嵌入式门面和公开重导出。 |
+| `nexus-sdk` | 进程内嵌入式内核门面。 |
 | `nexus-plan` | 计划文档解析和转换。 |
 | `nexus-sim` | 确定性仿真和重放辅助工具。 |
 
-## Actor Cargo Feature 选择
+## 标准包 feature 选择
 
-`nexus-actors` 包含标准进程内 Driver 和 Provider。某个二进制不需要全部实现时，可以
+`nexus-standard` 包含标准进程内 Provider 和 Source 实现。某个二进制不需要全部实现时，可以
 用 Cargo feature 减少编译进来的模块。
 
-默认 `standard` 编译标准进程内 Driver 和 Provider。`standard-core` 编译核心标准
-Driver/Provider 与 external session 代码；不编译 `fetch`、`fs`、`terminal` 或
-`mcp`。`external-session` 只编译 gateway 适配器用于 external Provider 和 Source
-endpoint 的 session 处理代码与 `SecureEnvelope` 代码。
+默认 `standard` 编译核心标准进程内实现。`standard-core` 编译同一
+核心集合和 pairing 管理 effect。`fetch`、`fs` 和 `terminal` 各自需要单独 feature。
+External Provider/Source session 处理和 `SecureEnvelope` 代码位于 `nexus-gateway`。
 
-需要注册对应进程内 effect 时，启用 `fetch`、`fs`、`terminal` 或 `mcp`。改变这些
-feature 只改变哪些实现会被编译和注册，不改变 Resource、Interface、Binding 或
-Operation 语义。
+HTTP inference provider feature 是可选的。`http-inference` 会启用全部 HTTP inference
+dialect。单独的 dialect feature 是 `openai-responses`、`openai-chat`、
+`anthropic-messages` 和 `gemini-generate-content`。`nexus-daemon` 会把这些
+feature 转发给 `nexus-standard`。
+
+`fetch`、`fs` 和 `terminal` 这类高风险进程内实现必须留在独立的 `nexus-standard`
+feature 后面。daemon 或嵌入式宿主只能通过 kernel state 声明和固定 Console action
+暴露它们。运行时进程内 projection 声明存储在 Nexus state 中。
+
+可选进程内 projection 声明属于运行时状态，路径为
+`state://kernel/projections/in-process/<id>`。它们通过 `projection.in_process.*`
+Console action、kernel state 准入和宿主侧 reconcile 转换为普通
+Resource、Interface、Driver 和 Binding 注册项。

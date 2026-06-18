@@ -289,6 +289,7 @@ impl Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::ensure;
 
     #[test]
     fn budget_reserve_denies_over_usd_limit() {
@@ -318,18 +319,27 @@ mod tests {
     }
 
     #[test]
-    fn budget_settle_refunds_overestimate_and_releases_inflight() {
+    fn budget_settle_refunds_overestimate_and_releases_inflight() -> anyhow::Result<()> {
         let spec = BudgetSpec {
             daily_micro_usd: Some(1000),
             ..Default::default()
         };
         let mut b = BudgetState::default();
-        // Reserve a conservative 500, actual was 100.
-        b.try_reserve(&spec, 500, 50).unwrap();
+        b.try_reserve(&spec, 500, 50)
+            .map_err(|error| anyhow::anyhow!("reserve failed: {error}"))?;
         b.settle(500, 100, 50, 10);
-        assert_eq!(b.spent_micro_usd, 100, "overestimate refunded to actual");
-        assert_eq!(b.inference_tokens, 10);
-        assert_eq!(b.inflight_ops, 0, "inflight slot released");
+        ensure!(
+            b.spent_micro_usd == 100,
+            "overestimate was not refunded: {}",
+            b.spent_micro_usd
+        );
+        ensure!(
+            b.inference_tokens == 10,
+            "unexpected token count: {}",
+            b.inference_tokens
+        );
+        ensure!(b.inflight_ops == 0, "inflight slot was not released");
+        Ok(())
     }
 
     #[test]
@@ -340,15 +350,22 @@ mod tests {
     }
 
     #[test]
-    fn outcome_into_value() {
-        assert_eq!(
-            Outcome::Done(Value::Int(1)).into_value().unwrap(),
-            Value::Int(1)
+    fn outcome_into_value() -> anyhow::Result<()> {
+        let value = Outcome::Done(Value::Int(1))
+            .into_value()
+            .map_err(|error| anyhow::anyhow!("done outcome returned failure: {error:?}"))?;
+        ensure!(
+            value == Value::Int(1),
+            "unexpected outcome value: {value:?}"
         );
-        assert!(matches!(
-            Outcome::Fail(Failure::Cancelled).into_value(),
-            Err(Failure::Cancelled)
-        ));
+        ensure!(
+            matches!(
+                Outcome::Fail(Failure::Cancelled).into_value(),
+                Err(Failure::Cancelled)
+            ),
+            "failure outcome did not return failure"
+        );
+        Ok(())
     }
 
     #[test]
@@ -358,10 +375,11 @@ mod tests {
     }
 
     #[test]
-    fn outcome_serde() {
+    fn outcome_serde() -> anyhow::Result<()> {
         let o = Outcome::Done(Value::Str("ok".into()));
-        let s = serde_json::to_string(&o).unwrap();
-        let back: Outcome = serde_json::from_str(&s).unwrap();
-        assert_eq!(o, back);
+        let s = serde_json::to_string(&o)?;
+        let back: Outcome = serde_json::from_str(&s)?;
+        ensure!(o == back, "outcome serde roundtrip changed value");
+        Ok(())
     }
 }

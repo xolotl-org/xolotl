@@ -137,6 +137,7 @@ mod tests {
     use crate::replay::ReplayClass;
     use crate::taint::{TaintSet, TaintSource};
     use crate::{IdentityRef, Path, Value};
+    use anyhow::ensure;
 
     fn fact(
         taint: TaintSet,
@@ -164,13 +165,17 @@ mod tests {
     }
 
     #[test]
-    fn protected_taint_yields_sensitive_data_tag() {
+    fn protected_taint_yields_sensitive_data_tag() -> anyhow::Result<()> {
         let t = TaintSet::of(TaintSource::Protected {
-            path: Path::parse("state://vault/x").unwrap(),
+            path: Path::parse("state://vault/x")?,
         });
         let f = fact(t, IdentityRef::ROOT, ProcessId::new(1), 1, DecisionTag::Ok);
         let tags = AuditRules::default().tags_for(&f, 0);
-        assert!(tags.contains(&AuditTag::SensitiveData));
+        ensure!(
+            tags.contains(&AuditTag::SensitiveData),
+            "sensitive data tag missing"
+        );
+        Ok(())
     }
 
     #[test]

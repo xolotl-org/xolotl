@@ -180,14 +180,22 @@ unsafe relaxation。
 
 | 动作族 | 示例 |
 | --- | --- |
-| 协议和注册表 | `protocol.describe`、`protocol.registry.snapshot`、`protocol.action_descriptor.get`、`protocol.schema.get` 兼容 alias、`registry.coverage.report` |
-| 资源与编辑描述符 | `resource.type.list`、`resource.type.describe`、`resource.view.describe`、`graph.type.describe` |
+| 协议和注册表 | `protocol.describe`、`protocol.registry.snapshot`、`protocol.action_descriptor.get`、`registry.coverage.report` |
+| 资源与编辑描述符 | `resource.type.list`、`resource.type.describe`、`resource.view.describe` |
 | 授权和可见性 | `authority.principal.effective`、`authority.action.matrix`、`visibility.authority.describe`、`visibility.state.read`、`visibility.state.list` |
 | 敏感值托管 | `secret.catalog`、`secret.reveal` |
-| 状态和配置 | `state.snapshot`、`config.read`、`config.list`、`config.write_cas` |
+| 状态和配置 | `state.snapshot`、`config.read`、`config.list`、`config.write_cas`，仅用于没有专用 action 的配置 |
 | 控制台访问 | `access.user.*`、`access.role.*`、`access.session.*`、`access.session.current.logout` |
-| 运行时、审计和来源链 | `runtime.process.inspect`、`audit.facts.recent`、`lineage.trace.read`、`lineage.fact.read`、`lineage.fact.by_operation`、`health.summary` |
-| 外部程序和配对 | `external.installation.*`、`pairing.create`、`pairing.approve`、`pairing.deny`、`pairing.replace` |
+| 运行时、审计和来源链 | `runtime.process.inspect`、`audit.facts.recent`、`lineage.trace.read`、`lineage.fact.read`、`health.summary` |
+| 外部程序和配对 | `external.manifest.*`、`external.installation.*`、`pairing.create`、`pairing.approve`、`pairing.deny`、`pairing.replace` |
+| 进程内 Provider/Source projection 声明 | `projection.in_process.list`、`projection.in_process.read`、`projection.in_process.write_cas` |
+| Inference 路由 | `inference.backend.*`、`inference.model.*`、`inference.group.*`、`inference.routing.*` |
+
+泛用 `config.*` action 会拒绝已经有专用 action family 的运行时配置路径。对这些
+路径使用 `access.*`、`external.*`、`projection.in_process.*`、`inference.*` 和
+`pairing.*`，让校验、授权、CAS 和审计绑定到声明的资源类型。
+External projection 是 external installation 声明的一部分，仍通过
+`external.installation.*` 管理。
 
 资源和图描述符提供与编辑器形态无关的语义元数据：资源类型、字段、视图、
 revision、关系、图节点类型、port、edge 和校验 hook。它们不指定 UI 组件，

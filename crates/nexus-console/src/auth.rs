@@ -246,38 +246,38 @@ pub struct KeyLoginRequest {
 
 /// Authenticated console principal used by management actions.
 #[derive(Clone, Debug)]
-pub struct ConsolePrincipal {
+pub(crate) struct ConsolePrincipal {
     /// Console username.
-    pub username: String,
+    pub(crate) username: String,
     /// Nexus identity path associated with the user.
-    pub identity_path: String,
+    pub(crate) identity_path: String,
     /// Effective grants after roles and direct grants are combined.
-    pub grants: CapSet,
+    pub(crate) grants: CapSet,
     /// Session MFA level.
-    pub mfa_level: u8,
+    pub(crate) mfa_level: u8,
 }
 
 /// Public session metadata returned by session-list actions.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SessionSummary {
+pub(crate) struct SessionSummary {
     /// Session id.
-    pub sid: String,
+    pub(crate) sid: String,
     /// Owning username.
-    pub username: String,
+    pub(crate) username: String,
     /// Identity path active for this session.
-    pub identity_path: String,
+    pub(crate) identity_path: String,
     /// Issue timestamp in millis since epoch.
-    pub issued_at: i64,
+    pub(crate) issued_at: i64,
     /// Absolute expiry timestamp in millis since epoch.
-    pub expires_at: i64,
+    pub(crate) expires_at: i64,
     /// Idle expiry timestamp in millis since epoch.
-    pub idle_expires_at: i64,
+    pub(crate) idle_expires_at: i64,
     /// Session MFA level.
-    pub mfa_level: u8,
+    pub(crate) mfa_level: u8,
     /// Last-seen timestamp in millis since epoch.
-    pub last_seen: i64,
+    pub(crate) last_seen: i64,
     /// Source address recorded when the session was issued.
-    pub source_addr: String,
+    pub(crate) source_addr: String,
 }
 
 /// Authentication and authorization errors returned by the console boundary.
@@ -345,37 +345,30 @@ struct FailureBucket {
 }
 
 /// Console authentication service.
-pub struct ConsoleAuth {
+pub(crate) struct ConsoleAuth {
     config: ConsoleAuthConfig,
     decoy_phc: String,
     argon2_slots: Semaphore,
     rate: Mutex<RateState>,
 }
 
-impl Default for ConsoleAuth {
-    fn default() -> Self {
-        Self::new(ConsoleAuthConfig::default())
-    }
-}
-
 impl ConsoleAuth {
     /// Create an auth service with bounded tuning and a decoy password hash.
-    pub fn new(config: ConsoleAuthConfig) -> Self {
+    pub(crate) fn new(config: ConsoleAuthConfig) -> Result<Self, AuthError> {
         let config = config.bounded();
-        let decoy_phc =
-            hash_password_with_salt("invalid-password", &[0x42; 16]).unwrap_or_default();
-        Self {
+        let decoy_phc = hash_password_with_salt("invalid-password", &[0x42; 16])?;
+        Ok(Self {
             argon2_slots: Semaphore::new(config.argon2_concurrency),
             config,
             decoy_phc,
             rate: Mutex::new(RateState::default()),
-        }
+        })
     }
 
     /// Authenticate with password/TOTP and issue a new session.
     ///
     /// Records a console auth audit fact for both success and failure.
-    pub async fn login(
+    pub(crate) async fn login(
         &self,
         boot: &Bootstrap,
         req: LoginRequest,
@@ -459,7 +452,7 @@ impl ConsoleAuth {
             let seed = read_string(state, &seed_ref)
                 .await?
                 .ok_or(AuthError::InvalidCredentials)?;
-            let step = verify_totp(&seed, code, user.totp_last_step, now_millis())
+            let step = verify_totp(&seed, code, user.totp_last_step, now_millis())?
                 .ok_or(AuthError::InvalidCredentials)?;
             user.totp_last_step = Some(step);
             write_user(state, &user).await?;
@@ -475,7 +468,7 @@ impl ConsoleAuth {
     ///
     /// The returned transcript is bound to username, challenge id, nonce, and
     /// origin. Records a credential audit fact.
-    pub async fn begin_key_login(
+    pub(crate) async fn begin_key_login(
         &self,
         boot: &Bootstrap,
         req: KeyChallengeRequest,
@@ -540,7 +533,7 @@ impl ConsoleAuth {
     ///
     /// Challenges are single-use: the challenge is revoked before signature
     /// validation completes.
-    pub async fn finish_key_login(
+    pub(crate) async fn finish_key_login(
         &self,
         boot: &Bootstrap,
         req: KeyLoginRequest,
@@ -624,18 +617,24 @@ impl ConsoleAuth {
     /// Upgrade an existing bearer session to MFA level 2.
     ///
     /// Uses TOTP when enabled for the user, otherwise rechecks the password.
-    pub async fn step_up(
+    pub(crate) async fn step_up(
         &self,
         boot: &Bootstrap,
         bearer: &str,
         req: StepUpRequest,
         source_addr: String,
     ) -> Result<LoginResponse, AuthError> {
-        let audit_username = self
+        let audit_username = match self
             .authenticate_token_inner(&boot.kernel.state, bearer)
             .await
-            .ok()
-            .map(|p| p.username);
+        {
+            Ok(principal) => Some(principal.username),
+            Err(AuthError::InvalidCredentials | AuthError::InvalidSession) => None,
+            Err(error) => {
+                tracing::warn!(?error, "console step-up audit username lookup failed");
+                None
+            }
+        };
         let result = self
             .step_up_inner(&boot.kernel.state, bearer, req, source_addr.clone())
             .await;
@@ -687,7 +686,7 @@ impl ConsoleAuth {
             let seed = read_string(state, &seed_ref)
                 .await?
                 .ok_or(AuthError::InvalidCredentials)?;
-            let step = verify_totp(&seed, code, user.totp_last_step, now_millis())
+            let step = verify_totp(&seed, code, user.totp_last_step, now_millis())?
                 .ok_or(AuthError::InvalidCredentials)?;
             user.totp_last_step = Some(step);
             write_user(state, &user).await?;
@@ -721,7 +720,7 @@ impl ConsoleAuth {
     }
 
     /// Authenticate a bearer token in `sid.secret` form.
-    pub async fn authenticate_token(
+    pub(crate) async fn authenticate_token(
         &self,
         boot: &Bootstrap,
         bearer: &str,
@@ -734,7 +733,7 @@ impl ConsoleAuth {
     ///
     /// This is intended for trusted management paths that already validated
     /// access to the session id.
-    pub async fn authenticate_sid(
+    pub(crate) async fn authenticate_sid(
         &self,
         boot: &Bootstrap,
         sid: &str,
@@ -820,29 +819,8 @@ impl ConsoleAuth {
         })
     }
 
-    /// Revoke the bearer token's session.
-    pub async fn logout(&self, boot: &Bootstrap, bearer: &str) -> Result<(), AuthError> {
-        self.logout_from_source(boot, bearer, None).await
-    }
-
-    /// Revoke the bearer token's session and record an optional source address.
-    pub async fn logout_from_source(
-        &self,
-        boot: &Bootstrap,
-        bearer: &str,
-        source_addr: Option<&str>,
-    ) -> Result<(), AuthError> {
-        let (sid, _) = bearer.split_once('.').ok_or(AuthError::InvalidSession)?;
-        self.logout_sid_from_source(boot, sid, source_addr).await
-    }
-
-    /// Revoke one session id.
-    pub async fn logout_sid(&self, boot: &Bootstrap, sid: &str) -> Result<(), AuthError> {
-        self.logout_sid_from_source(boot, sid, None).await
-    }
-
     /// Revoke one session id and record an optional source address.
-    pub async fn logout_sid_from_source(
+    pub(crate) async fn logout_sid_from_source(
         &self,
         boot: &Bootstrap,
         sid: &str,
@@ -879,7 +857,7 @@ impl ConsoleAuth {
     }
 
     /// List all visible console sessions for `principal`.
-    pub async fn list_sessions(
+    pub(crate) async fn list_sessions(
         &self,
         boot: &Bootstrap,
         principal: &ConsolePrincipal,
@@ -888,37 +866,24 @@ impl ConsoleAuth {
         authorize_path(&boot.kernel.state, principal, "read", &sessions_root, None).await?;
         let now = now_millis();
         sweep_expired_sessions(&boot.kernel.state, now).await?;
-        let mut sessions: Vec<_> = boot
+        let mut sessions = boot
             .kernel
             .state
             .read_prefix(&sessions_root)
             .await?
             .into_iter()
-            .filter_map(|(path, value)| {
-                let path_s = path.to_string();
-                let sid = path_s.rsplit('/').next()?.to_string();
-                SessionRecord::from_value(&sid, &value)
-                    .ok()
-                    .map(SessionSummary::from)
+            .map(|(path, value)| {
+                let sid = path_leaf(&path, "console session id")?;
+                let session = SessionRecord::from_value(&sid, &value)?;
+                Ok(SessionSummary::from(session))
             })
-            .collect();
+            .collect::<Result<Vec<_>, AuthError>>()?;
         sessions.sort_by_key(|s| (s.username.clone(), s.issued_at));
         Ok(sessions)
     }
 
-    /// Revoke one session after authorizing `principal` for the session path.
-    pub async fn revoke_session_by_id(
-        &self,
-        boot: &Bootstrap,
-        principal: &ConsolePrincipal,
-        sid: &str,
-    ) -> Result<(), AuthError> {
-        self.revoke_session_by_id_from_source(boot, principal, sid, None)
-            .await
-    }
-
     /// Revoke one session and record an optional source address.
-    pub async fn revoke_session_by_id_from_source(
+    pub(crate) async fn revoke_session_by_id_from_source(
         &self,
         boot: &Bootstrap,
         principal: &ConsolePrincipal,
@@ -950,19 +915,8 @@ impl ConsoleAuth {
         result
     }
 
-    /// Revoke all active sessions for `username`.
-    pub async fn revoke_user_sessions(
-        &self,
-        boot: &Bootstrap,
-        principal: &ConsolePrincipal,
-        username: &str,
-    ) -> Result<usize, AuthError> {
-        self.revoke_user_sessions_from_source(boot, principal, username, None)
-            .await
-    }
-
     /// Revoke all active sessions for `username` and record an optional source.
-    pub async fn revoke_user_sessions_from_source(
+    pub(crate) async fn revoke_user_sessions_from_source(
         &self,
         boot: &Bootstrap,
         principal: &ConsolePrincipal,
@@ -979,15 +933,9 @@ impl ConsoleAuth {
             .await?;
         let mut revoked = 0usize;
         for (path, value) in sessions {
-            let sid = path
-                .to_string()
-                .rsplit('/')
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            if let Ok(session) = SessionRecord::from_value(&sid, &value)
-                && session.username == username
-            {
+            let sid = path_leaf(&path, "console session id")?;
+            let session = SessionRecord::from_value(&sid, &value)?;
+            if session.username == username {
                 revoke_session(&boot.kernel.state, &sid).await?;
                 revoked += 1;
             }
@@ -1144,10 +1092,7 @@ async fn bootstrap_root_account_inner(
         PasswordHash::new(phc)
             .map_err(|_| AuthError::Crypto("invalid root password PHC string".into()))?;
     }
-    let supported_key = provisioning
-        .pubkeys
-        .iter()
-        .any(|key| parse_ed25519_key_descriptor(key).is_ok());
+    let supported_key = has_valid_ed25519_pubkey(&provisioning.pubkeys)?;
     if provisioning.password_hash.is_none() && !provisioning.pubkeys.is_empty() && !supported_key {
         return Err(AuthError::Crypto(
             "root pubkey provisioning requires at least one supported ed25519 key".into(),
@@ -1212,16 +1157,16 @@ async fn bootstrap_root_account_inner(
 }
 
 /// Extract a `Bearer ...` token from HTTP headers.
-pub fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Result<&str, AuthError> {
-    let raw = headers
+pub(crate) fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Result<&str, AuthError> {
+    let header = headers
         .get(axum::http::header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
         .ok_or(AuthError::MissingBearer)?;
+    let raw = header.to_str().map_err(|_| AuthError::MissingBearer)?;
     raw.strip_prefix("Bearer ").ok_or(AuthError::MissingBearer)
 }
 
 /// Validate console username syntax.
-pub fn validate_username(username: &str) -> Result<(), AuthError> {
+pub(crate) fn validate_username(username: &str) -> Result<(), AuthError> {
     if username.is_empty() || username.len() > 63 {
         return Err(AuthError::InvalidUsername);
     }
@@ -1242,7 +1187,7 @@ pub fn validate_username(username: &str) -> Result<(), AuthError> {
 /// Console management paths require both direct path authority and the console
 /// management effect authority; user/role writes are additionally checked so a
 /// non-root admin cannot grant authority above their ceiling.
-pub async fn authorize_path(
+pub(crate) async fn authorize_path(
     state: &Backend,
     principal: &ConsolePrincipal,
     verb: &str,
@@ -1318,21 +1263,21 @@ async fn authorize_role_target(
 
     let role_path = format!("{ROLES_PREFIX}/{role}");
     if let Some(existing) = state.read(&Path::parse(&role_path)?).await? {
-        let existing_grants = capset_from_strings(&role_grants(&existing))?;
+        let existing_grants = capset_from_strings(&role_grants(&existing)?)?;
         if !capset_covers(&principal.grants, &existing_grants) {
             return Err(AuthError::PermissionDenied);
         }
-        if role_frozen(&existing) && principal.username != ROOT_USERNAME {
+        if role_frozen(&existing)? && principal.username != ROOT_USERNAME {
             return Err(AuthError::PermissionDenied);
         }
     }
 
     if let Some(value) = new_value {
-        let candidate_grants = capset_from_strings(&role_grants(value))?;
+        let candidate_grants = capset_from_strings(&role_grants(value)?)?;
         if !capset_covers(&principal.grants, &candidate_grants) {
             return Err(AuthError::PermissionDenied);
         }
-        if role_frozen(value) && principal.username != ROOT_USERNAME {
+        if role_frozen(value)? && principal.username != ROOT_USERNAME {
             return Err(AuthError::PermissionDenied);
         }
     }
@@ -1343,12 +1288,7 @@ fn enforce_root_invariants(user: &UserRecord, effective: &CapSet) -> Result<(), 
     if !matches!(user.status.as_str(), "active") {
         return Err(AuthError::PermissionDenied);
     }
-    if user.password_hash_ref.is_none()
-        && !user
-            .pubkeys
-            .iter()
-            .any(|key| parse_ed25519_key_descriptor(key).is_ok())
-    {
+    if user.password_hash_ref.is_none() && !has_valid_ed25519_pubkey(&user.pubkeys)? {
         return Err(AuthError::PermissionDenied);
     }
     let user_mgmt = Path::parse("effect://kernel/console/users")?;
@@ -1368,7 +1308,7 @@ async fn effective_grants(state: &Backend, user: &UserRecord) -> Result<CapSet, 
     for role in &user.roles {
         let role_path = format!("{ROLES_PREFIX}/{role}");
         if let Some(v) = state.read(&Path::parse(&role_path)?).await? {
-            grants.extend(role_grants(&v));
+            grants.extend(role_grants(&v)?);
         }
     }
     let requested = capset_from_strings(&grants)?;
@@ -1384,20 +1324,18 @@ fn capset_from_strings(items: &[String]) -> Result<CapSet, AuthError> {
     Ok(CapSet(caps))
 }
 
-fn role_grants(value: &Value) -> Vec<String> {
-    value
+fn role_grants(value: &Value) -> Result<Vec<String>, AuthError> {
+    let map = value
         .as_map()
-        .and_then(|m| m.get("grants"))
-        .and_then(string_list)
-        .unwrap_or_default()
+        .ok_or_else(|| AuthError::State("console role must be a map".into()))?;
+    optional_string_list_field(map, "grants", "console role")
 }
 
-fn role_frozen(value: &Value) -> bool {
-    value
+fn role_frozen(value: &Value) -> Result<bool, AuthError> {
+    let map = value
         .as_map()
-        .and_then(|m| m.get("frozen"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+        .ok_or_else(|| AuthError::State("console role must be a map".into()))?;
+    optional_bool_field(map, "frozen", "console role")
 }
 
 #[derive(Clone, Debug)]
@@ -1430,10 +1368,10 @@ impl UserRecord {
             .and_then(|a| a.get("password"))
             .and_then(Value::as_map);
         let totp = authn.and_then(|a| a.get("totp")).and_then(Value::as_map);
-        let pubkeys = authn
-            .and_then(|a| a.get("pubkeys"))
-            .and_then(string_list)
-            .unwrap_or_default();
+        let pubkeys = match authn.and_then(|a| a.get("pubkeys")) {
+            Some(value) => string_list(value, "console user.authn.pubkeys")?,
+            None => Vec::new(),
+        };
         Ok(Self {
             username: username.to_string(),
             identity_path: str_field(m, "identity_path")
@@ -1455,12 +1393,9 @@ impl UserRecord {
                 .and_then(|t| t.get("last_step"))
                 .and_then(Value::as_int),
             pubkeys,
-            roles: m.get("roles").and_then(string_list).unwrap_or_default(),
-            grants: m.get("grants").and_then(string_list).unwrap_or_default(),
-            authority_ceiling: m
-                .get("authority_ceiling")
-                .and_then(string_list)
-                .unwrap_or_default(),
+            roles: optional_string_list_field(m, "roles", "console user")?,
+            grants: optional_string_list_field(m, "grants", "console user")?,
+            authority_ceiling: optional_string_list_field(m, "authority_ceiling", "console user")?,
             created_by: str_field(m, "created_by").unwrap_or_else(|| "unknown".into()),
             created_at: int_field(m, "created_at").unwrap_or(0),
             password_changed_at: int_field(m, "password_changed_at").unwrap_or(0),
@@ -1524,6 +1459,9 @@ struct SessionRecord {
 impl SessionRecord {
     fn from_value(sid: &str, value: &Value) -> Result<Self, AuthError> {
         let m = value.as_map().ok_or(AuthError::InvalidSession)?;
+        let mfa_level = optional_int_field(m, "mfa_level", "console session", 1)?;
+        let mfa_level = u8::try_from(mfa_level)
+            .map_err(|_| AuthError::State("console session.mfa_level is out of range".into()))?;
         Ok(Self {
             sid: sid.to_string(),
             username: str_field(m, "username").ok_or(AuthError::InvalidSession)?,
@@ -1531,9 +1469,9 @@ impl SessionRecord {
             issued_at: int_field(m, "issued_at").ok_or(AuthError::InvalidSession)?,
             expires_at: int_field(m, "expires_at").ok_or(AuthError::InvalidSession)?,
             idle_expires_at: int_field(m, "idle_expires_at").ok_or(AuthError::InvalidSession)?,
-            mfa_level: int_field(m, "mfa_level").unwrap_or(1) as u8,
-            last_seen: int_field(m, "last_seen").unwrap_or(0),
-            source_addr: str_field(m, "source_addr").unwrap_or_default(),
+            mfa_level,
+            last_seen: optional_int_field(m, "last_seen", "console session", 0)?,
+            source_addr: optional_str_field(m, "source_addr", "console session", "")?,
         })
     }
 
@@ -1677,15 +1615,9 @@ async fn revoke_key_challenge(state: &Backend, challenge_id: &str) -> Result<(),
 async fn sweep_expired_key_challenges(state: &Backend, now: i64) -> Result<(), AuthError> {
     let challenges = state.read_prefix(&Path::parse(CHALLENGES_PREFIX)?).await?;
     for (path, value) in challenges {
-        let challenge_id = path
-            .to_string()
-            .rsplit('/')
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        if let Ok(challenge) = KeyChallengeRecord::from_value(&challenge_id, &value)
-            && challenge.expires_at <= now
-        {
+        let challenge_id = path_leaf(&path, "console key challenge id")?;
+        let challenge = KeyChallengeRecord::from_value(&challenge_id, &value)?;
+        if challenge.expires_at <= now {
             revoke_key_challenge(state, &challenge_id).await?;
         }
     }
@@ -1705,15 +1637,9 @@ async fn revoke_session(state: &Backend, sid: &str) -> Result<(), AuthError> {
 async fn sweep_expired_sessions(state: &Backend, now: i64) -> Result<(), AuthError> {
     let sessions = state.read_prefix(&Path::parse(SESSIONS_PREFIX)?).await?;
     for (path, value) in sessions {
-        let sid = path
-            .to_string()
-            .rsplit('/')
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        if let Ok(session) = SessionRecord::from_value(&sid, &value)
-            && (session.expires_at <= now || session.idle_expires_at <= now)
-        {
+        let sid = path_leaf(&path, "console session id")?;
+        let session = SessionRecord::from_value(&sid, &value)?;
+        if session.expires_at <= now || session.idle_expires_at <= now {
             revoke_session(state, &sid).await?;
         }
     }
@@ -1726,16 +1652,15 @@ async fn enforce_session_limits(
     max_per_user: usize,
     global_limit: usize,
 ) -> Result<(), AuthError> {
-    let mut sessions: Vec<_> = state
+    let mut sessions = state
         .read_prefix(&Path::parse(SESSIONS_PREFIX)?)
         .await?
         .into_iter()
-        .filter_map(|(path, value)| {
-            let path_s = path.to_string();
-            let sid = path_s.rsplit('/').next()?.to_string();
-            SessionRecord::from_value(&sid, &value).ok()
+        .map(|(path, value)| {
+            let sid = path_leaf(&path, "console session id")?;
+            SessionRecord::from_value(&sid, &value)
         })
-        .collect();
+        .collect::<Result<Vec<_>, AuthError>>()?;
     sessions.sort_by_key(|s| s.issued_at);
 
     let mut user_sessions: Vec<_> = sessions
@@ -1804,6 +1729,15 @@ fn session_token_path(sid: &str) -> String {
 
 fn key_challenge_path(challenge_id: &str) -> String {
     format!("{CHALLENGES_PREFIX}/{challenge_id}")
+}
+
+fn path_leaf(path: &Path, label: &str) -> Result<String, AuthError> {
+    path.segments()
+        .last()
+        .map(|segment| segment.as_str())
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| AuthError::State(format!("missing {label} in path {path}")))
 }
 
 fn hash_password(password: &str) -> Result<String, AuthError> {
@@ -1883,9 +1817,7 @@ fn verify_key_login(
         if requested_key.is_some_and(|key| key != descriptor) {
             continue;
         }
-        let Ok(key) = parse_ed25519_key_descriptor(descriptor) else {
-            continue;
-        };
+        let key = parse_ed25519_key_descriptor(descriptor)?;
         if key.verify(transcript.as_bytes(), &signature).is_ok() {
             return Ok(true);
         }
@@ -1912,11 +1844,27 @@ fn parse_ed25519_key_descriptor(descriptor: &str) -> Result<VerifyingKey, AuthEr
     Ok(key)
 }
 
-fn verify_totp(seed_b64: &str, code: &str, last_step: Option<i64>, now_ms: i64) -> Option<i64> {
-    if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
-        return None;
+fn has_valid_ed25519_pubkey(pubkeys: &[String]) -> Result<bool, AuthError> {
+    let mut has_key = false;
+    for key in pubkeys {
+        parse_ed25519_key_descriptor(key)?;
+        has_key = true;
     }
-    let seed = URL_SAFE_NO_PAD.decode(seed_b64.as_bytes()).ok()?;
+    Ok(has_key)
+}
+
+fn verify_totp(
+    seed_b64: &str,
+    code: &str,
+    last_step: Option<i64>,
+    now_ms: i64,
+) -> Result<Option<i64>, AuthError> {
+    if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let seed = URL_SAFE_NO_PAD
+        .decode(seed_b64.as_bytes())
+        .map_err(|_| AuthError::Crypto("invalid TOTP seed encoding".into()))?;
     let current_step = (now_ms / 1000) / TOTP_PERIOD_SECS;
     for step in [current_step - 1, current_step, current_step + 1] {
         if last_step.is_some_and(|last| step <= last) {
@@ -1924,14 +1872,15 @@ fn verify_totp(seed_b64: &str, code: &str, last_step: Option<i64>, now_ms: i64) 
         }
         let expected = totp_at_step(&seed, step)?;
         if expected.as_bytes().ct_eq(code.as_bytes()).unwrap_u8() == 1 {
-            return Some(step);
+            return Ok(Some(step));
         }
     }
-    None
+    Ok(None)
 }
 
-fn totp_at_step(seed: &[u8], step: i64) -> Option<String> {
-    let mut mac = HmacSha1::new_from_slice(seed).ok()?;
+fn totp_at_step(seed: &[u8], step: i64) -> Result<String, AuthError> {
+    let mut mac = HmacSha1::new_from_slice(seed)
+        .map_err(|_| AuthError::Crypto("invalid TOTP seed".into()))?;
     mac.update(&(step as u64).to_be_bytes());
     let out = mac.finalize().into_bytes();
     let offset = (out[19] & 0x0f) as usize;
@@ -1939,7 +1888,7 @@ fn totp_at_step(seed: &[u8], step: i64) -> Option<String> {
         | ((out[offset + 1] as u32) << 16)
         | ((out[offset + 2] as u32) << 8)
         | (out[offset + 3] as u32);
-    Some(format!("{:06}", binary % 1_000_000))
+    Ok(format!("{:06}", binary % 1_000_000))
 }
 
 fn validate_session_id(sid: &str) -> Result<(), AuthError> {
@@ -1997,14 +1946,70 @@ fn int_field(m: &BTreeMap<String, Value>, key: &str) -> Option<i64> {
     m.get(key).and_then(Value::as_int)
 }
 
-fn string_list(v: &Value) -> Option<Vec<String>> {
+fn optional_str_field(
+    m: &BTreeMap<String, Value>,
+    key: &str,
+    label: &str,
+    default: &str,
+) -> Result<String, AuthError> {
+    match m.get(key) {
+        Some(Value::Str(value)) => Ok(value.clone()),
+        Some(_) => Err(AuthError::State(format!("{label}.{key} must be a string"))),
+        None => Ok(default.to_string()),
+    }
+}
+
+fn optional_int_field(
+    m: &BTreeMap<String, Value>,
+    key: &str,
+    label: &str,
+    default: i64,
+) -> Result<i64, AuthError> {
+    match m.get(key) {
+        Some(Value::Int(value)) => Ok(*value),
+        Some(_) => Err(AuthError::State(format!(
+            "{label}.{key} must be an integer"
+        ))),
+        None => Ok(default),
+    }
+}
+
+fn optional_bool_field(
+    m: &BTreeMap<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<bool, AuthError> {
+    match m.get(key) {
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(AuthError::State(format!("{label}.{key} must be a bool"))),
+        None => Ok(false),
+    }
+}
+
+fn optional_string_list_field(
+    m: &BTreeMap<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<Vec<String>, AuthError> {
+    match m.get(key) {
+        Some(value) => string_list(value, &format!("{label}.{key}")),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn string_list(v: &Value, label: &str) -> Result<Vec<String>, AuthError> {
     match v {
-        Value::List(xs) => Some(
-            xs.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect(),
-        ),
-        _ => None,
+        Value::List(xs) => xs
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| AuthError::State(format!("{label}[{idx}] must be a string")))
+            })
+            .collect(),
+        _ => Err(AuthError::State(format!("{label} must be a list"))),
     }
 }
 
@@ -2049,6 +2054,7 @@ fn audit_outcome(err: &AuthError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, bail, ensure};
     use ed25519_dalek::{Signer, SigningKey};
     use nexus_kernel::Bootstrap;
     use nexus_types::{Fact, OutcomeRef};
@@ -2057,21 +2063,38 @@ mod tests {
         Bootstrap::in_memory()
     }
 
-    fn audit_facts(boot: &Bootstrap) -> Vec<Fact> {
-        boot.kernel
-            .processes
-            .all_ids()
+    fn test_auth() -> anyhow::Result<ConsoleAuth> {
+        Ok(ConsoleAuth::new(ConsoleAuthConfig::default())?)
+    }
+
+    async fn bootstrap_root_password(boot: &Bootstrap) -> anyhow::Result<String> {
+        match bootstrap_root_account(boot, RootProvisioning::default()).await? {
+            BootstrapOutcome::CreatedRandomPassword { password, .. } => Ok(password),
+            outcome => bail!("expected generated root password, got {outcome:?}"),
+        }
+    }
+
+    fn audit_facts(boot: &Bootstrap) -> anyhow::Result<Vec<Fact>> {
+        let mut facts = Vec::new();
+        for pid in boot.kernel.processes.all_ids() {
+            facts.extend(
+                boot.kernel
+                    .facts
+                    .facts_of(pid)
+                    .with_context(|| format!("read audit facts for process {pid:?}"))?,
+            );
+        }
+        Ok(facts
             .into_iter()
-            .flat_map(|pid| boot.kernel.facts.facts_of(pid).unwrap())
             .filter(|fact| match &fact.outcome_ref {
                 OutcomeRef::Inline(Value::Map(m)) => m.contains_key("event"),
                 _ => false,
             })
-            .collect()
+            .collect())
     }
 
-    fn audit_events(boot: &Bootstrap) -> Vec<String> {
-        audit_facts(boot)
+    fn audit_events(boot: &Bootstrap) -> anyhow::Result<Vec<String>> {
+        Ok(audit_facts(boot)?
             .into_iter()
             .filter_map(|fact| match fact.outcome_ref {
                 OutcomeRef::Inline(Value::Map(m)) => {
@@ -2079,11 +2102,11 @@ mod tests {
                 }
                 _ => None,
             })
-            .collect()
+            .collect())
     }
 
-    fn audit_outcomes(boot: &Bootstrap, event: &str) -> Vec<String> {
-        audit_facts(boot)
+    fn audit_outcomes(boot: &Bootstrap, event: &str) -> anyhow::Result<Vec<String>> {
+        Ok(audit_facts(boot)?
             .into_iter()
             .filter_map(|fact| match fact.outcome_ref {
                 OutcomeRef::Inline(Value::Map(m))
@@ -2093,7 +2116,7 @@ mod tests {
                 }
                 _ => None,
             })
-            .collect()
+            .collect())
     }
 
     #[test]
@@ -2124,8 +2147,17 @@ mod tests {
         assert_eq!(cfg.idle_ttl_ms, MIN_SESSION_TTL_MS);
     }
 
-    fn fact_contains_string(fact: &Fact, needle: &str) -> bool {
-        serde_json::to_string(fact).unwrap().contains(needle)
+    fn fact_contains_string(fact: &Fact, needle: &str) -> anyhow::Result<bool> {
+        Ok(serde_json::to_string(fact)?.contains(needle))
+    }
+
+    fn facts_contain_string(facts: &[Fact], needle: &str) -> anyhow::Result<bool> {
+        for fact in facts {
+            if fact_contains_string(fact, needle)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn role_value(grants: Vec<&str>, frozen: bool) -> Value {
@@ -2144,14 +2176,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn random_root_password_preflight_tracks_empty_user_store() {
+    async fn random_root_password_preflight_tracks_empty_user_store() -> anyhow::Result<()> {
         let boot = auth_boot();
-        assert!(
-            root_random_password_needed(&boot, &RootProvisioning::default())
-                .await
-                .unwrap()
+        ensure!(
+            root_random_password_needed(&boot, &RootProvisioning::default()).await?,
+            "empty user store should require a random root password"
         );
-        assert!(
+        ensure!(
             !root_random_password_needed(
                 &boot,
                 &RootProvisioning {
@@ -2159,30 +2190,23 @@ mod tests {
                     pubkeys: vec!["ssh-ed25519 unsupported".into()],
                 },
             )
-            .await
-            .unwrap()
+            .await?,
+            "preseeded key material should skip random root password"
         );
 
-        bootstrap_root_account(&boot, RootProvisioning::default())
-            .await
-            .unwrap();
-        assert!(
-            !root_random_password_needed(&boot, &RootProvisioning::default())
-                .await
-                .unwrap()
+        bootstrap_root_account(&boot, RootProvisioning::default()).await?;
+        ensure!(
+            !root_random_password_needed(&boot, &RootProvisioning::default()).await?,
+            "existing root account should skip random root password"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn bootstraps_root_and_logs_in() {
+    async fn bootstraps_root_and_logs_in() -> anyhow::Result<()> {
         let boot = auth_boot();
-        let outcome = bootstrap_root_account(&boot, RootProvisioning::default())
-            .await
-            .unwrap();
-        let BootstrapOutcome::CreatedRandomPassword { password, .. } = outcome else {
-            panic!("expected generated password");
-        };
-        let auth = ConsoleAuth::default();
+        let password = bootstrap_root_password(&boot).await?;
+        let auth = test_auth()?;
         let login = auth
             .login(
                 &boot,
@@ -2193,38 +2217,58 @@ mod tests {
                 },
                 "test".into(),
             )
-            .await
-            .unwrap();
-        let principal = auth.authenticate_token(&boot, &login.token).await.unwrap();
-        assert_eq!(principal.username, "root");
-        assert!(
+            .await?;
+        let principal = auth.authenticate_token(&boot, &login.token).await?;
+        ensure!(
+            principal.username == "root",
+            "unexpected principal username"
+        );
+        ensure!(
             principal
                 .grants
-                .contains("write", &Path::parse("state://kernel/x").unwrap())
+                .contains("write", &Path::parse("state://kernel/x")?),
+            "root principal should have kernel state write access"
         );
-        assert!(principal.grants.contains(
-            "perform",
-            &Path::parse("effect://external/pairing/create").unwrap()
-        ));
-        assert!(
+        ensure!(
             principal
                 .grants
-                .contains("perform", &Path::parse("effect://proc/spawn").unwrap())
+                .contains("perform", &Path::parse("effect://external/pairing/create")?),
+            "root principal should be able to create pairings"
         );
-        let events = audit_events(&boot);
-        assert!(events.contains(&"console_bootstrap".into()));
-        assert!(events.contains(&"console_login".into()));
+        ensure!(
+            principal
+                .grants
+                .contains("perform", &Path::parse("effect://proc/spawn")?),
+            "root principal should be able to spawn processes"
+        );
+        let events = audit_events(&boot)?;
+        ensure!(
+            events.iter().any(|event| event == "console_bootstrap"),
+            "missing console bootstrap audit event"
+        );
+        ensure!(
+            events.iter().any(|event| event == "console_login"),
+            "missing console login audit event"
+        );
+        Ok(())
     }
 
     #[test]
-    fn random_tokens_are_valid_path_segments() {
+    fn random_tokens_are_valid_path_segments() -> anyhow::Result<()> {
         for _ in 0..128 {
-            let token = random_token(18).unwrap();
-            validate_session_id(&token).unwrap();
-            Path::parse(&format!("state://kernel/console/sessions/{token}")).unwrap();
+            let token = random_token(18)?;
+            validate_session_id(&token)?;
+            Path::parse(&format!("state://kernel/console/sessions/{token}"))?;
         }
-        assert!(validate_session_id("-bad").is_err());
-        assert!(validate_session_id("_bad").is_err());
+        ensure!(
+            validate_session_id("-bad").is_err(),
+            "leading '-' was accepted"
+        );
+        ensure!(
+            validate_session_id("_bad").is_err(),
+            "leading '_' was accepted"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -2236,15 +2280,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bearer_logout_revokes_session() {
+    async fn bearer_logout_revokes_session() -> anyhow::Result<()> {
         let boot = auth_boot();
-        let outcome = bootstrap_root_account(&boot, RootProvisioning::default())
-            .await
-            .unwrap();
-        let BootstrapOutcome::CreatedRandomPassword { password, .. } = outcome else {
-            panic!("expected generated password");
-        };
-        let auth = ConsoleAuth::default();
+        let password = bootstrap_root_password(&boot).await?;
+        let auth = test_auth()?;
         let login = auth
             .login(
                 &boot,
@@ -2255,37 +2294,42 @@ mod tests {
                 },
                 "test".into(),
             )
-            .await
-            .unwrap();
-        auth.logout_from_source(&boot, &login.token, Some("203.0.113.10"))
-            .await
-            .unwrap();
-        assert!(matches!(
-            auth.authenticate_token(&boot, &login.token).await,
-            Err(AuthError::InvalidSession)
-        ));
-        assert!(audit_events(&boot).contains(&"console_credential".into()));
-        assert!(audit_facts(&boot).into_iter().any(|fact| {
-            let OutcomeRef::Inline(Value::Map(m)) = fact.outcome_ref else {
-                return false;
-            };
-            m.get("event").and_then(Value::as_str) == Some("console_credential")
-                && m.get("outcome").and_then(Value::as_str) == Some("logout")
-                && m.get("username").and_then(Value::as_str) == Some("root")
-                && m.get("source_addr").and_then(Value::as_str) == Some("203.0.113.10")
-        }));
+            .await?;
+        auth.logout_sid_from_source(&boot, &login.sid, Some("203.0.113.10"))
+            .await?;
+        ensure!(
+            matches!(
+                auth.authenticate_token(&boot, &login.token).await,
+                Err(AuthError::InvalidSession)
+            ),
+            "revoked bearer token still authenticated"
+        );
+        let events = audit_events(&boot)?;
+        ensure!(
+            events.iter().any(|event| event == "console_credential"),
+            "missing console credential audit event"
+        );
+        let facts = audit_facts(&boot)?;
+        ensure!(
+            facts.into_iter().any(|fact| {
+                let OutcomeRef::Inline(Value::Map(m)) = fact.outcome_ref else {
+                    return false;
+                };
+                m.get("event").and_then(Value::as_str) == Some("console_credential")
+                    && m.get("outcome").and_then(Value::as_str) == Some("logout")
+                    && m.get("username").and_then(Value::as_str) == Some("root")
+                    && m.get("source_addr").and_then(Value::as_str) == Some("203.0.113.10")
+            }),
+            "missing logout audit fact with source address"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn step_up_issues_new_session_without_reusing_token() {
+    async fn step_up_issues_new_session_without_reusing_token() -> anyhow::Result<()> {
         let boot = auth_boot();
-        let outcome = bootstrap_root_account(&boot, RootProvisioning::default())
-            .await
-            .unwrap();
-        let BootstrapOutcome::CreatedRandomPassword { password, .. } = outcome else {
-            panic!("expected generated password");
-        };
-        let auth = ConsoleAuth::default();
+        let password = bootstrap_root_password(&boot).await?;
+        let auth = test_auth()?;
         let login = auth
             .login(
                 &boot,
@@ -2296,9 +2340,11 @@ mod tests {
                 },
                 "test".into(),
             )
-            .await
-            .unwrap();
-        assert_eq!(login.mfa_level, 1);
+            .await?;
+        ensure!(
+            login.mfa_level == 1,
+            "initial login should have MFA level 1"
+        );
         let elevated = auth
             .step_up(
                 &boot,
@@ -2309,48 +2355,47 @@ mod tests {
                 },
                 "test".into(),
             )
-            .await
-            .unwrap();
-        assert_ne!(elevated.sid, login.sid);
-        assert_ne!(elevated.token, login.token);
-        assert_eq!(elevated.mfa_level, 2);
-        assert_eq!(
+            .await?;
+        ensure!(
+            elevated.sid != login.sid,
+            "step-up should issue a new session id"
+        );
+        ensure!(
+            elevated.token != login.token,
+            "step-up should issue a new bearer token"
+        );
+        ensure!(elevated.mfa_level == 2, "step-up should raise MFA level");
+        ensure!(
             auth.authenticate_token(&boot, &login.token)
-                .await
-                .unwrap()
-                .mfa_level,
-            1
+                .await?
+                .mfa_level
+                == 1,
+            "original session MFA level changed"
         );
-        assert_eq!(
+        ensure!(
             auth.authenticate_token(&boot, &elevated.token)
-                .await
-                .unwrap()
-                .mfa_level,
-            2
+                .await?
+                .mfa_level
+                == 2,
+            "elevated session did not authenticate at MFA level 2"
         );
-        let facts = audit_facts(&boot);
-        assert!(
-            !facts
-                .iter()
-                .any(|fact| fact_contains_string(fact, &login.token))
+        let facts = audit_facts(&boot)?;
+        ensure!(
+            !facts_contain_string(&facts, &login.token)?,
+            "audit facts leaked original bearer token"
         );
-        assert!(
-            !facts
-                .iter()
-                .any(|fact| fact_contains_string(fact, &elevated.token))
+        ensure!(
+            !facts_contain_string(&facts, &elevated.token)?,
+            "audit facts leaked elevated bearer token"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn root_can_list_and_revoke_console_sessions() {
+    async fn root_can_list_and_revoke_console_sessions() -> anyhow::Result<()> {
         let boot = auth_boot();
-        let outcome = bootstrap_root_account(&boot, RootProvisioning::default())
-            .await
-            .unwrap();
-        let BootstrapOutcome::CreatedRandomPassword { password, .. } = outcome else {
-            panic!("expected generated password");
-        };
-        let auth = ConsoleAuth::default();
+        let password = bootstrap_root_password(&boot).await?;
+        let auth = test_auth()?;
         let login1 = auth
             .login(
                 &boot,
@@ -2361,8 +2406,7 @@ mod tests {
                 },
                 "test-a".into(),
             )
-            .await
-            .unwrap();
+            .await?;
         let login2 = auth
             .login(
                 &boot,
@@ -2373,33 +2417,75 @@ mod tests {
                 },
                 "test-b".into(),
             )
-            .await
-            .unwrap();
-        let principal = auth.authenticate_token(&boot, &login1.token).await.unwrap();
-        let sessions = auth.list_sessions(&boot, &principal).await.unwrap();
-        assert!(sessions.iter().any(|s| s.sid == login1.sid));
-        assert!(sessions.iter().any(|s| s.sid == login2.sid));
+            .await?;
+        let principal = auth.authenticate_token(&boot, &login1.token).await?;
+        let sessions = auth.list_sessions(&boot, &principal).await?;
+        ensure!(
+            sessions.iter().any(|s| s.sid == login1.sid),
+            "first session missing from session list"
+        );
+        ensure!(
+            sessions.iter().any(|s| s.sid == login2.sid),
+            "second session missing from session list"
+        );
 
-        auth.revoke_session_by_id(&boot, &principal, &login2.sid)
-            .await
-            .unwrap();
-        assert!(matches!(
-            auth.authenticate_token(&boot, &login2.token).await,
-            Err(AuthError::InvalidSession)
-        ));
-        assert!(audit_events(&boot).contains(&"console_credential".into()));
+        auth.revoke_session_by_id_from_source(&boot, &principal, &login2.sid, None)
+            .await?;
+        ensure!(
+            matches!(
+                auth.authenticate_token(&boot, &login2.token).await,
+                Err(AuthError::InvalidSession)
+            ),
+            "revoked session still authenticated"
+        );
+        let events = audit_events(&boot)?;
+        ensure!(
+            events.iter().any(|event| event == "console_credential"),
+            "missing console credential audit event"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn root_can_revoke_all_sessions_for_user() {
+    async fn malformed_console_session_state_is_rejected() -> anyhow::Result<()> {
         let boot = auth_boot();
-        let outcome = bootstrap_root_account(&boot, RootProvisioning::default())
-            .await
-            .unwrap();
-        let BootstrapOutcome::CreatedRandomPassword { password, .. } = outcome else {
-            panic!("expected generated password");
-        };
-        let auth = ConsoleAuth::default();
+        let password = bootstrap_root_password(&boot).await?;
+        let auth = test_auth()?;
+        let login = auth
+            .login(
+                &boot,
+                LoginRequest {
+                    username: "root".into(),
+                    password,
+                    totp_code: None,
+                },
+                "test".into(),
+            )
+            .await?;
+        let principal = auth.authenticate_token(&boot, &login.token).await?;
+        boot.kernel
+            .state
+            .write_set(
+                &Path::parse(&format!("{SESSIONS_PREFIX}/malformed"))?,
+                Value::Map(BTreeMap::new()),
+            )
+            .await?;
+
+        ensure!(
+            matches!(
+                auth.list_sessions(&boot, &principal).await,
+                Err(AuthError::InvalidSession)
+            ),
+            "malformed session state was accepted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn root_can_revoke_all_sessions_for_user() -> anyhow::Result<()> {
+        let boot = auth_boot();
+        let password = bootstrap_root_password(&boot).await?;
+        let auth = test_auth()?;
         let login1 = auth
             .login(
                 &boot,
@@ -2410,8 +2496,7 @@ mod tests {
                 },
                 "test-a".into(),
             )
-            .await
-            .unwrap();
+            .await?;
         let login2 = auth
             .login(
                 &boot,
@@ -2422,26 +2507,31 @@ mod tests {
                 },
                 "test-b".into(),
             )
-            .await
-            .unwrap();
-        let principal = auth.authenticate_token(&boot, &login1.token).await.unwrap();
+            .await?;
+        let principal = auth.authenticate_token(&boot, &login1.token).await?;
         let revoked = auth
-            .revoke_user_sessions(&boot, &principal, "root")
-            .await
-            .unwrap();
-        assert!(revoked >= 2);
-        assert!(matches!(
-            auth.authenticate_token(&boot, &login1.token).await,
-            Err(AuthError::InvalidSession)
-        ));
-        assert!(matches!(
-            auth.authenticate_token(&boot, &login2.token).await,
-            Err(AuthError::InvalidSession)
-        ));
+            .revoke_user_sessions_from_source(&boot, &principal, "root", None)
+            .await?;
+        ensure!(revoked >= 2, "expected at least two revoked sessions");
+        ensure!(
+            matches!(
+                auth.authenticate_token(&boot, &login1.token).await,
+                Err(AuthError::InvalidSession)
+            ),
+            "first revoked session still authenticated"
+        );
+        ensure!(
+            matches!(
+                auth.authenticate_token(&boot, &login2.token).await,
+                Err(AuthError::InvalidSession)
+            ),
+            "second revoked session still authenticated"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn pubkey_only_root_can_use_single_use_challenge_login() {
+    async fn pubkey_only_root_can_use_single_use_challenge_login() -> anyhow::Result<()> {
         let boot = auth_boot();
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
         let descriptor = format!(
@@ -2455,16 +2545,16 @@ mod tests {
                 pubkeys: vec![descriptor.clone()],
             },
         )
-        .await
-        .unwrap();
-        assert_eq!(
-            outcome,
-            BootstrapOutcome::CreatedPreseeded {
-                username: "root".into()
-            }
+        .await?;
+        let expected = BootstrapOutcome::CreatedPreseeded {
+            username: "root".into(),
+        };
+        ensure!(
+            outcome == expected,
+            "unexpected bootstrap outcome: {outcome:?}"
         );
 
-        let auth = ConsoleAuth::default();
+        let auth = test_auth()?;
         let challenge = auth
             .begin_key_login(
                 &boot,
@@ -2474,9 +2564,12 @@ mod tests {
                 },
                 "test".into(),
             )
-            .await
-            .unwrap();
-        assert!(audit_outcomes(&boot, "console_credential").contains(&"key_challenge".into()));
+            .await?;
+        let outcomes = audit_outcomes(&boot, "console_credential")?;
+        ensure!(
+            outcomes.iter().any(|outcome| outcome == "key_challenge"),
+            "missing key challenge audit outcome"
+        );
         let signature = signing_key.sign(challenge.transcript.as_bytes());
         let login = auth
             .finish_key_login(
@@ -2490,43 +2583,50 @@ mod tests {
                 },
                 "test".into(),
             )
-            .await
-            .unwrap();
-        let principal = auth.authenticate_token(&boot, &login.token).await.unwrap();
-        assert_eq!(principal.username, "root");
+            .await?;
+        let principal = auth.authenticate_token(&boot, &login.token).await?;
+        ensure!(
+            principal.username == "root",
+            "unexpected principal username"
+        );
 
         let reused = signing_key.sign(challenge.transcript.as_bytes());
-        assert!(matches!(
-            auth.finish_key_login(
-                &boot,
-                KeyLoginRequest {
-                    username: "root".into(),
-                    challenge_id: challenge.challenge_id,
-                    signature: URL_SAFE_NO_PAD.encode(reused.to_bytes()),
-                    origin: "https://console.local".into(),
-                    key: None,
-                },
-                "test".into(),
-            )
-            .await,
-            Err(AuthError::InvalidChallenge)
-        ));
-        let events = audit_events(&boot);
-        assert!(events.contains(&"console_login".into()));
-        assert!(events.contains(&"console_login_failed".into()));
+        ensure!(
+            matches!(
+                auth.finish_key_login(
+                    &boot,
+                    KeyLoginRequest {
+                        username: "root".into(),
+                        challenge_id: challenge.challenge_id,
+                        signature: URL_SAFE_NO_PAD.encode(reused.to_bytes()),
+                        origin: "https://console.local".into(),
+                        key: None,
+                    },
+                    "test".into(),
+                )
+                .await,
+                Err(AuthError::InvalidChallenge)
+            ),
+            "single-use key challenge was accepted twice"
+        );
+        let events = audit_events(&boot)?;
+        ensure!(
+            events.iter().any(|event| event == "console_login"),
+            "missing key login audit event"
+        );
+        ensure!(
+            events.iter().any(|event| event == "console_login_failed"),
+            "missing replay failure audit event"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn root_cannot_self_lock_or_self_demote() {
+    async fn root_cannot_self_lock_or_self_demote() -> anyhow::Result<()> {
         let boot = auth_boot();
         let state = &boot.kernel.state;
-        let outcome = bootstrap_root_account(&boot, RootProvisioning::default())
-            .await
-            .unwrap();
-        let BootstrapOutcome::CreatedRandomPassword { password, .. } = outcome else {
-            panic!("expected generated password");
-        };
-        let auth = ConsoleAuth::default();
+        let password = bootstrap_root_password(&boot).await?;
+        let auth = test_auth()?;
         let login = auth
             .login(
                 &boot,
@@ -2537,37 +2637,52 @@ mod tests {
                 },
                 "test".into(),
             )
-            .await
-            .unwrap();
-        let principal = auth.authenticate_token(&boot, &login.token).await.unwrap();
-        let path = Path::parse("state://kernel/console/users/root").unwrap();
-        let mut root = read_user(&state, "root").await.unwrap().unwrap();
+            .await?;
+        let principal = auth.authenticate_token(&boot, &login.token).await?;
+        let path = Path::parse("state://kernel/console/users/root")?;
+        let mut root = read_user(state, "root")
+            .await?
+            .context("root user missing after bootstrap")?;
 
         root.status = "disabled".into();
-        assert!(matches!(
-            authorize_path(&state, &principal, "write", &path, Some(&root.to_value())).await,
-            Err(AuthError::PermissionDenied)
-        ));
+        ensure!(
+            matches!(
+                authorize_path(state, &principal, "write", &path, Some(&root.to_value())).await,
+                Err(AuthError::PermissionDenied)
+            ),
+            "root was allowed to self-lock"
+        );
 
-        let mut root = read_user(&state, "root").await.unwrap().unwrap();
+        let mut root = read_user(state, "root")
+            .await?
+            .context("root user missing after self-lock check")?;
         root.grants = vec!["read://state/kernel/**".into()];
         root.authority_ceiling = root.grants.clone();
-        assert!(matches!(
-            authorize_path(&state, &principal, "write", &path, Some(&root.to_value())).await,
-            Err(AuthError::PermissionDenied)
-        ));
+        ensure!(
+            matches!(
+                authorize_path(state, &principal, "write", &path, Some(&root.to_value())).await,
+                Err(AuthError::PermissionDenied)
+            ),
+            "root was allowed to self-demote"
+        );
 
-        let mut root = read_user(&state, "root").await.unwrap().unwrap();
+        let mut root = read_user(state, "root")
+            .await?
+            .context("root user missing after self-demote check")?;
         root.password_hash_ref = None;
         root.pubkeys.clear();
-        assert!(matches!(
-            authorize_path(&state, &principal, "write", &path, Some(&root.to_value())).await,
-            Err(AuthError::PermissionDenied)
-        ));
+        ensure!(
+            matches!(
+                authorize_path(state, &principal, "write", &path, Some(&root.to_value())).await,
+                Err(AuthError::PermissionDenied)
+            ),
+            "root was allowed to remove all login methods"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn frozen_roles_and_role_grants_are_enforced() {
+    async fn frozen_roles_and_role_grants_are_enforced() -> anyhow::Result<()> {
         let boot = auth_boot();
         let state = boot.kernel.state.clone();
         let admin = ConsolePrincipal {
@@ -2576,63 +2691,103 @@ mod tests {
             grants: CapSet::from_strs([
                 "write://state/kernel/console/roles/**",
                 "perform://effect/kernel/console/users/**",
-            ])
-            .unwrap(),
+            ])?,
             mfa_level: 1,
         };
 
-        let role_path = Path::parse("state://kernel/console/roles/ops").unwrap();
+        let role_path = Path::parse("state://kernel/console/roles/ops")?;
         state
             .write_set(&role_path, role_value(vec![], true))
-            .await
-            .unwrap();
-        assert!(matches!(
-            authorize_path(
-                &state,
-                &admin,
-                "write",
-                &role_path,
-                Some(&role_value(vec![], false))
-            )
-            .await,
-            Err(AuthError::PermissionDenied)
-        ));
+            .await?;
+        ensure!(
+            matches!(
+                authorize_path(
+                    &state,
+                    &admin,
+                    "write",
+                    &role_path,
+                    Some(&role_value(vec![], false))
+                )
+                .await,
+                Err(AuthError::PermissionDenied)
+            ),
+            "frozen role was mutable"
+        );
 
-        let new_role = Path::parse("state://kernel/console/roles/newrole").unwrap();
-        assert!(matches!(
-            authorize_path(
-                &state,
-                &admin,
-                "write",
-                &new_role,
-                Some(&role_value(vec![], true))
-            )
-            .await,
-            Err(AuthError::PermissionDenied)
-        ));
-        assert!(matches!(
-            authorize_path(
-                &state,
-                &admin,
-                "write",
-                &new_role,
-                Some(&role_value(vec!["write://state/kernel/**"], false))
-            )
-            .await,
-            Err(AuthError::PermissionDenied)
-        ));
+        let new_role = Path::parse("state://kernel/console/roles/newrole")?;
+        ensure!(
+            matches!(
+                authorize_path(
+                    &state,
+                    &admin,
+                    "write",
+                    &new_role,
+                    Some(&role_value(vec![], true))
+                )
+                .await,
+                Err(AuthError::PermissionDenied)
+            ),
+            "caller created a frozen role"
+        );
+        ensure!(
+            matches!(
+                authorize_path(
+                    &state,
+                    &admin,
+                    "write",
+                    &new_role,
+                    Some(&role_value(vec!["write://state/kernel/**"], false))
+                )
+                .await,
+                Err(AuthError::PermissionDenied)
+            ),
+            "caller exceeded role grant authority"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn auth_audit_facts_are_redacted() {
+    async fn malformed_role_grants_are_rejected() -> anyhow::Result<()> {
         let boot = auth_boot();
-        let outcome = bootstrap_root_account(&boot, RootProvisioning::default())
-            .await
-            .unwrap();
-        let BootstrapOutcome::CreatedRandomPassword { password, .. } = outcome else {
-            panic!("expected generated password");
+        let state = boot.kernel.state.clone();
+        let admin = ConsolePrincipal {
+            username: "root".into(),
+            identity_path: "identity://console/root".into(),
+            grants: CapSet::from_strs(["*://**"])?,
+            mfa_level: 2,
         };
-        let auth = ConsoleAuth::default();
+        let mut role = BTreeMap::new();
+        role.insert(
+            "grants".into(),
+            Value::List(vec![
+                Value::Str("read://state/kernel/**".into()),
+                Value::Int(7),
+            ]),
+        );
+        role.insert("frozen".into(), Value::Bool(false));
+
+        ensure!(
+            matches!(
+            authorize_path(
+                &state,
+                &admin,
+                "write",
+                &Path::parse("state://kernel/console/roles/bad")?,
+                Some(&Value::Map(role))
+            )
+            .await,
+            Err(AuthError::State(message)) if message.contains("console role.grants[1]")
+            ),
+            "malformed role grant was accepted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auth_audit_facts_are_redacted() -> anyhow::Result<()> {
+        let boot = auth_boot();
+        let password = bootstrap_root_password(&boot).await?;
+        let auth = test_auth()?;
         let login = auth
             .login(
                 &boot,
@@ -2643,20 +2798,29 @@ mod tests {
                 },
                 "audit-source".into(),
             )
-            .await
-            .unwrap();
+            .await?;
 
-        let facts = audit_facts(&boot);
-        assert!(
-            facts
-                .iter()
-                .any(|fact| fact_contains_string(fact, "console_login"))
+        let facts = audit_facts(&boot)?;
+        ensure!(
+            facts_contain_string(&facts, "console_login")?,
+            "missing console login audit fact"
         );
-        for fact in facts {
-            assert!(!fact_contains_string(&fact, &password));
-            assert!(!fact_contains_string(&fact, &login.token));
-            assert!(!fact_contains_string(&fact, "password"));
-            assert!(!fact_contains_string(&fact, "token"));
-        }
+        ensure!(
+            !facts_contain_string(&facts, &password)?,
+            "audit facts leaked password"
+        );
+        ensure!(
+            !facts_contain_string(&facts, &login.token)?,
+            "audit facts leaked bearer token"
+        );
+        ensure!(
+            !facts_contain_string(&facts, "password")?,
+            "audit facts included password field"
+        );
+        ensure!(
+            !facts_contain_string(&facts, "token")?,
+            "audit facts included token field"
+        );
+        Ok(())
     }
 }

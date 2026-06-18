@@ -52,12 +52,13 @@ impl RedbStateBackend {
 
     fn notify(&self, event: StateEvent) {
         let target = event.path().clone();
-        let subs = self.subs.lock();
-        for s in subs.iter() {
-            if target.matches(&s.pattern) {
-                let _ = s.sender.send(event.clone());
+        let mut subs = self.subs.lock();
+        subs.retain(|s| {
+            if !target.matches(&s.pattern) {
+                return true;
             }
-        }
+            s.sender.send(event.clone()).is_ok()
+        });
     }
 
     fn record_history_in_txn(
@@ -194,8 +195,8 @@ fn history_key_parts(key: &[u8]) -> StateResult<(Path, i64)> {
 
 /// On-disk envelope persisting a value with its taint. Stored as JSON
 /// in `STATE_VALUES_TABLE`; bare `Value` encodings are rejected so provenance is
-/// never silently dropped. We build the JSON by hand (this crate doesn't depend
-/// on `serde` derive directly).
+/// preserved. We build the JSON by hand (this crate doesn't depend on `serde`
+/// derive directly).
 fn encode_envelope(value: &Value, taint: &TaintSet) -> Result<Vec<u8>, StateError> {
     let json = serde_json::json!({
         "__nexus_env": 1,
@@ -563,88 +564,87 @@ fn deserialize_history_entry(json: &serde_json::Value) -> StateResult<StateHisto
 mod tests {
     use super::*;
     use crate::RedbStore;
+    use anyhow::{Context, anyhow, bail, ensure};
     use nexus_types::Path;
 
-    fn p(s: &str) -> Path {
-        Path::parse(s).unwrap()
+    fn p(s: &str) -> anyhow::Result<Path> {
+        Path::parse(s).map_err(|error| anyhow!("path parse failed for {s}: {error}"))
     }
 
-    fn tmp_backend() -> RedbStateBackend {
-        let dir = tempfile::tempdir().unwrap();
+    fn tmp_backend() -> anyhow::Result<RedbStateBackend> {
+        let dir = tempfile::tempdir()?;
         let path = dir.keep().join("test.redb");
-        RedbStore::open(path).unwrap().state_backend()
+        Ok(RedbStore::open(path)?.state_backend())
     }
 
     #[tokio::test]
-    async fn set_and_read() {
-        let b = tmp_backend();
-        b.write_set(&p("state://x"), Value::Int(42)).await.unwrap();
-        let v = b.read(&p("state://x")).await.unwrap();
-        assert_eq!(v, Some(Value::Int(42)));
+    async fn set_and_read() -> anyhow::Result<()> {
+        let b = tmp_backend()?;
+        b.write_set(&p("state://x")?, Value::Int(42)).await?;
+        let v = b.read(&p("state://x")?).await?;
+        ensure!(v == Some(Value::Int(42)), "unexpected value: {v:?}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn read_missing_returns_none() {
-        let b = tmp_backend();
-        assert_eq!(b.read(&p("state://nope")).await.unwrap(), None);
+    async fn read_missing_returns_none() -> anyhow::Result<()> {
+        let b = tmp_backend()?;
+        let value = b.read(&p("state://nope")?).await?;
+        ensure!(value.is_none(), "unexpected value: {value:?}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn bare_value_encoding_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn bare_value_encoding_is_rejected() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let path = dir.keep().join("test.redb");
-        let store = RedbStore::open(path).unwrap();
+        let store = RedbStore::open(path)?;
         {
-            let txn = store
-                .db
-                .begin_write()
-                .map_err(|e| StateError::Backend(e.to_string()))
-                .unwrap();
+            let txn = store.db.begin_write()?;
             {
-                let mut table = txn.open_table(crate::STATE_VALUES_TABLE).unwrap();
-                let bare = serde_json::to_vec(&value_to_json(&Value::Int(7)).unwrap()).unwrap();
-                table
-                    .insert("state://bad-encoding", bare.as_slice())
-                    .unwrap();
+                let mut table = txn.open_table(crate::STATE_VALUES_TABLE)?;
+                let bare = serde_json::to_vec(&value_to_json(&Value::Int(7))?)?;
+                table.insert("state://bad-encoding", bare.as_slice())?;
             }
-            txn.commit().unwrap();
+            txn.commit()?;
         }
 
         let b = store.state_backend();
-        let err = b.read(&p("state://bad-encoding")).await.unwrap_err();
-        assert!(
+        let err = match b.read(&p("state://bad-encoding")?).await {
+            Ok(value) => bail!("expected encoding error, got {value:?}"),
+            Err(error) => error,
+        };
+        ensure!(
             matches!(&err, StateError::Backend(message) if message.contains("envelope marker")),
             "bare Value encoding must not be treated as pristine: {err:?}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn append_creates_and_grows() {
-        let b = tmp_backend();
-        b.write_append(&p("state://log"), Value::Int(1))
-            .await
-            .unwrap();
-        b.write_append(&p("state://log"), Value::Int(2))
-            .await
-            .unwrap();
-        let v = b.read(&p("state://log")).await.unwrap().unwrap();
+    async fn append_creates_and_grows() -> anyhow::Result<()> {
+        let b = tmp_backend()?;
+        b.write_append(&p("state://log")?, Value::Int(1)).await?;
+        b.write_append(&p("state://log")?, Value::Int(2)).await?;
+        let v = b
+            .read(&p("state://log")?)
+            .await?
+            .context("missing log value")?;
         match v {
-            Value::List(xs) => assert_eq!(xs.len(), 2),
-            _ => panic!("expected list"),
+            Value::List(xs) => ensure!(xs.len() == 2, "unexpected list length: {}", xs.len()),
+            other => bail!("expected list, got {other:?}"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn history_keeps_multiple_events_for_same_path_in_one_millisecond() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn history_keeps_multiple_events_for_same_path_in_one_millisecond() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
         let path = dir.keep().join("test.redb");
-        let store = RedbStore::open(path).unwrap();
-        let state_path = p("state://history/collide");
-        let txn = store
-            .db
-            .begin_write()
-            .map_err(|e| StateError::Backend(e.to_string()))
-            .unwrap();
+        let store = RedbStore::open(path)?;
+        let state_path = p("state://history/collide")?;
+        let txn = store.db.begin_write()?;
         RedbStateBackend::record_history_at_millis_in_txn(
             &txn,
             &StateEvent::Set {
@@ -653,8 +653,7 @@ mod tests {
                 taint: TaintSet::pristine(),
             },
             1_700_000_000_000,
-        )
-        .unwrap();
+        )?;
         RedbStateBackend::record_history_at_millis_in_txn(
             &txn,
             &StateEvent::Set {
@@ -663,136 +662,138 @@ mod tests {
                 taint: TaintSet::pristine(),
             },
             1_700_000_000_000,
-        )
-        .unwrap();
-        txn.commit().unwrap();
+        )?;
+        txn.commit()?;
 
         let backend = store.state_backend();
-        let entries = backend.read_range(&state_path, 0, i64::MAX).await.unwrap();
-        assert_eq!(entries.len(), 2);
+        let entries = backend.read_range(&state_path, 0, i64::MAX).await?;
+        ensure!(entries.len() == 2, "unexpected entries: {entries:?}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn history_clock_is_shared_across_state_backends() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn history_clock_is_shared_across_state_backends() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let path = dir.keep().join("test.redb");
-        let store = RedbStore::open(path).unwrap();
+        let store = RedbStore::open(path)?;
         let first = store.state_backend();
         let second = store.state_backend();
-        let state_path = p("state://history/shared-clock");
+        let state_path = p("state://history/shared-clock")?;
 
-        first.write_set(&state_path, Value::Int(1)).await.unwrap();
-        second.write_set(&state_path, Value::Int(2)).await.unwrap();
+        first.write_set(&state_path, Value::Int(1)).await?;
+        second.write_set(&state_path, Value::Int(2)).await?;
 
-        let entries = first.read_range(&state_path, 0, i64::MAX).await.unwrap();
-        assert_eq!(entries.len(), 2);
-        assert!(
-            entries[0].at_millis < entries[1].at_millis,
-            "history timestamps must preserve write order across backends"
-        );
+        let entries = first.read_range(&state_path, 0, i64::MAX).await?;
+        match entries.as_slice() {
+            [first, second] => ensure!(
+                first.at_millis < second.at_millis,
+                "history timestamps must preserve write order across backends"
+            ),
+            other => bail!("expected 2 entries, got {other:?}"),
+        }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cas_success_and_failure() {
-        let b = tmp_backend();
-        b.write_set(&p("state://k"), Value::Int(1)).await.unwrap();
-        b.write_cas(&p("state://k"), Some(Value::Int(1)), Value::Int(2))
-            .await
-            .unwrap();
-        assert_eq!(b.read(&p("state://k")).await.unwrap(), Some(Value::Int(2)));
+    async fn cas_success_and_failure() -> anyhow::Result<()> {
+        let b = tmp_backend()?;
+        b.write_set(&p("state://k")?, Value::Int(1)).await?;
+        b.write_cas(&p("state://k")?, Some(Value::Int(1)), Value::Int(2))
+            .await?;
+        let value = b.read(&p("state://k")?).await?;
+        ensure!(value == Some(Value::Int(2)), "unexpected value: {value:?}");
 
         let err = b
-            .write_cas(&p("state://k"), Some(Value::Int(99)), Value::Int(3))
+            .write_cas(&p("state://k")?, Some(Value::Int(99)), Value::Int(3))
             .await;
-        assert!(matches!(err, Err(StateError::CasFailed { .. })));
+        ensure!(
+            matches!(err, Err(StateError::CasFailed { .. })),
+            "expected CasFailed"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn delete_removes() {
-        let b = tmp_backend();
-        b.write_set(&p("state://k"), Value::Int(1)).await.unwrap();
-        b.write_delete(&p("state://k")).await.unwrap();
-        assert_eq!(b.read(&p("state://k")).await.unwrap(), None);
+    async fn delete_removes() -> anyhow::Result<()> {
+        let b = tmp_backend()?;
+        b.write_set(&p("state://k")?, Value::Int(1)).await?;
+        b.write_delete(&p("state://k")?).await?;
+        let value = b.read(&p("state://k")?).await?;
+        ensure!(value.is_none(), "unexpected value: {value:?}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn merge_missing_path_uses_incoming_value() {
-        let b = tmp_backend();
-        b.write_merge(&p("state://k"), Value::Int(7), MergeRule::Shallow)
-            .await
-            .unwrap();
-        assert_eq!(b.read(&p("state://k")).await.unwrap(), Some(Value::Int(7)));
+    async fn merge_missing_path_uses_incoming_value() -> anyhow::Result<()> {
+        let b = tmp_backend()?;
+        b.write_merge(&p("state://k")?, Value::Int(7), MergeRule::Shallow)
+            .await?;
+        let value = b.read(&p("state://k")?).await?;
+        ensure!(value == Some(Value::Int(7)), "unexpected value: {value:?}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn prefix_scan() {
-        let b = tmp_backend();
+    async fn prefix_scan() -> anyhow::Result<()> {
+        let b = tmp_backend()?;
         b.write_set(
-            &p("state://memory/alice/persona"),
+            &p("state://memory/alice/persona")?,
             Value::Str("hello".into()),
         )
-        .await
-        .unwrap();
-        b.write_set(&p("state://memory/alice/prefs"), Value::Int(1))
-            .await
-            .unwrap();
-        b.write_set(&p("state://memory/bob/persona"), Value::Str("world".into()))
-            .await
-            .unwrap();
-        b.write_set(&p("state://other"), Value::Int(99))
-            .await
-            .unwrap();
+        .await?;
+        b.write_set(&p("state://memory/alice/prefs")?, Value::Int(1))
+            .await?;
+        b.write_set(
+            &p("state://memory/bob/persona")?,
+            Value::Str("world".into()),
+        )
+        .await?;
+        b.write_set(&p("state://other")?, Value::Int(99)).await?;
 
-        let results = b.read_prefix(&p("state://memory/alice")).await.unwrap();
-        assert_eq!(results.len(), 2);
-        assert!(
+        let results = b.read_prefix(&p("state://memory/alice")?).await?;
+        ensure!(results.len() == 2, "unexpected results: {results:?}");
+        ensure!(
             results
                 .iter()
-                .all(|(p, _)| p.to_string().starts_with("state://memory/alice"))
+                .all(|(path, _)| path.to_string().starts_with("state://memory/alice")),
+            "unexpected prefix results: {results:?}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn prefix_scan_is_segment_aware() {
-        let b = tmp_backend();
-        b.write_set(&p("state://memory/alice"), Value::Int(1))
-            .await
-            .unwrap();
-        b.write_set(&p("state://memory/aliceevil"), Value::Int(2))
-            .await
-            .unwrap();
-        b.write_set(&p("state://memory/alice/prefs"), Value::Int(3))
-            .await
-            .unwrap();
+    async fn prefix_scan_is_segment_aware() -> anyhow::Result<()> {
+        let b = tmp_backend()?;
+        b.write_set(&p("state://memory/alice")?, Value::Int(1))
+            .await?;
+        b.write_set(&p("state://memory/aliceevil")?, Value::Int(2))
+            .await?;
+        b.write_set(&p("state://memory/alice/prefs")?, Value::Int(3))
+            .await?;
 
-        let results = b.read_prefix(&p("state://memory/alice")).await.unwrap();
+        let results = b.read_prefix(&p("state://memory/alice")?).await?;
         let paths: Vec<String> = results
             .into_iter()
             .map(|(path, _)| path.to_string())
             .collect();
-        assert_eq!(
-            paths,
-            vec!["state://memory/alice", "state://memory/alice/prefs"]
+        ensure!(
+            paths == vec!["state://memory/alice", "state://memory/alice/prefs"],
+            "unexpected paths: {paths:?}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn read_range_includes_descendants_but_not_string_prefix_siblings() {
-        let b = tmp_backend();
-        b.write_set(&p("state://memory"), Value::Int(1))
-            .await
-            .unwrap();
-        b.write_set(&p("state://memory/alice"), Value::Int(2))
-            .await
-            .unwrap();
-        b.write_set(&p("state://memoryevil"), Value::Int(3))
-            .await
-            .unwrap();
+    async fn read_range_includes_descendants_but_not_string_prefix_siblings() -> anyhow::Result<()>
+    {
+        let b = tmp_backend()?;
+        b.write_set(&p("state://memory")?, Value::Int(1)).await?;
+        b.write_set(&p("state://memory/alice")?, Value::Int(2))
+            .await?;
+        b.write_set(&p("state://memoryevil")?, Value::Int(3))
+            .await?;
 
-        let entries = b
-            .read_range(&p("state://memory"), 0, i64::MAX)
-            .await
-            .unwrap();
+        let entries = b.read_range(&p("state://memory")?, 0, i64::MAX).await?;
         let paths: Vec<String> = entries
             .into_iter()
             .map(|entry| match entry.event {
@@ -801,23 +802,29 @@ mod tests {
                 StateEvent::Delete { path } => path.to_string(),
             })
             .collect();
-        assert_eq!(paths, vec!["state://memory", "state://memory/alice"]);
+        ensure!(
+            paths == vec!["state://memory", "state://memory/alice"],
+            "unexpected paths: {paths:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn subscribe_receives_events() {
-        let b = tmp_backend();
-        let mut rx = b.subscribe(&p("state://watched/**")).await.unwrap();
-        b.write_set(&p("state://watched/a"), Value::Int(1))
-            .await
-            .unwrap();
+    async fn subscribe_receives_events() -> anyhow::Result<()> {
+        let b = tmp_backend()?;
+        let mut rx = b.subscribe(&p("state://watched/**")?).await?;
+        b.write_set(&p("state://watched/a")?, Value::Int(1)).await?;
         let ev = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
             .await
-            .unwrap()
-            .unwrap();
+            .map_err(|error| anyhow!("timed out waiting for event: {error}"))?
+            .map_err(|error| anyhow!("event receive failed: {error}"))?;
         match ev {
-            StateEvent::Set { path, .. } => assert_eq!(path.to_string(), "state://watched/a"),
-            _ => panic!("wrong event"),
+            StateEvent::Set { path, .. } => ensure!(
+                path.to_string() == "state://watched/a",
+                "unexpected path: {path}"
+            ),
+            other => bail!("wrong event: {other:?}"),
         }
+        Ok(())
     }
 }

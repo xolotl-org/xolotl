@@ -12,19 +12,24 @@ description.workspace = true
 workspace = true
 
 [dependencies]
-async-trait.workspace = true
-blake3.workspace = true
-getrandom.workspace = true
-nexus-actors = { workspace = true, default-features = false, features = ["external-session"] }
+async-trait = { workspace = true, default-features = false }
+blake3 = { workspace = true, default-features = false, features = ["std"] }
+chacha20poly1305 = { workspace = true, default-features = false, features = ["alloc"] }
+getrandom = { workspace = true, default-features = false }
+hkdf = { workspace = true, default-features = false }
 nexus-graph.workspace = true
 nexus-kernel.workspace = true
 nexus-proto.workspace = true
 nexus-state.workspace = true
 nexus-types.workspace = true
-parking_lot.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-sha2.workspace = true
-subtle.workspace = true
-thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+parking_lot = { workspace = true, default-features = false }
+serde = { workspace = true, default-features = false, features = ["derive", "std"] }
+serde_json = { workspace = true, default-features = false, features = ["std"] }
+sha2 = { workspace = true, default-features = false }
+subtle = { workspace = true, default-features = false }
+thiserror = { workspace = true, default-features = false, features = ["std"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros"] }
+tracing = { workspace = true, default-features = false, features = ["std"] }
+
+[dev-dependencies]
+anyhow = { workspace = true, default-features = false, features = ["std"] }

@@ -27,6 +27,9 @@ pub enum DriverError {
     /// Driver cannot produce the requested output mode.
     #[error("output mode {0:?} not supported")]
     UnsupportedOutput(OutputMode),
+    /// Caller supplied malformed input for the requested method.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     /// Transport or endpoint failure while reaching the driver.
     #[error("transport error: {0}")]
     Transport(String),
@@ -400,30 +403,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, bail, ensure};
     use nexus_types::{ErrorInfo, IdentityRef, NodeId, ProcessId};
     use parking_lot::Mutex;
 
     #[tokio::test]
-    async fn driver_plan_dispatches_to_method() {
+    async fn driver_plan_dispatches_to_method() -> anyhow::Result<()> {
         let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
         plan.insert(MethodId::new(0), Arc::new(EchoDriver));
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
         let out = plan
             .call(MethodId::new(0), Value::Int(7), OutputMode::Unary, &ctx)
             .await
-            .unwrap();
-        assert_eq!(out, Outcome::Done(Value::Int(7)));
+            .context("driver call failed")?;
+        ensure!(
+            out == Outcome::Done(Value::Int(7)),
+            "unexpected driver output: {out:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn missing_method_errors() {
+    async fn missing_method_errors() -> anyhow::Result<()> {
         let plan = DriverPlan::new(DriverId::new(1), None, 0);
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
-        let err = plan
+        let err = match plan
             .call(MethodId::new(9), Value::Null, OutputMode::Unary, &ctx)
             .await
-            .unwrap_err();
-        assert_eq!(err, DriverError::NoSuchMethod(MethodId::new(9)));
+        {
+            Ok(out) => bail!("expected missing method error, got {out:?}"),
+            Err(err) => err,
+        };
+        ensure!(
+            err == DriverError::NoSuchMethod(MethodId::new(9)),
+            "unexpected driver error: {err:?}"
+        );
+        Ok(())
     }
 
     struct RecordingEndpoint {
@@ -447,7 +462,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_driver_sends_stable_invoke_frame() {
+    async fn remote_driver_sends_stable_invoke_frame() -> anyhow::Result<()> {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let endpoint = Arc::new(RecordingEndpoint {
             seen: seen.clone(),
@@ -457,44 +472,74 @@ mod tests {
             EndpointId::new(7),
             nexus_types::ResourceId::new(11),
             3,
-            Path::parse("effect://external-provider/acme/search").unwrap(),
+            Path::parse("effect://external-provider/acme/search")
+                .context("effect path did not parse")?,
             endpoint,
         );
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let stream = Path::parse("state://stream/1/9").unwrap();
+        let stream = Path::parse("state://stream/1/9").context("stream path did not parse")?;
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
             .with_operation_id(OperationId::new(ProcessId::new(1), NodeId::new(9), 0))
             .with_stream(stream.clone(), tx);
         let out = driver
             .call(MethodId::new(0), Value::Int(1), OutputMode::Stream, &ctx)
             .await
-            .unwrap();
-        assert_eq!(out, Outcome::Done(Value::Str("remote-ok".into())));
-        assert!(ctx.output_taint().sources().iter().any(|taint_source| {
-            matches!(
-                taint_source,
-                TaintSource::Inbound {
-                    source,
-                    channel
-                } if source.as_str() == "provider/endpoint/7/resource/11/method/0/binding/3"
-                    && channel.as_str() == "effect://external-provider/acme/search"
-            )
-        }));
+            .context("remote driver call failed")?;
+        ensure!(
+            out == Outcome::Done(Value::Str("remote-ok".into())),
+            "unexpected remote driver output: {out:?}"
+        );
+        ensure!(
+            ctx.output_taint().sources().iter().any(|taint_source| {
+                matches!(
+                    taint_source,
+                    TaintSource::Inbound {
+                        source,
+                        channel
+                    } if source.as_str() == "provider/endpoint/7/resource/11/method/0/binding/3"
+                        && channel.as_str() == "effect://external-provider/acme/search"
+                )
+            }),
+            "remote driver did not tag inbound taint"
+        );
 
         let seen = seen.lock();
-        assert_eq!(seen.len(), 1);
-        let (dispatch, invoke) = &seen[0];
-        assert_eq!(dispatch.endpoint_id, EndpointId::new(7));
-        assert_eq!(dispatch.resource_id, nexus_types::ResourceId::new(11));
-        assert_eq!(dispatch.method_id, MethodId::new(0));
-        assert_eq!(dispatch.binding_generation, 3);
-        assert_eq!(dispatch.acting, IdentityRef::ROOT);
-        assert_eq!(invoke.invocation_id, "1/9/0");
-        assert_eq!(
-            invoke.effect_path.to_string(),
-            "effect://external-provider/acme/search"
+        ensure!(
+            seen.len() == 1,
+            "unexpected remote invoke count: {}",
+            seen.len()
         );
-        assert_eq!(invoke.method_id, MethodId::new(0));
-        assert_eq!(invoke.output_stream_to, Some(stream));
+        let (dispatch, invoke) = seen.first().context("missing remote invoke")?;
+        ensure!(
+            dispatch.endpoint_id == EndpointId::new(7),
+            "endpoint id mismatch"
+        );
+        ensure!(
+            dispatch.resource_id == nexus_types::ResourceId::new(11),
+            "resource id mismatch"
+        );
+        ensure!(dispatch.method_id == MethodId::new(0), "method id mismatch");
+        ensure!(
+            dispatch.binding_generation == 3,
+            "binding generation mismatch"
+        );
+        ensure!(
+            dispatch.acting == IdentityRef::ROOT,
+            "acting identity mismatch"
+        );
+        ensure!(invoke.invocation_id == "1/9/0", "invocation id mismatch");
+        ensure!(
+            invoke.effect_path.to_string() == "effect://external-provider/acme/search",
+            "effect path mismatch"
+        );
+        ensure!(
+            invoke.method_id == MethodId::new(0),
+            "invoke method id mismatch"
+        );
+        ensure!(
+            invoke.output_stream_to == Some(stream),
+            "invoke stream target mismatch"
+        );
+        Ok(())
     }
 }

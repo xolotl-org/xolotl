@@ -87,19 +87,23 @@ impl Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::ensure;
 
     #[test]
-    fn kernel_clone_shares_state() {
+    fn kernel_clone_shares_state() -> anyhow::Result<()> {
         let k = Kernel::in_memory();
         let k2 = k.clone();
         // Registering on one clone is visible on the other (shared Arc).
         let iface = k.registry.next_interface_id();
-        assert_eq!(iface, nexus_types::InterfaceId::new(1));
-        let iface2 = k2.registry.next_interface_id();
-        assert_eq!(
-            iface2,
-            nexus_types::InterfaceId::new(2),
-            "shared id counter"
+        ensure!(
+            iface == nexus_types::InterfaceId::new(1),
+            "unexpected first interface id: {iface:?}"
         );
+        let iface2 = k2.registry.next_interface_id();
+        ensure!(
+            iface2 == nexus_types::InterfaceId::new(2),
+            "shared id counter mismatch: {iface2:?}"
+        );
+        Ok(())
     }
 }

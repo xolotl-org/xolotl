@@ -86,9 +86,9 @@ impl StateEvent {
     }
 }
 
-/// A stored value together with its provenance. State persists the
-/// taint alongside the value; cleansing taint must be an explicit rewrite, never
-/// a silent drop. Backends store this envelope, not a bare `Value`.
+/// A stored value together with its provenance. State persists the taint
+/// alongside the value; cleansing taint must be an explicit rewrite. Backends
+/// store this envelope, not a bare `Value`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaintedValue {
     /// Stored state-plane value.
@@ -192,8 +192,7 @@ pub trait StateBackend: Send + Sync + 'static {
             .await
     }
     /// Backends that retain a history may serve range reads. The default
-    /// returns `Unsupported` so the kernel surfaces a clear error rather
-    /// than silently approximating.
+    /// returns `Unsupported` so the kernel surfaces a clear error.
     async fn read_range(
         &self,
         _path: &Path,
@@ -281,9 +280,10 @@ fn merge_maps(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, bail, ensure};
 
     #[test]
-    fn merge_shallow_overwrites_keys() {
+    fn merge_shallow_overwrites_keys() -> anyhow::Result<()> {
         let mut a = BTreeMap::new();
         a.insert("x".into(), Value::Int(1));
         a.insert("y".into(), Value::Int(2));
@@ -293,16 +293,26 @@ mod tests {
         let out = merge_values(Some(Value::Map(a)), Value::Map(b), MergeRule::Shallow);
         match out {
             Value::Map(m) => {
-                assert_eq!(m.get("x").unwrap(), &Value::Int(1));
-                assert_eq!(m.get("y").unwrap(), &Value::Int(20));
-                assert_eq!(m.get("z").unwrap(), &Value::Int(3));
+                ensure!(
+                    m.get("x").context("missing x")? == &Value::Int(1),
+                    "unexpected x"
+                );
+                ensure!(
+                    m.get("y").context("missing y")? == &Value::Int(20),
+                    "unexpected y"
+                );
+                ensure!(
+                    m.get("z").context("missing z")? == &Value::Int(3),
+                    "unexpected z"
+                );
             }
-            _ => panic!(),
+            other => bail!("expected map, got {other:?}"),
         }
+        Ok(())
     }
 
     #[test]
-    fn merge_deep_recurses() {
+    fn merge_deep_recurses() -> anyhow::Result<()> {
         let mut inner_a = BTreeMap::new();
         inner_a.insert("k".into(), Value::Int(1));
         let mut a = BTreeMap::new();
@@ -313,31 +323,40 @@ mod tests {
         b.insert("nested".into(), Value::Map(inner_b));
         let out = merge_values(Some(Value::Map(a)), Value::Map(b), MergeRule::Deep);
         match out {
-            Value::Map(m) => match m.get("nested").unwrap() {
+            Value::Map(m) => match m.get("nested").context("missing nested")? {
                 Value::Map(n) => {
-                    assert_eq!(n.get("k").unwrap(), &Value::Int(1));
-                    assert_eq!(n.get("k2").unwrap(), &Value::Int(2));
+                    ensure!(
+                        n.get("k").context("missing k")? == &Value::Int(1),
+                        "unexpected k"
+                    );
+                    ensure!(
+                        n.get("k2").context("missing k2")? == &Value::Int(2),
+                        "unexpected k2"
+                    );
                 }
-                _ => panic!(),
+                other => bail!("expected nested map, got {other:?}"),
             },
-            _ => panic!(),
+            other => bail!("expected map, got {other:?}"),
         }
+        Ok(())
     }
 
     #[test]
-    fn merge_lists_concat() {
+    fn merge_lists_concat() -> anyhow::Result<()> {
         let a = Value::List(vec![Value::Int(1), Value::Int(2)]);
         let b = Value::List(vec![Value::Int(3)]);
         let out = merge_values(Some(a), b, MergeRule::Shallow);
         match out {
-            Value::List(xs) => assert_eq!(xs.len(), 3),
-            _ => panic!(),
+            Value::List(xs) => ensure!(xs.len() == 3, "unexpected list length: {}", xs.len()),
+            other => bail!("expected list, got {other:?}"),
         }
+        Ok(())
     }
 
     #[test]
-    fn merge_missing_uses_incoming_without_synthesizing_null() {
+    fn merge_missing_uses_incoming_without_synthesizing_null() -> anyhow::Result<()> {
         let out = merge_values(None, Value::Int(7), MergeRule::Shallow);
-        assert_eq!(out, Value::Int(7));
+        ensure!(out == Value::Int(7), "unexpected merged value: {out:?}");
+        Ok(())
     }
 }

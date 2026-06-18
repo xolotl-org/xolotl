@@ -12,12 +12,15 @@ description = "WebSocket protocol adapter for Nexus"
 workspace = true
 
 [dependencies]
-axum = { workspace = true, features = ["http1", "tokio", "ws"] }
-futures-util.workspace = true
-nexus-actors = { workspace = true, default-features = false, features = ["external-session"] }
+axum = { workspace = true, default-features = false, features = ["http1", "tokio", "ws"] }
+futures-util = { workspace = true, default-features = false, features = ["sink", "std"] }
 nexus-gateway.workspace = true
 nexus-proto.workspace = true
 nexus-types.workspace = true
-prost.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
-tonic = { workspace = true, features = ["codegen"] }
+prost = { workspace = true, default-features = false, features = ["derive", "std"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "sync", "time", "macros"] }
+tonic = { workspace = true, default-features = false, features = ["codegen"] }
+tracing = { workspace = true, default-features = false, features = ["std"] }
+
+[dev-dependencies]
+anyhow = { workspace = true, default-features = false, features = ["std"] }

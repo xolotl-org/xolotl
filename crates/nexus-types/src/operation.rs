@@ -430,6 +430,7 @@ mod tests {
     use super::*;
     use crate::ids::NodeId;
     use crate::value::{BlobRef, Value};
+    use anyhow::{bail, ensure};
 
     #[test]
     fn operation_id_is_causal_not_counter() {
@@ -443,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn value_ref_externalizes_large_payloads() {
+    fn value_ref_externalizes_large_payloads() -> anyhow::Result<()> {
         let blob = Value::Blob(BlobRef {
             hash: "abc".into(),
             size: 1_000_000,
@@ -451,12 +452,16 @@ mod tests {
         });
         match ValueRef::of(blob) {
             ValueRef::External { hash, size } => {
-                assert_eq!(hash, "abc");
-                assert_eq!(size, 1_000_000);
+                ensure!(hash == "abc", "unexpected external hash: {hash}");
+                ensure!(size == 1_000_000, "unexpected external size: {size}");
             }
-            _ => panic!("large blob must be externalized, never inlined into a Fact"),
+            other => bail!("large blob was not externalized: {other:?}"),
         }
-        assert!(matches!(ValueRef::of(Value::Int(3)), ValueRef::Inline(_)));
+        ensure!(
+            matches!(ValueRef::of(Value::Int(3)), ValueRef::Inline(_)),
+            "small scalar was not inlined"
+        );
+        Ok(())
     }
 
     #[test]
@@ -510,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn fact_serde_roundtrip() {
+    fn fact_serde_roundtrip() -> anyhow::Result<()> {
         let f = Fact {
             id: OperationId::new(ProcessId::new(2), NodeId::new(1), 0),
             schema_version: Fact::SCHEMA_VERSION,
@@ -527,18 +532,31 @@ mod tests {
             replay: ReplayClass::Deterministic,
             timestamp: Timestamp::millis(123),
         };
-        let s = serde_json::to_string(&f).unwrap();
-        let back: Fact = serde_json::from_str(&s).unwrap();
-        assert_eq!(f, back);
+        let s = serde_json::to_string(&f)?;
+        let back: Fact = serde_json::from_str(&s)?;
+        ensure!(f == back, "fact serde roundtrip changed value");
+        Ok(())
     }
 
     #[test]
-    fn batch_summary_summarizes_shape_without_replacing_outcome() {
+    fn batch_summary_summarizes_shape_without_replacing_outcome() -> anyhow::Result<()> {
         let input = Value::List(vec![Value::Str("alpha".into()), Value::Str("beta".into())]);
         let outcome = OutcomeRef::of(Value::List(vec![Value::Int(1), Value::Int(2)]));
-        let summary = BatchSummary::new(&input, Some(&outcome)).unwrap();
-        assert_eq!(summary.elements, 2);
-        assert!(matches!(outcome, OutcomeRef::Inline(Value::List(_))));
-        assert!(matches!(summary.to_value(), Value::Map(_)));
+        let summary = BatchSummary::new(&input, Some(&outcome))
+            .ok_or_else(|| anyhow::anyhow!("batch summary was not created"))?;
+        ensure!(
+            summary.elements == 2,
+            "unexpected batch elements: {}",
+            summary.elements
+        );
+        ensure!(
+            matches!(outcome, OutcomeRef::Inline(Value::List(_))),
+            "outcome was replaced"
+        );
+        ensure!(
+            matches!(summary.to_value(), Value::Map(_)),
+            "summary did not render as map"
+        );
+        Ok(())
     }
 }

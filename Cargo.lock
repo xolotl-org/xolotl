@@ -1327,32 +1327,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nexus-actors"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "blake3",
- "chacha20poly1305",
- "criterion",
- "getrandom 0.4.2",
- "glob",
- "hkdf",
- "nexus-graph",
- "nexus-kernel",
- "nexus-state",
- "nexus-types",
- "parking_lot",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "thiserror",
- "tokio",
- "url",
-]
-
-[[package]]
 name = "nexus-console"
 version = "0.1.0"
 dependencies = [
@@ -1365,9 +1339,9 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.2",
  "hmac",
- "nexus-actors",
  "nexus-graph",
  "nexus-kernel",
+ "nexus-standard",
  "nexus-state",
  "nexus-types",
  "rmp-serde",
@@ -1379,6 +1353,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tower-http",
+ "tracing",
 ]
 
 [[package]]
@@ -1390,7 +1365,6 @@ dependencies = [
  "blake3",
  "dotenvy",
  "getrandom 0.4.2",
- "nexus-actors",
  "nexus-console",
  "nexus-gateway",
  "nexus-gateway-grpc",
@@ -1398,6 +1372,8 @@ dependencies = [
  "nexus-kernel",
  "nexus-proto",
  "nexus-sdk",
+ "nexus-standard",
+ "nexus-state",
  "nexus-storage-redb",
  "nexus-types",
  "serde",
@@ -1413,10 +1389,12 @@ dependencies = [
 name = "nexus-gateway"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "blake3",
+ "chacha20poly1305",
  "getrandom 0.4.2",
- "nexus-actors",
+ "hkdf",
  "nexus-graph",
  "nexus-kernel",
  "nexus-proto",
@@ -1429,53 +1407,61 @@ dependencies = [
  "subtle",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "nexus-gateway-grpc"
 version = "0.1.0"
 dependencies = [
- "nexus-actors",
+ "anyhow",
  "nexus-gateway",
  "nexus-proto",
  "nexus-types",
  "prost",
  "tokio",
  "tonic",
+ "tracing",
 ]
 
 [[package]]
 name = "nexus-gateway-mcp"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "base64",
  "nexus-gateway",
  "nexus-kernel",
  "nexus-types",
  "serde",
  "serde_json",
+ "std-uritemplate",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "nexus-gateway-websocket"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "futures-util",
- "nexus-actors",
  "nexus-gateway",
  "nexus-proto",
  "nexus-types",
  "prost",
  "tokio",
  "tonic",
+ "tracing",
 ]
 
 [[package]]
 name = "nexus-graph"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "blake3",
  "criterion",
  "nexus-types",
@@ -1488,6 +1474,7 @@ dependencies = [
 name = "nexus-kernel"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "blake3",
  "criterion",
@@ -1505,6 +1492,7 @@ dependencies = [
 name = "nexus-plan"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "nexus-graph",
  "nexus-types",
  "serde",
@@ -1517,6 +1505,7 @@ dependencies = [
 name = "nexus-proto"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "criterion",
  "nexus-graph",
  "nexus-types",
@@ -1530,11 +1519,11 @@ dependencies = [
 name = "nexus-sdk"
 version = "0.1.0"
 dependencies = [
- "nexus-actors",
- "nexus-gateway",
+ "anyhow",
  "nexus-graph",
  "nexus-kernel",
  "nexus-plan",
+ "nexus-standard",
  "nexus-state",
  "nexus-types",
  "serde_json",
@@ -1545,6 +1534,7 @@ dependencies = [
 name = "nexus-sim"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "nexus-graph",
  "nexus-kernel",
@@ -1554,9 +1544,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus-standard"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "criterion",
+ "getrandom 0.4.2",
+ "glob",
+ "nexus-graph",
+ "nexus-kernel",
+ "nexus-state",
+ "nexus-types",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "nexus-state"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "criterion",
  "dashmap",
@@ -1571,6 +1586,7 @@ dependencies = [
 name = "nexus-storage-redb"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "criterion",
  "nexus-kernel",
@@ -1587,6 +1603,7 @@ dependencies = [
 name = "nexus-types"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bitflags",
  "serde",
  "serde_json",
@@ -2388,6 +2405,12 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "std-uritemplate"
+version = "2.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c588687f213c025e3a8e949923d1861d8183b60b015e2136edfee082efc7a93"
 
 [[package]]
 name = "subtle"

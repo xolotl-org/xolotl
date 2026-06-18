@@ -606,7 +606,7 @@ impl Executor {
     }
     /// Resolve a `Wait(Signal)` by subscribing to `path` and returning when the
     /// first matching write arrives (or a bounded number of unrelated events
-    /// pass, to avoid wedging on a silent path).
+    /// pass without a match).
     async fn wait_signal(&self, state: &nexus_state::Backend, path: &nexus_types::Path) -> Outcome {
         use nexus_state::StateEvent;
         // If the signal is already present, return immediately.
@@ -631,10 +631,16 @@ impl Executor {
                     return Outcome::Done(item);
                 }
                 Ok(_) => continue,
-                Err(_) => {
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     return Outcome::Fail(nexus_types::Failure::policy(
                         "executor",
                         "wait signal channel closed",
+                    ));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    return Outcome::Fail(nexus_types::Failure::policy(
+                        "executor",
+                        format!("wait signal channel lagged and dropped {skipped} events"),
                     ));
                 }
             }
@@ -831,7 +837,10 @@ impl Executor {
         if let Some(m) = self.method_cache.read().get(&key) {
             return Some(m.clone());
         }
-        let resource_id = self.registry.resolve_resource(target).ok()?;
+        let resource_id = match self.registry.resolve_resource(target) {
+            Ok(resource_id) => resource_id,
+            Err(crate::registry::ResolveError::NoSuchResource(_)) => return None,
+        };
         let meta = self.compile_meta(resource_id, method_name)?;
         self.method_cache.write().insert(key, meta.clone());
         Some(meta)
@@ -961,10 +970,10 @@ fn is_outbound(target: &ResourceName) -> bool {
 /// Current wall clock in millis since epoch.
 pub fn now_millis() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as i64,
+        Err(err) => -(err.duration().as_millis() as i64),
+    }
 }
 
 #[cfg(test)]
@@ -974,6 +983,7 @@ mod tests {
     use crate::fact::FactSink;
     use crate::handle::HandleTable;
     use crate::open::{OpenRequest, open_resource};
+    use anyhow::{Context, bail, ensure};
     use nexus_state::{Backend, InMemoryBackend};
     use nexus_types::{
         Binding, ConstraintSet, DriverRef, Expiry, Grant, Interface, InterfaceFamily, InterfaceSet,
@@ -999,6 +1009,10 @@ mod tests {
 
     fn s(name: &str) -> StepRef {
         StepRef::new(ProcessId::new(1), name)
+    }
+
+    fn rn(path: &str) -> anyhow::Result<ResourceName> {
+        Ok(ResourceName::new(Path::parse(path)?))
     }
 
     #[derive(Clone)]
@@ -1053,7 +1067,7 @@ mod tests {
         reg: &Registry,
         spec: TestResourceSpec,
         driver: Arc<dyn Driver>,
-    ) -> (ResourceId, ResourceName) {
+    ) -> anyhow::Result<(ResourceId, ResourceName)> {
         let iface_id = reg.next_interface_id();
         reg.register_interface(Interface {
             id: iface_id,
@@ -1083,7 +1097,7 @@ mod tests {
         let binding_id = reg.next_binding_id();
         reg.admit_binding(Binding {
             id: binding_id,
-            selector: ResourceSelector::parse(spec.selector).unwrap(),
+            selector: ResourceSelector::parse(spec.selector)?,
             interfaces: InterfaceSet::new(vec![iface_id]),
             driver: DriverRef {
                 id: driver_id,
@@ -1092,8 +1106,8 @@ mod tests {
             endpoint: None,
             generation: 1,
         })
-        .unwrap();
-        let name = ResourceName::new(Path::parse(spec.path).unwrap());
+        .context("test binding admission failed")?;
+        let name = rn(spec.path)?;
         let rid = reg.next_resource_id();
         reg.admit_resource(
             Resource {
@@ -1108,38 +1122,41 @@ mod tests {
             },
             true,
         )
-        .unwrap();
-        (rid, name)
+        .context("test resource admission failed")?;
+        Ok((rid, name))
     }
 
     #[tokio::test]
-    async fn pure_evaluates() {
+    async fn pure_evaluates() -> anyhow::Result<()> {
         let ex = executor();
-        assert_eq!(
-            ex.eval(&DoNode::pure(Value::Int(5))).await,
-            Outcome::Done(Value::Int(5))
+        let out = ex.eval(&DoNode::pure(Value::Int(5))).await;
+        ensure!(
+            out == Outcome::Done(Value::Int(5)),
+            "pure node outcome mismatch: {out:?}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn acting_denied_without_delegate_grant() {
+    async fn acting_denied_without_delegate_grant() -> anyhow::Result<()> {
         // Process 1 holds no grants (empty registry). An Acting block must be
-        // denied fail-closed — no silent identity switch.
+        // denied fail-closed.
         let ex = executor();
         let prog = DoNode::acting(
-            nexus_types::Path::parse("process/bob").unwrap(),
+            nexus_types::Path::parse("process/bob")?,
             DoNode::pure(Value::Int(1)),
         );
         match ex.eval(&prog).await {
             Outcome::Fail(nexus_types::Failure::PolicyViolation { policy, .. }) => {
-                assert_eq!(policy, "act-as");
+                ensure!(policy == "act-as", "unexpected policy: {policy}");
             }
-            other => panic!("expected act-as PolicyViolation, got {other:?}"),
+            other => bail!("expected act-as PolicyViolation, got {other:?}"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn acting_allowed_with_delegate_grant() {
+    async fn acting_allowed_with_delegate_grant() -> anyhow::Result<()> {
         use nexus_types::{Expiry, Grant, MethodBitmap, ResourceSelector, RightFlags, Rights};
         let (facts, _) = FactSink::in_memory();
         let dp = DataPlane::new(
@@ -1151,21 +1168,26 @@ mod tests {
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("act-as://process/bob").unwrap(),
+            selector: ResourceSelector::parse("act-as://process/bob")?,
             rights: Rights::new(MethodBitmap::ALL, RightFlags::DELEGATE),
             constraints: nexus_types::ConstraintSet::empty(),
             expires: Expiry::Never,
         });
         let ex = Executor::new(ProcessId::new(1), dp, reg, StepTable::new());
         let prog = DoNode::acting(
-            nexus_types::Path::parse("process/bob").unwrap(),
+            nexus_types::Path::parse("process/bob")?,
             DoNode::pure(Value::Int(7)),
         );
-        assert_eq!(ex.eval(&prog).await, Outcome::Done(Value::Int(7)));
+        let out = ex.eval(&prog).await;
+        ensure!(
+            out == Outcome::Done(Value::Int(7)),
+            "delegate grant should allow acting, got {out:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cancelled_process_short_circuits_at_operation_boundary() {
+    async fn cancelled_process_short_circuits_at_operation_boundary() -> anyhow::Result<()> {
         // A process marked Cancelled must not issue its Operation: the boundary
         // check short-circuits to Failure::Cancelled.
         use crate::process::{ProcessEntry, ProcessTable};
@@ -1188,20 +1210,22 @@ mod tests {
         // A bare Operation node (target need not resolve — the cancel check fires
         // before resource resolution).
         let prog = DoNode::op(OperationTemplate {
-            target: ResourceName::new(nexus_types::Path::parse("effect://x/post").unwrap()),
+            target: rn("effect://x/post")?,
             method: "invoke".into(),
             method_id: None,
             output: nexus_types::OutputMode::Unary,
             literal_input: Some(Value::Null),
         });
-        assert_eq!(
-            ex.eval(&prog).await,
-            Outcome::Fail(nexus_types::Failure::Cancelled)
+        let out = ex.eval(&prog).await;
+        ensure!(
+            out == Outcome::Fail(nexus_types::Failure::Cancelled),
+            "cancelled process should short-circuit, got {out:?}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn acting_denied_when_grant_lacks_delegate_flag() {
+    async fn acting_denied_when_grant_lacks_delegate_flag() -> anyhow::Result<()> {
         use nexus_types::{Expiry, Grant, MethodBitmap, ResourceSelector, RightFlags, Rights};
         let (facts, _) = FactSink::in_memory();
         let dp = DataPlane::new(
@@ -1214,96 +1238,130 @@ mod tests {
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("act-as://process/bob").unwrap(),
+            selector: ResourceSelector::parse("act-as://process/bob")?,
             rights: Rights::new(MethodBitmap::ALL, RightFlags::CLONE),
             constraints: nexus_types::ConstraintSet::empty(),
             expires: Expiry::Never,
         });
         let ex = Executor::new(ProcessId::new(1), dp, reg, StepTable::new());
         let prog = DoNode::acting(
-            nexus_types::Path::parse("process/bob").unwrap(),
+            nexus_types::Path::parse("process/bob")?,
             DoNode::pure(Value::Int(1)),
         );
-        assert!(matches!(
-            ex.eval(&prog).await,
-            Outcome::Fail(nexus_types::Failure::PolicyViolation { .. })
-        ));
+        let out = ex.eval(&prog).await;
+        ensure!(
+            matches!(
+                out,
+                Outcome::Fail(nexus_types::Failure::PolicyViolation { .. })
+            ),
+            "acting without delegate flag should fail, got {out:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn and_then_runs_step() {
+    async fn and_then_runs_step() -> anyhow::Result<()> {
         let ex = executor();
         ex.steps.install(ex.process, "double", |v, _| match v {
             Value::Int(i) => DoNode::pure(Value::Int(i * 2)),
             _ => DoNode::pure(Value::Null),
         });
         let prog = DoNode::pure(Value::Int(21)).and_then(s("double"));
-        assert_eq!(ex.eval(&prog).await, Outcome::Done(Value::Int(42)));
+        let out = ex.eval(&prog).await;
+        ensure!(
+            out == Outcome::Done(Value::Int(42)),
+            "and_then output mismatch: {out:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn step_ref_must_belong_to_current_process() {
+    async fn step_ref_must_belong_to_current_process() -> anyhow::Result<()> {
         let ex = executor();
         ex.steps.install(ex.process, "double", |v, _| match v {
             Value::Int(i) => DoNode::pure(Value::Int(i * 2)),
             _ => DoNode::pure(Value::Null),
         });
         let prog = DoNode::pure(Value::Int(21)).and_then(StepRef::new(ProcessId::new(2), "double"));
-        assert!(matches!(
-            ex.eval(&prog).await,
-            Outcome::Fail(nexus_types::Failure::PolicyViolation { policy, .. }) if policy == "step"
-        ));
+        let out = ex.eval(&prog).await;
+        ensure!(
+            matches!(out, Outcome::Fail(nexus_types::Failure::PolicyViolation { ref policy, .. }) if policy == "step"),
+            "cross-process step ref should fail, got {out:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn or_else_recovers() {
+    async fn or_else_recovers() -> anyhow::Result<()> {
         let ex = executor();
         ex.steps.install(ex.process, "fallback", |_, _| {
             DoNode::pure(Value::Str("ok".into()))
         });
         let prog = DoNode::fail(nexus_types::Failure::Cancelled).or_else(s("fallback"));
-        assert_eq!(ex.eval(&prog).await, Outcome::Done(Value::Str("ok".into())));
+        let out = ex.eval(&prog).await;
+        ensure!(
+            out == Outcome::Done(Value::Str("ok".into())),
+            "or_else recovery mismatch: {out:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn or_else_passes_through_success() {
+    async fn or_else_passes_through_success() -> anyhow::Result<()> {
         let ex = executor();
         ex.steps.install(ex.process, "never", |_, _| {
             DoNode::pure(Value::Str("recovered".into()))
         });
         let prog = DoNode::pure(Value::Int(1)).or_else(s("never"));
-        assert_eq!(ex.eval(&prog).await, Outcome::Done(Value::Int(1)));
+        let out = ex.eval(&prog).await;
+        ensure!(
+            out == Outcome::Done(Value::Int(1)),
+            "or_else success passthrough mismatch"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn let_use_binds() {
+    async fn let_use_binds() -> anyhow::Result<()> {
         let ex = executor();
         let prog = DoNode::r#let("x", DoNode::pure(Value::Int(7)), DoNode::use_("x"));
-        assert_eq!(ex.eval(&prog).await, Outcome::Done(Value::Int(7)));
+        let out = ex.eval(&prog).await;
+        ensure!(
+            out == Outcome::Done(Value::Int(7)),
+            "let/use output mismatch: {out:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn both_joins_pair() {
+    async fn both_joins_pair() -> anyhow::Result<()> {
         let ex = executor();
         let prog = DoNode::both(DoNode::pure(Value::Int(1)), DoNode::pure(Value::Int(2)));
-        assert_eq!(
-            ex.eval(&prog).await,
-            Outcome::Done(Value::List(vec![Value::Int(1), Value::Int(2)]))
+        let out = ex.eval(&prog).await;
+        ensure!(
+            out == Outcome::Done(Value::List(vec![Value::Int(1), Value::Int(2)])),
+            "both output mismatch: {out:?}"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn both_fails_if_either_arm_fails() {
+    async fn both_fails_if_either_arm_fails() -> anyhow::Result<()> {
         let ex = executor();
         let prog = DoNode::both(
             DoNode::pure(Value::Int(1)),
             DoNode::fail(nexus_types::Failure::Cancelled),
         );
-        assert!(matches!(ex.eval(&prog).await, Outcome::Fail(_)));
+        let out = ex.eval(&prog).await;
+        ensure!(
+            matches!(out, Outcome::Fail(_)),
+            "both should fail, got {out:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn race_takes_first_success() {
+    async fn race_takes_first_success() -> anyhow::Result<()> {
         let ex = executor();
         let prog = DoNode::race(
             DoNode::pure(Value::Str("a".into())),
@@ -1313,22 +1371,28 @@ mod tests {
         // bias toward the first-polled arm in tokio::select! is not guaranteed,
         // so accept either).
         let out = ex.eval(&prog).await;
-        assert!(matches!(out, Outcome::Done(Value::Str(ref s)) if s == "a" || s == "b"));
+        ensure!(
+            matches!(out, Outcome::Done(Value::Str(ref s)) if s == "a" || s == "b"),
+            "race output mismatch: {out:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn unbound_use_fails_at_compile() {
+    async fn unbound_use_fails_at_compile() -> anyhow::Result<()> {
         let ex = executor();
         // A bare Use with no enclosing Let fails to compile → executor surfaces
         // a policy failure rather than panicking.
-        assert!(matches!(
-            ex.eval(&DoNode::use_("nope")).await,
-            Outcome::Fail(_)
-        ));
+        let out = ex.eval(&DoNode::use_("nope")).await;
+        ensure!(
+            matches!(out, Outcome::Fail(_)),
+            "unbound use should fail, got {out:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn chained_and_then_keeps_threading_value() {
+    async fn chained_and_then_keeps_threading_value() -> anyhow::Result<()> {
         let ex = executor();
         ex.steps.install(ex.process, "inc", |v, _| match v {
             Value::Int(i) => DoNode::pure(Value::Int(i + 1)),
@@ -1338,18 +1402,28 @@ mod tests {
             .and_then(s("inc"))
             .and_then(s("inc"))
             .and_then(s("inc"));
-        assert_eq!(ex.eval(&prog).await, Outcome::Done(Value::Int(3)));
+        let out = ex.eval(&prog).await;
+        ensure!(
+            out == Outcome::Done(Value::Int(3)),
+            "chained and_then output mismatch"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn wait_deadline_in_past_returns_immediately() {
+    async fn wait_deadline_in_past_returns_immediately() -> anyhow::Result<()> {
         let ex = executor();
         let prog = DoNode::wait_deadline(0); // epoch — already passed
-        assert_eq!(ex.eval(&prog).await, Outcome::Done(Value::Null));
+        let out = ex.eval(&prog).await;
+        ensure!(
+            out == Outcome::Done(Value::Null),
+            "past deadline output mismatch: {out:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn wait_signal_resolves_on_write() {
+    async fn wait_signal_resolves_on_write() -> anyhow::Result<()> {
         let state = test_state();
         let (facts, _) = FactSink::in_memory();
         let dp = DataPlane::new(
@@ -1359,98 +1433,120 @@ mod tests {
         );
         let ex = Executor::new(ProcessId::new(1), dp, Registry::new(), StepTable::new())
             .with_state(state.clone());
-        let signal = nexus_types::Path::parse("state://stream/1/sig").unwrap();
+        let signal = nexus_types::Path::parse("state://stream/1/sig")?;
         // Write the signal after a short delay; the Wait must observe it.
         let writer = {
             let state = state.clone();
             let signal = signal.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                state.write_set(&signal, Value::Int(99)).await.unwrap();
+                state.write_set(&signal, Value::Int(99)).await?;
+                Ok::<(), anyhow::Error>(())
             })
         };
         let out = ex.eval(&DoNode::wait_signal(signal)).await;
-        writer.await.unwrap();
-        assert_eq!(out, Outcome::Done(Value::Int(99)));
+        writer
+            .await
+            .context("signal writer task failed to join")??;
+        ensure!(
+            out == Outcome::Done(Value::Int(99)),
+            "wait signal output mismatch: {out:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn wait_signal_without_state_fails() {
+    async fn wait_signal_without_state_fails() -> anyhow::Result<()> {
         let ex = executor(); // no state backend bound
-        let signal = nexus_types::Path::parse("state://stream/1/sig").unwrap();
-        assert!(matches!(
-            ex.eval(&DoNode::wait_signal(signal)).await,
-            Outcome::Fail(_)
-        ));
+        let signal = nexus_types::Path::parse("state://stream/1/sig")?;
+        let out = ex.eval(&DoNode::wait_signal(signal)).await;
+        ensure!(
+            matches!(out, Outcome::Fail(_)),
+            "wait without state should fail, got {out:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn causal_positions_match_compiled_graph() {
+    fn causal_positions_match_compiled_graph() -> anyhow::Result<()> {
         // The Operations the executor issues carry the compiler's NodeIds. Here
         // we just assert the compiled graph is what the executor walks: a
         // 2-node chain (Op, Step) numbers the Op at 0 (its CausalPosition).
         use nexus_graph::{NodeKind, compile_do};
         let prog = DoNode::op(nexus_graph::OperationTemplate {
-            target: ResourceName::new(nexus_types::Path::parse("effect://x/post").unwrap()),
+            target: rn("effect://x/post")?,
             method: "invoke".into(),
             method_id: None,
             output: nexus_types::OutputMode::Unary,
             literal_input: None,
         })
         .and_then(s("s"));
-        let g = compile_do(&prog).unwrap();
-        assert!(matches!(
-            g.node(NodeId::new(0)).unwrap().kind,
-            NodeKind::Operation(_)
-        ));
-    }
-
-    #[test]
-    fn intrinsic_source_classifies_targets() {
-        use nexus_types::TaintSource;
-        let infer =
-            ResourceName::new(nexus_types::Path::parse("effect://inference/infer").unwrap());
-        assert!(matches!(
-            intrinsic_source(&infer),
-            Some(TaintSource::ModelOutput)
-        ));
-        let fetch = ResourceName::new(nexus_types::Path::parse("effect://fetch/get").unwrap());
-        assert!(matches!(
-            intrinsic_source(&fetch),
-            Some(TaintSource::Fetched { .. })
-        ));
-        let vault = ResourceName::new(nexus_types::Path::parse("state://vault/alice/x").unwrap());
-        assert!(matches!(
-            intrinsic_source(&vault),
-            Some(TaintSource::Protected { .. })
-        ));
-        let plain = ResourceName::new(nexus_types::Path::parse("state://memory/alice").unwrap());
-        assert!(intrinsic_source(&plain).is_none());
-    }
-
-    #[test]
-    fn is_outbound_classifies_targets() {
-        let post =
-            ResourceName::new(nexus_types::Path::parse("effect://chat_platform/post").unwrap());
-        assert!(is_outbound(&post));
-        let instant_messaging_platform = ResourceName::new(
-            nexus_types::Path::parse("effect://instant_messaging_platform/notify").unwrap(),
+        let g = compile_do(&prog).context("compile_do failed")?;
+        let node = g.node(NodeId::new(0)).context("missing node 0")?;
+        ensure!(
+            matches!(node.kind, NodeKind::Operation(_)),
+            "node 0 should be an operation"
         );
-        assert!(is_outbound(&instant_messaging_platform));
-        let http_callback =
-            ResourceName::new(nexus_types::Path::parse("effect://http_callback/notify").unwrap());
-        assert!(is_outbound(&http_callback));
-        let email = ResourceName::new(nexus_types::Path::parse("effect://email/send").unwrap());
-        assert!(is_outbound(&email));
-        let infer =
-            ResourceName::new(nexus_types::Path::parse("effect://inference/infer").unwrap());
-        assert!(!is_outbound(&infer));
-        let read = ResourceName::new(nexus_types::Path::parse("state://memory/alice").unwrap());
-        assert!(!is_outbound(&read));
+        Ok(())
+    }
+
+    #[test]
+    fn intrinsic_source_classifies_targets() -> anyhow::Result<()> {
+        use nexus_types::TaintSource;
+        let infer = rn("effect://inference/infer")?;
+        ensure!(
+            matches!(intrinsic_source(&infer), Some(TaintSource::ModelOutput)),
+            "inference target should be model output taint"
+        );
+        let fetch = rn("effect://fetch/get")?;
+        ensure!(
+            matches!(intrinsic_source(&fetch), Some(TaintSource::Fetched { .. })),
+            "fetch target should be fetched taint"
+        );
+        let vault = rn("state://vault/alice/x")?;
+        ensure!(
+            matches!(
+                intrinsic_source(&vault),
+                Some(TaintSource::Protected { .. })
+            ),
+            "vault target should be protected taint"
+        );
+        let plain = rn("state://memory/alice")?;
+        ensure!(
+            intrinsic_source(&plain).is_none(),
+            "plain memory target should not have intrinsic taint"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn is_outbound_classifies_targets() -> anyhow::Result<()> {
+        let post = rn("effect://chat_platform/post")?;
+        ensure!(is_outbound(&post), "chat platform post should be outbound");
+        let instant_messaging_platform = rn("effect://instant_messaging_platform/notify")?;
+        ensure!(
+            is_outbound(&instant_messaging_platform),
+            "instant messaging notify should be outbound"
+        );
+        let http_callback = rn("effect://http_callback/notify")?;
+        ensure!(
+            is_outbound(&http_callback),
+            "HTTP callback notify should be outbound"
+        );
+        let email = rn("effect://email/send")?;
+        ensure!(is_outbound(&email), "email send should be outbound");
+        let infer = rn("effect://inference/infer")?;
+        ensure!(
+            !is_outbound(&infer),
+            "inference target should not be outbound"
+        );
+        let read = rn("state://memory/alice")?;
+        ensure!(!is_outbound(&read), "state read should not be outbound");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn protected_data_to_outbound_is_denied() {
+    async fn protected_data_to_outbound_is_denied() -> anyhow::Result<()> {
         // A value tainted Protected (read from vault) flowing into an outbound
         // Operation is structurally denied — the taint gate fires before
         // resource resolution would.
@@ -1458,13 +1554,11 @@ mod tests {
         let ex = executor();
         let env = Env::root().with_taint(nexus_types::TaintSet::of(
             nexus_types::TaintSource::Protected {
-                path: nexus_types::Path::parse("state://vault/alice/x").unwrap(),
+                path: nexus_types::Path::parse("state://vault/alice/x")?,
             },
         ));
         let tmpl = OperationTemplate {
-            target: ResourceName::new(
-                nexus_types::Path::parse("effect://chat_platform/post").unwrap(),
-            ),
+            target: rn("effect://chat_platform/post")?,
             method: "invoke".into(),
             method_id: None,
             output: nexus_types::OutputMode::Unary,
@@ -1481,23 +1575,24 @@ mod tests {
             .await;
         match out {
             Outcome::Fail(nexus_types::Failure::PolicyViolation { policy, .. }) => {
-                assert_eq!(policy, "taint");
+                ensure!(policy == "taint", "unexpected policy: {policy}");
             }
-            other => panic!("expected taint PolicyViolation, got {other:?}"),
+            other => bail!("expected taint PolicyViolation, got {other:?}"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn persisted_protected_state_taint_blocks_later_outbound_op() {
+    async fn persisted_protected_state_taint_blocks_later_outbound_op() -> anyhow::Result<()> {
         let state = test_state();
-        let secret_path = Path::parse("state://memory/private").unwrap();
+        let secret_path = Path::parse("state://memory/private")?;
         let protected = TaintSet::of(TaintSource::Protected {
             path: secret_path.clone(),
         });
         state
             .write_set_tainted(&secret_path, Value::Str("secret".into()), protected)
             .await
-            .unwrap();
+            .context("writing tainted state failed")?;
 
         let reg = Registry::new();
         reg.register_grant(Grant {
@@ -1524,7 +1619,7 @@ mod tests {
             Arc::new(TestStateReadDriver {
                 state: state.clone(),
             }),
-        );
+        )?;
         let (post_resource, post_name) = register_test_resource(
             &reg,
             TestResourceSpec {
@@ -1539,7 +1634,7 @@ mod tests {
                 selector: "perform://effect/chat_platform/post",
             },
             Arc::new(EchoDriver),
-        );
+        )?;
 
         let (facts, _) = FactSink::in_memory();
         let handles = Arc::new(RwLock::new(HandleTable::new()));
@@ -1562,7 +1657,7 @@ mod tests {
                     now_millis: 0,
                 },
             )
-            .unwrap()
+            .context("state read open failed")?
         };
         ex.bind_handle(read_target.clone(), read_handle);
 
@@ -1581,7 +1676,7 @@ mod tests {
                     now_millis: 0,
                 },
             )
-            .unwrap()
+            .context("post open failed")?
         };
         ex.bind_handle(post_name.clone(), post_handle);
 
@@ -1607,9 +1702,10 @@ mod tests {
 
         match ex.eval(&prog).await {
             Outcome::Fail(nexus_types::Failure::PolicyViolation { policy, .. }) => {
-                assert_eq!(policy, "taint");
+                ensure!(policy == "taint", "unexpected policy: {policy}");
             }
-            other => panic!("expected taint PolicyViolation, got {other:?}"),
+            other => bail!("expected taint PolicyViolation, got {other:?}"),
         }
+        Ok(())
     }
 }

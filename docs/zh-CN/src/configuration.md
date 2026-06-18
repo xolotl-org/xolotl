@@ -127,6 +127,14 @@ daemon 的控制台 listener 当前是 plain listener。`local_trusted` 只用�
 
 ## 运行时配置
 
-运行时 Provider 设置、模型路由、组、绑定、外部程序安装、Provider projection、Source projection 和策略管理状态都属于 Nexus state，并通过 Console WebSocket 管理。
+运行时 Provider 设置、模型路由、组、绑定、进程内 Provider/Source projection 声明、外部 Provider/Source installation 声明和策略管理状态都属于 Nexus state，并通过 Console WebSocket action 管理。External projection 是 installation 声明的一部分。External 声明使用 `external.*`，inference 声明使用 `inference.*`，进程内 projection 声明使用 `projection.in_process.*`。泛用 `config.*` action 会拒绝已经有专用 action family 的运行时配置路径。
+
+`nexus-standard` Cargo feature 决定哪些进程内实现被编译进宿主二进制。可选进程内 projection 声明位于
+`state://kernel/projections/in-process/<id>`。
+
+HTTP inference provider 只有在宿主二进制启用对应 `nexus-standard` feature 时才会编译。
+运行时声明放在 `state://kernel/inference/*` 和 `state://kernel/routing/inference`；
+backend 记录只保存 `state://vault/inference/<backend>/api_key` 这类 secret 引用，
+不保存原始 API key。
 
 控制台认证、WebSocket 和传输安全字段是部署设置。能力检查、二次确认门槛、按路径准入、动作注册表校验和敏感值脱敏始终由运行时路径执行。

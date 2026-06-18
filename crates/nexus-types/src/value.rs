@@ -484,16 +484,18 @@ pub enum ValueError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::ensure;
 
     #[test]
-    fn value_serde_roundtrip() {
+    fn value_serde_roundtrip() -> anyhow::Result<()> {
         let mut m = BTreeMap::new();
         m.insert("a".into(), Value::Int(1));
         m.insert("b".into(), Value::Str("x".into()));
         let v = Value::Map(m);
-        let s = serde_json::to_string(&v).unwrap();
-        let back: Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v, back);
+        let s = serde_json::to_string(&v)?;
+        let back: Value = serde_json::from_str(&s)?;
+        ensure!(v == back, "serde roundtrip changed value");
+        Ok(())
     }
 
     #[test]
@@ -505,11 +507,15 @@ mod tests {
     }
 
     #[test]
-    fn failure_display() {
+    fn failure_display() -> anyhow::Result<()> {
         let f = Failure::NoHandler {
-            path: crate::path::p("effect://x/post"),
+            path: crate::path::p("effect://x/post")?,
         };
-        assert!(f.to_string().contains("effect://x/post"));
+        ensure!(
+            f.to_string().contains("effect://x/post"),
+            "failure display omitted path"
+        );
+        Ok(())
     }
 
     #[test]

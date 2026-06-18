@@ -36,7 +36,7 @@ listener address and frame encoding:
 | Run management actions, inspect runtime state, manage users, manage sessions, subscribe to state or audit streams | Console Protocol |
 | Connect an external program that provides effect handlers | External gateway as Provider |
 | Connect an external program that emits inbound events or receives outbound commands | External gateway as Source |
-| Publish selected Nexus effects as MCP tools through explicit publish capabilities | MCP |
+| Publish selected Gateway publications as MCP tools, resources, resource templates, and prompts | MCP |
 
 ## External Gateway
 
@@ -46,15 +46,43 @@ Provider and Source are the only external projection roles.
 The daemon owns session admission and authority:
 
 1. the external program sends `RoleSessionClientHello`;
-2. the daemon loads the installation, projection, pairing, and approved session
-   state;
+2. the daemon loads the installation, its selected projection, pairing, and
+   approved session state;
 3. the daemon sends `SessionContext` with authoritative generations and limits;
 4. the external program replies with `RoleReady`;
 5. business frames flow only after the session is ready.
 
-Provider readiness registers projected bindings for that ready session. Source
-events are admitted only after generation checks, schema checks, dedupe,
-capacity checks, rate checks, and policy checks pass.
+Provider bindings come from the installation projection; `RoleReady` only
+confirms the selected session context. Source events are admitted only after
+generation checks, schema checks, dedupe, capacity checks, rate checks, and
+policy checks pass.
+
+## MCP
+
+MCP server support is defined by Gateway publications. A publication names one
+Gateway surface for the `mcp` protocol and declares one kind: `tool`,
+`resource`, `resource_template`, or `prompt`. It does not repeat the effect
+target, schema, or caller binding. Discovery returns only MCP publications whose
+surface is visible to the authenticated principal. Tool calls, resource reads,
+and prompt requests submit through the published surface id, so schema checks,
+limits, policy, Handle ownership, Facts, taint, and audit stay on the shared
+Gateway path.
+
+Publishing requires the referenced surface to carry a `publish://...`
+capability that covers the target effect. MCP clients never submit raw effect
+paths, raw capabilities, acting identities, or raw Operations.
+
+The MCP adapter negotiates `2025-11-25` first and keeps compatible recent
+protocol versions in the handshake. It implements initialize, ping, tool,
+resource, resource template, prompt, and completion requests. It does not
+advertise logging, resource subscriptions, list-change notifications, or task
+execution.
+
+MCP-specific fields stay in publication properties. `icons`, `mimeType`, `size`,
+prompt `arguments`, and static `completions` are read by the MCP adapter.
+Gateway still owns the surface target, schemas, bindings, limits, and audit
+path. Tool results may return native MCP `content`, `structuredContent`,
+`isError`, and `_meta`; content blocks are validated before they are sent.
 
 ## Console Protocol
 

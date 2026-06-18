@@ -156,9 +156,24 @@ daemon-owned console TLS material is configured.
 
 ## Runtime Configuration
 
-Runtime provider setup, model routing, groups, bindings, external program
-installations, Provider projections, Source projections, and policy-managed
-state belong in Nexus state and are managed through Console WebSocket.
+Runtime provider setup, model routing, groups, bindings, in-process Provider or
+Source projection declarations, external Provider/Source installation declarations, and
+policy-managed state belong in Nexus state and are managed through Console
+WebSocket actions.
+External projections are part of each installation declaration. External
+declarations use `external.*`; inference declarations use `inference.*`;
+in-process projection declarations use `projection.in_process.*`. Generic `config.*`
+actions reject runtime config paths that have a dedicated action family.
+
+`nexus-standard` Cargo features decide which in-process implementations are
+compiled into the host binary. Optional in-process projection declarations live under
+`state://kernel/projections/in-process/<id>`.
+
+HTTP inference providers are compiled only when the host binary enables the
+matching `nexus-standard` feature. Runtime declarations live under
+`state://kernel/inference/*` and `state://kernel/routing/inference`; backend
+records store secret references such as
+`state://vault/inference/<backend>/api_key`, not raw API keys.
 
 Console auth, WebSocket, and transport-security fields are deployment settings.
 Capability checks, step-up gates, path-specific admission, action registry

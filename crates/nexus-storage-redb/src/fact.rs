@@ -237,6 +237,7 @@ fn ensure_fact_schema(fact: &Fact) -> Result<(), FactError> {
 mod tests {
     use super::*;
     use crate::RedbStore;
+    use anyhow::{anyhow, ensure};
     use nexus_types::{
         DecisionTag, HandleId, IdentityRef, MethodId, NodeId, OutcomeRef, ProcessId, ReplayClass,
         ResourceId, Timestamp, Value, ValueRef,
@@ -266,75 +267,98 @@ mod tests {
     }
 
     #[test]
-    fn append_then_complete_updates_in_place() {
-        let dir = tempfile::tempdir().unwrap();
+    fn append_then_complete_updates_in_place() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let path = dir.path().join("facts.redb");
-        let store = RedbStore::open(&path).unwrap();
-        let fs = store.fact_store().unwrap();
-        fs.append(fact(1, 0, false)).unwrap();
-        fs.complete(fact(1, 0, true)).unwrap();
-        let facts = fs.facts_of(ProcessId::new(1)).unwrap();
-        assert_eq!(
-            facts.len(),
-            1,
-            "complete updates the begun slot, not a new one"
+        let store = RedbStore::open(&path)?;
+        let fs = store.fact_store()?;
+        fs.append(fact(1, 0, false))?;
+        fs.complete(fact(1, 0, true))?;
+        let facts = fs.facts_of(ProcessId::new(1))?;
+        ensure!(
+            facts.len() == 1,
+            "complete should update the begun slot: {facts:?}"
         );
-        assert!(facts[0].is_complete());
+        match facts.as_slice() {
+            [fact] => ensure!(fact.is_complete(), "fact should be complete: {fact:?}"),
+            other => ensure!(other.len() == 1, "unexpected facts: {other:?}"),
+        }
+        Ok(())
     }
 
     #[test]
-    fn concurrent_complete_same_new_operation_is_single_slot() {
-        let dir = tempfile::tempdir().unwrap();
+    fn concurrent_complete_same_new_operation_is_single_slot() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let path = dir.path().join("facts.redb");
-        let store = RedbStore::open(&path).unwrap();
-        let fs = Arc::new(store.fact_store().unwrap());
+        let store = RedbStore::open(&path)?;
+        let fs = Arc::new(store.fact_store()?);
         let barrier = Arc::new(std::sync::Barrier::new(8));
         let mut threads = Vec::new();
 
         for _ in 0..8 {
             let fs = fs.clone();
             let barrier = barrier.clone();
-            threads.push(std::thread::spawn(move || {
+            threads.push(std::thread::spawn(move || -> anyhow::Result<()> {
                 barrier.wait();
-                fs.complete(fact(1, 0, true)).unwrap();
+                fs.complete(fact(1, 0, true))?;
+                Ok(())
             }));
         }
         for thread in threads {
-            thread.join().unwrap();
+            thread
+                .join()
+                .map_err(|_| anyhow!("fact completion thread panicked"))??;
         }
 
-        let facts = fs.facts_of(ProcessId::new(1)).unwrap();
-        assert_eq!(facts.len(), 1);
-        assert_eq!(fs.all_facts().unwrap().len(), 1);
+        let facts = fs.facts_of(ProcessId::new(1))?;
+        ensure!(facts.len() == 1, "unexpected facts: {facts:?}");
+        let all = fs.all_facts()?;
+        ensure!(all.len() == 1, "unexpected all facts: {all:?}");
+        Ok(())
     }
 
     #[test]
-    fn persists_across_reopen() {
-        let dir = tempfile::tempdir().unwrap();
+    fn persists_across_reopen() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let path = dir.path().join("facts.redb");
         {
-            let store = RedbStore::open(&path).unwrap();
-            let fs = store.fact_store().unwrap();
-            fs.append(fact(2, 0, true)).unwrap();
+            let store = RedbStore::open(&path)?;
+            let fs = store.fact_store()?;
+            fs.append(fact(2, 0, true))?;
         }
-        let store = RedbStore::open(&path).unwrap();
-        let fs = store.fact_store().unwrap();
-        assert_eq!(fs.facts_of(ProcessId::new(2)).unwrap().len(), 1);
-        assert_eq!(fs.cursor(), 1, "cursor restored across reopen");
+        let store = RedbStore::open(&path)?;
+        let fs = store.fact_store()?;
+        let facts = fs.facts_of(ProcessId::new(2))?;
+        ensure!(facts.len() == 1, "unexpected facts: {facts:?}");
+        ensure!(fs.cursor() == 1, "unexpected cursor: {}", fs.cursor());
+        Ok(())
     }
 
     #[test]
-    fn all_facts_returns_append_order() {
-        let dir = tempfile::tempdir().unwrap();
+    fn all_facts_returns_append_order() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let path = dir.path().join("facts.redb");
-        let store = RedbStore::open(&path).unwrap();
-        let fs = store.fact_store().unwrap();
-        fs.complete(fact(1, 0, true)).unwrap();
-        fs.complete(fact(2, 0, true)).unwrap();
+        let store = RedbStore::open(&path)?;
+        let fs = store.fact_store()?;
+        fs.complete(fact(1, 0, true))?;
+        fs.complete(fact(2, 0, true))?;
 
-        let facts = fs.all_facts().unwrap();
-        assert_eq!(facts.len(), 2);
-        assert_eq!(facts[0].caller, ProcessId::new(1));
-        assert_eq!(facts[1].caller, ProcessId::new(2));
+        let facts = fs.all_facts()?;
+        match facts.as_slice() {
+            [first, second] => {
+                ensure!(
+                    first.caller == ProcessId::new(1),
+                    "unexpected first caller: {:?}",
+                    first.caller
+                );
+                ensure!(
+                    second.caller == ProcessId::new(2),
+                    "unexpected second caller: {:?}",
+                    second.caller
+                );
+            }
+            other => ensure!(other.len() == 2, "unexpected facts: {other:?}"),
+        }
+        Ok(())
     }
 }

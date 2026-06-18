@@ -1,17 +1,8 @@
-//! `open()` = compile: turn a Grant + Resource + Policy + Binding into a
-//! closed, executable [`Handle`]. This is the only way a Handle is created.
+//! Compile open requests into executable [`Handle`] values.
 //!
-//! The seven compile steps:
-//!
-//! ```text
-//! 1. find holder==process grant whose selector hits the resource
-//! 2. requested rights ⊆ grant.rights (bitmap subset)
-//! 3. check static (open-time) constraints
-//! 4. compile applicable Policy → PolicySnapshot, partially evaluating
-//! 5. read Binding → build DriverPlan (local inline / remote stub)
-//! 6. residual empty? → mark Unconditional
-//! 7. allocate (index, generation) slot in HandleTable, return Handle
-//! ```
+//! Open resolves a matching grant, validates static constraints and reserved
+//! paths, builds the driver plan, and installs the resulting handle in the
+//! caller's handle table.
 
 use crate::driver::{DriverPlan, RemoteDriver};
 use crate::handle::{FastPath, Handle, HandleState, HandleTable};
@@ -100,7 +91,7 @@ pub fn open_resource_with_attached(
     req: OpenRequest,
     attached_grants: &[Grant],
 ) -> Result<HandleId, OpenError> {
-    // Step 0: resolve the resource descriptor.
+    // Resolve the resource descriptor before evaluating grants and policies.
     let resource = registry
         .resource(req.resource)
         .ok_or(OpenError::NoSuchResource(req.resource))?;
@@ -122,14 +113,10 @@ pub fn open_resource_with_attached(
         return Err(OpenError::ReservedPath(resource_name.to_string()));
     }
 
-    // Step 1+2 fused: find a grant held by the process that both hits
-    // the resource via its selector AND covers the requested rights. Fusing the
-    // two checks is required: a process may hold several grants matching the
-    // same resource (e.g. one for method X, one for method Y). Picking the first
-    // selector match and only then checking rights would spuriously reject a
-    // request that a *different* held grant authorizes. We therefore require
-    // `req.rights ⊆ g.rights` as part of selection, and only surface
-    // `RightsNotSubset` when a selector matched but no grant covered the rights.
+    // Select a held grant that both matches the resource selector and covers the
+    // requested rights. A process may hold several grants for the same resource
+    // with different method rights, so selector matching and rights coverage
+    // must be evaluated together.
     let mut candidates = registry.candidate_grants(req.process, &req.verb, &resource_name);
     candidates.extend(attached_grants.iter().cloned());
     let matching: Vec<_> = candidates
@@ -145,8 +132,8 @@ pub fn open_resource_with_attached(
         .find(|g| req.rights.is_subset_of(&g.rights))
     {
         Some(g) => g,
-        // A selector matched but none covered the rights → RightsNotSubset;
-        // nothing matched the resource at all → NoMatchingGrant.
+        // A selector matched but none covered the rights; without any selector
+        // match, report that no grant covered the resource.
         None if selector_matched => return Err(OpenError::RightsNotSubset),
         None => {
             return Err(OpenError::NoMatchingGrant {
@@ -156,10 +143,8 @@ pub fn open_resource_with_attached(
         }
     };
 
-    // Step 3: static constraints. Constraints that reference no per-op input
-    // (only `until`, evaluated against the wall clock) are decided now; if they
-    // fail with no input, the grant doesn't apply at open time.
-    // The full residual is carried forward to step 4.
+    // Evaluate constraints that do not require per-operation input at open time.
+    // The remaining residual policy is carried into the handle plan.
     let constraints = grant.constraints.clone();
     let cache_key = OpenCacheKey::new(
         grant.id,
@@ -174,10 +159,10 @@ pub fn open_resource_with_attached(
         return Ok(handles.insert(handle_from_plan(req.process, Some(resource_name), plan)));
     }
 
-    // Step 4: compile policy → snapshot with partial evaluation. The residual
-    // is the input-dependent part of (a) the grant's own constraints and (b)
-    // every registered source policy that applies to this open. The
-    // open-time decidable parts are evaluated and eliminated.
+    // Compile policy into a snapshot with partial evaluation. The residual is
+    // the input-dependent part of the grant constraints and registered source
+    // policies that apply to this open. Open-time decidable parts are evaluated
+    // and eliminated.
     let mut snapshot = compile_policy_snapshot(&constraints);
     let open_ctx = OpenContext {
         resource: req.resource,
@@ -198,7 +183,7 @@ pub fn open_resource_with_attached(
         }
     }
 
-    // Step 5: read binding → build the driver plan (local inline / remote stub).
+    // Read the binding and build the driver plan.
     let binding = registry
         .binding(resource.binding)
         .ok_or(OpenError::NoSuchBinding(resource.binding))?;
@@ -242,7 +227,7 @@ pub fn open_resource_with_attached(
         }
     }
 
-    // Step 6: residual empty → Unconditional.
+    // Empty residual policy permits the unconditional fast path.
     let fast_path = if snapshot.is_empty() {
         FastPath::Unconditional
     } else {
@@ -256,7 +241,7 @@ pub fn open_resource_with_attached(
     };
     registry.store_open_plan(cache_key, compiled.clone());
 
-    // Step 7: allocate slot, install, return id.
+    // Allocate and install the handle slot.
     Ok(handles.insert(handle_from_plan(req.process, Some(resource_name), compiled)))
 }
 
@@ -330,6 +315,7 @@ mod tests {
         DriverDescriptor, DriverError, EchoDriver, FnDriver, RemoteEndpoint, RemoteInvokeDispatch,
     };
     use crate::handle::HandleTable;
+    use anyhow::{Context, bail, ensure};
     use async_trait::async_trait;
     use nexus_types::{
         Binding, EndpointId, Expiry, Grant, Interface, InterfaceFamily, InterfaceSet, Invoke,
@@ -339,7 +325,7 @@ mod tests {
     };
     use parking_lot::Mutex;
 
-    fn setup_resource(reg: &Registry, path: &str) -> ResourceId {
+    fn setup_resource(reg: &Registry, path: &str) -> anyhow::Result<ResourceId> {
         let iface_id = reg.next_interface_id();
         reg.register_interface(Interface {
             id: iface_id,
@@ -369,7 +355,7 @@ mod tests {
         let binding_id = reg.next_binding_id();
         reg.register_binding(Binding {
             id: binding_id,
-            selector: ResourceSelector::parse("perform://effect/**").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/**")?,
             interfaces: InterfaceSet::new(vec![iface_id]),
             driver: nexus_types::DriverRef {
                 id: driver_id,
@@ -383,7 +369,7 @@ mod tests {
             Resource {
                 id: rid,
                 descriptor: ResourceDescriptor {
-                    name: ResourceName::new(Path::parse(path).unwrap()),
+                    name: ResourceName::new(Path::parse(path)?),
                     kind: ResourceKind::Effect,
                     metadata: Metadata::default(),
                 },
@@ -392,11 +378,15 @@ mod tests {
             },
             path.starts_with("effect://kernel/"),
         )
-        .unwrap();
-        rid
+        .context("resource admission failed")?;
+        Ok(rid)
     }
 
-    fn setup_remote_resource(reg: &Registry, path: &str, endpoint: EndpointId) -> ResourceId {
+    fn setup_remote_resource(
+        reg: &Registry,
+        path: &str,
+        endpoint: EndpointId,
+    ) -> anyhow::Result<ResourceId> {
         let iface_id = reg.next_interface_id();
         reg.register_interface(Interface {
             id: iface_id,
@@ -430,7 +420,7 @@ mod tests {
         let binding_id = reg.next_binding_id();
         reg.admit_binding(Binding {
             id: binding_id,
-            selector: ResourceSelector::parse("perform://effect/external-provider/**").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/external-provider/**")?,
             interfaces: InterfaceSet::new(vec![iface_id]),
             driver: nexus_types::DriverRef {
                 id: driver_id,
@@ -439,13 +429,13 @@ mod tests {
             endpoint: Some(endpoint),
             generation: 1,
         })
-        .unwrap();
+        .context("remote binding admission failed")?;
         let rid = reg.next_resource_id();
         reg.admit_resource(
             Resource {
                 id: rid,
                 descriptor: ResourceDescriptor {
-                    name: ResourceName::new(Path::parse(path).unwrap()),
+                    name: ResourceName::new(Path::parse(path)?),
                     kind: ResourceKind::Effect,
                     metadata: Metadata::default(),
                 },
@@ -454,11 +444,11 @@ mod tests {
             },
             false,
         )
-        .unwrap();
-        rid
+        .context("remote resource admission failed")?;
+        Ok(rid)
     }
 
-    fn setup_state_subtree_resource(reg: &Registry) -> ResourceId {
+    fn setup_state_subtree_resource(reg: &Registry) -> anyhow::Result<ResourceId> {
         let iface_id = reg.next_interface_id();
         reg.register_interface(Interface {
             id: iface_id,
@@ -488,7 +478,7 @@ mod tests {
         let binding_id = reg.next_binding_id();
         reg.register_binding(Binding {
             id: binding_id,
-            selector: ResourceSelector::parse("*://state/**").unwrap(),
+            selector: ResourceSelector::parse("*://state/**")?,
             interfaces: InterfaceSet::new(vec![iface_id]),
             driver: nexus_types::DriverRef {
                 id: driver_id,
@@ -502,7 +492,7 @@ mod tests {
             Resource {
                 id: rid,
                 descriptor: ResourceDescriptor {
-                    name: ResourceName::new(Path::parse("state://").unwrap()),
+                    name: ResourceName::new(Path::parse("state://")?),
                     kind: ResourceKind::State,
                     metadata: Metadata::default(),
                 },
@@ -511,8 +501,8 @@ mod tests {
             },
             true,
         )
-        .unwrap();
-        rid
+        .context("state resource admission failed")?;
+        Ok(rid)
     }
 
     struct TestEndpoint {
@@ -534,14 +524,21 @@ mod tests {
         }
     }
 
+    fn expect_open_error(result: Result<HandleId, OpenError>) -> anyhow::Result<OpenError> {
+        match result {
+            Ok(handle) => bail!("expected open error, got handle {handle:?}"),
+            Err(err) => Ok(err),
+        }
+    }
+
     #[test]
-    fn open_unconditional_when_no_constraints() {
+    fn open_unconditional_when_no_constraints() -> anyhow::Result<()> {
         let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://x/post");
+        let rid = setup_resource(&reg, "effect://x/post")?;
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/x/post").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/x/post")?,
             rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
@@ -560,34 +557,37 @@ mod tests {
                 now_millis: 0,
             },
         )
-        .unwrap();
-        let h = handles.get(id).unwrap();
-        assert!(
+        .context("open_resource failed")?;
+        let h = handles.get(id).context("opened handle did not resolve")?;
+        ensure!(
             h.is_unconditional(),
-            "no constraints ⇒ Unconditional fast path"
+            "no constraints should use the unconditional fast path"
         );
-        assert!(h.driver_plan.supports(nexus_types::MethodId::new(100)));
+        ensure!(
+            h.driver_plan.supports(nexus_types::MethodId::new(100)),
+            "driver plan should support method 100"
+        );
+        Ok(())
     }
 
     #[test]
-    fn endpoint_binding_requires_registered_endpoint() {
+    fn endpoint_binding_requires_registered_endpoint() -> anyhow::Result<()> {
         let reg = Registry::new();
         let rid = setup_remote_resource(
             &reg,
             "effect://external-provider/acme/search",
             EndpointId::new(99),
-        );
+        )?;
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/external-provider/acme/search")
-                .unwrap(),
+            selector: ResourceSelector::parse("perform://effect/external-provider/acme/search")?,
             rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
         });
         let mut handles = HandleTable::new();
-        let err = open_resource(
+        let err = expect_open_error(open_resource(
             &reg,
             &mut handles,
             OpenRequest {
@@ -599,25 +599,28 @@ mod tests {
                 requested_path: None,
                 now_millis: 0,
             },
-        )
-        .unwrap_err();
-        assert!(matches!(err, OpenError::NoSuchEndpoint(id) if id == EndpointId::new(99)));
+        ))?;
+        ensure!(
+            matches!(err, OpenError::NoSuchEndpoint(id) if id == EndpointId::new(99)),
+            "unexpected open error: {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn ordinary_effect_grant_cannot_open_kernel_effect() {
+    fn ordinary_effect_grant_cannot_open_kernel_effect() -> anyhow::Result<()> {
         let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://kernel/process/inspect");
+        let rid = setup_resource(&reg, "effect://kernel/process/inspect")?;
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/**").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/**")?,
             rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
         });
         let mut handles = HandleTable::new();
-        let err = open_resource(
+        let err = expect_open_error(open_resource(
             &reg,
             &mut handles,
             OpenRequest {
@@ -629,27 +632,29 @@ mod tests {
                 requested_path: None,
                 now_millis: 0,
             },
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            OpenError::ReservedPath(p) if p == "effect://kernel/process/inspect"
-        ));
-        assert_eq!(handles.len(), 0);
+        ))?;
+        ensure!(
+            matches!(err, OpenError::ReservedPath(ref p) if p == "effect://kernel/process/inspect"),
+            "unexpected open error: {err:?}"
+        );
+        ensure!(
+            handles.is_empty(),
+            "reserved open should not allocate handles"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn endpoint_binding_compiles_to_remote_driver_plan() {
+    async fn endpoint_binding_compiles_to_remote_driver_plan() -> anyhow::Result<()> {
         let reg = Registry::new();
         let endpoint = reg.next_endpoint_id();
         let seen = Arc::new(Mutex::new(Vec::new()));
         reg.register_endpoint(endpoint, Arc::new(TestEndpoint { seen: seen.clone() }));
-        let rid = setup_remote_resource(&reg, "effect://external-provider/acme/search", endpoint);
+        let rid = setup_remote_resource(&reg, "effect://external-provider/acme/search", endpoint)?;
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/external-provider/acme/search")
-                .unwrap(),
+            selector: ResourceSelector::parse("perform://effect/external-provider/acme/search")?,
             rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
@@ -668,10 +673,13 @@ mod tests {
                 now_millis: 0,
             },
         )
-        .unwrap();
-        let h = handles.get(id).unwrap();
-        assert!(h.driver_plan.is_remote());
-        assert!(h.driver_plan.supports(nexus_types::MethodId::new(0)));
+        .context("open_resource failed")?;
+        let h = handles.get(id).context("opened handle did not resolve")?;
+        ensure!(h.driver_plan.is_remote(), "driver plan should be remote");
+        ensure!(
+            h.driver_plan.supports(nexus_types::MethodId::new(0)),
+            "driver plan should support method 0"
+        );
 
         let ctx =
             crate::DriverContext::new(IdentityRef::ROOT, ProcessId::new(1)).with_operation_id(
@@ -686,28 +694,34 @@ mod tests {
                 &ctx,
             )
             .await
-            .unwrap();
-        assert_eq!(
-            out,
-            nexus_types::Outcome::Done(nexus_types::Value::Str("remote".into()))
+            .context("remote driver call failed")?;
+        ensure!(
+            out == nexus_types::Outcome::Done(nexus_types::Value::Str("remote".into())),
+            "unexpected remote outcome: {out:?}"
         );
         let seen = seen.lock();
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].invocation_id, "1/4/0");
-        assert_eq!(
-            seen[0].effect_path.to_string(),
-            "effect://external-provider/acme/search"
+        ensure!(
+            seen.len() == 1,
+            "unexpected remote invoke count: {}",
+            seen.len()
         );
+        let invoke = seen.first().context("missing remote invoke")?;
+        ensure!(invoke.invocation_id == "1/4/0", "invocation id mismatch");
+        ensure!(
+            invoke.effect_path.to_string() == "effect://external-provider/acme/search",
+            "remote effect path mismatch"
+        );
+        Ok(())
     }
 
     #[test]
-    fn repeated_open_reuses_compiled_open_plan_not_handle_slot() {
+    fn repeated_open_reuses_compiled_open_plan_not_handle_slot() -> anyhow::Result<()> {
         let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://x/post");
+        let rid = setup_resource(&reg, "effect://x/post")?;
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/x/post").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/x/post")?,
             rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
@@ -723,23 +737,48 @@ mod tests {
             now_millis: 123,
         };
 
-        let first = open_resource(&reg, &mut handles, req()).unwrap();
-        assert_eq!(reg.open_cache_stats(), (0, 1, 1));
-        let second = open_resource(&reg, &mut handles, req()).unwrap();
-        assert_eq!(reg.open_cache_stats(), (1, 1, 1));
+        let first = open_resource(&reg, &mut handles, req()).context("first open failed")?;
+        ensure!(
+            reg.open_cache_stats() == (0, 1, 1),
+            "first open cache stats mismatch: {:?}",
+            reg.open_cache_stats()
+        );
+        let second = open_resource(&reg, &mut handles, req()).context("second open failed")?;
+        ensure!(
+            reg.open_cache_stats() == (1, 1, 1),
+            "second open cache stats mismatch: {:?}",
+            reg.open_cache_stats()
+        );
 
-        assert_ne!(first, second, "each open still allocates its own Handle");
-        assert_eq!(handles.len(), 2);
-        assert!(handles.get(first).unwrap().is_unconditional());
-        assert!(handles.get(second).unwrap().is_unconditional());
+        ensure!(first != second, "each open should allocate its own handle");
+        ensure!(
+            handles.len() == 2,
+            "unexpected handle count: {}",
+            handles.len()
+        );
+        ensure!(
+            handles
+                .get(first)
+                .context("first handle did not resolve")?
+                .is_unconditional(),
+            "first handle should be unconditional"
+        );
+        ensure!(
+            handles
+                .get(second)
+                .context("second handle did not resolve")?
+                .is_unconditional(),
+            "second handle should be unconditional"
+        );
+        Ok(())
     }
 
     #[test]
-    fn open_fails_without_matching_grant() {
+    fn open_fails_without_matching_grant() -> anyhow::Result<()> {
         let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://x/post");
+        let rid = setup_resource(&reg, "effect://x/post")?;
         let mut handles = HandleTable::new();
-        let err = open_resource(
+        let err = expect_open_error(open_resource(
             &reg,
             &mut handles,
             OpenRequest {
@@ -751,19 +790,22 @@ mod tests {
                 requested_path: None,
                 now_millis: 0,
             },
-        )
-        .unwrap_err();
-        assert!(matches!(err, OpenError::NoMatchingGrant { .. }));
+        ))?;
+        ensure!(
+            matches!(err, OpenError::NoMatchingGrant { .. }),
+            "unexpected open error: {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn ordinary_state_grant_cannot_open_vault_or_fact_projection() {
+    fn ordinary_state_grant_cannot_open_vault_or_fact_projection() -> anyhow::Result<()> {
         let reg = Registry::new();
-        let rid = setup_state_subtree_resource(&reg);
+        let rid = setup_state_subtree_resource(&reg)?;
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("*://state/**").unwrap(),
+            selector: ResourceSelector::parse("*://state/**")?,
             rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
@@ -775,7 +817,7 @@ mod tests {
             "state://kernel/bootstrap/phase",
             "state://kernel",
         ] {
-            let err = open_resource(
+            let err = expect_open_error(open_resource(
                 &reg,
                 &mut handles,
                 OpenRequest {
@@ -784,29 +826,35 @@ mod tests {
                     verb: "read".into(),
                     rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
                     acting: IdentityRef::ROOT,
-                    requested_path: Some(Path::parse(path).unwrap()),
+                    requested_path: Some(Path::parse(path)?),
                     now_millis: 0,
                 },
-            )
-            .unwrap_err();
-            assert!(matches!(err, OpenError::ReservedPath(p) if p == path));
+            ))?;
+            ensure!(
+                matches!(err, OpenError::ReservedPath(ref p) if p == path),
+                "unexpected reserved-path error for {path}: {err:?}"
+            );
         }
-        assert_eq!(handles.len(), 0);
+        ensure!(
+            handles.is_empty(),
+            "reserved opens should not allocate handles"
+        );
+        Ok(())
     }
 
     #[test]
-    fn open_picks_grant_covering_rights_not_first_selector_match() {
+    fn open_picks_grant_covering_rights_not_first_selector_match() -> anyhow::Result<()> {
         // A process holds TWO grants hitting the same resource: the first (by
         // registration order) covers only derive flags but NO methods; the
         // second covers method 0. Requesting method 0 must succeed by selecting
         // the *covering* grant, not spuriously fail on the first match.
         let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://x/post");
+        let rid = setup_resource(&reg, "effect://x/post")?;
         // Grant A: matches selector, but rights cover no methods.
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/x/post").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/x/post")?,
             rights: Rights::new(MethodBitmap::empty(), RightFlags::all()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
@@ -815,7 +863,7 @@ mod tests {
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/x/post").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/x/post")?,
             rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
@@ -834,25 +882,30 @@ mod tests {
                 now_millis: 0,
             },
         )
-        .expect("a held grant covers method 0; open must select it");
-        assert!(handles.get(id).unwrap().rights.methods.allows(0));
+        .context("open_resource should select the grant covering method 0")?;
+        let handle = handles.get(id).context("opened handle did not resolve")?;
+        ensure!(
+            handle.rights.methods.allows(0),
+            "selected handle should allow method 0"
+        );
+        Ok(())
     }
 
     #[test]
-    fn open_rights_not_subset_when_selector_matched_but_rights_uncovered() {
+    fn open_rights_not_subset_when_selector_matched_but_rights_uncovered() -> anyhow::Result<()> {
         let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://x/post");
+        let rid = setup_resource(&reg, "effect://x/post")?;
         // Only grant: matches selector but covers no methods.
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/x/post").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/x/post")?,
             rights: Rights::new(MethodBitmap::empty(), RightFlags::empty()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
         });
         let mut handles = HandleTable::new();
-        let err = open_resource(
+        let err = expect_open_error(open_resource(
             &reg,
             &mut handles,
             OpenRequest {
@@ -864,22 +917,25 @@ mod tests {
                 requested_path: None,
                 now_millis: 0,
             },
-        )
-        .unwrap_err();
-        assert!(matches!(err, OpenError::RightsNotSubset));
+        ))?;
+        ensure!(
+            matches!(err, OpenError::RightsNotSubset),
+            "unexpected open error: {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn open_conditional_when_constraints_present() {
+    fn open_conditional_when_constraints_present() -> anyhow::Result<()> {
         let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://x/post");
+        let rid = setup_resource(&reg, "effect://x/post")?;
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/x/post").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/x/post")?,
             rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
             constraints: ConstraintSet {
-                predicates: vec![nexus_types::cap::Predicate::parse("account=alice").unwrap()],
+                predicates: vec![nexus_types::cap::Predicate::parse("account=alice")?],
             },
             expires: Expiry::Never,
         });
@@ -897,20 +953,25 @@ mod tests {
                 now_millis: 0,
             },
         )
-        .unwrap();
-        assert!(!handles.get(id).unwrap().is_unconditional());
+        .context("open_resource failed")?;
+        let handle = handles.get(id).context("opened handle did not resolve")?;
+        ensure!(
+            !handle.is_unconditional(),
+            "constraint-bearing grant should produce a conditional handle"
+        );
+        Ok(())
     }
 
     #[test]
-    fn registered_policy_adds_residual_check() {
+    fn registered_policy_adds_residual_check() -> anyhow::Result<()> {
         use crate::policy::CapabilityPolicy;
         let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://x/post");
+        let rid = setup_resource(&reg, "effect://x/post")?;
         // Grant has no constraints (would be Unconditional)…
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/x/post").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/x/post")?,
             rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
@@ -918,9 +979,9 @@ mod tests {
         // …but a registered source policy attaches an input predicate, so the
         // handle must become Conditional (a residual check exists).
         reg.register_policy(Arc::new(CapabilityPolicy {
-            pattern: nexus_types::Capability::parse("perform://effect/x/**").unwrap(),
+            pattern: nexus_types::Capability::parse("perform://effect/x/**")?,
             constraints: ConstraintSet {
-                predicates: vec![nexus_types::cap::Predicate::parse("account=alice").unwrap()],
+                predicates: vec![nexus_types::cap::Predicate::parse("account=alice")?],
             },
         }));
         let mut handles = HandleTable::new();
@@ -937,10 +998,12 @@ mod tests {
                 now_millis: 0,
             },
         )
-        .unwrap();
-        assert!(
-            !handles.get(id).unwrap().is_unconditional(),
-            "a matching source policy with a predicate ⇒ Conditional"
+        .context("open_resource failed")?;
+        let handle = handles.get(id).context("opened handle did not resolve")?;
+        ensure!(
+            !handle.is_unconditional(),
+            "matching source policy with a predicate should produce a conditional handle"
         );
+        Ok(())
     }
 }

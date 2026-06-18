@@ -25,8 +25,7 @@ pub struct FactError(pub String);
 
 /// Pluggable durable sink. The in-memory impl is the default; redb provides a
 /// persistent one. The kernel speaks only this trait. Read failures are
-/// explicit so recovery/audit do not silently treat corrupted Fact storage as
-/// an empty stream.
+/// surfaced so corrupted Fact storage is never treated as an empty stream.
 pub trait FactStore: Send + Sync + 'static {
     /// Append a (possibly pending) fact. Returns the append cursor position.
     /// Errors before the cursor advances, so a retry reuses the same slot.
@@ -222,6 +221,7 @@ fn validate_fact_schema(fact: &Fact) -> Result<(), FactError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{bail, ensure};
     use nexus_types::{
         DecisionTag, HandleId, IdentityRef, MethodId, NodeId, OutcomeRef, ProcessId, ReplayClass,
         ResourceId, Timestamp, Value, ValueRef,
@@ -247,42 +247,57 @@ mod tests {
     }
 
     #[test]
-    fn only_non_idempotent_effect_fsyncs() {
+    fn only_non_idempotent_effect_fsyncs() -> anyhow::Result<()> {
         let (sink, store) = FactSink::in_memory();
         // Deterministic / Observation / Idempotent: no barrier.
-        sink.begin(fact(1, 0, ReplayClass::Deterministic)).unwrap();
-        sink.complete(fact(1, 0, ReplayClass::Deterministic))
-            .unwrap();
-        sink.begin(fact(1, 1, ReplayClass::Observation)).unwrap();
-        sink.complete(fact(1, 1, ReplayClass::Observation)).unwrap();
-        sink.begin(fact(1, 2, ReplayClass::IdempotentEffect))
-            .unwrap();
-        sink.complete(fact(1, 2, ReplayClass::IdempotentEffect))
-            .unwrap();
-        assert_eq!(store.sync_count(), 0, "no fsync for replay-safe classes");
+        sink.begin(fact(1, 0, ReplayClass::Deterministic))?;
+        sink.complete(fact(1, 0, ReplayClass::Deterministic))?;
+        sink.begin(fact(1, 1, ReplayClass::Observation))?;
+        sink.complete(fact(1, 1, ReplayClass::Observation))?;
+        sink.begin(fact(1, 2, ReplayClass::IdempotentEffect))?;
+        sink.complete(fact(1, 2, ReplayClass::IdempotentEffect))?;
+        ensure!(
+            store.sync_count() == 0,
+            "replay-safe classes should not fsync"
+        );
 
         // NonIdempotentEffect: fsync at begin and complete.
-        sink.begin(fact(1, 3, ReplayClass::NonIdempotentEffect))
-            .unwrap();
-        sink.complete(fact(1, 3, ReplayClass::NonIdempotentEffect))
-            .unwrap();
-        assert_eq!(store.sync_count(), 2, "write-ahead + post-effect fsync");
+        sink.begin(fact(1, 3, ReplayClass::NonIdempotentEffect))?;
+        sink.complete(fact(1, 3, ReplayClass::NonIdempotentEffect))?;
+        ensure!(
+            store.sync_count() == 2,
+            "non-idempotent effect fsync count mismatch"
+        );
+        Ok(())
     }
 
     #[test]
-    fn facts_of_filters_by_process() {
+    fn facts_of_filters_by_process() -> anyhow::Result<()> {
         let (sink, _) = FactSink::in_memory();
-        sink.begin(fact(1, 0, ReplayClass::Deterministic)).unwrap();
-        sink.begin(fact(2, 0, ReplayClass::Deterministic)).unwrap();
-        assert_eq!(sink.facts_of(ProcessId::new(1)).unwrap().len(), 1);
+        sink.begin(fact(1, 0, ReplayClass::Deterministic))?;
+        sink.begin(fact(2, 0, ReplayClass::Deterministic))?;
+        let facts = sink.facts_of(ProcessId::new(1))?;
+        ensure!(
+            facts.len() == 1,
+            "unexpected process fact count: {}",
+            facts.len()
+        );
+        Ok(())
     }
 
     #[test]
-    fn fact_sink_rejects_unknown_schema_version() {
+    fn fact_sink_rejects_unknown_schema_version() -> anyhow::Result<()> {
         let (sink, _) = FactSink::in_memory();
         let mut f = fact(1, 0, ReplayClass::Deterministic);
         f.schema_version = Fact::SCHEMA_VERSION + 1;
-        let err = sink.begin(f).unwrap_err();
-        assert!(err.0.contains("unsupported Fact schema_version"));
+        let err = match sink.begin(f) {
+            Ok(()) => bail!("expected schema error"),
+            Err(err) => err,
+        };
+        ensure!(
+            err.0.contains("unsupported Fact schema_version"),
+            "unexpected FactSink error: {err}"
+        );
+        Ok(())
     }
 }

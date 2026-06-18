@@ -27,7 +27,7 @@
 | 执行管理动作、检查运行时状态、管理用户、管理会话、订阅状态或审计流 | 控制台协议 |
 | 连接提供 effect handler 的外部程序 | External gateway Provider |
 | 连接发送入站事件或接收 outbound command 的外部程序 | External gateway Source |
-| 通过显式 publish capability 把选定 Nexus effect 暴露为 MCP tool | MCP |
+| 把选定 Gateway publication 发布为 MCP tool、resource、resource template 和 prompt | MCP |
 
 ## External Gateway
 
@@ -36,12 +36,22 @@ External gateway session 见 [External Gateway](external-gateway.md)。Provider 
 daemon 负责 session 准入和裁定：
 
 1. 外部程序发送 `RoleSessionClientHello`；
-2. daemon 读取 installation、projection、pairing 和已批准 session state；
+2. daemon 读取 installation、其中选中的 projection、pairing 和已批准 session state；
 3. daemon 发送带权威 generation 和限制的 `SessionContext`；
 4. 外部程序回复 `RoleReady`；
 5. session ready 后才允许业务 frame 流动。
 
-Provider ready 后会为该 ready session 注册投影 binding。Source event 只有通过 generation、schema、dedupe、capacity、rate 和 policy 检查后才会准入。
+Provider binding 来自 installation projection；`RoleReady` 只确认选定的 session context。Source event 只有通过 generation、schema、dedupe、capacity、rate 和 policy 检查后才会准入。
+
+## MCP
+
+MCP server 支持由 Gateway publication 定义。publication 为 `mcp` 协议命名一个 Gateway surface，并声明一种 kind：`tool`、`resource`、`resource_template` 或 `prompt`。它不重复声明 effect target、schema 或调用方绑定。发现接口只返回当前认证 principal 可见 surface 对应的 MCP publication。tool 调用、resource 读取和 prompt 请求都通过发布的 surface id 提交，因此 schema、limit、policy、Handle 归属、Fact、taint 和 audit 都仍走共享 Gateway 路径。
+
+发布要求被引用的 surface 带有覆盖目标 effect 的 `publish://...` capability。MCP client 不能提交 raw effect path、raw capability、acting identity 或 raw Operation。
+
+MCP adapter 优先协商 `2025-11-25`，并在 handshake 中保留近期兼容版本。它实现 initialize、ping、tool、resource、resource template、prompt 和 completion 请求。不声明 logging、resource subscription、list-change notification 或 task execution。
+
+MCP 专用字段留在 publication properties 中。`icons`、`mimeType`、`size`、prompt `arguments` 和静态 `completions` 由 MCP adapter 读取。Gateway 仍持有 surface target、schema、binding、limit 和 audit 路径。Tool result 可以返回原生 MCP `content`、`structuredContent`、`isError` 和 `_meta`；content block 会先校验再发送。
 
 ## 控制台协议
 

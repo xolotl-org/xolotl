@@ -278,12 +278,7 @@ impl Path {
     }
 }
 
-// Character-set helpers.
-//
-// These are deliberately conservative. We intentionally forbid:
-//  - non-ASCII (no Unicode confusables)
-//  - most punctuation (only `_`, `-`, `.`, `:` allowed where noted)
-//  - leading digits in scheme names
+// Path syntax accepts a narrow ASCII set so validation stays predictable.
 
 fn is_scheme_ident(s: &str) -> bool {
     let mut chars = s.chars();
@@ -342,7 +337,7 @@ fn split_canonical_cluster(head: &str) -> Option<(&str, &str)> {
 fn is_standard_scheme(s: &str) -> bool {
     matches!(
         s,
-        "state" | "effect" | "process" | "proc" | "mcp-res" | "blob" | "tensor"
+        "state" | "effect" | "process" | "proc" | "blob" | "tensor"
     )
 }
 
@@ -392,148 +387,240 @@ impl fmt::Display for Path {
 
 /// Convenience constructor used throughout the workspace and tests.
 #[cfg(test)]
-pub fn p(s: &str) -> Path {
-    Path::parse(s).expect("invalid path literal")
+pub fn p(s: &str) -> anyhow::Result<Path> {
+    Ok(Path::parse(s)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, bail, ensure};
 
     #[test]
-    fn parse_effect_path() {
-        let p = Path::parse("effect://inference/infer").unwrap();
-        assert_eq!(p.scheme(), "effect");
-        assert_eq!(
-            p.segments(),
-            &[SmolStr::from("inference"), SmolStr::from("infer")]
+    fn parse_effect_path() -> anyhow::Result<()> {
+        let p = Path::parse("effect://inference/infer")?;
+        ensure!(p.scheme() == "effect", "unexpected scheme: {}", p.scheme());
+        ensure!(
+            p.segments() == [SmolStr::from("inference"), SmolStr::from("infer")],
+            "unexpected segments: {:?}",
+            p.segments()
         );
-        assert!(p.cluster().is_none());
+        ensure!(
+            p.cluster().is_none(),
+            "unexpected cluster: {:?}",
+            p.cluster()
+        );
+        Ok(())
     }
 
     #[test]
-    fn parse_state_with_path_prefix() {
-        let p = Path::parse("path://state/memory/alice/persona").unwrap();
-        assert_eq!(p.scheme(), "state");
-        assert_eq!(p.segments().len(), 3);
+    fn parse_state_with_path_prefix() -> anyhow::Result<()> {
+        let p = Path::parse("path://state/memory/alice/persona")?;
+        ensure!(p.scheme() == "state", "unexpected scheme: {}", p.scheme());
+        ensure!(
+            p.segments().len() == 3,
+            "unexpected segment count: {}",
+            p.segments().len()
+        );
+        Ok(())
     }
 
     #[test]
-    fn checked_builder_matches_parse_validation() {
+    fn checked_builder_matches_parse_validation() -> anyhow::Result<()> {
         let path = Path::try_new("state")
-            .unwrap()
+            .context("build state path")?
             .try_push("kernel")
-            .unwrap()
+            .context("push kernel")?
             .try_push("async")
-            .unwrap()
+            .context("push async")?
             .try_push("42")
-            .unwrap();
-        assert_eq!(path.to_string(), "state://kernel/async/42");
-        assert_eq!(
-            Path::try_new("state")
-                .unwrap()
-                .try_push("bad/slash")
-                .unwrap_err(),
-            PathError::BadSegmentChar("bad/slash".into())
+            .context("push id")?;
+        ensure!(
+            path.to_string() == "state://kernel/async/42",
+            "unexpected path: {path}"
         );
-    }
-
-    #[test]
-    fn path_params_are_rejected() {
-        assert_eq!(
-            Path::parse("effect://memory/recall@scope=user").unwrap_err(),
-            PathError::ParamsUnsupported
+        let err = match Path::try_new("state")?.try_push("bad/slash") {
+            Ok(path) => bail!("bad segment was accepted: {path}"),
+            Err(error) => error,
+        };
+        ensure!(
+            err == PathError::BadSegmentChar("bad/slash".into()),
+            "unexpected bad segment error: {err:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn parse_cluster() {
-        let p = Path::parse("path://pc-home/effect/memory/recall").unwrap();
-        assert_eq!(p.cluster(), Some("pc-home"));
-        assert_eq!(p.scheme(), "effect");
-        assert_eq!(p.to_string(), "path://pc-home/effect/memory/recall");
-    }
-
-    #[test]
-    fn noncanonical_cluster_spelling_is_rejected() {
-        assert_eq!(
-            Path::parse("path:////pc-home/effect/memory/recall").unwrap_err(),
-            PathError::MissingScheme
+    fn path_params_are_rejected() -> anyhow::Result<()> {
+        let err = match Path::parse("effect://memory/recall@scope=user") {
+            Ok(path) => bail!("path parameters were accepted: {path}"),
+            Err(error) => error,
+        };
+        ensure!(
+            err == PathError::ParamsUnsupported,
+            "unexpected params error: {err:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn empty_segment_rejected() {
-        assert_eq!(
-            Path::parse("effect://a//b").unwrap_err(),
-            PathError::EmptySegment
+    fn parse_cluster() -> anyhow::Result<()> {
+        let p = Path::parse("path://pc-home/effect/memory/recall")?;
+        ensure!(
+            p.cluster() == Some("pc-home"),
+            "unexpected cluster: {:?}",
+            p.cluster()
         );
+        ensure!(p.scheme() == "effect", "unexpected scheme: {}", p.scheme());
+        ensure!(
+            p.to_string() == "path://pc-home/effect/memory/recall",
+            "unexpected path: {p}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn missing_scheme_rejected() {
-        assert_eq!(Path::parse("").unwrap_err(), PathError::Empty);
+    fn noncanonical_cluster_spelling_is_rejected() -> anyhow::Result<()> {
+        let err = match Path::parse("path:////pc-home/effect/memory/recall") {
+            Ok(path) => bail!("noncanonical cluster was accepted: {path}"),
+            Err(error) => error,
+        };
+        ensure!(
+            err == PathError::MissingScheme,
+            "unexpected cluster spelling error: {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn pattern_match_exact() {
-        let p1 = p("effect://x/post");
-        assert!(p1.matches(&p("effect://x/post")));
-        assert!(!p1.matches(&p("effect://x/reply")));
+    fn empty_segment_rejected() -> anyhow::Result<()> {
+        let err = match Path::parse("effect://a//b") {
+            Ok(path) => bail!("empty segment was accepted: {path}"),
+            Err(error) => error,
+        };
+        ensure!(
+            err == PathError::EmptySegment,
+            "unexpected empty segment error: {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn pattern_match_single_wildcard() {
-        let target = p("state://memory/alice/persona");
-        assert!(target.matches(&p("state://memory/*/persona")));
-        assert!(!target.matches(&p("state://memory/*")));
+    fn missing_scheme_rejected() -> anyhow::Result<()> {
+        let err = match Path::parse("") {
+            Ok(path) => bail!("empty path was accepted: {path}"),
+            Err(error) => error,
+        };
+        ensure!(
+            err == PathError::Empty,
+            "unexpected empty path error: {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn pattern_match_double_wildcard() {
-        let target = p("state://memory/alice/episodic/2024/03/05");
-        assert!(target.matches(&p("state://memory/alice/**")));
-        assert!(target.matches(&p("state://memory/**")));
-        assert!(target.matches(&p("state://**")));
+    fn pattern_match_exact() -> anyhow::Result<()> {
+        let p1 = p("effect://x/post")?;
+        ensure!(
+            p1.matches(&p("effect://x/post")?),
+            "exact pattern did not match"
+        );
+        ensure!(
+            !p1.matches(&p("effect://x/reply")?),
+            "sibling path matched exact pattern"
+        );
+        Ok(())
     }
 
     #[test]
-    fn pattern_match_requires_same_cluster() {
-        let target = p("path://pc-home/state/memory/alice");
-        assert!(target.matches(&p("path://pc-home/state/memory/*")));
-        assert!(!target.matches(&p("state://memory/*")));
-        assert!(!target.matches(&p("path://phone/state/memory/*")));
+    fn pattern_match_single_wildcard() -> anyhow::Result<()> {
+        let target = p("state://memory/alice/persona")?;
+        ensure!(
+            target.matches(&p("state://memory/*/persona")?),
+            "single wildcard did not match"
+        );
+        ensure!(
+            !target.matches(&p("state://memory/*")?),
+            "single wildcard matched too many segments"
+        );
+        Ok(())
     }
 
     #[test]
-    fn prefix_check() {
-        let parent = p("process://alice");
-        let child = p("process://alice/x-bot");
-        assert!(parent.is_prefix_of(&child));
-        assert!(!child.is_prefix_of(&parent));
+    fn pattern_match_double_wildcard() -> anyhow::Result<()> {
+        let target = p("state://memory/alice/episodic/2024/03/05")?;
+        ensure!(
+            target.matches(&p("state://memory/alice/**")?),
+            "owner wildcard failed"
+        );
+        ensure!(
+            target.matches(&p("state://memory/**")?),
+            "memory wildcard failed"
+        );
+        ensure!(target.matches(&p("state://**")?), "scheme wildcard failed");
+        Ok(())
     }
 
     #[test]
-    fn prefix_check_requires_same_cluster() {
-        let parent = p("path://pc-home/process/alice");
-        let child = p("path://pc-home/process/alice/x-bot");
-        let other_cluster = p("path://phone/process/alice/x-bot");
-        assert!(parent.is_prefix_of(&child));
-        assert!(!parent.is_prefix_of(&other_cluster));
+    fn pattern_match_requires_same_cluster() -> anyhow::Result<()> {
+        let target = p("path://pc-home/state/memory/alice")?;
+        ensure!(
+            target.matches(&p("path://pc-home/state/memory/*")?),
+            "same-cluster pattern did not match"
+        );
+        ensure!(
+            !target.matches(&p("state://memory/*")?),
+            "unclustered pattern matched clustered path"
+        );
+        ensure!(
+            !target.matches(&p("path://phone/state/memory/*")?),
+            "different cluster matched"
+        );
+        Ok(())
     }
 
     #[test]
-    fn round_trip_display() {
+    fn prefix_check() -> anyhow::Result<()> {
+        let parent = p("process://alice")?;
+        let child = p("process://alice/x-bot")?;
+        ensure!(
+            parent.is_prefix_of(&child),
+            "parent was not prefix of child"
+        );
+        ensure!(!child.is_prefix_of(&parent), "child was prefix of parent");
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_check_requires_same_cluster() -> anyhow::Result<()> {
+        let parent = p("path://pc-home/process/alice")?;
+        let child = p("path://pc-home/process/alice/x-bot")?;
+        let other_cluster = p("path://phone/process/alice/x-bot")?;
+        ensure!(
+            parent.is_prefix_of(&child),
+            "same-cluster parent was not prefix"
+        );
+        ensure!(
+            !parent.is_prefix_of(&other_cluster),
+            "different-cluster child matched prefix"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn round_trip_display() -> anyhow::Result<()> {
         let s = "effect://inference/infer";
-        let path = Path::parse(s).unwrap();
-        assert_eq!(path.to_string(), s);
+        let path = Path::parse(s)?;
+        ensure!(path.to_string() == s, "display roundtrip failed: {path}");
+        Ok(())
     }
 
     #[test]
-    fn serialize_roundtrip() {
-        let path = p("state://memory/alice/persona");
-        let s = serde_json::to_string(&path).unwrap();
-        let back: Path = serde_json::from_str(&s).unwrap();
-        assert_eq!(path, back);
+    fn serialize_roundtrip() -> anyhow::Result<()> {
+        let path = p("state://memory/alice/persona")?;
+        let s = serde_json::to_string(&path)?;
+        let back: Path = serde_json::from_str(&s)?;
+        ensure!(path == back, "serde roundtrip changed path");
+        Ok(())
     }
 }

@@ -21,7 +21,6 @@ message ExternalFrame {
     EventAck event_ack = 7;
     Invoke invoke = 8;
     InvokeResult invoke_result = 9;
-    ProviderReady provider_ready = 10;
     ControlFrame control = 11;
     SecureEnvelope secure_envelope = 12;
   }
@@ -89,7 +88,7 @@ enum ExternalRole {
   EXTERNAL_ROLE_UNSPECIFIED = 0;
   // Source: provides a state:// inbound event stream.
   EXTERNAL_ROLE_SOURCE = 1;
-  // Provider: registers effect:// handlers (plugin, MCP server, remote device).
+  // Provider: serves effect:// capabilities declared by its projection.
   EXTERNAL_ROLE_PROVIDER = 2;
 }
 
@@ -162,17 +161,6 @@ message InvokeResult {
     nexus.v1.Value success = 2;
     ErrorInfo error = 3;
   }
-}
-
-// Provider client to daemon: initialization complete, declare capabilities.
-message ProviderReady {
-  repeated EffectHandlerSpec provides = 1;
-}
-
-message EffectHandlerSpec {
-  string path = 1;
-  nexus.v1.Purity purity = 2;
-  optional string description = 3;
 }
 
 // Control frames. Direction is variant-specific.

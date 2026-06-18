@@ -205,6 +205,7 @@ impl HandleTable {
 mod tests {
     use super::*;
     use crate::driver::{DriverPlan, EchoDriver};
+    use anyhow::{Context, ensure};
     use nexus_types::{DriverId, MethodBitmap, MethodId, RightFlags};
     use std::sync::Arc;
 
@@ -224,41 +225,44 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_get_roundtrip() {
+    fn insert_and_get_roundtrip() -> anyhow::Result<()> {
         let mut t = HandleTable::new();
         let id = t.insert(mk_handle(1));
-        let h = t.get(id).unwrap();
-        assert_eq!(h.id, id);
-        assert!(h.check_owner(ProcessId::new(1)));
-        assert!(h.allows_method(0));
-        assert!(!h.allows_method(1));
+        let h = t.get(id).context("inserted handle did not resolve")?;
+        ensure!(h.id == id, "handle id mismatch");
+        ensure!(h.check_owner(ProcessId::new(1)), "handle owner mismatch");
+        ensure!(h.allows_method(0), "method 0 should be allowed");
+        ensure!(!h.allows_method(1), "method 1 should not be allowed");
+        Ok(())
     }
 
     #[test]
-    fn revoke_invalidates_old_id_aba_safe() {
+    fn revoke_invalidates_old_id_aba_safe() -> anyhow::Result<()> {
         let mut t = HandleTable::new();
         let id = t.insert(mk_handle(1));
-        assert!(t.revoke(id));
+        ensure!(t.revoke(id), "handle should revoke");
         // Old id no longer resolves (generation bumped).
-        assert!(t.get(id).is_none());
+        ensure!(t.get(id).is_none(), "revoked handle should not resolve");
         // Slot is reused; new handle gets a higher generation.
         let id2 = t.insert(mk_handle(2));
-        assert_eq!(id2.index, id.index, "slot reused");
-        assert_ne!(
-            id2.generation, id.generation,
-            "generation advanced (ABA-safe)"
-        );
-        assert!(t.get(id).is_none(), "stale id still rejected");
-        assert!(t.get(id2).is_some());
+        ensure!(id2.index == id.index, "slot should be reused");
+        ensure!(id2.generation != id.generation, "generation should advance");
+        ensure!(t.get(id).is_none(), "stale id should still be rejected");
+        ensure!(t.get(id2).is_some(), "new handle should resolve");
+        Ok(())
     }
 
     #[test]
-    fn revoke_owned_by_clears_process_handles() {
+    fn revoke_owned_by_clears_process_handles() -> anyhow::Result<()> {
         let mut t = HandleTable::new();
         t.insert(mk_handle(1));
         t.insert(mk_handle(1));
         t.insert(mk_handle(2));
-        assert_eq!(t.revoke_owned_by(ProcessId::new(1)), 2);
-        assert_eq!(t.len(), 1);
+        ensure!(
+            t.revoke_owned_by(ProcessId::new(1)) == 2,
+            "process-owned revoke count mismatch"
+        );
+        ensure!(t.len() == 1, "unexpected handle count: {}", t.len());
+        Ok(())
     }
 }

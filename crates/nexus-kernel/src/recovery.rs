@@ -207,13 +207,19 @@ pub async fn recover_process_persisting(
             entry.fact.id
         ));
         if let Ok(path) = path {
-            // Best-effort: a quarantine write failure is logged by the caller,
-            // not fatal to recovering other processes.
             let v = nexus_types::Value::Str(format!(
                 "{:?} suggested={:?}",
                 entry.fact.id, entry.suggested_action
             ));
-            let _ = state.write_set(&path, v).await;
+            if let Err(error) = state.write_set(&path, v).await {
+                tracing::warn!(
+                    ?error,
+                    %path,
+                    process = process.get(),
+                    fact = %entry.fact.id,
+                    "quarantine state write failed during recovery"
+                );
+            }
         }
     }
     Ok(report)
@@ -222,6 +228,7 @@ pub async fn recover_process_persisting(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, ensure};
     use nexus_types::{
         DecisionTag, HandleId, IdentityRef, MethodId, NodeId, OperationId, OutcomeRef, ResourceId,
         Timestamp, Value, ValueRef,
@@ -251,47 +258,66 @@ mod tests {
     }
 
     #[test]
-    fn completed_facts_are_skipped() {
+    fn completed_facts_are_skipped() -> anyhow::Result<()> {
         let (r, q) = classify_recovery(&[fact(0, ReplayClass::Deterministic, true)]);
-        assert_eq!(r.skipped, 1);
-        assert!(q.is_empty());
+        ensure!(r.skipped == 1, "completed fact should be skipped");
+        ensure!(q.is_empty(), "completed fact should not be quarantined");
+        Ok(())
     }
 
     #[test]
-    fn pending_non_idempotent_quarantines() {
+    fn pending_non_idempotent_quarantines() -> anyhow::Result<()> {
         let (r, q) = classify_recovery(&[fact(0, ReplayClass::NonIdempotentEffect, false)]);
-        assert_eq!(r.quarantined, 1);
-        assert_eq!(q.len(), 1);
-        assert_eq!(q[0].suggested_action, QuarantineAction::ManualComplete);
+        ensure!(
+            r.quarantined == 1,
+            "pending non-idempotent fact should quarantine"
+        );
+        ensure!(q.len() == 1, "unexpected quarantine count: {}", q.len());
+        let quarantine = q.first().context("missing quarantine entry")?;
+        ensure!(
+            quarantine.suggested_action == QuarantineAction::ManualComplete,
+            "unexpected quarantine action"
+        );
+        Ok(())
     }
 
     #[test]
-    fn pending_idempotent_retries() {
+    fn pending_idempotent_retries() -> anyhow::Result<()> {
         let (r, q) = classify_recovery(&[fact(0, ReplayClass::IdempotentEffect, false)]);
-        assert_eq!(r.retried, 1);
-        assert!(q.is_empty());
+        ensure!(r.retried == 1, "pending idempotent fact should retry");
+        ensure!(q.is_empty(), "idempotent retry should not quarantine");
+        Ok(())
     }
 
     #[test]
-    fn unsupported_fact_schema_quarantines_even_completed_fact() {
+    fn unsupported_fact_schema_quarantines_even_completed_fact() -> anyhow::Result<()> {
         let mut f = fact(0, ReplayClass::Deterministic, true);
         f.schema_version = Fact::SCHEMA_VERSION + 1;
         let (r, q) = classify_recovery(&[f.clone()]);
 
-        assert_eq!(r.skipped, 0);
-        assert_eq!(r.quarantined, 1);
-        assert_eq!(r.schema_mismatched, 1);
-        assert_eq!(q.len(), 1);
-        assert_eq!(q[0].fact, f);
-        assert_eq!(q[0].suggested_action, QuarantineAction::MigrateSchema);
+        ensure!(r.skipped == 0, "unsupported schema should not be skipped");
+        ensure!(r.quarantined == 1, "unsupported schema should quarantine");
+        ensure!(r.schema_mismatched == 1, "schema mismatch count mismatch");
+        ensure!(q.len() == 1, "unexpected quarantine count: {}", q.len());
+        let quarantine = q.first().context("missing quarantine entry")?;
+        ensure!(quarantine.fact == f, "quarantined fact mismatch");
+        ensure!(
+            quarantine.suggested_action == QuarantineAction::MigrateSchema,
+            "unexpected quarantine action"
+        );
+        Ok(())
     }
 
     #[test]
-    fn replay_map_ignores_unsupported_fact_schema() {
+    fn replay_map_ignores_unsupported_fact_schema() -> anyhow::Result<()> {
         let mut f = fact(0, ReplayClass::Deterministic, true);
         f.schema_version = Fact::SCHEMA_VERSION + 1;
         let replay = ReplayMap::from_facts(&[f]);
 
-        assert!(replay.is_empty());
+        ensure!(
+            replay.is_empty(),
+            "unsupported fact schema should not enter replay map"
+        );
+        Ok(())
     }
 }

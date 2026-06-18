@@ -25,31 +25,35 @@ Cargo converts hyphens to underscores in generated Rustdoc paths. For example:
 ```text
 nexus-sdk      -> target/doc/nexus_sdk/index.html
 nexus-kernel   -> target/doc/nexus_kernel/index.html
-nexus-actors   -> target/doc/nexus_actors/index.html
+nexus-standard   -> target/doc/nexus_standard/index.html
 ```
 
 ## Reading Order
 
 For embedding:
 
-1. `nexus-sdk`
-2. `nexus-graph`
-3. `nexus-types`
-4. `nexus-kernel`
+- `nexus-sdk`
+- `nexus-graph`
+- `nexus-types`
+- `nexus-kernel`
 
 For protocol adapters:
 
-1. `nexus-gateway`
-2. `nexus-proto`
-3. `nexus-gateway-grpc`
-4. `nexus-gateway-websocket`
-5. `nexus-gateway-mcp`
+- `nexus-gateway`
+- `nexus-proto`
+- `nexus-gateway-grpc`
+- `nexus-gateway-websocket`
+- `nexus-gateway-mcp`
+
+External Provider/Source session admission and secure envelope helpers are under
+`nexus_gateway::external`. The `nexus-gateway` root API is for gateway profiles,
+sessions, submissions, limits, and runtime status.
 
 For standard providers:
 
-1. `nexus-actors`
-2. `nexus-state`
-3. `nexus-storage-redb`
+- `nexus-standard`
+- `nexus-state`
+- `nexus-storage-redb`
 
 ## Doc Quality Checks
 

@@ -17,7 +17,7 @@ use crate::driver::{DriverDescriptor, DynDriver};
 use crate::kernel::Kernel;
 use crate::open::{OpenError, OpenRequest, open_resource_with_attached};
 use crate::process::ProcessEntry;
-use crate::registry::AdmissionError;
+use crate::registry::{AdmissionError, ResolveError};
 use nexus_types::{
     Binding, CapError, ConstraintSet, DriverRef, Expiry, Fact, Grant, HandleId, IdentityRef,
     Interface, InterfaceFamily, InterfaceSet, Metadata, Method, MethodBitmap, ModalitySet,
@@ -128,8 +128,7 @@ impl From<nexus_state::StateError> for BootstrapError {
     }
 }
 
-/// Assembly-time method descriptor. Output support is explicit: no
-/// bootstrap path may silently advertise streaming for a unary-only driver.
+/// Assembly-time method descriptor. Output support must match the driver.
 #[derive(Clone, Copy, Debug)]
 pub struct MethodSpec {
     /// Public method name inside the interface.
@@ -262,6 +261,33 @@ impl Bootstrap {
         driver: DynDriver,
         cost: nexus_types::CostModel,
     ) -> Result<ResourceName, BootstrapError> {
+        self.register_effect_inner(path, methods, driver, cost, Metadata::default(), 1, false)
+    }
+
+    /// Register or relink a Callable effect Resource backed by an in-process
+    /// driver.
+    pub fn register_or_relink_effect_with_cost(
+        &self,
+        path: &str,
+        methods: &[MethodSpec],
+        driver: DynDriver,
+        cost: nexus_types::CostModel,
+        metadata: Metadata,
+        generation: u64,
+    ) -> Result<ResourceName, BootstrapError> {
+        self.register_effect_inner(path, methods, driver, cost, metadata, generation, true)
+    }
+
+    fn register_effect_inner(
+        &self,
+        path: &str,
+        methods: &[MethodSpec],
+        driver: DynDriver,
+        cost: nexus_types::CostModel,
+        metadata: Metadata,
+        generation: u64,
+        relink_existing: bool,
+    ) -> Result<ResourceName, BootstrapError> {
         if methods.len() != 1 || methods[0].name != "invoke" {
             return Err(BootstrapError::InvalidMethodSpec {
                 resource: path.to_string(),
@@ -269,9 +295,43 @@ impl Bootstrap {
                     .into(),
             });
         }
+        if generation == 0 {
+            return Err(BootstrapError::InvalidMethodSpec {
+                resource: path.to_string(),
+                reason: "binding generation must be positive".into(),
+            });
+        }
+        let name = ResourceName::new(Path::parse(path).map_err(|source| BootstrapError::Path {
+            literal: path.to_string(),
+            source,
+        })?);
         let reg = &self.kernel.registry;
+        if relink_existing {
+            match reg.resource_binding_generation(&name) {
+                Ok(current) if generation < current => {
+                    return Err(
+                        crate::registry::AdmissionError::BindingGenerationRegressed {
+                            resource: name.path().to_string(),
+                            current,
+                            attempted: generation,
+                        }
+                        .into(),
+                    );
+                }
+                Ok(_) | Err(crate::registry::AdmissionError::ResourceNotRegistered(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let selector_literal = format!("perform://{}", strip_scheme(path));
+        let selector = ResourceSelector::parse(&selector_literal).map_err(|source| {
+            BootstrapError::Selector {
+                literal: selector_literal,
+                source,
+            }
+        })?;
         let iface_id = reg.next_interface_id();
         let method_descs = build_methods(methods, cost, false);
+        let interfaces = InterfaceSet::new(vec![iface_id]);
         reg.register_interface(Interface {
             id: iface_id,
             family: InterfaceFamily::Callable,
@@ -283,23 +343,12 @@ impl Bootstrap {
         reg.register_driver(DriverDescriptor {
             id: driver_id,
             name: path.to_string(),
-            implements: InterfaceSet::new(vec![iface_id]),
+            implements: interfaces.clone(),
             transport: Transport::InProcess,
             driver,
         });
 
         let binding_id = reg.next_binding_id();
-        // The binding selector mirrors the effect path under the `perform` verb.
-        // A parse failure here is an assembly-time programmer error (the path is
-        // a static literal), so fail fast — never silently broaden the selector
-        // to a wildcard, which would over-grant authority.
-        let selector_literal = format!("perform://{}", strip_scheme(path));
-        let selector = ResourceSelector::parse(&selector_literal).map_err(|source| {
-            BootstrapError::Selector {
-                literal: selector_literal,
-                source,
-            }
-        })?;
         // Admit (not bare-register) so the invariant is enforced even for
         // built-ins: the bound Driver implements every Interface the Binding
         // declares. The driver registered just above implements `iface_id`, so a
@@ -307,29 +356,35 @@ impl Bootstrap {
         reg.admit_binding(Binding {
             id: binding_id,
             selector,
-            interfaces: InterfaceSet::new(vec![iface_id]),
+            interfaces: interfaces.clone(),
             driver: DriverRef {
                 id: driver_id,
                 name: path.to_string(),
             },
             endpoint: None,
-            generation: 1,
+            generation,
         })?;
 
+        if relink_existing {
+            match reg.resolve_resource(&name) {
+                Ok(_) => {
+                    reg.relink_resource(&name, interfaces, binding_id)?;
+                    return Ok(name);
+                }
+                Err(ResolveError::NoSuchResource(_)) => {}
+            }
+        }
+
         let rid = reg.next_resource_id();
-        let name = ResourceName::new(Path::parse(path).map_err(|source| BootstrapError::Path {
-            literal: path.to_string(),
-            source,
-        })?);
         reg.admit_resource(
             Resource {
                 id: rid,
                 descriptor: ResourceDescriptor {
                     name: name.clone(),
                     kind: ResourceKind::Effect,
-                    metadata: Metadata::default(),
+                    metadata,
                 },
-                interfaces: InterfaceSet::new(vec![iface_id]),
+                interfaces,
                 binding: binding_id,
             },
             true,
@@ -668,21 +723,16 @@ impl Bootstrap {
         Ok(())
     }
 
-    /// Finalize a Process: the ordered teardown sequence. Mutating the
-    /// process tree + handle table directly (this is the kernel's own
-    /// bookkeeping, not a runtime Operation):
-    ///
-    /// 1. mark `Finalizing`
-    /// 2. cancel descendants deepest-first
-    /// 3. run the process's finalizers in reverse order
-    /// 4. revoke all handles owned by the process (ABA-safe generation bump)
-    /// 5. mark `Done` and record a `ProcessFinalized` Fact-like state marker
+    /// Finalize a Process by marking teardown state, cancelling descendants,
+    /// running finalizers, revoking owned handles, and recording the
+    /// `ProcessFinalized` lifecycle marker.
     pub async fn finalize_process(&self, process: ProcessId) -> Result<(), BootstrapError> {
         let procs = &self.kernel.processes;
-        // 1. mark Finalizing.
+        // Enter teardown before touching descendants or handles.
         procs.set_status(process, ProcessStatus::Finalizing);
 
-        // 2. cancel descendants deepest-first (excluding self, handled last).
+        // Cancel descendants deepest-first while this process remains in
+        // Finalizing until its own cleanup completes.
         for descendant in procs.subtree_post_order(process) {
             if descendant != process {
                 procs.set_status(descendant, ProcessStatus::Cancelled);
@@ -690,20 +740,26 @@ impl Bootstrap {
             }
         }
 
-        // 3. run finalizers in reverse.
+        // Run finalizers in reverse registration order.
         for body in procs.take_finalizers(process) {
             let ex = self.kernel.executor_for(process);
-            let _ = ex.eval(&body).await;
+            if let nexus_types::Outcome::Fail(failure) = ex.eval(&body).await {
+                tracing::warn!(
+                    process = process.get(),
+                    %failure,
+                    "process finalizer failed"
+                );
+            }
         }
 
-        // 4. revoke handles owned by the process.
+        // Revoke handles owned by the process after finalizers have run.
         let revoked = self.kernel.handles.write().revoke_owned_by(process);
 
-        // 5. Write a ProcessFinalized Fact to the Fact stream as the
-        // authoritative lifecycle record, mark Completed, and write a state
-        // marker for quick lookup. The Fact uses a reserved high CausalPosition
-        // so it never collides with a program node's id. If the Fact cannot be
-        // recorded, leave the Process in Finalizing for operator inspection.
+        // Write a ProcessFinalized Fact to the Fact stream as the authoritative
+        // lifecycle record, mark Completed, and write a state marker for quick
+        // lookup. The Fact uses a reserved high CausalPosition so it never
+        // collides with a program node's id. If the Fact cannot be recorded,
+        // leave the Process in Finalizing for operator inspection.
         let finalized = Fact {
             id: nexus_types::OperationId::new(process, FINALIZED_NODE, 0),
             schema_version: Fact::SCHEMA_VERSION,
@@ -834,26 +890,34 @@ fn strip_scheme(path: &str) -> String {
 mod tests {
     use super::*;
     use crate::driver::EchoDriver;
+    use anyhow::{Context, bail, ensure};
     use nexus_graph::{DoNode, OperationTemplate};
     use nexus_types::{OutputMode, Value};
     use std::sync::Arc;
 
+    fn expect_bootstrap_error<T>(
+        result: Result<T, BootstrapError>,
+    ) -> anyhow::Result<BootstrapError> {
+        match result {
+            Ok(_) => bail!("expected bootstrap error"),
+            Err(err) => Ok(err),
+        }
+    }
+
     #[tokio::test]
-    async fn end_to_end_operation_flows_through_resolved_handle() {
+    async fn end_to_end_operation_flows_through_resolved_handle() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
         // Register an echo effect and open a handle for the root process.
-        let name = boot
-            .register_effect(
-                "effect://echo/say",
-                &[MethodSpec::new(
-                    "invoke",
-                    Purity::Pure,
-                    MethodSpec::UNARY_ASYNC,
-                )],
-                Arc::new(EchoDriver),
-            )
-            .unwrap();
-        let handle = boot.open_for(boot.root, &name, "perform").unwrap();
+        let name = boot.register_effect(
+            "effect://echo/say",
+            &[MethodSpec::new(
+                "invoke",
+                Purity::Pure,
+                MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(EchoDriver),
+        )?;
+        let handle = boot.open_for(boot.root, &name, "perform")?;
 
         // Build an executor, bind the handle, run a one-Operation program.
         let ex = boot.kernel.executor_for(boot.root);
@@ -866,29 +930,35 @@ mod tests {
             literal_input: Some(Value::Str("hello".into())),
         });
         let out = ex.eval(&prog).await;
-        assert_eq!(out, nexus_types::Outcome::Done(Value::Str("hello".into())));
+        ensure!(
+            out == nexus_types::Outcome::Done(Value::Str("hello".into())),
+            "unexpected operation outcome: {out:?}"
+        );
 
         // A single unconsumed pure-Deterministic read need not record a Fact
         // because recovery can recompute it. The EchoDriver method is Pure, and
         // the op's output flows nowhere, so no Fact is written.
-        assert_eq!(boot.kernel.facts.facts_of(boot.root).unwrap().len(), 0);
+        let facts = boot.kernel.facts.facts_of(boot.root)?;
+        ensure!(
+            facts.is_empty(),
+            "pure unconsumed op should not record facts"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn unary_only_method_rejects_stream_request() {
+    async fn unary_only_method_rejects_stream_request() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        let name = boot
-            .register_effect(
-                "effect://echo/unary",
-                &[MethodSpec::new(
-                    "invoke",
-                    Purity::Pure,
-                    MethodSpec::UNARY_ASYNC,
-                )],
-                Arc::new(EchoDriver),
-            )
-            .unwrap();
-        let handle = boot.open_for(boot.root, &name, "perform").unwrap();
+        let name = boot.register_effect(
+            "effect://echo/unary",
+            &[MethodSpec::new(
+                "invoke",
+                Purity::Pure,
+                MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(EchoDriver),
+        )?;
+        let handle = boot.open_for(boot.root, &name, "perform")?;
         let ex = boot.kernel.executor_for(boot.root);
         ex.bind_handle(name.clone(), handle);
         let prog = DoNode::Op(OperationTemplate {
@@ -900,36 +970,35 @@ mod tests {
         });
         match ex.eval(&prog).await {
             nexus_types::Outcome::Fail(nexus_types::Failure::InvalidInput { reason }) => {
-                assert!(
+                ensure!(
                     reason.contains("does not support output mode"),
                     "unexpected failure reason: {reason}"
                 );
             }
-            other => panic!("expected unsupported stream request, got {other:?}"),
+            other => bail!("expected unsupported stream request, got {other:?}"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn budget_exhaustion_denies_costly_op_before_effect() {
+    async fn budget_exhaustion_denies_costly_op_before_effect() -> anyhow::Result<()> {
         // A process with a tiny daily budget running a costed effect is denied
         // with BudgetExhausted because the reservation fires before dispatch.
         let boot = Bootstrap::in_memory();
-        let name = boot
-            .register_effect_with_cost(
-                "effect://pricey/call",
-                &[MethodSpec::new(
-                    "invoke",
-                    Purity::Effectful,
-                    MethodSpec::UNARY_ASYNC,
-                )],
-                Arc::new(EchoDriver),
-                // 1 USD flat per call = 1_000_000 micro-USD.
-                nexus_types::CostModel {
-                    flat_micro_usd: 1_000_000,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let name = boot.register_effect_with_cost(
+            "effect://pricey/call",
+            &[MethodSpec::new(
+                "invoke",
+                Purity::Effectful,
+                MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(EchoDriver),
+            // 1 USD flat per call = 1_000_000 micro-USD.
+            nexus_types::CostModel {
+                flat_micro_usd: 1_000_000,
+                ..Default::default()
+            },
+        )?;
         // Root's daily budget is only 500_000 micro-USD — below one call.
         boot.kernel.processes.set_budget_spec(
             boot.root,
@@ -938,7 +1007,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let handle = boot.open_for(boot.root, &name, "perform").unwrap();
+        let handle = boot.open_for(boot.root, &name, "perform")?;
         let ex = boot.kernel.executor_for(boot.root);
         ex.bind_handle(name.clone(), handle);
         let prog = DoNode::Op(OperationTemplate {
@@ -950,31 +1019,30 @@ mod tests {
         });
         match ex.eval(&prog).await {
             nexus_types::Outcome::Fail(nexus_types::Failure::BudgetExhausted { dim }) => {
-                assert_eq!(dim, "daily_micro_usd");
+                ensure!(
+                    dim == "daily_micro_usd",
+                    "unexpected budget dimension: {dim}"
+                );
             }
-            other => panic!("expected BudgetExhausted, got {other:?}"),
+            other => bail!("expected BudgetExhausted, got {other:?}"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn batchable_budget_charges_flat_cost_per_element() {
+    async fn batchable_budget_charges_flat_cost_per_element() -> anyhow::Result<()> {
         // Batchable methods apply CostModel per element. A 3-element batch with
         // flat=100 reserves 300 before dispatch, so a 250 budget denies.
         let boot = Bootstrap::in_memory();
-        let name = boot
-            .register_effect_with_cost(
-                "effect://batch/embed",
-                &[
-                    MethodSpec::new("invoke", Purity::Idempotent, MethodSpec::UNARY_ASYNC)
-                        .batchable(),
-                ],
-                Arc::new(EchoDriver),
-                nexus_types::CostModel {
-                    flat_micro_usd: 100,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let name = boot.register_effect_with_cost(
+            "effect://batch/embed",
+            &[MethodSpec::new("invoke", Purity::Idempotent, MethodSpec::UNARY_ASYNC).batchable()],
+            Arc::new(EchoDriver),
+            nexus_types::CostModel {
+                flat_micro_usd: 100,
+                ..Default::default()
+            },
+        )?;
         boot.kernel.processes.set_budget_spec(
             boot.root,
             nexus_types::BudgetSpec {
@@ -982,7 +1050,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let handle = boot.open_for(boot.root, &name, "perform").unwrap();
+        let handle = boot.open_for(boot.root, &name, "perform")?;
         let ex = boot.kernel.executor_for(boot.root);
         ex.bind_handle(name.clone(), handle);
         let prog = DoNode::Op(OperationTemplate {
@@ -998,47 +1066,53 @@ mod tests {
         });
         match ex.eval(&prog).await {
             nexus_types::Outcome::Fail(nexus_types::Failure::BudgetExhausted { dim }) => {
-                assert_eq!(dim, "daily_micro_usd");
+                ensure!(
+                    dim == "daily_micro_usd",
+                    "unexpected budget dimension: {dim}"
+                );
             }
-            other => panic!("expected batch BudgetExhausted, got {other:?}"),
+            other => bail!("expected batch BudgetExhausted, got {other:?}"),
         }
+        Ok(())
     }
 
     #[test]
-    fn effect_registration_rejects_sibling_methods() {
+    fn effect_registration_rejects_sibling_methods() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        assert!(matches!(
-            boot.register_effect(
-                "effect://approval/ask",
-                &[
-                    MethodSpec::new("invoke", Purity::Effectful, MethodSpec::UNARY_ASYNC),
-                    MethodSpec::new("check", Purity::Idempotent, MethodSpec::UNARY_ASYNC),
-                ],
-                Arc::new(EchoDriver),
+        ensure!(
+            matches!(
+                boot.register_effect(
+                    "effect://approval/ask",
+                    &[
+                        MethodSpec::new("invoke", Purity::Effectful, MethodSpec::UNARY_ASYNC),
+                        MethodSpec::new("check", Purity::Idempotent, MethodSpec::UNARY_ASYNC),
+                    ],
+                    Arc::new(EchoDriver),
+                ),
+                Err(BootstrapError::InvalidMethodSpec { .. })
             ),
-            Err(BootstrapError::InvalidMethodSpec { .. })
-        ));
+            "sibling methods should be rejected"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn budget_settles_and_allows_within_limit() {
+    async fn budget_settles_and_allows_within_limit() -> anyhow::Result<()> {
         // A costed op within budget runs, and settlement leaves inflight at 0.
         let boot = Bootstrap::in_memory();
-        let name = boot
-            .register_effect_with_cost(
-                "effect://cheap/call",
-                &[MethodSpec::new(
-                    "invoke",
-                    Purity::Pure,
-                    MethodSpec::UNARY_ASYNC,
-                )],
-                Arc::new(EchoDriver),
-                nexus_types::CostModel {
-                    flat_micro_usd: 100,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let name = boot.register_effect_with_cost(
+            "effect://cheap/call",
+            &[MethodSpec::new(
+                "invoke",
+                Purity::Pure,
+                MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(EchoDriver),
+            nexus_types::CostModel {
+                flat_micro_usd: 100,
+                ..Default::default()
+            },
+        )?;
         boot.kernel.processes.set_budget_spec(
             boot.root,
             nexus_types::BudgetSpec {
@@ -1046,7 +1120,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let handle = boot.open_for(boot.root, &name, "perform").unwrap();
+        let handle = boot.open_for(boot.root, &name, "perform")?;
         let ex = boot.kernel.executor_for(boot.root);
         ex.bind_handle(name.clone(), handle);
         let prog = DoNode::Op(OperationTemplate {
@@ -1056,42 +1130,42 @@ mod tests {
             output: OutputMode::Unary,
             literal_input: Some(Value::Str("ok".into())),
         });
-        assert_eq!(
-            ex.eval(&prog).await,
-            nexus_types::Outcome::Done(Value::Str("ok".into()))
+        let out = ex.eval(&prog).await;
+        ensure!(
+            out == nexus_types::Outcome::Done(Value::Str("ok".into())),
+            "unexpected budgeted operation outcome: {out:?}"
         );
         // Settled: inflight released, spend reflects the flat charge.
         let inflight = boot
             .kernel
             .processes
             .budget_mut(boot.root, |b| b.inflight_ops)
-            .unwrap();
-        assert_eq!(inflight, 0, "inflight slot released after settle");
+            .context("missing root budget state")?;
+        ensure!(inflight == 0, "inflight slot released after settle");
         let spent = boot
             .kernel
             .processes
             .budget_mut(boot.root, |b| b.spent_micro_usd)
-            .unwrap();
-        assert_eq!(spent, 100, "flat cost settled");
+            .context("missing root budget state")?;
+        ensure!(spent == 100, "flat cost settled");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn consumed_operation_records_a_fact() {
+    async fn consumed_operation_records_a_fact() -> anyhow::Result<()> {
         // When the operation's output is consumed downstream, a Fact is
         // recorded so recovery can reuse it.
         let boot = Bootstrap::in_memory();
-        let name = boot
-            .register_effect(
-                "effect://echo2/say",
-                &[MethodSpec::new(
-                    "invoke",
-                    Purity::Pure,
-                    MethodSpec::UNARY_ASYNC,
-                )],
-                Arc::new(EchoDriver),
-            )
-            .unwrap();
-        let handle = boot.open_for(boot.root, &name, "perform").unwrap();
+        let name = boot.register_effect(
+            "effect://echo2/say",
+            &[MethodSpec::new(
+                "invoke",
+                Purity::Pure,
+                MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(EchoDriver),
+        )?;
+        let handle = boot.open_for(boot.root, &name, "perform")?;
         let ex = boot.kernel.executor_for(boot.root);
         ex.bind_handle(name.clone(), handle);
         ex.steps
@@ -1105,41 +1179,48 @@ mod tests {
         })
         .and_then(nexus_graph::StepRef::new(boot.root, "echo_back"));
         let out = ex.eval(&prog).await;
-        assert_eq!(out, nexus_types::Outcome::Done(Value::Str("hi".into())));
-        assert_eq!(boot.kernel.facts.facts_of(boot.root).unwrap().len(), 1);
+        ensure!(
+            out == nexus_types::Outcome::Done(Value::Str("hi".into())),
+            "unexpected consumed operation outcome: {out:?}"
+        );
+        let facts = boot.kernel.facts.facts_of(boot.root)?;
+        ensure!(facts.len() == 1, "consumed op should record one fact");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn recover_all_runs_clean_on_fresh_boot() {
+    async fn recover_all_runs_clean_on_fresh_boot() -> anyhow::Result<()> {
         // A freshly-booted kernel has no pending Facts → nothing to recover.
         let boot = Bootstrap::in_memory();
-        let report = boot.recover_all().await.unwrap();
-        assert_eq!(report.skipped + report.retried + report.quarantined, 0);
+        let report = boot.recover_all().await?;
+        ensure!(
+            report.skipped + report.retried + report.quarantined == 0,
+            "fresh boot should have nothing to recover"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn finalize_marks_completed_and_writes_marker() {
+    async fn finalize_marks_completed_and_writes_marker() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
         // Spawn a child request Process, then finalize it.
-        let child = boot
-            .spawn_request_process_under_with_request_grants(
-                boot.root,
-                nexus_types::IdentityRef::ROOT,
-                &[],
-            )
-            .unwrap();
-        boot.finalize_process(child).await.unwrap();
-        assert_eq!(
-            boot.kernel.processes.status(child),
-            Some(nexus_types::ProcessStatus::Completed)
+        let child = boot.spawn_request_process_under_with_request_grants(
+            boot.root,
+            nexus_types::IdentityRef::ROOT,
+            &[],
+        )?;
+        boot.finalize_process(child).await?;
+        ensure!(
+            boot.kernel.processes.status(child) == Some(nexus_types::ProcessStatus::Completed),
+            "child process should be completed"
         );
         // The finalize marker is written to state.
-        let path = finalized_marker_path(child).unwrap();
-        let marker = boot.kernel.state.read(&path).await.unwrap();
-        assert!(marker.is_some());
+        let path = finalized_marker_path(child)?;
+        let marker = boot.kernel.state.read(&path).await?;
+        ensure!(marker.is_some(), "finalize marker should be written");
         // Finalization appends a ProcessFinalized Fact to the Fact stream.
-        let facts = boot.kernel.facts.facts_of(child).unwrap();
-        assert!(
+        let facts = boot.kernel.facts.facts_of(child)?;
+        ensure!(
             facts.iter().any(|f| {
                 f.id.position == nexus_types::NodeId::new(u32::MAX)
                     && matches!(&f.outcome_ref, nexus_types::OutcomeRef::Inline(nexus_types::Value::Map(m))
@@ -1147,6 +1228,7 @@ mod tests {
             }),
             "finalize records a ProcessFinalized Fact"
         );
+        Ok(())
     }
 
     struct FailingFinalizeFactStore;
@@ -1181,78 +1263,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_fact_failure_keeps_process_finalizing() {
+    async fn finalize_fact_failure_keeps_process_finalizing() -> anyhow::Result<()> {
         let facts = crate::fact::FactSink::new(Arc::new(FailingFinalizeFactStore));
         let state: nexus_state::Backend = Arc::new(nexus_state::InMemoryBackend::new());
         let boot = Bootstrap::from_kernel(crate::Kernel::with_backends(state, facts));
-        let child = boot
-            .spawn_request_process_under_with_request_grants(
-                boot.root,
-                nexus_types::IdentityRef::ROOT,
-                &[],
-            )
-            .unwrap();
+        let child = boot.spawn_request_process_under_with_request_grants(
+            boot.root,
+            nexus_types::IdentityRef::ROOT,
+            &[],
+        )?;
 
-        let err = boot.finalize_process(child).await.unwrap_err();
-        assert!(matches!(err, BootstrapError::Fact(_)));
-        assert_eq!(
-            boot.kernel.processes.status(child),
-            Some(nexus_types::ProcessStatus::Finalizing),
+        let err = expect_bootstrap_error(boot.finalize_process(child).await)?;
+        ensure!(
+            matches!(err, BootstrapError::Fact(_)),
+            "unexpected finalize error: {err:?}"
+        );
+        ensure!(
+            boot.kernel.processes.status(child) == Some(nexus_types::ProcessStatus::Finalizing),
             "a terminal status requires the authoritative finalization Fact"
         );
+        Ok(())
     }
 
     #[test]
-    fn gateway_audit_fact_failure_does_not_insert_audit_process() {
+    fn gateway_audit_fact_failure_does_not_insert_audit_process() -> anyhow::Result<()> {
         let facts = crate::fact::FactSink::new(Arc::new(FailingFinalizeFactStore));
         let state: nexus_state::Backend = Arc::new(nexus_state::InMemoryBackend::new());
         let boot = Bootstrap::from_kernel(crate::Kernel::with_backends(state, facts));
         let before = boot.kernel.processes.all_ids().len();
 
-        let err = boot
-            .record_gateway_audit(GatewayAudit {
-                event: "login",
-                username: Some("alice"),
-                source_addr: Some("127.0.0.1"),
-                outcome: "denied",
-                mfa_level: None,
-                details: None,
-            })
-            .unwrap_err();
+        let err = match boot.record_gateway_audit(GatewayAudit {
+            event: "login",
+            username: Some("alice"),
+            source_addr: Some("127.0.0.1"),
+            outcome: "denied",
+            mfa_level: None,
+            details: None,
+        }) {
+            Ok(()) => bail!("expected gateway audit fact error"),
+            Err(err) => err,
+        };
 
-        assert!(err.to_string().contains("simulated complete failure"));
-        assert_eq!(
-            boot.kernel.processes.all_ids().len(),
-            before,
+        ensure!(
+            err.to_string().contains("simulated complete failure"),
+            "unexpected audit error: {err}"
+        );
+        ensure!(
+            boot.kernel.processes.all_ids().len() == before,
             "pre-operation audit events must not create process rows without audit Facts"
         );
+        Ok(())
     }
 
     #[test]
-    fn request_process_rejects_malformed_request_grant_before_insert() {
+    fn request_process_rejects_malformed_request_grant_before_insert() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
         let before = boot.kernel.processes.all_ids().len();
-        let err = boot
-            .spawn_request_process_under_with_request_grants(
-                boot.root,
-                nexus_types::IdentityRef::ROOT,
-                &[RequestGrantTemplate {
-                    literal: "effect://x/post",
-                    methods: MethodBitmap::method(0),
-                }],
-            )
-            .unwrap_err();
-        assert!(matches!(err, BootstrapError::Selector { .. }));
-        assert_eq!(
-            boot.kernel.processes.all_ids().len(),
-            before,
+        let err = expect_bootstrap_error(boot.spawn_request_process_under_with_request_grants(
+            boot.root,
+            nexus_types::IdentityRef::ROOT,
+            &[RequestGrantTemplate {
+                literal: "effect://x/post",
+                methods: MethodBitmap::method(0),
+            }],
+        ))?;
+        ensure!(
+            matches!(err, BootstrapError::Selector { .. }),
+            "unexpected malformed request grant error: {err:?}"
+        );
+        ensure!(
+            boot.kernel.processes.all_ids().len() == before,
             "malformed request grants must not leave a child process behind"
         );
+        Ok(())
     }
 
     /// Register a Process holding exactly `selectors` as grants, to act as a
     /// restricted authority anchor in tests.
-    fn restricted_anchor(boot: &Bootstrap, selectors: &[&str]) -> nexus_types::ProcessId {
+    fn restricted_anchor(
+        boot: &Bootstrap,
+        selectors: &[&str],
+    ) -> anyhow::Result<nexus_types::ProcessId> {
         let anchor = boot.kernel.processes.fresh_id();
         let mut entry = ProcessEntry::new(anchor, Some(boot.root), nexus_types::IdentityRef::ROOT);
         entry.status = ProcessStatus::Running;
@@ -1261,49 +1352,48 @@ mod tests {
             let grant = Grant {
                 id: boot.kernel.registry.next_grant_id(),
                 holder: anchor,
-                selector: ResourceSelector::parse(sel).expect("anchor selector parses"),
+                selector: ResourceSelector::parse(sel)?,
                 rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
                 constraints: ConstraintSet::empty(),
                 expires: Expiry::Never,
             };
             boot.kernel.registry.register_grant(grant);
         }
-        anchor
+        Ok(anchor)
     }
 
     #[test]
-    fn root_anchor_covers_every_request_grant_template() {
+    fn root_anchor_covers_every_request_grant_template() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        let child = boot
-            .spawn_request_process_under_with_request_grants(
-                boot.root,
-                nexus_types::IdentityRef::ROOT,
-                &[
-                    RequestGrantTemplate {
-                        literal: "perform://effect/x/post",
-                        methods: MethodBitmap::method(0),
-                    },
-                    RequestGrantTemplate {
-                        literal: "read://state/memory/alice/x",
-                        methods: MethodBitmap::method(0),
-                    },
-                ],
-            )
-            .expect("root anchor covers all request grant templates");
-        assert!(
+        let child = boot.spawn_request_process_under_with_request_grants(
+            boot.root,
+            nexus_types::IdentityRef::ROOT,
+            &[
+                RequestGrantTemplate {
+                    literal: "perform://effect/x/post",
+                    methods: MethodBitmap::method(0),
+                },
+                RequestGrantTemplate {
+                    literal: "read://state/memory/alice/x",
+                    methods: MethodBitmap::method(0),
+                },
+            ],
+        )?;
+        ensure!(
             boot.kernel.registry.grants_of(child).is_empty(),
             "request Process grants must not be registered in the global grant table"
         );
         let grants = boot.kernel.processes.attached_grants(child);
-        assert_eq!(grants.len(), 2, "one grant per request grant template");
+        ensure!(grants.len() == 2, "one grant per request grant template");
+        Ok(())
     }
 
     #[test]
-    fn restricted_anchor_rejects_capability_outside_ceiling_fail_closed() {
+    fn restricted_anchor_rejects_capability_outside_ceiling_fail_closed() -> anyhow::Result<()> {
         // An anchor holding only inference authority must reject a request
         // grant outside that ceiling.
         let boot = Bootstrap::in_memory();
-        let anchor = restricted_anchor(&boot, &["perform://effect/inference/**"]);
+        let anchor = restricted_anchor(&boot, &["perform://effect/inference/**"])?;
         let before = boot.kernel.processes.all_ids().len();
 
         // Covered capability is fine.
@@ -1314,66 +1404,64 @@ mod tests {
                 literal: "perform://effect/inference/infer",
                 methods: MethodBitmap::method(0),
             }],
-        )
-        .expect("request grant within anchor ceiling is accepted");
+        )?;
 
         // Rejected declarations must not allocate a child Process.
         let mid = boot.kernel.processes.all_ids().len();
-        let err = boot
-            .spawn_request_process_under_with_request_grants(
-                anchor,
-                nexus_types::IdentityRef::ROOT,
-                &[RequestGrantTemplate {
-                    literal: "perform://effect/proc/spawn",
-                    methods: MethodBitmap::method(0),
-                }],
-            )
-            .unwrap_err();
-        assert!(
+        let err = expect_bootstrap_error(boot.spawn_request_process_under_with_request_grants(
+            anchor,
+            nexus_types::IdentityRef::ROOT,
+            &[RequestGrantTemplate {
+                literal: "perform://effect/proc/spawn",
+                methods: MethodBitmap::method(0),
+            }],
+        ))?;
+        ensure!(
             matches!(err, BootstrapError::CapabilityCeiling { .. }),
             "request grant outside anchor ceiling must be rejected"
         );
-        assert_eq!(
-            boot.kernel.processes.all_ids().len(),
-            mid,
+        ensure!(
+            boot.kernel.processes.all_ids().len() == mid,
             "a rejected over-broad request grant must not leave a child process behind"
         );
-        assert!(mid > before, "the covered spawn did create a child");
+        ensure!(mid > before, "the covered spawn did create a child");
+        Ok(())
     }
 
     #[test]
-    fn restricted_anchor_rejects_when_one_of_several_caps_exceeds_ceiling() {
+    fn restricted_anchor_rejects_when_one_of_several_caps_exceeds_ceiling() -> anyhow::Result<()> {
         // The whole spawn fails if any request grant exceeds the anchor; the
         // covered ones must not be partially granted.
         let boot = Bootstrap::in_memory();
-        let anchor = restricted_anchor(&boot, &["perform://effect/inference/**"]);
+        let anchor = restricted_anchor(&boot, &["perform://effect/inference/**"])?;
         let before = boot.kernel.processes.all_ids().len();
-        let err = boot
-            .spawn_request_process_under_with_request_grants(
-                anchor,
-                nexus_types::IdentityRef::ROOT,
-                &[
-                    RequestGrantTemplate {
-                        literal: "perform://effect/inference/infer",
-                        methods: MethodBitmap::method(0),
-                    },
-                    RequestGrantTemplate {
-                        literal: "write://state/vault/alice/x",
-                        methods: MethodBitmap::method(0),
-                    },
-                ],
-            )
-            .unwrap_err();
-        assert!(matches!(err, BootstrapError::CapabilityCeiling { .. }));
-        assert_eq!(
-            boot.kernel.processes.all_ids().len(),
-            before,
+        let err = expect_bootstrap_error(boot.spawn_request_process_under_with_request_grants(
+            anchor,
+            nexus_types::IdentityRef::ROOT,
+            &[
+                RequestGrantTemplate {
+                    literal: "perform://effect/inference/infer",
+                    methods: MethodBitmap::method(0),
+                },
+                RequestGrantTemplate {
+                    literal: "write://state/vault/alice/x",
+                    methods: MethodBitmap::method(0),
+                },
+            ],
+        ))?;
+        ensure!(
+            matches!(err, BootstrapError::CapabilityCeiling { .. }),
+            "unexpected capability ceiling error: {err:?}"
+        );
+        ensure!(
+            boot.kernel.processes.all_ids().len() == before,
             "a partially-uncovered declared set must spawn nothing"
         );
+        Ok(())
     }
 
     #[test]
-    fn request_grant_template_narrows_anchor_method_rights() {
+    fn request_grant_template_narrows_anchor_method_rights() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
         let anchor = boot.kernel.processes.fresh_id();
         let mut entry = ProcessEntry::new(anchor, Some(boot.root), nexus_types::IdentityRef::ROOT);
@@ -1382,30 +1470,39 @@ mod tests {
         boot.kernel.registry.register_grant(Grant {
             id: boot.kernel.registry.next_grant_id(),
             holder: anchor,
-            selector: ResourceSelector::parse("perform://effect/echo/**").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/echo/**")?,
             rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
         });
 
-        let child = boot
-            .spawn_request_process_under_with_request_grants(
-                anchor,
-                nexus_types::IdentityRef::ROOT,
-                &[RequestGrantTemplate {
-                    literal: "perform://effect/echo/say",
-                    methods: MethodBitmap::method(0),
-                }],
-            )
-            .unwrap();
+        let child = boot.spawn_request_process_under_with_request_grants(
+            anchor,
+            nexus_types::IdentityRef::ROOT,
+            &[RequestGrantTemplate {
+                literal: "perform://effect/echo/say",
+                methods: MethodBitmap::method(0),
+            }],
+        )?;
         let grants = boot.kernel.processes.attached_grants(child);
-        assert_eq!(grants.len(), 1);
-        assert!(grants[0].rights.methods.allows(0));
-        assert!(!grants[0].rights.methods.allows(1));
+        ensure!(
+            grants.len() == 1,
+            "unexpected grant count: {}",
+            grants.len()
+        );
+        ensure!(
+            grants[0].rights.methods.allows(0),
+            "method 0 should be allowed"
+        );
+        ensure!(
+            !grants[0].rights.methods.allows(1),
+            "method 1 should not be allowed"
+        );
+        Ok(())
     }
 
     #[test]
-    fn compiled_request_grant_template_uses_anchor_backstop() {
+    fn compiled_request_grant_template_uses_anchor_backstop() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
         let anchor = boot.kernel.processes.fresh_id();
         let mut entry = ProcessEntry::new(anchor, Some(boot.root), nexus_types::IdentityRef::ROOT);
@@ -1414,41 +1511,46 @@ mod tests {
         boot.kernel.registry.register_grant(Grant {
             id: boot.kernel.registry.next_grant_id(),
             holder: anchor,
-            selector: ResourceSelector::parse("perform://effect/echo/**").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/echo/**")?,
             rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
         });
 
         let compiled = CompiledRequestGrantTemplate {
-            selector: ResourceSelector::parse("perform://effect/echo/say").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/echo/say")?,
             methods: MethodBitmap::method(0),
         };
-        let child = boot
-            .spawn_request_process_under_with_compiled_request_grants(
-                anchor,
-                nexus_types::IdentityRef::ROOT,
-                &[compiled],
-            )
-            .unwrap();
-        assert_eq!(boot.kernel.processes.attached_grants(child).len(), 1);
+        let child = boot.spawn_request_process_under_with_compiled_request_grants(
+            anchor,
+            nexus_types::IdentityRef::ROOT,
+            &[compiled],
+        )?;
+        ensure!(
+            boot.kernel.processes.attached_grants(child).len() == 1,
+            "compiled grant should attach one grant"
+        );
 
         let overbroad = CompiledRequestGrantTemplate {
-            selector: ResourceSelector::parse("perform://effect/echo/say").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/echo/say")?,
             methods: MethodBitmap::method(1),
         };
-        assert!(matches!(
-            boot.spawn_request_process_under_with_compiled_request_grants(
-                anchor,
-                nexus_types::IdentityRef::ROOT,
-                &[overbroad],
+        ensure!(
+            matches!(
+                boot.spawn_request_process_under_with_compiled_request_grants(
+                    anchor,
+                    nexus_types::IdentityRef::ROOT,
+                    &[overbroad],
+                ),
+                Err(BootstrapError::CapabilityCeiling { .. })
             ),
-            Err(BootstrapError::CapabilityCeiling { .. })
-        ));
+            "overbroad compiled grant should be rejected"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn recovery_replays_completed_effect_without_reissuing() {
+    async fn recovery_replays_completed_effect_without_reissuing() -> anyhow::Result<()> {
         // Re-running a recovered program must not repeat an effect that already
         // happened. We run a consumed Operation once, build a ReplayMap from the
         // fact stream, then re-run the same program with the map; the effect
@@ -1461,21 +1563,19 @@ mod tests {
         CALLS.store(0, Ordering::SeqCst);
 
         let boot = Bootstrap::in_memory();
-        let name = boot
-            .register_effect(
-                "effect://counter/tick",
-                &[MethodSpec::new(
-                    "invoke",
-                    Purity::Effectful,
-                    MethodSpec::UNARY_ASYNC,
-                )],
-                StdArc::new(FnDriver(|_m: nexus_types::MethodId, _in: Value| {
-                    CALLS.fetch_add(1, Ordering::SeqCst);
-                    Ok(Value::Int(7))
-                })),
-            )
-            .unwrap();
-        let handle = boot.open_for(boot.root, &name, "perform").unwrap();
+        let name = boot.register_effect(
+            "effect://counter/tick",
+            &[MethodSpec::new(
+                "invoke",
+                Purity::Effectful,
+                MethodSpec::UNARY_ASYNC,
+            )],
+            StdArc::new(FnDriver(|_m: nexus_types::MethodId, _in: Value| {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                Ok(Value::Int(7))
+            })),
+        )?;
+        let handle = boot.open_for(boot.root, &name, "perform")?;
 
         // A program whose Operation output is consumed (so a Fact is recorded).
         let prog = DoNode::Op(OperationTemplate {
@@ -1492,34 +1592,35 @@ mod tests {
         ex1.bind_handle(name.clone(), handle);
         ex1.steps
             .install(boot.root, "use_it", |v, _| DoNode::pure(v));
-        let _ = ex1.eval(&prog).await;
-        assert_eq!(
-            CALLS.load(Ordering::SeqCst),
-            1,
+        let first = ex1.eval(&prog).await;
+        ensure!(
+            first == nexus_types::Outcome::Done(Value::Int(7)),
+            "unexpected first run outcome: {first:?}"
+        );
+        ensure!(
+            CALLS.load(Ordering::SeqCst) == 1,
             "effect fires on the first run"
         );
 
         // Build a replay map from the recorded facts and re-run.
-        let replay = StdArc::new(crate::recovery::ReplayMap::from_facts(
-            &boot.kernel.facts.facts_of(boot.root).unwrap(),
-        ));
-        assert!(!replay.is_empty(), "the completed effect was recorded");
-        let handle2 = boot.open_for(boot.root, &name, "perform").unwrap();
+        let facts = boot.kernel.facts.facts_of(boot.root)?;
+        let replay = StdArc::new(crate::recovery::ReplayMap::from_facts(&facts));
+        ensure!(!replay.is_empty(), "the completed effect was recorded");
+        let handle2 = boot.open_for(boot.root, &name, "perform")?;
         let ex2 = boot.kernel.executor_for(boot.root).with_replay(replay);
         ex2.bind_handle(name.clone(), handle2);
         ex2.steps
             .install(boot.root, "use_it", |v, _| DoNode::pure(v));
         let out = ex2.eval(&prog).await;
 
-        assert_eq!(
-            CALLS.load(Ordering::SeqCst),
-            1,
+        ensure!(
+            CALLS.load(Ordering::SeqCst) == 1,
             "recovery must NOT re-issue the already-recorded effect"
         );
-        assert_eq!(
-            out,
-            nexus_types::Outcome::Done(Value::Int(7)),
+        ensure!(
+            out == nexus_types::Outcome::Done(Value::Int(7)),
             "recorded outcome is replayed"
         );
+        Ok(())
     }
 }

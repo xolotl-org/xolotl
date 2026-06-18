@@ -12,11 +12,12 @@ description.workspace = true
 workspace = true
 
 [dependencies]
-async-trait.workspace = true
+async-trait = { workspace = true, default-features = false }
 nexus-graph.workspace = true
 nexus-kernel.workspace = true
 nexus-types.workspace = true
-parking_lot.workspace = true
+parking_lot = { workspace = true, default-features = false }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+anyhow = { workspace = true, default-features = false, features = ["std"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros", "time"] }

@@ -26,10 +26,9 @@ pub use convert::{
     failure_to_pb, inbound_event_from_pb, inbound_event_to_pb, invoke_from_pb,
     invoke_result_from_pb, invoke_result_to_pb, invoke_to_pb, outbound_command_from_pb,
     outbound_command_to_pb, outcome_to_pb, output_mode_from_pb, output_mode_to_pb, path_from_pb,
-    path_to_pb, program_from_pb, program_to_pb, provider_ready_from_pb, provider_ready_to_pb,
-    role_ready_from_pb, role_ready_to_pb, role_session_client_hello_from_pb,
-    role_session_client_hello_to_pb, session_context_from_pb, session_context_to_pb, value_from_pb,
-    value_from_pb_checked, value_to_pb,
+    path_to_pb, program_from_pb, program_to_pb, role_ready_from_pb, role_ready_to_pb,
+    role_session_client_hello_from_pb, role_session_client_hello_to_pb, session_context_from_pb,
+    session_context_to_pb, value_from_pb, value_from_pb_checked, value_to_pb,
 };
 
 #[cfg(test)]

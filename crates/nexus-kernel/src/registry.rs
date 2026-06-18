@@ -7,8 +7,8 @@
 use crate::driver::{DriverDescriptor, DriverPlan, DynDriver, DynRemoteEndpoint};
 use crate::handle::FastPath;
 use nexus_types::{
-    Binding, BindingId, DriverId, EndpointId, Grant, GrantId, Interface, InterfaceId, MethodId,
-    Path, ProcessId, Resource, ResourceId, ResourceName, Rights,
+    Binding, BindingId, DriverId, EndpointId, Grant, GrantId, Interface, InterfaceId, InterfaceSet,
+    MethodId, Path, ProcessId, Resource, ResourceId, ResourceName, Rights,
 };
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -28,12 +28,40 @@ pub enum ResolveError {
 /// Errors returned by registry admission checks.
 #[derive(Debug, Error)]
 pub enum AdmissionError {
+    /// Binding id was already registered.
+    #[error("binding id {0:?} is already registered")]
+    DuplicateBindingId(BindingId),
+    /// Resource id was already registered.
+    #[error("resource id {0:?} is already registered")]
+    DuplicateResourceId(ResourceId),
+    /// Resource name was already registered.
+    #[error("resource name {0} is already registered")]
+    DuplicateResourceName(String),
     /// Binding's driver does not implement a declared interface.
     #[error("interface {0} not implemented by driver {1}")]
     InterfaceNotImplemented(InterfaceId, DriverId),
+    /// Binding points at a driver that is not registered.
+    #[error("driver {0:?} is not registered")]
+    DriverNotRegistered(DriverId),
+    /// Resource points at a binding that is not registered.
+    #[error("binding {0:?} is not registered")]
+    BindingNotRegistered(BindingId),
     /// Resource requires interfaces not covered by its binding.
     #[error("binding {0} does not cover resource {1}'s interfaces")]
     InterfacesNotCovered(BindingId, ResourceId),
+    /// Resource name was not registered.
+    #[error("resource name {0} is not registered")]
+    ResourceNotRegistered(String),
+    /// A relink tried to move a resource to an older binding generation.
+    #[error("resource {resource} binding generation regressed from {current} to {attempted}")]
+    BindingGenerationRegressed {
+        /// Resource name being relinked.
+        resource: String,
+        /// Current binding generation.
+        current: u64,
+        /// Attempted binding generation.
+        attempted: u64,
+    },
     /// Non-kernel caller attempted to register a reserved path.
     #[error("resource name {0} is under a reserved kernel prefix")]
     ReservedPrefix(String),
@@ -355,10 +383,20 @@ impl Registry {
             return Err(AdmissionError::ReservedPrefix(name.path().to_string()));
         }
         let mut inner = self.inner.write();
+        if inner.resources.contains_key(&resource.id) {
+            return Err(AdmissionError::DuplicateResourceId(resource.id));
+        }
+        if inner.names.contains_key(&name) {
+            return Err(AdmissionError::DuplicateResourceName(
+                name.path().to_string(),
+            ));
+        }
+        let binding = inner
+            .bindings
+            .get(&resource.binding)
+            .ok_or(AdmissionError::BindingNotRegistered(resource.binding))?;
         // Binding must cover the resource's interfaces.
-        if let Some(binding) = inner.bindings.get(&resource.binding)
-            && !binding.interfaces.covers(&resource.interfaces)
-        {
+        if !binding.interfaces.covers(&resource.interfaces) {
             return Err(AdmissionError::InterfacesNotCovered(
                 resource.binding,
                 resource.id,
@@ -371,19 +409,94 @@ impl Registry {
         Ok(id)
     }
 
+    /// Relink an existing Resource to a new admitted Binding.
+    ///
+    /// The Resource id and name stay stable; newly opened Handles compile
+    /// against the new binding, while already opened Handles keep their frozen
+    /// driver plan. The new binding generation must not move backwards.
+    pub fn relink_resource(
+        &self,
+        name: &ResourceName,
+        interfaces: InterfaceSet,
+        binding: BindingId,
+    ) -> Result<ResourceId, AdmissionError> {
+        let mut inner = self.inner.write();
+        let id = inner
+            .names
+            .get(name)
+            .copied()
+            .ok_or_else(|| AdmissionError::ResourceNotRegistered(name.path().to_string()))?;
+        let old_binding_id = inner
+            .resources
+            .get(&id)
+            .ok_or_else(|| AdmissionError::ResourceNotRegistered(name.path().to_string()))?
+            .binding;
+        let old_generation = inner
+            .bindings
+            .get(&old_binding_id)
+            .ok_or(AdmissionError::BindingNotRegistered(old_binding_id))?
+            .generation;
+        let new_binding = inner
+            .bindings
+            .get(&binding)
+            .ok_or(AdmissionError::BindingNotRegistered(binding))?;
+        if !new_binding.interfaces.covers(&interfaces) {
+            return Err(AdmissionError::InterfacesNotCovered(binding, id));
+        }
+        if new_binding.generation < old_generation {
+            return Err(AdmissionError::BindingGenerationRegressed {
+                resource: name.path().to_string(),
+                current: old_generation,
+                attempted: new_binding.generation,
+            });
+        }
+        let resource = inner
+            .resources
+            .get_mut(&id)
+            .ok_or_else(|| AdmissionError::ResourceNotRegistered(name.path().to_string()))?;
+        resource.interfaces = interfaces;
+        resource.binding = binding;
+        inner.invalidate_open_cache();
+        Ok(id)
+    }
+
+    /// Return the current binding generation for a registered Resource.
+    pub fn resource_binding_generation(&self, name: &ResourceName) -> Result<u64, AdmissionError> {
+        let inner = self.inner.read();
+        let id = inner
+            .names
+            .get(name)
+            .copied()
+            .ok_or_else(|| AdmissionError::ResourceNotRegistered(name.path().to_string()))?;
+        let resource = inner
+            .resources
+            .get(&id)
+            .ok_or_else(|| AdmissionError::ResourceNotRegistered(name.path().to_string()))?;
+        let binding = inner
+            .bindings
+            .get(&resource.binding)
+            .ok_or(AdmissionError::BindingNotRegistered(resource.binding))?;
+        Ok(binding.generation)
+    }
+
     /// Admit and register a Binding. The bound Driver must
     /// implement every Interface the Binding declares — checked here so a
     /// Binding can never reference interfaces its Driver doesn't provide.
     pub fn admit_binding(&self, binding: Binding) -> Result<BindingId, AdmissionError> {
         let inner = self.inner.read();
-        if let Some(driver) = inner.drivers.get(&binding.driver.id) {
-            for iface in &binding.interfaces.interfaces {
-                if !driver.implements.interfaces.contains(iface) {
-                    return Err(AdmissionError::InterfaceNotImplemented(
-                        *iface,
-                        binding.driver.id,
-                    ));
-                }
+        if inner.bindings.contains_key(&binding.id) {
+            return Err(AdmissionError::DuplicateBindingId(binding.id));
+        }
+        let driver = inner
+            .drivers
+            .get(&binding.driver.id)
+            .ok_or(AdmissionError::DriverNotRegistered(binding.driver.id))?;
+        for iface in &binding.interfaces.interfaces {
+            if !driver.implements.interfaces.contains(iface) {
+                return Err(AdmissionError::InterfaceNotImplemented(
+                    *iface,
+                    binding.driver.id,
+                ));
             }
         }
         drop(inner);
@@ -632,162 +745,286 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, ensure};
     use nexus_types::{
         ConstraintSet, Expiry, InterfaceSet, Metadata, MethodBitmap, Path, ResourceDescriptor,
         ResourceKind, ResourceSelector, RightFlags,
     };
 
-    fn name(s: &str) -> ResourceName {
-        ResourceName::new(Path::parse(s).unwrap())
+    fn name(s: &str) -> anyhow::Result<ResourceName> {
+        Ok(ResourceName::new(Path::parse(s)?))
+    }
+
+    fn empty_binding(reg: &Registry, generation: u64) -> anyhow::Result<BindingId> {
+        let id = reg.next_binding_id();
+        reg.register_binding(Binding {
+            id,
+            selector: ResourceSelector::parse("perform://effect/**")?,
+            interfaces: InterfaceSet::default(),
+            driver: nexus_types::DriverRef {
+                id: DriverId::new(0),
+                name: "test".into(),
+            },
+            endpoint: None,
+            generation,
+        });
+        Ok(id)
     }
 
     #[test]
-    fn namespace_sandbox_rejects_escape() {
+    fn namespace_sandbox_rejects_escape() -> anyhow::Result<()> {
         // A sandboxed provider's effects must stay under its namespace.
-        let ns = nexus_types::Path::parse("effect://external-provider/acme").unwrap();
-        assert!(
-            Registry::check_namespace_sandbox(
-                &ns,
-                &[
-                    nexus_types::Path::parse("effect://external-provider/acme/fetch").unwrap(),
-                    nexus_types::Path::parse("effect://external-provider/acme/post").unwrap()
-                ],
-            )
-            .is_ok()
+        let ns = nexus_types::Path::parse("effect://external-provider/acme")?;
+        let allowed = [
+            nexus_types::Path::parse("effect://external-provider/acme/fetch")?,
+            nexus_types::Path::parse("effect://external-provider/acme/post")?,
+        ];
+        ensure!(
+            Registry::check_namespace_sandbox(&ns, &allowed).is_ok(),
+            "provider namespace should allow paths below the namespace"
         );
-        assert!(
-            Registry::check_namespace_sandbox(
-                &ns,
-                &[
-                    nexus_types::Path::parse("effect://external-provider/acme/ok").unwrap(),
-                    nexus_types::Path::parse("effect://x/post").unwrap()
-                ],
-            )
-            .is_err()
+        let escaped = [
+            nexus_types::Path::parse("effect://external-provider/acme/ok")?,
+            nexus_types::Path::parse("effect://x/post")?,
+        ];
+        ensure!(
+            Registry::check_namespace_sandbox(&ns, &escaped).is_err(),
+            "provider namespace should reject paths outside the namespace"
         );
-        assert!(
-            Registry::check_namespace_sandbox(
-                &ns,
-                &[nexus_types::Path::parse("effect://external-provider/acmeevil/tool").unwrap()],
-            )
-            .is_err(),
-            "segment-aware sandboxing must reject string-prefix siblings"
+        let sibling = [nexus_types::Path::parse(
+            "effect://external-provider/acmeevil/tool",
+        )?];
+        ensure!(
+            Registry::check_namespace_sandbox(&ns, &sibling).is_err(),
+            "provider namespace should reject string-prefix siblings"
         );
+        Ok(())
     }
 
     #[test]
-    fn resolve_after_admit() {
+    fn resolve_after_admit() -> anyhow::Result<()> {
         let reg = Registry::new();
         let rid = reg.next_resource_id();
+        let binding = empty_binding(&reg, 1)?;
         let res = Resource {
             id: rid,
             descriptor: ResourceDescriptor {
-                name: name("effect://inference/infer"),
+                name: name("effect://inference/infer")?,
                 kind: ResourceKind::Effect,
                 metadata: Metadata::default(),
             },
             interfaces: InterfaceSet::default(),
-            binding: BindingId::new(0),
+            binding,
         };
-        reg.admit_resource(res, false).unwrap();
-        assert_eq!(
-            reg.resolve_resource(&name("effect://inference/infer"))
-                .unwrap(),
-            rid
-        );
+        reg.admit_resource(res, false)?;
+        let resolved = reg.resolve_resource(&name("effect://inference/infer")?)?;
+        ensure!(resolved == rid, "resolved resource id mismatch");
+        Ok(())
     }
 
     #[test]
-    fn effect_resources_do_not_prefix_resolve_sibling_actions() {
+    fn duplicate_resource_name_is_rejected() -> anyhow::Result<()> {
         let reg = Registry::new();
-        let rid = reg.next_resource_id();
-        let res = Resource {
-            id: rid,
+        let binding = empty_binding(&reg, 1)?;
+        let first = Resource {
+            id: reg.next_resource_id(),
             descriptor: ResourceDescriptor {
-                name: name("effect://approval"),
+                name: name("effect://inference/infer")?,
                 kind: ResourceKind::Effect,
                 metadata: Metadata::default(),
             },
             interfaces: InterfaceSet::default(),
-            binding: BindingId::new(0),
+            binding,
         };
-        reg.admit_resource(res, false).unwrap();
+        reg.admit_resource(first, false)?;
 
-        assert_eq!(
-            reg.resolve_resource(&name("effect://approval")).unwrap(),
-            rid
+        let second = Resource {
+            id: reg.next_resource_id(),
+            descriptor: ResourceDescriptor {
+                name: name("effect://inference/infer")?,
+                kind: ResourceKind::Effect,
+                metadata: Metadata::default(),
+            },
+            interfaces: InterfaceSet::default(),
+            binding,
+        };
+        let err = reg.admit_resource(second, false);
+        ensure!(
+            matches!(err, Err(AdmissionError::DuplicateResourceName(_))),
+            "duplicate resource name was not rejected: {err:?}"
         );
-        assert!(matches!(
-            reg.resolve_resource(&name("effect://approval/check")),
-            Err(ResolveError::NoSuchResource(path)) if path == "effect://approval/check"
-        ));
+        Ok(())
     }
 
     #[test]
-    fn state_resources_can_prefix_resolve_concrete_paths() {
+    fn relink_resource_keeps_resource_id_and_updates_binding() -> anyhow::Result<()> {
+        let reg = Registry::new();
+        let first_binding = empty_binding(&reg, 1)?;
+        let rid = reg.next_resource_id();
+        let resource_name = name("effect://external-provider/chat/search")?;
+        reg.admit_resource(
+            Resource {
+                id: rid,
+                descriptor: ResourceDescriptor {
+                    name: resource_name.clone(),
+                    kind: ResourceKind::Effect,
+                    metadata: Metadata::default(),
+                },
+                interfaces: InterfaceSet::default(),
+                binding: first_binding,
+            },
+            false,
+        )?;
+
+        let next_binding = empty_binding(&reg, 2)?;
+        let relinked =
+            reg.relink_resource(&resource_name, InterfaceSet::default(), next_binding)?;
+        ensure!(relinked == rid, "relink changed resource id");
+        let generation = reg.resource_binding_generation(&resource_name)?;
+        ensure!(generation == 2, "resource generation was not updated");
+        let stored = reg.resource(rid).context("resource should remain stored")?;
+        ensure!(
+            stored.binding == next_binding,
+            "resource binding was not updated"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn relink_resource_rejects_generation_regression() -> anyhow::Result<()> {
+        let reg = Registry::new();
+        let first_binding = empty_binding(&reg, 3)?;
+        let rid = reg.next_resource_id();
+        let resource_name = name("effect://external-provider/chat/search")?;
+        reg.admit_resource(
+            Resource {
+                id: rid,
+                descriptor: ResourceDescriptor {
+                    name: resource_name.clone(),
+                    kind: ResourceKind::Effect,
+                    metadata: Metadata::default(),
+                },
+                interfaces: InterfaceSet::default(),
+                binding: first_binding,
+            },
+            false,
+        )?;
+
+        let stale_binding = empty_binding(&reg, 2)?;
+        let err = reg.relink_resource(&resource_name, InterfaceSet::default(), stale_binding);
+        ensure!(
+            matches!(err, Err(AdmissionError::BindingGenerationRegressed { .. })),
+            "stale binding generation was not rejected: {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn effect_resources_do_not_prefix_resolve_sibling_actions() -> anyhow::Result<()> {
         let reg = Registry::new();
         let rid = reg.next_resource_id();
+        let binding = empty_binding(&reg, 1)?;
         let res = Resource {
             id: rid,
             descriptor: ResourceDescriptor {
-                name: name("state://memory"),
+                name: name("effect://approval")?,
+                kind: ResourceKind::Effect,
+                metadata: Metadata::default(),
+            },
+            interfaces: InterfaceSet::default(),
+            binding,
+        };
+        reg.admit_resource(res, false)?;
+
+        let resolved = reg.resolve_resource(&name("effect://approval")?)?;
+        ensure!(resolved == rid, "resolved effect id mismatch");
+        let err = reg.resolve_resource(&name("effect://approval/check")?);
+        ensure!(
+            matches!(
+                err,
+            Err(ResolveError::NoSuchResource(ref path)) if path == "effect://approval/check"
+            ),
+            "effect sibling action should not prefix-resolve: {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn state_resources_can_prefix_resolve_concrete_paths() -> anyhow::Result<()> {
+        let reg = Registry::new();
+        let rid = reg.next_resource_id();
+        let binding = empty_binding(&reg, 1)?;
+        let res = Resource {
+            id: rid,
+            descriptor: ResourceDescriptor {
+                name: name("state://memory")?,
                 kind: ResourceKind::State,
                 metadata: Metadata::default(),
             },
             interfaces: InterfaceSet::default(),
-            binding: BindingId::new(0),
+            binding,
         };
-        reg.admit_resource(res, false).unwrap();
+        reg.admit_resource(res, false)?;
 
-        assert_eq!(
-            reg.resolve_resource(&name("state://memory/alice/fact"))
-                .unwrap(),
-            rid
-        );
+        let resolved = reg.resolve_resource(&name("state://memory/alice/fact")?)?;
+        ensure!(resolved == rid, "state prefix resource id mismatch");
+        Ok(())
     }
 
     #[test]
-    fn reserved_prefix_rejected_for_non_kernel() {
+    fn reserved_prefix_rejected_for_non_kernel() -> anyhow::Result<()> {
         let reg = Registry::new();
         let rid = reg.next_resource_id();
+        let binding = empty_binding(&reg, 1)?;
         let res = Resource {
             id: rid,
             descriptor: ResourceDescriptor {
-                name: name("state://kernel/secret"),
+                name: name("state://kernel/secret")?,
                 kind: ResourceKind::Kernel,
                 metadata: Metadata::default(),
             },
             interfaces: InterfaceSet::default(),
-            binding: BindingId::new(0),
+            binding,
         };
-        assert!(matches!(
-            reg.admit_resource(res.clone(), false),
-            Err(AdmissionError::ReservedPrefix(_))
-        ));
+        let non_kernel = reg.admit_resource(res.clone(), false);
+        ensure!(
+            matches!(non_kernel, Err(AdmissionError::ReservedPrefix(_))),
+            "non-kernel caller should not admit reserved prefix: {non_kernel:?}"
+        );
         // Kernel caller may register it.
-        assert!(reg.admit_resource(res, true).is_ok());
+        reg.admit_resource(res, true)?;
+        Ok(())
     }
 
     #[test]
-    fn grants_of_filters_by_holder() {
+    fn grants_of_filters_by_holder() -> anyhow::Result<()> {
         let reg = Registry::new();
-        let g = |holder: u64, id: u64| Grant {
-            id: GrantId::new(id),
-            holder: ProcessId::new(holder),
-            selector: nexus_types::ResourceSelector::parse("perform://effect/x").unwrap(),
-            rights: nexus_types::Rights::default(),
-            constraints: nexus_types::ConstraintSet::empty(),
-            expires: nexus_types::Expiry::Never,
+        let g = |holder: u64, id: u64| -> anyhow::Result<Grant> {
+            Ok(Grant {
+                id: GrantId::new(id),
+                holder: ProcessId::new(holder),
+                selector: nexus_types::ResourceSelector::parse("perform://effect/x")?,
+                rights: nexus_types::Rights::default(),
+                constraints: nexus_types::ConstraintSet::empty(),
+                expires: nexus_types::Expiry::Never,
+            })
         };
-        reg.register_grant(g(1, 10));
-        reg.register_grant(g(1, 11));
-        reg.register_grant(g(2, 12));
-        assert_eq!(reg.grants_of(ProcessId::new(1)).len(), 2);
-        assert_eq!(reg.grants_of(ProcessId::new(2)).len(), 1);
+        reg.register_grant(g(1, 10)?);
+        reg.register_grant(g(1, 11)?);
+        reg.register_grant(g(2, 12)?);
+        ensure!(
+            reg.grants_of(ProcessId::new(1)).len() == 2,
+            "holder 1 grant count mismatch"
+        );
+        ensure!(
+            reg.grants_of(ProcessId::new(2)).len() == 1,
+            "holder 2 grant count mismatch"
+        );
+        Ok(())
     }
 
     #[test]
-    fn candidate_grants_use_exact_selector_index() {
+    fn candidate_grants_use_exact_selector_index() -> anyhow::Result<()> {
         let reg = Registry::new();
         let holder = ProcessId::new(7);
         for i in 0..128 {
@@ -795,7 +1032,7 @@ mod tests {
                 id: reg.next_grant_id(),
                 holder,
                 selector: ResourceSelector::parse(&format!("perform://effect/irrelevant/g{i}"))
-                    .unwrap(),
+                    .with_context(|| format!("irrelevant selector {i} did not parse"))?,
                 rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
                 constraints: ConstraintSet::empty(),
                 expires: Expiry::Never,
@@ -804,54 +1041,25 @@ mod tests {
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder,
-            selector: ResourceSelector::parse("perform://effect/target").unwrap(),
+            selector: ResourceSelector::parse("perform://effect/target")?,
             rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
         });
 
-        let candidates =
-            reg.candidate_grants(holder, "perform", &Path::parse("effect://target").unwrap());
-        assert_eq!(candidates.len(), 1);
-        assert!(
-            candidates[0]
-                .selector
-                .matches("perform", &Path::parse("effect://target").unwrap())
-        );
-    }
-
-    #[test]
-    fn candidate_grants_exact_index_matches_clustered_targets_structurally() {
-        let reg = Registry::new();
-        let holder = ProcessId::new(7);
-        for i in 0..SMALL_HOLDER_GRANT_SCAN_LIMIT {
-            reg.register_grant(Grant {
-                id: reg.next_grant_id(),
-                holder,
-                selector: ResourceSelector::parse(&format!("perform://effect/irrelevant/g{i}"))
-                    .unwrap(),
-                rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
-                constraints: ConstraintSet::empty(),
-                expires: Expiry::Never,
-            });
-        }
-        reg.register_grant(Grant {
-            id: reg.next_grant_id(),
-            holder,
-            selector: ResourceSelector::parse("perform://effect/target").unwrap(),
-            rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
-            constraints: ConstraintSet::empty(),
-            expires: Expiry::Never,
-        });
-
-        let target = Path::parse("path://phone/effect/target").unwrap();
+        let target = Path::parse("effect://target")?;
         let candidates = reg.candidate_grants(holder, "perform", &target);
-        assert_eq!(candidates.len(), 1);
-        assert!(candidates[0].selector.matches("perform", &target));
+        ensure!(candidates.len() == 1, "candidate count mismatch");
+        let candidate = candidates.first().context("missing candidate grant")?;
+        ensure!(
+            candidate.selector.matches("perform", &target),
+            "candidate selector did not match target"
+        );
+        Ok(())
     }
 
     #[test]
-    fn replacing_grant_updates_selector_indexes() {
+    fn candidate_grants_exact_index_matches_clustered_targets_structurally() -> anyhow::Result<()> {
         let reg = Registry::new();
         let holder = ProcessId::new(7);
         for i in 0..SMALL_HOLDER_GRANT_SCAN_LIMIT {
@@ -859,31 +1067,73 @@ mod tests {
                 id: reg.next_grant_id(),
                 holder,
                 selector: ResourceSelector::parse(&format!("perform://effect/irrelevant/g{i}"))
-                    .unwrap(),
+                    .with_context(|| format!("irrelevant selector {i} did not parse"))?,
+                rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
+                constraints: ConstraintSet::empty(),
+                expires: Expiry::Never,
+            });
+        }
+        reg.register_grant(Grant {
+            id: reg.next_grant_id(),
+            holder,
+            selector: ResourceSelector::parse("perform://effect/target")?,
+            rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
+            constraints: ConstraintSet::empty(),
+            expires: Expiry::Never,
+        });
+
+        let target = Path::parse("path://phone/effect/target")?;
+        let candidates = reg.candidate_grants(holder, "perform", &target);
+        ensure!(candidates.len() == 1, "candidate count mismatch");
+        let candidate = candidates.first().context("missing candidate grant")?;
+        ensure!(
+            candidate.selector.matches("perform", &target),
+            "candidate selector did not match clustered target"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_grant_updates_selector_indexes() -> anyhow::Result<()> {
+        let reg = Registry::new();
+        let holder = ProcessId::new(7);
+        for i in 0..SMALL_HOLDER_GRANT_SCAN_LIMIT {
+            reg.register_grant(Grant {
+                id: reg.next_grant_id(),
+                holder,
+                selector: ResourceSelector::parse(&format!("perform://effect/irrelevant/g{i}"))
+                    .with_context(|| format!("irrelevant selector {i} did not parse"))?,
                 rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
                 constraints: ConstraintSet::empty(),
                 expires: Expiry::Never,
             });
         }
         let id = reg.next_grant_id();
-        let grant = |selector: &str| Grant {
-            id,
-            holder,
-            selector: ResourceSelector::parse(selector).unwrap(),
-            rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
-            constraints: ConstraintSet::empty(),
-            expires: Expiry::Never,
+        let grant = |selector: &str| -> anyhow::Result<Grant> {
+            Ok(Grant {
+                id,
+                holder,
+                selector: ResourceSelector::parse(selector)?,
+                rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
+                constraints: ConstraintSet::empty(),
+                expires: Expiry::Never,
+            })
         };
 
-        reg.register_grant(grant("perform://effect/old"));
-        reg.register_grant(grant("perform://effect/new"));
+        reg.register_grant(grant("perform://effect/old")?);
+        reg.register_grant(grant("perform://effect/new")?);
 
-        assert!(
-            reg.candidate_grants(holder, "perform", &Path::parse("effect://old").unwrap())
-                .is_empty()
+        let old = Path::parse("effect://old")?;
+        ensure!(
+            reg.candidate_grants(holder, "perform", &old).is_empty(),
+            "old selector index should be empty after replacement"
         );
-        let candidates =
-            reg.candidate_grants(holder, "perform", &Path::parse("effect://new").unwrap());
-        assert_eq!(candidates.len(), 1);
+        let new = Path::parse("effect://new")?;
+        let candidates = reg.candidate_grants(holder, "perform", &new);
+        ensure!(
+            candidates.len() == 1,
+            "new selector candidate count mismatch"
+        );
+        Ok(())
     }
 }

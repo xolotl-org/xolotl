@@ -16,18 +16,21 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-pub mod auth;
-pub mod mgmt;
+mod auth;
+mod mgmt;
 pub mod protocol;
-pub mod state;
-pub mod ws;
+mod state;
+mod ws;
 
 pub use auth::{
-    AuthError, BootstrapOutcome, ConsoleAuthConfig, ConsolePrincipal, KeyChallengeRequest,
-    KeyChallengeResponse, KeyLoginRequest, LoginRequest, LoginResponse, RootProvisioning,
-    StepUpRequest, bootstrap_root_account, root_random_password_needed,
+    AuthError, BootstrapOutcome, ConsoleAuthConfig, DEFAULT_GLOBAL_SESSION_LIMIT,
+    DEFAULT_IDLE_TTL_MS, DEFAULT_MAX_SESSIONS_PER_USER, DEFAULT_SESSION_TTL_MS,
+    HARD_ARGON2_CONCURRENCY, HARD_GLOBAL_SESSION_LIMIT, HARD_MAX_SESSIONS_PER_USER,
+    KeyChallengeRequest, KeyChallengeResponse, KeyLoginRequest, LoginRequest, LoginResponse,
+    MAX_IDLE_TTL_MS, MAX_SESSION_TTL_MS, MIN_ARGON2_CONCURRENCY, MIN_GLOBAL_SESSION_LIMIT,
+    MIN_IDLE_TTL_MS, MIN_MAX_SESSIONS_PER_USER, MIN_SESSION_TTL_MS, RootProvisioning,
+    StepUpRequest, bootstrap_root_account, default_argon2_concurrency, root_random_password_needed,
 };
-pub use mgmt::MgmtError;
 pub use protocol::{
     ActionCall, ActionResult, ClientFrame, ClientHello, ConsoleErrorCode, ConsoleEvent,
     PrincipalSummary, ProtocolMetadata, ServerFrame, StreamCall,
@@ -35,6 +38,19 @@ pub use protocol::{
 pub use state::{
     ConsoleState, ConsoleTransportSecurityConfig, ConsoleTransportSecurityMode,
     ConsoleTrustedProxyConfig, ConsoleUnsafeTransportRelaxation, ConsoleWsConfig,
+    DEFAULT_WS_EVENT_SEND_TIMEOUT, DEFAULT_WS_IDLE_TIMEOUT, DEFAULT_WS_MAX_BYTES_PER_SECOND,
+    DEFAULT_WS_MAX_CONNECTIONS_GLOBAL, DEFAULT_WS_MAX_CONNECTIONS_PER_SOURCE,
+    DEFAULT_WS_MAX_CONNECTIONS_PER_USER, DEFAULT_WS_MAX_FACT_LIMIT, DEFAULT_WS_MAX_FRAME_BYTES,
+    DEFAULT_WS_MAX_FRAMES_PER_SECOND, DEFAULT_WS_MAX_STATE_LIST_LIMIT,
+    DEFAULT_WS_MAX_SUBSCRIPTIONS, DEFAULT_WS_MAX_TRACE_LIMIT, HARD_MAX_WS_BYTES_PER_SECOND,
+    HARD_MAX_WS_CONNECTIONS_GLOBAL, HARD_MAX_WS_CONNECTIONS_PER_SOURCE,
+    HARD_MAX_WS_CONNECTIONS_PER_USER, HARD_MAX_WS_EVENT_SEND_TIMEOUT, HARD_MAX_WS_FACT_LIMIT,
+    HARD_MAX_WS_FRAME_BYTES, HARD_MAX_WS_FRAMES_PER_SECOND, HARD_MAX_WS_IDLE_TIMEOUT,
+    HARD_MAX_WS_STATE_LIST_LIMIT, HARD_MAX_WS_SUBSCRIPTIONS, HARD_MAX_WS_TRACE_LIMIT,
+    MIN_WS_CONNECTIONS_GLOBAL, MIN_WS_CONNECTIONS_PER_SOURCE, MIN_WS_CONNECTIONS_PER_USER,
+    MIN_WS_EVENT_SEND_TIMEOUT, MIN_WS_IDLE_TIMEOUT, MIN_WS_MAX_BYTES_PER_SECOND,
+    MIN_WS_MAX_FACT_LIMIT, MIN_WS_MAX_FRAME_BYTES, MIN_WS_MAX_FRAMES_PER_SECOND,
+    MIN_WS_MAX_STATE_LIST_LIMIT, MIN_WS_MAX_SUBSCRIPTIONS, MIN_WS_MAX_TRACE_LIMIT,
 };
 
 /// Build the console router.
@@ -134,7 +150,7 @@ async fn api_step_up(
     let bearer = match auth::bearer_from_headers(&headers) {
         Ok(bearer) => bearer,
         Err(e) => {
-            record_http_auth_audit(&st, "console_credential", Some(&source), "missing_bearer");
+            record_http_auth_audit(&st, "console_credential", Some(&source), "missing_bearer")?;
             return Err(auth_error(e));
         }
     };
@@ -164,11 +180,19 @@ pub(crate) fn verified_source_addr(
 }
 
 fn forwarded_client_addr(headers: &HeaderMap) -> Option<String> {
-    headers
+    let header = headers
         .get("x-forwarded-for")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.split(',').next())
+        .or_else(|| headers.get("x-real-ip"))?;
+    let value = match header.to_str() {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(?error, "forwarded source address header rejected");
+            return None;
+        }
+    };
+    value
+        .split(',')
+        .next()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -184,15 +208,29 @@ fn record_http_auth_audit(
     event: &'static str,
     source_addr: Option<&str>,
     outcome: &'static str,
-) {
-    let _ = st.boot.record_gateway_audit(nexus_kernel::GatewayAudit {
-        event,
-        username: None,
-        source_addr,
-        outcome,
-        mfa_level: None,
-        details: None,
-    });
+) -> Result<(), (StatusCode, String)> {
+    st.boot
+        .record_gateway_audit(nexus_kernel::GatewayAudit {
+            event,
+            username: None,
+            source_addr,
+            outcome,
+            mfa_level: None,
+            details: None,
+        })
+        .map_err(|error| {
+            tracing::warn!(
+                ?error,
+                event,
+                outcome,
+                source_addr = source_addr.unwrap_or("unknown"),
+                "console HTTP audit record failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal authentication error".into(),
+            )
+        })
 }
 
 fn validate_http_auth_origin(
@@ -204,7 +242,7 @@ fn validate_http_auth_origin(
     match ws::validate_http_auth_headers(headers, peer, &st.transport_security) {
         Ok(origin) => Ok(origin),
         Err(message) => {
-            record_http_auth_audit(st, "console_credential", Some(source), "origin_denied");
+            record_http_auth_audit(st, "console_credential", Some(source), "origin_denied")?;
             Err((StatusCode::FORBIDDEN, message))
         }
     }
@@ -219,7 +257,7 @@ fn validate_key_login_origin(
     if body_origin.trim() == request_origin {
         Ok(())
     } else {
-        record_http_auth_audit(st, "console_credential", Some(source), "origin_mismatch");
+        record_http_auth_audit(st, "console_credential", Some(source), "origin_mismatch")?;
         Err((
             StatusCode::FORBIDDEN,
             "public-key login origin must match request origin".into(),
@@ -248,9 +286,10 @@ pub(crate) fn auth_error(e: AuthError) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{bail, ensure};
     use axum::http::HeaderValue;
-    use nexus_actors::{StandardConfig, install_standard};
     use nexus_kernel::Bootstrap;
+    use nexus_standard::{StandardConfig, install_standard};
     use nexus_types::{OutcomeRef, Value};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
@@ -265,12 +304,12 @@ mod tests {
         headers
     }
 
-    fn audit_outcomes(st: &ConsoleState, event: &str) -> Vec<String> {
-        st.boot
+    fn audit_outcomes(st: &ConsoleState, event: &str) -> anyhow::Result<Vec<String>> {
+        Ok(st
+            .boot
             .kernel
             .facts
-            .all_facts()
-            .unwrap()
+            .all_facts()?
             .into_iter()
             .filter_map(|fact| match fact.outcome_ref {
                 OutcomeRef::Inline(Value::Map(m))
@@ -280,32 +319,34 @@ mod tests {
                 }
                 _ => None,
             })
-            .collect()
+            .collect())
     }
 
     #[tokio::test]
-    async fn router_builds() {
+    async fn router_builds() -> anyhow::Result<()> {
         let boot = Arc::new(Bootstrap::in_memory());
-        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
-        let st = ConsoleState::shared(boot);
-        let _ = router(st);
+        install_standard(&boot, &StandardConfig::default())?;
+        let st = ConsoleState::shared(boot)?;
+        drop(router(st));
+        Ok(())
     }
 
     #[test]
-    fn source_addr_prefers_peer_over_forwarded_headers_by_default() {
+    fn source_addr_prefers_peer_over_forwarded_headers_by_default() -> anyhow::Result<()> {
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "203.0.113.8".parse().unwrap());
+        headers.insert("x-forwarded-for", "203.0.113.8".parse()?);
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
-        assert_eq!(source_addr(&headers, Some(peer)), "127.0.0.1");
+        ensure!(
+            source_addr(&headers, Some(peer)) == "127.0.0.1",
+            "peer address did not take precedence"
+        );
+        Ok(())
     }
 
     #[test]
-    fn source_addr_uses_forwarded_for_from_trusted_proxy() {
+    fn source_addr_uses_forwarded_for_from_trusted_proxy() -> anyhow::Result<()> {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-forwarded-for",
-            "203.0.113.8, 198.51.100.2".parse().unwrap(),
-        );
+        headers.insert("x-forwarded-for", "203.0.113.8, 198.51.100.2".parse()?);
         let proxy_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let peer = SocketAddr::new(proxy_ip, 12345);
         let cfg = ConsoleTransportSecurityConfig {
@@ -316,31 +357,39 @@ mod tests {
             },
             unsafe_relaxations: Vec::new(),
         };
-        assert_eq!(
-            verified_source_addr(&headers, Some(peer), &cfg),
-            "203.0.113.8"
+        ensure!(
+            verified_source_addr(&headers, Some(peer), &cfg) == "203.0.113.8",
+            "trusted proxy forwarded-for address was not used"
         );
         let untrusted_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 12345);
-        assert_eq!(
-            verified_source_addr(&headers, Some(untrusted_peer), &cfg),
-            "127.0.0.2"
+        ensure!(
+            verified_source_addr(&headers, Some(untrusted_peer), &cfg) == "127.0.0.2",
+            "untrusted proxy forwarded-for address was used"
         );
+        Ok(())
     }
 
     #[test]
-    fn auth_error_redacts_internal_details() {
+    fn auth_error_redacts_internal_details() -> anyhow::Result<()> {
         let (status, message) = auth_error(AuthError::State(
             "state://vault/console/root/password".into(),
         ));
 
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(message, "internal authentication error");
+        ensure!(
+            status == StatusCode::INTERNAL_SERVER_ERROR,
+            "internal auth error used wrong status"
+        );
+        ensure!(
+            message == "internal authentication error",
+            "internal auth error leaked details"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn step_up_missing_bearer_writes_gateway_audit() {
+    async fn step_up_missing_bearer_writes_gateway_audit() -> anyhow::Result<()> {
         let boot = Arc::new(Bootstrap::in_memory());
-        let st = ConsoleState::shared(boot);
+        let st = ConsoleState::shared(boot)?;
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
 
         let result = api_step_up(
@@ -354,21 +403,26 @@ mod tests {
         )
         .await;
         let err = match result {
-            Ok(_) => {
-                assert!(false, "step-up without bearer must fail");
-                return;
-            }
+            Ok(_) => bail!("step-up without bearer unexpectedly succeeded"),
             Err(err) => err,
         };
 
-        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
-        assert!(audit_outcomes(&st, "console_credential").contains(&"missing_bearer".into()));
+        ensure!(
+            err.0 == StatusCode::UNAUTHORIZED,
+            "missing bearer used wrong status"
+        );
+        let outcomes = audit_outcomes(&st, "console_credential")?;
+        ensure!(
+            outcomes.iter().any(|outcome| outcome == "missing_bearer"),
+            "missing bearer audit outcome was not recorded"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn http_auth_origin_is_required() {
+    async fn http_auth_origin_is_required() -> anyhow::Result<()> {
         let boot = Arc::new(Bootstrap::in_memory());
-        let st = ConsoleState::shared(boot);
+        let st = ConsoleState::shared(boot)?;
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
 
         let result = api_login(
@@ -383,21 +437,26 @@ mod tests {
         )
         .await;
         let err = match result {
-            Ok(_) => {
-                assert!(false, "auth request without origin must fail");
-                return;
-            }
+            Ok(_) => bail!("auth request without origin unexpectedly succeeded"),
             Err(err) => err,
         };
 
-        assert_eq!(err.0, StatusCode::FORBIDDEN);
-        assert!(audit_outcomes(&st, "console_credential").contains(&"origin_denied".into()));
+        ensure!(
+            err.0 == StatusCode::FORBIDDEN,
+            "missing origin used wrong status"
+        );
+        let outcomes = audit_outcomes(&st, "console_credential")?;
+        ensure!(
+            outcomes.iter().any(|outcome| outcome == "origin_denied"),
+            "origin_denied audit outcome was not recorded"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn key_login_body_origin_must_match_request_origin() {
+    async fn key_login_body_origin_must_match_request_origin() -> anyhow::Result<()> {
         let boot = Arc::new(Bootstrap::in_memory());
-        let st = ConsoleState::shared(boot);
+        let st = ConsoleState::shared(boot)?;
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
 
         let result = api_key_challenge(
@@ -411,14 +470,19 @@ mod tests {
         )
         .await;
         let err = match result {
-            Ok(_) => {
-                assert!(false, "mismatched key login origin must fail");
-                return;
-            }
+            Ok(_) => bail!("mismatched key login origin unexpectedly succeeded"),
             Err(err) => err,
         };
 
-        assert_eq!(err.0, StatusCode::FORBIDDEN);
-        assert!(audit_outcomes(&st, "console_credential").contains(&"origin_mismatch".into()));
+        ensure!(
+            err.0 == StatusCode::FORBIDDEN,
+            "origin mismatch used wrong status"
+        );
+        let outcomes = audit_outcomes(&st, "console_credential")?;
+        ensure!(
+            outcomes.iter().any(|outcome| outcome == "origin_mismatch"),
+            "origin_mismatch audit outcome was not recorded"
+        );
+        Ok(())
     }
 }

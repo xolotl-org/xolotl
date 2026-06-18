@@ -122,52 +122,89 @@ pub fn default_registry() -> PathRegistry {
 mod tests {
     use super::*;
     use crate::p;
+    use anyhow::{bail, ensure};
 
     #[test]
-    fn state_without_segment_is_rejected() {
+    fn state_without_segment_is_rejected() -> anyhow::Result<()> {
         let v = StatePathValidator;
-        let path = p("state://");
-        let err = v.validate(&path).unwrap_err();
-        assert!(matches!(err, Failure::PathInvalid { .. }));
+        let path = p("state://")?;
+        let err = match v.validate(&path) {
+            Ok(()) => bail!("state path without segment was accepted"),
+            Err(error) => error,
+        };
+        ensure!(
+            matches!(err, Failure::PathInvalid { .. }),
+            "unexpected error: {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn state_with_segment_is_accepted() {
+    fn state_with_segment_is_accepted() -> anyhow::Result<()> {
         let v = StatePathValidator;
-        let path = p("state://memory");
-        assert!(v.validate(&path).is_ok());
+        let path = p("state://memory")?;
+        ensure!(v.validate(&path).is_ok(), "valid state path was rejected");
+        Ok(())
     }
 
     #[test]
-    fn effect_with_one_segment_is_rejected() {
+    fn effect_with_one_segment_is_rejected() -> anyhow::Result<()> {
         let v = EffectPathValidator;
-        let path = p("effect://inference");
-        let err = v.validate(&path).unwrap_err();
-        assert!(matches!(err, Failure::PathInvalid { .. }));
+        let path = p("effect://inference")?;
+        let err = match v.validate(&path) {
+            Ok(()) => bail!("effect path with one segment was accepted"),
+            Err(error) => error,
+        };
+        ensure!(
+            matches!(err, Failure::PathInvalid { .. }),
+            "unexpected error: {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn effect_with_two_segments_is_accepted() {
+    fn effect_with_two_segments_is_accepted() -> anyhow::Result<()> {
         let v = EffectPathValidator;
-        let path = p("effect://inference/infer");
-        assert!(v.validate(&path).is_ok());
+        let path = p("effect://inference/infer")?;
+        ensure!(v.validate(&path).is_ok(), "valid effect path was rejected");
+        Ok(())
     }
 
     #[test]
-    fn unregistered_scheme_passes() {
+    fn unregistered_scheme_passes() -> anyhow::Result<()> {
         let r = default_registry();
-        let path = Path::parse("mcp-res://tool/fetch").unwrap();
-        assert!(r.validate(&path).is_ok());
+        let path = Path::parse("custom://tool/fetch")?;
+        ensure!(r.validate(&path).is_ok(), "custom scheme was rejected");
+        Ok(())
     }
 
     #[test]
-    fn builtin_validators_cover_state_effect_process() {
+    fn builtin_validators_cover_state_effect_process() -> anyhow::Result<()> {
         let r = default_registry();
-        assert!(r.validate(&p("state://memory/alice")).is_ok());
-        assert!(r.validate(&p("effect://x/post")).is_ok());
-        assert!(r.validate(&p("process://alice")).is_ok());
-        assert!(r.validate(&p("state://")).is_err());
-        assert!(r.validate(&p("effect://infer")).is_err());
-        assert!(r.validate(&p("process://")).is_err());
+        ensure!(
+            r.validate(&p("state://memory/alice")?).is_ok(),
+            "state path rejected"
+        );
+        ensure!(
+            r.validate(&p("effect://x/post")?).is_ok(),
+            "effect path rejected"
+        );
+        ensure!(
+            r.validate(&p("process://alice")?).is_ok(),
+            "process path rejected"
+        );
+        ensure!(
+            r.validate(&p("state://")?).is_err(),
+            "empty state path accepted"
+        );
+        ensure!(
+            r.validate(&p("effect://infer")?).is_err(),
+            "one-segment effect path accepted"
+        );
+        ensure!(
+            r.validate(&p("process://")?).is_err(),
+            "empty process path accepted"
+        );
+        Ok(())
     }
 }

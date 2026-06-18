@@ -237,13 +237,18 @@ impl ExecutionGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, anyhow, ensure};
 
     fn s(name: &str) -> StepRef {
         StepRef::new(ProcessId::new(1), name)
     }
 
+    fn p(path: &str) -> anyhow::Result<Path> {
+        Path::parse(path).map_err(|error| anyhow!("path parse failed for {path}: {error}"))
+    }
+
     #[test]
-    fn node_lookup_by_id() {
+    fn node_lookup_by_id() -> anyhow::Result<()> {
         let g = ExecutionGraph {
             nodes: vec![
                 Node {
@@ -263,31 +268,43 @@ mod tests {
             root: NodeId::new(0),
             graph_hash: [0u8; 32],
         };
-        assert!(matches!(
-            g.node(NodeId::new(0)).unwrap().kind,
-            NodeKind::Pure(_)
-        ));
-        assert!(matches!(
-            g.node(NodeId::new(1)).unwrap().kind,
-            NodeKind::Step(_)
-        ));
-        assert!(g.node(NodeId::new(2)).is_none());
-        assert_eq!(g.out_edges(NodeId::new(0)).count(), 1);
+        let first = g.node(NodeId::new(0)).context("missing first node")?;
+        ensure!(
+            matches!(&first.kind, NodeKind::Pure(_)),
+            "unexpected first node: {first:?}"
+        );
+        let second = g.node(NodeId::new(1)).context("missing second node")?;
+        ensure!(
+            matches!(&second.kind, NodeKind::Step(_)),
+            "unexpected second node: {second:?}"
+        );
+        ensure!(g.node(NodeId::new(2)).is_none(), "unexpected third node");
+        let edge_count = g.out_edges(NodeId::new(0)).count();
+        ensure!(edge_count == 1, "unexpected edge count: {edge_count}");
+        Ok(())
     }
 
     #[test]
-    fn only_operation_is_side_effecting() {
-        assert!(
+    fn only_operation_is_side_effecting() -> anyhow::Result<()> {
+        ensure!(
             NodeKind::Operation(OperationTemplate {
-                target: ResourceName::new(Path::parse("effect://x/post").unwrap()),
+                target: ResourceName::new(p("effect://x/post")?),
                 method: "invoke".into(),
                 method_id: None,
                 output: OutputMode::Unary,
                 literal_input: None,
             })
-            .is_side_effecting()
+            .is_side_effecting(),
+            "operation should be side-effecting"
         );
-        assert!(!NodeKind::Pure(Value::Null).is_side_effecting());
-        assert!(!NodeKind::Step(s("s")).is_side_effecting());
+        ensure!(
+            !NodeKind::Pure(Value::Null).is_side_effecting(),
+            "pure node should not be side-effecting"
+        );
+        ensure!(
+            !NodeKind::Step(s("s")).is_side_effecting(),
+            "step node should not be side-effecting"
+        );
+        Ok(())
     }
 }

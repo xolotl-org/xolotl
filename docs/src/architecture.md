@@ -52,34 +52,44 @@ during recovery.
 | Crate | Role |
 | --- | --- |
 | `nexus-types` | Core ids, paths, values, capabilities, operations, audit, trace, external access, and process data. |
-| `nexus-graph` | `DoNode`, `ExecutionGraph`, graph compiler, cursor, and actor linting. |
+| `nexus-graph` | `DoNode`, `ExecutionGraph`, graph compiler, cursor, and `ActorSpec` linting. |
 | `nexus-state` | State backend trait and in-memory implementation. |
 | `nexus-kernel` | Registry, policy, handle table, execution path, executor, process table, recovery, and bootstrap. |
 | `nexus-storage-redb` | redb-backed state and fact storage. |
-| `nexus-actors` | Standard in-process Drivers and Providers. |
+| `nexus-standard` | Standard in-process Provider and Source implementations. |
 | `nexus-gateway` | Shared session admission, flow-control, taint, and audit code for external protocol adapters. |
 | `nexus-gateway-grpc` | External Provider/Source gRPC adapter. |
 | `nexus-gateway-websocket` | External Provider/Source WebSocket adapter. |
-| `nexus-gateway-mcp` | MCP server-side adapter for selected Nexus effects. |
+| `nexus-gateway-mcp` | MCP server-side adapter for selected Gateway publication kinds. |
 | `nexus-proto` | Protobuf schema and vendored Rust bindings. |
 | `nexus-console` | Gateway for Web Console management actions. |
 | `nexus-daemon` | `nexusd`, the long-running host process. |
-| `nexus-sdk` | Embedded facade and public re-exports. |
+| `nexus-sdk` | Embedded facade for in-process kernel use. |
 | `nexus-plan` | Plan document parsing and lowering. |
 | `nexus-sim` | Deterministic simulation and replay helpers. |
 
-## Actor Cargo Features
+## Standard Package Features
 
-`nexus-actors` contains the standard in-process Drivers and Providers. A binary
-can compile only the modules it needs.
+`nexus-standard` contains the standard in-process Provider and Source
+implementations. A binary can compile only the modules it needs.
 
-The default `standard` feature builds the standard in-process Drivers and
-Providers. `standard-core` builds the core standard Drivers and Providers plus
-external session code; it does not build `fetch`, `fs`, `terminal`, or `mcp`.
-`external-session` builds only the session handling and `SecureEnvelope` code
-used by gateway adapters for external Provider and Source endpoints.
+The default `standard` feature builds the core standard in-process
+implementations. `standard-core` builds that core set and the pairing management
+effects. `fetch`, `fs`, and `terminal` each require their own feature. External
+Provider/Source session handling and `SecureEnvelope` code live in
+`nexus-gateway`.
 
-Enable `fetch`, `fs`, `terminal`, or `mcp` when the binary should register those
-in-process effects. Changing these features changes which implementations are
-compiled and registered. It does not change Resource, Interface, Binding, or
-Operation semantics.
+HTTP inference provider features are opt-in. `http-inference` enables all HTTP
+inference dialects. The individual dialect features are `openai-responses`,
+`openai-chat`, `anthropic-messages`, and `gemini-generate-content`.
+`nexus-daemon` forwards those feature names to `nexus-standard`.
+
+High-risk in-process implementations such as `fetch`, `fs`, and `terminal`
+must stay behind separate `nexus-standard` features. A daemon or embedded host may
+expose them only through kernel-state declarations and fixed Console actions.
+Runtime in-process projection declarations are stored in Nexus state.
+
+Optional in-process projection declarations are runtime state under
+`state://kernel/projections/in-process/<id>`. They use `projection.in_process.*`
+Console actions, kernel state admission, and host-side reconciliation into
+ordinary Resource, Interface, Driver, and Binding registry entries.

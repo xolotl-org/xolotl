@@ -8,8 +8,7 @@ use crate::nexus::v1 as pb;
 use nexus_graph::{DoNode, OperationTemplate, StepRef, WaitSpec};
 use nexus_types::{
     BlobRef, CapError, Capability, DType, Failure, FloatBits, FrameKind, FrameRef, MethodId,
-    Outcome, OutputMode, Path, PathError, ProcessId, Purity, ResourceName, StreamMarker, TensorRef,
-    Value,
+    Outcome, OutputMode, Path, PathError, ProcessId, ResourceName, StreamMarker, TensorRef, Value,
 };
 use thiserror::Error;
 
@@ -84,7 +83,7 @@ pub fn value_from_pb_checked(v: &pb::Value) -> Result<Value, ConvertError> {
     Ok(match &v.kind {
         None => Value::Null,
         Some(Kind::NullVal(raw)) => {
-            let _ = pb::NullValue::try_from(*raw).map_err(|_| ConvertError::Enum("value.null"))?;
+            pb::NullValue::try_from(*raw).map_err(|_| ConvertError::Enum("value.null"))?;
             Value::Null
         }
         Some(Kind::BoolVal(b)) => Value::Bool(*b),
@@ -633,8 +632,8 @@ pub fn outcome_to_pb(o: &Outcome) -> pb::Outcome {
 
 use nexus_types::external::{
     AckStatus, ApplyStatus, CommandResult, ConfigAxis, ControlFrame, ErrorInfo, EventAck,
-    FlowSignal, InboundEvent, Invoke, InvokeResult, OutboundCommand, ProviderReady, RejectReason,
-    Role, RoleReady, RoleSessionClientHello, SessionContext,
+    FlowSignal, InboundEvent, Invoke, InvokeResult, OutboundCommand, RejectReason, Role, RoleReady,
+    RoleSessionClientHello, SessionContext,
 };
 use pb::external as ext;
 
@@ -889,38 +888,6 @@ pub fn event_ack_from_pb(ack: &ext::EventAck) -> Result<EventAck, ConvertError> 
     })
 }
 
-/// `ProviderReady` → wire `ProviderReady`.
-pub fn provider_ready_to_pb(ready: &ProviderReady) -> ext::ProviderReady {
-    ext::ProviderReady {
-        provides: ready
-            .provides
-            .iter()
-            .map(|handler| ext::EffectHandlerSpec {
-                path: handler.path.clone(),
-                purity: purity_to_pb(handler.purity) as i32,
-                description: handler.description.clone(),
-            })
-            .collect(),
-    }
-}
-
-/// Wire `ProviderReady` → `ProviderReady`.
-pub fn provider_ready_from_pb(ready: &ext::ProviderReady) -> Result<ProviderReady, ConvertError> {
-    Ok(ProviderReady {
-        provides: ready
-            .provides
-            .iter()
-            .map(|handler| {
-                Ok(nexus_types::external::EffectHandlerSpec {
-                    path: handler.path.clone(),
-                    purity: purity_from_pb(handler.purity)?,
-                    description: handler.description.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, ConvertError>>()?,
-    })
-}
-
 /// `ControlFrame` → wire `ControlFrame`.
 pub fn control_frame_to_pb(frame: &ControlFrame) -> ext::ControlFrame {
     let kind = match frame {
@@ -1092,23 +1059,6 @@ fn ack_status_from_pb(status: i32) -> Result<AckStatus, ConvertError> {
         ext::AckStatus::Duplicate => Ok(AckStatus::Duplicate),
         ext::AckStatus::Rejected => Ok(AckStatus::Rejected),
         ext::AckStatus::Unspecified => Err(ConvertError::Enum("ack.status")),
-    }
-}
-
-fn purity_to_pb(purity: Purity) -> pb::Purity {
-    match purity {
-        Purity::Pure => pb::Purity::Pure,
-        Purity::Idempotent => pb::Purity::Idempotent,
-        Purity::Effectful => pb::Purity::Effectful,
-    }
-}
-
-fn purity_from_pb(purity: i32) -> Result<Purity, ConvertError> {
-    match pb::Purity::try_from(purity).map_err(|_| ConvertError::Enum("purity"))? {
-        pb::Purity::Pure => Ok(Purity::Pure),
-        pb::Purity::Idempotent => Ok(Purity::Idempotent),
-        pb::Purity::Effectful => Ok(Purity::Effectful),
-        pb::Purity::Unspecified => Err(ConvertError::Enum("purity")),
     }
 }
 

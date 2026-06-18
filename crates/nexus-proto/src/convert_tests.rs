@@ -2,12 +2,35 @@
 //! Path / Capability / Outcome mappings must survive a `to_pb`/`from_pb` cycle.
 
 use crate::convert::*;
+use anyhow::{Context, anyhow, bail, ensure};
 use nexus_graph::{DoNode, OperationTemplate};
 use nexus_types::{
     BlobRef, Capability, DType, Failure, FloatBits, FrameKind, Outcome, OutputMode, Path,
     Predicate, ResourceName, StreamMarker, TensorRef, Value,
 };
 use std::collections::BTreeMap;
+
+fn p(path: &str) -> anyhow::Result<Path> {
+    Path::parse(path).map_err(|error| anyhow!("path parse failed for {path}: {error}"))
+}
+
+fn pb_path(path: &str) -> anyhow::Result<crate::nexus::v1::Path> {
+    Ok(path_to_pb(&p(path)?))
+}
+
+fn op_template(
+    path: &str,
+    output: OutputMode,
+    literal_input: Option<Value>,
+) -> anyhow::Result<OperationTemplate> {
+    Ok(OperationTemplate {
+        target: ResourceName::new(p(path)?),
+        method: "invoke".into(),
+        method_id: None,
+        output,
+        literal_input,
+    })
+}
 
 fn blob() -> BlobRef {
     BlobRef {
@@ -178,7 +201,7 @@ fn checked_value_rejects_malformed_multimodal_refs() {
 }
 
 #[test]
-fn external_value_frames_reject_malformed_multimodal_refs() {
+fn external_value_frames_reject_malformed_multimodal_refs() -> anyhow::Result<()> {
     use crate::nexus::v1 as pb;
     use crate::nexus::v1::external as ext;
 
@@ -192,7 +215,7 @@ fn external_value_frames_reject_malformed_multimodal_refs() {
         }
     }
 
-    assert!(
+    ensure!(
         role_session_client_hello_from_pb(&ext::RoleSessionClientHello {
             role: ext::ExternalRole::Source as i32,
             installation_id: "install-1".into(),
@@ -201,10 +224,11 @@ fn external_value_frames_reject_malformed_multimodal_refs() {
             observed: Some(ext::ObservedGenerations::default()),
             config_schema: Some(malformed_tensor()),
         })
-        .is_err()
+        .is_err(),
+        "malformed config schema should be rejected"
     );
 
-    assert!(
+    ensure!(
         inbound_event_from_pb(&ext::InboundEvent {
             id: "event-1".into(),
             payload: Some(malformed_tensor()),
@@ -213,49 +237,52 @@ fn external_value_frames_reject_malformed_multimodal_refs() {
             stream_id: None,
             seq: None,
         })
-        .is_err()
+        .is_err(),
+        "malformed inbound event should be rejected"
     );
 
-    assert!(
+    ensure!(
         invoke_from_pb(&ext::Invoke {
             invocation_id: "invoke-1".into(),
-            effect_path: Some(path_to_pb(
-                &Path::parse("effect://external-provider/acme/search").unwrap()
-            )),
+            effect_path: Some(pb_path("effect://external-provider/acme/search")?),
             input: Some(malformed_tensor()),
             deadline_ms: None,
             output_stream_to: None,
             method_id: Some(7),
         })
-        .is_err()
+        .is_err(),
+        "malformed invoke input should be rejected"
     );
 
-    assert!(
+    ensure!(
         invoke_result_from_pb(&ext::InvokeResult {
             invocation_id: "invoke-1".into(),
             outcome: Some(ext::invoke_result::Outcome::Success(malformed_tensor())),
         })
-        .is_err()
+        .is_err(),
+        "malformed invoke result should be rejected"
     );
 
-    assert!(
+    ensure!(
         outbound_command_from_pb(&ext::OutboundCommand {
             id: "cmd-1".into(),
             action: Some(malformed_tensor()),
             observed: Some(ext::ObservedGenerations::default()),
         })
-        .is_err()
+        .is_err(),
+        "malformed outbound command should be rejected"
     );
 
-    assert!(
+    ensure!(
         command_result_from_pb(&ext::CommandResult {
             id: "cmd-1".into(),
             outcome: Some(ext::command_result::Outcome::Success(malformed_tensor())),
         })
-        .is_err()
+        .is_err(),
+        "malformed command result should be rejected"
     );
 
-    assert!(
+    ensure!(
         control_frame_from_pb(&ext::ControlFrame {
             kind: Some(ext::control_frame::Kind::PresentationProfileUpdate(
                 ext::PresentationProfileUpdate {
@@ -265,10 +292,11 @@ fn external_value_frames_reject_malformed_multimodal_refs() {
                 },
             )),
         })
-        .is_err()
+        .is_err(),
+        "malformed presentation profile should be rejected"
     );
 
-    assert!(
+    ensure!(
         control_frame_from_pb(&ext::ControlFrame {
             kind: Some(ext::control_frame::Kind::InstallationConfigUpdate(
                 ext::InstallationConfigUpdate {
@@ -277,10 +305,11 @@ fn external_value_frames_reject_malformed_multimodal_refs() {
                 },
             )),
         })
-        .is_err()
+        .is_err(),
+        "malformed installation config should be rejected"
     );
 
-    assert!(
+    ensure!(
         control_frame_from_pb(&ext::ControlFrame {
             kind: Some(ext::control_frame::Kind::PresentationConfigUpdate(
                 ext::PresentationConfigUpdate {
@@ -290,15 +319,17 @@ fn external_value_frames_reject_malformed_multimodal_refs() {
                 },
             )),
         })
-        .is_err()
+        .is_err(),
+        "malformed presentation config should be rejected"
     );
+    Ok(())
 }
 
 #[test]
-fn external_value_frames_require_explicit_value_fields() {
+fn external_value_frames_require_explicit_value_fields() -> anyhow::Result<()> {
     use crate::nexus::v1::external as ext;
 
-    assert!(
+    ensure!(
         inbound_event_from_pb(&ext::InboundEvent {
             id: "event-1".into(),
             payload: None,
@@ -307,49 +338,52 @@ fn external_value_frames_require_explicit_value_fields() {
             stream_id: None,
             seq: None,
         })
-        .is_err()
+        .is_err(),
+        "missing inbound payload should be rejected"
     );
 
-    assert!(
+    ensure!(
         invoke_from_pb(&ext::Invoke {
             invocation_id: "invoke-1".into(),
-            effect_path: Some(path_to_pb(
-                &Path::parse("effect://external-provider/acme/search").unwrap()
-            )),
+            effect_path: Some(pb_path("effect://external-provider/acme/search")?),
             input: None,
             deadline_ms: None,
             output_stream_to: None,
             method_id: Some(7),
         })
-        .is_err()
+        .is_err(),
+        "missing invoke input should be rejected"
     );
 
-    assert!(
+    ensure!(
         invoke_result_from_pb(&ext::InvokeResult {
             invocation_id: "invoke-1".into(),
             outcome: None,
         })
-        .is_err()
+        .is_err(),
+        "missing invoke result outcome should be rejected"
     );
 
-    assert!(
+    ensure!(
         outbound_command_from_pb(&ext::OutboundCommand {
             id: "cmd-1".into(),
             action: None,
             observed: Some(ext::ObservedGenerations::default()),
         })
-        .is_err()
+        .is_err(),
+        "missing outbound action should be rejected"
     );
 
-    assert!(
+    ensure!(
         command_result_from_pb(&ext::CommandResult {
             id: "cmd-1".into(),
             outcome: None,
         })
-        .is_err()
+        .is_err(),
+        "missing command result outcome should be rejected"
     );
 
-    assert!(
+    ensure!(
         control_frame_from_pb(&ext::ControlFrame {
             kind: Some(ext::control_frame::Kind::PresentationProfileUpdate(
                 ext::PresentationProfileUpdate {
@@ -359,8 +393,10 @@ fn external_value_frames_require_explicit_value_fields() {
                 },
             )),
         })
-        .is_err()
+        .is_err(),
+        "missing presentation profile should be rejected"
     );
+    Ok(())
 }
 
 #[test]
@@ -383,12 +419,28 @@ fn program_from_pb_rejects_malformed_literal_value() {
 }
 
 #[test]
-fn path_round_trips_with_cluster() {
-    let p = Path::parse("path://pc-home/effect/inference/infer").unwrap();
-    let back = path_from_pb(&path_to_pb(&p)).unwrap();
-    assert_eq!(p.scheme(), back.scheme());
-    assert_eq!(p.segments(), back.segments());
-    assert_eq!(p.cluster(), back.cluster());
+fn path_round_trips_with_cluster() -> anyhow::Result<()> {
+    let path = p("path://pc-home/effect/inference/infer")?;
+    let back = path_from_pb(&path_to_pb(&path))?;
+    ensure!(
+        path.scheme() == back.scheme(),
+        "scheme changed: {} != {}",
+        path.scheme(),
+        back.scheme()
+    );
+    ensure!(
+        path.segments() == back.segments(),
+        "segments changed: {:?} != {:?}",
+        path.segments(),
+        back.segments()
+    );
+    ensure!(
+        path.cluster() == back.cluster(),
+        "cluster changed: {:?} != {:?}",
+        path.cluster(),
+        back.cluster()
+    );
+    Ok(())
 }
 
 #[test]
@@ -397,81 +449,94 @@ fn path_params_are_not_wire_api() {
 }
 
 #[test]
-fn capability_round_trips() {
+fn capability_round_trips() -> anyhow::Result<()> {
     let c = Capability {
         verb: "read".into(),
         scheme: "state".into(),
         segments: vec!["kernel".into(), "config".into()],
         predicate: Predicate::parse("size<100").ok(),
     };
-    let back = capability_from_pb(&capability_to_pb(&c)).unwrap();
-    assert_eq!(c.verb, back.verb);
-    assert_eq!(c.scheme, back.scheme);
-    assert_eq!(c.segments, back.segments);
-    assert_eq!(
-        c.predicate.map(|p| p.to_string()),
-        back.predicate.map(|p| p.to_string())
+    let back = capability_from_pb(&capability_to_pb(&c))?;
+    ensure!(c.verb == back.verb, "verb changed: {}", back.verb);
+    ensure!(c.scheme == back.scheme, "scheme changed: {}", back.scheme);
+    ensure!(
+        c.segments == back.segments,
+        "segments changed: {:?}",
+        back.segments
     );
+    ensure!(
+        c.predicate.map(|p| p.to_string()) == back.predicate.map(|p| p.to_string()),
+        "predicate changed"
+    );
+    Ok(())
 }
 
 #[test]
-fn program_round_trips_structurally() {
-    let op = OperationTemplate {
-        target: ResourceName::new(Path::parse("effect://x/post").unwrap()),
-        method: "invoke".into(),
-        method_id: None,
-        output: OutputMode::Collect { limit: 8 },
-        literal_input: Some(Value::Str("hello".into())),
-    };
+fn program_round_trips_structurally() -> anyhow::Result<()> {
+    let op = op_template(
+        "effect://x/post",
+        OutputMode::Collect { limit: 8 },
+        Some(Value::Str("hello".into())),
+    )?;
     let program = DoNode::Both(
         Box::new(DoNode::Pure(Value::Int(1))),
         Box::new(DoNode::Op(op)),
     );
-    let back = program_from_pb(&program_to_pb(&program)).unwrap();
-    assert_eq!(program, back);
+    let back = program_from_pb(&program_to_pb(&program))?;
+    ensure!(program == back, "program changed: {back:?}");
+    Ok(())
 }
 
 #[test]
-fn program_explicit_unspecified_output_mode_fails_closed() {
-    let mut program = program_to_pb(&DoNode::Op(OperationTemplate {
-        target: ResourceName::new(Path::parse("effect://x/post").unwrap()),
-        method: "invoke".into(),
-        method_id: None,
-        output: OutputMode::Unary,
-        literal_input: None,
-    }));
-    let root = program.root.as_mut().unwrap();
-    let crate::nexus::v1::do_node::Kind::Op(op) = root.kind.as_mut().unwrap() else {
-        panic!("expected op node");
+fn program_explicit_unspecified_output_mode_fails_closed() -> anyhow::Result<()> {
+    let mut program = program_to_pb(&DoNode::Op(op_template(
+        "effect://x/post",
+        OutputMode::Unary,
+        None,
+    )?));
+    let root = program.root.as_mut().context("missing program root")?;
+    let crate::nexus::v1::do_node::Kind::Op(op) =
+        root.kind.as_mut().context("missing root kind")?
+    else {
+        bail!("expected op node");
     };
     op.output = Some(crate::nexus::v1::OutputMode {
         kind: crate::nexus::v1::OutputModeKind::Unspecified as i32,
         collect_limit: 0,
     });
 
-    assert!(program_from_pb(&program).is_err());
+    ensure!(
+        program_from_pb(&program).is_err(),
+        "unspecified output mode should fail closed"
+    );
+    Ok(())
 }
 
 #[test]
-fn program_missing_output_mode_defaults_to_unary() {
-    let mut program = program_to_pb(&DoNode::Op(OperationTemplate {
-        target: ResourceName::new(Path::parse("effect://x/post").unwrap()),
-        method: "invoke".into(),
-        method_id: None,
-        output: OutputMode::Unary,
-        literal_input: None,
-    }));
-    let root = program.root.as_mut().unwrap();
-    let crate::nexus::v1::do_node::Kind::Op(op) = root.kind.as_mut().unwrap() else {
-        panic!("expected op node");
+fn program_missing_output_mode_defaults_to_unary() -> anyhow::Result<()> {
+    let mut program = program_to_pb(&DoNode::Op(op_template(
+        "effect://x/post",
+        OutputMode::Unary,
+        None,
+    )?));
+    let root = program.root.as_mut().context("missing program root")?;
+    let crate::nexus::v1::do_node::Kind::Op(op) =
+        root.kind.as_mut().context("missing root kind")?
+    else {
+        bail!("expected op node");
     };
     op.output = None;
 
-    let back = program_from_pb(&program).unwrap();
+    let back = program_from_pb(&program)?;
     let DoNode::Op(op) = back else {
-        panic!("expected op node");
+        bail!("expected op node");
     };
-    assert_eq!(op.output, OutputMode::Unary);
+    ensure!(
+        op.output == OutputMode::Unary,
+        "unexpected output mode: {:?}",
+        op.output
+    );
+    Ok(())
 }
 
 #[test]
@@ -484,39 +549,42 @@ fn program_missing_root_fails_closed() {
 }
 
 #[test]
-fn outcome_done_and_fail_map() {
+fn outcome_done_and_fail_map() -> anyhow::Result<()> {
     let done = Outcome::Done(Value::Int(5));
     let pb = outcome_to_pb(&done);
-    assert!(matches!(
-        pb.result,
-        Some(crate::nexus::v1::outcome::Result::Done(_))
-    ));
+    ensure!(
+        matches!(pb.result, Some(crate::nexus::v1::outcome::Result::Done(_))),
+        "done outcome encoded incorrectly"
+    );
 
     let fail = Outcome::Fail(Failure::Timeout);
     let pb = outcome_to_pb(&fail);
     match pb.result {
-        Some(crate::nexus::v1::outcome::Result::Fail(f)) => assert_eq!(f.kind, "timeout"),
-        _ => panic!("expected fail"),
+        Some(crate::nexus::v1::outcome::Result::Fail(f)) => {
+            ensure!(f.kind == "timeout", "unexpected failure kind: {}", f.kind);
+        }
+        other => bail!("expected fail, got {other:?}"),
     }
+    Ok(())
 }
 
-// Prost wire-encoding round trips.
-// These prove the hand-vendored `#[prost(...)]` field tags / oneofs / maps
-// encode and decode correctly on the wire (not just that they compile).
-
 #[test]
-fn value_survives_protobuf_encode_decode() {
+fn value_survives_protobuf_encode_decode() -> anyhow::Result<()> {
     use prost::Message;
     let pb = value_to_pb(&composite_value());
     let bytes = pb.encode_to_vec();
-    let decoded = crate::nexus::v1::Value::decode(&bytes[..]).expect("decode");
-    assert_eq!(pb, decoded);
-    // …and the structural meaning survives the full wire trip.
-    assert_eq!(value_from_pb(&decoded), composite_value());
+    let decoded = crate::nexus::v1::Value::decode(&bytes[..])?;
+    ensure!(pb == decoded, "protobuf value changed: {decoded:?}");
+    let value = value_from_pb(&decoded);
+    ensure!(
+        value == composite_value(),
+        "decoded value changed: {value:?}"
+    );
+    Ok(())
 }
 
 #[test]
-fn external_handshake_frames_survive_wire() {
+fn external_handshake_frames_survive_wire() -> anyhow::Result<()> {
     use crate::nexus::v1::external as ext;
     use prost::Message;
     let hello = ext::ExternalFrame {
@@ -535,8 +603,8 @@ fn external_handshake_frames_survive_wire() {
         )),
     };
     let bytes = hello.encode_to_vec();
-    let back = ext::ExternalFrame::decode(&bytes[..]).unwrap();
-    assert_eq!(hello, back);
+    let back = ext::ExternalFrame::decode(&bytes[..])?;
+    ensure!(hello == back, "hello frame changed: {back:?}");
 
     let context = ext::SessionContext {
         installation_id: "install-1".into(),
@@ -557,12 +625,13 @@ fn external_handshake_frames_survive_wire() {
         })),
     };
     let bytes = ready.encode_to_vec();
-    let back = ext::ExternalFrame::decode(&bytes[..]).unwrap();
-    assert_eq!(ready, back);
+    let back = ext::ExternalFrame::decode(&bytes[..])?;
+    ensure!(ready == back, "ready frame changed: {back:?}");
+    Ok(())
 }
 
 #[test]
-fn external_session_typed_frames_roundtrip() {
+fn external_session_typed_frames_roundtrip() -> anyhow::Result<()> {
     use crate::convert::{
         event_ack_from_pb, event_ack_to_pb, inbound_event_from_pb, inbound_event_to_pb,
         role_ready_from_pb, role_ready_to_pb, role_session_client_hello_from_pb,
@@ -586,10 +655,8 @@ fn external_session_typed_frames_roundtrip() {
         observed,
         config_schema: Some(Value::Map(Default::default())),
     };
-    assert_eq!(
-        role_session_client_hello_from_pb(&role_session_client_hello_to_pb(&hello)).unwrap(),
-        hello
-    );
+    let back = role_session_client_hello_from_pb(&role_session_client_hello_to_pb(&hello))?;
+    ensure!(back == hello, "hello changed: {back:?}");
 
     let context = SessionContext {
         installation_id: "install-1".into(),
@@ -604,18 +671,14 @@ fn external_session_typed_frames_roundtrip() {
         alias_catalog_generation: 6,
         session_id: "session-1".into(),
     };
-    assert_eq!(
-        session_context_from_pb(&session_context_to_pb(&context)).unwrap(),
-        context
-    );
+    let back = session_context_from_pb(&session_context_to_pb(&context))?;
+    ensure!(back == context, "context changed: {back:?}");
 
     let ready = RoleReady {
         accepted_context: context,
     };
-    assert_eq!(
-        role_ready_from_pb(&role_ready_to_pb(&ready)).unwrap(),
-        ready
-    );
+    let back = role_ready_from_pb(&role_ready_to_pb(&ready))?;
+    ensure!(back == ready, "ready changed: {back:?}");
 
     let event = InboundEvent {
         id: "event-1".into(),
@@ -625,21 +688,21 @@ fn external_session_typed_frames_roundtrip() {
         stream_id: Some("stream-1".into()),
         seq: Some(7),
     };
-    assert_eq!(
-        inbound_event_from_pb(&inbound_event_to_pb(&event)).unwrap(),
-        event
-    );
+    let back = inbound_event_from_pb(&inbound_event_to_pb(&event))?;
+    ensure!(back == event, "event changed: {back:?}");
 
     let ack = EventAck {
         id: "event-1".into(),
         status: AckStatus::Rejected,
         reject_reason: Some("schema".into()),
     };
-    assert_eq!(event_ack_from_pb(&event_ack_to_pb(&ack)).unwrap(), ack);
+    let back = event_ack_from_pb(&event_ack_to_pb(&ack))?;
+    ensure!(back == ack, "ack changed: {back:?}");
+    Ok(())
 }
 
 #[test]
-fn external_secure_envelope_survives_wire() {
+fn external_secure_envelope_survives_wire() -> anyhow::Result<()> {
     use crate::nexus::v1::external as ext;
     use prost::Message;
     let frame = ext::ExternalFrame {
@@ -665,14 +728,13 @@ fn external_secure_envelope_survives_wire() {
         )),
     };
     let bytes = frame.encode_to_vec();
-    let back = ext::ExternalFrame::decode(&bytes[..]).unwrap();
-    assert_eq!(frame, back);
+    let back = ext::ExternalFrame::decode(&bytes[..])?;
+    ensure!(frame == back, "secure envelope changed: {back:?}");
+    Ok(())
 }
 
 #[test]
-fn control_frame_config_ack_survives_wire() {
-    // Regression: ConfigAck is oneof tag 7. The oneof field's `tags`
-    // list previously omitted 7, so ConfigAck silently failed to round-trip.
+fn control_frame_config_ack_survives_wire() -> anyhow::Result<()> {
     use crate::nexus::v1::external as ext;
     use prost::Message;
     let frame = ext::ExternalFrame {
@@ -686,25 +748,22 @@ fn control_frame_config_ack_survives_wire() {
         })),
     };
     let bytes = frame.encode_to_vec();
-    let back = ext::ExternalFrame::decode(&bytes[..]).unwrap();
-    assert_eq!(
-        frame, back,
-        "ConfigAck (tag 7) must round-trip through the wire"
-    );
-    // And specifically that the ConfigAck payload survived (not dropped to None).
+    let back = ext::ExternalFrame::decode(&bytes[..])?;
+    ensure!(frame == back, "config ack frame changed: {back:?}");
     match back.frame {
         Some(ext::external_frame::Frame::Control(c)) => {
-            assert!(matches!(
-                c.kind,
-                Some(ext::control_frame::Kind::ConfigAck(_))
-            ));
+            ensure!(
+                matches!(c.kind, Some(ext::control_frame::Kind::ConfigAck(_))),
+                "config ack payload missing"
+            );
         }
-        other => panic!("expected Control/ConfigAck, got {other:?}"),
+        other => bail!("expected Control/ConfigAck, got {other:?}"),
     }
+    Ok(())
 }
 
 #[test]
-fn external_control_frames_roundtrip_through_pb() {
+fn external_control_frames_roundtrip_through_pb() -> anyhow::Result<()> {
     use crate::convert::{control_frame_from_pb, control_frame_to_pb};
     use nexus_types::Value;
     use nexus_types::external::{ApplyStatus, ConfigAxis, ControlFrame, FlowSignal, RejectReason};
@@ -750,38 +809,10 @@ fn external_control_frames_roundtrip_through_pb() {
     ];
 
     for frame in frames {
-        assert_eq!(
-            control_frame_from_pb(&control_frame_to_pb(&frame)).unwrap(),
-            frame
-        );
+        let back = control_frame_from_pb(&control_frame_to_pb(&frame))?;
+        ensure!(back == frame, "control frame changed: {back:?}");
     }
-}
-
-#[test]
-fn external_provider_ready_roundtrips_through_pb() {
-    use crate::convert::{provider_ready_from_pb, provider_ready_to_pb};
-    use nexus_types::Purity;
-    use nexus_types::external::{EffectHandlerSpec, ProviderReady};
-
-    let ready = ProviderReady {
-        provides: vec![
-            EffectHandlerSpec {
-                path: "effect://external-provider/acme/search".into(),
-                purity: Purity::Idempotent,
-                description: Some("search".into()),
-            },
-            EffectHandlerSpec {
-                path: "effect://external-provider/acme/send".into(),
-                purity: Purity::Effectful,
-                description: None,
-            },
-        ],
-    };
-
-    assert_eq!(
-        provider_ready_from_pb(&provider_ready_to_pb(&ready)).unwrap(),
-        ready
-    );
+    Ok(())
 }
 
 #[test]
@@ -793,30 +824,36 @@ fn service_names_and_method_paths_are_correct() {
 }
 
 #[test]
-fn invoke_frame_types_roundtrip_through_pb() {
-    // The Invoke business frame maps losslessly between types and proto.
+fn invoke_frame_types_roundtrip_through_pb() -> anyhow::Result<()> {
     use crate::convert::{invoke_from_pb, invoke_to_pb};
     use nexus_types::external::Invoke;
-    use nexus_types::{MethodId, Path, Value};
+    use nexus_types::{MethodId, Value};
     let inv = Invoke {
         invocation_id: "inv-1".into(),
-        effect_path: Path::parse("effect://x/post").unwrap(),
+        effect_path: p("effect://x/post")?,
         method_id: MethodId::new(7),
         input: Value::Str("hello".into()),
         deadline_ms: Some(5000),
-        output_stream_to: Some(Path::parse("state://chat/out").unwrap()),
+        output_stream_to: Some(p("state://chat/out")?),
     };
-    let back = invoke_from_pb(&invoke_to_pb(&inv)).unwrap();
-    assert_eq!(back.invocation_id, inv.invocation_id);
-    assert_eq!(back.effect_path, inv.effect_path);
-    assert_eq!(back.method_id, inv.method_id);
-    assert_eq!(back.input, inv.input);
-    assert_eq!(back.deadline_ms, inv.deadline_ms);
-    assert_eq!(back.output_stream_to, inv.output_stream_to);
+    let back = invoke_from_pb(&invoke_to_pb(&inv))?;
+    ensure!(
+        back.invocation_id == inv.invocation_id,
+        "invocation id changed"
+    );
+    ensure!(back.effect_path == inv.effect_path, "effect path changed");
+    ensure!(back.method_id == inv.method_id, "method id changed");
+    ensure!(back.input == inv.input, "input changed");
+    ensure!(back.deadline_ms == inv.deadline_ms, "deadline changed");
+    ensure!(
+        back.output_stream_to == inv.output_stream_to,
+        "output stream target changed"
+    );
+    Ok(())
 }
 
 #[test]
-fn malformed_wire_paths_and_capabilities_fail_closed() {
+fn malformed_wire_paths_and_capabilities_fail_closed() -> anyhow::Result<()> {
     use crate::convert::{
         capability_from_pb, control_frame_from_pb, event_ack_from_pb, invoke_from_pb, path_from_pb,
         role_ready_from_pb, session_context_from_pb,
@@ -829,7 +866,7 @@ fn malformed_wire_paths_and_capabilities_fail_closed() {
         segments: vec!["bad space".into()],
         cluster: None,
     };
-    assert!(path_from_pb(&bad_path).is_err());
+    ensure!(path_from_pb(&bad_path).is_err(), "bad path should fail");
 
     let bad_capability = pb::Capability {
         verb: "effect".into(),
@@ -837,7 +874,10 @@ fn malformed_wire_paths_and_capabilities_fail_closed() {
         segments: vec!["post".into()],
         predicate: None,
     };
-    assert!(capability_from_pb(&bad_capability).is_err());
+    ensure!(
+        capability_from_pb(&bad_capability).is_err(),
+        "bad capability should fail"
+    );
 
     let missing_effect_path = ext::Invoke {
         invocation_id: "inv-1".into(),
@@ -847,45 +887,61 @@ fn malformed_wire_paths_and_capabilities_fail_closed() {
         output_stream_to: None,
         method_id: Some(0),
     };
-    assert!(invoke_from_pb(&missing_effect_path).is_err());
+    ensure!(
+        invoke_from_pb(&missing_effect_path).is_err(),
+        "missing effect path should fail"
+    );
 
     let missing_method = ext::Invoke {
         invocation_id: "inv-1".into(),
-        effect_path: Some(crate::convert::path_to_pb(
-            &Path::parse("effect://x/post").unwrap(),
-        )),
+        effect_path: Some(pb_path("effect://x/post")?),
         input: Some(crate::convert::value_to_pb(&Value::Null)),
         deadline_ms: None,
         output_stream_to: None,
         method_id: None,
     };
-    assert!(invoke_from_pb(&missing_method).is_err());
+    ensure!(
+        invoke_from_pb(&missing_method).is_err(),
+        "missing method should fail"
+    );
 
     let bad_context = ext::SessionContext {
         role: ext::ExternalRole::Unspecified as i32,
         ..Default::default()
     };
-    assert!(session_context_from_pb(&bad_context).is_err());
+    ensure!(
+        session_context_from_pb(&bad_context).is_err(),
+        "bad context should fail"
+    );
 
     let missing_context = ext::RoleReady {
         accepted_context: None,
     };
-    assert!(role_ready_from_pb(&missing_context).is_err());
+    ensure!(
+        role_ready_from_pb(&missing_context).is_err(),
+        "missing context should fail"
+    );
 
     let bad_ack = ext::EventAck {
         id: "event-1".into(),
         status: ext::AckStatus::Unspecified as i32,
         reject_reason: None,
     };
-    assert!(event_ack_from_pb(&bad_ack).is_err());
+    ensure!(event_ack_from_pb(&bad_ack).is_err(), "bad ack should fail");
 
-    assert!(control_frame_from_pb(&ext::ControlFrame { kind: None }).is_err());
+    ensure!(
+        control_frame_from_pb(&ext::ControlFrame { kind: None }).is_err(),
+        "missing control frame kind should fail"
+    );
     let bad_flow = ext::ControlFrame {
         kind: Some(ext::control_frame::Kind::FlowControl(ext::FlowControl {
             signal: ext::FlowSignal::Unspecified as i32,
         })),
     };
-    assert!(control_frame_from_pb(&bad_flow).is_err());
+    ensure!(
+        control_frame_from_pb(&bad_flow).is_err(),
+        "bad flow signal should fail"
+    );
 
     let rejected_without_reason = ext::ControlFrame {
         kind: Some(ext::control_frame::Kind::ConfigAck(ext::ConfigAck {
@@ -895,20 +951,15 @@ fn malformed_wire_paths_and_capabilities_fail_closed() {
             reject_reason: None,
         })),
     };
-    assert!(control_frame_from_pb(&rejected_without_reason).is_err());
-
-    let bad_provider_ready = ext::ProviderReady {
-        provides: vec![ext::EffectHandlerSpec {
-            path: "effect://external-provider/acme/search".into(),
-            purity: crate::nexus::v1::Purity::Unspecified as i32,
-            description: None,
-        }],
-    };
-    assert!(crate::convert::provider_ready_from_pb(&bad_provider_ready).is_err());
+    ensure!(
+        control_frame_from_pb(&rejected_without_reason).is_err(),
+        "rejected ack without reason should fail"
+    );
+    Ok(())
 }
 
 #[test]
-fn invoke_result_ok_and_err_roundtrip() {
+fn invoke_result_ok_and_err_roundtrip() -> anyhow::Result<()> {
     use crate::convert::{invoke_result_from_pb, invoke_result_to_pb};
     use nexus_types::Value;
     use nexus_types::external::{ErrorInfo, InvokeResult};
@@ -916,9 +967,13 @@ fn invoke_result_ok_and_err_roundtrip() {
         invocation_id: "r1".into(),
         outcome: Ok(Value::Int(42)),
     };
-    let back = invoke_result_from_pb(&invoke_result_to_pb(&ok)).unwrap();
-    assert_eq!(back.invocation_id, "r1");
-    assert_eq!(back.outcome, Ok(Value::Int(42)));
+    let back = invoke_result_from_pb(&invoke_result_to_pb(&ok))?;
+    ensure!(back.invocation_id == "r1", "unexpected invocation id");
+    ensure!(
+        back.outcome == Ok(Value::Int(42)),
+        "unexpected ok outcome: {:?}",
+        back.outcome
+    );
 
     let err = InvokeResult {
         invocation_id: "r2".into(),
@@ -927,18 +982,23 @@ fn invoke_result_ok_and_err_roundtrip() {
             message: "429".into(),
         }),
     };
-    let back = invoke_result_from_pb(&invoke_result_to_pb(&err)).unwrap();
+    let back = invoke_result_from_pb(&invoke_result_to_pb(&err))?;
     match back.outcome {
         Err(e) => {
-            assert_eq!(e.kind, "rate_limit");
-            assert_eq!(e.message, "429");
+            ensure!(e.kind == "rate_limit", "unexpected error kind: {}", e.kind);
+            ensure!(
+                e.message == "429",
+                "unexpected error message: {}",
+                e.message
+            );
         }
-        Ok(_) => panic!("expected error outcome"),
+        Ok(value) => bail!("expected error outcome, got {value:?}"),
     }
+    Ok(())
 }
 
 #[test]
-fn source_command_frames_roundtrip() {
+fn source_command_frames_roundtrip() -> anyhow::Result<()> {
     use crate::convert::{
         command_result_from_pb, command_result_to_pb, outbound_command_from_pb,
         outbound_command_to_pb,
@@ -954,15 +1014,15 @@ fn source_command_frames_roundtrip() {
             alias_catalog_generation: 2,
         },
     };
-    let back = outbound_command_from_pb(&outbound_command_to_pb(&command)).unwrap();
-    assert_eq!(back, command);
+    let back = outbound_command_from_pb(&outbound_command_to_pb(&command))?;
+    ensure!(back == command, "command changed: {back:?}");
 
     let ok = CommandResult {
         id: "cmd-1".into(),
         outcome: Ok(Value::Bool(true)),
     };
-    let back = command_result_from_pb(&command_result_to_pb(&ok)).unwrap();
-    assert_eq!(back, ok);
+    let back = command_result_from_pb(&command_result_to_pb(&ok))?;
+    ensure!(back == ok, "ok result changed: {back:?}");
 
     let err = CommandResult {
         id: "cmd-2".into(),
@@ -971,6 +1031,7 @@ fn source_command_frames_roundtrip() {
             message: "failed".into(),
         }),
     };
-    let back = command_result_from_pb(&command_result_to_pb(&err)).unwrap();
-    assert_eq!(back, err);
+    let back = command_result_from_pb(&command_result_to_pb(&err))?;
+    ensure!(back == err, "error result changed: {back:?}");
+    Ok(())
 }

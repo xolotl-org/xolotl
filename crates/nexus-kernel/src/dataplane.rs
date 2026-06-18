@@ -409,9 +409,19 @@ impl DataPlane {
         let mut stream_task = None;
         let mut collect_task = None;
         match op.output {
-            OutputMode::Stream => {
-                stream_task = self.attach_stream_sink(op, &mut ctx);
-            }
+            OutputMode::Stream => match self.attach_stream_sink(op, &mut ctx) {
+                Ok(task) => stream_task = Some(task),
+                Err(error) => {
+                    return self.deny(
+                        op,
+                        Some(resolved.resource),
+                        replay,
+                        now_millis,
+                        DecisionTag::DriverError,
+                        driver_err_to_failure(error),
+                    );
+                }
+            },
             OutputMode::Collect { limit } => {
                 if supports.contains(OutputModeSet::STREAM) {
                     dispatch_output = OutputMode::Stream;
@@ -451,12 +461,16 @@ impl DataPlane {
         if matches!(op.output, OutputMode::Stream) {
             match &result {
                 Ok(_) => {
-                    let _ = ctx.emit(Value::StreamEnd(nexus_types::StreamMarker::Done));
+                    if !ctx.emit(Value::StreamEnd(nexus_types::StreamMarker::Done)) {
+                        tracing::debug!(op = ?op.id, "stream end marker receiver closed");
+                    }
                 }
                 Err(e) => {
-                    let _ = ctx.emit(Value::StreamEnd(nexus_types::StreamMarker::Error {
+                    if !ctx.emit(Value::StreamEnd(nexus_types::StreamMarker::Error {
                         message: e.to_string(),
-                    }));
+                    })) {
+                        tracing::debug!(op = ?op.id, "stream error marker receiver closed");
+                    }
                 }
             }
         }
@@ -685,9 +699,11 @@ impl DataPlane {
         &self,
         op: &Operation,
         ctx: &mut DriverContext,
-    ) -> Option<tokio::task::JoinHandle<Result<(), String>>> {
+    ) -> Result<tokio::task::JoinHandle<Result<(), String>>, DriverError> {
         let state = self.state.clone();
-        let path = stream_path(op).ok()?;
+        let path = stream_path(op).map_err(|error| {
+            DriverError::InvalidInput(format!("stream path construction failed: {error}"))
+        })?;
         let taint = op.taint.clone();
         let append_path = path.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -696,7 +712,7 @@ impl DataPlane {
             DriverContext::new(op.acting, op.process).with_operation_id(op.id),
         );
         *ctx = previous.with_stream(path, tx);
-        Some(tokio::spawn(async move {
+        Ok(tokio::spawn(async move {
             while let Some(chunk) = rx.recv().await {
                 if let Err(e) = state
                     .write_append_tainted(&append_path, chunk, taint.clone())
@@ -1127,6 +1143,7 @@ fn driver_err_to_failure(e: DriverError) -> Failure {
         DriverError::UnsupportedOutput(_) => Failure::InvalidInput {
             reason: "unsupported output mode".into(),
         },
+        DriverError::InvalidInput(reason) => Failure::InvalidInput { reason },
         DriverError::Transport(m) => Failure::HandlerError {
             kind: "transport".into(),
             message: m,
@@ -1146,6 +1163,7 @@ mod tests {
     use crate::driver::{Driver, DriverContext, DriverPlan, EchoDriver, FnDriver};
     use crate::fact::FactStore;
     use crate::handle::{Handle, HandleState};
+    use anyhow::{Context, bail, ensure};
     use nexus_state::{Backend, InMemoryBackend, StateError, StateResult, StateStream};
     use nexus_types::{
         DriverId, HandleId, IdentityRef, MethodBitmap, MethodId, NodeId, OperationId, OutputMode,
@@ -1283,7 +1301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unconditional_executes_and_records_ok() {
+    async fn unconditional_executes_and_records_ok() -> anyhow::Result<()> {
         let (dp, id) = dataplane_with_handle(
             Rights::new(MethodBitmap::method(0), RightFlags::empty()),
             FastPath::Unconditional,
@@ -1298,19 +1316,24 @@ mod tests {
                 true,
             )
             .await;
-        assert_eq!(out.outcome, Outcome::Done(Value::Int(9)));
+        ensure!(
+            out.outcome == Outcome::Done(Value::Int(9)),
+            "unexpected outcome: {:?}",
+            out.outcome
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn state_read_output_taint_uses_persisted_taint() {
+    async fn state_read_output_taint_uses_persisted_taint() -> anyhow::Result<()> {
         let state = test_state();
-        let path = Path::parse("state://chat/private").unwrap();
+        let path = Path::parse("state://chat/private")?;
         let protected =
             nexus_types::TaintSet::of(nexus_types::TaintSource::Protected { path: path.clone() });
         state
             .write_set_tainted(&path, Value::Str("secret".into()), protected)
             .await
-            .unwrap();
+            .context("writing protected state failed")?;
         let (dp, id, store) = dataplane_with_state_handle(state, MethodId::new(0), path);
 
         let out = dp
@@ -1324,27 +1347,33 @@ mod tests {
             )
             .await;
 
-        assert!(out.output_taint.has_protected());
-        assert!(store.all_facts().unwrap()[0].taint.has_protected());
+        ensure!(
+            out.output_taint.has_protected(),
+            "output taint should be protected"
+        );
+        let facts = store.all_facts().context("reading facts failed")?;
+        let fact = facts.first().context("missing recorded fact")?;
+        ensure!(fact.taint.has_protected(), "fact taint should be protected");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn state_list_output_taint_unions_persisted_taint() {
+    async fn state_list_output_taint_unions_persisted_taint() -> anyhow::Result<()> {
         let state = test_state();
-        let prefix = Path::parse("state://chat").unwrap();
-        let public = Path::parse("state://chat/public").unwrap();
-        let private = Path::parse("state://chat/private").unwrap();
+        let prefix = Path::parse("state://chat")?;
+        let public = Path::parse("state://chat/public")?;
+        let private = Path::parse("state://chat/private")?;
         state
             .write_set(&public, Value::Str("ok".into()))
             .await
-            .unwrap();
+            .context("writing public state failed")?;
         let protected = nexus_types::TaintSet::of(nexus_types::TaintSource::Protected {
             path: private.clone(),
         });
         state
             .write_set_tainted(&private, Value::Str("secret".into()), protected)
             .await
-            .unwrap();
+            .context("writing protected state failed")?;
         let (dp, id, store) = dataplane_with_state_handle(state, MethodId::new(4), prefix);
 
         let out = dp
@@ -1358,16 +1387,20 @@ mod tests {
             )
             .await;
 
-        assert!(out.output_taint.has_protected());
-        assert!(store.all_facts().unwrap()[0].taint.has_protected());
+        ensure!(
+            out.output_taint.has_protected(),
+            "listed output taint should be protected"
+        );
+        let facts = store.all_facts().context("reading facts failed")?;
+        let fact = facts.first().context("missing recorded fact")?;
+        ensure!(fact.taint.has_protected(), "fact taint should be protected");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn large_modality_input_reaches_driver_intact() {
-        // Regression: a Blob/Tensor/Frame input must reach the driver as the
-        // full value (it used to be silently dropped to Null because the Fact
-        // projection leaked onto the dispatch path). The Fact still records a
-        // fixed-size ValueRef::External.
+    async fn large_modality_input_reaches_driver_intact() -> anyhow::Result<()> {
+        // Blob/Tensor/Frame input reaches the driver as the full value. The
+        // Fact record stores a fixed-size ValueRef::External.
         use nexus_types::BlobRef;
         let (dp, id) = dataplane_with_handle(
             Rights::new(MethodBitmap::method(0), RightFlags::empty()),
@@ -1389,11 +1422,16 @@ mod tests {
             )
             .await;
         // EchoDriver returns its input — the driver saw the real Blob, not Null.
-        assert_eq!(out.outcome, Outcome::Done(blob));
+        ensure!(
+            out.outcome == Outcome::Done(blob),
+            "large modality outcome mismatch: {:?}",
+            out.outcome
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn batchable_list_records_single_fact_with_batch_summary() {
+    async fn batchable_list_records_single_fact_with_batch_summary() -> anyhow::Result<()> {
         let mut table = HandleTable::new();
         let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
         plan.insert(MethodId::new(7), Arc::new(EchoDriver));
@@ -1423,19 +1461,27 @@ mod tests {
                 },
             )
             .await;
-        assert!(matches!(out.outcome, Outcome::Done(Value::List(_))));
-        let facts = store.facts_of(ProcessId::new(1)).unwrap();
-        assert_eq!(facts.len(), 1, "batchable call records one Fact");
-        let batch = facts[0].batch.as_ref().expect("batch summary present");
-        assert_eq!(batch.elements, 2);
-        assert!(matches!(
-            facts[0].outcome_ref,
-            OutcomeRef::Inline(Value::List(_))
-        ));
+        ensure!(
+            matches!(out.outcome, Outcome::Done(Value::List(_))),
+            "batchable call should return a list, got {:?}",
+            out.outcome
+        );
+        let facts = store
+            .facts_of(ProcessId::new(1))
+            .context("reading facts failed")?;
+        ensure!(facts.len() == 1, "batchable call should record one Fact");
+        let fact = facts.first().context("missing batchable fact")?;
+        let batch = fact.batch.as_ref().context("missing batch summary")?;
+        ensure!(batch.elements == 2, "batch element count mismatch");
+        ensure!(
+            matches!(fact.outcome_ref, OutcomeRef::Inline(Value::List(_))),
+            "batch fact outcome should be inline list"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn missing_right_is_denied() {
+    async fn missing_right_is_denied() -> anyhow::Result<()> {
         let (dp, id) = dataplane_with_handle(
             Rights::new(MethodBitmap::method(0), RightFlags::empty()),
             FastPath::Unconditional,
@@ -1451,14 +1497,16 @@ mod tests {
                 true,
             )
             .await;
-        assert!(matches!(
-            out.outcome,
-            Outcome::Fail(Failure::PermissionDenied { .. })
-        ));
+        ensure!(
+            matches!(out.outcome, Outcome::Fail(Failure::PermissionDenied { .. })),
+            "missing right should deny, got {:?}",
+            out.outcome
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn wrong_owner_is_denied() {
+    async fn wrong_owner_is_denied() -> anyhow::Result<()> {
         let (dp, id) = dataplane_with_handle(
             Rights::new(MethodBitmap::method(0), RightFlags::empty()),
             FastPath::Unconditional,
@@ -1468,11 +1516,15 @@ mod tests {
         let out = dp
             .execute(&o, 0, ReplayClass::Deterministic, SUPPORTS_UNARY, 0, true)
             .await;
-        assert!(matches!(out.outcome, Outcome::Fail(_)));
+        ensure!(
+            matches!(out.outcome, Outcome::Fail(_)),
+            "wrong owner should fail"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn driver_failure_records_driver_error() {
+    async fn driver_failure_records_driver_error() -> anyhow::Result<()> {
         let mut table = HandleTable::new();
         let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
         plan.insert(
@@ -1503,23 +1555,20 @@ mod tests {
                 false,
             )
             .await;
-        assert!(matches!(
-            out.outcome,
-            Outcome::Fail(Failure::HandlerError { .. })
-        ));
+        ensure!(
+            matches!(out.outcome, Outcome::Fail(Failure::HandlerError { .. })),
+            "driver failure should surface handler error, got {:?}",
+            out.outcome
+        );
         // NonIdempotentEffect ⇒ write-ahead barrier fired at begin.
-        assert!(store.sync_count() >= 1);
+        ensure!(store.sync_count() >= 1, "write-ahead barrier should sync");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn unconsumed_deterministic_read_skips_fact() {
+    async fn unconsumed_deterministic_read_skips_fact() -> anyhow::Result<()> {
         // With record=false and a Deterministic class, no Fact is written
         // because recovery can recompute the read. The store stays empty.
-        let (dp, id) = dataplane_with_handle(
-            Rights::new(MethodBitmap::method(0), RightFlags::empty()),
-            FastPath::Unconditional,
-        );
-        // dataplane_with_handle's FactSink store is dropped; rebuild one we keep.
         let mut table = HandleTable::new();
         let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
         plan.insert(MethodId::new(7), Arc::new(EchoDriver));
@@ -1535,7 +1584,6 @@ mod tests {
         });
         let (facts, store) = FactSink::in_memory();
         let dp2 = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
-        let _ = (dp, id);
         let out = dp2
             .execute(
                 &op(id2, 7, Value::Int(1)),
@@ -1546,16 +1594,20 @@ mod tests {
                 false,
             )
             .await;
-        assert_eq!(out.outcome, Outcome::Done(Value::Int(1)));
-        assert_eq!(
-            store.len(),
-            0,
-            "unconsumed deterministic read writes no Fact"
+        ensure!(
+            out.outcome == Outcome::Done(Value::Int(1)),
+            "deterministic read outcome mismatch: {:?}",
+            out.outcome
         );
+        ensure!(
+            store.is_empty(),
+            "unconsumed deterministic read should write no Fact"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn unconsumed_idempotent_effect_still_records_fact() {
+    async fn unconsumed_idempotent_effect_still_records_fact() -> anyhow::Result<()> {
         // Effectful / IdempotentEffect operations are external side effects, so
         // recovery must know they happened even if later graph nodes do not
         // consume the result.
@@ -1584,12 +1636,17 @@ mod tests {
                 false,
             )
             .await;
-        assert_eq!(out.outcome, Outcome::Done(Value::Int(1)));
-        assert_eq!(store.len(), 1, "idempotent effect writes a Fact");
+        ensure!(
+            out.outcome == Outcome::Done(Value::Int(1)),
+            "idempotent effect outcome mismatch: {:?}",
+            out.outcome
+        );
+        ensure!(store.len() == 1, "idempotent effect should write one Fact");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn idempotent_effect_dedupes_by_business_key() {
+    async fn idempotent_effect_dedupes_by_business_key() -> anyhow::Result<()> {
         // Two IdempotentEffect ops carrying the same `_idem_key` run the driver
         // only once; the second short-circuits to the cached outcome.
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1647,23 +1704,35 @@ mod tests {
             )
             .await;
 
-        assert_eq!(first.outcome, Outcome::Done(Value::Int(100)));
-        // Second deduped → Short with the same value, driver NOT called again.
-        assert_eq!(second.outcome, Outcome::Short(Value::Int(100)));
-        assert_eq!(
-            CALLS.load(Ordering::SeqCst),
-            1,
-            "driver runs once; the dup is deduped"
+        ensure!(
+            first.outcome == Outcome::Done(Value::Int(100)),
+            "first idempotent outcome mismatch: {:?}",
+            first.outcome
         );
-        let facts = store.facts_of(ProcessId::new(1)).unwrap();
-        assert_eq!(facts.len(), 2, "retry attempts remain auditable");
-        assert_eq!(facts[0].id.attempt, 0);
-        assert_eq!(facts[1].id.attempt, 1);
-        assert!(facts.iter().all(|f| f.decision == DecisionTag::Ok));
+        // Second deduped → Short with the same value, driver NOT called again.
+        ensure!(
+            second.outcome == Outcome::Short(Value::Int(100)),
+            "second idempotent outcome mismatch: {:?}",
+            second.outcome
+        );
+        ensure!(CALLS.load(Ordering::SeqCst) == 1, "driver should run once");
+        let facts = store
+            .facts_of(ProcessId::new(1))
+            .context("reading facts failed")?;
+        ensure!(facts.len() == 2, "retry attempts should remain auditable");
+        let first_fact = facts.first().context("missing first retry fact")?;
+        let second_fact = facts.get(1).context("missing second retry fact")?;
+        ensure!(first_fact.id.attempt == 0, "first attempt mismatch");
+        ensure!(second_fact.id.attempt == 1, "second attempt mismatch");
+        ensure!(
+            facts.iter().all(|f| f.decision == DecisionTag::Ok),
+            "all retry facts should be ok decisions"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn idempotent_effect_dedupes_across_data_plane_instances() {
+    async fn idempotent_effect_dedupes_across_data_plane_instances() -> anyhow::Result<()> {
         // Idempotency records live in state://idemp/*, so a restarted DataPlane
         // sharing the backend still dedupes the same effective key.
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1724,17 +1793,24 @@ mod tests {
             )
             .await;
 
-        assert_eq!(first.outcome, Outcome::Done(Value::Int(100)));
-        assert_eq!(second.outcome, Outcome::Short(Value::Int(100)));
-        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
-        assert!(
-            state
-                .read_prefix(&Path::parse("state://idemp").unwrap())
-                .await
-                .unwrap()
-                .len()
-                >= 1
+        ensure!(
+            first.outcome == Outcome::Done(Value::Int(100)),
+            "first dataplane outcome mismatch: {:?}",
+            first.outcome
         );
+        ensure!(
+            second.outcome == Outcome::Short(Value::Int(100)),
+            "second dataplane outcome mismatch: {:?}",
+            second.outcome
+        );
+        ensure!(CALLS.load(Ordering::SeqCst) == 1, "driver should run once");
+        let prefix = Path::parse("state://idemp")?;
+        let entries = state
+            .read_prefix(&prefix)
+            .await
+            .context("reading idempotency prefix failed")?;
+        ensure!(!entries.is_empty(), "idempotency state should be populated");
+        Ok(())
     }
 
     /// A FactStore whose writes always fail, exercising the fail-closed
@@ -1762,7 +1838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_ahead_failure_denies_effect_fail_closed() {
+    async fn write_ahead_failure_denies_effect_fail_closed() -> anyhow::Result<()> {
         // A NonIdempotentEffect must write ahead before the effect is issued.
         // If that durable append fails, the op is denied and the driver is
         // never called; no effect can happen without a record.
@@ -1803,11 +1879,12 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(out.outcome, Outcome::Fail(_)), "op must be denied");
-        assert!(
+        ensure!(matches!(out.outcome, Outcome::Fail(_)), "op must be denied");
+        ensure!(
             !CALLED.load(Ordering::SeqCst),
-            "driver must NOT run when the write-ahead barrier fails (fail-closed)"
+            "driver must not run when the write-ahead barrier fails"
         );
+        Ok(())
     }
 
     struct StreamingDriver;
@@ -1821,9 +1898,15 @@ mod tests {
             output: OutputMode,
             ctx: &DriverContext,
         ) -> Result<Outcome, DriverError> {
-            assert_eq!(output, OutputMode::Stream);
-            assert!(ctx.emit(Value::Str("chunk-1".into())));
-            assert!(ctx.emit(Value::Str("chunk-2".into())));
+            if output != OutputMode::Stream {
+                return Err(DriverError::Other("expected stream output".into()));
+            }
+            if !ctx.emit(Value::Str("chunk-1".into())) {
+                return Err(DriverError::Other("first chunk was not accepted".into()));
+            }
+            if !ctx.emit(Value::Str("chunk-2".into())) {
+                return Err(DriverError::Other("second chunk was not accepted".into()));
+            }
             Ok(Outcome::Done(Value::Int(2)))
         }
     }
@@ -1839,8 +1922,12 @@ mod tests {
             output: OutputMode,
             ctx: &DriverContext,
         ) -> Result<Outcome, DriverError> {
-            assert_eq!(output, OutputMode::Stream);
-            let _ = ctx.emit(Value::Str("chunk".into()));
+            if output != OutputMode::Stream {
+                return Err(DriverError::Other("expected stream output".into()));
+            }
+            if !ctx.emit(Value::Str("chunk".into())) {
+                return Err(DriverError::Other("chunk was not accepted".into()));
+            }
             Ok(Outcome::Done(Value::Int(1)))
         }
     }
@@ -1902,7 +1989,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_chunks_append_to_state_with_one_fact() {
+    async fn stream_chunks_append_to_state_with_one_fact() -> anyhow::Result<()> {
         let mut table = HandleTable::new();
         let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
         plan.insert(MethodId::new(7), Arc::new(StreamingDriver));
@@ -1925,29 +2012,34 @@ mod tests {
         let out = dp
             .execute(&o, 0, ReplayClass::Deterministic, SUPPORTS_STREAM, 0, true)
             .await;
-        assert_eq!(out.outcome, Outcome::Done(Value::Int(2)));
+        ensure!(
+            out.outcome == Outcome::Done(Value::Int(2)),
+            "streaming outcome mismatch: {:?}",
+            out.outcome
+        );
 
         let stream = state
-            .read(&Path::parse("state://stream/1/0").unwrap())
+            .read(&Path::parse("state://stream/1/0")?)
             .await
-            .unwrap();
-        assert_eq!(
-            stream,
-            Some(Value::List(vec![
-                Value::Str("chunk-1".into()),
-                Value::Str("chunk-2".into()),
-                Value::StreamEnd(nexus_types::StreamMarker::Done),
-            ]))
+            .context("reading stream state failed")?;
+        ensure!(
+            stream
+                == Some(Value::List(vec![
+                    Value::Str("chunk-1".into()),
+                    Value::Str("chunk-2".into()),
+                    Value::StreamEnd(nexus_types::StreamMarker::Done),
+                ])),
+            "stream state mismatch: {stream:?}"
         );
-        assert_eq!(
-            store.len(),
-            1,
-            "streaming chunks append to state, not one Fact per chunk"
+        ensure!(
+            store.len() == 1,
+            "streaming chunks should append to state, not one Fact per chunk"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn stream_append_failure_returns_driver_error() {
+    async fn stream_append_failure_returns_driver_error() -> anyhow::Result<()> {
         let mut table = HandleTable::new();
         let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
         plan.insert(MethodId::new(7), Arc::new(OneChunkStreamingDriver));
@@ -1973,10 +2065,14 @@ mod tests {
 
         match out.outcome {
             Outcome::Fail(nexus_types::Failure::HandlerError { message, .. }) => {
-                assert!(message.contains("stream sink failed"));
+                ensure!(
+                    message.contains("stream sink failed"),
+                    "unexpected handler error message: {message}"
+                );
             }
-            other => panic!("expected stream sink failure, got {other:?}"),
+            other => bail!("expected stream sink failure, got {other:?}"),
         }
+        Ok(())
     }
 
     struct CollectDriver;
@@ -1990,15 +2086,25 @@ mod tests {
             output: OutputMode,
             ctx: &DriverContext,
         ) -> Result<Outcome, DriverError> {
-            assert_eq!(output, OutputMode::Stream);
-            let _ = ctx.emit(Value::Str("a".into()));
-            let _ = ctx.emit(Value::Str("b".into()));
+            if output != OutputMode::Stream {
+                return Err(DriverError::Other("expected stream output".into()));
+            }
+            if !ctx.emit(Value::Str("a".into())) {
+                return Err(DriverError::Other(
+                    "first collect chunk was not accepted".into(),
+                ));
+            }
+            if !ctx.emit(Value::Str("b".into())) {
+                return Err(DriverError::Other(
+                    "second collect chunk was not accepted".into(),
+                ));
+            }
             Ok(Outcome::Done(Value::Int(2)))
         }
     }
 
     #[tokio::test]
-    async fn collect_aggregates_stream_chunks_up_to_limit() {
+    async fn collect_aggregates_stream_chunks_up_to_limit() -> anyhow::Result<()> {
         let mut table = HandleTable::new();
         let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
         plan.insert(MethodId::new(7), Arc::new(CollectDriver));
@@ -2020,15 +2126,17 @@ mod tests {
         let out = dp
             .execute(&o, 0, ReplayClass::Deterministic, SUPPORTS_STREAM, 0, true)
             .await;
-        assert_eq!(
-            out.outcome,
-            Outcome::Done(Value::List(vec![Value::Str("a".into())]))
+        ensure!(
+            out.outcome == Outcome::Done(Value::List(vec![Value::Str("a".into())])),
+            "collect outcome mismatch: {:?}",
+            out.outcome
         );
-        assert_eq!(store.len(), 1);
+        ensure!(store.len() == 1, "collect should record one Fact");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn collect_wraps_unary_result_when_no_chunks_are_emitted() {
+    async fn collect_wraps_unary_result_when_no_chunks_are_emitted() -> anyhow::Result<()> {
         struct UnaryOnlyCollectDriver;
 
         #[async_trait::async_trait]
@@ -2040,8 +2148,12 @@ mod tests {
                 output: OutputMode,
                 ctx: &DriverContext,
             ) -> Result<Outcome, DriverError> {
-                assert_eq!(output, OutputMode::Unary);
-                assert!(ctx.stream_to.is_none());
+                if output != OutputMode::Unary {
+                    return Err(DriverError::Other("expected unary output".into()));
+                }
+                if ctx.stream_to.is_some() {
+                    return Err(DriverError::Other("unexpected stream sink".into()));
+                }
                 Ok(Outcome::Done(input))
             }
         }
@@ -2066,11 +2178,16 @@ mod tests {
         let out = dp
             .execute(&o, 0, ReplayClass::Deterministic, SUPPORTS_UNARY, 0, true)
             .await;
-        assert_eq!(out.outcome, Outcome::Done(Value::List(vec![Value::Int(9)])));
+        ensure!(
+            out.outcome == Outcome::Done(Value::List(vec![Value::Int(9)])),
+            "collect unary wrap outcome mismatch: {:?}",
+            out.outcome
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn sink_only_suppresses_response_body() {
+    async fn sink_only_suppresses_response_body() -> anyhow::Result<()> {
         let mut table = HandleTable::new();
         let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
         plan.insert(MethodId::new(7), Arc::new(EchoDriver));
@@ -2098,13 +2215,24 @@ mod tests {
                 true,
             )
             .await;
-        assert_eq!(out.outcome, Outcome::Done(Value::Null));
-        let facts = store.facts_of(ProcessId::new(1)).unwrap();
-        assert_eq!(facts.len(), 1);
-        assert!(matches!(
-            facts[0].outcome_ref,
-            nexus_types::OutcomeRef::Inline(Value::Null)
-        ));
+        ensure!(
+            out.outcome == Outcome::Done(Value::Null),
+            "sink-only outcome mismatch: {:?}",
+            out.outcome
+        );
+        let facts = store
+            .facts_of(ProcessId::new(1))
+            .context("reading facts failed")?;
+        ensure!(facts.len() == 1, "sink-only should record one Fact");
+        let fact = facts.first().context("missing sink-only fact")?;
+        ensure!(
+            matches!(
+                fact.outcome_ref,
+                nexus_types::OutcomeRef::Inline(Value::Null)
+            ),
+            "sink-only fact should record Null"
+        );
+        Ok(())
     }
 
     struct AsyncDriver;
@@ -2118,21 +2246,23 @@ mod tests {
             output: OutputMode,
             _ctx: &DriverContext,
         ) -> Result<Outcome, DriverError> {
-            assert_eq!(output, OutputMode::AsyncProcess);
+            if output != OutputMode::AsyncProcess {
+                return Err(DriverError::Other("expected async process output".into()));
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             Ok(Outcome::Done(input))
         }
     }
 
-    fn async_dataplane(
-        rights: Rights,
-    ) -> (
+    type AsyncFixture = (
         DataPlane,
         HandleId,
         nexus_state::Backend,
         Arc<crate::fact::InMemoryFactStore>,
         crate::process::ProcessTable,
-    ) {
+    );
+
+    fn async_dataplane(rights: Rights) -> anyhow::Result<AsyncFixture> {
         let mut table = HandleTable::new();
         let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
         plan.insert(MethodId::new(7), Arc::new(AsyncDriver));
@@ -2150,35 +2280,41 @@ mod tests {
         let state: nexus_state::Backend = Arc::new(nexus_state::InMemoryBackend::new());
         let processes = crate::process::ProcessTable::new();
         let parent = processes.fresh_id();
-        assert_eq!(parent, ProcessId::new(1));
+        ensure!(
+            parent == ProcessId::new(1),
+            "unexpected parent process id: {parent:?}"
+        );
         let mut entry = ProcessEntry::new(parent, None, IdentityRef::ROOT);
         entry.status = nexus_types::ProcessStatus::Running;
         processes.insert(entry);
         let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, state.clone())
             .with_processes(processes.clone());
-        (dp, id, state, store, processes)
+        Ok((dp, id, state, store, processes))
     }
 
     #[tokio::test]
-    async fn async_process_requires_spawn_with_right() {
+    async fn async_process_requires_spawn_with_right() -> anyhow::Result<()> {
         let (dp, id, _state, _store, _processes) =
-            async_dataplane(Rights::new(MethodBitmap::method(0), RightFlags::empty()));
+            async_dataplane(Rights::new(MethodBitmap::method(0), RightFlags::empty()))?;
         let mut o = op(id, 7, Value::Str("work".into()));
         o.output = OutputMode::AsyncProcess;
 
         let out = dp
             .execute(&o, 0, ReplayClass::Deterministic, SUPPORTS_ASYNC, 0, true)
             .await;
-        assert!(matches!(
-            out.outcome,
-            Outcome::Fail(Failure::PermissionDenied { .. })
-        ));
+        ensure!(
+            matches!(out.outcome, Outcome::Fail(Failure::PermissionDenied { .. })),
+            "async process without spawn right should deny, got {:?}",
+            out.outcome
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn async_process_returns_pollable_resource_and_records_child_fact() {
+    async fn async_process_returns_pollable_resource_and_records_child_fact() -> anyhow::Result<()>
+    {
         let (dp, id, state, store, processes) =
-            async_dataplane(Rights::new(MethodBitmap::method(0), RightFlags::SPAWN_WITH));
+            async_dataplane(Rights::new(MethodBitmap::method(0), RightFlags::SPAWN_WITH))?;
         let mut o = op(id, 7, Value::Str("work".into()));
         o.output = OutputMode::AsyncProcess;
 
@@ -2187,54 +2323,70 @@ mod tests {
             .await;
         let (child, status_path, outcome_path) = match out.outcome {
             Outcome::Done(Value::Map(m)) => {
-                assert_eq!(m.get("kind"), Some(&Value::Str("executor_resource".into())));
-                assert_eq!(m.get("path"), Some(&Value::Str("proc://async/2".into())));
+                ensure!(
+                    m.get("kind") == Some(&Value::Str("executor_resource".into())),
+                    "async resource kind mismatch: {m:?}"
+                );
+                ensure!(
+                    m.get("path") == Some(&Value::Str("proc://async/2".into())),
+                    "async resource path mismatch: {m:?}"
+                );
                 let child = match m.get("process") {
                     Some(Value::Int(n)) => ProcessId::new(*n as u64),
-                    other => panic!("expected child process id, got {other:?}"),
+                    other => bail!("expected child process id, got {other:?}"),
                 };
                 let status_path = match m.get("status_path") {
-                    Some(Value::Str(s)) => Path::parse(s).unwrap(),
-                    other => panic!("expected status path, got {other:?}"),
+                    Some(Value::Str(s)) => Path::parse(s)?,
+                    other => bail!("expected status path, got {other:?}"),
                 };
                 let outcome_path = match m.get("outcome_path") {
-                    Some(Value::Str(s)) => Path::parse(s).unwrap(),
-                    other => panic!("expected outcome path, got {other:?}"),
+                    Some(Value::Str(s)) => Path::parse(s)?,
+                    other => bail!("expected outcome path, got {other:?}"),
                 };
                 (child, status_path, outcome_path)
             }
-            other => panic!("expected async resource map, got {other:?}"),
+            other => bail!("expected async resource map, got {other:?}"),
         };
-        assert_eq!(child, ProcessId::new(2));
-        assert!(processes.exists(child));
+        ensure!(child == ProcessId::new(2), "child process id mismatch");
+        ensure!(processes.exists(child), "child process should exist");
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
-                if let Some(v) = state.read(&outcome_path).await.unwrap() {
-                    break v;
+                if let Some(v) = state.read(&outcome_path).await? {
+                    break Ok::<Value, anyhow::Error>(v);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("async child writes outcome");
+        .context("async child did not write outcome before timeout")??;
         let mut expected = BTreeMap::new();
         expected.insert("status".into(), Value::Str("done".into()));
         expected.insert("value".into(), Value::Str("work".into()));
-        assert_eq!(outcome, Value::Map(expected));
-        assert_eq!(
-            processes.status(child),
-            Some(nexus_types::ProcessStatus::Completed)
+        ensure!(
+            outcome == Value::Map(expected),
+            "async child outcome mismatch: {outcome:?}"
         );
-        let status = state.read(&status_path).await.unwrap().unwrap();
+        ensure!(
+            processes.status(child) == Some(nexus_types::ProcessStatus::Completed),
+            "async child should be completed"
+        );
+        let status = state
+            .read(&status_path)
+            .await
+            .context("reading child status failed")?
+            .context("missing child status")?;
         match status {
-            Value::Map(m) => assert_eq!(m.get("phase"), Some(&Value::Str("completed".into()))),
-            other => panic!("expected status map, got {other:?}"),
+            Value::Map(m) => ensure!(
+                m.get("phase") == Some(&Value::Str("completed".into())),
+                "child status phase mismatch: {m:?}"
+            ),
+            other => bail!("expected status map, got {other:?}"),
         }
-        assert_eq!(
-            store.len(),
-            2,
-            "parent spawn and child execution each record one Fact"
+        ensure!(
+            store.len() == 2,
+            "parent spawn and child execution should each record one Fact"
         );
+        Ok(())
     }
 }

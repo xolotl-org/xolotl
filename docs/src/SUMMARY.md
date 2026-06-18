@@ -10,6 +10,7 @@
 - [Gateways](gateways.md)
   - [External Gateway](external-gateway.md)
   - [Console Protocol](console-protocol.md)
+- [HTTP Inference Providers](http-inference-providers.md)
 - [Configuration](configuration.md)
 - [API Reference](api-reference.md)
 - [Documentation Policy](documentation-policy.md)

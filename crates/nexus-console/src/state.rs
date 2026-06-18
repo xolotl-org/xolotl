@@ -12,8 +12,8 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::auth::{ConsoleAuth, ConsoleAuthConfig};
-use nexus_actors::PairingDisplayEdge;
+use crate::auth::{AuthError, ConsoleAuth, ConsoleAuthConfig};
+use nexus_standard::PairingDisplayEdge;
 
 /// Default maximum WebSocket frame size.
 pub const DEFAULT_WS_MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -92,25 +92,26 @@ pub const HARD_MAX_WS_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Shared console backend state.
 pub struct ConsoleState {
     /// Shared kernel bootstrap handle.
-    pub boot: Arc<Bootstrap>,
+    pub(crate) boot: Arc<Bootstrap>,
     /// The state backend the console reads/writes management config through.
     /// All management config lives under `state://kernel/*`.
-    pub state: Backend,
+    pub(crate) state: Backend,
     /// Authentication service.
-    pub auth: ConsoleAuth,
+    pub(crate) auth: ConsoleAuth,
     /// One-time pairing display edge.
-    pub pairing_display: PairingDisplayEdge,
+    pub(crate) pairing_display: PairingDisplayEdge,
     /// WebSocket runtime limits and counters.
-    pub ws: ConsoleWsRuntime,
+    pub(crate) ws: ConsoleWsRuntime,
     /// Transport security and proxy/origin policy.
-    pub transport_security: ConsoleTransportSecurityConfig,
+    pub(crate) transport_security: ConsoleTransportSecurityConfig,
 }
 
 impl ConsoleState {
     /// Build console state with default auth, WebSocket, and pairing display.
-    pub fn new(boot: Arc<Bootstrap>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(boot: Arc<Bootstrap>) -> Result<Self, AuthError> {
         Self::with_pairing_display_and_config(
-            boot,
+            boot.clone(),
             PairingDisplayEdge::default(),
             ConsoleAuthConfig::default(),
             ConsoleWsConfig::default(),
@@ -119,10 +120,14 @@ impl ConsoleState {
     }
 
     /// Build console state with a custom pairing display edge.
-    pub fn with_pairing_display(boot: Arc<Bootstrap>, pairing_display: PairingDisplayEdge) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_pairing_display(
+        boot: Arc<Bootstrap>,
+        pairing_display: PairingDisplayEdge,
+    ) -> Result<Self, AuthError> {
         Self::with_pairing_display_and_config(
-            boot,
-            pairing_display,
+            boot.clone(),
+            pairing_display.clone(),
             ConsoleAuthConfig::default(),
             ConsoleWsConfig::default(),
             ConsoleTransportSecurityConfig::default(),
@@ -130,35 +135,37 @@ impl ConsoleState {
     }
 
     /// Build console state with custom pairing display, auth, WS tuning, and transport security.
-    pub fn with_pairing_display_and_config(
+    pub(crate) fn with_pairing_display_and_config(
         boot: Arc<Bootstrap>,
         pairing_display: PairingDisplayEdge,
         auth: ConsoleAuthConfig,
         ws: ConsoleWsConfig,
         transport_security: ConsoleTransportSecurityConfig,
-    ) -> Self {
+    ) -> Result<Self, AuthError> {
         let state = boot.kernel.state.clone();
-        Self {
+        Ok(Self {
             boot,
             state,
-            auth: ConsoleAuth::new(auth),
+            auth: ConsoleAuth::new(auth)?,
             pairing_display,
             ws: ConsoleWsRuntime::new(ws),
             transport_security: transport_security.bounded(),
-        }
+        })
     }
 
     /// Build reference-counted console state with defaults.
-    pub fn shared(boot: Arc<Bootstrap>) -> Arc<Self> {
-        Arc::new(Self::new(boot))
+    #[cfg(test)]
+    pub(crate) fn shared(boot: Arc<Bootstrap>) -> Result<Arc<Self>, AuthError> {
+        Ok(Arc::new(Self::new(boot)?))
     }
 
     /// Build reference-counted console state with a custom pairing display.
-    pub fn shared_with_pairing_display(
+    #[cfg(test)]
+    pub(crate) fn shared_with_pairing_display(
         boot: Arc<Bootstrap>,
         pairing_display: PairingDisplayEdge,
-    ) -> Arc<Self> {
-        Arc::new(Self::with_pairing_display(boot, pairing_display))
+    ) -> Result<Arc<Self>, AuthError> {
+        Ok(Arc::new(Self::with_pairing_display(boot, pairing_display)?))
     }
 
     /// Build reference-counted console state with full custom tuning.
@@ -168,14 +175,14 @@ impl ConsoleState {
         auth: ConsoleAuthConfig,
         ws: ConsoleWsConfig,
         transport_security: ConsoleTransportSecurityConfig,
-    ) -> Arc<Self> {
-        Arc::new(Self::with_pairing_display_and_config(
+    ) -> Result<Arc<Self>, AuthError> {
+        Ok(Arc::new(Self::with_pairing_display_and_config(
             boot,
             pairing_display,
             auth,
             ws,
             transport_security,
-        ))
+        )?))
     }
 }
 
@@ -399,7 +406,7 @@ impl ConsoleWsConfig {
 
 /// Runtime counters enforcing Console WebSocket limits.
 #[derive(Debug)]
-pub struct ConsoleWsRuntime {
+pub(crate) struct ConsoleWsRuntime {
     config: ConsoleWsConfig,
     counts: Mutex<ConsoleWsCounts>,
 }
@@ -412,7 +419,7 @@ impl Default for ConsoleWsRuntime {
 
 impl ConsoleWsRuntime {
     /// Create a runtime counter set with bounded configuration.
-    pub fn new(config: ConsoleWsConfig) -> Self {
+    pub(crate) fn new(config: ConsoleWsConfig) -> Self {
         let config = config.bounded();
         Self {
             config,
@@ -421,12 +428,12 @@ impl ConsoleWsRuntime {
     }
 
     /// Return the bounded WebSocket configuration.
-    pub fn config(&self) -> &ConsoleWsConfig {
+    pub(crate) fn config(&self) -> &ConsoleWsConfig {
         &self.config
     }
 
     /// Reserve one connection for a source address.
-    pub fn try_acquire_source(&self, source: &str) -> Result<(), ConsoleWsLimit> {
+    pub(crate) fn try_acquire_source(&self, source: &str) -> Result<(), ConsoleWsLimit> {
         let mut counts = self.counts();
         if counts.global >= self.config.max_connections_global {
             return Err(ConsoleWsLimit::Global);
@@ -440,14 +447,14 @@ impl ConsoleWsRuntime {
     }
 
     /// Release a previously reserved source-address connection.
-    pub fn release_source(&self, source: &str) {
+    pub(crate) fn release_source(&self, source: &str) {
         let mut counts = self.counts();
         counts.global = counts.global.saturating_sub(1);
         decrement(&mut counts.by_source, source);
     }
 
     /// Move a connection's per-user accounting from `current` to `next`.
-    pub fn try_replace_user(
+    pub(crate) fn try_replace_user(
         &self,
         current: Option<&str>,
         next: &str,
@@ -467,7 +474,7 @@ impl ConsoleWsRuntime {
     }
 
     /// Release one user-accounted connection.
-    pub fn release_user(&self, user: &str) {
+    pub(crate) fn release_user(&self, user: &str) {
         let mut counts = self.counts();
         decrement(&mut counts.by_user, user);
     }
@@ -482,7 +489,7 @@ impl ConsoleWsRuntime {
 
 /// WebSocket limit class that rejected a connection or authentication update.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConsoleWsLimit {
+pub(crate) enum ConsoleWsLimit {
     /// Global connection limit reached.
     Global,
     /// Per-source connection limit reached.

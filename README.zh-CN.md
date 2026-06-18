@@ -27,7 +27,7 @@ Nexus 负责模型调用、工具执行、长期状态和外部协议之间的�
 - Source projection 发送入站事件，也可以接收 outbound command。
 - gRPC 和 WebSocket 是同一个 external Provider/Source gateway 的两种传输实现。
 
-MCP 把选定 Nexus effect 暴露为 MCP tool。它不创建新的外部角色。
+MCP 把选定 Gateway publication 发布为 tool、resource、resource template 和 prompt。MCP 请求通过与其他协议适配器相同的 Gateway surface 提交。
 
 ## 文档
 
@@ -84,19 +84,19 @@ Process
 | `nexus-state` | 状态后端 trait 与内存实现。 |
 | `nexus-kernel` | 进程、句柄、注册表、策略、执行器、恢复、事实记录。 |
 | `nexus-storage-redb` | 基于 redb 的持久状态和 `FactStore`。 |
-| `nexus-actors` | 标准进程内 driver 和 Provider。 |
+| `nexus-standard` | 标准进程内 Provider 和 Source 实现。 |
 | `nexus-gateway` | external 协议适配器共享的 session 准入、流控、taint 和 audit 代码。 |
 | `nexus-gateway-grpc` | 使用 `nexus-proto` 的 external Provider/Source gRPC 适配器。 |
 | `nexus-gateway-websocket` | external Provider/Source WebSocket 适配器。 |
-| `nexus-gateway-mcp` | 把选定 Nexus effect 暴露为 MCP tool 的服务端适配器。 |
+| `nexus-gateway-mcp` | 把选定 Gateway publication 暴露为 MCP tool、resource、resource template 和 prompt 的服务端适配器。 |
 | `nexus-proto` | Protobuf schema 和随仓库提供的 prost/tonic 绑定。 |
 | `nexus-console` | Web 控制台管理动作的 gateway。 |
 | `nexus-daemon` | 长期运行的宿主进程 `nexusd`。 |
 | `nexus-sdk` | 嵌入和测试用便捷导出。 |
 | `nexus-plan`, `nexus-sim` | 规划与仿真 crate。 |
 
-`nexus-actors` 使用 Cargo feature 选择要编译的模块。默认 `standard` 会编译标准进程内
-Driver 和 Provider。gateway 相关 crate 只启用 `external-session`，其中包含
+`nexus-standard` 使用 Cargo feature 选择要编译的模块。默认 `standard` 会编译标准进程内
+实现。gateway 相关 crate 只启用 `external-session`，其中包含
 external Provider 和 Source endpoint 的 session 处理代码。
 
 ## 环境要求
@@ -182,15 +182,16 @@ External WebSocket 通过 `[server].external_websocket_addr` 或 `NEXUS_EXTERNAL
 
 ```text
 state://kernel/external-installations/<installation_id>
-state://kernel/external-projections/<installation_id>/<projection_id>
 state://kernel/external-pairings/<pairing_id>
 state://kernel/external-sessions/<installation_id>/<role>
 state://kernel/external-credential-revocations/<installation_id>
 ```
 
+Provider/Source 投影嵌在每个 external installation 声明中。
+
 ### MCP
 
-`nexus-gateway-mcp` 只在对应 effect resource 拥有显式 publish capability 时，把选定 Nexus effect 暴露为 MCP tool。MCP 调用会转换为标准能力约束操作。
+`nexus-gateway-mcp` 把选定 Gateway publication 暴露为 MCP tool、resource、resource template 和 prompt。每个 publication 引用一个 Gateway surface；该 surface 必须有显式 publish capability，MCP 调用、资源读取和 prompt 请求都会转换为标准能力约束操作。adapter 优先协商 `2025-11-25`，支持来自 publication properties 的 completion，并在返回原生 MCP content block 前进行校验。
 
 ## 路径与能力规则
 

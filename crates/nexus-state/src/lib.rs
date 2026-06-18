@@ -24,45 +24,51 @@ pub type Backend = std::sync::Arc<dyn StateBackend>;
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use anyhow::{anyhow, bail, ensure};
     use nexus_types::{Path, Value};
     use std::sync::Arc;
 
-    fn p(s: &str) -> Path {
-        Path::parse(s).unwrap()
+    fn p(s: &str) -> anyhow::Result<Path> {
+        Path::parse(s).map_err(|error| anyhow!("path parse failed for {s}: {error}"))
     }
 
-    /// End-to-end check: backend behind a trait object behaves as expected.
     #[tokio::test]
-    async fn dyn_backend_works_through_trait() {
+    async fn dyn_backend_works_through_trait() -> anyhow::Result<()> {
         let b: Backend = Arc::new(InMemoryBackend::new());
-        b.write_set(&p("state://greet"), Value::Str("hi".into()))
-            .await
-            .unwrap();
-        let v = b.read(&p("state://greet")).await.unwrap();
-        assert_eq!(v, Some(Value::Str("hi".into())));
+        b.write_set(&p("state://greet")?, Value::Str("hi".into()))
+            .await?;
+        let v = b.read(&p("state://greet")?).await?;
+        ensure!(
+            v == Some(Value::Str("hi".into())),
+            "unexpected value: {v:?}"
+        );
+        Ok(())
     }
 
-    /// Subscribe across multiple writers and assert ordering for a single key.
     #[tokio::test]
-    async fn ordered_events_under_load() {
+    async fn ordered_events_under_load() -> anyhow::Result<()> {
         let b: Backend = Arc::new(InMemoryBackend::new());
-        let mut rx = b.subscribe(&p("state://q")).await.unwrap();
+        let mut rx = b.subscribe(&p("state://q")?).await?;
         for i in 0..50 {
-            b.write_set(&p("state://q"), Value::Int(i)).await.unwrap();
+            b.write_set(&p("state://q")?, Value::Int(i)).await?;
         }
         let mut last = -1;
         for _ in 0..50 {
-            let ev = rx.recv().await.unwrap();
+            let ev = rx
+                .recv()
+                .await
+                .map_err(|error| anyhow!("event receive failed: {error}"))?;
             if let StateEvent::Set {
                 value: Value::Int(i),
                 ..
             } = ev
             {
-                assert!(i > last);
+                ensure!(i > last, "event order regressed: {i} after {last}");
                 last = i;
             } else {
-                panic!("unexpected event");
+                bail!("unexpected event: {ev:?}");
             }
         }
+        Ok(())
     }
 }

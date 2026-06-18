@@ -12,31 +12,32 @@ description = "Management-domain Gateway (Web Console backend) for Nexus"
 workspace = true
 
 [dependencies]
-anyhow.workspace = true
-argon2 = { workspace = true, features = ["std"] }
-axum = { workspace = true, features = ["http1", "json", "tokio", "ws"] }
-base64.workspace = true
-ed25519-dalek.workspace = true
-futures-util.workspace = true
-getrandom.workspace = true
-hmac.workspace = true
-nexus-actors = { workspace = true, features = ["standard"] }
+anyhow = { workspace = true, default-features = false, features = ["std"] }
+argon2 = { workspace = true, default-features = false, features = ["std"] }
+axum = { workspace = true, default-features = false, features = ["http1", "json", "tokio", "ws"] }
+base64 = { workspace = true, default-features = false, features = ["alloc"] }
+ed25519-dalek = { workspace = true, default-features = false, features = ["fast", "std", "zeroize"] }
+futures-util = { workspace = true, default-features = false, features = ["sink", "std"] }
+getrandom = { workspace = true, default-features = false }
+hmac = { workspace = true, default-features = false }
+nexus-standard = { workspace = true, default-features = false, features = ["standard"] }
 nexus-graph.workspace = true
 nexus-kernel.workspace = true
 nexus-state.workspace = true
 nexus-types.workspace = true
-rmp-serde.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-sha1.workspace = true
-sha2.workspace = true
-subtle.workspace = true
-thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "macros", "rt-multi-thread", "signal", "time"] }
-tower-http = { workspace = true, features = ["trace", "cors"] }
+rmp-serde = { workspace = true, default-features = false }
+serde = { workspace = true, default-features = false, features = ["derive", "std"] }
+serde_json = { workspace = true, default-features = false, features = ["std"] }
+sha1 = { workspace = true, default-features = false }
+sha2 = { workspace = true, default-features = false }
+subtle = { workspace = true, default-features = false }
+thiserror = { workspace = true, default-features = false, features = ["std"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros", "rt-multi-thread", "signal", "time"] }
+tower-http = { workspace = true, default-features = false, features = ["trace", "cors"] }
+tracing = { workspace = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
-criterion.workspace = true
+criterion = { workspace = true, default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "console_protocol"

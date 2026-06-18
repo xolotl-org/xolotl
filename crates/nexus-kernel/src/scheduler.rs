@@ -47,19 +47,24 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::ensure;
 
     #[test]
-    fn system_outranks_interactive_outranks_background() {
+    fn system_outranks_interactive_outranks_background() -> anyhow::Result<()> {
         let s = Scheduler;
-        assert_eq!(
-            s.pick(&[Queue::Background, Queue::Interactive]),
-            Some(Queue::Interactive)
+        ensure!(
+            s.pick(&[Queue::Background, Queue::Interactive]) == Some(Queue::Interactive),
+            "interactive should outrank background"
         );
-        assert_eq!(
-            s.pick(&[Queue::Background, Queue::Interactive, Queue::System]),
-            Some(Queue::System)
+        ensure!(
+            s.pick(&[Queue::Background, Queue::Interactive, Queue::System]) == Some(Queue::System),
+            "system should outrank all other queues"
         );
-        assert_eq!(s.pick(&[Queue::Background]), Some(Queue::Background));
-        assert_eq!(s.pick(&[]), None);
+        ensure!(
+            s.pick(&[Queue::Background]) == Some(Queue::Background),
+            "background should be picked when it is the only pending queue"
+        );
+        ensure!(s.pick(&[]).is_none(), "empty queue set should not schedule");
+        Ok(())
     }
 }

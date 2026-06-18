@@ -11,21 +11,21 @@ description.workspace = true
 [lints]
 workspace = true
 
-# NOTE: no `protoc` build step. The Rust bindings are hand-vendored in
-# `src/{common,program,external}.rs` (faithful to tonic-prost-build 0.14
-# output) so this crate builds anywhere prost/tonic resolve. The `.proto` files
-# under `proto/` remain the canonical wire schema; keep the two in sync.
+# This crate does not run `protoc` during builds. Rust bindings are checked in
+# under `src/{common,program,external}.rs`; `.proto` files under `proto/` remain
+# the wire schema.
 
 [dependencies]
 nexus-graph.workspace = true
 nexus-types.workspace = true
-prost.workspace = true
-thiserror.workspace = true
-tonic = { workspace = true, features = ["codegen", "router", "transport"] }
-tonic-prost.workspace = true
+prost = { workspace = true, default-features = false, features = ["derive", "std"] }
+thiserror = { workspace = true, default-features = false, features = ["std"] }
+tonic = { workspace = true, default-features = false, features = ["codegen", "router", "transport"] }
+tonic-prost = { workspace = true, default-features = false }
 
 [dev-dependencies]
-criterion.workspace = true
+anyhow = { workspace = true, default-features = false, features = ["std"] }
+criterion = { workspace = true, default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "wire_conversion"

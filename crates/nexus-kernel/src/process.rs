@@ -242,19 +242,24 @@ impl ProcessTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, ensure};
 
     #[test]
-    fn spawn_links_parent_child() {
+    fn spawn_links_parent_child() -> anyhow::Result<()> {
         let t = ProcessTable::new();
         let root = t.fresh_id();
         t.insert(ProcessEntry::new(root, None, IdentityRef::ROOT));
         let child = t.fresh_id();
         t.insert(ProcessEntry::new(child, Some(root), IdentityRef::new(2)));
-        assert_eq!(t.children_of(root), vec![child]);
+        ensure!(
+            t.children_of(root) == vec![child],
+            "child process was not linked to parent"
+        );
+        Ok(())
     }
 
     #[test]
-    fn subtree_post_order_is_deepest_first() {
+    fn subtree_post_order_is_deepest_first() -> anyhow::Result<()> {
         let t = ProcessTable::new();
         let a = t.fresh_id();
         t.insert(ProcessEntry::new(a, None, IdentityRef::ROOT));
@@ -263,11 +268,15 @@ mod tests {
         let c = t.fresh_id();
         t.insert(ProcessEntry::new(c, Some(b), IdentityRef::ROOT));
         // a -> b -> c ; post-order cancels c, then b, then a.
-        assert_eq!(t.subtree_post_order(a), vec![c, b, a]);
+        ensure!(
+            t.subtree_post_order(a) == vec![c, b, a],
+            "subtree post-order mismatch"
+        );
+        Ok(())
     }
 
     #[test]
-    fn finalizers_run_in_reverse() {
+    fn finalizers_run_in_reverse() -> anyhow::Result<()> {
         let t = ProcessTable::new();
         let p = t.fresh_id();
         t.insert(ProcessEntry::new(p, None, IdentityRef::ROOT));
@@ -275,7 +284,16 @@ mod tests {
         t.add_finalizer(p, nexus_graph::DoNode::pure(nexus_types::Value::Int(2)));
         let fs = t.take_finalizers(p);
         // Added 1 then 2; reverse order runs 2 then 1.
-        assert_eq!(fs[0], nexus_graph::DoNode::pure(nexus_types::Value::Int(2)));
-        assert_eq!(fs[1], nexus_graph::DoNode::pure(nexus_types::Value::Int(1)));
+        let first = fs.first().context("missing first finalizer")?;
+        ensure!(
+            *first == nexus_graph::DoNode::pure(nexus_types::Value::Int(2)),
+            "first finalizer mismatch"
+        );
+        let second = fs.get(1).context("missing second finalizer")?;
+        ensure!(
+            *second == nexus_graph::DoNode::pure(nexus_types::Value::Int(1)),
+            "second finalizer mismatch"
+        );
+        Ok(())
     }
 }

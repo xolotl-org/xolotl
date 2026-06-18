@@ -39,12 +39,13 @@ impl RedbStore {
         let db = Database::create(path.into())?;
         {
             let txn = db.begin_write().map_err(map_db_error)?;
-            let _ = txn.open_table(STATE_VALUES_TABLE);
-            let _ = txn.open_table(STATE_HISTORY_TABLE);
-            let _ = txn.open_table(FACTS_TABLE);
-            let _ = txn.open_table(FACT_INDEX_TABLE);
-            let _ = txn.open_table(FACT_PROCESS_INDEX_TABLE);
-            let _ = txn.open_table(FACT_META_TABLE);
+            txn.open_table(STATE_VALUES_TABLE).map_err(map_db_error)?;
+            txn.open_table(STATE_HISTORY_TABLE).map_err(map_db_error)?;
+            txn.open_table(FACTS_TABLE).map_err(map_db_error)?;
+            txn.open_table(FACT_INDEX_TABLE).map_err(map_db_error)?;
+            txn.open_table(FACT_PROCESS_INDEX_TABLE)
+                .map_err(map_db_error)?;
+            txn.open_table(FACT_META_TABLE).map_err(map_db_error)?;
             txn.commit().map_err(map_db_error)?;
         }
         Ok(Self {

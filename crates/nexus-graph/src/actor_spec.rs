@@ -1,54 +1,34 @@
-//! `ActorSpec` + linter — declared vs. actually-used capabilities.
+//! Actor declarations and capability linting.
 //!
-//! An **Actor** is a named, long-lived Process whose body is a `Do<()>`.
-//! An [`ActorSpec`] is the lintable declaration wrapper around that body: it
-//! declares the capabilities / state paths / subscriptions / budget the Actor
-//! intends to touch, so an operator can know what the Actor reaches *without
-//! reading its code*.
-//!
-//! The declaration is more than documentation. `declared_capabilities` is
-//! treated as a runtime ceiling when a Process begins handling untrusted input:
-//! the kernel derives an attenuated child-Handle set covering only the declared
-//! capabilities, so an injected Plan cannot reach a capability the task never
-//! declared. That makes the security-relevant lint finding the
-//! **undeclared-but-used** capability: an Operation the program issues against a
-//! target the spec did not declare would be outside the task ceiling at runtime.
-//!
-//! [`lint`] walks a program's AST via [`DoNode::ops`]
-//! and compares each Operation's required capability against the declared
-//! capability literals.
+//! An [`ActorSpec`] names a long-lived [`DoNode`] body and declares the
+//! capabilities, state paths, subscriptions, and budget attached to that body.
+//! [`lint`] compares operations found in the body with the declared capability
+//! literals.
 
 use crate::r#do::DoNode;
 use nexus_types::{BudgetSpec, CapSet, Capability};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-/// The lintable declaration around an Actor's `Do<()>` body. Standard
-/// Actors ship unprivileged and version-aligned with the runtime; this spec is
-/// what an operator (or `nexus-console`) reads to audit reach.
+/// Declaration for a named long-lived `Do<()>` body.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ActorSpec {
-    /// A stable name for the Actor.
+    /// Stable actor name.
     #[serde(default)]
     pub name: String,
-    /// Capability literals the Actor declares it may use. These are canonical
-    /// capability strings such as `perform://effect/x/post`,
-    /// `read://state/memory/alice/**`, and `subscribe://state/chat/**`. This
-    /// list is also the task-level capability ceiling.
+    /// Capability literals declared for the actor body.
     #[serde(default)]
     pub declared_capabilities: Vec<String>,
-    /// `state://…` path patterns the Actor declares it will read/write.
+    /// State path patterns declared for reads and writes.
     #[serde(default)]
     pub declared_states: Vec<String>,
-    /// Stream paths the Actor subscribes to, compiled into a `for_each`
-    /// Reaction.
+    /// Stream path patterns the actor subscribes to.
     #[serde(default)]
     pub subscriptions: Vec<String>,
-    /// The capability set the Actor is granted; the operator checks declared
-    /// capabilities are covered by these Grants.
+    /// Granted capability set.
     #[serde(default)]
     pub capabilities: CapSet,
-    /// Cost / inflight ceiling for the Actor.
+    /// Budget and inflight limits.
     #[serde(default)]
     pub budget: BudgetSpec,
 }
@@ -72,10 +52,16 @@ impl ActorSpec {
         let Ok(path) = nexus_types::Path::parse(target) else {
             return false;
         };
-        self.declared_capabilities
-            .iter()
-            .filter_map(|literal| Capability::parse(literal).ok())
-            .any(|cap| cap.covers(verb, &path))
+        for literal in &self.declared_capabilities {
+            let cap = match Capability::parse(literal) {
+                Ok(cap) => cap,
+                Err(_) => return false,
+            };
+            if cap.covers(verb, &path) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -117,11 +103,19 @@ pub struct LintFinding {
 /// over-declaring only widens the ceiling, a separate (advisory) concern.
 pub fn lint(spec: &ActorSpec, program: &DoNode) -> Vec<LintFinding> {
     let mut findings = Vec::new();
-    let declared: Vec<_> = spec
-        .declared_capabilities
-        .iter()
-        .filter_map(|literal| Capability::parse(literal).ok())
-        .collect();
+    let mut declared = Vec::new();
+    for literal in &spec.declared_capabilities {
+        match Capability::parse(literal) {
+            Ok(capability) => declared.push(capability),
+            Err(error) => findings.push(LintFinding {
+                severity: LintSeverity::Error,
+                target: literal.clone(),
+                verb: String::new(),
+                method: "declared_capabilities".into(),
+                message: format!("declared capability `{literal}` is malformed: {error}"),
+            }),
+        }
+    }
     let mut seen = HashSet::new();
     for op in program.ops() {
         let target_path = op.target.path();
@@ -178,127 +172,172 @@ fn capability_target(target: &str) -> String {
 mod tests {
     use super::*;
     use crate::graph::{OperationTemplate, StepRef};
+    use anyhow::{Context, anyhow, ensure};
     use nexus_types::{OutputMode, Path, ProcessId, ResourceName, Value};
 
     fn s(name: &str) -> StepRef {
         StepRef::new(ProcessId::new(1), name)
     }
 
-    fn op(path: &str) -> OperationTemplate {
-        OperationTemplate {
-            target: ResourceName::new(Path::parse(path).unwrap()),
+    fn op(path: &str) -> anyhow::Result<OperationTemplate> {
+        Ok(OperationTemplate {
+            target: ResourceName::new(
+                Path::parse(path)
+                    .map_err(|error| anyhow!("path parse failed for {path}: {error}"))?,
+            ),
             method: "invoke".into(),
             method_id: None,
             output: OutputMode::Unary,
             literal_input: None,
-        }
+        })
     }
 
     #[test]
-    fn undeclared_capability_is_flagged() {
+    fn undeclared_capability_is_flagged() -> anyhow::Result<()> {
         let spec = ActorSpec::with_capabilities("notifier", ["perform://effect/events/emit"]);
-        // Program declares events but reaches out to fetch — undeclared.
         let program = DoNode::r#let(
             "e",
-            DoNode::op(op("effect://events/emit")),
-            DoNode::op(op("effect://fetch/get")),
+            DoNode::op(op("effect://events/emit")?),
+            DoNode::op(op("effect://fetch/get")?),
         );
         let findings = lint(&spec, &program);
-        assert_eq!(findings.len(), 1, "only the undeclared fetch is flagged");
-        assert_eq!(findings[0].target, "effect://fetch/get");
-        assert_eq!(findings[0].verb, "perform");
-        assert_eq!(findings[0].severity, LintSeverity::Error);
+        ensure!(findings.len() == 1, "unexpected findings: {findings:?}");
+        let finding = findings.first().context("missing finding")?;
+        ensure!(
+            finding.target == "effect://fetch/get",
+            "unexpected target: {}",
+            finding.target
+        );
+        ensure!(
+            finding.verb == "perform",
+            "unexpected verb: {}",
+            finding.verb
+        );
+        ensure!(
+            finding.severity == LintSeverity::Error,
+            "unexpected severity: {:?}",
+            finding.severity
+        );
+        Ok(())
     }
 
     #[test]
-    fn fully_declared_program_is_clean() {
+    fn fully_declared_program_is_clean() -> anyhow::Result<()> {
         let spec = ActorSpec::with_capabilities(
             "housekeeper",
             ["perform://effect/fs/read", "perform://effect/events/emit"],
         );
         let program = DoNode::Both(
-            Box::new(DoNode::op(op("effect://fs/read"))),
-            Box::new(DoNode::op(op("effect://events/emit"))),
-        );
-        assert!(
-            lint(&spec, &program).is_empty(),
-            "every used effect is declared"
-        );
-    }
-
-    #[test]
-    fn capability_prefix_covers_finer_target() {
-        assert!(capability_covers(
-            "perform://effect/fs/**",
-            "perform",
-            "effect://fs/read"
-        ));
-        assert!(capability_covers(
-            "perform://effect/fs/read",
-            "perform",
-            "effect://fs/read"
-        ));
-        // Not a prefix: a finer pattern does not cover a coarser target.
-        assert!(!capability_covers(
-            "perform://effect/fs/read",
-            "perform",
-            "effect://fs"
-        ));
-        // Different namespace.
-        assert!(!capability_covers(
-            "perform://effect/fs/**",
-            "perform",
-            "effect://fetch/get"
-        ));
-        // Resource paths are not capability literals.
-        assert!(!capability_covers(
-            "effect://fs",
-            "perform",
-            "effect://fs/read"
-        ));
-    }
-
-    #[test]
-    fn duplicate_undeclared_uses_collapse_to_one_finding() {
-        let spec = ActorSpec::with_capabilities("a", ["perform://effect/memory/**"]);
-        let program = DoNode::Both(
-            Box::new(DoNode::op(op("effect://x/post"))),
-            Box::new(DoNode::op(op("effect://x/post"))),
+            Box::new(DoNode::op(op("effect://fs/read")?)),
+            Box::new(DoNode::op(op("effect://events/emit")?)),
         );
         let findings = lint(&spec, &program);
-        assert_eq!(findings.len(), 1, "same (target,method) flagged once");
+        ensure!(findings.is_empty(), "unexpected findings: {findings:?}");
+        Ok(())
     }
 
     #[test]
-    fn state_append_requires_write_capability() {
-        let mut append = op("state://events/topic");
+    fn capability_prefix_covers_finer_target() -> anyhow::Result<()> {
+        ensure!(
+            capability_covers("perform://effect/fs/**", "perform", "effect://fs/read"),
+            "wildcard capability did not cover finer target"
+        );
+        ensure!(
+            capability_covers("perform://effect/fs/read", "perform", "effect://fs/read"),
+            "exact capability did not cover target"
+        );
+        ensure!(
+            !capability_covers("perform://effect/fs/read", "perform", "effect://fs"),
+            "finer target covered coarser target"
+        );
+        ensure!(
+            !capability_covers("perform://effect/fs/**", "perform", "effect://fetch/get"),
+            "capability covered different namespace"
+        );
+        ensure!(
+            !capability_covers("effect://fs", "perform", "effect://fs/read"),
+            "resource path was treated as capability literal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_undeclared_uses_collapse_to_one_finding() -> anyhow::Result<()> {
+        let spec = ActorSpec::with_capabilities("a", ["perform://effect/memory/**"]);
+        let program = DoNode::Both(
+            Box::new(DoNode::op(op("effect://x/post")?)),
+            Box::new(DoNode::op(op("effect://x/post")?)),
+        );
+        let findings = lint(&spec, &program);
+        ensure!(findings.len() == 1, "unexpected findings: {findings:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_declared_capability_is_flagged() -> anyhow::Result<()> {
+        let spec = ActorSpec::with_capabilities("a", ["effect://x/post"]);
+        let findings = lint(&spec, &DoNode::pure(Value::Null));
+
+        ensure!(findings.len() == 1, "unexpected findings: {findings:?}");
+        let finding = findings.first().context("missing finding")?;
+        ensure!(
+            finding.target == "effect://x/post",
+            "unexpected target: {}",
+            finding.target
+        );
+        ensure!(
+            finding.method == "declared_capabilities",
+            "unexpected method: {}",
+            finding.method
+        );
+        ensure!(
+            finding.severity == LintSeverity::Error,
+            "unexpected severity: {:?}",
+            finding.severity
+        );
+        ensure!(
+            !spec.declares_capability("perform", "effect://x/post"),
+            "malformed declaration should not grant capability"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn state_append_requires_write_capability() -> anyhow::Result<()> {
+        let mut append = op("state://events/topic")?;
         append.method = "append".into();
         let program = DoNode::op(append);
 
         let read_spec = ActorSpec::with_capabilities("reader", ["read://state/events/**"]);
         let findings = lint(&read_spec, &program);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].verb, "write");
-        assert!(
-            findings[0]
+        ensure!(findings.len() == 1, "unexpected findings: {findings:?}");
+        let finding = findings.first().context("missing finding")?;
+        ensure!(finding.verb == "write", "unexpected verb: {}", finding.verb);
+        ensure!(
+            finding
                 .message
                 .contains("capability `write://state/events/topic`"),
-            "message should point operators to the canonical write capability"
+            "unexpected message: {}",
+            finding.message
         );
 
         let write_spec = ActorSpec::with_capabilities("writer", ["write://state/events/**"]);
-        assert!(lint(&write_spec, &program).is_empty());
+        let findings = lint(&write_spec, &program);
+        ensure!(findings.is_empty(), "unexpected findings: {findings:?}");
+        Ok(())
     }
 
     #[test]
-    fn pure_program_with_no_ops_is_clean() {
+    fn pure_program_with_no_ops_is_clean() -> anyhow::Result<()> {
         let spec = ActorSpec::default();
         let program = DoNode::pure(Value::Int(1)).and_then(s("noop"));
-        assert!(lint(&spec, &program).is_empty());
+        let findings = lint(&spec, &program);
+        ensure!(findings.is_empty(), "unexpected findings: {findings:?}");
+        Ok(())
     }
 
     #[test]
-    fn spec_serde_roundtrip() {
+    fn spec_serde_roundtrip() -> anyhow::Result<()> {
         let spec = ActorSpec {
             name: "n".into(),
             declared_capabilities: vec!["perform://effect/fs/**".into()],
@@ -307,8 +346,9 @@ mod tests {
             capabilities: CapSet::new(),
             budget: BudgetSpec::default(),
         };
-        let s = serde_json::to_string(&spec).unwrap();
-        let back: ActorSpec = serde_json::from_str(&s).unwrap();
-        assert_eq!(spec, back);
+        let s = serde_json::to_string(&spec)?;
+        let back: ActorSpec = serde_json::from_str(&s)?;
+        ensure!(spec == back, "round trip changed spec: {back:?}");
+        Ok(())
     }
 }

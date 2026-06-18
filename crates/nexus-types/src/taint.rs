@@ -136,6 +136,7 @@ impl TaintSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::ensure;
 
     #[test]
     fn union_is_idempotent() {
@@ -147,13 +148,14 @@ mod tests {
     }
 
     #[test]
-    fn protected_is_detected_through_union() {
-        let vault = Path::parse("state://vault/alice/x").unwrap();
+    fn protected_is_detected_through_union() -> anyhow::Result<()> {
+        let vault = Path::parse("state://vault/alice/x")?;
         let mut t = TaintSet::of(TaintSource::ModelOutput);
-        assert!(!t.has_protected());
+        ensure!(!t.has_protected(), "new model taint was protected");
         t.union(&TaintSet::of(TaintSource::Protected { path: vault }));
-        assert!(t.has_protected());
-        assert!(t.has_untrusted_content());
+        ensure!(t.has_protected(), "protected taint was not detected");
+        ensure!(t.has_untrusted_content(), "model taint was not preserved");
+        Ok(())
     }
 
     #[test]

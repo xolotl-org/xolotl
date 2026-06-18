@@ -4,6 +4,7 @@ use nexus_console::protocol::{
     StreamCall, protocol_metadata,
 };
 use nexus_types::Value;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::hint::black_box;
 
@@ -17,44 +18,67 @@ fn snapshot_value(fields: usize) -> Value {
     Value::Map(map)
 }
 
-fn action_call() -> ClientFrame {
-    ClientFrame::Call {
+fn json_bytes(value: &Value) -> Result<JsonBytes, String> {
+    JsonBytes::try_from_value(value).map_err(|error| error.to_string())
+}
+
+fn action_result_value(value: Value, server_rev: u64) -> Result<ActionResult, String> {
+    ActionResult::value(value, server_rev).map_err(|error| error.to_string())
+}
+
+fn encode_named<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
+    rmp_serde::to_vec_named(value).map_err(|error| error.to_string())
+}
+
+fn decode_client_frame(bytes: &[u8]) -> Result<ClientFrame, String> {
+    rmp_serde::from_slice(bytes).map_err(|error| error.to_string())
+}
+
+fn consume_result<T, E>(result: Result<T, E>) {
+    match result {
+        Ok(value) => drop(black_box(value)),
+        Err(error) => drop(black_box(error)),
+    }
+}
+
+fn action_call() -> Result<ClientFrame, String> {
+    Ok(ClientFrame::Call {
         id: 42,
         call: ActionCall {
             action: "state.snapshot".into(),
-            input: JsonBytes::from_value(&snapshot_value(SNAPSHOT_FIELDS)),
+            input: json_bytes(&snapshot_value(SNAPSHOT_FIELDS))?,
             scope: Some("debug performance check".into()),
             justification: Some("benchmark".into()),
             ttl_ms: Some(60_000),
         },
-    }
+    })
 }
 
-fn subscribe_call() -> ClientFrame {
-    ClientFrame::Subscribe {
+fn subscribe_call() -> Result<ClientFrame, String> {
+    Ok(ClientFrame::Subscribe {
         id: 7,
         stream: StreamCall {
             stream: "state.watch".into(),
-            input: JsonBytes::from_value(&Value::Map(BTreeMap::from([(
+            input: json_bytes(&Value::Map(BTreeMap::from([(
                 "pattern".into(),
                 Value::Str("state://bench/**".into()),
-            )]))),
+            )])))?,
             scope: Some("benchmark".into()),
             justification: Some("benchmark".into()),
             ttl_ms: Some(60_000),
             since_rev: Some(128),
         },
-    }
+    })
 }
 
-fn event_frame() -> ServerFrame {
-    ServerFrame::Event {
+fn event_frame() -> Result<ServerFrame, String> {
+    Ok(ServerFrame::Event {
         stream: 7,
         event: ConsoleEvent::StateSet {
             path: "state://bench/k1".into(),
-            value: JsonBytes::from_value(&snapshot_value(SNAPSHOT_FIELDS)),
+            value: json_bytes(&snapshot_value(SNAPSHOT_FIELDS))?,
         },
-    }
+    })
 }
 
 fn bench_json_envelope(c: &mut Criterion) {
@@ -64,16 +88,19 @@ fn bench_json_envelope(c: &mut Criterion) {
     group.bench_function("json_bytes_from_value_256_fields", |b| {
         let value = snapshot_value(SNAPSHOT_FIELDS);
         b.iter(|| {
-            let json = JsonBytes::from_value(black_box(&value));
-            black_box(json);
+            let json = json_bytes(black_box(&value));
+            consume_result(json);
         });
     });
 
     group.bench_function("json_bytes_to_value_256_fields", |b| {
-        let json = JsonBytes::from_value(&snapshot_value(SNAPSHOT_FIELDS));
+        let json = json_bytes(&snapshot_value(SNAPSHOT_FIELDS));
         b.iter(|| {
-            let value = json.try_to_value().expect("json envelope must decode");
-            black_box(value);
+            let value = match &json {
+                Ok(json) => json.try_to_value().map_err(|error| error.to_string()),
+                Err(error) => Err(error.clone()),
+            };
+            consume_result(value);
         });
     });
 
@@ -87,25 +114,33 @@ fn bench_msgpack_frames(c: &mut Criterion) {
     group.bench_function("encode_client_call_snapshot", |b| {
         let frame = action_call();
         b.iter(|| {
-            let bytes = rmp_serde::to_vec_named(black_box(&frame)).expect("frame encode must work");
-            black_box(bytes);
+            let bytes = match &frame {
+                Ok(frame) => encode_named(black_box(frame)),
+                Err(error) => Err(error.clone()),
+            };
+            consume_result(bytes);
         });
     });
 
     group.bench_function("decode_client_call_snapshot", |b| {
-        let bytes = rmp_serde::to_vec_named(&action_call()).expect("frame encode must work");
+        let bytes = action_call().and_then(|frame| encode_named(&frame));
         b.iter(|| {
-            let frame: ClientFrame =
-                rmp_serde::from_slice(black_box(&bytes)).expect("frame decode must work");
-            black_box(frame);
+            let frame = match &bytes {
+                Ok(bytes) => decode_client_frame(black_box(bytes)),
+                Err(error) => Err(error.clone()),
+            };
+            consume_result(frame);
         });
     });
 
     group.bench_function("encode_server_event_snapshot", |b| {
         let frame = event_frame();
         b.iter(|| {
-            let bytes = rmp_serde::to_vec_named(black_box(&frame)).expect("frame encode must work");
-            black_box(bytes);
+            let bytes = match &frame {
+                Ok(frame) => encode_named(black_box(frame)),
+                Err(error) => Err(error.clone()),
+            };
+            consume_result(bytes);
         });
     });
 
@@ -113,10 +148,10 @@ fn bench_msgpack_frames(c: &mut Criterion) {
         b.iter_batched(
             subscribe_call,
             |frame| {
-                let bytes = rmp_serde::to_vec_named(&frame).expect("frame encode must work");
-                let decoded: ClientFrame =
-                    rmp_serde::from_slice(bytes.as_slice()).expect("frame decode must work");
-                black_box(decoded);
+                let decoded = frame
+                    .and_then(|frame| encode_named(&frame))
+                    .and_then(|bytes| decode_client_frame(bytes.as_slice()));
+                consume_result(decoded);
             },
             BatchSize::SmallInput,
         );
@@ -141,8 +176,8 @@ fn bench_metadata(c: &mut Criterion) {
                 metadata: protocol_metadata(1, 1),
             },
             |frame| {
-                let bytes = rmp_serde::to_vec_named(&frame).expect("frame encode must work");
-                black_box(bytes);
+                let bytes = encode_named(&frame);
+                consume_result(bytes);
             },
             BatchSize::SmallInput,
         );
@@ -153,8 +188,8 @@ fn bench_metadata(c: &mut Criterion) {
             hello: ClientHello::default(),
         };
         b.iter(|| {
-            let bytes = rmp_serde::to_vec_named(black_box(&frame)).expect("frame encode must work");
-            black_box(bytes);
+            let bytes = encode_named(black_box(&frame));
+            consume_result(bytes);
         });
     });
 
@@ -167,8 +202,8 @@ fn bench_results(c: &mut Criterion) {
     group.bench_function("action_result_value_256_fields", |b| {
         let value = snapshot_value(SNAPSHOT_FIELDS);
         b.iter(|| {
-            let result = ActionResult::value(black_box(value.clone()), black_box(99));
-            black_box(result);
+            let result = action_result_value(black_box(value.clone()), black_box(99));
+            consume_result(result);
         });
     });
 

@@ -1,18 +1,14 @@
 use anyhow::{Context, Result};
-use nexus_console::auth::{
-    DEFAULT_GLOBAL_SESSION_LIMIT, DEFAULT_IDLE_TTL_MS, DEFAULT_MAX_SESSIONS_PER_USER,
-    DEFAULT_SESSION_TTL_MS, default_argon2_concurrency,
-};
-use nexus_console::state::{
-    DEFAULT_WS_EVENT_SEND_TIMEOUT, DEFAULT_WS_IDLE_TIMEOUT, DEFAULT_WS_MAX_BYTES_PER_SECOND,
-    DEFAULT_WS_MAX_CONNECTIONS_GLOBAL, DEFAULT_WS_MAX_CONNECTIONS_PER_SOURCE,
-    DEFAULT_WS_MAX_CONNECTIONS_PER_USER, DEFAULT_WS_MAX_FACT_LIMIT, DEFAULT_WS_MAX_FRAME_BYTES,
-    DEFAULT_WS_MAX_FRAMES_PER_SECOND, DEFAULT_WS_MAX_STATE_LIST_LIMIT,
-    DEFAULT_WS_MAX_SUBSCRIPTIONS, DEFAULT_WS_MAX_TRACE_LIMIT,
-};
 use nexus_console::{
     ConsoleAuthConfig, ConsoleTransportSecurityConfig, ConsoleTransportSecurityMode,
     ConsoleTrustedProxyConfig, ConsoleUnsafeTransportRelaxation, ConsoleWsConfig,
+    DEFAULT_GLOBAL_SESSION_LIMIT, DEFAULT_IDLE_TTL_MS, DEFAULT_MAX_SESSIONS_PER_USER,
+    DEFAULT_SESSION_TTL_MS, DEFAULT_WS_EVENT_SEND_TIMEOUT, DEFAULT_WS_IDLE_TIMEOUT,
+    DEFAULT_WS_MAX_BYTES_PER_SECOND, DEFAULT_WS_MAX_CONNECTIONS_GLOBAL,
+    DEFAULT_WS_MAX_CONNECTIONS_PER_SOURCE, DEFAULT_WS_MAX_CONNECTIONS_PER_USER,
+    DEFAULT_WS_MAX_FACT_LIMIT, DEFAULT_WS_MAX_FRAME_BYTES, DEFAULT_WS_MAX_FRAMES_PER_SECOND,
+    DEFAULT_WS_MAX_STATE_LIST_LIMIT, DEFAULT_WS_MAX_SUBSCRIPTIONS, DEFAULT_WS_MAX_TRACE_LIMIT,
+    default_argon2_concurrency,
 };
 #[cfg(feature = "external-gateway")]
 use nexus_gateway::{
@@ -64,8 +60,9 @@ pub const HARD_EXTERNAL_SOURCE_COMMAND_RATE_LIMIT_MAX: usize = 65_536;
 
 /// Bootstrap-only config loaded by `nexusd`: storage, listeners, console root
 /// bootstrap material, and bounded console auth/WebSocket resource limits.
-/// Runtime config such as providers, models, groups, routing, bindings, and
-/// policies lives in Nexus state.
+/// Runtime config such as external Provider/Source installations, models,
+/// groups, routing, bindings, process declarations, and policies lives in Nexus
+/// state.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct NexusConfig {
@@ -1168,42 +1165,69 @@ impl NexusConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexus_console::auth::{
-        HARD_GLOBAL_SESSION_LIMIT, MIN_ARGON2_CONCURRENCY, MIN_IDLE_TTL_MS,
-        MIN_MAX_SESSIONS_PER_USER, MIN_SESSION_TTL_MS,
-    };
-    use nexus_console::state::{
-        HARD_MAX_WS_CONNECTIONS_PER_SOURCE, HARD_MAX_WS_FRAME_BYTES, HARD_MAX_WS_FRAMES_PER_SECOND,
-        HARD_MAX_WS_SUBSCRIPTIONS, HARD_MAX_WS_TRACE_LIMIT, MIN_WS_CONNECTIONS_GLOBAL,
-        MIN_WS_CONNECTIONS_PER_USER, MIN_WS_EVENT_SEND_TIMEOUT, MIN_WS_IDLE_TIMEOUT,
-        MIN_WS_MAX_BYTES_PER_SECOND, MIN_WS_MAX_FACT_LIMIT, MIN_WS_MAX_STATE_LIST_LIMIT,
+    use anyhow::bail;
+    use nexus_console::{
+        HARD_GLOBAL_SESSION_LIMIT, HARD_MAX_WS_CONNECTIONS_PER_SOURCE, HARD_MAX_WS_FRAME_BYTES,
+        HARD_MAX_WS_FRAMES_PER_SECOND, HARD_MAX_WS_SUBSCRIPTIONS, HARD_MAX_WS_TRACE_LIMIT,
+        MIN_ARGON2_CONCURRENCY, MIN_IDLE_TTL_MS, MIN_MAX_SESSIONS_PER_USER, MIN_SESSION_TTL_MS,
+        MIN_WS_CONNECTIONS_GLOBAL, MIN_WS_CONNECTIONS_PER_USER, MIN_WS_EVENT_SEND_TIMEOUT,
+        MIN_WS_IDLE_TIMEOUT, MIN_WS_MAX_BYTES_PER_SECOND, MIN_WS_MAX_FACT_LIMIT,
+        MIN_WS_MAX_STATE_LIST_LIMIT,
     };
 
-    fn assert_config_rejects_unknown_field(toml: &str, field: &str) {
-        let err = toml::from_str::<NexusConfig>(toml).unwrap_err();
+    macro_rules! assert {
+        ($condition:expr $(,)?) => {
+            anyhow::ensure!($condition, "assertion failed: {}", stringify!($condition));
+        };
+        ($condition:expr, $($arg:tt)+) => {
+            anyhow::ensure!($condition, $($arg)+);
+        };
+    }
+
+    macro_rules! assert_eq {
+        ($left:expr, $right:expr $(,)?) => {
+            match (&$left, &$right) {
+                (left, right) => anyhow::ensure!(
+                    left == right,
+                    "assertion failed: left != right\nleft: {left:?}\nright: {right:?}"
+                ),
+            }
+        };
+        ($left:expr, $right:expr, $($arg:tt)+) => {
+            anyhow::ensure!($left == $right, $($arg)+);
+        };
+    }
+
+    fn assert_config_rejects_unknown_field(toml: &str, field: &str) -> anyhow::Result<()> {
+        let err = match toml::from_str::<NexusConfig>(toml) {
+            Ok(config) => bail!("expected unknown-field rejection, got {config:?}"),
+            Err(error) => error,
+        };
         let message = err.to_string();
         assert!(
             message.contains("unknown field") && message.contains(field),
             "unexpected error for {field}: {message}"
         );
+        Ok(())
     }
 
     #[cfg(feature = "external-gateway")]
-    fn temp_config_file(name: &str, contents: &[u8]) -> String {
+    fn temp_config_file(name: &str, contents: &[u8]) -> anyhow::Result<String> {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .context("system time is before unix epoch")?
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
             "nexus-config-test-{}-{nanos}-{name}",
             std::process::id()
         ));
-        fs::write(&path, contents).unwrap();
-        path.to_string_lossy().into_owned()
+        fs::write(&path, contents)
+            .with_context(|| format!("writing temporary config file {}", path.display()))?;
+        Ok(path.to_string_lossy().into_owned())
     }
 
     #[test]
-    fn console_tuning_defaults_match_runtime_defaults() {
+    fn console_tuning_defaults_match_runtime_defaults() -> anyhow::Result<()> {
         let auth: ConsoleAuthConfig = ConsoleAuthTuning::default().into();
         let default_auth = ConsoleAuthConfig::default();
         assert_eq!(auth.session_ttl_ms, default_auth.session_ttl_ms);
@@ -1234,10 +1258,11 @@ mod tests {
         assert_eq!(ws.max_fact_limit, default_ws.max_fact_limit);
         assert_eq!(ws.max_trace_limit, default_ws.max_trace_limit);
         assert_eq!(ws.event_send_timeout, default_ws.event_send_timeout);
+        Ok(())
     }
 
     #[test]
-    fn console_tuning_clamps_unreasonable_values() {
+    fn console_tuning_clamps_unreasonable_values() -> anyhow::Result<()> {
         let auth: ConsoleAuthConfig = ConsoleAuthTuning {
             session_ttl_ms: 1,
             idle_ttl_ms: -1,
@@ -1282,10 +1307,11 @@ mod tests {
         assert_eq!(ws.max_fact_limit, MIN_WS_MAX_FACT_LIMIT);
         assert_eq!(ws.max_trace_limit, HARD_MAX_WS_TRACE_LIMIT);
         assert_eq!(ws.event_send_timeout, MIN_WS_EVENT_SEND_TIMEOUT);
+        Ok(())
     }
 
     #[test]
-    fn config_file_accepts_console_transport_security() {
+    fn config_file_accepts_console_transport_security() -> anyhow::Result<()> {
         let cfg: NexusConfig = toml::from_str(
             r#"
 [console.transport_security]
@@ -1295,179 +1321,174 @@ honor_x_forwarded_proto = true
 honor_x_forwarded_host = true
 honor_x_forwarded_for = true
 "#,
-        )
-        .unwrap();
+        )?;
 
         let transport = cfg
             .console
             .transport_security
-            .to_console_transport_security_config()
-            .unwrap();
+            .to_console_transport_security_config()?;
         assert_eq!(
             transport.mode,
             ConsoleTransportSecurityMode::TrustedReverseProxy
         );
         assert_eq!(
             transport.trusted_proxy.peers,
-            vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
+            vec!["127.0.0.1".parse::<IpAddr>()?]
         );
+        Ok(())
     }
 
     #[test]
-    fn console_transport_security_requires_proxy_peer() {
+    fn console_transport_security_requires_proxy_peer() -> anyhow::Result<()> {
         let cfg: NexusConfig = toml::from_str(
             r#"
 [console.transport_security]
 mode = "trusted_reverse_proxy"
 "#,
-        )
-        .unwrap();
+        )?;
 
-        let err = cfg
+        let err = match cfg
             .console
             .transport_security
             .to_console_transport_security_config()
-            .unwrap_err();
+        {
+            Ok(transport) => bail!("expected proxy peer rejection, got {transport:?}"),
+            Err(error) => error,
+        };
         assert!(err.to_string().contains("trusted_proxy_peers"));
+        Ok(())
     }
 
     #[test]
-    fn console_plain_listener_rejects_production_tls() {
-        let parsed = toml::from_str::<NexusConfig>(
+    fn console_plain_listener_rejects_production_tls() -> anyhow::Result<()> {
+        let cfg = toml::from_str::<NexusConfig>(
             r#"
 [console.transport_security]
 mode = "production_tls"
 "#,
-        );
-        let cfg = match parsed {
-            Ok(cfg) => cfg,
-            Err(error) => {
-                assert!(false, "unexpected config parse error: {error}");
-                return;
-            }
-        };
+        )?;
 
-        let result = cfg
+        let err = match cfg
             .console
             .transport_security
-            .validate_plain_listener("console", "127.0.0.1:9000");
-        assert!(result.is_err());
-        let message = result
-            .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
+            .validate_plain_listener("console", "127.0.0.1:9000")
+        {
+            Ok(listener) => bail!("expected production TLS rejection, got {listener:?}"),
+            Err(error) => error,
+        };
+        let message = err.to_string();
         assert!(message.contains("production_tls requires a TLS listener"));
+        Ok(())
     }
 
     #[test]
-    fn console_local_trusted_requires_loopback_listener() {
-        let parsed = toml::from_str::<NexusConfig>(
+    fn console_local_trusted_requires_loopback_listener() -> anyhow::Result<()> {
+        let cfg = toml::from_str::<NexusConfig>(
             r#"
 [console.transport_security]
 mode = "local_trusted"
 "#,
-        );
-        let cfg = match parsed {
-            Ok(cfg) => cfg,
-            Err(error) => {
-                assert!(false, "unexpected config parse error: {error}");
-                return;
-            }
-        };
+        )?;
 
-        let result = cfg
+        let err = match cfg
             .console
             .transport_security
-            .validate_plain_listener("console", "0.0.0.0:9000");
-        assert!(result.is_err());
-        let message = result
-            .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
+            .validate_plain_listener("console", "0.0.0.0:9000")
+        {
+            Ok(listener) => bail!("expected local trusted rejection, got {listener:?}"),
+            Err(error) => error,
+        };
+        let message = err.to_string();
         assert!(message.contains("local_trusted requires a loopback listen address"));
+        Ok(())
     }
 
     #[test]
-    fn config_file_accepts_explicit_console_unsafe_transport() {
+    fn config_file_accepts_explicit_console_unsafe_transport() -> anyhow::Result<()> {
         let cfg: NexusConfig = toml::from_str(
             r#"
 [console.transport_security]
 mode = "unsafe_plaintext"
 unsafe_relaxations = ["ignore_origin_port"]
 "#,
-        )
-        .unwrap();
+        )?;
 
         let transport = cfg
             .console
             .transport_security
-            .to_console_transport_security_config()
-            .unwrap();
+            .to_console_transport_security_config()?;
         assert_eq!(
             transport.mode,
             ConsoleTransportSecurityMode::UnsafePlaintext
         );
         assert!(transport.is_unsafe());
         assert!(transport.ignore_origin_port());
+        Ok(())
     }
 
     #[test]
-    fn config_file_rejects_unknown_bootstrap_fields() {
+    fn config_file_rejects_unknown_bootstrap_fields() -> anyhow::Result<()> {
         assert_config_rejects_unknown_field(
             r#"
 unknown_section = true
 "#,
             "unknown_section",
-        );
+        )?;
         assert_config_rejects_unknown_field(
             r#"
 [server]
 unknown_addr = "127.0.0.1:9100"
 "#,
             "unknown_addr",
-        );
+        )?;
         assert_config_rejects_unknown_field(
             r#"
 [console.ws]
 max_frame_bytez = 1024
 "#,
             "max_frame_bytez",
-        );
+        )?;
+        Ok(())
     }
 
     #[cfg(all(feature = "external-grpc", feature = "external-websocket"))]
     #[test]
-    fn example_config_uses_declared_fields() {
+    fn example_config_uses_declared_fields() -> anyhow::Result<()> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../nexus.toml.example");
-        let content = std::fs::read_to_string(&path).unwrap();
-        toml::from_str::<NexusConfig>(&content).unwrap();
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading example config {}", path.display()))?;
+        toml::from_str::<NexusConfig>(&content)
+            .with_context(|| format!("parsing example config {}", path.display()))?;
+        Ok(())
     }
 
     #[cfg(feature = "external-websocket")]
     #[test]
-    fn gateway_transport_security_defaults_to_loopback_only() {
+    fn gateway_transport_security_defaults_to_loopback_only() -> anyhow::Result<()> {
         let cfg = GatewayTransportSecurityTuning::default();
         let security = cfg
             .validate_plain_listener("external WebSocket gateway", "127.0.0.1:9200")
-            .unwrap();
+            .context("loopback listener should be accepted")?;
         assert_eq!(
             security.config.mode,
             GatewayTransportSecurityMode::LocalTrusted
         );
         assert_eq!(
             security.listen_addr,
-            "127.0.0.1:9200".parse::<SocketAddr>().unwrap()
+            "127.0.0.1:9200".parse::<SocketAddr>()?
         );
 
-        let err = cfg
-            .validate_plain_listener("external WebSocket gateway", "0.0.0.0:9200")
-            .unwrap_err();
+        let err = match cfg.validate_plain_listener("external WebSocket gateway", "0.0.0.0:9200") {
+            Ok(_security) => bail!("expected non-loopback listener rejection"),
+            Err(error) => error,
+        };
         assert!(err.to_string().contains("loopback"));
+        Ok(())
     }
 
     #[cfg(all(feature = "external-grpc", feature = "external-websocket"))]
     #[test]
-    fn config_file_accepts_external_gateway_listeners() {
+    fn config_file_accepts_external_gateway_listeners() -> anyhow::Result<()> {
         let cfg: NexusConfig = toml::from_str(
             r#"
 [server]
@@ -1504,8 +1525,7 @@ max_connections = 0
 [external_gateway.websocket.transport_security]
 mode = "local_trusted"
 "#,
-        )
-        .unwrap();
+        )?;
 
         assert_eq!(
             cfg.server.external_grpc_addr.as_deref(),
@@ -1538,9 +1558,12 @@ mode = "local_trusted"
                 .transport_security
                 .validate_grpc_listener(
                     "external gRPC gateway",
-                    cfg.server.external_grpc_addr.as_deref().unwrap(),
+                    cfg.server
+                        .external_grpc_addr
+                        .as_deref()
+                        .context("external_grpc_addr should be configured")?,
                 )
-                .unwrap();
+                .context("gRPC listener should be accepted")?;
             assert_eq!(
                 listener.config.mode,
                 GatewayTransportSecurityMode::LocalTrusted
@@ -1553,18 +1576,23 @@ mode = "local_trusted"
             .transport_security
             .validate_plain_listener(
                 "external WebSocket gateway",
-                cfg.server.external_websocket_addr.as_deref().unwrap(),
+                cfg.server
+                    .external_websocket_addr
+                    .as_deref()
+                    .context("external_websocket_addr should be configured")?,
             )
-            .unwrap();
+            .context("WebSocket listener should be accepted")?;
         assert_eq!(
             listener.config.mode,
             GatewayTransportSecurityMode::LocalTrusted
         );
+        Ok(())
     }
 
     #[cfg(feature = "external-websocket")]
     #[test]
-    fn config_file_accepts_external_gateway_trusted_proxy_transport_security() {
+    fn config_file_accepts_external_gateway_trusted_proxy_transport_security() -> anyhow::Result<()>
+    {
         let cfg: NexusConfig = toml::from_str(
             r#"
 [external_gateway.websocket.transport_security]
@@ -1572,91 +1600,100 @@ mode = "trusted_reverse_proxy"
 trusted_proxy_peers = ["127.0.0.1"]
 honor_x_forwarded_for = true
 "#,
-        )
-        .unwrap();
+        )?;
 
         let security = cfg
             .external_gateway
             .websocket
             .transport_security
             .validate_plain_listener("external WebSocket gateway", "0.0.0.0:9200")
-            .unwrap();
+            .context("trusted proxy listener should be accepted")?;
         assert_eq!(
             security.config.mode,
             GatewayTransportSecurityMode::TrustedReverseProxy
         );
         assert_eq!(
             security.config.trusted_proxy.peers,
-            vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
+            vec!["127.0.0.1".parse::<IpAddr>()?]
         );
+        Ok(())
     }
 
     #[cfg(feature = "external-websocket")]
     #[test]
-    fn external_gateway_plain_listener_trusted_proxy_requires_peer() {
+    fn external_gateway_plain_listener_trusted_proxy_requires_peer() -> anyhow::Result<()> {
         let cfg: NexusConfig = toml::from_str(
             r#"
 [external_gateway.websocket.transport_security]
 mode = "trusted_reverse_proxy"
 "#,
-        )
-        .unwrap();
+        )?;
 
-        let err = cfg
+        let err = match cfg
             .external_gateway
             .websocket
             .transport_security
             .validate_plain_listener("external WebSocket gateway", "0.0.0.0:9200")
-            .unwrap_err();
+        {
+            Ok(_security) => bail!("expected trusted proxy peer rejection"),
+            Err(error) => error,
+        };
         assert!(err.to_string().contains("trusted_proxy_peers"));
+        Ok(())
     }
 
     #[cfg(feature = "external-grpc")]
     #[test]
-    fn external_gateway_grpc_trusted_proxy_requires_peer() {
+    fn external_gateway_grpc_trusted_proxy_requires_peer() -> anyhow::Result<()> {
         let cfg: NexusConfig = toml::from_str(
             r#"
 [external_gateway.grpc.transport_security]
 mode = "trusted_reverse_proxy"
 "#,
-        )
-        .unwrap();
+        )?;
 
-        let err = cfg
+        let err = match cfg
             .external_gateway
             .grpc
             .transport_security
             .validate_grpc_listener("external gRPC gateway", "0.0.0.0:9444")
-            .unwrap_err();
+        {
+            Ok(_listener) => bail!("expected trusted proxy peer rejection"),
+            Err(error) => error,
+        };
         assert!(err.to_string().contains("trusted_proxy_peers"));
+        Ok(())
     }
 
     #[cfg(feature = "external-websocket")]
     #[test]
-    fn external_gateway_disabled_for_test_is_rejected_outside_tests() {
+    fn external_gateway_disabled_for_test_is_rejected_outside_tests() -> anyhow::Result<()> {
         let cfg: NexusConfig = toml::from_str(
             r#"
 [external_gateway.websocket.transport_security]
 mode = "disabled_for_test"
 "#,
-        )
-        .unwrap();
+        )?;
 
-        let err = cfg
+        let err = match cfg
             .external_gateway
             .websocket
             .transport_security
             .validate_plain_listener_inner("external WebSocket gateway", "127.0.0.1:9200", false)
-            .unwrap_err();
+        {
+            Ok(_security) => bail!("expected disabled_for_test rejection"),
+            Err(error) => error,
+        };
         assert!(err.to_string().contains("only valid in tests"));
+        Ok(())
     }
 
     #[cfg(feature = "external-websocket")]
     #[test]
-    fn external_gateway_plain_listener_tls_modes_fail_closed() {
-        let cert = temp_config_file("cert.pem", b"certificate");
-        let key = temp_config_file("key.pem", b"private-key");
-        let root = temp_config_file("client-ca.pem", b"client-ca");
+    fn external_gateway_plain_listener_tls_modes_fail_closed() -> anyhow::Result<()> {
+        let cert = temp_config_file("cert.pem", b"certificate")?;
+        let key = temp_config_file("key.pem", b"private-key")?;
+        let root = temp_config_file("client-ca.pem", b"client-ca")?;
         let cfg: NexusConfig = toml::from_str(&format!(
             r#"
 [external_gateway.websocket.transport_security]
@@ -1664,15 +1701,17 @@ mode = "production_tls"
 certificate_chain_path = "{cert}"
 private_key_path = "{key}"
 "#,
-        ))
-        .unwrap();
+        ))?;
 
-        let err = cfg
+        let err = match cfg
             .external_gateway
             .websocket
             .transport_security
             .validate_plain_listener("external WebSocket gateway", "127.0.0.1:9200")
-            .unwrap_err();
+        {
+            Ok(_security) => bail!("expected production TLS plain-listener rejection"),
+            Err(error) => error,
+        };
         assert!(err.to_string().contains("requires a TLS listener"));
 
         let cfg: NexusConfig = toml::from_str(&format!(
@@ -1683,39 +1722,44 @@ certificate_chain_path = "{cert}"
 private_key_path = "{key}"
 client_trust_roots = ["{root}"]
 "#,
-        ))
-        .unwrap();
+        ))?;
 
-        let err = cfg
+        let err = match cfg
             .external_gateway
             .websocket
             .transport_security
             .validate_plain_listener("external WebSocket gateway", "127.0.0.1:9200")
-            .unwrap_err();
+        {
+            Ok(_security) => bail!("expected mutual TLS plain-listener rejection"),
+            Err(error) => error,
+        };
         assert!(err.to_string().contains("requires a TLS listener"));
+        Ok(())
     }
 
     #[cfg(feature = "external-grpc")]
     #[test]
-    fn external_gateway_grpc_tls_modes_require_material() {
+    fn external_gateway_grpc_tls_modes_require_material() -> anyhow::Result<()> {
         let cfg: NexusConfig = toml::from_str(
             r#"
 [external_gateway.grpc.transport_security]
 mode = "production_tls"
 "#,
-        )
-        .unwrap();
+        )?;
 
-        let err = cfg
+        let err = match cfg
             .external_gateway
             .grpc
             .transport_security
             .validate_grpc_listener("external gRPC gateway", "127.0.0.1:9444")
-            .unwrap_err();
+        {
+            Ok(_listener) => bail!("expected certificate material rejection"),
+            Err(error) => error,
+        };
         assert!(err.to_string().contains("certificate_chain_path"));
 
-        let cert = temp_config_file("cert.pem", b"certificate");
-        let key = temp_config_file("key.pem", b"private-key");
+        let cert = temp_config_file("cert.pem", b"certificate")?;
+        let key = temp_config_file("key.pem", b"private-key")?;
         let cfg: NexusConfig = toml::from_str(&format!(
             r#"
 [external_gateway.grpc.transport_security]
@@ -1723,23 +1767,26 @@ mode = "mtls"
 certificate_chain_path = "{cert}"
 private_key_path = "{key}"
 "#,
-        ))
-        .unwrap();
+        ))?;
 
-        let err = cfg
+        let err = match cfg
             .external_gateway
             .grpc
             .transport_security
             .validate_grpc_listener("external gRPC gateway", "127.0.0.1:9444")
-            .unwrap_err();
+        {
+            Ok(_listener) => bail!("expected client trust roots rejection"),
+            Err(error) => error,
+        };
         assert!(err.to_string().contains("client_trust_roots"));
+        Ok(())
     }
 
     #[cfg(feature = "external-grpc")]
     #[test]
-    fn external_gateway_grpc_tls_modes_load_certificate_material() {
-        let cert = temp_config_file("cert.pem", b"certificate");
-        let key = temp_config_file("key.pem", b"private-key");
+    fn external_gateway_grpc_tls_modes_load_certificate_material() -> anyhow::Result<()> {
+        let cert = temp_config_file("cert.pem", b"certificate")?;
+        let key = temp_config_file("key.pem", b"private-key")?;
         let cfg: NexusConfig = toml::from_str(&format!(
             r#"
 [external_gateway.grpc.transport_security]
@@ -1747,28 +1794,28 @@ mode = "production_tls"
 certificate_chain_path = "{cert}"
 private_key_path = "{key}"
 "#
-        ))
-        .unwrap();
+        ))?;
 
         let listener = cfg
             .external_gateway
             .grpc
             .transport_security
             .validate_grpc_listener("external gRPC gateway", "127.0.0.1:9444")
-            .unwrap();
+            .context("production TLS listener should load certificate material")?;
         assert_eq!(
             listener.config.mode,
             GatewayTransportSecurityMode::ProductionTls
         );
         assert!(listener.tls.is_some());
+        Ok(())
     }
 
     #[cfg(feature = "external-grpc")]
     #[test]
-    fn external_gateway_grpc_mtls_requires_and_loads_client_roots() {
-        let cert = temp_config_file("cert.pem", b"certificate");
-        let key = temp_config_file("key.pem", b"private-key");
-        let root = temp_config_file("client-ca.pem", b"client-ca");
+    fn external_gateway_grpc_mtls_requires_and_loads_client_roots() -> anyhow::Result<()> {
+        let cert = temp_config_file("cert.pem", b"certificate")?;
+        let key = temp_config_file("key.pem", b"private-key")?;
+        let root = temp_config_file("client-ca.pem", b"client-ca")?;
         let cfg: NexusConfig = toml::from_str(&format!(
             r#"
 [external_gateway.grpc.transport_security]
@@ -1777,25 +1824,27 @@ certificate_chain_path = "{cert}"
 private_key_path = "{key}"
 client_trust_roots = ["{root}"]
 "#
-        ))
-        .unwrap();
+        ))?;
 
         let listener = cfg
             .external_gateway
             .grpc
             .transport_security
             .validate_grpc_listener("external gRPC gateway", "127.0.0.1:9444")
-            .unwrap();
+            .context("mutual TLS listener should load certificate material")?;
         assert_eq!(
             listener.config.mode,
             GatewayTransportSecurityMode::MutualTls
         );
-        let tls = listener.tls.unwrap();
+        let tls = listener
+            .tls
+            .context("mutual TLS material should be present")?;
         assert!(!tls.client_trust_roots_pem.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn config_file_accepts_console_auth_and_ws_tuning() {
+    fn config_file_accepts_console_auth_and_ws_tuning() -> anyhow::Result<()> {
         let cfg: NexusConfig = toml::from_str(
             r#"
 [console.auth]
@@ -1819,8 +1868,7 @@ max_fact_limit = 32
 max_trace_limit = 64
 event_send_timeout_ms = 250
 "#,
-        )
-        .unwrap();
+        )?;
 
         let auth: ConsoleAuthConfig = cfg.console.auth.into();
         assert_eq!(auth.session_ttl_ms, 120_000);
@@ -1831,11 +1879,12 @@ event_send_timeout_ms = 250
         assert_eq!(ws.max_connections_global, 8);
         assert_eq!(ws.idle_timeout, Duration::from_secs(60));
         assert_eq!(ws.event_send_timeout, Duration::from_millis(250));
+        Ok(())
     }
 
     #[cfg(feature = "external-websocket")]
     #[test]
-    fn external_gateway_websocket_transport_config_is_bounded() {
+    fn external_gateway_websocket_transport_config_is_bounded() -> anyhow::Result<()> {
         let cfg: NexusConfig = toml::from_str(
             r#"
 [external_gateway.websocket.transport]
@@ -1844,8 +1893,7 @@ first_frame_timeout_ms = 0
 idle_timeout_ms = 0
 max_connections = 0
 "#,
-        )
-        .unwrap();
+        )?;
 
         let ws: ExternalWebSocketConfig = cfg.external_gateway.websocket.transport.into();
         assert_eq!(ws, ExternalWebSocketConfig::default());
@@ -1858,8 +1906,7 @@ first_frame_timeout_ms = 999999999999
 idle_timeout_ms = 999999999999
 max_connections = 999999999999
 "#,
-        )
-        .unwrap();
+        )?;
         let ws: ExternalWebSocketConfig = cfg.external_gateway.websocket.transport.into();
         assert_eq!(
             ws.max_frame_bytes,
@@ -1877,11 +1924,12 @@ max_connections = 999999999999
             ws.max_connections,
             nexus_gateway_websocket::HARD_MAX_CONNECTIONS
         );
+        Ok(())
     }
 
     #[cfg(all(feature = "external-grpc", feature = "external-websocket"))]
     #[test]
-    fn external_gateway_limits_are_bounded() {
+    fn external_gateway_limits_are_bounded() -> anyhow::Result<()> {
         let cfg: NexusConfig = toml::from_str(
             r#"
 [external_gateway.grpc]
@@ -1902,8 +1950,7 @@ source_max_in_flight_commands = 999999999999
 source_command_rate_limit_window_ms = 999999999999
 source_command_rate_limit_max = 999999999999
 "#,
-        )
-        .unwrap();
+        )?;
 
         let grpc = cfg.external_gateway.grpc.bounded();
         assert_eq!(
@@ -1916,6 +1963,7 @@ source_command_rate_limit_max = 999999999999
             websocket.session_limits(),
             hard_external_gateway_session_limits()
         );
+        Ok(())
     }
 
     #[cfg(all(feature = "external-grpc", feature = "external-websocket"))]

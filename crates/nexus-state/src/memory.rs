@@ -89,12 +89,13 @@ impl InMemoryBackend {
 
     fn notify(&self, event: StateEvent) {
         let target = event.path().clone();
-        let subs = self.subs.lock();
-        for s in subs.iter() {
-            if target.matches(&s.pattern) {
-                let _ = s.sender.send(event.clone());
+        let mut subs = self.subs.lock();
+        subs.retain(|s| {
+            if !target.matches(&s.pattern) {
+                return true;
             }
-        }
+            s.sender.send(event.clone()).is_ok()
+        });
     }
 }
 
@@ -292,164 +293,171 @@ impl StateBackend for InMemoryBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, anyhow, bail, ensure};
     use nexus_types::Path;
 
-    fn p(s: &str) -> Path {
-        Path::parse(s).unwrap()
+    fn p(s: &str) -> anyhow::Result<Path> {
+        Path::parse(s).map_err(|error| anyhow!("path parse failed for {s}: {error}"))
     }
 
     #[tokio::test]
-    async fn set_and_read() {
+    async fn set_and_read() -> anyhow::Result<()> {
         let b = InMemoryBackend::new();
-        b.write_set(&p("state://x"), Value::Int(42)).await.unwrap();
-        let v = b.read(&p("state://x")).await.unwrap();
-        assert_eq!(v, Some(Value::Int(42)));
+        b.write_set(&p("state://x")?, Value::Int(42)).await?;
+        let v = b.read(&p("state://x")?).await?;
+        ensure!(v == Some(Value::Int(42)), "unexpected value: {v:?}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn append_creates_list_then_grows() {
+    async fn append_creates_list_then_grows() -> anyhow::Result<()> {
         let b = InMemoryBackend::new();
-        b.write_append(&p("state://log"), Value::Int(1))
-            .await
-            .unwrap();
-        b.write_append(&p("state://log"), Value::Int(2))
-            .await
-            .unwrap();
-        let v = b.read(&p("state://log")).await.unwrap().unwrap();
+        b.write_append(&p("state://log")?, Value::Int(1)).await?;
+        b.write_append(&p("state://log")?, Value::Int(2)).await?;
+        let v = b
+            .read(&p("state://log")?)
+            .await?
+            .context("missing log value")?;
         match v {
-            Value::List(xs) => assert_eq!(xs.len(), 2),
-            _ => panic!("expected list"),
+            Value::List(xs) => ensure!(xs.len() == 2, "unexpected list length: {}", xs.len()),
+            other => bail!("expected list, got {other:?}"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cas_succeeds_on_match() {
+    async fn cas_succeeds_on_match() -> anyhow::Result<()> {
         let b = InMemoryBackend::new();
-        b.write_set(&p("state://k"), Value::Int(1)).await.unwrap();
-        b.write_cas(&p("state://k"), Some(Value::Int(1)), Value::Int(2))
-            .await
-            .unwrap();
-        assert_eq!(b.read(&p("state://k")).await.unwrap(), Some(Value::Int(2)));
+        b.write_set(&p("state://k")?, Value::Int(1)).await?;
+        b.write_cas(&p("state://k")?, Some(Value::Int(1)), Value::Int(2))
+            .await?;
+        let value = b.read(&p("state://k")?).await?;
+        ensure!(value == Some(Value::Int(2)), "unexpected value: {value:?}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cas_fails_on_mismatch() {
+    async fn cas_fails_on_mismatch() -> anyhow::Result<()> {
         let b = InMemoryBackend::new();
-        b.write_set(&p("state://k"), Value::Int(1)).await.unwrap();
+        b.write_set(&p("state://k")?, Value::Int(1)).await?;
         let err = b
-            .write_cas(&p("state://k"), Some(Value::Int(99)), Value::Int(2))
+            .write_cas(&p("state://k")?, Some(Value::Int(99)), Value::Int(2))
             .await;
         match err {
             Err(StateError::CasFailed { .. }) => {}
-            other => panic!("expected CasFailed, got {:?}", other),
+            other => bail!("expected CasFailed, got {other:?}"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cas_creates_when_expected_none() {
+    async fn cas_creates_when_expected_none() -> anyhow::Result<()> {
         let b = InMemoryBackend::new();
-        b.write_cas(&p("state://k"), None, Value::Int(7))
-            .await
-            .unwrap();
-        assert_eq!(b.read(&p("state://k")).await.unwrap(), Some(Value::Int(7)));
+        b.write_cas(&p("state://k")?, None, Value::Int(7)).await?;
+        let value = b.read(&p("state://k")?).await?;
+        ensure!(value == Some(Value::Int(7)), "unexpected value: {value:?}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cas_can_match_explicit_null_value() {
+    async fn cas_can_match_explicit_null_value() -> anyhow::Result<()> {
         let b = InMemoryBackend::new();
-        b.write_set(&p("state://k"), Value::Null).await.unwrap();
-        b.write_cas(&p("state://k"), Some(Value::Null), Value::Int(9))
-            .await
-            .unwrap();
-        assert_eq!(b.read(&p("state://k")).await.unwrap(), Some(Value::Int(9)));
+        b.write_set(&p("state://k")?, Value::Null).await?;
+        b.write_cas(&p("state://k")?, Some(Value::Null), Value::Int(9))
+            .await?;
+        let value = b.read(&p("state://k")?).await?;
+        ensure!(value == Some(Value::Int(9)), "unexpected value: {value:?}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn cas_none_does_not_match_explicit_null_value() {
+    async fn cas_none_does_not_match_explicit_null_value() -> anyhow::Result<()> {
         let b = InMemoryBackend::new();
-        b.write_set(&p("state://k"), Value::Null).await.unwrap();
-        let err = b.write_cas(&p("state://k"), None, Value::Int(9)).await;
-        assert!(matches!(err, Err(StateError::CasFailed { .. })));
+        b.write_set(&p("state://k")?, Value::Null).await?;
+        let err = b.write_cas(&p("state://k")?, None, Value::Int(9)).await;
+        ensure!(
+            matches!(err, Err(StateError::CasFailed { .. })),
+            "expected CasFailed"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn delete_removes() {
+    async fn delete_removes() -> anyhow::Result<()> {
         let b = InMemoryBackend::new();
-        b.write_set(&p("state://k"), Value::Int(1)).await.unwrap();
-        b.write_delete(&p("state://k")).await.unwrap();
-        assert_eq!(b.read(&p("state://k")).await.unwrap(), None);
+        b.write_set(&p("state://k")?, Value::Int(1)).await?;
+        b.write_delete(&p("state://k")?).await?;
+        let value = b.read(&p("state://k")?).await?;
+        ensure!(value.is_none(), "expected deleted value, got {value:?}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn merge_missing_path_uses_incoming_value() {
+    async fn merge_missing_path_uses_incoming_value() -> anyhow::Result<()> {
         let b = InMemoryBackend::new();
-        b.write_merge(&p("state://k"), Value::Int(7), MergeRule::Shallow)
-            .await
-            .unwrap();
-        assert_eq!(b.read(&p("state://k")).await.unwrap(), Some(Value::Int(7)));
+        b.write_merge(&p("state://k")?, Value::Int(7), MergeRule::Shallow)
+            .await?;
+        let value = b.read(&p("state://k")?).await?;
+        ensure!(value == Some(Value::Int(7)), "unexpected value: {value:?}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn subscribe_receives_events() {
+    async fn subscribe_receives_events() -> anyhow::Result<()> {
         let b = InMemoryBackend::new();
-        let mut rx = b.subscribe(&p("state://watched/**")).await.unwrap();
-        b.write_set(&p("state://watched/a"), Value::Int(1))
-            .await
-            .unwrap();
+        let mut rx = b.subscribe(&p("state://watched/**")?).await?;
+        b.write_set(&p("state://watched/a")?, Value::Int(1)).await?;
         let ev = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
             .await
-            .unwrap()
-            .unwrap();
+            .map_err(|error| anyhow!("timed out waiting for event: {error}"))?
+            .map_err(|error| anyhow!("event receive failed: {error}"))?;
         match ev {
-            StateEvent::Set { path, .. } => assert_eq!(path.to_string(), "state://watched/a"),
-            _ => panic!("wrong event"),
+            StateEvent::Set { path, .. } => ensure!(
+                path.to_string() == "state://watched/a",
+                "unexpected path: {path}"
+            ),
+            other => bail!("wrong event: {other:?}"),
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn subscribe_filters_by_pattern() {
+    async fn subscribe_filters_by_pattern() -> anyhow::Result<()> {
         let b = InMemoryBackend::new();
-        let mut rx = b.subscribe(&p("state://watched/specific")).await.unwrap();
-        b.write_set(&p("state://watched/other"), Value::Int(1))
-            .await
-            .unwrap();
+        let mut rx = b.subscribe(&p("state://watched/specific")?).await?;
+        b.write_set(&p("state://watched/other")?, Value::Int(1))
+            .await?;
         let res = tokio::time::timeout(std::time::Duration::from_millis(20), rx.recv()).await;
-        assert!(res.is_err()); // nothing should arrive
+        ensure!(res.is_err(), "unexpected event: {res:?}");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn read_prefix_returns_sorted_matching_entries_only() {
+    async fn read_prefix_returns_sorted_matching_entries_only() -> anyhow::Result<()> {
         let b = InMemoryBackend::new();
-        b.write_set(&p("state://memory/b"), Value::Int(2))
-            .await
-            .unwrap();
-        b.write_set(&p("state://memory/a"), Value::Int(1))
-            .await
-            .unwrap();
-        b.write_set(&p("state://other/z"), Value::Int(99))
-            .await
-            .unwrap();
+        b.write_set(&p("state://memory/b")?, Value::Int(2)).await?;
+        b.write_set(&p("state://memory/a")?, Value::Int(1)).await?;
+        b.write_set(&p("state://other/z")?, Value::Int(99)).await?;
 
-        let rows = b.read_prefix(&p("state://memory")).await.unwrap();
+        let rows = b.read_prefix(&p("state://memory")?).await?;
         let paths: Vec<String> = rows.into_iter().map(|(path, _)| path.to_string()).collect();
-        assert_eq!(paths, vec!["state://memory/a", "state://memory/b"]);
+        ensure!(
+            paths == vec!["state://memory/a", "state://memory/b"],
+            "unexpected paths: {paths:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn read_range_includes_direct_and_descendant_paths() {
+    async fn read_range_includes_direct_and_descendant_paths() -> anyhow::Result<()> {
         let b = InMemoryBackend::new();
-        let prefix = p("state://memory");
-        b.write_set(&p("state://memory"), Value::Int(1))
-            .await
-            .unwrap();
-        b.write_set(&p("state://memory/alice"), Value::Int(2))
-            .await
-            .unwrap();
-        b.write_set(&p("state://other"), Value::Int(3))
-            .await
-            .unwrap();
+        let prefix = p("state://memory")?;
+        b.write_set(&p("state://memory")?, Value::Int(1)).await?;
+        b.write_set(&p("state://memory/alice")?, Value::Int(2))
+            .await?;
+        b.write_set(&p("state://other")?, Value::Int(3)).await?;
 
-        let entries = b.read_range(&prefix, 0, i64::MAX).await.unwrap();
+        let entries = b.read_range(&prefix, 0, i64::MAX).await?;
         let event_paths: Vec<String> = entries
             .into_iter()
             .map(|entry| match entry.event {
@@ -458,37 +466,55 @@ mod tests {
                 StateEvent::Delete { path } => path.to_string(),
             })
             .collect();
-        assert_eq!(event_paths, vec!["state://memory", "state://memory/alice"]);
-    }
-
-    #[tokio::test]
-    async fn read_at_reconstructs_list_before_delete() {
-        let b = InMemoryBackend::new();
-        let path = p("state://log");
-        b.write_append(&path, Value::Int(1)).await.unwrap();
-        let after_first = b.history.lock()[0].at_millis;
-        b.write_append(&path, Value::Int(2)).await.unwrap();
-        let before_delete = b.history.lock()[1].at_millis;
-        b.write_delete(&path).await.unwrap();
-
-        let before_value = b.read_at(&path, after_first).await.unwrap();
-        let mid_value = b.read_at(&path, before_delete).await.unwrap();
-        let current = b.read(&path).await.unwrap();
-
-        assert_eq!(before_value, Some(Value::List(vec![Value::Int(1)])));
-        assert_eq!(
-            mid_value,
-            Some(Value::List(vec![Value::Int(1), Value::Int(2)]))
+        ensure!(
+            event_paths == vec!["state://memory", "state://memory/alice"],
+            "unexpected paths: {event_paths:?}"
         );
-        assert_eq!(current, None);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn history_timestamps_are_strictly_increasing() {
+    async fn read_at_reconstructs_list_before_delete() -> anyhow::Result<()> {
         let b = InMemoryBackend::new();
-        b.write_set(&p("state://x"), Value::Int(1)).await.unwrap();
-        b.write_set(&p("state://x"), Value::Int(2)).await.unwrap();
-        b.write_delete(&p("state://x")).await.unwrap();
+        let path = p("state://log")?;
+        b.write_append(&path, Value::Int(1)).await?;
+        let after_first = b
+            .history
+            .lock()
+            .first()
+            .context("missing first history entry")?
+            .at_millis;
+        b.write_append(&path, Value::Int(2)).await?;
+        let before_delete = b
+            .history
+            .lock()
+            .get(1)
+            .context("missing second history entry")?
+            .at_millis;
+        b.write_delete(&path).await?;
+
+        let before_value = b.read_at(&path, after_first).await?;
+        let mid_value = b.read_at(&path, before_delete).await?;
+        let current = b.read(&path).await?;
+
+        ensure!(
+            before_value == Some(Value::List(vec![Value::Int(1)])),
+            "unexpected first historical value: {before_value:?}"
+        );
+        ensure!(
+            mid_value == Some(Value::List(vec![Value::Int(1), Value::Int(2)])),
+            "unexpected second historical value: {mid_value:?}"
+        );
+        ensure!(current.is_none(), "unexpected current value: {current:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_timestamps_are_strictly_increasing() -> anyhow::Result<()> {
+        let b = InMemoryBackend::new();
+        b.write_set(&p("state://x")?, Value::Int(1)).await?;
+        b.write_set(&p("state://x")?, Value::Int(2)).await?;
+        b.write_delete(&p("state://x")?).await?;
 
         let times: Vec<i64> = b
             .history
@@ -496,8 +522,13 @@ mod tests {
             .iter()
             .map(|entry| entry.at_millis)
             .collect();
-        assert_eq!(times.len(), 3);
-        assert!(times[0] < times[1]);
-        assert!(times[1] < times[2]);
+        match times.as_slice() {
+            [first, second, third] => {
+                ensure!(first < second, "first timestamp order violated: {times:?}");
+                ensure!(second < third, "second timestamp order violated: {times:?}");
+            }
+            other => bail!("expected 3 timestamps, got {other:?}"),
+        }
+        Ok(())
     }
 }

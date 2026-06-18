@@ -17,13 +17,20 @@ use crate::protocol::{
     ACTION_CHANGE_SET_CREATE, ACTION_CHANGE_SET_DIFF, ACTION_CHANGE_SET_DISCARD,
     ACTION_CHANGE_SET_DRY_RUN, ACTION_CHANGE_SET_UPDATE, ACTION_CHANGE_SET_VALIDATE,
     ACTION_CONFIG_LIST, ACTION_CONFIG_READ, ACTION_CONFIG_WRITE_CAS,
-    ACTION_EXTERNAL_INSTALLATION_INSTALL, ACTION_EXTERNAL_INSTALLATION_REVOKE,
+    ACTION_EXTERNAL_INSTALLATION_INSTALL, ACTION_EXTERNAL_INSTALLATION_LIST,
+    ACTION_EXTERNAL_INSTALLATION_READ, ACTION_EXTERNAL_INSTALLATION_REVOKE,
     ACTION_EXTERNAL_INSTALLATION_START, ACTION_EXTERNAL_INSTALLATION_STOP,
-    ACTION_EXTERNAL_INSTALLATION_UPDATE, ACTION_GRAPH_TYPE_DESCRIBE, ACTION_HEALTH_SUMMARY,
-    ACTION_LINEAGE_FACT_BY_OPERATION, ACTION_LINEAGE_FACT_READ, ACTION_LINEAGE_TRACE_READ,
+    ACTION_EXTERNAL_INSTALLATION_UPDATE, ACTION_EXTERNAL_MANIFEST_LIST,
+    ACTION_EXTERNAL_MANIFEST_READ, ACTION_EXTERNAL_MANIFEST_WRITE_CAS, ACTION_HEALTH_SUMMARY,
+    ACTION_INFERENCE_BACKEND_LIST, ACTION_INFERENCE_BACKEND_READ,
+    ACTION_INFERENCE_BACKEND_WRITE_CAS, ACTION_INFERENCE_GROUP_LIST, ACTION_INFERENCE_GROUP_READ,
+    ACTION_INFERENCE_GROUP_WRITE_CAS, ACTION_INFERENCE_MODEL_LIST, ACTION_INFERENCE_MODEL_READ,
+    ACTION_INFERENCE_MODEL_WRITE_CAS, ACTION_INFERENCE_ROUTING_READ,
+    ACTION_INFERENCE_ROUTING_WRITE_CAS, ACTION_LINEAGE_FACT_READ, ACTION_LINEAGE_TRACE_READ,
     ACTION_PAIRING_APPROVE, ACTION_PAIRING_CREATE, ACTION_PAIRING_DENY, ACTION_PAIRING_REPLACE,
-    ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET, ACTION_PROTOCOL_DESCRIBE,
-    ACTION_PROTOCOL_REGISTRY_SNAPSHOT, ACTION_PROTOCOL_SCHEMA_GET, ACTION_REGISTRY_COVERAGE_REPORT,
+    ACTION_PROJECTION_IN_PROCESS_LIST, ACTION_PROJECTION_IN_PROCESS_READ,
+    ACTION_PROJECTION_IN_PROCESS_WRITE_CAS, ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET,
+    ACTION_PROTOCOL_DESCRIBE, ACTION_PROTOCOL_REGISTRY_SNAPSHOT, ACTION_REGISTRY_COVERAGE_REPORT,
     ACTION_RESOURCE_TYPE_DESCRIBE, ACTION_RESOURCE_TYPE_LIST, ACTION_RESOURCE_VIEW_DESCRIBE,
     ACTION_RUNTIME_PROCESS_INSPECT, ACTION_SECRET_CATALOG, ACTION_SECRET_REVEAL,
     ACTION_STATE_SNAPSHOT, ACTION_VISIBILITY_AUTHORITY_DESCRIBE, ACTION_VISIBILITY_STATE_LIST,
@@ -39,7 +46,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use nexus_graph::{DoNode, OperationTemplate};
 use nexus_kernel::RequestGrantTemplate;
 use nexus_state::StateEvent;
@@ -49,6 +56,7 @@ use nexus_types::{
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,7 +66,7 @@ const MAX_VISIBILITY_TTL_MS: u64 = 10 * 60 * 1000;
 
 /// Upgrade an authenticated HTTP request path to the Console Protocol
 /// WebSocket endpoint.
-pub async fn upgrade(
+pub(crate) async fn upgrade(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -103,6 +111,12 @@ struct WsSession {
 
 struct SubscriptionHandle {
     shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+fn shutdown_subscription(handle: SubscriptionHandle) {
+    if handle.shutdown.send(()).is_err() {
+        tracing::debug!("console subscription shutdown receiver was already closed");
+    }
 }
 
 struct SubscriptionMessage {
@@ -180,7 +194,8 @@ async fn session(socket: WebSocket, state: Arc<ConsoleState>, source_addr: Strin
                     break;
                 };
                 let close_after = should_close_after_reply(&sess, &reply);
-                if send(&mut tx, reply).await.is_err() {
+                if let Err(error) = send(&mut tx, reply).await {
+                    record_ws_send_error(&sess, &error);
                     break;
                 }
                 if close_after {
@@ -197,11 +212,13 @@ async fn session(socket: WebSocket, state: Arc<ConsoleState>, source_addr: Strin
                     }
                     Err(e) => {
                         record_ws_audit(&sess.state, sess.principal.as_ref(), Some(&sess.source_addr), "invalid_session");
-                        let _ = send(&mut tx, auth_error_frame(None, e)).await;
+                        if let Err(error) = send(&mut tx, auth_error_frame(None, e)).await {
+                            record_ws_send_error(&sess, &error);
+                        }
                         break;
                     }
                 }
-                if send_with_timeout(
+                if let Err(error) = send_with_timeout(
                     &mut tx,
                     ServerFrame::Event {
                         stream: msg.stream,
@@ -210,8 +227,8 @@ async fn session(socket: WebSocket, state: Arc<ConsoleState>, source_addr: Strin
                     sess.state.ws.config().event_send_timeout,
                 )
                 .await
-                .is_err()
                 {
+                    record_ws_send_error(&sess, &error);
                     record_ws_audit(&sess.state, sess.principal.as_ref(), Some(&sess.source_addr), "backpressure_close");
                     break;
                 }
@@ -220,7 +237,7 @@ async fn session(socket: WebSocket, state: Arc<ConsoleState>, source_addr: Strin
     }
 
     for (_, handle) in std::mem::take(&mut sess.subscriptions) {
-        let _ = handle.shutdown.send(());
+        shutdown_subscription(handle);
     }
 }
 
@@ -479,7 +496,7 @@ async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
                 return frame;
             }
             if let Some(handle) = sess.subscriptions.remove(&id) {
-                let _ = handle.shutdown.send(());
+                shutdown_subscription(handle);
             }
             ServerFrame::Reply {
                 id,
@@ -538,7 +555,7 @@ async fn dispatch_call(
         ACTION_PROTOCOL_DESCRIBE | ACTION_PROTOCOL_REGISTRY_SNAPSHOT => {
             protocol::protocol_metadata_to_value(protocol_metadata(sess))
         }
-        ACTION_PROTOCOL_SCHEMA_GET | ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET => {
+        ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET => {
             let mut input = input_map(input_value(&call.input)?)?;
             let action_id = string_arg(&mut input, "action")?;
             protocol::descriptor_value(&action_id).ok_or_else(|| {
@@ -561,13 +578,6 @@ async fn dispatch_call(
             let view = string_arg(&mut input, "view")?;
             protocol::resource_view_descriptor_value(&view)
                 .ok_or_else(|| ConsoleError::BadRequest(format!("unknown resource view: {view}")))?
-        }
-        ACTION_GRAPH_TYPE_DESCRIBE => {
-            let mut input = input_map(input_value(&call.input)?)?;
-            let graph_type = string_arg(&mut input, "graph_type")?;
-            protocol::graph_type_descriptor_value(&graph_type).ok_or_else(|| {
-                ConsoleError::BadRequest(format!("unknown graph type: {graph_type}"))
-            })?
         }
         ACTION_CHANGE_SET_CREATE
         | ACTION_CHANGE_SET_UPDATE
@@ -665,13 +675,13 @@ async fn dispatch_call(
         ACTION_CONFIG_READ => {
             let mut input = input_map(input_value(&call.input)?)?;
             let path = string_arg(&mut input, "path")?;
-            let value = mgmt::inspect(&sess.state, principal, &path).await?;
+            let value = mgmt::inspect_config(&sess.state, principal, &path).await?;
             value.unwrap_or(Value::Null)
         }
         ACTION_CONFIG_LIST => {
             let mut input = input_map(input_value(&call.input)?)?;
             let prefix = string_arg(&mut input, "prefix")?;
-            let entries = mgmt::inspect_prefix(&sess.state, principal, &prefix).await?;
+            let entries = mgmt::inspect_config_prefix(&sess.state, principal, &prefix).await?;
             entries_value(entries)
         }
         ACTION_CONFIG_WRITE_CAS => {
@@ -680,7 +690,6 @@ async fn dispatch_call(
             let value = value_arg(&mut input, "value")?;
             let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_config_write_safety(principal, &path)?;
-            validate_config_write_value_for_path(&path, &value)?;
             mgmt::write_config(&sess.state, principal, &path, value, expected_version).await?;
             return Ok(ActionResult::empty(server_rev(sess)));
         }
@@ -709,7 +718,7 @@ async fn dispatch_call(
             let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
             auth::validate_username(&username)?;
-            mgmt::write_config(
+            mgmt::write_dedicated_config(
                 &sess.state,
                 principal,
                 &format!("state://kernel/console/users/{username}"),
@@ -739,7 +748,8 @@ async fn dispatch_call(
                     ));
                 }
             }
-            mgmt::write_config(&sess.state, principal, &path, value, expected_version).await?;
+            mgmt::write_dedicated_config(&sess.state, principal, &path, value, expected_version)
+                .await?;
             return Ok(ActionResult::empty(server_rev(sess)));
         }
         ACTION_ACCESS_ROLE_READ => {
@@ -767,7 +777,7 @@ async fn dispatch_call(
             let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
             auth::validate_username(&role)?;
-            mgmt::write_config(
+            mgmt::write_dedicated_config(
                 &sess.state,
                 principal,
                 &format!("state://kernel/console/roles/{role}"),
@@ -917,7 +927,7 @@ async fn dispatch_call(
             )
             .await?
         }
-        ACTION_LINEAGE_FACT_READ | ACTION_LINEAGE_FACT_BY_OPERATION => {
+        ACTION_LINEAGE_FACT_READ => {
             require_visibility_access(principal, &call)?;
             let mut input = input_map(input_value(&call.input)?)?;
             let op_id = parse_operation_id(&string_arg(&mut input, "op_id")?)?;
@@ -931,6 +941,27 @@ async fn dispatch_call(
             lineage_fact_read(sess, principal, op_id).await?
         }
         ACTION_HEALTH_SUMMARY => health_summary(sess, principal).await?,
+        ACTION_EXTERNAL_INSTALLATION_LIST => {
+            let entries = mgmt::inspect_prefix(
+                &sess.state,
+                principal,
+                "state://kernel/external-installations",
+            )
+            .await?;
+            entries_value(entries)
+        }
+        ACTION_EXTERNAL_INSTALLATION_READ => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let id = string_arg(&mut input, "id")?;
+            validate_path_segment(&id, "external installation id")?;
+            let value = mgmt::inspect(
+                &sess.state,
+                principal,
+                &format!("state://kernel/external-installations/{id}"),
+            )
+            .await?;
+            value.unwrap_or(Value::Null)
+        }
         ACTION_EXTERNAL_INSTALLATION_INSTALL | ACTION_EXTERNAL_INSTALLATION_UPDATE => {
             let mut input = input_map(input_value(&call.input)?)?;
             let id = string_arg(&mut input, "id")?;
@@ -938,8 +969,8 @@ async fn dispatch_call(
             let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
             validate_path_segment(&id, "external installation id")?;
-            validate_extension_installation_def(&id, &def)?;
-            mgmt::write_config(
+            validate_external_installation_def(&id, &def)?;
+            mgmt::write_dedicated_config(
                 &sess.state,
                 principal,
                 &format!("state://kernel/external-installations/{id}"),
@@ -964,12 +995,12 @@ async fn dispatch_call(
             let mut input = input_map(input_value(&call.input)?)?;
             let id = string_arg(&mut input, "id")?;
             require_step_up(principal)?;
-            validate_path_segment(&id, "external installation id")?;
+            let installation = read_external_installation(sess, principal, &id).await?;
             invoke_effect(
                 sess,
                 principal,
                 "effect://proc/kill",
-                map_value([("id", Value::Str(id))]),
+                map_value([("id", Value::Str(installation.id))]),
             )
             .await?
         }
@@ -979,13 +1010,216 @@ async fn dispatch_call(
             let credential_generation_floor =
                 optional_i64_arg(&mut input, "credential_generation_floor")?;
             require_step_up(principal)?;
-            validate_path_segment(&installation_id, "external installation id")?;
+            if matches!(credential_generation_floor, Some(floor) if floor < 1) {
+                return Err(ConsoleError::BadRequest(
+                    "credential_generation_floor must be at least 1".into(),
+                ));
+            }
+            let installation =
+                read_external_installation(sess, principal, &installation_id).await?;
             let mut m = BTreeMap::new();
-            m.insert("installation_id".into(), Value::Str(installation_id));
+            m.insert("installation_id".into(), Value::Str(installation.id));
             if let Some(floor) = credential_generation_floor {
                 m.insert("credential_generation_floor".into(), Value::Int(floor));
             }
             invoke_effect(sess, principal, "effect://external/revoke", Value::Map(m)).await?
+        }
+        ACTION_EXTERNAL_MANIFEST_LIST => {
+            let entries =
+                mgmt::inspect_prefix(&sess.state, principal, "state://kernel/manifests").await?;
+            entries_value(entries)
+        }
+        ACTION_EXTERNAL_MANIFEST_READ => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let platform = string_arg(&mut input, "platform")?;
+            validate_path_segment(&platform, "external manifest platform")?;
+            let value = mgmt::inspect(
+                &sess.state,
+                principal,
+                &format!("state://kernel/manifests/{platform}"),
+            )
+            .await?;
+            value.unwrap_or(Value::Null)
+        }
+        ACTION_EXTERNAL_MANIFEST_WRITE_CAS => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let platform = string_arg(&mut input, "platform")?;
+            let def = value_arg(&mut input, "def")?;
+            let expected_version = optional_u64_arg(&mut input, "expected_version")?;
+            require_step_up(principal)?;
+            validate_path_segment(&platform, "external manifest platform")?;
+            mgmt::write_dedicated_config(
+                &sess.state,
+                principal,
+                &format!("state://kernel/manifests/{platform}"),
+                def,
+                expected_version,
+            )
+            .await?;
+            return Ok(ActionResult::empty(server_rev(sess)));
+        }
+        ACTION_PROJECTION_IN_PROCESS_LIST => {
+            let entries = mgmt::inspect_prefix(
+                &sess.state,
+                principal,
+                "state://kernel/projections/in-process",
+            )
+            .await?;
+            entries_value(entries)
+        }
+        ACTION_PROJECTION_IN_PROCESS_READ => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let id = string_arg(&mut input, "id")?;
+            validate_path_segment(&id, "in-process projection id")?;
+            let value = mgmt::inspect(
+                &sess.state,
+                principal,
+                &format!("state://kernel/projections/in-process/{id}"),
+            )
+            .await?;
+            value.unwrap_or(Value::Null)
+        }
+        ACTION_PROJECTION_IN_PROCESS_WRITE_CAS => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let id = string_arg(&mut input, "id")?;
+            let def = value_arg(&mut input, "def")?;
+            let expected_version = optional_u64_arg(&mut input, "expected_version")?;
+            require_step_up(principal)?;
+            validate_path_segment(&id, "in-process projection id")?;
+            mgmt::write_dedicated_config(
+                &sess.state,
+                principal,
+                &format!("state://kernel/projections/in-process/{id}"),
+                def,
+                expected_version,
+            )
+            .await?;
+            return Ok(ActionResult::empty(server_rev(sess)));
+        }
+        ACTION_INFERENCE_BACKEND_LIST => {
+            let entries =
+                mgmt::inspect_prefix(&sess.state, principal, "state://kernel/inference/backends")
+                    .await?;
+            entries_value(entries)
+        }
+        ACTION_INFERENCE_BACKEND_READ => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let id = string_arg(&mut input, "id")?;
+            validate_path_segment(&id, "inference backend id")?;
+            let value = mgmt::inspect(
+                &sess.state,
+                principal,
+                &format!("state://kernel/inference/backends/{id}"),
+            )
+            .await?;
+            value.unwrap_or(Value::Null)
+        }
+        ACTION_INFERENCE_BACKEND_WRITE_CAS => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let id = string_arg(&mut input, "id")?;
+            let def = value_arg(&mut input, "def")?;
+            let expected_version = optional_u64_arg(&mut input, "expected_version")?;
+            require_step_up(principal)?;
+            validate_path_segment(&id, "inference backend id")?;
+            mgmt::write_dedicated_config(
+                &sess.state,
+                principal,
+                &format!("state://kernel/inference/backends/{id}"),
+                def,
+                expected_version,
+            )
+            .await?;
+            return Ok(ActionResult::empty(server_rev(sess)));
+        }
+        ACTION_INFERENCE_MODEL_LIST => {
+            let entries =
+                mgmt::inspect_prefix(&sess.state, principal, "state://kernel/inference/models")
+                    .await?;
+            entries_value(entries)
+        }
+        ACTION_INFERENCE_MODEL_READ => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let id = string_arg(&mut input, "id")?;
+            validate_path_segment(&id, "inference model id")?;
+            let value = mgmt::inspect(
+                &sess.state,
+                principal,
+                &format!("state://kernel/inference/models/{id}"),
+            )
+            .await?;
+            value.unwrap_or(Value::Null)
+        }
+        ACTION_INFERENCE_MODEL_WRITE_CAS => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let id = string_arg(&mut input, "id")?;
+            let def = value_arg(&mut input, "def")?;
+            let expected_version = optional_u64_arg(&mut input, "expected_version")?;
+            require_step_up(principal)?;
+            validate_path_segment(&id, "inference model id")?;
+            mgmt::write_dedicated_config(
+                &sess.state,
+                principal,
+                &format!("state://kernel/inference/models/{id}"),
+                def,
+                expected_version,
+            )
+            .await?;
+            return Ok(ActionResult::empty(server_rev(sess)));
+        }
+        ACTION_INFERENCE_GROUP_LIST => {
+            let entries =
+                mgmt::inspect_prefix(&sess.state, principal, "state://kernel/inference/groups")
+                    .await?;
+            entries_value(entries)
+        }
+        ACTION_INFERENCE_GROUP_READ => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let name = string_arg(&mut input, "name")?;
+            validate_path_segment(&name, "inference group name")?;
+            let value = mgmt::inspect(
+                &sess.state,
+                principal,
+                &format!("state://kernel/inference/groups/{name}"),
+            )
+            .await?;
+            value.unwrap_or(Value::Null)
+        }
+        ACTION_INFERENCE_GROUP_WRITE_CAS => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let name = string_arg(&mut input, "name")?;
+            let def = value_arg(&mut input, "def")?;
+            let expected_version = optional_u64_arg(&mut input, "expected_version")?;
+            require_step_up(principal)?;
+            validate_path_segment(&name, "inference group name")?;
+            mgmt::write_dedicated_config(
+                &sess.state,
+                principal,
+                &format!("state://kernel/inference/groups/{name}"),
+                def,
+                expected_version,
+            )
+            .await?;
+            return Ok(ActionResult::empty(server_rev(sess)));
+        }
+        ACTION_INFERENCE_ROUTING_READ => {
+            let value =
+                mgmt::inspect(&sess.state, principal, "state://kernel/routing/inference").await?;
+            value.unwrap_or(Value::Null)
+        }
+        ACTION_INFERENCE_ROUTING_WRITE_CAS => {
+            let mut input = input_map(input_value(&call.input)?)?;
+            let def = value_arg(&mut input, "def")?;
+            let expected_version = optional_u64_arg(&mut input, "expected_version")?;
+            require_step_up(principal)?;
+            mgmt::write_dedicated_config(
+                &sess.state,
+                principal,
+                "state://kernel/routing/inference",
+                def,
+                expected_version,
+            )
+            .await?;
+            return Ok(ActionResult::empty(server_rev(sess)));
         }
         ACTION_PAIRING_CREATE => {
             let mut input_map = input_map(input_value(&call.input)?)?;
@@ -1056,7 +1290,7 @@ async fn dispatch_call(
             )));
         }
     };
-    Ok(ActionResult::value(out, server_rev(sess)))
+    ActionResult::value(out, server_rev(sess)).map_err(value_envelope_error)
 }
 
 async fn subscribe(
@@ -1099,7 +1333,7 @@ async fn subscribe(
             let event_tx = sess.event_tx.clone();
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
             if let Some(handle) = sess.subscriptions.remove(&id) {
-                let _ = handle.shutdown.send(());
+                shutdown_subscription(handle);
             }
             tokio::spawn(async move {
                 loop {
@@ -1107,7 +1341,18 @@ async fn subscribe(
                         _ = &mut shutdown_rx => break,
                         ev = rx.recv() => {
                             let Ok(ev) = ev else { break };
-                            let event = state_event(ev);
+                            let event = match state_event(ev) {
+                                Ok(event) => event,
+                                Err(e) => {
+                                    send_subscription_closed(
+                                        &event_tx,
+                                        id,
+                                        format!("state event serialization failed: {e}"),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                            };
                             if event_tx.send(SubscriptionMessage { stream: id, event }).await.is_err() {
                                 break;
                             }
@@ -1142,7 +1387,7 @@ async fn subscribe(
             let state = sess.state.clone();
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
             if let Some(handle) = sess.subscriptions.remove(&id) {
-                let _ = handle.shutdown.send(());
+                shutdown_subscription(handle);
             }
             tokio::spawn(async move {
                 let mut seen = 0usize;
@@ -1154,25 +1399,30 @@ async fn subscribe(
                             let facts = match state.boot.kernel.facts.all_facts() {
                                 Ok(facts) => facts,
                                 Err(e) => {
-                                    let _ = event_tx
-                                        .send(SubscriptionMessage {
-                                            stream: id,
-                                            event: ConsoleEvent::SubscriptionClosed {
-                                                reason: e.to_string(),
-                                            },
-                                        })
-                                        .await;
+                                    send_subscription_closed(&event_tx, id, e.to_string()).await;
                                     break;
                                 }
                             };
                             for fact in facts.iter().skip(seen).filter(|fact| {
                                 process.is_none_or(|pid| fact.caller.get() == pid)
                             }) {
+                                let fact = match JsonBytes::try_from_value(&fact_value(fact.clone())) {
+                                    Ok(fact) => fact,
+                                    Err(e) => {
+                                        send_subscription_closed(
+                                            &event_tx,
+                                            id,
+                                            format!("audit fact serialization failed: {e}"),
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                };
                                 if event_tx
                                     .send(SubscriptionMessage {
                                         stream: id,
                                         event: ConsoleEvent::Audit {
-                                            fact: JsonBytes::from_value(&fact_value(fact.clone())),
+                                            fact,
                                         },
                                     })
                                     .await
@@ -1838,6 +2088,15 @@ async fn proc_spec_from_installation(
     principal: &ConsolePrincipal,
     id: &str,
 ) -> Result<ProcSpec, ConsoleError> {
+    let def = read_external_installation(sess, principal, id).await?;
+    Ok(proc_spec_from_transport(def.id, def.transport))
+}
+
+async fn read_external_installation(
+    sess: &WsSession,
+    principal: &ConsolePrincipal,
+    id: &str,
+) -> Result<ExternalInstallationDef, ConsoleError> {
     validate_path_segment(id, "external installation id")?;
     let installation_path = format!("state://kernel/external-installations/{id}");
     let value = mgmt::inspect(&sess.state, principal, &installation_path)
@@ -1857,7 +2116,7 @@ async fn proc_spec_from_installation(
     def.validate_admission().map_err(|e| {
         ConsoleError::BadRequest(format!("ExternalInstallationDef admission failed: {e}"))
     })?;
-    Ok(proc_spec_from_transport(def.id, def.transport))
+    Ok(def)
 }
 
 fn proc_spec_from_transport(id: String, transport: Transport) -> ProcSpec {
@@ -1955,21 +2214,69 @@ fn u64_to_i64_saturating(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-async fn send<S>(tx: &mut S, frame: ServerFrame) -> Result<(), ()>
-where
-    S: SinkExt<Message> + Unpin,
-{
-    let bytes = encode_frame(&frame).map_err(|_| ())?;
-    tx.send(Message::Binary(bytes.into())).await.map_err(|_| ())
+#[derive(Debug)]
+enum WsSendError {
+    Encode(rmp_serde::encode::Error),
+    Transport(String),
+    Timeout,
 }
 
-async fn send_with_timeout<S>(tx: &mut S, frame: ServerFrame, timeout: Duration) -> Result<(), ()>
+impl fmt::Display for WsSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Encode(error) => write!(f, "frame encoding failed: {error}"),
+            Self::Transport(error) => write!(f, "transport send failed: {error}"),
+            Self::Timeout => f.write_str("transport send timed out"),
+        }
+    }
+}
+
+fn record_ws_send_error(sess: &WsSession, error: &WsSendError) {
+    let username = sess.principal.as_ref().map(|p| p.username.as_str());
+    match error {
+        WsSendError::Transport(message) => {
+            tracing::debug!(
+                %message,
+                username = username.unwrap_or("<anonymous>"),
+                source_addr = sess.source_addr.as_str(),
+                "console WebSocket transport send failed"
+            );
+        }
+        WsSendError::Encode(_) | WsSendError::Timeout => {
+            tracing::warn!(
+                error = %error,
+                username = username.unwrap_or("<anonymous>"),
+                source_addr = sess.source_addr.as_str(),
+                "console WebSocket frame send failed"
+            );
+        }
+    }
+}
+
+async fn send<S>(tx: &mut S, frame: ServerFrame) -> Result<(), WsSendError>
 where
-    S: SinkExt<Message> + Unpin,
+    S: Sink<Message> + Unpin,
+    S::Error: fmt::Display,
 {
-    tokio::time::timeout(timeout, send(tx, frame))
+    let bytes = encode_frame(&frame).map_err(WsSendError::Encode)?;
+    tx.send(Message::Binary(bytes.into()))
         .await
-        .map_err(|_| ())?
+        .map_err(|e| WsSendError::Transport(e.to_string()))
+}
+
+async fn send_with_timeout<S>(
+    tx: &mut S,
+    frame: ServerFrame,
+    timeout: Duration,
+) -> Result<(), WsSendError>
+where
+    S: Sink<Message> + Unpin,
+    S::Error: fmt::Display,
+{
+    match tokio::time::timeout(timeout, send(tx, frame)).await {
+        Ok(result) => result,
+        Err(_) => Err(WsSendError::Timeout),
+    }
 }
 
 fn message_len(msg: &Message) -> usize {
@@ -1995,6 +2302,23 @@ enum ConsoleError {
     BadRequest(String),
     Operation(String),
 }
+
+impl fmt::Display for ConsoleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConsoleError::Auth(err) => write!(f, "auth error: {err}"),
+            ConsoleError::Mgmt(err) => write!(f, "management error: {err:?}"),
+            ConsoleError::NotAuthenticated => f.write_str("not authenticated"),
+            ConsoleError::StepUpRequired => f.write_str("step-up required"),
+            ConsoleError::RateLimited => f.write_str("rate limited"),
+            ConsoleError::BadRequest(message) | ConsoleError::Operation(message) => {
+                f.write_str(message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConsoleError {}
 
 impl From<auth::AuthError> for ConsoleError {
     fn from(e: auth::AuthError) -> Self {
@@ -2146,14 +2470,24 @@ fn record_ws_audit(
     source_addr: Option<&str>,
     outcome: &'static str,
 ) {
-    let _ = state.boot.record_gateway_audit(nexus_kernel::GatewayAudit {
+    let username = principal.map(|p| p.username.as_str());
+    let mfa_level = principal.map(|p| p.mfa_level);
+    if let Err(error) = state.boot.record_gateway_audit(nexus_kernel::GatewayAudit {
         event: "console_ws",
-        username: principal.map(|p| p.username.as_str()),
+        username,
         source_addr,
         outcome,
-        mfa_level: principal.map(|p| p.mfa_level),
+        mfa_level,
         details: None,
-    });
+    }) {
+        tracing::warn!(
+            ?error,
+            outcome,
+            username = username.unwrap_or("<anonymous>"),
+            source_addr = source_addr.unwrap_or("unknown"),
+            "console WebSocket audit record failed"
+        );
+    }
 }
 
 struct VisibilityAuditDetails<'a> {
@@ -2330,19 +2664,39 @@ fn registry_counts_value(counts: nexus_kernel::registry::RegistryCounts) -> Valu
     ])
 }
 
-fn state_event(ev: StateEvent) -> ConsoleEvent {
+fn state_event(ev: StateEvent) -> Result<ConsoleEvent, serde_json::Error> {
     match ev {
-        StateEvent::Set { path, value, .. } => ConsoleEvent::StateSet {
+        StateEvent::Set { path, value, .. } => Ok(ConsoleEvent::StateSet {
             path: path.to_string(),
-            value: JsonBytes::from_value(&value),
-        },
-        StateEvent::Append { path, item, .. } => ConsoleEvent::StateAppend {
+            value: JsonBytes::try_from_value(&value)?,
+        }),
+        StateEvent::Append { path, item, .. } => Ok(ConsoleEvent::StateAppend {
             path: path.to_string(),
-            item: JsonBytes::from_value(&item),
-        },
-        StateEvent::Delete { path } => ConsoleEvent::StateDelete {
+            item: JsonBytes::try_from_value(&item)?,
+        }),
+        StateEvent::Delete { path } => Ok(ConsoleEvent::StateDelete {
             path: path.to_string(),
-        },
+        }),
+    }
+}
+
+async fn send_subscription_closed(
+    event_tx: &mpsc::Sender<SubscriptionMessage>,
+    stream: u64,
+    reason: String,
+) {
+    if event_tx
+        .send(SubscriptionMessage {
+            stream,
+            event: ConsoleEvent::SubscriptionClosed { reason },
+        })
+        .await
+        .is_err()
+    {
+        tracing::debug!(
+            stream,
+            "console subscription owner closed before close event could be delivered"
+        );
     }
 }
 
@@ -2351,10 +2705,13 @@ fn validate_upgrade_headers(
     peer: Option<SocketAddr>,
     transport: &crate::ConsoleTransportSecurityConfig,
 ) -> Result<(), String> {
-    if let Some(path) = headers.get(":path").and_then(|h| h.to_str().ok())
-        && path != "/ws"
-    {
-        return Err("unexpected console websocket path".into());
+    if let Some(path) = headers.get(":path") {
+        let path = path
+            .to_str()
+            .map_err(|_| "console websocket path header is malformed".to_string())?;
+        if path != "/ws" {
+            return Err("unexpected console websocket path".into());
+        }
     }
     validate_origin_headers("console websocket", headers, peer, transport).map(|_| ())
 }
@@ -2375,8 +2732,9 @@ fn validate_origin_headers(
 ) -> Result<String, String> {
     let origin = headers
         .get(header::ORIGIN)
-        .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| format!("{label} origin header is required"))?;
+        .ok_or_else(|| format!("{label} origin header is required"))?
+        .to_str()
+        .map_err(|_| format!("{label} origin header is malformed"))?;
     let parsed_origin = OriginParts::parse(origin, label)?;
     let trusted_proxy = transport.trusts_peer(peer.map(|p| p.ip()));
     let external_host = external_host(label, headers, trusted_proxy, transport)?;
@@ -2391,7 +2749,7 @@ fn validate_origin_headers(
     if !transport.ignore_origin_port() && parsed_origin.port != external.port {
         return Err(format!("{label} origin port is not allowed"));
     }
-    if let Some(proto) = external_forwarded_proto(headers, trusted_proxy, transport)
+    if let Some(proto) = external_forwarded_proto(label, headers, trusted_proxy, transport)?
         && parsed_origin.scheme != proto
     {
         return Err(format!("{label} origin scheme is not allowed"));
@@ -2431,14 +2789,17 @@ impl<'a> OriginParts<'a> {
             let (host, rest) = stripped
                 .split_once(']')
                 .ok_or_else(|| format!("{label} host header is malformed"))?;
-            let port = rest.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
+            let port = match rest.strip_prefix(':') {
+                Some(port) => Some(parse_origin_port(port, label)?),
+                None if rest.is_empty() => None,
+                None => return Err(format!("{label} host header is malformed")),
+            };
             (host, port)
         } else if let Some((host, port)) = authority.rsplit_once(':') {
-            if port.chars().all(|c| c.is_ascii_digit()) {
-                (host, port.parse::<u16>().ok())
-            } else {
-                (authority, None)
+            if host.contains(':') || port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+                return Err(format!("{label} host header is malformed"));
             }
+            (host, Some(parse_origin_port(port, label)?))
         } else {
             (authority, None)
         };
@@ -2453,6 +2814,14 @@ impl<'a> OriginParts<'a> {
     }
 }
 
+fn parse_origin_port(raw: &str, label: &str) -> Result<u16, String> {
+    if raw.is_empty() {
+        return Err(format!("{label} host header is malformed"));
+    }
+    raw.parse::<u16>()
+        .map_err(|_| format!("{label} host header is malformed"))
+}
+
 fn external_host<'a>(
     label: &str,
     headers: &'a HeaderMap,
@@ -2461,32 +2830,57 @@ fn external_host<'a>(
 ) -> Result<&'a str, String> {
     if trusted_proxy
         && transport.trusted_proxy.honor_x_forwarded_host
-        && let Some(host) = headers
-            .get("x-forwarded-host")
-            .and_then(|h| h.to_str().ok())
+        && let Some(host) = headers.get("x-forwarded-host")
     {
-        return Ok(host.split(',').next().unwrap_or(host).trim());
+        let host = host
+            .to_str()
+            .map_err(|_| format!("{label} x-forwarded-host header is malformed"))?;
+        return first_forwarded_header_value(label, "x-forwarded-host", host);
     }
     headers
         .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
         .ok_or_else(|| format!("{label} host header is required"))
+        .and_then(|host| {
+            host.to_str()
+                .map_err(|_| format!("{label} host header is malformed"))
+        })
 }
 
 fn external_forwarded_proto<'a>(
+    label: &str,
     headers: &'a HeaderMap,
     trusted_proxy: bool,
     transport: &crate::ConsoleTransportSecurityConfig,
-) -> Option<&'a str> {
+) -> Result<Option<&'a str>, String> {
     if !(trusted_proxy && transport.trusted_proxy.honor_x_forwarded_proto) {
-        return None;
+        return Ok(None);
     }
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| matches!(*value, "http" | "https"))
+    let Some(proto) = headers.get("x-forwarded-proto") else {
+        return Ok(None);
+    };
+    let proto = proto
+        .to_str()
+        .map_err(|_| format!("{label} x-forwarded-proto header is malformed"))?;
+    let proto = first_forwarded_header_value(label, "x-forwarded-proto", proto)?;
+    if !matches!(proto, "http" | "https") {
+        return Err(format!("{label} x-forwarded-proto header is unsupported"));
+    }
+    Ok(Some(proto))
+}
+
+fn first_forwarded_header_value<'a>(
+    label: &str,
+    name: &str,
+    value: &'a str,
+) -> Result<&'a str, String> {
+    let Some(first) = value.split(',').next() else {
+        return Err(format!("{label} {name} header is malformed"));
+    };
+    let first = first.trim();
+    if first.is_empty() {
+        return Err(format!("{label} {name} header is malformed"));
+    }
+    Ok(first)
 }
 
 fn server_rev(sess: &WsSession) -> u64 {
@@ -2681,25 +3075,12 @@ fn require_config_write_safety(
     path: &str,
 ) -> Result<(), ConsoleError> {
     let parsed = Path::parse(path)?;
-    let segs = parsed.segments();
-    let high_risk = parsed.scheme() == "state"
-        && segs.first().map(|s| s.as_str()) == Some("kernel")
-        && matches!(
-            segs.get(1).map(|s| s.as_str()),
-            Some(
-                "console"
-                    | "external"
-                    | "external-installations"
-                    | "external-projections"
-                    | "external-pairings"
-                    | "external-sessions"
-                    | "external-credential-revocations"
-                    | "procs"
-            )
-        );
-    if high_risk {
-        require_step_up(principal)?;
+    if mgmt::is_dedicated_runtime_config_path(&parsed) {
+        return Err(ConsoleError::BadRequest(
+            "runtime config path must use its dedicated console action".into(),
+        ));
     }
+    require_step_up(principal)?;
     Ok(())
 }
 
@@ -2754,8 +3135,20 @@ fn map_value(items: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
 }
 
 fn serde_value<T: Serialize>(value: T) -> Value {
-    serde_json::from_value(serde_json::to_value(value).unwrap_or(serde_json::Value::Null))
-        .unwrap_or(Value::Null)
+    let json = match serde_json::to_value(value) {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::error!(?error, "console value projection serialization failed");
+            return Value::Null;
+        }
+    };
+    match serde_json::from_value(json) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(?error, "console value projection conversion failed");
+            Value::Null
+        }
+    }
 }
 
 fn map_bool(value: &Value, key: &str) -> Option<bool> {
@@ -2824,6 +3217,10 @@ fn input_value(input: &JsonBytes) -> Result<Value, ConsoleError> {
     input
         .try_to_value()
         .map_err(|e| ConsoleError::BadRequest(format!("invalid JSON Value envelope: {e}")))
+}
+
+fn value_envelope_error(e: serde_json::Error) -> ConsoleError {
+    ConsoleError::Operation(format!("JSON Value envelope serialization failed: {e}"))
 }
 
 fn input_map(input: Value) -> Result<BTreeMap<String, Value>, ConsoleError> {
@@ -2936,7 +3333,7 @@ fn optional_usize_arg(
         .transpose()
 }
 
-fn validate_extension_installation_def(id: &str, value: &Value) -> Result<(), ConsoleError> {
+fn validate_external_installation_def(id: &str, value: &Value) -> Result<(), ConsoleError> {
     let json = serde_json::to_value(value).map_err(|e| {
         ConsoleError::BadRequest(format!("ExternalInstallationDef serialization failed: {e}"))
     })?;
@@ -2951,28 +3348,6 @@ fn validate_extension_installation_def(id: &str, value: &Value) -> Result<(), Co
     def.validate_admission().map_err(|e| {
         ConsoleError::BadRequest(format!("ExternalInstallationDef admission failed: {e}"))
     })
-}
-
-fn validate_config_write_value_for_path(path: &str, value: &Value) -> Result<(), ConsoleError> {
-    let parsed = Path::parse(path)?;
-    let segs = parsed.segments();
-    if parsed.scheme() == "state"
-        && segs.first().map(|s| s.as_str()) == Some("kernel")
-        && segs.get(1).map(|s| s.as_str()) == Some("external-installations")
-    {
-        let Some(id) = segs.get(2) else {
-            return Err(ConsoleError::BadRequest(
-                "ExternalInstallationDef writes must target state://kernel/external-installations/<id>".into(),
-            ));
-        };
-        if segs.len() != 3 {
-            return Err(ConsoleError::BadRequest(
-                "ExternalInstallationDef writes must target exactly one installation id".into(),
-            ));
-        }
-        validate_extension_installation_def(id, value)?;
-    }
-    Ok(())
 }
 
 fn optional_bool_arg(
@@ -3036,12 +3411,26 @@ mod tests {
         ConsoleTransportSecurityConfig, ConsoleTransportSecurityMode, ConsoleTrustedProxyConfig,
         ConsoleUnsafeTransportRelaxation, ConsoleWsConfig, ConsoleWsRuntime,
     };
-    use nexus_actors::{PairingDisplayEdge, StandardConfig, install_standard};
+    use anyhow::{Context, bail, ensure};
     use nexus_kernel::Bootstrap;
+    use nexus_standard::{PairingDisplayEdge, StandardConfig, install_standard};
     use nexus_types::{
-        EffectCapability, ExternalProjectionDef, Purity, Role, Transport, TrustLevel,
+        EffectCapability, ExternalProjectionDef, InferenceApiDialect, InferenceAuthRef,
+        InferenceBackendDef, Purity, Role, Transport, TrustLevel,
     };
     use std::collections::BTreeMap;
+
+    fn json_bytes(value: &Value) -> anyhow::Result<JsonBytes> {
+        Ok(JsonBytes::try_from_value(value)?)
+    }
+
+    fn decode_json_bytes(json: JsonBytes) -> anyhow::Result<Value> {
+        Ok(json.try_to_value()?)
+    }
+
+    fn invalid_header_value() -> anyhow::Result<axum::http::HeaderValue> {
+        Ok(axum::http::HeaderValue::from_bytes(b"\xff")?)
+    }
 
     struct FailingFactStore;
 
@@ -3074,26 +3463,21 @@ mod tests {
         }
     }
 
-    fn console_state() -> Arc<ConsoleState> {
+    fn console_state() -> anyhow::Result<Arc<ConsoleState>> {
         let pairing_display = PairingDisplayEdge::default();
         let boot = Arc::new(Bootstrap::in_memory());
-        install_standard(
-            &boot,
-            &StandardConfig {
-                pairing_display: pairing_display.clone(),
-                ..Default::default()
-            },
-        )
-        .expect("standard providers should install");
+        let config = StandardConfig::default().with_pairing_display(pairing_display.clone());
+        install_standard(&boot, &config).context("install standard package")?;
         ConsoleState::shared_with_pairing_display(boot, pairing_display)
+            .context("create console state")
     }
 
-    fn audit_outcomes(st: &ConsoleState, event: &str) -> Vec<String> {
-        st.boot
+    fn audit_outcomes(st: &ConsoleState, event: &str) -> anyhow::Result<Vec<String>> {
+        Ok(st
+            .boot
             .kernel
             .facts
-            .all_facts()
-            .unwrap()
+            .all_facts()?
             .into_iter()
             .filter_map(|fact| match fact.outcome_ref {
                 nexus_types::OutcomeRef::Inline(Value::Map(m))
@@ -3103,7 +3487,7 @@ mod tests {
                 }
                 _ => None,
             })
-            .collect()
+            .collect())
     }
 
     fn test_session(st: Arc<ConsoleState>, principal: ConsolePrincipal) -> WsSession {
@@ -3145,26 +3529,26 @@ mod tests {
         }
     }
 
-    fn root_principal() -> ConsolePrincipal {
-        ConsolePrincipal {
+    fn root_principal() -> anyhow::Result<ConsolePrincipal> {
+        Ok(ConsolePrincipal {
             username: "root".into(),
             identity_path: "process://root".into(),
-            grants: nexus_types::CapSet::from_strs(["*://**"]).unwrap(),
+            grants: nexus_types::CapSet::from_strs(["*://**"])?,
             mfa_level: 2,
-        }
+        })
     }
 
     #[test]
-    fn visibility_audit_fact_failure_is_not_swallowed() {
+    fn visibility_audit_fact_failure_is_not_swallowed() -> anyhow::Result<()> {
         let facts = nexus_kernel::FactSink::new(Arc::new(FailingFactStore));
         let state: nexus_state::Backend = Arc::new(nexus_state::InMemoryBackend::new());
         let boot = Arc::new(Bootstrap::from_kernel(nexus_kernel::Kernel::with_backends(
             state, facts,
         )));
-        let st = ConsoleState::shared(boot);
-        let principal = root_principal();
+        let st = ConsoleState::shared(boot).context("create console state")?;
+        let principal = root_principal()?;
 
-        let err = record_visibility_audit(
+        let err = match record_visibility_audit(
             &st,
             &principal,
             Some("test"),
@@ -3175,20 +3559,24 @@ mod tests {
                 ttl_ms: Some(1000),
                 target: Some("state://chat/source/messages/1"),
             },
-        )
-        .unwrap_err();
+        ) {
+            Ok(()) => bail!("visibility audit unexpectedly succeeded"),
+            Err(err) => err,
+        };
 
-        assert!(
-            matches!(err, ConsoleError::Operation(message) if message.contains("simulated complete failure"))
+        ensure!(
+            matches!(err, ConsoleError::Operation(ref message) if message.contains("simulated complete failure")),
+            "unexpected visibility audit error: {err:?}"
         );
+        Ok(())
     }
 
-    async fn root_login(st: &Arc<ConsoleState>) -> (String, ConsolePrincipal, String) {
-        let outcome = bootstrap_root_account(&st.boot, RootProvisioning::default())
-            .await
-            .unwrap();
+    async fn root_login(
+        st: &Arc<ConsoleState>,
+    ) -> anyhow::Result<(String, ConsolePrincipal, String)> {
+        let outcome = bootstrap_root_account(&st.boot, RootProvisioning::default()).await?;
         let BootstrapOutcome::CreatedRandomPassword { password, .. } = outcome else {
-            panic!("expected root bootstrap");
+            bail!("expected root bootstrap, got {outcome:?}");
         };
         let login = st
             .auth
@@ -3201,21 +3589,16 @@ mod tests {
                 },
                 "test".into(),
             )
-            .await
-            .unwrap();
-        let principal = st
-            .auth
-            .authenticate_token(&st.boot, &login.token)
-            .await
-            .unwrap();
-        (login.token, principal, password)
+            .await?;
+        let principal = st.auth.authenticate_token(&st.boot, &login.token).await?;
+        Ok((login.token, principal, password))
     }
 
     async fn step_up_principal(
         st: &Arc<ConsoleState>,
         token: &str,
         password: String,
-    ) -> ConsolePrincipal {
+    ) -> anyhow::Result<ConsolePrincipal> {
         let elevated = st
             .auth
             .step_up(
@@ -3227,19 +3610,18 @@ mod tests {
                 },
                 "test".into(),
             )
-            .await
-            .unwrap();
-        st.auth
+            .await?;
+        Ok(st
+            .auth
             .authenticate_token(&st.boot, &elevated.token)
-            .await
-            .unwrap()
+            .await?)
     }
 
     async fn step_up_login(
         st: &Arc<ConsoleState>,
         token: &str,
         password: String,
-    ) -> (String, ConsolePrincipal) {
+    ) -> anyhow::Result<(String, ConsolePrincipal)> {
         let elevated = st
             .auth
             .step_up(
@@ -3251,17 +3633,15 @@ mod tests {
                 },
                 "test".into(),
             )
-            .await
-            .unwrap();
+            .await?;
         let principal = st
             .auth
             .authenticate_token(&st.boot, &elevated.token)
-            .await
-            .unwrap();
-        (elevated.token, principal)
+            .await?;
+        Ok((elevated.token, principal))
     }
 
-    fn extension_installation(id: &str, version: u64) -> Value {
+    fn extension_installation(id: &str, version: u64) -> anyhow::Result<Value> {
         let def = ExternalInstallationDef {
             id: id.into(),
             platform: id.into(),
@@ -3275,7 +3655,7 @@ mod tests {
             projections: vec![ExternalProjectionDef {
                 id: "provider".into(),
                 role: Role::Provider,
-                namespace: Some(Path::parse(&format!("effect://external-provider/{id}")).unwrap()),
+                namespace: Some(Path::parse(&format!("effect://external-provider/{id}"))?),
                 provides: vec![EffectCapability::new(
                     format!("effect://external-provider/{id}/search"),
                     Purity::Idempotent,
@@ -3285,41 +3665,57 @@ mod tests {
             }],
             version,
         };
-        serde_json::from_value(serde_json::to_value(def).unwrap()).unwrap()
+        Ok(serde_json::from_value(serde_json::to_value(def)?)?)
     }
 
-    fn call(action: &str, input: Value) -> ActionCall {
-        ActionCall {
+    fn inference_backend(id: &str) -> anyhow::Result<Value> {
+        let def = InferenceBackendDef {
+            id: id.into(),
+            dialect: InferenceApiDialect::OpenAiChatCompletions,
+            base_url: "https://api.deepseek.com".into(),
+            auth: InferenceAuthRef::BearerToken {
+                token_ref: Path::parse("state://vault/inference/deepseek/api_key")?,
+            },
+            default_headers: BTreeMap::new(),
+            request_overrides: BTreeMap::new(),
+            api_version: None,
+            version: 0,
+        };
+        Ok(serde_json::from_value(serde_json::to_value(def)?)?)
+    }
+
+    fn call(action: &str, input: Value) -> anyhow::Result<ActionCall> {
+        Ok(ActionCall {
             action: action.into(),
-            input: JsonBytes::from_value(&input),
+            input: json_bytes(&input)?,
             scope: None,
             justification: None,
             ttl_ms: None,
-        }
+        })
     }
 
-    fn visibility_call(action: &str, input: Value) -> ActionCall {
-        ActionCall {
+    fn visibility_call(action: &str, input: Value) -> anyhow::Result<ActionCall> {
+        Ok(ActionCall {
             action: action.into(),
-            input: JsonBytes::from_value(&input),
+            input: json_bytes(&input)?,
             scope: Some("test".into()),
             justification: Some("test visibility inspection".into()),
             ttl_ms: Some(60_000),
+        })
+    }
+
+    fn output_value(result: ActionResult) -> anyhow::Result<Value> {
+        decode_json_bytes(result.output.context("expected action output")?)
+    }
+
+    fn fact_count(st: &ConsoleState) -> anyhow::Result<usize> {
+        let mut count = 0usize;
+        for pid in st.boot.kernel.processes.all_ids() {
+            count = count
+                .checked_add(st.boot.kernel.facts.facts_of(pid)?.len())
+                .context("fact count overflow")?;
         }
-    }
-
-    fn output_value(result: ActionResult) -> Value {
-        result.output.expect("expected action output").to_value()
-    }
-
-    fn fact_count(st: &ConsoleState) -> usize {
-        st.boot
-            .kernel
-            .processes
-            .all_ids()
-            .into_iter()
-            .map(|pid| st.boot.kernel.facts.facts_of(pid).unwrap().len())
-            .sum()
+        Ok(count)
     }
 
     #[test]
@@ -3383,7 +3779,7 @@ mod tests {
     }
 
     #[test]
-    fn console_frame_roundtrips_with_msgpack() {
+    fn console_frame_roundtrips_with_msgpack() -> anyhow::Result<()> {
         let frame = ClientFrame::Call {
             id: 7,
             call: call(
@@ -3404,16 +3800,18 @@ mod tests {
                     ),
                     ("since_rev", Value::Int(3)),
                 ]),
-            ),
+            )?,
         };
-        let bytes = encode_frame(&frame).unwrap();
-        let decoded = decode_frame(&bytes, HARD_MAX_WS_FRAME_BYTES).unwrap();
-        assert_eq!(decoded, frame);
+        let bytes = encode_frame(&frame)?;
+        let decoded = decode_frame(&bytes, HARD_MAX_WS_FRAME_BYTES)
+            .map_err(|message| anyhow::anyhow!(message))?;
+        ensure!(decoded == frame, "decoded frame did not match original");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn hello_rejects_unsupported_wire_encoding() {
-        let st = console_state();
+    async fn hello_rejects_unsupported_wire_encoding() -> anyhow::Result<()> {
+        let st = console_state()?;
         let mut sess = unauth_session(st.clone());
         let reply = handle_frame(
             &mut sess,
@@ -3426,15 +3824,22 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(
-            reply,
-            ServerFrame::Error {
-                id: None,
-                code: ConsoleErrorCode::BadRequest,
-                ..
-            }
-        ));
-        assert!(audit_outcomes(&st, "console_ws").contains(&"protocol_error".into()));
+        ensure!(
+            matches!(
+                reply,
+                ServerFrame::Error {
+                    id: None,
+                    code: ConsoleErrorCode::BadRequest,
+                    ..
+                }
+            ),
+            "unsupported encoding was accepted"
+        );
+        let outcomes = audit_outcomes(&st, "console_ws")?;
+        ensure!(
+            outcomes.iter().any(|outcome| outcome == "protocol_error"),
+            "missing protocol_error audit outcome"
+        );
 
         let reply = handle_frame(
             &mut sess,
@@ -3443,12 +3848,16 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(reply, ServerFrame::HelloAccepted { .. }));
+        ensure!(
+            matches!(reply, ServerFrame::HelloAccepted { .. }),
+            "default hello was rejected"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn auth_and_calls_require_accepted_hello() {
-        let st = console_state();
+    async fn auth_and_calls_require_accepted_hello() -> anyhow::Result<()> {
+        let st = console_state()?;
         let mut sess = unauth_session(st.clone());
         let reply = handle_frame(
             &mut sess,
@@ -3457,66 +3866,95 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(
-            reply,
-            ServerFrame::Error {
-                id: None,
-                code: ConsoleErrorCode::BadFrame,
-                ..
-            }
-        ));
+        ensure!(
+            matches!(
+                reply,
+                ServerFrame::Error {
+                    id: None,
+                    code: ConsoleErrorCode::BadFrame,
+                    ..
+                }
+            ),
+            "auth before hello was accepted"
+        );
 
         let reply = handle_frame(
             &mut sess,
             ClientFrame::Call {
                 id: 42,
-                call: call(ACTION_PROTOCOL_DESCRIBE, Value::Null),
+                call: call(ACTION_PROTOCOL_DESCRIBE, Value::Null)?,
             },
         )
         .await;
-        assert!(matches!(
-            reply,
-            ServerFrame::Error {
-                id: Some(42),
-                code: ConsoleErrorCode::BadFrame,
-                ..
-            }
-        ));
-        assert!(audit_outcomes(&st, "console_ws").contains(&"protocol_error".into()));
+        ensure!(
+            matches!(
+                reply,
+                ServerFrame::Error {
+                    id: Some(42),
+                    code: ConsoleErrorCode::BadFrame,
+                    ..
+                }
+            ),
+            "call before hello was accepted"
+        );
+        let outcomes = audit_outcomes(&st, "console_ws")?;
+        ensure!(
+            outcomes.iter().any(|outcome| outcome == "protocol_error"),
+            "missing protocol_error audit outcome"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn unsubscribe_requires_authenticated_session() {
-        let st = console_state();
+    async fn unsubscribe_requires_authenticated_session() -> anyhow::Result<()> {
+        let st = console_state()?;
         let mut sess = unauth_session(st);
         sess.hello_accepted = true;
         let reply = handle_frame(&mut sess, ClientFrame::Unsubscribe { id: 99 }).await;
-        assert!(matches!(
-            reply,
-            ServerFrame::Error {
-                id: Some(99),
-                code: ConsoleErrorCode::NotAuthenticated,
-                ..
-            }
-        ));
-        assert!(audit_outcomes(&sess.state, "console_ws").contains(&"not_authenticated".into()));
+        ensure!(
+            matches!(
+                reply,
+                ServerFrame::Error {
+                    id: Some(99),
+                    code: ConsoleErrorCode::NotAuthenticated,
+                    ..
+                }
+            ),
+            "unauthenticated unsubscribe was accepted"
+        );
+        let outcomes = audit_outcomes(&sess.state, "console_ws")?;
+        ensure!(
+            outcomes
+                .iter()
+                .any(|outcome| outcome == "not_authenticated"),
+            "missing not_authenticated audit outcome"
+        );
+        Ok(())
     }
 
     #[test]
-    fn rejected_upgrade_writes_gateway_audit() {
-        let st = console_state();
+    fn rejected_upgrade_writes_gateway_audit() -> anyhow::Result<()> {
+        let st = console_state()?;
         let headers = HeaderMap::new();
 
-        let err = validate_upgrade_headers_audited(&st, &headers, None).unwrap_err();
+        let err = match validate_upgrade_headers_audited(&st, &headers, None) {
+            Ok(()) => bail!("upgrade without headers unexpectedly succeeded"),
+            Err(err) => err,
+        };
 
-        assert!(err.contains("origin"));
-        assert!(audit_outcomes(&st, "console_ws").contains(&"origin_denied".into()));
+        ensure!(err.contains("origin"), "unexpected upgrade error: {err}");
+        let outcomes = audit_outcomes(&st, "console_ws")?;
+        ensure!(
+            outcomes.iter().any(|outcome| outcome == "origin_denied"),
+            "missing origin_denied audit outcome"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn step_up_required_writes_specific_gateway_audit() {
-        let st = console_state();
-        let (token, principal, _password) = root_login(&st).await;
+    async fn step_up_required_writes_specific_gateway_audit() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (token, principal, _password) = root_login(&st).await?;
         let mut sess = test_session_for_token(st.clone(), principal, &token);
 
         let reply = handle_frame(
@@ -3526,26 +3964,34 @@ mod tests {
                 call: call(
                     ACTION_PAIRING_DENY,
                     map_value([("pairing_id", Value::Str("pair-ws".into()))]),
-                ),
+                )?,
             },
         )
         .await;
 
-        assert!(matches!(
+        ensure!(
+            matches!(
             reply,
             ServerFrame::Error {
                 id: Some(11),
                 code: ConsoleErrorCode::Forbidden,
                 message,
             } if message == "step-up required"
-        ));
-        assert!(audit_outcomes(&st, "console_ws").contains(&"step_up_required".into()));
+            ),
+            "step-up-only action was not rejected"
+        );
+        let outcomes = audit_outcomes(&st, "console_ws")?;
+        ensure!(
+            outcomes.iter().any(|outcome| outcome == "step_up_required"),
+            "missing step_up_required audit outcome"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn forbidden_management_path_is_redacted_and_audited() {
-        let st = console_state();
-        let (token, principal, _password) = root_login(&st).await;
+    async fn forbidden_management_path_is_redacted_and_audited() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (token, principal, _password) = root_login(&st).await?;
         let mut sess = test_session_for_token(st.clone(), principal, &token);
 
         let reply = handle_frame(
@@ -3558,89 +4004,123 @@ mod tests {
                         "path",
                         Value::Str("state://vault/console/root/password".into()),
                     )]),
-                ),
+                )?,
             },
         )
         .await;
 
-        assert!(matches!(
+        ensure!(
+            matches!(
             &reply,
             ServerFrame::Error {
                 id: Some(12),
                 code: ConsoleErrorCode::Forbidden,
                 message,
             } if message == "management path is not allowed"
-        ));
+            ),
+            "vault management path was not forbidden"
+        );
         if let ServerFrame::Error { message, .. } = &reply {
-            assert!(!message.contains("state://vault"));
-            assert!(!message.contains("password"));
+            ensure!(
+                !message.contains("state://vault"),
+                "forbidden error leaked vault path"
+            );
+            ensure!(
+                !message.contains("password"),
+                "forbidden error leaked password path segment"
+            );
         }
-        assert!(audit_outcomes(&st, "console_ws").contains(&"permission_denied".into()));
+        let outcomes = audit_outcomes(&st, "console_ws")?;
+        ensure!(
+            outcomes
+                .iter()
+                .any(|outcome| outcome == "permission_denied"),
+            "missing permission_denied audit outcome"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn secret_reveal_blocked_attempt_is_audited() {
-        let st = console_state();
-        let (token, _principal, password) = root_login(&st).await;
-        let (elevated_token, principal) = step_up_login(&st, &token, password).await;
+    async fn secret_reveal_blocked_attempt_is_audited() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (token, _principal, password) = root_login(&st).await?;
+        let (elevated_token, principal) = step_up_login(&st, &token, password).await?;
         let mut sess = test_session_for_token(st.clone(), principal, &elevated_token);
 
         let reply = handle_frame(
             &mut sess,
             ClientFrame::Call {
                 id: 13,
-                call: visibility_call(ACTION_SECRET_REVEAL, Value::Null),
+                call: visibility_call(ACTION_SECRET_REVEAL, Value::Null)?,
             },
         )
         .await;
 
-        assert!(matches!(
-            reply,
-            ServerFrame::Error {
-                id: Some(13),
-                code: ConsoleErrorCode::BadRequest,
-                ..
-            }
-        ));
-        assert!(
-            audit_outcomes(&st, "console_visibility").contains(&"secret_reveal_blocked".into())
+        ensure!(
+            matches!(
+                reply,
+                ServerFrame::Error {
+                    id: Some(13),
+                    code: ConsoleErrorCode::BadRequest,
+                    ..
+                }
+            ),
+            "secret reveal was not blocked"
         );
+        let outcomes = audit_outcomes(&st, "console_visibility")?;
+        ensure!(
+            outcomes
+                .iter()
+                .any(|outcome| outcome == "secret_reveal_blocked"),
+            "missing secret_reveal_blocked audit outcome"
+        );
+        Ok(())
     }
 
     #[test]
-    fn configured_limits_are_bounded_by_backend_hard_caps() {
-        assert_eq!(
+    fn configured_limits_are_bounded_by_backend_hard_caps() -> anyhow::Result<()> {
+        ensure!(
             bounded_limit(
                 HARD_MAX_WS_FACT_LIMIT + 1,
                 HARD_MAX_WS_FACT_LIMIT + 2,
                 HARD_MAX_WS_FACT_LIMIT,
-            ),
-            HARD_MAX_WS_FACT_LIMIT
+            ) == HARD_MAX_WS_FACT_LIMIT,
+            "configured fact limit exceeded hard cap"
         );
-        assert_eq!(bounded_limit(100, 12, HARD_MAX_WS_FACT_LIMIT), 12);
+        ensure!(
+            bounded_limit(100, 12, HARD_MAX_WS_FACT_LIMIT) == 12,
+            "configured fact limit did not preserve smaller configured value"
+        );
 
         let frame = ClientFrame::Ping { nonce: 9 };
-        let bytes = encode_frame(&frame).unwrap();
-        assert!(decode_frame(&bytes, bytes.len()).is_ok());
-        assert!(decode_frame(&bytes, bytes.len().saturating_sub(1)).is_err());
+        let bytes = encode_frame(&frame)?;
+        ensure!(
+            decode_frame(&bytes, bytes.len()).is_ok(),
+            "frame did not decode within exact limit"
+        );
+        ensure!(
+            decode_frame(&bytes, bytes.len().saturating_sub(1)).is_err(),
+            "frame decoded despite too-small limit"
+        );
+        Ok(())
     }
 
     #[test]
-    fn protocol_action_calls_are_msgpack_frames() {
+    fn protocol_action_calls_are_msgpack_frames() -> anyhow::Result<()> {
         let actions = vec![
-            call(ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE, Value::Null),
-            call(ACTION_AUTHORITY_ACTION_MATRIX, Value::Null),
+            call(ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE, Value::Null)?,
+            call(ACTION_AUTHORITY_ACTION_MATRIX, Value::Null)?,
             call(
                 ACTION_AUTHORITY_WHY_DENIED,
                 map_value([("action", Value::Str(ACTION_CONFIG_WRITE_CAS.into()))]),
-            ),
-            call(ACTION_ACCESS_USER_LIST, Value::Null),
-            call(ACTION_ACCESS_ROLE_LIST, Value::Null),
-            call(ACTION_ACCESS_SESSION_LIST, Value::Null),
+            )?,
+            call(ACTION_ACCESS_USER_LIST, Value::Null)?,
+            call(ACTION_ACCESS_ROLE_LIST, Value::Null)?,
+            call(ACTION_ACCESS_SESSION_LIST, Value::Null)?,
             call(
                 ACTION_AUDIT_FACTS_RECENT,
                 map_value([("limit", Value::Int(10))]),
-            ),
+            )?,
             call(
                 ACTION_LINEAGE_TRACE_READ,
                 map_value([
@@ -3648,55 +4128,63 @@ mod tests {
                     ("from", Value::Int(0)),
                     ("limit", Value::Int(10)),
                 ]),
-            ),
+            )?,
             call(
                 ACTION_LINEAGE_FACT_READ,
                 map_value([("op_id", Value::Str("1/0/0".into()))]),
-            ),
-            call(ACTION_HEALTH_SUMMARY, Value::Null),
+            )?,
+            call(ACTION_HEALTH_SUMMARY, Value::Null)?,
             call(
                 ACTION_EXTERNAL_INSTALLATION_START,
                 map_value([("id", Value::Str("acme".into()))]),
-            ),
+            )?,
             call(
                 ACTION_PAIRING_DENY,
                 map_value([("pairing_id", Value::Str("pair-a".into()))]),
-            ),
+            )?,
         ];
         for (idx, call) in actions.into_iter().enumerate() {
             let frame = ClientFrame::Call {
                 id: idx as u64,
                 call,
             };
-            let bytes = encode_frame(&frame).unwrap();
-            assert_eq!(
-                decode_frame(&bytes, HARD_MAX_WS_FRAME_BYTES).unwrap(),
-                frame
+            let bytes = encode_frame(&frame)?;
+            ensure!(
+                decode_frame(&bytes, HARD_MAX_WS_FRAME_BYTES)
+                    .map_err(|message| anyhow::anyhow!(message))?
+                    == frame,
+                "call frame {idx} did not roundtrip"
             );
         }
         let sub = ClientFrame::Subscribe {
             id: 1,
             stream: StreamCall {
                 stream: STREAM_STATE_WATCH.into(),
-                input: JsonBytes::from_value(&map_value([(
+                input: json_bytes(&map_value([(
                     "pattern",
                     Value::Str("state://kernel/**".into()),
-                )])),
+                )]))?,
                 scope: Some("test".into()),
                 justification: Some("test stream".into()),
                 ttl_ms: Some(60_000),
                 since_rev: None,
             },
         };
-        let bytes = encode_frame(&sub).unwrap();
-        assert_eq!(decode_frame(&bytes, HARD_MAX_WS_FRAME_BYTES).unwrap(), sub);
+        let bytes = encode_frame(&sub)?;
+        ensure!(
+            decode_frame(&bytes, HARD_MAX_WS_FRAME_BYTES)
+                .map_err(|message| anyhow::anyhow!(message))?
+                == sub,
+            "subscription frame did not roundtrip"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn dispatches_config_and_runtime_actions() {
-        let st = console_state();
-        let (token, _principal, password) = root_login(&st).await;
-        let principal = step_up_principal(&st, &token, password).await;
+    async fn dispatches_config_and_runtime_actions() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (token, _principal, password) = root_login(&st).await?;
+        let principal = step_up_principal(&st, &token, password).await?;
         let mut sess = test_session(st.clone(), principal.clone());
         dispatch_call(
             &mut sess,
@@ -3705,13 +4193,12 @@ mod tests {
                 ACTION_EXTERNAL_INSTALLATION_INSTALL,
                 map_value([
                     ("id", Value::Str("acme".into())),
-                    ("def", extension_installation("acme", 0)),
+                    ("def", extension_installation("acme", 0)?),
                     ("expected_version", Value::Null),
                 ]),
-            ),
+            )?,
         )
-        .await
-        .unwrap();
+        .await?;
         let out = dispatch_call(
             &mut sess,
             &principal,
@@ -3721,29 +4208,31 @@ mod tests {
                     ("include_recent_facts", Value::Bool(true)),
                     ("limit", Value::Int(8)),
                 ]),
-            ),
+            )?,
         )
-        .await
-        .unwrap();
-        assert!(out.output.is_some());
+        .await?;
+        ensure!(out.output.is_some(), "runtime inspect output is missing");
         let facts = dispatch_call(
             &mut sess,
             &principal,
             visibility_call(
                 ACTION_AUDIT_FACTS_RECENT,
                 map_value([("limit", Value::Int(16))]),
-            ),
+            )?,
         )
-        .await
-        .unwrap();
-        assert!(matches!(output_value(facts), Value::List(_)));
+        .await?;
+        ensure!(
+            matches!(output_value(facts)?, Value::List(_)),
+            "recent facts output was not a list"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn protocol_metadata_actions_use_session_transport_security() {
+    async fn protocol_metadata_actions_use_session_transport_security() -> anyhow::Result<()> {
         let pairing_display = PairingDisplayEdge::default();
         let boot = Arc::new(Bootstrap::in_memory());
-        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
+        install_standard(&boot, &StandardConfig::default()).context("install standard package")?;
         let st = ConsoleState::shared_with_pairing_display_and_config(
             boot,
             pairing_display,
@@ -3753,52 +4242,38 @@ mod tests {
                 mode: ConsoleTransportSecurityMode::UnsafePlaintext,
                 ..ConsoleTransportSecurityConfig::default()
             },
-        );
-        let principal = root_principal();
+        )
+        .context("create console state")?;
+        let principal = root_principal()?;
         let mut sess = test_session(st, principal.clone());
         let result = dispatch_call(
             &mut sess,
             &principal,
-            call(ACTION_PROTOCOL_DESCRIBE, Value::Null),
+            call(ACTION_PROTOCOL_DESCRIBE, Value::Null)?,
         )
-        .await;
-        let output = match result {
-            Ok(result) => match result.output {
-                Some(output) => match output.try_to_value() {
-                    Ok(value) => value,
-                    Err(error) => {
-                        assert!(false, "metadata output must decode: {error}");
-                        return;
-                    }
-                },
-                None => {
-                    assert!(false, "metadata output is missing");
-                    return;
-                }
-            },
-            Err(error) => {
-                assert!(false, "metadata action failed: {error:?}");
-                return;
-            }
-        };
-        let Some(map) = output.as_map() else {
-            assert!(false, "metadata output must be a map");
-            return;
-        };
-        assert_eq!(
-            map.get("transport_security_mode").and_then(Value::as_str),
-            Some("unsafe_plaintext")
+        .await
+        .map_err(|error| anyhow::anyhow!("metadata action failed: {error:?}"))?;
+        let output = result
+            .output
+            .context("metadata output is missing")?
+            .try_to_value()
+            .map_err(|error| anyhow::anyhow!("metadata output must decode: {error}"))?;
+        let map = output.as_map().context("metadata output must be a map")?;
+        ensure!(
+            map.get("transport_security_mode").and_then(Value::as_str) == Some("unsafe_plaintext"),
+            "transport_security_mode mismatch"
         );
-        assert_eq!(
-            map.get("unsafe_transport").and_then(Value::as_bool),
-            Some(true)
+        ensure!(
+            map.get("unsafe_transport").and_then(Value::as_bool) == Some(true),
+            "unsafe_transport mismatch"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn authority_matrix_explains_step_up_and_visibility_gate() {
-        let st = console_state();
-        let (token, principal, password) = root_login(&st).await;
+    async fn authority_matrix_explains_step_up_and_visibility_gate() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (token, principal, password) = root_login(&st).await?;
         let mut sess = test_session(st.clone(), principal.clone());
         let out = dispatch_call(
             &mut sess,
@@ -3806,20 +4281,22 @@ mod tests {
             call(
                 ACTION_AUTHORITY_ACTION_MATRIX,
                 map_value([("domain", Value::Str("visibility".into()))]),
-            ),
+            )?,
         )
-        .await
-        .unwrap();
-        let Value::List(rows) = output_value(out) else {
-            panic!("expected matrix rows")
+        .await?;
+        let Value::List(rows) = output_value(out)? else {
+            bail!("expected matrix rows");
         };
-        assert!(rows.iter().any(|row| {
-            row.as_map().is_some_and(
-                |m| matches!(m.get("status"), Some(Value::Str(s)) if s == "step_up_required"),
-            )
-        }));
+        ensure!(
+            rows.iter().any(|row| {
+                row.as_map().is_some_and(
+                    |m| matches!(m.get("status"), Some(Value::Str(s)) if s == "step_up_required"),
+                )
+            }),
+            "matrix did not report step_up_required"
+        );
 
-        let principal = step_up_principal(&st, &token, password).await;
+        let principal = step_up_principal(&st, &token, password).await?;
         let mut sess = test_session(st.clone(), principal.clone());
         let out = dispatch_call(
             &mut sess,
@@ -3827,115 +4304,91 @@ mod tests {
             call(
                 ACTION_AUTHORITY_ACTION_MATRIX,
                 map_value([("domain", Value::Str("visibility".into()))]),
-            ),
+            )?,
         )
-        .await
-        .unwrap();
-        let Value::List(rows) = output_value(out) else {
-            panic!("expected matrix rows")
+        .await?;
+        let Value::List(rows) = output_value(out)? else {
+            bail!("expected matrix rows");
         };
-        assert!(rows.iter().any(|row| {
+        ensure!(
+            rows.iter().any(|row| {
             row.as_map().is_some_and(|m| {
                 matches!(m.get("action"), Some(Value::Str(a)) if a == ACTION_VISIBILITY_STATE_READ)
                     && matches!(m.get("status"), Some(Value::Str(s)) if s == "visibility_gate_required")
             })
-        }));
+            }),
+            "matrix did not report visibility gate"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn dispatches_shape_independent_descriptor_actions() {
-        let st = console_state();
-        let (_token, principal, _password) = root_login(&st).await;
+    async fn dispatches_shape_independent_descriptor_actions() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (_token, principal, _password) = root_login(&st).await?;
         let mut sess = test_session(st, principal.clone());
 
-        let result = dispatch_call(
-            &mut sess,
-            &principal,
-            call(ACTION_RESOURCE_TYPE_LIST, Value::Null),
-        )
-        .await;
-        let list = match result {
-            Ok(result) => match result.output {
-                Some(output) => output.to_value(),
-                None => panic!("resource type list output missing"),
-            },
-            Err(error) => panic!("resource type list failed: {error:?}"),
-        };
-        assert!(matches!(list, Value::List(items) if !items.is_empty()));
+        let list = output_value(
+            dispatch_call(
+                &mut sess,
+                &principal,
+                call(ACTION_RESOURCE_TYPE_LIST, Value::Null)?,
+            )
+            .await?,
+        )?;
+        ensure!(
+            matches!(list, Value::List(items) if !items.is_empty()),
+            "resource type list was empty or not a list"
+        );
 
-        let result = dispatch_call(
-            &mut sess,
-            &principal,
-            call(
-                ACTION_RESOURCE_TYPE_DESCRIBE,
-                map_value([("resource_type", Value::Str("access.user".into()))]),
-            ),
-        )
-        .await;
-        let descriptor = match result {
-            Ok(result) => match result.output {
-                Some(output) => output.to_value(),
-                None => panic!("resource type descriptor output missing"),
-            },
-            Err(error) => panic!("resource type descriptor failed: {error:?}"),
-        };
+        let descriptor = output_value(
+            dispatch_call(
+                &mut sess,
+                &principal,
+                call(
+                    ACTION_RESOURCE_TYPE_DESCRIBE,
+                    map_value([("resource_type", Value::Str("access.user".into()))]),
+                )?,
+            )
+            .await?,
+        )?;
         let Value::Map(descriptor) = descriptor else {
-            panic!("expected resource descriptor map")
+            bail!("expected resource descriptor map");
         };
         let Some(Value::List(fields)) = descriptor.get("fields") else {
-            panic!("resource descriptor fields missing")
+            bail!("resource descriptor fields missing");
         };
-        assert!(fields.iter().any(|field| {
-            field.as_map().is_some_and(|map| {
+        ensure!(
+            fields.iter().any(|field| {
+                field.as_map().is_some_and(|map| {
                 matches!(map.get("semantic_kind"), Some(Value::Str(kind)) if kind == "resource_ref")
             })
-        }));
-
-        let result = dispatch_call(
-            &mut sess,
-            &principal,
-            call(
-                ACTION_RESOURCE_VIEW_DESCRIBE,
-                map_value([("view", Value::Str("access.users".into()))]),
-            ),
-        )
-        .await;
-        let view = match result {
-            Ok(result) => match result.output {
-                Some(output) => output.to_value(),
-                None => panic!("resource view descriptor output missing"),
-            },
-            Err(error) => panic!("resource view descriptor failed: {error:?}"),
-        };
-        assert!(
-            matches!(view, Value::Map(map) if map.get("resource_type") == Some(&Value::Str("access.user".into())))
+            }),
+            "resource descriptor did not include a resource_ref field"
         );
 
-        let result = dispatch_call(
-            &mut sess,
-            &principal,
-            call(
-                ACTION_GRAPH_TYPE_DESCRIBE,
-                map_value([("graph_type", Value::Str("plan.workflow".into()))]),
-            ),
-        )
-        .await;
-        let graph = match result {
-            Ok(result) => match result.output {
-                Some(output) => output.to_value(),
-                None => panic!("graph type descriptor output missing"),
-            },
-            Err(error) => panic!("graph type descriptor failed: {error:?}"),
-        };
-        assert!(
-            matches!(graph, Value::Map(map) if matches!(map.get("node_types"), Some(Value::List(nodes)) if !nodes.is_empty()))
+        let view = output_value(
+            dispatch_call(
+                &mut sess,
+                &principal,
+                call(
+                    ACTION_RESOURCE_VIEW_DESCRIBE,
+                    map_value([("view", Value::Str("access.users".into()))]),
+                )?,
+            )
+            .await?,
+        )?;
+        ensure!(
+            matches!(view, Value::Map(map) if map.get("resource_type") == Some(&Value::Str("access.user".into()))),
+            "resource view descriptor did not target access.user"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn planned_change_set_actions_are_not_executable() {
-        let st = console_state();
-        let (_token, principal, _password) = root_login(&st).await;
+    async fn planned_change_set_actions_are_not_executable() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (_token, principal, _password) = root_login(&st).await?;
         let mut sess = test_session(st, principal.clone());
         let result = dispatch_call(
             &mut sess,
@@ -3943,44 +4396,46 @@ mod tests {
             call(
                 ACTION_CHANGE_SET_CREATE,
                 map_value([("registry_rev", Value::Int(1))]),
-            ),
+            )?,
         )
         .await;
-        assert!(matches!(
+        ensure!(
+            matches!(
             result,
             Err(ConsoleError::BadRequest(message))
                 if message == "planned console action is not implemented: change_set.create"
-        ));
-
-        let result = dispatch_call(
-            &mut sess,
-            &principal,
-            call(
-                ACTION_AUTHORITY_ACTION_MATRIX,
-                map_value([("domain", Value::Str("change_set".into()))]),
             ),
-        )
-        .await;
-        let matrix = match result {
-            Ok(result) => match result.output {
-                Some(output) => output.to_value(),
-                None => panic!("authority matrix output missing"),
-            },
-            Err(error) => panic!("authority matrix failed: {error:?}"),
-        };
+            "planned change-set create was executable"
+        );
+
+        let matrix = output_value(
+            dispatch_call(
+                &mut sess,
+                &principal,
+                call(
+                    ACTION_AUTHORITY_ACTION_MATRIX,
+                    map_value([("domain", Value::Str("change_set".into()))]),
+                )?,
+            )
+            .await?,
+        )?;
         let Value::List(rows) = matrix else {
-            panic!("expected matrix rows")
+            bail!("expected matrix rows");
         };
-        assert!(rows.iter().all(|row| {
-            row.as_map()
-                .is_some_and(|map| map.get("status") == Some(&Value::Str("planned".into())))
-        }));
+        ensure!(
+            rows.iter().all(|row| {
+                row.as_map()
+                    .is_some_and(|map| map.get("status") == Some(&Value::Str("planned".into())))
+            }),
+            "change-set matrix contained a non-planned row"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn authority_resource_access_keeps_vault_on_secret_custody_path() {
-        let st = console_state();
-        let (_token, principal, _password) = root_login(&st).await;
+    async fn authority_resource_access_keeps_vault_on_secret_custody_path() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (_token, principal, _password) = root_login(&st).await?;
         let mut sess = test_session(st, principal.clone());
         let out = dispatch_call(
             &mut sess,
@@ -3994,14 +4449,16 @@ mod tests {
                     ),
                     ("verb", Value::Str("read".into())),
                 ]),
-            ),
+            )?,
         )
-        .await
-        .unwrap();
-        let Value::Map(row) = output_value(out) else {
-            panic!("expected map")
+        .await?;
+        let Value::Map(row) = output_value(out)? else {
+            bail!("expected map");
         };
-        assert_eq!(row.get("allowed"), Some(&Value::Bool(true)));
+        ensure!(
+            row.get("allowed") == Some(&Value::Bool(true)),
+            "business state read should be allowed"
+        );
 
         let out = dispatch_call(
             &mut sess,
@@ -4015,24 +4472,27 @@ mod tests {
                     ),
                     ("verb", Value::Str("read".into())),
                 ]),
-            ),
+            )?,
         )
-        .await
-        .unwrap();
-        let Value::Map(row) = output_value(out) else {
-            panic!("expected map")
+        .await?;
+        let Value::Map(row) = output_value(out)? else {
+            bail!("expected map");
         };
-        assert_eq!(row.get("allowed"), Some(&Value::Bool(false)));
-        assert_eq!(
-            row.get("why_not"),
-            Some(&Value::Str("secret_custody_required".into()))
+        ensure!(
+            row.get("allowed") == Some(&Value::Bool(false)),
+            "vault read should not be allowed"
         );
+        ensure!(
+            row.get("why_not") == Some(&Value::Str("secret_custody_required".into())),
+            "vault read should require secret custody"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn authority_why_denied_explains_single_action_gate() {
-        let st = console_state();
-        let (_token, principal, _password) = root_login(&st).await;
+    async fn authority_why_denied_explains_single_action_gate() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (_token, principal, _password) = root_login(&st).await?;
         let mut sess = test_session(st, principal.clone());
         let out = dispatch_call(
             &mut sess,
@@ -4040,52 +4500,63 @@ mod tests {
             call(
                 ACTION_AUTHORITY_WHY_DENIED,
                 map_value([("action", Value::Str(ACTION_PAIRING_DENY.into()))]),
-            ),
+            )?,
         )
-        .await
-        .unwrap();
-        let Value::Map(row) = output_value(out) else {
-            panic!("expected map")
+        .await?;
+        let Value::Map(row) = output_value(out)? else {
+            bail!("expected map");
         };
-        assert_eq!(
-            row.get("status"),
-            Some(&Value::Str("step_up_required".into()))
+        ensure!(
+            row.get("status") == Some(&Value::Str("step_up_required".into())),
+            "why-denied did not report step_up_required"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn health_summary_reports_kernel_registry_and_fact_status() {
-        let st = console_state();
-        let (_token, principal, _password) = root_login(&st).await;
+    async fn health_summary_reports_kernel_registry_and_fact_status() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (_token, principal, _password) = root_login(&st).await?;
         let mut sess = test_session(st, principal.clone());
         let out = dispatch_call(
             &mut sess,
             &principal,
-            call(ACTION_HEALTH_SUMMARY, Value::Null),
+            call(ACTION_HEALTH_SUMMARY, Value::Null)?,
         )
-        .await
-        .unwrap();
-        let Value::Map(row) = output_value(out) else {
-            panic!("expected map")
+        .await?;
+        let Value::Map(row) = output_value(out)? else {
+            bail!("expected map");
         };
-        assert_eq!(row.get("status"), Some(&Value::Str("ok".into())));
-        assert!(matches!(row.get("registry"), Some(Value::Map(_))));
-        assert!(matches!(row.get("process_status"), Some(Value::Map(_))));
-        assert!(matches!(row.get("fact_cursor"), Some(Value::Int(_))));
+        ensure!(
+            row.get("status") == Some(&Value::Str("ok".into())),
+            "health status was not ok"
+        );
+        ensure!(
+            matches!(row.get("registry"), Some(Value::Map(_))),
+            "health summary missing registry map"
+        );
+        ensure!(
+            matches!(row.get("process_status"), Some(Value::Map(_))),
+            "health summary missing process_status map"
+        );
+        ensure!(
+            matches!(row.get("fact_cursor"), Some(Value::Int(_))),
+            "health summary missing fact_cursor"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn lineage_fact_read_uses_visibility_gate_and_operation_id() {
-        let st = console_state();
-        let (token, _principal, password) = root_login(&st).await;
-        let principal = step_up_principal(&st, &token, password).await;
+    async fn lineage_fact_read_uses_visibility_gate_and_operation_id() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (token, _principal, password) = root_login(&st).await?;
+        let principal = step_up_principal(&st, &token, password).await?;
         st.state
             .write_set(
-                &Path::parse("state://chat/source/messages/lineage").unwrap(),
+                &Path::parse("state://chat/source/messages/lineage")?,
                 Value::Str("lineage fact source".into()),
             )
-            .await
-            .unwrap();
+            .await?;
         let mut sess = test_session(st.clone(), principal.clone());
         dispatch_call(
             &mut sess,
@@ -4096,64 +4567,79 @@ mod tests {
                     "path",
                     Value::Str("state://chat/source/messages/lineage".into()),
                 )]),
-            ),
+            )?,
         )
-        .await
-        .unwrap();
+        .await?;
 
-        let op_id = st
-            .boot
-            .kernel
-            .facts
-            .all_facts()
-            .unwrap()
+        let facts = st.boot.kernel.facts.all_facts()?;
+        let op_id = facts
             .last()
             .map(|fact| fact.id.to_string())
-            .expect("expected at least one fact");
-        let err = dispatch_call(
+            .context("expected at least one fact")?;
+        let err = match dispatch_call(
             &mut sess,
             &principal,
             call(
                 ACTION_LINEAGE_FACT_READ,
                 map_value([("op_id", Value::Str(op_id.clone()))]),
-            ),
+            )?,
         )
         .await
-        .unwrap_err();
-        assert!(matches!(err, ConsoleError::BadRequest(_)));
+        {
+            Ok(_) => bail!("lineage fact read without visibility gate unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::BadRequest(_)),
+            "unexpected lineage fact read error: {err:?}"
+        );
 
         let out = dispatch_call(
             &mut sess,
             &principal,
             visibility_call(
-                ACTION_LINEAGE_FACT_BY_OPERATION,
+                ACTION_LINEAGE_FACT_READ,
                 map_value([("op_id", Value::Str(op_id.clone()))]),
-            ),
+            )?,
         )
-        .await
-        .unwrap();
-        let Value::Map(row) = output_value(out) else {
-            panic!("expected map")
+        .await?;
+        let Value::Map(row) = output_value(out)? else {
+            bail!("expected map");
         };
-        assert_eq!(row.get("op_id"), Some(&Value::Str(op_id)));
-        assert!(matches!(row.get("input_ref"), Some(Value::Map(_))));
-        assert!(matches!(row.get("outcome_ref"), Some(Value::Map(_))));
-        assert_eq!(row.get("partial"), Some(&Value::Bool(true)));
-        assert!(matches!(row.get("partial_reason"), Some(Value::Str(_))));
+        ensure!(
+            row.get("op_id") == Some(&Value::Str(op_id)),
+            "lineage fact op_id mismatch"
+        );
+        ensure!(
+            matches!(row.get("input_ref"), Some(Value::Map(_))),
+            "lineage fact missing input_ref"
+        );
+        ensure!(
+            matches!(row.get("outcome_ref"), Some(Value::Map(_))),
+            "lineage fact missing outcome_ref"
+        );
+        ensure!(
+            row.get("partial") == Some(&Value::Bool(true)),
+            "lineage fact should be marked partial"
+        );
+        ensure!(
+            matches!(row.get("partial_reason"), Some(Value::Str(_))),
+            "lineage fact missing partial_reason"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn lineage_trace_read_explicitly_marks_partial_projection() {
-        let st = console_state();
-        let (token, _principal, password) = root_login(&st).await;
-        let principal = step_up_principal(&st, &token, password).await;
+    async fn lineage_trace_read_explicitly_marks_partial_projection() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (token, _principal, password) = root_login(&st).await?;
+        let principal = step_up_principal(&st, &token, password).await?;
         st.state
             .write_set(
-                &Path::parse("state://chat/source/messages/trace").unwrap(),
+                &Path::parse("state://chat/source/messages/trace")?,
                 Value::Str("trace source".into()),
             )
-            .await
-            .unwrap();
+            .await?;
         let mut sess = test_session(st.clone(), principal.clone());
         dispatch_call(
             &mut sess,
@@ -4164,19 +4650,14 @@ mod tests {
                     "path",
                     Value::Str("state://chat/source/messages/trace".into()),
                 )]),
-            ),
+            )?,
         )
-        .await
-        .unwrap();
-        let process = st
-            .boot
-            .kernel
-            .facts
-            .all_facts()
-            .unwrap()
+        .await?;
+        let facts = st.boot.kernel.facts.all_facts()?;
+        let process = facts
             .last()
             .map(|fact| fact.caller.get())
-            .expect("expected at least one fact");
+            .context("expected at least one fact")?;
 
         let out = dispatch_call(
             &mut sess,
@@ -4188,23 +4669,32 @@ mod tests {
                     ("from", Value::Int(0)),
                     ("limit", Value::Int(8)),
                 ]),
-            ),
+            )?,
         )
-        .await
-        .unwrap();
-        let Value::Map(row) = output_value(out) else {
-            panic!("expected map")
+        .await?;
+        let Value::Map(row) = output_value(out)? else {
+            bail!("expected map");
         };
-        assert_eq!(row.get("partial"), Some(&Value::Bool(true)));
-        assert!(matches!(row.get("partial_reason"), Some(Value::Str(_))));
-        assert!(matches!(row.get("items"), Some(Value::List(items)) if !items.is_empty()));
+        ensure!(
+            row.get("partial") == Some(&Value::Bool(true)),
+            "lineage trace should be partial"
+        );
+        ensure!(
+            matches!(row.get("partial_reason"), Some(Value::Str(_))),
+            "lineage trace missing partial_reason"
+        );
+        ensure!(
+            matches!(row.get("items"), Some(Value::List(items)) if !items.is_empty()),
+            "lineage trace items missing or empty"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn pairing_create_can_return_one_time_display_secret() {
-        let st = console_state();
-        let (token, _principal, password) = root_login(&st).await;
-        let principal = step_up_principal(&st, &token, password).await;
+    async fn pairing_create_can_return_one_time_display_secret() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (token, _principal, password) = root_login(&st).await?;
+        let principal = step_up_principal(&st, &token, password).await?;
         let mut sess = test_session(st.clone(), principal.clone());
         dispatch_call(
             &mut sess,
@@ -4213,13 +4703,12 @@ mod tests {
                 ACTION_EXTERNAL_INSTALLATION_INSTALL,
                 map_value([
                     ("id", Value::Str("pairable".into())),
-                    ("def", extension_installation("pairable", 0)),
+                    ("def", extension_installation("pairable", 0)?),
                     ("expected_version", Value::Null),
                 ]),
-            ),
+            )?,
         )
-        .await
-        .unwrap();
+        .await?;
         let out = dispatch_call(
             &mut sess,
             &principal,
@@ -4235,41 +4724,54 @@ mod tests {
                     ),
                     ("reveal_display_secret", Value::Bool(true)),
                 ]),
-            ),
+            )?,
         )
-        .await
-        .unwrap();
-        let Value::Map(m) = output_value(out) else {
-            panic!("expected map")
+        .await?;
+        let Value::Map(m) = output_value(out)? else {
+            bail!("expected map");
         };
-        assert!(matches!(m.get("display_secret"), Some(Value::Str(s)) if !s.is_empty()));
-        assert_eq!(st.pairing_display.take_display_secret("pair-ws"), None);
+        ensure!(
+            matches!(m.get("display_secret"), Some(Value::Str(s)) if !s.is_empty()),
+            "pairing display secret was missing"
+        );
+        ensure!(
+            st.pairing_display.take_display_secret("pair-ws").is_none(),
+            "pairing display secret was not one-time"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn pairing_deny_requires_step_up() {
-        let st = console_state();
-        let (_token, principal, _password) = root_login(&st).await;
+    async fn pairing_deny_requires_step_up() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (_token, principal, _password) = root_login(&st).await?;
         let mut sess = test_session(st, principal.clone());
-        let err = dispatch_call(
+        let err = match dispatch_call(
             &mut sess,
             &principal,
             call(
                 ACTION_PAIRING_DENY,
                 map_value([("pairing_id", Value::Str("pair-ws".into()))]),
-            ),
+            )?,
         )
         .await
-        .unwrap_err();
-        assert!(matches!(err, ConsoleError::StepUpRequired));
+        {
+            Ok(_) => bail!("pairing deny unexpectedly succeeded without step-up"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::StepUpRequired),
+            "unexpected pairing deny error: {err:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn generic_config_write_enforces_step_up_for_sensitive_prefixes() {
-        let st = console_state();
-        let (_token, principal, _password) = root_login(&st).await;
+    async fn generic_config_write_rejects_typed_runtime_prefixes() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (_token, principal, _password) = root_login(&st).await?;
         let mut sess = test_session(st, principal.clone());
-        let err = dispatch_call(
+        let err = match dispatch_call(
             &mut sess,
             &principal,
             call(
@@ -4279,38 +4781,46 @@ mod tests {
                         "path",
                         Value::Str("state://kernel/external-installations/acme".into()),
                     ),
-                    ("value", extension_installation("acme", 0)),
+                    ("value", extension_installation("acme", 0)?),
                     ("expected_version", Value::Null),
                 ]),
-            ),
+            )?,
         )
         .await
-        .unwrap_err();
-        assert!(matches!(err, ConsoleError::StepUpRequired));
+        {
+            Ok(_) => bail!("generic config write unexpectedly accepted runtime prefix"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::BadRequest(ref message) if message == "runtime config path must use its dedicated console action"),
+            "unexpected generic config write error: {err:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn extension_installation_write_validates_admission_before_state_write() {
-        let st = console_state();
-        let (token, _principal, password) = root_login(&st).await;
-        let principal = step_up_principal(&st, &token, password).await;
+    async fn external_installation_action_validates_admission_before_state_write()
+    -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (token, _principal, password) = root_login(&st).await?;
+        let principal = step_up_principal(&st, &token, password).await?;
         let mut sess = test_session(st.clone(), principal.clone());
-        let mut bad = extension_installation("acme", 0);
+        let mut bad = extension_installation("acme", 0)?;
         let Value::Map(root) = &mut bad else {
-            panic!("expected installation map")
+            bail!("expected installation map");
         };
         let Some(Value::List(projections)) = root.get_mut("projections") else {
-            panic!("expected projections")
+            bail!("expected projections");
         };
         let Some(Value::Map(provider)) = projections.first_mut() else {
-            panic!("expected provider projection")
+            bail!("expected provider projection");
         };
         provider.insert(
             "namespace".into(),
             Value::Str("effect://external-provider/other".into()),
         );
 
-        let err = dispatch_call(
+        let err = match dispatch_call(
             &mut sess,
             &principal,
             call(
@@ -4320,20 +4830,26 @@ mod tests {
                     ("def", bad.clone()),
                     ("expected_version", Value::Null),
                 ]),
-            ),
+            )?,
         )
         .await
-        .unwrap_err();
-        assert!(matches!(err, ConsoleError::BadRequest(_)));
-        assert_eq!(
+        {
+            Ok(_) => bail!("bad external installation unexpectedly passed admission"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::BadRequest(_)),
+            "unexpected external installation error: {err:?}"
+        );
+        ensure!(
             st.state
-                .read(&Path::parse("state://kernel/external-installations/acme").unwrap())
-                .await
-                .unwrap(),
-            None
+                .read(&Path::parse("state://kernel/external-installations/acme")?)
+                .await?
+                .is_none(),
+            "bad external installation was written"
         );
 
-        let err = dispatch_call(
+        let err = match dispatch_call(
             &mut sess,
             &principal,
             call(
@@ -4346,33 +4862,199 @@ mod tests {
                     ("value", bad),
                     ("expected_version", Value::Null),
                 ]),
-            ),
+            )?,
         )
         .await
-        .unwrap_err();
-        assert!(matches!(err, ConsoleError::BadRequest(_)));
-        assert_eq!(
-            st.state
-                .read(&Path::parse("state://kernel/external-installations/acme").unwrap())
-                .await
-                .unwrap(),
-            None
+        {
+            Ok(_) => bail!("generic config write unexpectedly accepted external installation path"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::BadRequest(ref message) if message == "runtime config path must use its dedicated console action"),
+            "unexpected generic config write error: {err:?}"
         );
+        ensure!(
+            st.state
+                .read(&Path::parse("state://kernel/external-installations/acme")?)
+                .await?
+                .is_none(),
+            "generic config write stored external installation"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn visibility_read_allows_root_business_state_after_step_up() {
-        let st = console_state();
-        let (token, _principal, password) = root_login(&st).await;
-        let principal = step_up_principal(&st, &token, password).await;
+    async fn external_lifecycle_actions_require_installed_declaration() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (token, _principal, password) = root_login(&st).await?;
+        let principal = step_up_principal(&st, &token, password).await?;
+        let mut sess = test_session(st.clone(), principal.clone());
+
+        let before_stop = fact_count(&st)?;
+        let stop = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_EXTERNAL_INSTALLATION_STOP,
+                map_value([("id", Value::Str("missing".into()))]),
+            )?,
+        )
+        .await;
+        ensure!(
+            matches!(stop, Err(ConsoleError::BadRequest(message)) if message == "external installation is not installed"),
+            "missing external installation stop was not rejected"
+        );
+        ensure!(
+            fact_count(&st)? == before_stop,
+            "missing external installation stop recorded facts"
+        );
+
+        let before_revoke = fact_count(&st)?;
+        let revoke = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_EXTERNAL_INSTALLATION_REVOKE,
+                map_value([("installation_id", Value::Str("missing".into()))]),
+            )?,
+        )
+        .await;
+        ensure!(
+            matches!(revoke, Err(ConsoleError::BadRequest(message)) if message == "external installation is not installed"),
+            "missing external installation revoke was not rejected"
+        );
+        ensure!(
+            fact_count(&st)? == before_revoke,
+            "missing external installation revoke recorded facts"
+        );
+
+        let before_bad_floor = fact_count(&st)?;
+        let bad_floor = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_EXTERNAL_INSTALLATION_REVOKE,
+                map_value([
+                    ("installation_id", Value::Str("missing".into())),
+                    ("credential_generation_floor", Value::Int(0)),
+                ]),
+            )?,
+        )
+        .await;
+        ensure!(
+            matches!(bad_floor, Err(ConsoleError::BadRequest(message)) if message == "credential_generation_floor must be at least 1"),
+            "invalid credential_generation_floor was not rejected"
+        );
+        ensure!(
+            fact_count(&st)? == before_bad_floor,
+            "invalid credential_generation_floor recorded facts"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inference_backend_action_validates_admission_before_state_write() -> anyhow::Result<()>
+    {
+        let st = console_state()?;
+        let (token, _principal, password) = root_login(&st).await?;
+        let principal = step_up_principal(&st, &token, password).await?;
+        let mut sess = test_session(st.clone(), principal.clone());
+
+        dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_INFERENCE_BACKEND_WRITE_CAS,
+                map_value([
+                    ("id", Value::Str("deepseek".into())),
+                    ("def", inference_backend("deepseek")?),
+                    ("expected_version", Value::Null),
+                ]),
+            )?,
+        )
+        .await?;
+        let out = dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_INFERENCE_BACKEND_READ,
+                map_value([("id", Value::Str("deepseek".into()))]),
+            )?,
+        )
+        .await?;
+        ensure!(
+            matches!(output_value(out)?, Value::Map(_)),
+            "inference backend read did not return a map"
+        );
+
+        let err = match dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_INFERENCE_BACKEND_WRITE_CAS,
+                map_value([
+                    ("id", Value::Str("other".into())),
+                    ("def", inference_backend("deepseek")?),
+                    ("expected_version", Value::Null),
+                ]),
+            )?,
+        )
+        .await
+        {
+            Ok(_) => bail!("mismatched inference backend unexpectedly passed admission"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::Mgmt(MgmtError::Admission(_))),
+            "unexpected inference admission error: {err:?}"
+        );
+        ensure!(
+            st.state
+                .read(&Path::parse("state://kernel/inference/backends/other")?)
+                .await?
+                .is_none(),
+            "mismatched inference backend was written"
+        );
+
+        let err = match dispatch_call(
+            &mut sess,
+            &principal,
+            call(
+                ACTION_CONFIG_WRITE_CAS,
+                map_value([
+                    (
+                        "path",
+                        Value::Str("state://kernel/inference/backends/other".into()),
+                    ),
+                    ("value", inference_backend("deepseek")?),
+                    ("expected_version", Value::Null),
+                ]),
+            )?,
+        )
+        .await
+        {
+            Ok(_) => bail!("generic config write unexpectedly accepted inference path"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::BadRequest(ref message) if message == "runtime config path must use its dedicated console action"),
+            "unexpected generic config write error: {err:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn visibility_read_allows_root_business_state_after_step_up() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (token, _principal, password) = root_login(&st).await?;
+        let principal = step_up_principal(&st, &token, password).await?;
         st.state
             .write_set(
-                &Path::parse("state://chat/source/messages/1").unwrap(),
+                &Path::parse("state://chat/source/messages/1")?,
                 Value::Str("hello from chat".into()),
             )
-            .await
-            .unwrap();
-        let before = fact_count(&st);
+            .await?;
+        let before = fact_count(&st)?;
         let mut sess = test_session(st.clone(), principal.clone());
         let out = dispatch_call(
             &mut sess,
@@ -4380,73 +5062,86 @@ mod tests {
             visibility_call(
                 ACTION_VISIBILITY_STATE_READ,
                 map_value([("path", Value::Str("state://chat/source/messages/1".into()))]),
-            ),
+            )?,
         )
-        .await
-        .unwrap();
-        assert_eq!(output_value(out), Value::Str("hello from chat".into()));
-        let after = fact_count(&st);
-        assert!(
+        .await?;
+        ensure!(
+            output_value(out)? == Value::Str("hello from chat".into()),
+            "visibility read returned unexpected value"
+        );
+        let after = fact_count(&st)?;
+        ensure!(
             after > before,
             "visibility read must execute through Operation/Fact, not backend side channel"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn malformed_principal_identity_rejects_visibility_without_root_fallback() {
-        let st = console_state();
+    async fn malformed_principal_identity_rejects_visibility_without_root_fallback()
+    -> anyhow::Result<()> {
+        let st = console_state()?;
         st.state
             .write_set(
-                &Path::parse("state://chat/source/messages/1").unwrap(),
+                &Path::parse("state://chat/source/messages/1")?,
                 Value::Str("hello from chat".into()),
             )
-            .await
-            .unwrap();
+            .await?;
         let before = st.boot.kernel.processes.all_ids().len();
-        let mut principal = root_principal();
+        let mut principal = root_principal()?;
         principal.identity_path = "not-a-path".into();
         let mut sess = test_session(st.clone(), principal.clone());
 
-        let err = dispatch_call(
+        let err = match dispatch_call(
             &mut sess,
             &principal,
             visibility_call(
                 ACTION_VISIBILITY_STATE_READ,
                 map_value([("path", Value::Str("state://chat/source/messages/1".into()))]),
-            ),
+            )?,
         )
         .await
-        .unwrap_err();
+        {
+            Ok(_) => bail!("visibility read unexpectedly accepted malformed principal"),
+            Err(err) => err,
+        };
 
-        assert!(
-            matches!(err, ConsoleError::Operation(message) if message.contains("invalid principal identity path"))
+        ensure!(
+            matches!(err, ConsoleError::Operation(ref message) if message.contains("invalid principal identity path")),
+            "unexpected malformed principal error: {err:?}"
         );
-        assert_eq!(
-            st.boot.kernel.processes.all_ids().len(),
-            before,
+        ensure!(
+            st.boot.kernel.processes.all_ids().len() == before,
             "malformed console principals must not fall back to root or spawn a process"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn visibility_rejects_vault_and_requires_justification() {
-        let st = console_state();
-        let (token, _principal, password) = root_login(&st).await;
-        let principal = step_up_principal(&st, &token, password).await;
+    async fn visibility_rejects_vault_and_requires_justification() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (token, _principal, password) = root_login(&st).await?;
+        let principal = step_up_principal(&st, &token, password).await?;
         let mut sess = test_session(st.clone(), principal.clone());
-        let err = dispatch_call(
+        let err = match dispatch_call(
             &mut sess,
             &principal,
             call(
                 ACTION_VISIBILITY_STATE_READ,
                 map_value([("path", Value::Str("state://chat/source/messages/1".into()))]),
-            ),
+            )?,
         )
         .await
-        .unwrap_err();
-        assert!(matches!(err, ConsoleError::BadRequest(_)));
+        {
+            Ok(_) => bail!("visibility read without justification unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::BadRequest(_)),
+            "unexpected missing-justification error: {err:?}"
+        );
 
-        let err = dispatch_call(
+        let err = match dispatch_call(
             &mut sess,
             &principal,
             visibility_call(
@@ -4455,18 +5150,29 @@ mod tests {
                     "path",
                     Value::Str("state://vault/console/root/password".into()),
                 )]),
-            ),
+            )?,
         )
         .await
-        .unwrap_err();
-        assert!(matches!(err, ConsoleError::BadRequest(_)));
-        assert!(audit_outcomes(&st, "console_visibility").contains(&"state_read_blocked".into()));
+        {
+            Ok(_) => bail!("vault visibility read unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::BadRequest(_)),
+            "unexpected vault visibility error: {err:?}"
+        );
+        let outcomes = audit_outcomes(&st, "console_visibility")?;
+        ensure!(
+            outcomes
+                .iter()
+                .any(|outcome| outcome == "state_read_blocked"),
+            "missing state_read_blocked audit outcome"
+        );
         let visibility_facts = st
             .boot
             .kernel
             .facts
-            .all_facts()
-            .unwrap()
+            .all_facts()?
             .into_iter()
             .filter(|fact| match &fact.outcome_ref {
                 nexus_types::OutcomeRef::Inline(Value::Map(m)) => {
@@ -4474,26 +5180,29 @@ mod tests {
                 }
                 _ => false,
             })
-            .map(|fact| serde_json::to_string(&fact).unwrap())
-            .collect::<Vec<_>>();
-        assert!(
+            .map(|fact| Ok(serde_json::to_string(&fact)?))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        ensure!(
             visibility_facts
                 .iter()
-                .any(|fact| fact.contains("state://vault/**"))
+                .any(|fact| fact.contains("state://vault/**")),
+            "visibility audit did not include redacted vault scope"
         );
-        assert!(
+        ensure!(
             !visibility_facts
                 .iter()
-                .any(|fact| fact.contains("state://vault/console/root/password"))
+                .any(|fact| fact.contains("state://vault/console/root/password")),
+            "visibility audit leaked concrete vault path"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn invalid_json_envelope_is_rejected() {
-        let st = console_state();
-        let (_token, principal, _password) = root_login(&st).await;
+    async fn invalid_json_envelope_is_rejected() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (_token, principal, _password) = root_login(&st).await?;
         let mut sess = test_session(st, principal.clone());
-        let err = dispatch_call(
+        let err = match dispatch_call(
             &mut sess,
             &principal,
             ActionCall {
@@ -4505,17 +5214,24 @@ mod tests {
             },
         )
         .await
-        .unwrap_err();
-        assert!(matches!(
+        {
+            Ok(_) => bail!("invalid JSON envelope unexpectedly decoded"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(
             err,
-            ConsoleError::BadRequest(message) if message.contains("invalid JSON Value envelope")
-        ));
+            ConsoleError::BadRequest(ref message) if message.contains("invalid JSON Value envelope")
+            ),
+            "unexpected invalid envelope error: {err:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn snapshot_runtime_facts_require_visibility_gate() {
-        let st = console_state();
-        let (token, principal, password) = root_login(&st).await;
+    async fn snapshot_runtime_facts_require_visibility_gate() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (token, principal, password) = root_login(&st).await?;
         let mut sess = test_session(st.clone(), principal.clone());
         let out = dispatch_call(
             &mut sess,
@@ -4526,19 +5242,30 @@ mod tests {
                     "sections",
                     Value::List(vec![map_value([("kind", Value::Str("runtime".into()))])]),
                 )]),
-            ),
+            )?,
         )
-        .await
-        .unwrap();
-        let Value::Map(row) = output_value(out) else {
-            panic!("expected map")
+        .await?;
+        let Value::Map(row) = output_value(out)? else {
+            bail!("expected map");
         };
-        assert!(matches!(row.get("server_rev"), Some(Value::Int(_))));
-        assert!(matches!(row.get("registry_rev"), Some(Value::Int(_))));
-        assert!(matches!(row.get("fact_cursor"), Some(Value::Int(_))));
-        assert!(matches!(row.get("truncated"), Some(Value::List(_))));
+        ensure!(
+            matches!(row.get("server_rev"), Some(Value::Int(_))),
+            "snapshot missing server_rev"
+        );
+        ensure!(
+            matches!(row.get("registry_rev"), Some(Value::Int(_))),
+            "snapshot missing registry_rev"
+        );
+        ensure!(
+            matches!(row.get("fact_cursor"), Some(Value::Int(_))),
+            "snapshot missing fact_cursor"
+        );
+        ensure!(
+            matches!(row.get("truncated"), Some(Value::List(_))),
+            "snapshot missing truncated list"
+        );
 
-        let principal = step_up_principal(&st, &token, password).await;
+        let principal = step_up_principal(&st, &token, password).await?;
         let mut sess = test_session(st, principal.clone());
         let input = map_value([(
             "sections",
@@ -4547,45 +5274,60 @@ mod tests {
                 ("include_recent_facts", Value::Bool(true)),
             ])]),
         )]);
-        let err = dispatch_call(
+        let err = match dispatch_call(
             &mut sess,
             &principal,
-            call(ACTION_STATE_SNAPSHOT, input.clone()),
+            call(ACTION_STATE_SNAPSHOT, input.clone())?,
         )
         .await
-        .unwrap_err();
-        assert!(matches!(err, ConsoleError::BadRequest(_)));
+        {
+            Ok(_) => bail!("runtime snapshot with recent facts bypassed visibility gate"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::BadRequest(_)),
+            "unexpected snapshot visibility error: {err:?}"
+        );
 
         let out = dispatch_call(
             &mut sess,
             &principal,
-            visibility_call(ACTION_STATE_SNAPSHOT, input),
+            visibility_call(ACTION_STATE_SNAPSHOT, input)?,
         )
-        .await
-        .unwrap();
-        assert!(matches!(output_value(out), Value::Map(_)));
+        .await?;
+        ensure!(
+            matches!(output_value(out)?, Value::Map(_)),
+            "visibility-gated snapshot output was not a map"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn subscription_rejects_resume_without_replacing_existing_subscription() {
-        let st = console_state();
-        let (token, _principal, password) = root_login(&st).await;
-        let principal = step_up_principal(&st, &token, password).await;
+    async fn subscription_rejects_resume_without_replacing_existing_subscription()
+    -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (token, _principal, password) = root_login(&st).await?;
+        let principal = step_up_principal(&st, &token, password).await?;
         let mut sess = test_session(st, principal.clone());
         let (shutdown, _rx) = tokio::sync::oneshot::channel();
-        sess.subscriptions
+        let previous = sess
+            .subscriptions
             .insert(7, SubscriptionHandle { shutdown });
+        ensure!(
+            previous.is_none(),
+            "test subscription id was already present"
+        );
 
-        let err = subscribe(
+        let err = match subscribe(
             &mut sess,
             &principal,
             7,
             StreamCall {
                 stream: STREAM_STATE_WATCH.into(),
-                input: JsonBytes::from_value(&map_value([(
+                input: json_bytes(&map_value([(
                     "pattern",
                     Value::Str("state://kernel/**".into()),
-                )])),
+                )]))?,
                 scope: Some("test".into()),
                 justification: Some("test stream".into()),
                 ttl_ms: Some(60_000),
@@ -4593,16 +5335,26 @@ mod tests {
             },
         )
         .await
-        .unwrap_err();
-        assert!(matches!(err, ConsoleError::BadRequest(_)));
-        assert!(sess.subscriptions.contains_key(&7));
+        {
+            Ok(_) => bail!("subscription resume unexpectedly replaced existing subscription"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::BadRequest(_)),
+            "unexpected subscription resume error: {err:?}"
+        );
+        ensure!(
+            sess.subscriptions.contains_key(&7),
+            "failed subscription resume removed existing subscription"
+        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn subscription_rejects_vault_or_global_state_patterns() {
-        let st = console_state();
-        let (token, _principal, password) = root_login(&st).await;
-        let principal = step_up_principal(&st, &token, password).await;
+    async fn subscription_rejects_vault_or_global_state_patterns() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (token, _principal, password) = root_login(&st).await?;
+        let principal = step_up_principal(&st, &token, password).await?;
         let (tx, _rx) = mpsc::channel(1);
         let mut sess = WsSession {
             state: st,
@@ -4615,16 +5367,16 @@ mod tests {
             event_tx: tx,
             rate: FrameRate::default(),
         };
-        let err = subscribe(
+        let err = match subscribe(
             &mut sess,
             &principal,
             1,
             StreamCall {
                 stream: STREAM_STATE_WATCH.into(),
-                input: JsonBytes::from_value(&map_value([(
+                input: json_bytes(&map_value([(
                     "pattern",
                     Value::Str("state://vault/**".into()),
-                )])),
+                )]))?,
                 scope: Some("test".into()),
                 justification: Some("test stream".into()),
                 ttl_ms: Some(60_000),
@@ -4632,19 +5384,22 @@ mod tests {
             },
         )
         .await
-        .unwrap_err();
-        assert!(matches!(err, ConsoleError::BadRequest(_)));
+        {
+            Ok(_) => bail!("vault subscription pattern unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::BadRequest(_)),
+            "unexpected vault subscription error: {err:?}"
+        );
 
-        let err = subscribe(
+        let err = match subscribe(
             &mut sess,
             &principal,
             2,
             StreamCall {
                 stream: STREAM_STATE_WATCH.into(),
-                input: JsonBytes::from_value(&map_value([(
-                    "pattern",
-                    Value::Str("state://**".into()),
-                )])),
+                input: json_bytes(&map_value([("pattern", Value::Str("state://**".into()))]))?,
                 scope: Some("test".into()),
                 justification: Some("test stream".into()),
                 ttl_ms: Some(60_000),
@@ -4652,63 +5407,65 @@ mod tests {
             },
         )
         .await
-        .unwrap_err();
-        assert!(matches!(err, ConsoleError::BadRequest(_)));
+        {
+            Ok(_) => bail!("global state subscription pattern unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::BadRequest(_)),
+            "unexpected global subscription error: {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn origin_host_and_port_must_match_by_default() {
+    fn origin_host_and_port_must_match_by_default() -> anyhow::Result<()> {
         let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, "console.local:9443".parse().unwrap());
-        headers.insert(
-            header::ORIGIN,
-            "https://console.local:9443".parse().unwrap(),
-        );
+        headers.insert(header::HOST, "console.local:9443".parse()?);
+        headers.insert(header::ORIGIN, "https://console.local:9443".parse()?);
         let cfg = ConsoleTransportSecurityConfig::default();
-        assert!(validate_upgrade_headers(&headers, None, &cfg).is_ok());
-        headers.insert(
-            header::ORIGIN,
-            "https://console.local:8080".parse().unwrap(),
+        validate_upgrade_headers(&headers, None, &cfg)
+            .map_err(|message| anyhow::anyhow!(message))?;
+        headers.insert(header::ORIGIN, "https://console.local:8080".parse()?);
+        ensure!(
+            validate_upgrade_headers(&headers, None, &cfg).is_err(),
+            "origin port mismatch was accepted"
         );
-        assert!(validate_upgrade_headers(&headers, None, &cfg).is_err());
-        headers.insert(
-            header::ORIGIN,
-            "https://attacker.local:9443".parse().unwrap(),
+        headers.insert(header::ORIGIN, "https://attacker.local:9443".parse()?);
+        ensure!(
+            validate_upgrade_headers(&headers, None, &cfg).is_err(),
+            "origin host mismatch was accepted"
         );
-        assert!(validate_upgrade_headers(&headers, None, &cfg).is_err());
+        Ok(())
     }
 
     #[test]
-    fn ignore_origin_port_relaxation_allows_only_port_mismatch() {
+    fn ignore_origin_port_relaxation_allows_only_port_mismatch() -> anyhow::Result<()> {
         let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, "console.local:9443".parse().unwrap());
-        headers.insert(
-            header::ORIGIN,
-            "https://console.local:8080".parse().unwrap(),
-        );
+        headers.insert(header::HOST, "console.local:9443".parse()?);
+        headers.insert(header::ORIGIN, "https://console.local:8080".parse()?);
         let cfg = ConsoleTransportSecurityConfig {
             unsafe_relaxations: vec![ConsoleUnsafeTransportRelaxation::IgnoreOriginPort],
             ..ConsoleTransportSecurityConfig::default()
         };
-        assert!(validate_upgrade_headers(&headers, None, &cfg).is_ok());
-        headers.insert(
-            header::ORIGIN,
-            "https://attacker.local:8080".parse().unwrap(),
+        validate_upgrade_headers(&headers, None, &cfg)
+            .map_err(|message| anyhow::anyhow!(message))?;
+        headers.insert(header::ORIGIN, "https://attacker.local:8080".parse()?);
+        ensure!(
+            validate_upgrade_headers(&headers, None, &cfg).is_err(),
+            "origin host mismatch was accepted by port relaxation"
         );
-        assert!(validate_upgrade_headers(&headers, None, &cfg).is_err());
+        Ok(())
     }
 
     #[test]
-    fn trusted_proxy_uses_forwarded_external_host() {
+    fn trusted_proxy_uses_forwarded_external_host() -> anyhow::Result<()> {
         let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, "127.0.0.1:9000".parse().unwrap());
-        headers.insert(
-            header::ORIGIN,
-            "https://console.example.com".parse().unwrap(),
-        );
-        headers.insert("x-forwarded-host", "console.example.com".parse().unwrap());
-        headers.insert("x-forwarded-proto", "https".parse().unwrap());
-        let proxy_ip = "127.0.0.1".parse().unwrap();
+        headers.insert(header::HOST, "127.0.0.1:9000".parse()?);
+        headers.insert(header::ORIGIN, "https://console.example.com".parse()?);
+        headers.insert("x-forwarded-host", "console.example.com".parse()?);
+        headers.insert("x-forwarded-proto", "https".parse()?);
+        let proxy_ip = "127.0.0.1".parse()?;
         let cfg = ConsoleTransportSecurityConfig {
             mode: ConsoleTransportSecurityMode::TrustedReverseProxy,
             trusted_proxy: ConsoleTrustedProxyConfig {
@@ -4718,17 +5475,142 @@ mod tests {
             unsafe_relaxations: Vec::new(),
         };
         let peer = SocketAddr::new(proxy_ip, 12345);
-        assert!(validate_upgrade_headers(&headers, Some(peer), &cfg).is_ok());
-        let untrusted_peer = SocketAddr::new("127.0.0.2".parse().unwrap(), 12345);
-        assert!(validate_upgrade_headers(&headers, Some(untrusted_peer), &cfg).is_err());
+        validate_upgrade_headers(&headers, Some(peer), &cfg)
+            .map_err(|message| anyhow::anyhow!(message))?;
+        let untrusted_peer = SocketAddr::new("127.0.0.2".parse()?, 12345);
+        ensure!(
+            validate_upgrade_headers(&headers, Some(untrusted_peer), &cfg).is_err(),
+            "untrusted proxy peer was accepted"
+        );
+        Ok(())
     }
 
     #[test]
-    fn origin_and_host_are_required() {
+    fn invalid_origin_headers_are_rejected() -> anyhow::Result<()> {
+        let cfg = ConsoleTransportSecurityConfig::default();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            axum::http::HeaderValue::from_static("console.local:9443"),
+        );
+        headers.insert(header::ORIGIN, invalid_header_value()?);
+        let message = match validate_upgrade_headers(&headers, None, &cfg) {
+            Ok(()) => bail!("invalid origin header was accepted"),
+            Err(message) => message,
+        };
+        ensure!(
+            message.contains("origin header is malformed"),
+            "unexpected invalid origin message: {message}"
+        );
+
+        headers.insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static("https://console.local:9443"),
+        );
+        headers.insert(header::HOST, invalid_header_value()?);
+        let message = match validate_upgrade_headers(&headers, None, &cfg) {
+            Ok(()) => bail!("invalid host header was accepted"),
+            Err(message) => message,
+        };
+        ensure!(
+            message.contains("host header is malformed"),
+            "unexpected invalid host message: {message}"
+        );
+
+        headers.insert(
+            header::HOST,
+            axum::http::HeaderValue::from_static("console.local:999999"),
+        );
+        let message = match validate_upgrade_headers(&headers, None, &cfg) {
+            Ok(()) => bail!("invalid host port was accepted"),
+            Err(message) => message,
+        };
+        ensure!(
+            message.contains("host header is malformed"),
+            "unexpected invalid host port message: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_forwarded_headers_are_rejected() -> anyhow::Result<()> {
+        let proxy_ip = std::net::IpAddr::from([127, 0, 0, 1]);
+        let peer = SocketAddr::new(proxy_ip, 12345);
+        let cfg = ConsoleTransportSecurityConfig {
+            mode: ConsoleTransportSecurityMode::TrustedReverseProxy,
+            trusted_proxy: ConsoleTrustedProxyConfig {
+                peers: vec![proxy_ip],
+                ..ConsoleTrustedProxyConfig::default()
+            },
+            unsafe_relaxations: Vec::new(),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            axum::http::HeaderValue::from_static("127.0.0.1:9000"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            axum::http::HeaderValue::from_static("https://console.example.com"),
+        );
+        headers.insert("x-forwarded-host", invalid_header_value()?);
+        headers.insert(
+            "x-forwarded-proto",
+            axum::http::HeaderValue::from_static("https"),
+        );
+        let message = match validate_upgrade_headers(&headers, Some(peer), &cfg) {
+            Ok(()) => bail!("invalid forwarded host header was accepted"),
+            Err(message) => message,
+        };
+        ensure!(
+            message.contains("x-forwarded-host header is malformed"),
+            "unexpected forwarded host message: {message}"
+        );
+
+        headers.insert(
+            "x-forwarded-host",
+            axum::http::HeaderValue::from_static("console.example.com"),
+        );
+        headers.insert("x-forwarded-proto", invalid_header_value()?);
+        let message = match validate_upgrade_headers(&headers, Some(peer), &cfg) {
+            Ok(()) => bail!("invalid forwarded proto header was accepted"),
+            Err(message) => message,
+        };
+        ensure!(
+            message.contains("x-forwarded-proto header is malformed"),
+            "unexpected forwarded proto message: {message}"
+        );
+
+        headers.insert(
+            "x-forwarded-proto",
+            axum::http::HeaderValue::from_static("ftp"),
+        );
+        let message = match validate_upgrade_headers(&headers, Some(peer), &cfg) {
+            Ok(()) => bail!("unsupported forwarded proto header was accepted"),
+            Err(message) => message,
+        };
+        ensure!(
+            message.contains("x-forwarded-proto header is unsupported"),
+            "unexpected unsupported forwarded proto message: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn origin_and_host_are_required() -> anyhow::Result<()> {
         let mut headers = HeaderMap::new();
         let cfg = ConsoleTransportSecurityConfig::default();
-        assert!(validate_upgrade_headers(&headers, None, &cfg).is_err());
-        headers.insert(header::ORIGIN, "https://console.local".parse().unwrap());
-        assert!(validate_upgrade_headers(&headers, None, &cfg).is_err());
+        ensure!(
+            validate_upgrade_headers(&headers, None, &cfg).is_err(),
+            "upgrade without origin and host was accepted"
+        );
+        headers.insert(header::ORIGIN, "https://console.local".parse()?);
+        ensure!(
+            validate_upgrade_headers(&headers, None, &cfg).is_err(),
+            "upgrade without host was accepted"
+        );
+        Ok(())
     }
 }

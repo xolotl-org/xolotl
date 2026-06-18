@@ -58,18 +58,26 @@ impl StepTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, ensure};
 
     #[test]
-    fn install_and_invoke_step() {
+    fn install_and_invoke_step() -> anyhow::Result<()> {
         let t = StepTable::new();
         let pid = ProcessId::new(1);
         t.install(pid, "double", |v, _| match v {
             Value::Int(i) => DoNode::pure(Value::Int(i * 2)),
             _ => DoNode::pure(Value::Null),
         });
-        let f = t.get(pid, "double").unwrap();
-        assert_eq!(f(Value::Int(21), None), DoNode::pure(Value::Int(42)));
+        let f = t.get(pid, "double").context("missing installed step")?;
+        ensure!(
+            f(Value::Int(21), None) == DoNode::pure(Value::Int(42)),
+            "step output mismatch"
+        );
         // Step is process-scoped: another process doesn't see it.
-        assert!(t.get(ProcessId::new(2), "double").is_none());
+        ensure!(
+            t.get(ProcessId::new(2), "double").is_none(),
+            "step leaked across process scope"
+        );
+        Ok(())
     }
 }

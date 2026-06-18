@@ -295,85 +295,123 @@ fn hash_graph(graph: &ExecutionGraph) -> Result<[u8; 32], CompileError> {
 mod tests {
     use super::*;
     use crate::graph::{OperationTemplate, StepRef};
+    use anyhow::{Context, anyhow, bail, ensure};
     use nexus_types::{OutputMode, Path, ProcessId, ResourceName};
 
     fn s(name: &str) -> StepRef {
         StepRef::new(ProcessId::new(1), name)
     }
 
-    fn op(path: &str) -> OperationTemplate {
-        OperationTemplate {
-            target: ResourceName::new(Path::parse(path).unwrap()),
+    fn op(path: &str) -> anyhow::Result<OperationTemplate> {
+        Ok(OperationTemplate {
+            target: ResourceName::new(
+                Path::parse(path)
+                    .map_err(|error| anyhow!("path parse failed for {path}: {error}"))?,
+            ),
             method: "invoke".into(),
             method_id: None,
             output: OutputMode::Unary,
             literal_input: None,
-        }
+        })
     }
 
     #[test]
-    fn pure_compiles_to_single_node() {
-        let g = compile_do(&DoNode::pure(Value::Int(1))).unwrap();
-        assert_eq!(g.len(), 1);
-        assert_eq!(g.root, NodeId::new(0));
-        assert!(matches!(g.node(g.root).unwrap().kind, NodeKind::Pure(_)));
-    }
-
-    #[test]
-    fn node_ids_are_stable_across_recompiles() {
-        let prog = DoNode::op(op("effect://x")).and_then(s("s"));
-        let a = compile_do(&prog).unwrap();
-        let b = compile_do(&prog).unwrap();
-        assert_eq!(
-            a.graph_hash, b.graph_hash,
-            "same program ⇒ same hash (stable CausalPosition)"
+    fn pure_compiles_to_single_node() -> anyhow::Result<()> {
+        let g = compile_do(&DoNode::pure(Value::Int(1)))?;
+        ensure!(g.len() == 1, "unexpected graph length: {}", g.len());
+        ensure!(g.root == NodeId::new(0), "unexpected root: {:?}", g.root);
+        let root = g.node(g.root).context("missing root node")?;
+        ensure!(
+            matches!(&root.kind, NodeKind::Pure(_)),
+            "unexpected root node: {root:?}"
         );
-        assert_eq!(a.nodes.len(), b.nodes.len());
+        Ok(())
+    }
+
+    #[test]
+    fn node_ids_are_stable_across_recompiles() -> anyhow::Result<()> {
+        let prog = DoNode::op(op("effect://x")?).and_then(s("s"));
+        let a = compile_do(&prog)?;
+        let b = compile_do(&prog)?;
+        ensure!(
+            a.graph_hash == b.graph_hash,
+            "graph hash changed: {:?} != {:?}",
+            a.graph_hash,
+            b.graph_hash
+        );
+        ensure!(
+            a.nodes.len() == b.nodes.len(),
+            "node length changed: {} != {}",
+            a.nodes.len(),
+            b.nodes.len()
+        );
         for (na, nb) in a.nodes.iter().zip(&b.nodes) {
-            assert_eq!(na.id, nb.id);
-            assert_eq!(na.kind, nb.kind);
+            ensure!(na.id == nb.id, "node id changed: {na:?} != {nb:?}");
+            ensure!(na.kind == nb.kind, "node kind changed: {na:?} != {nb:?}");
         }
+        Ok(())
     }
 
     #[test]
-    fn and_then_emits_step_with_then_edge() {
-        let g = compile_do(&DoNode::op(op("effect://x")).and_then(s("s"))).unwrap();
-        // node 0: Operation, node 1: Step, edge 0->1 Then
-        assert!(matches!(
-            g.node(NodeId::new(0)).unwrap().kind,
-            NodeKind::Operation(_)
-        ));
-        assert!(matches!(
-            g.node(NodeId::new(1)).unwrap().kind,
-            NodeKind::Step(_)
-        ));
-        assert!(g.edges.iter().any(|e| e.from == NodeId::new(0)
-            && e.to == NodeId::new(1)
-            && e.kind == EdgeKind::Then));
+    fn and_then_emits_step_with_then_edge() -> anyhow::Result<()> {
+        let g = compile_do(&DoNode::op(op("effect://x")?).and_then(s("s")))?;
+        let first = g.node(NodeId::new(0)).context("missing first node")?;
+        ensure!(
+            matches!(&first.kind, NodeKind::Operation(_)),
+            "unexpected first node: {first:?}"
+        );
+        let second = g.node(NodeId::new(1)).context("missing second node")?;
+        ensure!(
+            matches!(&second.kind, NodeKind::Step(_)),
+            "unexpected second node: {second:?}"
+        );
+        ensure!(
+            g.edges.iter().any(|e| e.from == NodeId::new(0)
+                && e.to == NodeId::new(1)
+                && e.kind == EdgeKind::Then),
+            "missing Then edge: {:?}",
+            g.edges
+        );
+        Ok(())
     }
 
     #[test]
-    fn let_use_wires_use_edge() {
+    fn let_use_wires_use_edge() -> anyhow::Result<()> {
         let prog = DoNode::r#let("x", DoNode::pure(Value::Int(5)), DoNode::use_("x"));
-        let g = compile_do(&prog).unwrap();
-        assert!(g.edges.iter().any(|e| e.kind == EdgeKind::Use));
+        let g = compile_do(&prog)?;
+        ensure!(
+            g.edges.iter().any(|e| e.kind == EdgeKind::Use),
+            "missing Use edge: {:?}",
+            g.edges
+        );
+        Ok(())
     }
 
     #[test]
-    fn unbound_use_is_rejected() {
-        let err = compile_do(&DoNode::use_("nope")).unwrap_err();
-        assert_eq!(err, CompileError::UnboundName("nope".into()));
+    fn unbound_use_is_rejected() -> anyhow::Result<()> {
+        let err = match compile_do(&DoNode::use_("nope")) {
+            Ok(graph) => bail!("expected unbound name error, got graph {graph:?}"),
+            Err(error) => error,
+        };
+        ensure!(
+            err == CompileError::UnboundName("nope".into()),
+            "unexpected error: {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn both_join_has_two_arms() {
-        let prog = DoNode::both(DoNode::op(op("effect://a")), DoNode::op(op("effect://b")));
-        let g = compile_do(&prog).unwrap();
+    fn both_join_has_two_arms() -> anyhow::Result<()> {
+        let prog = DoNode::both(DoNode::op(op("effect://a")?), DoNode::op(op("effect://b")?));
+        let g = compile_do(&prog)?;
         let join = g.root;
-        assert!(matches!(
-            g.node(join).unwrap().kind,
-            NodeKind::Join(JoinKind::Both)
-        ));
-        assert_eq!(g.out_edges_of(join, EdgeKind::Arm).count(), 2);
+        let node = g.node(join).context("missing join node")?;
+        ensure!(
+            matches!(&node.kind, NodeKind::Join(JoinKind::Both)),
+            "unexpected join node: {node:?}"
+        );
+        let arms = g.out_edges_of(join, EdgeKind::Arm).count();
+        ensure!(arms == 2, "unexpected arm count: {arms}");
+        Ok(())
     }
 }

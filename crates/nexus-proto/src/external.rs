@@ -5,7 +5,7 @@
 /// Top-level frame envelope.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExternalFrame {
-    #[prost(oneof = "external_frame::Frame", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12")]
+    #[prost(oneof = "external_frame::Frame", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12")]
     pub frame: ::core::option::Option<external_frame::Frame>,
 }
 /// Nested message and enum types in `ExternalFrame`.
@@ -30,8 +30,6 @@ pub mod external_frame {
         Invoke(super::Invoke),
         #[prost(message, tag = "9")]
         InvokeResult(super::InvokeResult),
-        #[prost(message, tag = "10")]
-        ProviderReady(super::ProviderReady),
         #[prost(message, tag = "11")]
         Control(super::ControlFrame),
         #[prost(message, tag = "12")]
@@ -223,21 +221,6 @@ pub mod invoke_result {
         Error(super::ErrorInfo),
     }
 }
-/// Provider client to daemon: initialization complete, declare capabilities.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ProviderReady {
-    #[prost(message, repeated, tag = "1")]
-    pub provides: ::prost::alloc::vec::Vec<EffectHandlerSpec>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct EffectHandlerSpec {
-    #[prost(string, tag = "1")]
-    pub path: ::prost::alloc::string::String,
-    #[prost(enumeration = "super::Purity", tag = "2")]
-    pub purity: i32,
-    #[prost(string, optional, tag = "3")]
-    pub description: ::core::option::Option<::prost::alloc::string::String>,
-}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ControlFrame {
     #[prost(oneof = "control_frame::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
@@ -348,7 +331,7 @@ pub enum ExternalRole {
     Unspecified = 0,
     /// Source: provides a state:// inbound event stream.
     Source = 1,
-    /// Provider: registers effect:// handlers (plugin, MCP server, remote device).
+    /// Provider: serves effect:// capabilities declared by its projection.
     Provider = 2,
 }
 impl ExternalRole {

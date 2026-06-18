@@ -4,7 +4,7 @@ External gateway 把进程外程序以 Provider 或 Source projection 接入 Nex
 
 ## 角色
 
-Provider session 暴露远端 effect handler。ready Provider 会报告自己能服务的投影 effect；daemon 为该 ready session 注册这些 binding，并且只向已注册 effect 下发 invocation。
+Provider session 暴露由所选 installation projection 声明的远端 effect handler。`RoleReady` 确认 daemon 选定的 session context 后，daemon 为该 ready session 注册这些 projection binding，并且只向已注册 effect 下发 invocation。
 
 Source session 发送入站事件，也可以接收 daemon 的 outbound command。无论 Source event 通过 gRPC 还是 WebSocket 到达，都会进入同一套 schema、policy、capacity、dedupe 和 taint 路径。
 
@@ -82,7 +82,7 @@ session record 必须匹配连接方的 installation id 和 role。daemon 会在
 
 ## Provider Flow
 
-Provider invoke 只会发送给 ready session 已报告的投影 effect，且 invoke input 必须匹配 Provider projection 的 `input_schema`。Provider result 只接受 daemon 已登记的在途 invocation。result 必须来自同一个 ready Provider session generation，在 invocation deadline 前到达，并且不超过该 invocation 登记的结果大小限制。
+Provider invoke 只会发送给 installation projection 声明并已为 ready session 注册的投影 effect，且 invoke input 必须匹配 Provider projection 的 `input_schema`。Provider result 只接受 daemon 已登记的在途 invocation。result 必须来自同一个 ready Provider session generation，在 invocation deadline 前到达，并且不超过该 invocation 登记的结果大小限制。
 
 invocation deadline 到达时，daemon 会 best-effort 发送 `ProviderCancel` control frame，再在本地释放 pending invocation。这是协作取消信号，不承诺撤销已经发生的外部副作用。
 

@@ -9,8 +9,8 @@
 use crate::auth::{self, ConsolePrincipal};
 use crate::state::ConsoleState;
 use nexus_types::{
-    AuditRules, Capability, ExternalInstallationDef, ExternalProjectionDef, ManifestDef, Path,
-    TrustLevel, Value,
+    AuditRules, Capability, KernelConfigAdmission, Path, Value,
+    admit_kernel_config as admit_shared_kernel_config,
 };
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
@@ -19,7 +19,7 @@ use thiserror::Error;
 
 /// Errors raised by console management state helpers.
 #[derive(Debug, Error)]
-pub enum MgmtError {
+pub(crate) enum MgmtError {
     /// Path is outside the console-manageable kernel state prefix.
     #[error("path is not under the manageable state://kernel/ prefix: {0}")]
     NotManageable(String),
@@ -57,7 +57,7 @@ fn ensure_manageable(path: &Path) -> Result<(), MgmtError> {
 }
 
 /// Read a management config value.
-pub async fn inspect(
+pub(crate) async fn inspect(
     state: &Arc<ConsoleState>,
     principal: &ConsolePrincipal,
     path: &str,
@@ -72,8 +72,19 @@ pub async fn inspect(
         .map_err(|error| MgmtError::Operation(error.to_string()))
 }
 
+/// Read a config value through the generic config action family.
+pub(crate) async fn inspect_config(
+    state: &Arc<ConsoleState>,
+    principal: &ConsolePrincipal,
+    path: &str,
+) -> Result<Option<Value>, MgmtError> {
+    let p = Path::parse(path)?;
+    reject_dedicated_runtime_config_path(&p)?;
+    inspect(state, principal, path).await
+}
+
 /// List the keys under a management prefix (inspect a subtree).
-pub async fn inspect_prefix(
+pub(crate) async fn inspect_prefix(
     state: &Arc<ConsoleState>,
     principal: &ConsolePrincipal,
     prefix: &str,
@@ -92,18 +103,61 @@ pub async fn inspect_prefix(
         .collect())
 }
 
+/// List config values through the generic config action family.
+pub(crate) async fn inspect_config_prefix(
+    state: &Arc<ConsoleState>,
+    principal: &ConsolePrincipal,
+    prefix: &str,
+) -> Result<Vec<(String, Value)>, MgmtError> {
+    let p = Path::parse(prefix)?;
+    reject_dedicated_runtime_config_prefix(&p)?;
+    inspect_prefix(state, principal, prefix).await
+}
+
 /// Change config with a CAS state write on the expected prior version.
 /// `expected_version` of `None` means "create if absent" (install);
 /// `Some(v)` means "update only if current version == v" (reconfigure). The
 /// value's `version` field is bumped on write.
-pub async fn write_config(
+pub(crate) async fn write_config(
     state: &Arc<ConsoleState>,
     principal: &ConsolePrincipal,
     path: &str,
-    mut value: Value,
+    value: Value,
     expected_version: Option<u64>,
 ) -> Result<(), MgmtError> {
     let p = Path::parse(path)?;
+    if is_dedicated_runtime_config_path(&p) {
+        return Err(MgmtError::Admission(
+            "runtime config path must use its dedicated console action".into(),
+        ));
+    }
+    write_config_inner(state, principal, p, value, expected_version).await
+}
+
+/// Change config for a path owned by a dedicated Console action family.
+pub(crate) async fn write_dedicated_config(
+    state: &Arc<ConsoleState>,
+    principal: &ConsolePrincipal,
+    path: &str,
+    value: Value,
+    expected_version: Option<u64>,
+) -> Result<(), MgmtError> {
+    let p = Path::parse(path)?;
+    if !is_dedicated_runtime_config_path(&p) {
+        return Err(MgmtError::Admission(
+            "dedicated console action cannot write generic config path".into(),
+        ));
+    }
+    write_config_inner(state, principal, p, value, expected_version).await
+}
+
+async fn write_config_inner(
+    state: &Arc<ConsoleState>,
+    principal: &ConsolePrincipal,
+    p: Path,
+    mut value: Value,
+    expected_version: Option<u64>,
+) -> Result<(), MgmtError> {
     ensure_manageable(&p)?;
     auth::authorize_path(&state.state, principal, "write", &p, Some(&value)).await?;
 
@@ -112,7 +166,7 @@ pub async fn write_config(
         .read(&p)
         .await
         .map_err(|error| MgmtError::Operation(error.to_string()))?;
-    let current_version = current.as_ref().and_then(value_version);
+    let current_version = current.as_ref().map(value_version).transpose()?.flatten();
     if current_version != expected_version {
         return Err(MgmtError::Conflict {
             expected: expected_version,
@@ -141,11 +195,72 @@ pub async fn write_config(
     Ok(())
 }
 
-fn value_version(v: &Value) -> Option<u64> {
-    v.as_map()
-        .and_then(|m| m.get("version"))
-        .and_then(|x| x.as_int())
-        .and_then(|i| u64::try_from(i).ok())
+pub(crate) fn is_dedicated_runtime_config_path(path: &Path) -> bool {
+    let segs = path.segments();
+    if path.scheme() != "state" || segs.first().map(|s| s.as_str()) != Some("kernel") {
+        return false;
+    }
+    matches!(
+        segs.get(1).map(|s| s.as_str()),
+        Some(
+            "console"
+                | "external-installations"
+                | "external-pairings"
+                | "external-sessions"
+                | "external-credential-revocations"
+                | "inference"
+                | "manifests"
+                | "procs"
+        )
+    ) || (segs.get(1).map(|s| s.as_str()) == Some("projections")
+        && segs.get(2).map(|s| s.as_str()) == Some("in-process"))
+        || (segs.get(1).map(|s| s.as_str()) == Some("routing")
+            && segs.get(2).map(|s| s.as_str()) == Some("inference"))
+}
+
+fn reject_dedicated_runtime_config_path(path: &Path) -> Result<(), MgmtError> {
+    if is_dedicated_runtime_config_path(path) {
+        return Err(MgmtError::Admission(
+            "runtime config path must use its dedicated console action".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_dedicated_runtime_config_prefix(path: &Path) -> Result<(), MgmtError> {
+    let segs = path.segments();
+    let contains_dedicated_subtree = if path.scheme() == "state" {
+        match segs {
+            [kernel] => kernel.as_str() == "kernel",
+            [kernel, routing] => {
+                kernel.as_str() == "kernel"
+                    && (routing.as_str() == "routing" || routing.as_str() == "projections")
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    if contains_dedicated_subtree {
+        return Err(MgmtError::Admission(
+            "runtime config path must use its dedicated console action".into(),
+        ));
+    }
+    reject_dedicated_runtime_config_path(path)
+}
+
+fn value_version(v: &Value) -> Result<Option<u64>, MgmtError> {
+    let Some(version) = v.as_map().and_then(|m| m.get("version")) else {
+        return Ok(None);
+    };
+    let Some(version) = version.as_int() else {
+        return Err(MgmtError::Admission(
+            "config version must be an integer".into(),
+        ));
+    };
+    let version = u64::try_from(version)
+        .map_err(|_| MgmtError::Admission("config version must be nonnegative".into()))?;
+    Ok(Some(version))
 }
 
 fn set_version(v: &mut Value, version: u64) -> Result<(), MgmtError> {
@@ -167,18 +282,13 @@ async fn admit_kernel_config(
         return Err(MgmtError::NotManageable(path.to_string()));
     }
 
+    match admit_shared_kernel_config(path, value) {
+        Ok(KernelConfigAdmission::Admitted) => return Ok(()),
+        Ok(KernelConfigAdmission::Unhandled) => {}
+        Err(error) => return Err(MgmtError::Admission(error.to_string())),
+    }
+
     match segs {
-        s if is_path(s, &["kernel", "external-installations"]) => {
-            let id = required_tail(s, "external installation id")?;
-            admit_extension_installation(id, value)
-        }
-        s if is_path_with_tail(s, &["kernel", "external-projections"], 2) => {
-            admit_extension_projection(s, value)
-        }
-        s if is_path(s, &["kernel", "manifests"]) => {
-            let platform = required_tail(s, "manifest platform")?;
-            admit_manifest_def(platform, value)
-        }
         s if is_path(s, &["kernel", "console", "users"]) => {
             let username = required_tail(s, "console username")?;
             auth::validate_username(username)
@@ -203,15 +313,6 @@ async fn admit_kernel_config(
 
 fn is_path<S: AsRef<str>>(segs: &[S], prefix: &[&str]) -> bool {
     segs.len() == prefix.len() + 1
-        && segs
-            .iter()
-            .take(prefix.len())
-            .zip(prefix.iter())
-            .all(|(actual, expected)| actual.as_ref() == *expected)
-}
-
-fn is_path_with_tail<S: AsRef<str>>(segs: &[S], prefix: &[&str], tail_len: usize) -> bool {
-    segs.len() == prefix.len() + tail_len
         && segs
             .iter()
             .take(prefix.len())
@@ -434,144 +535,23 @@ fn decode_config_value<T: DeserializeOwned>(value: &Value, label: &str) -> Resul
         .map_err(|e| MgmtError::Admission(format!("{label} is malformed: {e}")))
 }
 
-fn admit_extension_installation(path_id: &str, value: &Value) -> Result<(), MgmtError> {
-    let def: ExternalInstallationDef = decode_config_value(value, "ExternalInstallationDef")?;
-    if def.id != path_id {
-        return Err(MgmtError::Admission(format!(
-            "ExternalInstallationDef.id {:?} does not match path id {:?}",
-            def.id, path_id
-        )));
-    }
-    admit_json_schema(&def.config_schema, "ExternalInstallationDef.config_schema")?;
-    def.validate_admission()
-        .map_err(|e| MgmtError::Admission(format!("ExternalInstallationDef admission failed: {e}")))
-}
-
-fn admit_extension_projection<S: AsRef<str>>(segs: &[S], value: &Value) -> Result<(), MgmtError> {
-    let installation_id = segs
-        .get(2)
-        .map(|s| s.as_ref())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| MgmtError::Admission("missing external installation id".into()))?;
-    let projection_id = segs
-        .get(3)
-        .map(|s| s.as_ref())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| MgmtError::Admission("missing external projection id".into()))?;
-    let def: ExternalProjectionDef = decode_config_value(value, "ExternalProjectionDef")?;
-    if def.id != projection_id {
-        return Err(MgmtError::Admission(format!(
-            "ExternalProjectionDef.id {:?} does not match path projection {:?}",
-            def.id, projection_id
-        )));
-    }
-    def.validate_admission(
-        installation_id,
-        TrustLevel::Sandboxed,
-        &nexus_types::Transport::Grpc { endpoint: None },
-    )
-    .map_err(|e| MgmtError::Admission(format!("ExternalProjectionDef admission failed: {e}")))
-}
-
-fn admit_manifest_def(path_platform: &str, value: &Value) -> Result<(), MgmtError> {
-    let def: ManifestDef = decode_config_value(value, "ManifestDef")?;
-    if def.platform != path_platform {
-        return Err(MgmtError::Admission(format!(
-            "ManifestDef.platform {:?} does not match path platform {:?}",
-            def.platform, path_platform
-        )));
-    }
-    if def.platform.trim().is_empty() {
-        return Err(MgmtError::Admission(
-            "ManifestDef.platform must not be empty".into(),
-        ));
-    }
-    if def.version == 0 {
-        return Err(MgmtError::Admission(
-            "ManifestDef.version must be a positive config revision".into(),
-        ));
-    }
-    admit_json_schema(&def.config_schema, "ManifestDef.config_schema")?;
-    if def.supported_transports.is_empty() {
-        return Err(MgmtError::Admission(
-            "ManifestDef.supported_transports must not be empty".into(),
-        ));
-    }
-    if !def
-        .supported_transports
-        .iter()
-        .any(|t| t == &def.default_transport)
-    {
-        return Err(MgmtError::Admission(
-            "ManifestDef.default_transport must be listed in supported_transports".into(),
-        ));
-    }
-    if def.projections.is_empty() {
-        return Err(MgmtError::Admission(
-            "ManifestDef.projections must not be empty".into(),
-        ));
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for projection in &def.projections {
-        if !seen.insert(projection.id.clone()) {
-            return Err(MgmtError::Admission(format!(
-                "ManifestDef contains duplicate projection id {:?}",
-                projection.id
-            )));
-        }
-        projection
-            .validate_admission(&def.platform, TrustLevel::Sandboxed, &def.default_transport)
-            .map_err(|e| {
-                MgmtError::Admission(format!("ManifestDef projection admission failed: {e}"))
-            })?;
-        for cap in &projection.provides {
-            admit_manifest_effect(&cap.effect_path)?;
-        }
-    }
-    Ok(())
-}
-
-fn admit_json_schema(schema: &Value, label: &str) -> Result<(), MgmtError> {
-    match schema {
-        Value::Null | Value::Map(_) => Ok(()),
-        _ => Err(MgmtError::Admission(format!(
-            "{label} must be null or a JSON object"
-        ))),
-    }
-}
-
-fn admit_manifest_effect(effect_path: &str) -> Result<(), MgmtError> {
-    let effect = Path::parse(effect_path).map_err(|e| {
-        MgmtError::Admission(format!(
-            "ManifestDef projection effect path is malformed: {e}"
-        ))
-    })?;
-    if effect.scheme() != "effect" || effect.segments().is_empty() {
-        return Err(MgmtError::Admission(
-            "ManifestDef projection effects must be effect:// paths".into(),
-        ));
-    }
-    if effect.segments().first().map(|s| s.as_str()) == Some("kernel") {
-        return Err(MgmtError::Admission(
-            "ManifestDef projection effects must not target effect://kernel/*".into(),
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::{BootstrapOutcome, LoginRequest, RootProvisioning, bootstrap_root_account};
-    use nexus_actors::{StandardConfig, install_standard};
+    use anyhow::{Context, bail, ensure};
     use nexus_kernel::Bootstrap;
-    use nexus_types::{EffectCapability, Purity, Role, Transport, TrustLevel};
+    use nexus_standard::{StandardConfig, install_standard};
+    use nexus_types::{
+        EffectCapability, ExternalInstallationDef, ExternalProjectionDef, InferenceApiDialect,
+        InferenceAuthRef, InferenceBackendDef, Purity, Role, Transport, TrustLevel,
+    };
     use std::collections::BTreeMap;
 
-    fn console_state() -> Arc<ConsoleState> {
+    fn console_state() -> anyhow::Result<Arc<ConsoleState>> {
         let boot = Arc::new(Bootstrap::in_memory());
-        assert!(install_standard(&boot, &StandardConfig::default()).is_ok());
-        ConsoleState::shared(boot)
+        install_standard(&boot, &StandardConfig::default())?;
+        Ok(ConsoleState::shared(boot)?)
     }
 
     fn obj(version: Option<u64>) -> Value {
@@ -583,7 +563,7 @@ mod tests {
         Value::Map(m)
     }
 
-    fn extension_installation(id: &str, version: u64) -> Value {
+    fn extension_installation(id: &str, version: u64) -> anyhow::Result<Value> {
         let def = ExternalInstallationDef {
             id: id.into(),
             platform: id.into(),
@@ -597,7 +577,7 @@ mod tests {
             projections: vec![ExternalProjectionDef {
                 id: "provider".into(),
                 role: Role::Provider,
-                namespace: Some(Path::parse(&format!("effect://external-provider/{id}")).unwrap()),
+                namespace: Some(Path::parse(&format!("effect://external-provider/{id}"))?),
                 provides: vec![EffectCapability::new(
                     format!("effect://external-provider/{id}/search"),
                     Purity::Idempotent,
@@ -607,10 +587,29 @@ mod tests {
             }],
             version,
         };
-        serde_json::from_value(serde_json::to_value(def).unwrap()).unwrap()
+        Ok(serde_json::from_value(serde_json::to_value(def)?)?)
     }
 
-    fn instant_messaging_platform_installation(version: u64) -> Value {
+    fn value_from<T: serde::Serialize>(value: &T) -> anyhow::Result<Value> {
+        Ok(serde_json::from_value(serde_json::to_value(value)?)?)
+    }
+
+    fn inference_backend(id: &str) -> anyhow::Result<Value> {
+        value_from(&InferenceBackendDef {
+            id: id.into(),
+            dialect: InferenceApiDialect::OpenAiChatCompletions,
+            base_url: "https://api.deepseek.com".into(),
+            auth: InferenceAuthRef::BearerToken {
+                token_ref: Path::parse("state://vault/inference/deepseek/api_key")?,
+            },
+            default_headers: BTreeMap::new(),
+            request_overrides: BTreeMap::new(),
+            api_version: None,
+            version: 0,
+        })
+    }
+
+    fn instant_messaging_platform_installation(version: u64) -> anyhow::Result<Value> {
         let def = nexus_types::ExternalInstallationDef {
             id: "instant_messaging_platform".into(),
             platform: "instant_messaging_platform".into(),
@@ -628,8 +627,7 @@ mod tests {
                         sink: nexus_types::sandboxed_source_event_sink_path(
                             "instant_messaging_platform",
                             "source",
-                        )
-                        .unwrap(),
+                        )?,
                         purity: Purity::Effectful,
                         event_schema: None,
                         max_inline_payload_bytes: 65_536,
@@ -647,10 +645,9 @@ mod tests {
                 nexus_types::ExternalProjectionDef {
                     id: "provider".into(),
                     role: Role::Provider,
-                    namespace: Some(
-                        Path::parse("effect://external-provider/instant_messaging_platform")
-                            .unwrap(),
-                    ),
+                    namespace: Some(Path::parse(
+                        "effect://external-provider/instant_messaging_platform",
+                    )?),
                     provides: vec![EffectCapability::new(
                         "effect://external-provider/instant_messaging_platform/send_text",
                         Purity::Effectful,
@@ -661,15 +658,13 @@ mod tests {
             ],
             version,
         };
-        serde_json::from_value(serde_json::to_value(def).unwrap()).unwrap()
+        Ok(serde_json::from_value(serde_json::to_value(def)?)?)
     }
 
-    async fn root_principal(st: &Arc<ConsoleState>) -> ConsolePrincipal {
-        let outcome = bootstrap_root_account(&st.boot, RootProvisioning::default())
-            .await
-            .unwrap();
+    async fn root_principal(st: &Arc<ConsoleState>) -> anyhow::Result<ConsolePrincipal> {
+        let outcome = bootstrap_root_account(&st.boot, RootProvisioning::default()).await?;
         let BootstrapOutcome::CreatedRandomPassword { password, .. } = outcome else {
-            panic!("expected root bootstrap");
+            bail!("expected root bootstrap, got {outcome:?}");
         };
         let login = st
             .auth
@@ -682,141 +677,323 @@ mod tests {
                 },
                 "test".into(),
             )
-            .await
-            .unwrap();
-        st.auth
-            .authenticate_token(&st.boot, &login.token)
-            .await
-            .unwrap()
+            .await?;
+        Ok(st.auth.authenticate_token(&st.boot, &login.token).await?)
+    }
+
+    fn expect_admission_message<T>(
+        result: Result<T, MgmtError>,
+        expected: &str,
+    ) -> anyhow::Result<()> {
+        match result {
+            Err(MgmtError::Admission(message)) if message == expected => Ok(()),
+            Err(err) => bail!("expected admission error {expected:?}, got {err:?}"),
+            Ok(_) => bail!("expected admission error {expected:?}, got success"),
+        }
+    }
+
+    fn expect_admission<T>(result: Result<T, MgmtError>) -> anyhow::Result<()> {
+        match result {
+            Err(MgmtError::Admission(_)) => Ok(()),
+            Err(err) => bail!("expected admission error, got {err:?}"),
+            Ok(_) => bail!("expected admission error, got success"),
+        }
+    }
+
+    fn expect_not_manageable<T>(result: Result<T, MgmtError>) -> anyhow::Result<()> {
+        match result {
+            Err(MgmtError::NotManageable(_)) => Ok(()),
+            Err(err) => bail!("expected not-manageable error, got {err:?}"),
+            Ok(_) => bail!("expected not-manageable error, got success"),
+        }
     }
 
     #[tokio::test]
-    async fn non_kernel_paths_are_rejected() {
-        let st = console_state();
-        let root = root_principal(&st).await;
-        assert!(matches!(
-            inspect(&st, &root, "state://memory/alice").await,
-            Err(MgmtError::NotManageable(_))
-        ));
-        assert!(matches!(
+    async fn non_kernel_paths_are_rejected() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let root = root_principal(&st).await?;
+        expect_not_manageable(inspect(&st, &root, "state://memory/alice").await)?;
+        expect_not_manageable(
             write_config(&st, &root, "state://vault/secret", obj(None), None).await,
-            Err(MgmtError::NotManageable(_))
-        ));
+        )?;
+        Ok(())
     }
 
     #[test]
-    fn console_user_admission_rejects_unknown_fields() {
+    fn console_user_admission_rejects_unknown_fields() -> anyhow::Result<()> {
         let mut user = BTreeMap::new();
         user.insert("unknown".into(), Value::Bool(true));
 
-        assert!(matches!(
-            admit_console_user("ops", &Value::Map(user)),
-            Err(MgmtError::Admission(message)) if message.contains("unknown field")
-        ));
+        let err = match admit_console_user("ops", &Value::Map(user)) {
+            Ok(()) => bail!("console user with unknown field was admitted"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, MgmtError::Admission(ref message) if message.contains("unknown field")),
+            "unexpected console user admission error: {err:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn console_role_admission_rejects_malformed_grants() {
+    fn console_role_admission_rejects_malformed_grants() -> anyhow::Result<()> {
         let mut role = BTreeMap::new();
         role.insert(
             "grants".into(),
             Value::List(vec![Value::Str("not-a-capability".into())]),
         );
 
-        assert!(matches!(
-            admit_console_role(&Value::Map(role)),
-            Err(MgmtError::Admission(message)) if message.contains("console role.grants")
-        ));
-    }
-
-    #[tokio::test]
-    async fn install_then_reconfigure_with_cas() {
-        let st = console_state();
-        let root = root_principal(&st).await;
-        let path = "state://kernel/external-installations/acme";
-        write_config(&st, &root, path, extension_installation("acme", 0), None)
-            .await
-            .unwrap();
-        let v = inspect(&st, &root, path).await.unwrap().unwrap();
-        assert_eq!(value_version(&v), Some(1));
-        write_config(&st, &root, path, extension_installation("acme", 1), Some(1))
-            .await
-            .unwrap();
-        let v = inspect(&st, &root, path).await.unwrap().unwrap();
-        assert_eq!(value_version(&v), Some(2));
-        assert!(matches!(
-            write_config(&st, &root, path, extension_installation("acme", 1), Some(1)).await,
-            Err(MgmtError::Conflict { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn extension_installation_admission_supports_multi_projection_package() {
-        let st = console_state();
-        let root = root_principal(&st).await;
-        let path = "state://kernel/external-installations/instant_messaging_platform";
-        write_config(
-            &st,
-            &root,
-            path,
-            instant_messaging_platform_installation(0),
-            None,
-        )
-        .await
-        .unwrap();
-        let v = inspect(&st, &root, path).await.unwrap().unwrap();
-        assert_eq!(value_version(&v), Some(1));
-
-        let mut bad = instant_messaging_platform_installation(0);
-        let Value::Map(ref mut m) = bad else {
-            panic!("expected object");
+        let err = match admit_console_role(&Value::Map(role)) {
+            Ok(()) => bail!("console role with malformed grant was admitted"),
+            Err(err) => err,
         };
-        let Value::List(projections) = m.get_mut("projections").unwrap() else {
-            panic!("expected projections");
-        };
-        let Value::Map(provider) = &mut projections[1] else {
-            panic!("expected provider projection");
-        };
-        provider.insert(
-            "provides".into(),
-            Value::List(vec![
-                serde_json::from_value(serde_json::json!({
-                    "effect_path": "effect://external-provider/other/send_text",
-                    "purity": "effectful"
-                }))
-                .unwrap(),
-            ]),
+        ensure!(
+            matches!(err, MgmtError::Admission(ref message) if message.contains("console role.grants")),
+            "unexpected console role admission error: {err:?}"
         );
-        assert!(matches!(
-            write_config(&st, &root, path, bad, Some(1)).await,
-            Err(MgmtError::Admission(_))
-        ));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn removed_external_config_prefix_is_rejected() {
-        let st = console_state();
-        let root = root_principal(&st).await;
-        assert!(matches!(
+    async fn generic_config_write_rejects_dedicated_runtime_paths() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let root = root_principal(&st).await?;
+        expect_admission_message(
             write_config(
                 &st,
                 &root,
-                "state://kernel/external/acme",
-                extension_installation("acme", 0),
+                "state://kernel/external-installations/acme",
+                extension_installation("acme", 0)?,
                 None,
             )
             .await,
-            Err(MgmtError::Admission(_))
-        ));
+            "runtime config path must use its dedicated console action",
+        )?;
+        expect_admission_message(
+            write_config(
+                &st,
+                &root,
+                "state://kernel/projections/in-process/fetch",
+                obj(None),
+                None,
+            )
+            .await,
+            "runtime config path must use its dedicated console action",
+        )?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn unknown_kernel_config_paths_are_rejected() {
-        let st = console_state();
-        let root = root_principal(&st).await;
-        assert!(matches!(
+    async fn generic_config_read_rejects_dedicated_runtime_paths() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let root = root_principal(&st).await?;
+        expect_admission_message(
+            inspect_config(&st, &root, "state://kernel/external-installations/acme").await,
+            "runtime config path must use its dedicated console action",
+        )?;
+        expect_admission_message(
+            inspect_config_prefix(&st, &root, "state://kernel/inference/backends").await,
+            "runtime config path must use its dedicated console action",
+        )?;
+        expect_admission_message(
+            inspect_config_prefix(&st, &root, "state://kernel").await,
+            "runtime config path must use its dedicated console action",
+        )?;
+        expect_admission_message(
+            inspect_config_prefix(&st, &root, "state://kernel/routing").await,
+            "runtime config path must use its dedicated console action",
+        )?;
+        expect_admission_message(
+            inspect_config_prefix(&st, &root, "state://kernel/projections").await,
+            "runtime config path must use its dedicated console action",
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dedicated_config_write_rejects_generic_paths() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let root = root_principal(&st).await?;
+        expect_admission_message(
+            write_dedicated_config(&st, &root, "state://kernel/audit/rules", obj(None), None).await,
+            "dedicated console action cannot write generic config path",
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn install_then_reconfigure_with_cas() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let root = root_principal(&st).await?;
+        let path = "state://kernel/external-installations/acme";
+        write_dedicated_config(&st, &root, path, extension_installation("acme", 0)?, None).await?;
+        let v = inspect(&st, &root, path)
+            .await?
+            .context("installed config missing")?;
+        ensure!(
+            value_version(&v)? == Some(1),
+            "initial install did not advance version to 1"
+        );
+        write_dedicated_config(
+            &st,
+            &root,
+            path,
+            extension_installation("acme", 1)?,
+            Some(1),
+        )
+        .await?;
+        let v = inspect(&st, &root, path)
+            .await?
+            .context("reconfigured config missing")?;
+        ensure!(
+            value_version(&v)? == Some(2),
+            "reconfigure did not advance version to 2"
+        );
+        let stale = write_dedicated_config(
+            &st,
+            &root,
+            path,
+            extension_installation("acme", 1)?,
+            Some(1),
+        )
+        .await;
+        ensure!(
+            matches!(stale, Err(MgmtError::Conflict { .. })),
+            "stale CAS write did not conflict"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_rejects_existing_negative_config_version() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let root = root_principal(&st).await?;
+        let path = Path::parse("state://kernel/external-installations/acme")?;
+        let mut existing = extension_installation("acme", 0)?;
+        let Value::Map(ref mut map) = existing else {
+            bail!("expected object");
+        };
+        map.insert("version".into(), Value::Int(-1));
+        st.state.write_cas(&path, None, existing).await?;
+        let path = path.to_string();
+
+        expect_admission_message(
+            write_dedicated_config(
+                &st,
+                &root,
+                &path,
+                extension_installation("acme", 1)?,
+                Some(1),
+            )
+            .await,
+            "config version must be nonnegative",
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extension_installation_admission_supports_multi_projection_package()
+    -> anyhow::Result<()> {
+        let st = console_state()?;
+        let root = root_principal(&st).await?;
+        let path = "state://kernel/external-installations/instant_messaging_platform";
+        write_dedicated_config(
+            &st,
+            &root,
+            path,
+            instant_messaging_platform_installation(0)?,
+            None,
+        )
+        .await?;
+        let v = inspect(&st, &root, path)
+            .await?
+            .context("multi-projection installation missing")?;
+        ensure!(
+            value_version(&v)? == Some(1),
+            "multi-projection install did not advance version"
+        );
+
+        let mut bad = instant_messaging_platform_installation(0)?;
+        let Value::Map(ref mut m) = bad else {
+            bail!("expected object");
+        };
+        let Value::List(projections) = m.get_mut("projections").context("expected projections")?
+        else {
+            bail!("expected projections");
+        };
+        let Value::Map(provider) = projections
+            .get_mut(1)
+            .context("expected provider projection")?
+        else {
+            bail!("expected provider projection");
+        };
+        provider.insert(
+            "provides".into(),
+            Value::List(vec![serde_json::from_value(serde_json::json!({
+                "effect_path": "effect://external-provider/other/send_text",
+                "purity": "effectful"
+            }))?]),
+        );
+        expect_admission(write_dedicated_config(&st, &root, path, bad, Some(1)).await)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inference_backend_admission_requires_path_id_and_vault_secret_ref()
+    -> anyhow::Result<()> {
+        let st = console_state()?;
+        let root = root_principal(&st).await?;
+        write_dedicated_config(
+            &st,
+            &root,
+            "state://kernel/inference/backends/deepseek",
+            inference_backend("deepseek")?,
+            None,
+        )
+        .await?;
+
+        expect_admission(
+            write_dedicated_config(
+                &st,
+                &root,
+                "state://kernel/inference/backends/other",
+                inference_backend("deepseek")?,
+                None,
+            )
+            .await,
+        )?;
+
+        let mut bad = inference_backend("bad")?;
+        let Value::Map(ref mut map) = bad else {
+            bail!("expected backend object");
+        };
+        map.insert(
+            "auth".into(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "bearer_token",
+                "token_ref": "state://kernel/inference/bad/api_key"
+            }))?,
+        );
+        expect_admission(
+            write_dedicated_config(
+                &st,
+                &root,
+                "state://kernel/inference/backends/bad",
+                bad,
+                None,
+            )
+            .await,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_kernel_config_paths_are_rejected() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let root = root_principal(&st).await?;
+        expect_admission(
             write_config(&st, &root, "state://kernel/unknown/x", obj(None), None).await,
-            Err(MgmtError::Admission(_))
-        ));
+        )?;
+        Ok(())
     }
 }

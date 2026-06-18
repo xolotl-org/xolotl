@@ -232,93 +232,108 @@ impl DoNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{anyhow, bail, ensure};
     use nexus_types::{ProcessId, ResourceName};
 
     fn s(name: &str) -> StepRef {
         StepRef::new(ProcessId::new(1), name)
     }
 
-    fn op(path: &str) -> OperationTemplate {
-        OperationTemplate {
-            target: ResourceName::new(Path::parse(path).unwrap()),
+    fn op(path: &str) -> anyhow::Result<OperationTemplate> {
+        Ok(OperationTemplate {
+            target: ResourceName::new(
+                Path::parse(path)
+                    .map_err(|error| anyhow!("path parse failed for {path}: {error}"))?,
+            ),
             method: "invoke".into(),
             method_id: None,
             output: nexus_types::OutputMode::Unary,
             literal_input: None,
-        }
+        })
     }
 
     #[test]
-    fn build_and_then_chain() {
-        let d = DoNode::op(op("effect://x/post")).and_then(s("handle"));
-        assert!(matches!(d, DoNode::AndThen { .. }));
+    fn build_and_then_chain() -> anyhow::Result<()> {
+        let d = DoNode::op(op("effect://x/post")?).and_then(s("handle"));
+        ensure!(
+            matches!(d, DoNode::AndThen { .. }),
+            "unexpected node: {d:?}"
+        );
+        Ok(())
     }
 
     #[test]
-    fn map_builds_and_then() {
-        // `map` is sugar for `AndThen` into a pure projecting Step.
-        let d = DoNode::op(op("effect://x/post")).map(s("project"));
+    fn map_builds_and_then() -> anyhow::Result<()> {
+        let d = DoNode::op(op("effect://x/post")?).map(s("project"));
         match d {
-            DoNode::AndThen { then, .. } => assert_eq!(then.name, "project"),
-            _ => panic!("map must desugar to AndThen"),
+            DoNode::AndThen { then, .. } => {
+                ensure!(then.name == "project", "unexpected step: {:?}", then.name);
+            }
+            other => bail!("map must desugar to AndThen, got {other:?}"),
         }
+        Ok(())
     }
 
     #[test]
-    fn retry_zero_is_identity() {
-        let d = DoNode::op(op("effect://x")).retry(0, s("again"));
-        assert!(matches!(d, DoNode::Op(_)));
+    fn retry_zero_is_identity() -> anyhow::Result<()> {
+        let d = DoNode::op(op("effect://x")?).retry(0, s("again"));
+        ensure!(matches!(d, DoNode::Op(_)), "unexpected node: {d:?}");
+        Ok(())
     }
 
     #[test]
-    fn retry_nests_or_else() {
-        // max=2 → two nested OrElse wrapping the inner Op, each routing to the
-        // same recover step.
-        let d = DoNode::op(op("effect://x")).retry(2, s("again"));
+    fn retry_nests_or_else() -> anyhow::Result<()> {
+        let d = DoNode::op(op("effect://x")?).retry(2, s("again"));
         match d {
             DoNode::OrElse { d: outer_d, or } => {
-                assert_eq!(or.name, "again");
+                ensure!(or.name == "again", "unexpected outer step: {:?}", or.name);
                 match *outer_d {
                     DoNode::OrElse { d: inner_d, or } => {
-                        assert_eq!(or.name, "again");
-                        assert!(matches!(*inner_d, DoNode::Op(_)));
+                        ensure!(or.name == "again", "unexpected inner step: {:?}", or.name);
+                        ensure!(
+                            matches!(*inner_d, DoNode::Op(_)),
+                            "unexpected retry body: {inner_d:?}"
+                        );
                     }
-                    _ => panic!("expected nested OrElse"),
+                    other => bail!("expected nested OrElse, got {other:?}"),
                 }
             }
-            _ => panic!("expected OrElse"),
+            other => bail!("expected OrElse, got {other:?}"),
         }
-        // Structural bound: 1 Op + 2 OrElse wrappers = size 3.
-        let d2 = DoNode::op(op("effect://x")).retry(2, s("again"));
-        assert_eq!(d2.size(), 3);
+        let d2 = DoNode::op(op("effect://x")?).retry(2, s("again"));
+        ensure!(d2.size() == 3, "unexpected retry size: {}", d2.size());
+        Ok(())
     }
 
     #[test]
-    fn collect_ops_walks_all_branches() {
+    fn collect_ops_walks_all_branches() -> anyhow::Result<()> {
         let d = DoNode::Let {
             name: "x".into(),
-            value: Box::new(DoNode::op(op("effect://a"))),
+            value: Box::new(DoNode::op(op("effect://a")?)),
             body: Box::new(DoNode::Both(
-                Box::new(DoNode::op(op("effect://b"))),
-                Box::new(DoNode::op(op("effect://c"))),
+                Box::new(DoNode::op(op("effect://b")?)),
+                Box::new(DoNode::op(op("effect://c")?)),
             )),
         };
-        assert_eq!(d.ops().len(), 3);
-        assert_eq!(d.size(), 5);
+        ensure!(d.ops().len() == 3, "unexpected op count: {}", d.ops().len());
+        ensure!(d.size() == 5, "unexpected size: {}", d.size());
+        Ok(())
     }
 
     #[test]
-    fn serde_roundtrip() {
+    fn serde_roundtrip() -> anyhow::Result<()> {
         let d = DoNode::r#let("x", DoNode::pure(Value::Int(1)), DoNode::use_("x"));
-        let s = serde_json::to_string(&d).unwrap();
-        let back: DoNode = serde_json::from_str(&s).unwrap();
-        assert_eq!(d, back);
+        let s = serde_json::to_string(&d)?;
+        let back: DoNode = serde_json::from_str(&s)?;
+        ensure!(d == back, "round trip changed node: {back:?}");
+        Ok(())
     }
 
     #[test]
-    fn fail_is_terminal() {
+    fn fail_is_terminal() -> anyhow::Result<()> {
         let d = DoNode::fail(Failure::Cancelled);
-        assert_eq!(d.size(), 1);
-        assert!(d.ops().is_empty());
+        ensure!(d.size() == 1, "unexpected size: {}", d.size());
+        ensure!(d.ops().is_empty(), "fail node should not contain ops");
+        Ok(())
     }
 }

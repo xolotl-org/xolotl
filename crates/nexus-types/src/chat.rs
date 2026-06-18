@@ -136,7 +136,7 @@ impl ChatMessage {
     }
 
     /// Concatenate all `Text` parts into a single string.
-    /// Non-text parts are silently skipped.
+    /// Includes only `Text` parts.
     pub fn text_concat(&self) -> String {
         self.content
             .iter()
@@ -187,17 +187,35 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, ensure};
 
     #[test]
-    fn chat_message_roundtrip() {
+    fn chat_message_roundtrip() -> anyhow::Result<()> {
         let msg = ChatMessage::user("chat_platform", "C42", "hello world");
-        let json = serde_json::to_string(&msg).unwrap();
-        let back: ChatMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.role, MessageRole::User);
-        assert_eq!(back.text_concat(), "hello world");
-        let meta = back.metadata.unwrap();
-        assert_eq!(meta.platform, "chat_platform");
-        assert_eq!(meta.conversation_id.as_deref(), Some("C42"));
+        let json = serde_json::to_string(&msg)?;
+        let back: ChatMessage = serde_json::from_str(&json)?;
+        ensure!(
+            back.role == MessageRole::User,
+            "unexpected role: {:?}",
+            back.role
+        );
+        ensure!(
+            back.text_concat() == "hello world",
+            "unexpected text: {}",
+            back.text_concat()
+        );
+        let meta = back.metadata.context("metadata missing")?;
+        ensure!(
+            meta.platform == "chat_platform",
+            "unexpected platform: {}",
+            meta.platform
+        );
+        ensure!(
+            meta.conversation_id.as_deref() == Some("C42"),
+            "unexpected conversation id: {:?}",
+            meta.conversation_id
+        );
+        Ok(())
     }
 
     #[test]
@@ -232,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn content_part_serde() {
+    fn content_part_serde() -> anyhow::Result<()> {
         let part = ContentPart::ToolCall {
             id: "call_1".into(),
             name: "fetch".into(),
@@ -245,11 +263,15 @@ mod tests {
                 m
             }),
         };
-        let json = serde_json::to_string(&part).unwrap();
-        assert!(json.contains("tool_call"));
-        assert!(json.contains("call_1"));
-        let back: ContentPart = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, part);
+        let json = serde_json::to_string(&part)?;
+        ensure!(
+            json.contains("tool_call"),
+            "tool_call marker missing from json"
+        );
+        ensure!(json.contains("call_1"), "call id missing from json");
+        let back: ContentPart = serde_json::from_str(&json)?;
+        ensure!(back == part, "serde roundtrip changed content part");
+        Ok(())
     }
 
     #[test]

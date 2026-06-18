@@ -12,12 +12,16 @@ description = "MCP protocol adapter for Nexus"
 workspace = true
 
 [dependencies]
+base64 = { workspace = true, default-features = false, features = ["alloc"] }
 nexus-gateway.workspace = true
 nexus-kernel.workspace = true
 nexus-types.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
+serde = { workspace = true, default-features = false, features = ["derive", "std"] }
+serde_json = { workspace = true, default-features = false, features = ["std"] }
+std-uritemplate = { workspace = true, default-features = false }
+thiserror = { workspace = true, default-features = false, features = ["std"] }
+tracing = { workspace = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+anyhow = { workspace = true, default-features = false, features = ["std"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "macros"] }

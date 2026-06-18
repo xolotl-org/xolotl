@@ -25,31 +25,35 @@ Cargo 会把 Rust 包名里的连字符转换为下划线。例如：
 ```text
 nexus-sdk      -> target/doc/nexus_sdk/index.html
 nexus-kernel   -> target/doc/nexus_kernel/index.html
-nexus-actors   -> target/doc/nexus_actors/index.html
+nexus-standard   -> target/doc/nexus_standard/index.html
 ```
 
 ## 阅读顺序
 
 嵌入运行时：
 
-1. `nexus-sdk`
-2. `nexus-graph`
-3. `nexus-types`
-4. `nexus-kernel`
+- `nexus-sdk`
+- `nexus-graph`
+- `nexus-types`
+- `nexus-kernel`
 
 协议适配器：
 
-1. `nexus-gateway`
-2. `nexus-proto`
-3. `nexus-gateway-grpc`
-4. `nexus-gateway-websocket`
-5. `nexus-gateway-mcp`
+- `nexus-gateway`
+- `nexus-proto`
+- `nexus-gateway-grpc`
+- `nexus-gateway-websocket`
+- `nexus-gateway-mcp`
+
+External Provider/Source session 准入和 secure envelope helper 位于
+`nexus_gateway::external`。`nexus-gateway` 根 API 用于 gateway profile、
+session、submission、limit 和运行时状态。
 
 标准提供方：
 
-1. `nexus-actors`
-2. `nexus-state`
-3. `nexus-storage-redb`
+- `nexus-standard`
+- `nexus-state`
+- `nexus-storage-redb`
 
 ## 文档质量检查
 

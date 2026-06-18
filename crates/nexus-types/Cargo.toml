@@ -15,8 +15,11 @@ workspace = true
 default = []
 
 [dependencies]
-bitflags.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-smol_str.workspace = true
-thiserror.workspace = true
+bitflags = { workspace = true, default-features = false }
+serde = { workspace = true, default-features = false, features = ["derive", "std"] }
+serde_json = { workspace = true, default-features = false, features = ["std"] }
+smol_str = { workspace = true, default-features = false, features = ["serde", "std"] }
+thiserror = { workspace = true, default-features = false, features = ["std"] }
+
+[dev-dependencies]
+anyhow = { workspace = true, default-features = false, features = ["std"] }

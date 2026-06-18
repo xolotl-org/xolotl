@@ -83,35 +83,52 @@ impl GraphCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, ensure};
 
     #[test]
-    fn cursor_lifo_order() {
+    fn cursor_lifo_order() -> anyhow::Result<()> {
         let mut c = GraphCursor::at_root(NodeId::new(0));
         c.push(Frame::new(NodeId::new(1), Value::Int(1)));
         c.push(Frame::new(NodeId::new(2), Value::Int(2)));
-        assert_eq!(c.pop().unwrap().node, NodeId::new(2));
-        assert_eq!(c.pop().unwrap().node, NodeId::new(1));
-        assert_eq!(c.pop().unwrap().node, NodeId::new(0));
-        assert!(c.is_finished());
+        ensure!(
+            c.pop().context("missing first frame")?.node == NodeId::new(2),
+            "unexpected first frame"
+        );
+        ensure!(
+            c.pop().context("missing second frame")?.node == NodeId::new(1),
+            "unexpected second frame"
+        );
+        ensure!(
+            c.pop().context("missing root frame")?.node == NodeId::new(0),
+            "unexpected root frame"
+        );
+        ensure!(c.is_finished(), "cursor should be finished");
+        Ok(())
     }
 
     #[test]
-    fn done_set_dedups_and_aligns_by_node_id() {
+    fn done_set_dedups_and_aligns_by_node_id() -> anyhow::Result<()> {
         let mut c = GraphCursor::at_root(NodeId::new(0));
         c.mark_done(NodeId::new(5));
         c.mark_done(NodeId::new(5));
-        assert_eq!(c.done.len(), 1);
-        assert!(c.is_done(NodeId::new(5)));
-        assert!(!c.is_done(NodeId::new(6)));
+        ensure!(
+            c.done.len() == 1,
+            "unexpected done length: {}",
+            c.done.len()
+        );
+        ensure!(c.is_done(NodeId::new(5)), "node 5 should be done");
+        ensure!(!c.is_done(NodeId::new(6)), "node 6 should not be done");
+        Ok(())
     }
 
     #[test]
-    fn cursor_serde_roundtrip_for_snapshot() {
+    fn cursor_serde_roundtrip_for_snapshot() -> anyhow::Result<()> {
         let mut c = GraphCursor::at_root(NodeId::new(0));
         c.mark_done(NodeId::new(0));
         c.push(Frame::new(NodeId::new(1), Value::Str("x".into())));
-        let s = serde_json::to_string(&c).unwrap();
-        let back: GraphCursor = serde_json::from_str(&s).unwrap();
-        assert_eq!(c, back);
+        let s = serde_json::to_string(&c)?;
+        let back: GraphCursor = serde_json::from_str(&s)?;
+        ensure!(c == back, "round trip changed cursor: {back:?}");
+        Ok(())
     }
 }
