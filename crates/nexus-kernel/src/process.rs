@@ -1,60 +1,87 @@
 //! Process table, spawn, and finalize.
 //!
-//! A [`ProcessEntry`] tracks a live Process's status, parent, grants, budget,
-//! and finalizers. Spawn attenuates capabilities (a child's grant cannot
-//! exceed its parent's); finalize cancels children, runs finalizers in
+//! A [`ProcessEntry`] tracks a live Process's status, parent, attached grants,
+//! budget, and finalizers. Spawn attenuates capabilities (a child's grant
+//! cannot exceed its parent's); finalize cancels children, runs finalizers in
 //! reverse, revokes handles, and writes a `ProcessFinalized` fact.
 
-use nexus_types::{BudgetSpec, BudgetState, Grant, GrantId, IdentityRef, ProcessId, ProcessStatus};
+use nexus_types::{
+    BudgetSpec, BudgetState, Grant, GrantId, IdentityRef, Path, ProcessId, ProcessStatus, Value,
+};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::task::AbortHandle;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TaskAttachment {
+    Attached,
+    AlreadyTerminal,
+    NoSuchProcess,
+    AlreadyAttached,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FinalizeStart {
+    Started,
+    AlreadyFinalizing,
+    AlreadyTerminal,
+    NoSuchProcess,
+}
 
 /// Live bookkeeping for one Process. The serializable `Process` descriptor
 /// lives in `nexus-types`; this is the runtime entry the kernel mutates.
-pub struct ProcessEntry {
+pub(crate) struct ProcessEntry {
     /// Process identifier.
-    pub id: ProcessId,
+    pub(crate) id: ProcessId,
     /// Parent process, if this process was spawned by another process.
-    pub parent: Option<ProcessId>,
+    pub(crate) parent: Option<ProcessId>,
     /// Interned identity this process runs as.
-    pub identity: IdentityRef,
+    pub(crate) identity: IdentityRef,
     /// Current lifecycle state.
-    pub status: ProcessStatus,
-    /// Grants held by this process.
-    pub grants: Vec<GrantId>,
+    pub(crate) status: ProcessStatus,
     /// Request-scoped grants attached directly to this process.
-    pub attached_grants: Vec<Grant>,
+    pub(crate) attached_grants: Vec<Grant>,
     /// Current budget counters.
-    pub budget: BudgetState,
+    pub(crate) budget: BudgetState,
     /// Per-dimension spending limits. Default is unbounded on every
     /// dimension (a process with no declared budget is unconstrained).
-    pub budget_spec: BudgetSpec,
-    /// Finalizer programs, run in reverse order on finalize. Stored as
-    /// serialized `Do<A>` so they survive recovery; the kernel re-runs them.
-    pub on_finalize: Vec<nexus_graph::DoNode>,
+    pub(crate) budget_spec: BudgetSpec,
+    /// Finalizer programs, run in reverse order on finalize.
+    pub(crate) on_finalize: Vec<nexus_graph::DoNode>,
+    /// Optional directory entry updated for named long-lived processes.
+    pub(crate) directory: Option<Path>,
+    /// Whether one task is currently running this Process's finalization.
+    pub(crate) finalization_in_progress: bool,
+    /// Finalizer failures collected before the lifecycle record is durable.
+    pub(crate) finalizer_failures: Vec<Value>,
+    /// Whether finalizers, handle revocation, and lifecycle recording completed.
+    pub(crate) finalized: bool,
 }
 
 impl ProcessEntry {
     /// Create a process entry in the `Created` state.
-    pub fn new(id: ProcessId, parent: Option<ProcessId>, identity: IdentityRef) -> Self {
+    pub(crate) fn new(id: ProcessId, parent: Option<ProcessId>, identity: IdentityRef) -> Self {
         Self {
             id,
             parent,
             identity,
             status: ProcessStatus::Created,
-            grants: Vec::new(),
             attached_grants: Vec::new(),
             budget: BudgetState::default(),
             budget_spec: BudgetSpec::default(),
             on_finalize: Vec::new(),
+            directory: None,
+            finalization_in_progress: false,
+            finalizer_failures: Vec::new(),
+            finalized: false,
         }
     }
 }
 
 /// The process tree: a registry of live processes plus parent/child links,
 /// carrying cancellation propagation and capability attenuation.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ProcessTable {
     inner: Arc<RwLock<ProcessTableInner>>,
 }
@@ -63,32 +90,35 @@ pub struct ProcessTable {
 struct ProcessTableInner {
     procs: HashMap<ProcessId, ProcessEntry>,
     children: HashMap<ProcessId, Vec<ProcessId>>,
+    tasks: HashMap<ProcessId, AbortHandle>,
     next: u64,
     next_attached_grant: u64,
 }
 
 impl ProcessTable {
     /// Create an empty process table.
-    pub fn new() -> Self {
-        Self::default()
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(ProcessTableInner::default())),
+        }
     }
 
     /// Allocate a fresh process id.
-    pub fn fresh_id(&self) -> ProcessId {
+    pub(crate) fn fresh_id(&self) -> ProcessId {
         let mut inner = self.inner.write();
         inner.next += 1;
         ProcessId::new(inner.next)
     }
 
     /// Allocate a process-attached grant id.
-    pub fn fresh_attached_grant_id(&self) -> GrantId {
+    pub(crate) fn fresh_attached_grant_id(&self) -> GrantId {
         let mut inner = self.inner.write();
         inner.next_attached_grant += 1;
         GrantId::new((1u64 << 63) | inner.next_attached_grant)
     }
 
     /// Insert a new process entry, linking it under its parent.
-    pub fn insert(&self, entry: ProcessEntry) {
+    pub(crate) fn insert(&self, entry: ProcessEntry) {
         let mut inner = self.inner.write();
         if let Some(parent) = entry.parent {
             inner.children.entry(parent).or_default().push(entry.id);
@@ -101,16 +131,140 @@ impl ProcessTable {
         self.inner.read().procs.get(&id).map(|p| p.status)
     }
 
-    /// Update a process status if the process exists.
-    pub fn set_status(&self, id: ProcessId, status: ProcessStatus) {
-        if let Some(p) = self.inner.write().procs.get_mut(&id) {
-            p.status = status;
+    /// Move a process into Finalizing if no terminal/finalizing owner exists.
+    pub(crate) fn begin_finalizing(&self, id: ProcessId) -> FinalizeStart {
+        let mut inner = self.inner.write();
+        let Some(entry) = inner.procs.get_mut(&id) else {
+            return FinalizeStart::NoSuchProcess;
+        };
+        if entry.finalized {
+            return FinalizeStart::AlreadyTerminal;
         }
+        if entry.finalization_in_progress {
+            return FinalizeStart::AlreadyFinalizing;
+        }
+        entry.finalization_in_progress = true;
+        entry.status = ProcessStatus::Finalizing;
+        FinalizeStart::Started
+    }
+
+    /// Release the finalization owner after a failed cleanup attempt.
+    pub(crate) fn release_finalizing(&self, id: ProcessId) -> Option<()> {
+        let mut inner = self.inner.write();
+        let entry = inner.procs.get_mut(&id)?;
+        if !entry.finalized {
+            entry.finalization_in_progress = false;
+        }
+        Some(())
+    }
+
+    /// Record a terminal status before lifecycle side records are committed.
+    pub(crate) fn mark_terminal_status(
+        &self,
+        id: ProcessId,
+        status: ProcessStatus,
+    ) -> Option<ProcessStatus> {
+        let mut inner = self.inner.write();
+        let entry = inner.procs.get_mut(&id)?;
+        let actual = if entry.status.is_terminal() {
+            entry.status
+        } else if status.is_terminal() {
+            entry.status = status;
+            status
+        } else {
+            entry.status
+        };
+        Some(actual)
+    }
+
+    /// Mark lifecycle cleanup fully complete.
+    pub(crate) fn complete_finalization(&self, id: ProcessId) -> Option<()> {
+        let mut inner = self.inner.write();
+        let entry = inner.procs.get_mut(&id)?;
+        entry.finalization_in_progress = false;
+        entry.finalizer_failures.clear();
+        entry.finalized = true;
+        Some(())
+    }
+
+    /// Cancel a process unless it has already reached a terminal status.
+    pub(crate) fn cancel_if_non_terminal(&self, id: ProcessId) -> Option<bool> {
+        let mut inner = self.inner.write();
+        let entry = inner.procs.get_mut(&id)?;
+        if entry.status.is_terminal() {
+            return Some(false);
+        }
+        entry.status = ProcessStatus::Cancelled;
+        Some(true)
+    }
+
+    /// Mark cleanup complete and set a terminal status if one has not already
+    /// won.
+    pub(crate) fn mark_finalized_terminal(
+        &self,
+        id: ProcessId,
+        status: ProcessStatus,
+    ) -> Option<ProcessStatus> {
+        let mut inner = self.inner.write();
+        let entry = inner.procs.get_mut(&id)?;
+        let actual = if entry.status.is_terminal() {
+            entry.status
+        } else if status.is_terminal() {
+            entry.status = status;
+            status
+        } else {
+            entry.status
+        };
+        entry.finalization_in_progress = false;
+        entry.finalizer_failures.clear();
+        entry.finalized = true;
+        Some(actual)
+    }
+
+    /// Attach a task abort handle to a running process.
+    pub(crate) fn attach_task(&self, id: ProcessId, task: AbortHandle) -> TaskAttachment {
+        let mut inner = self.inner.write();
+        let Some(entry) = inner.procs.get(&id) else {
+            return TaskAttachment::NoSuchProcess;
+        };
+        if entry.status.is_terminal() {
+            return TaskAttachment::AlreadyTerminal;
+        }
+        if inner.tasks.contains_key(&id) {
+            return TaskAttachment::AlreadyAttached;
+        }
+        inner.tasks.insert(id, task);
+        TaskAttachment::Attached
+    }
+
+    /// Abort and remove the task attached to a process.
+    pub(crate) fn abort_task(&self, id: ProcessId) -> bool {
+        match self.inner.write().tasks.remove(&id) {
+            Some(task) => {
+                task.abort();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove the task handle for a process that has already finished.
+    pub(crate) fn remove_task(&self, id: ProcessId) -> bool {
+        self.inner.write().tasks.remove(&id).is_some()
     }
 
     /// Return the identity a process runs as.
     pub fn identity(&self, id: ProcessId) -> Option<IdentityRef> {
         self.inner.read().procs.get(&id).map(|p| p.identity)
+    }
+
+    /// Directory entry for a named long-lived process.
+    pub(crate) fn directory(&self, id: ProcessId) -> Option<Path> {
+        self.inner
+            .read()
+            .procs
+            .get(&id)
+            .and_then(|p| p.directory.clone())
     }
 
     /// Request-scoped grants attached directly to a process.
@@ -138,15 +292,8 @@ impl ProcessTable {
             .unwrap_or_default()
     }
 
-    /// Register a finalizer program to run when `id` finalizes.
-    pub fn add_finalizer(&self, id: ProcessId, body: nexus_graph::DoNode) {
-        if let Some(p) = self.inner.write().procs.get_mut(&id) {
-            p.on_finalize.push(body);
-        }
-    }
-
     /// Take the finalizers for a process in reverse order.
-    pub fn take_finalizers(&self, id: ProcessId) -> Vec<nexus_graph::DoNode> {
+    pub(crate) fn take_finalizers(&self, id: ProcessId) -> Vec<nexus_graph::DoNode> {
         let mut inner = self.inner.write();
         match inner.procs.get_mut(&id) {
             Some(p) => {
@@ -158,9 +305,26 @@ impl ProcessTable {
         }
     }
 
+    /// Finalizer failures retained across finalization retries.
+    pub(crate) fn finalizer_failures(&self, id: ProcessId) -> Option<Vec<Value>> {
+        self.inner
+            .read()
+            .procs
+            .get(&id)
+            .map(|p| p.finalizer_failures.clone())
+    }
+
+    /// Replace retained finalizer failures for a Process.
+    pub(crate) fn set_finalizer_failures(&self, id: ProcessId, failures: Vec<Value>) -> Option<()> {
+        let mut inner = self.inner.write();
+        let entry = inner.procs.get_mut(&id)?;
+        entry.finalizer_failures = failures;
+        Some(())
+    }
+
     /// Recursively collect a process and all descendants for cancel propagation,
     /// deepest first.
-    pub fn subtree_post_order(&self, root: ProcessId) -> Vec<ProcessId> {
+    pub(crate) fn subtree_post_order(&self, root: ProcessId) -> Vec<ProcessId> {
         let mut out = Vec::new();
         self.collect_post_order(root, &mut out);
         out
@@ -174,7 +338,12 @@ impl ProcessTable {
     }
 
     /// Mutate a process budget state under the table lock.
-    pub fn budget_mut<R>(&self, id: ProcessId, f: impl FnOnce(&mut BudgetState) -> R) -> Option<R> {
+    #[cfg(test)]
+    pub(crate) fn budget_mut<R>(
+        &self,
+        id: ProcessId,
+        f: impl FnOnce(&mut BudgetState) -> R,
+    ) -> Option<R> {
         self.inner
             .write()
             .procs
@@ -182,18 +351,22 @@ impl ProcessTable {
             .map(|p| f(&mut p.budget))
     }
 
-    /// Set a process's budget spec (limits). Called at spawn / from StartRecord.
-    pub fn set_budget_spec(&self, id: ProcessId, spec: BudgetSpec) {
-        if let Some(p) = self.inner.write().procs.get_mut(&id) {
-            p.budget_spec = spec;
-        }
+    /// Set a process's budget spec.
+    #[must_use]
+    pub fn set_budget_spec(&self, id: ProcessId, spec: BudgetSpec) -> bool {
+        let mut inner = self.inner.write();
+        let Some(p) = inner.procs.get_mut(&id) else {
+            return false;
+        };
+        p.budget_spec = spec;
+        true
     }
 
     /// Reserve one operation's estimated cost against `id`'s budget,
     /// pre-debiting under the lock so concurrent ops can't race past the limit.
     /// Returns `Err(dim)` naming the exhausted dimension. A process with no
     /// entry (standalone/test) is treated as unbounded → `Ok(())`.
-    pub fn reserve(
+    pub(crate) fn reserve(
         &self,
         id: ProcessId,
         est_micro_usd: u64,
@@ -210,7 +383,7 @@ impl ProcessTable {
     }
 
     /// Settle a previously-reserved operation against its actual cost.
-    pub fn settle(
+    pub(crate) fn settle(
         &self,
         id: ProcessId,
         reserved_micro_usd: u64,
@@ -229,12 +402,13 @@ impl ProcessTable {
     }
 
     /// Number of live process entries.
-    pub fn count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn count(&self) -> usize {
         self.inner.read().procs.len()
     }
 
     /// Whether a process id exists in the table.
-    pub fn exists(&self, id: ProcessId) -> bool {
+    pub(crate) fn exists(&self, id: ProcessId) -> bool {
         self.inner.read().procs.contains_key(&id)
     }
 }
@@ -279,9 +453,14 @@ mod tests {
     fn finalizers_run_in_reverse() -> anyhow::Result<()> {
         let t = ProcessTable::new();
         let p = t.fresh_id();
-        t.insert(ProcessEntry::new(p, None, IdentityRef::ROOT));
-        t.add_finalizer(p, nexus_graph::DoNode::pure(nexus_types::Value::Int(1)));
-        t.add_finalizer(p, nexus_graph::DoNode::pure(nexus_types::Value::Int(2)));
+        let mut entry = ProcessEntry::new(p, None, IdentityRef::ROOT);
+        entry
+            .on_finalize
+            .push(nexus_graph::DoNode::pure(nexus_types::Value::Int(1)));
+        entry
+            .on_finalize
+            .push(nexus_graph::DoNode::pure(nexus_types::Value::Int(2)));
+        t.insert(entry);
         let fs = t.take_finalizers(p);
         // Added 1 then 2; reverse order runs 2 then 1.
         let first = fs.first().context("missing first finalizer")?;
@@ -293,6 +472,84 @@ mod tests {
         ensure!(
             *second == nexus_graph::DoNode::pure(nexus_types::Value::Int(1)),
             "second finalizer mismatch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn begin_finalizing_has_one_owner() -> anyhow::Result<()> {
+        let t = ProcessTable::new();
+        let p = t.fresh_id();
+        let mut entry = ProcessEntry::new(p, None, IdentityRef::ROOT);
+        entry.status = ProcessStatus::Running;
+        t.insert(entry);
+
+        ensure!(
+            t.begin_finalizing(p) == FinalizeStart::Started,
+            "running process should enter finalizing once"
+        );
+        ensure!(
+            t.begin_finalizing(p) == FinalizeStart::AlreadyFinalizing,
+            "second finalizer owner should be rejected"
+        );
+        let actual = t
+            .mark_finalized_terminal(p, ProcessStatus::Failed)
+            .context("missing process")?;
+        ensure!(
+            actual == ProcessStatus::Failed,
+            "final status should be recorded"
+        );
+        ensure!(
+            t.begin_finalizing(p) == FinalizeStart::AlreadyTerminal,
+            "finalized process should not re-enter finalizing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn finalized_terminal_does_not_overwrite_existing_terminal_status() -> anyhow::Result<()> {
+        let t = ProcessTable::new();
+        let p = t.fresh_id();
+        let mut entry = ProcessEntry::new(p, None, IdentityRef::ROOT);
+        entry.status = ProcessStatus::Cancelled;
+        t.insert(entry);
+
+        let actual = t
+            .mark_finalized_terminal(p, ProcessStatus::Completed)
+            .context("missing process")?;
+        ensure!(
+            actual == ProcessStatus::Cancelled,
+            "existing terminal status should win"
+        );
+        ensure!(
+            t.status(p) == Some(ProcessStatus::Cancelled),
+            "process table status was overwritten"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_process_can_enter_finalizing_before_cleanup() -> anyhow::Result<()> {
+        let t = ProcessTable::new();
+        let p = t.fresh_id();
+        let mut entry = ProcessEntry::new(p, None, IdentityRef::ROOT);
+        entry.status = ProcessStatus::Cancelled;
+        t.insert(entry);
+
+        ensure!(
+            t.begin_finalizing(p) == FinalizeStart::Started,
+            "cancelled process still needs cleanup ownership"
+        );
+        let actual = t
+            .mark_finalized_terminal(p, ProcessStatus::Cancelled)
+            .context("missing process")?;
+        ensure!(
+            actual == ProcessStatus::Cancelled,
+            "cancelled terminal status should win"
+        );
+        ensure!(
+            t.begin_finalizing(p) == FinalizeStart::AlreadyTerminal,
+            "cleanup should not run twice"
         );
         Ok(())
     }

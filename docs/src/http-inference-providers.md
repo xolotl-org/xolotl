@@ -22,6 +22,12 @@ The dialect describes the HTTP API shape. OpenAI-compatible services such as
 DeepSeek, OpenRouter, vLLM, and Ollama-compatible deployments can use the
 OpenAI Chat Completions dialect with their own base URL and model id.
 
+Embedded hosts do not have to use HTTP inference. They can install
+`nexus-standard` with `StandardConfig::with_inference_backend` and supply an
+in-process backend implementing `InferenceBackend`. That backend serves the same
+`effect://inference/*` resources and the standard model-backed effects while
+still being invoked through handles, policy, budget, and Facts.
+
 ## Cargo Features
 
 HTTP inference provider code is opt-in.

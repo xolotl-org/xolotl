@@ -39,6 +39,10 @@ nexus-standard   -> target/doc/nexus_standard/index.html
 
 `nexus-sdk` 默认保持最小化。用 `NexusBuilder` 接入宿主持有的状态和事实记录后端。
 SDK 的 `standard` feature 提供标准进程内 Provider 安装 API。
+使用 `ActorSpec` 和 `Nexus::spawn_actor` 声明并启动命名长寿 Process。
+Actor body 或终结器引用进程本地 `StepRef` 时，使用 `Nexus::spawn_actor_with_steps`。
+使用 `StandardConfig::with_modules` 选择实际安装的 standard 模块，使用
+`StandardConfig::with_inference_backend` 接入标准模型类 effect 使用的宿主模型 backend。
 
 协议适配器：
 

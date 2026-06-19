@@ -40,6 +40,12 @@ For embedding:
 `nexus-sdk` is minimal by default. Use `NexusBuilder` to supply host-owned state
 and fact backends. The SDK `standard` feature exposes the standard in-process
 provider package installation API.
+Use `ActorSpec` and `Nexus::spawn_actor` for named long-lived Process
+declarations. Use `Nexus::spawn_actor_with_steps` when the actor body references
+process-local `StepRef`s in the body or finalizers. Use
+`StandardConfig::with_modules` to choose installed standard modules and
+`StandardConfig::with_inference_backend` to supply the host model backend used
+by standard model-backed effects.
 
 For protocol adapters:
 

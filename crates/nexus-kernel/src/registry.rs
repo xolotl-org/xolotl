@@ -507,10 +507,9 @@ impl Registry {
         Ok(id)
     }
 
-    /// Register a binding without admission checks.
-    ///
-    /// Prefer [`Registry::admit_binding`] for externally supplied bindings.
-    pub fn register_binding(&self, binding: Binding) {
+    /// Register a binding without admission checks for crate-local fixtures.
+    #[cfg(test)]
+    pub(crate) fn register_binding(&self, binding: Binding) {
         let mut inner = self.inner.write();
         inner.bindings.insert(binding.id, binding);
         inner.invalidate_open_cache();

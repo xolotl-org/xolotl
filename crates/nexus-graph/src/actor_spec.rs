@@ -1,36 +1,33 @@
 //! Actor declarations and capability linting.
 //!
 //! An [`ActorSpec`] names a long-lived [`DoNode`] body and declares the
-//! capabilities, state paths, subscriptions, and budget attached to that body.
+//! capability ceiling, budget, and finalizers attached to that body.
 //! [`lint`] compares operations found in the body with the declared capability
 //! literals.
 
-use crate::r#do::DoNode;
-use nexus_types::{BudgetSpec, CapSet, Capability};
+use crate::r#do::{DoNode, bind_process_self_capability_literal};
+use nexus_types::{BudgetSpec, Capability, PathError, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// Declaration for a named long-lived `Do<()>` body.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ActorSpec {
     /// Stable actor name.
     #[serde(default)]
     pub name: String,
+    /// Durable program body run by the actor process.
+    #[serde(default = "default_body")]
+    pub body: DoNode,
     /// Capability literals declared for the actor body.
     #[serde(default)]
     pub declared_capabilities: Vec<String>,
-    /// State path patterns declared for reads and writes.
-    #[serde(default)]
-    pub declared_states: Vec<String>,
-    /// Stream path patterns the actor subscribes to.
-    #[serde(default)]
-    pub subscriptions: Vec<String>,
-    /// Granted capability set.
-    #[serde(default)]
-    pub capabilities: CapSet,
     /// Budget and inflight limits.
     #[serde(default)]
     pub budget: BudgetSpec,
+    /// Finalizers run when the actor process is finalized.
+    #[serde(default)]
+    pub finalizers: Vec<DoNode>,
 }
 
 impl ActorSpec {
@@ -42,27 +39,124 @@ impl ActorSpec {
     {
         Self {
             name: name.into(),
+            body: default_body(),
             declared_capabilities: capabilities.into_iter().map(Into::into).collect(),
             ..Self::default()
         }
     }
 
     /// Whether `(verb, target)` is covered by any declared capability literal.
-    pub fn declares_capability(&self, verb: &str, target: &str) -> bool {
-        let Ok(path) = nexus_types::Path::parse(target) else {
-            return false;
-        };
+    pub fn declares_capability(
+        &self,
+        verb: &str,
+        target: &str,
+    ) -> Result<bool, CapabilityQueryError> {
+        let path = nexus_types::Path::parse(target).map_err(|source| {
+            CapabilityQueryError::TargetPath {
+                literal: target.to_string(),
+                source,
+            }
+        })?;
         for literal in &self.declared_capabilities {
-            let cap = match Capability::parse(literal) {
-                Ok(cap) => cap,
-                Err(_) => return false,
-            };
+            let cap =
+                Capability::parse(literal).map_err(|source| CapabilityQueryError::Declaration {
+                    literal: literal.clone(),
+                    source,
+                })?;
             if cap.covers(verb, &path) {
-                return true;
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
+
+    /// Bind declaration-time process-local references to a concrete Process.
+    pub fn bind_process_local_refs(
+        &self,
+        process: nexus_types::ProcessId,
+    ) -> Result<Self, ActorBindError> {
+        let body = self.body.bind_process_local_refs(process)?;
+        let finalizers = self
+            .finalizers
+            .iter()
+            .map(|finalizer| finalizer.bind_process_local_refs(process))
+            .collect::<Result<Vec<_>, _>>()?;
+        let declared_capabilities = self
+            .declared_capabilities
+            .iter()
+            .map(|literal| {
+                bind_process_self_capability_literal(literal, process).map_err(|source| {
+                    ActorBindError::Capability {
+                        literal: literal.clone(),
+                        source,
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            name: self.name.clone(),
+            body,
+            declared_capabilities,
+            budget: self.budget.clone(),
+            finalizers,
+        })
+    }
+}
+
+impl Default for ActorSpec {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            body: default_body(),
+            declared_capabilities: Vec::new(),
+            budget: BudgetSpec::default(),
+            finalizers: Vec::new(),
+        }
+    }
+}
+
+fn default_body() -> DoNode {
+    DoNode::pure(Value::Null)
+}
+
+/// Error returned by capability coverage queries on an [`ActorSpec`].
+#[derive(Debug, thiserror::Error)]
+pub enum CapabilityQueryError {
+    /// The requested target path is malformed.
+    #[error("target path {literal:?} is malformed: {source}")]
+    TargetPath {
+        /// Target path literal supplied by the caller.
+        literal: String,
+        /// Path parser error.
+        #[source]
+        source: PathError,
+    },
+    /// One declared capability literal is malformed.
+    #[error("declared capability {literal:?} is malformed: {source}")]
+    Declaration {
+        /// Capability literal from the actor spec.
+        literal: String,
+        /// Capability parser error.
+        #[source]
+        source: nexus_types::CapError,
+    },
+}
+
+/// Error returned while binding process-local Actor references.
+#[derive(Debug, thiserror::Error)]
+pub enum ActorBindError {
+    /// A path containing a process-local placeholder could not be rebound.
+    #[error("process-local path binding failed: {0}")]
+    Path(#[from] PathError),
+    /// A declared capability could not be rebound.
+    #[error("declared capability {literal:?} binding failed: {source}")]
+    Capability {
+        /// Capability literal from the actor spec.
+        literal: String,
+        /// Capability parser error.
+        #[source]
+        source: nexus_types::CapError,
+    },
 }
 
 /// The severity of a [`LintFinding`].
@@ -102,9 +196,25 @@ pub struct LintFinding {
 /// capabilities that the program never uses are *not* flagged here —
 /// over-declaring only widens the ceiling, a separate (advisory) concern.
 pub fn lint(spec: &ActorSpec, program: &DoNode) -> Vec<LintFinding> {
+    let (declared, mut findings) = parse_declared_capabilities(&spec.declared_capabilities);
+    lint_program(program, &declared, &mut findings, None);
+    findings
+}
+
+/// Lint an actor's declared body and finalizers against its capability ceiling.
+pub fn lint_actor(spec: &ActorSpec) -> Vec<LintFinding> {
+    let (declared, mut findings) = parse_declared_capabilities(&spec.declared_capabilities);
+    lint_program(&spec.body, &declared, &mut findings, None);
+    for (index, finalizer) in spec.finalizers.iter().enumerate() {
+        lint_program(finalizer, &declared, &mut findings, Some(index));
+    }
+    findings
+}
+
+fn parse_declared_capabilities(literals: &[String]) -> (Vec<Capability>, Vec<LintFinding>) {
     let mut findings = Vec::new();
     let mut declared = Vec::new();
-    for literal in &spec.declared_capabilities {
+    for literal in literals {
         match Capability::parse(literal) {
             Ok(capability) => declared.push(capability),
             Err(error) => findings.push(LintFinding {
@@ -116,11 +226,20 @@ pub fn lint(spec: &ActorSpec, program: &DoNode) -> Vec<LintFinding> {
             }),
         }
     }
+    (declared, findings)
+}
+
+fn lint_program(
+    program: &DoNode,
+    declared: &[Capability],
+    findings: &mut Vec<LintFinding>,
+    finalizer_index: Option<usize>,
+) {
     let mut seen = HashSet::new();
     for op in program.ops() {
         let target_path = op.target.path();
         let target = target_path.to_string();
-        let verb = capability_verb_for_method(&op.method);
+        let verb = operation_capability_verb(&op.method);
         if declared.iter().any(|cap| cap.covers(verb, target_path)) {
             continue;
         }
@@ -128,20 +247,24 @@ pub fn lint(spec: &ActorSpec, program: &DoNode) -> Vec<LintFinding> {
         if !seen.insert(key) {
             continue;
         }
+        let base_message = format!(
+            "capability `{verb}://{}` for method `{}` is used but not declared in \
+             ActorSpec.declared_capabilities; it exceeds the task-level ceiling",
+            capability_target(&target),
+            op.method
+        );
+        let message = match finalizer_index {
+            Some(index) => format!("finalizer[{index}]: {base_message}"),
+            None => base_message,
+        };
         findings.push(LintFinding {
             severity: LintSeverity::Error,
             target: target.clone(),
             verb: verb.into(),
             method: op.method.clone(),
-            message: format!(
-                "capability `{verb}://{}` for method `{}` is used but not declared in \
-                 ActorSpec.declared_capabilities; it exceeds the task-level ceiling",
-                capability_target(&target),
-                op.method
-            ),
+            message,
         });
     }
-    findings
 }
 
 /// Whether a declared capability literal covers the required `(verb, target)`.
@@ -155,7 +278,8 @@ pub fn capability_covers(literal: &str, verb: &str, target: &str) -> bool {
     cap.covers(verb, &path)
 }
 
-fn capability_verb_for_method(method: &str) -> &'static str {
+/// Capability verb required by an operation method name.
+pub fn operation_capability_verb(method: &str) -> &'static str {
     match method {
         "read" | "list" => "read",
         "write" | "append" | "delete" => "write",
@@ -171,8 +295,8 @@ fn capability_target(target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{OperationTemplate, StepRef};
-    use anyhow::{Context, anyhow, ensure};
+    use crate::graph::{OperationTemplate, StepRef, WaitSpec};
+    use anyhow::{Context, anyhow, bail, ensure};
     use nexus_types::{OutputMode, Path, ProcessId, ResourceName, Value};
 
     fn s(name: &str) -> StepRef {
@@ -296,7 +420,10 @@ mod tests {
             finding.severity
         );
         ensure!(
-            !spec.declares_capability("perform", "effect://x/post"),
+            matches!(
+                spec.declares_capability("perform", "effect://x/post"),
+                Err(CapabilityQueryError::Declaration { .. })
+            ),
             "malformed declaration should not grant capability"
         );
         Ok(())
@@ -340,15 +467,98 @@ mod tests {
     fn spec_serde_roundtrip() -> anyhow::Result<()> {
         let spec = ActorSpec {
             name: "n".into(),
+            body: DoNode::pure(Value::Null),
             declared_capabilities: vec!["perform://effect/fs/**".into()],
-            declared_states: vec!["state://memory/alice/*".into()],
-            subscriptions: vec!["state://events/external/chat_bridge/source".into()],
-            capabilities: CapSet::new(),
             budget: BudgetSpec::default(),
+            finalizers: Vec::new(),
         };
         let s = serde_json::to_string(&spec)?;
         let back: ActorSpec = serde_json::from_str(&s)?;
         ensure!(spec == back, "round trip changed spec: {back:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn lint_actor_uses_spec_body() -> anyhow::Result<()> {
+        let mut spec = ActorSpec::with_capabilities("writer", ["write://state/events/**"]);
+        let mut append = op("state://events/topic")?;
+        append.method = "append".into();
+        spec.body = DoNode::op(append);
+        let findings = lint_actor(&spec);
+        ensure!(findings.is_empty(), "unexpected findings: {findings:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn lint_actor_checks_finalizers() -> anyhow::Result<()> {
+        let mut spec = ActorSpec::with_capabilities("writer", ["write://state/events/**"]);
+        spec.finalizers
+            .push(DoNode::op(op("effect://events/emit")?));
+        let findings = lint_actor(&spec);
+        ensure!(findings.len() == 1, "unexpected findings: {findings:?}");
+        let finding = findings.first().context("missing finding")?;
+        ensure!(
+            finding.message.contains("finalizer[0]"),
+            "missing finalizer context: {}",
+            finding.message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_declared_capability_is_reported_once_for_actor() -> anyhow::Result<()> {
+        let mut spec = ActorSpec::with_capabilities("a", ["effect://x/post"]);
+        spec.finalizers.push(DoNode::pure(Value::Null));
+        let findings = lint_actor(&spec);
+        ensure!(findings.len() == 1, "unexpected findings: {findings:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn bind_process_local_refs_rewrites_actor_spec() -> anyhow::Result<()> {
+        let mut write = op("state://process/self/scratch")?;
+        write.method = "write".into();
+        let mut spec =
+            ActorSpec::with_capabilities("worker", ["write://state/process/self/**@until=123"]);
+        spec.body = DoNode::op(write);
+        spec.finalizers.push(DoNode::wait_signal(Path::parse(
+            "state://process/self/stop",
+        )?));
+
+        let bound = spec.bind_process_local_refs(ProcessId::new(77))?;
+        ensure!(
+            bound.declared_capabilities
+                == vec!["write://state/process/77/**@until=123".to_string()],
+            "unexpected capabilities: {:?}",
+            bound.declared_capabilities
+        );
+        let op = bound.body.ops().first().copied().context("missing op")?;
+        ensure!(
+            op.target.path().to_string() == "state://process/77/scratch",
+            "unexpected body target: {}",
+            op.target.path()
+        );
+        match bound.finalizers.first().context("missing finalizer")? {
+            DoNode::Wait(WaitSpec::Signal(path)) => ensure!(
+                path.to_string() == "state://process/77/stop",
+                "unexpected finalizer path: {path}"
+            ),
+            other => bail!("unexpected finalizer: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn capability_query_reports_malformed_target() -> anyhow::Result<()> {
+        let spec = ActorSpec::with_capabilities("reader", ["read://state/memory/**"]);
+        let err = match spec.declares_capability("read", "state://bad//path") {
+            Ok(value) => bail!("malformed target unexpectedly returned {value}"),
+            Err(error) => error,
+        };
+        ensure!(
+            matches!(err, CapabilityQueryError::TargetPath { .. }),
+            "unexpected error: {err:?}"
+        );
         Ok(())
     }
 }

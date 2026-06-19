@@ -22,7 +22,10 @@ pub mod cursor;
 pub mod r#do;
 pub mod graph;
 
-pub use actor_spec::{ActorSpec, LintFinding, LintSeverity, capability_covers, lint};
+pub use actor_spec::{
+    ActorBindError, ActorSpec, CapabilityQueryError, LintFinding, LintSeverity, capability_covers,
+    lint, lint_actor, operation_capability_verb,
+};
 pub use compile::{CompileError, compile_do, compile_do_at};
 pub use cursor::{Frame, GraphCursor};
 pub use r#do::DoNode;

@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 async-trait = { workspace = true, default-features = false }
 blake3 = { workspace = true, default-features = false, features = ["std"] }
+futures-util = { workspace = true, default-features = false, features = ["std"] }
 nexus-graph.workspace = true
 nexus-state.workspace = true
 nexus-types.workspace = true

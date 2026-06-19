@@ -72,9 +72,10 @@ Publishing requires the referenced surface to carry a `publish://...`
 capability that covers the target effect. MCP clients never submit raw effect
 paths, raw capabilities, acting identities, or raw Operations.
 
-The MCP adapter negotiates `2025-11-25` first and keeps compatible recent
-protocol versions in the handshake. It implements initialize, ping, tool,
-resource, resource template, prompt, and completion requests. It does not
+The MCP adapter negotiates `2025-11-25` first and keeps all supported published
+MCP protocol revisions in the handshake. It implements initialize, ping, tool,
+resource, resource template, prompt, and completion requests. It advertises
+completion support only for protocol revisions that define it. It does not
 advertise logging, resource subscriptions, list-change notifications, or task
 execution.
 

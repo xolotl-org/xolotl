@@ -115,6 +115,9 @@ Nexus separates the runtime into four code paths:
 
 `nexus-standard` uses Cargo features to choose which modules are built. The
 default `standard` feature builds the standard in-process implementations.
+Embedded hosts can choose a smaller installed module set with
+`StandardConfig::with_modules` and can provide their own model backend for
+standard model-backed effects with `StandardConfig::with_inference_backend`.
 Gateway crates use only `external-session`, which contains session
 handling for external Provider and Source endpoints.
 
@@ -122,6 +125,13 @@ handling for external Provider and Source endpoints.
 `NexusBuilder` to provide their own state backend and fact sink. Standard
 providers are installed explicitly by enabling the SDK `standard` feature or by
 calling `nexus-standard` directly.
+`ActorSpec` is available through `nexus-graph` and `nexus-sdk`; the kernel can
+spawn it as a named long-lived Process through `Bootstrap::spawn_actor_under` or
+`Nexus::spawn_actor`. If the body or finalizers reference process-local
+`StepRef`s, pass their host functions at spawn time with
+`Bootstrap::spawn_actor_under_with_steps` or `Nexus::spawn_actor_with_steps`.
+Actor declarations may use `state://process/self/...`; spawn binds it to the
+concrete Process id before linting and execution.
 
 ## Requirements
 
@@ -242,8 +252,9 @@ resources, resource templates, and prompts. Each publication references a
 Gateway surface; the surface must have an explicit publish capability, and MCP
 calls, reads, and prompt requests are translated into standard
 capability-scoped operations. The adapter negotiates `2025-11-25` first,
-supports completions from publication properties, and validates native MCP
-content blocks before returning them.
+keeps supported published MCP revisions available, declares completions only
+for revisions that define them, and validates native MCP content blocks before
+returning them.
 
 ## Path And Capability Rules
 

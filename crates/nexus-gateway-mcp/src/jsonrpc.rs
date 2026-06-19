@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Map, json};
 
 pub(crate) const JSONRPC_VERSION: &str = "2.0";
 pub(crate) const JSONRPC_PARSE_ERROR: i64 = -32700;
@@ -127,37 +127,45 @@ fn jsonrpc_error_message(code: i64) -> &'static str {
 
 pub(crate) fn select_mcp_protocol_version(client_version: Option<&str>) -> &'static str {
     match client_version {
-        Some(version) if MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&version) => {
-            for supported in MCP_SUPPORTED_PROTOCOL_VERSIONS {
-                if *supported == version {
-                    return supported;
-                }
+        Some(version) => {
+            if let Some(supported) = MCP_SUPPORTED_PROTOCOL_VERSIONS
+                .iter()
+                .copied()
+                .find(|supported| *supported == version)
+            {
+                supported
+            } else {
+                MCP_PROTOCOL_VERSION
             }
-            MCP_PROTOCOL_VERSION
         }
-        _ => MCP_PROTOCOL_VERSION,
+        None => MCP_PROTOCOL_VERSION,
     }
 }
 
 pub(crate) fn mcp_initialize_result(protocol_version: &'static str) -> serde_json::Value {
+    let mut capabilities = Map::new();
+    capabilities.insert("tools".into(), json!({ "listChanged": false }));
+    capabilities.insert(
+        "resources".into(),
+        json!({
+            "subscribe": false,
+            "listChanged": false
+        }),
+    );
+    capabilities.insert("prompts".into(), json!({ "listChanged": false }));
+    if mcp_supports_completions(protocol_version) {
+        capabilities.insert("completions".into(), json!({}));
+    }
     json!({
         "protocolVersion": protocol_version,
-        "capabilities": {
-            "tools": {
-                "listChanged": false
-            },
-            "resources": {
-                "subscribe": false,
-                "listChanged": false
-            },
-            "prompts": {
-                "listChanged": false
-            },
-            "completions": {}
-        },
+        "capabilities": capabilities,
         "serverInfo": {
             "name": "nexus-gateway-mcp",
             "version": env!("CARGO_PKG_VERSION")
         }
     })
+}
+
+fn mcp_supports_completions(protocol_version: &str) -> bool {
+    matches!(protocol_version, "2025-11-25" | "2025-06-18" | "2025-03-26")
 }

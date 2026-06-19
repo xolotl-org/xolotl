@@ -12,12 +12,14 @@ use crate::handle::{FastPath, HandleTable};
 use crate::open::derive_handle;
 use crate::policy::{CheckCtx, PolicyDecision};
 use crate::process::ProcessEntry;
+use futures_util::FutureExt;
 use nexus_types::{
     DecisionTag, Fact, Failure, Operation, Outcome, OutcomeRef, OutputMode, OutputModeSet, Path,
     TaintSet, Timestamp, Value, ValueRef,
 };
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 /// Result of executing one operation: the outcome plus the recorded decision
@@ -452,10 +454,15 @@ impl DataPlane {
         let mut result = match &async_result {
             Some(_) => Ok(Outcome::Done(Value::Null)),
             None => {
-                resolved
-                    .plan
-                    .call(op.method, input, dispatch_output, &ctx)
+                match AssertUnwindSafe(resolved.plan.call(op.method, input, dispatch_output, &ctx))
+                    .catch_unwind()
                     .await
+                {
+                    Ok(result) => result,
+                    Err(payload) => Err(DriverError::Other(
+                        crate::bootstrap::panic_payload_message("driver", payload),
+                    )),
+                }
             }
         };
         if matches!(op.output, OutputMode::Stream) {
@@ -822,6 +829,16 @@ impl DataPlane {
                 if let Err(e) = outcome_path {
                     errors.push(format!("outcome path: {e}"));
                 }
+                self.handles.write().revoke_owned_by(child);
+                if processes
+                    .mark_finalized_terminal(child, nexus_types::ProcessStatus::Failed)
+                    .is_none()
+                {
+                    tracing::error!(
+                        child = child.get(),
+                        "async process disappeared during path failure cleanup"
+                    );
+                }
                 return Outcome::Fail(Failure::InvalidInput {
                     reason: format!(
                         "failed to construct async process resource paths: {}",
@@ -866,7 +883,7 @@ impl DataPlane {
             {
                 tracing::error!(?e, child = ?child, "async process status write failed");
             }
-            let outcome = Box::pin(child_dp.execute_inner(
+            let child_run = Box::pin(child_dp.execute_inner(
                 &child_op,
                 ExecuteParams {
                     method_index,
@@ -877,15 +894,36 @@ impl DataPlane {
                     record: true,
                 },
                 true,
-            ))
-            .await
-            .outcome;
+            ));
+            let outcome = match AssertUnwindSafe(child_run).catch_unwind().await {
+                Ok(output) => output.outcome,
+                Err(payload) => Outcome::Fail(Failure::HandlerError {
+                    kind: "panic".into(),
+                    message: crate::bootstrap::panic_payload_message("async process", payload),
+                }),
+            };
             let terminal = if outcome.is_success() {
                 nexus_types::ProcessStatus::Completed
             } else {
                 nexus_types::ProcessStatus::Failed
             };
-            child_processes.set_status(child, terminal);
+            let revoked = child_dp.handles.write().revoke_owned_by(child);
+            let actual_status = match child_processes.mark_finalized_terminal(child, terminal) {
+                Some(status) => status,
+                None => {
+                    tracing::error!(
+                        child = child.get(),
+                        "async process disappeared before terminal cleanup"
+                    );
+                    terminal
+                }
+            };
+            if revoked == 0 {
+                tracing::debug!(
+                    child = child.get(),
+                    "async process cleanup found no owned handles"
+                );
+            }
             if let Err(e) = child_state
                 .write_set_tainted(
                     &child_outcome_path,
@@ -896,10 +934,15 @@ impl DataPlane {
             {
                 tracing::error!(?e, child = ?child, "async process outcome write failed");
             }
-            let phase = if outcome.is_success() {
-                "completed"
-            } else {
-                "failed"
+            let phase = match actual_status {
+                nexus_types::ProcessStatus::Completed => "completed",
+                nexus_types::ProcessStatus::Failed => "failed",
+                nexus_types::ProcessStatus::Cancelled => "cancelled",
+                nexus_types::ProcessStatus::Created => "created",
+                nexus_types::ProcessStatus::Running => "running",
+                nexus_types::ProcessStatus::Waiting => "waiting",
+                nexus_types::ProcessStatus::Suspended => "suspended",
+                nexus_types::ProcessStatus::Finalizing => "finalizing",
             };
             let status = async_status_value(
                 phase,
@@ -2386,6 +2429,61 @@ mod tests {
         ensure!(
             store.len() == 2,
             "parent spawn and child execution should each record one Fact"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_process_completion_does_not_overwrite_cancellation() -> anyhow::Result<()> {
+        let (dp, id, state, _store, processes) =
+            async_dataplane(Rights::new(MethodBitmap::method(0), RightFlags::SPAWN_WITH))?;
+        let mut o = op(id, 7, Value::Str("work".into()));
+        o.output = OutputMode::AsyncProcess;
+
+        let out = dp
+            .execute(&o, 0, ReplayClass::Deterministic, SUPPORTS_ASYNC, 0, false)
+            .await;
+        let (child, status_path) = match out.outcome {
+            Outcome::Done(Value::Map(m)) => {
+                let child = match m.get("process") {
+                    Some(Value::Int(n)) => ProcessId::new(*n as u64),
+                    other => bail!("expected child process id, got {other:?}"),
+                };
+                let status_path = match m.get("status_path") {
+                    Some(Value::Str(s)) => Path::parse(s)?,
+                    other => bail!("expected status path, got {other:?}"),
+                };
+                (child, status_path)
+            }
+            other => bail!("expected async resource map, got {other:?}"),
+        };
+        ensure!(
+            processes.cancel_if_non_terminal(child) == Some(true),
+            "child process should accept cancellation"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(nexus_types::ProcessStatus::Completed) = processes.status(child) {
+                    bail!("async child completion overwrote cancellation");
+                }
+                if let Some(value) = state.read(&status_path).await?
+                    && value
+                        .as_map()
+                        .and_then(|map| map.get("phase"))
+                        .and_then(Value::as_str)
+                        == Some("cancelled")
+                {
+                    break Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("async child did not publish cancelled status before timeout")??;
+        ensure!(
+            processes.status(child) == Some(nexus_types::ProcessStatus::Cancelled),
+            "child process status was not cancelled"
         );
         Ok(())
     }

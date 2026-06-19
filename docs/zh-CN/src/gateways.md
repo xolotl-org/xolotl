@@ -49,7 +49,7 @@ MCP server 支持由 Gateway publication 定义。publication 为 `mcp` 协议�
 
 发布要求被引用的 surface 带有覆盖目标 effect 的 `publish://...` capability。MCP client 不能提交 raw effect path、raw capability、acting identity 或 raw Operation。
 
-MCP adapter 优先协商 `2025-11-25`，并在 handshake 中保留近期兼容版本。它实现 initialize、ping、tool、resource、resource template、prompt 和 completion 请求。不声明 logging、resource subscription、list-change notification 或 task execution。
+MCP adapter 优先协商 `2025-11-25`，并在 handshake 中保留所有已支持的已发布 MCP 协议修订。它实现 initialize、ping、tool、resource、resource template、prompt 和 completion 请求，但只在对应协议修订定义 completion 时声明 completion。不声明 logging、resource subscription、list-change notification 或 task execution。
 
 MCP 专用字段留在 publication properties 中。`icons`、`mimeType`、`size`、prompt `arguments` 和静态 `completions` 由 MCP adapter 读取。Gateway 仍持有 surface target、schema、binding、limit 和 audit 路径。Tool result 可以返回原生 MCP `content`、`structuredContent`、`isError` 和 `_meta`；content block 会先校验再发送。
 

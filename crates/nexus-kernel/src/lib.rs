@@ -43,7 +43,7 @@ pub mod step;
 
 pub use bootstrap::{
     Bootstrap, BootstrapError, CompiledRequestGrantTemplate, GatewayAudit, MethodSpec,
-    RequestGrantTemplate,
+    ProcessStepBinding, RequestGrantTemplate, SpawnedActor,
 };
 pub use dataplane::{DataPlane, ExecOutput, ExecuteParams};
 pub use driver::{
@@ -60,11 +60,11 @@ pub use policy::{
     ConstraintCheck, OpenContext, PolicyCompileError, PolicyDecision, PolicySnapshot, PolicySource,
     RateLimitCheck,
 };
-pub use process::{ProcessEntry, ProcessTable};
+pub use process::ProcessTable;
 pub use recovery::{
     QuarantineAction, QuarantineEntry, RecoveryReport, ReplayMap, Snapshot, classify_recovery,
     recover_process,
 };
 pub use registry::{AdmissionError, Registry, ResolveError};
 pub use scheduler::{Queue, Scheduler};
-pub use step::{StepFn, StepTable};
+pub use step::{StepFn, StepInstallError};

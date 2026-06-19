@@ -19,6 +19,12 @@ const JSONRPC_INVALID_PARAMS: i64 = -32602;
 const JSONRPC_RESOURCE_NOT_FOUND: i64 = -32002;
 const JSONRPC_GATEWAY_ERROR: i64 = -32000;
 const TEST_TOKEN: &str = "mcp-token-for-alice-0001";
+const MCP_PUBLISHED_PROTOCOL_VERSIONS: &[(&str, bool)] = &[
+    ("2025-11-25", true),
+    ("2025-06-18", true),
+    ("2025-03-26", true),
+    ("2024-11-05", false),
+];
 
 macro_rules! assert {
     ($condition:expr $(,)?) => {
@@ -873,58 +879,42 @@ async fn jsonrpc_initialize_ping_and_initialized_notification_do_not_expose_surf
     ))?;
     let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(boot, profile))?));
 
-    let initialized = mcp
-        .handle_jsonrpc_value(
-            "",
-            json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-03-26",
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "test-client",
-                        "version": "0.1.0"
+    for (id, &(protocol_version, supports_completions)) in
+        MCP_PUBLISHED_PROTOCOL_VERSIONS.iter().enumerate()
+    {
+        let initialized = mcp
+            .handle_jsonrpc_value(
+                "",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": protocol_version,
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "test-client",
+                            "version": "0.1.0"
+                        }
                     }
-                }
-            }),
-        )
-        .await;
-    assert!(initialized.error.is_none());
-    let result = response_result(&initialized, "initialize")?;
-    assert_eq!(result["protocolVersion"], "2025-03-26");
-    assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
-    assert_eq!(result["capabilities"]["resources"]["subscribe"], false);
-    assert_eq!(result["capabilities"]["prompts"]["listChanged"], false);
-    assert!(result["capabilities"]["completions"].is_object());
-    assert!(result["capabilities"].get("logging").is_none());
-    assert!(result["capabilities"].get("tasks").is_none());
-    assert!(result.get("tools").is_none());
-
-    let latest = mcp
-        .handle_jsonrpc_value(
-            "",
-            json!({
-                "jsonrpc": "2.0",
-                "id": "latest",
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-11-25",
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "test-client",
-                        "version": "0.1.0"
-                    }
-                }
-            }),
-        )
-        .await;
-    assert!(latest.error.is_none());
-    assert_eq!(
-        response_result(&latest, "initialize latest")?["protocolVersion"],
-        "2025-11-25"
-    );
+                }),
+            )
+            .await;
+        assert!(initialized.error.is_none());
+        let result = response_result(&initialized, "initialize")?;
+        assert_eq!(result["protocolVersion"], protocol_version);
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
+        assert_eq!(result["capabilities"]["resources"]["subscribe"], false);
+        assert_eq!(result["capabilities"]["prompts"]["listChanged"], false);
+        if supports_completions {
+            assert!(result["capabilities"]["completions"].is_object());
+        } else {
+            assert!(result["capabilities"].get("completions").is_none());
+        }
+        assert!(result["capabilities"].get("logging").is_none());
+        assert!(result["capabilities"].get("tasks").is_none());
+        assert!(result.get("tools").is_none());
+    }
 
     let notification = mcp
         .handle_jsonrpc_message_value(

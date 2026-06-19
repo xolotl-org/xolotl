@@ -127,10 +127,14 @@ daemon 的控制台监听器当前是明文监听器。`local_trusted` 只用于
 
 ## 运行时配置
 
-运行时 Provider 设置、模型路由、组、绑定、进程内 Provider/Source projection 声明、外部 Provider/Source installation 声明和策略管理状态都属于 Nexus state，并通过 Console WebSocket action 管理。External projection 是 installation 声明的一部分。External 声明使用 `external.*`，inference 声明使用 `inference.*`，进程内 projection 声明使用 `projection.in_process.*`。泛用 `config.*` action 会拒绝已经有专用动作族的运行时配置路径。
+运行时 Provider 设置、模型路由、组、绑定、进程内 Provider/Source projection 声明、外部 Provider/Source installation 声明和策略管理状态都属于 Nexus state，并通过 Console WebSocket action 管理。External projection 是 installation 声明的一部分。External 声明使用 `external.*`，inference 声明使用 `inference.*`，进程内 projection 声明通过 `config.*` 写入 `state://kernel/projections/in-process/<id>`。泛用 `config.*` action 会拒绝已经有专用动作族的运行时配置路径。
 
 `nexus-standard` Cargo feature 决定哪些进程内实现被编译进宿主二进制。可选进程内 projection 声明位于
-`state://kernel/projections/in-process/<id>`。
+`state://kernel/projections/in-process/<id>`。reconcile 状态写在
+`state://kernel/projection-status/in-process/<id>`，通过
+`projection.in_process.status.*` 读取；状态会区分期望声明版本和当前 active registry 版本。
+嵌入式宿主还可以用 `StandardConfig::with_modules` 选择实际安装哪些已编译的
+standard-core 模块；代码编译进二进制并不等于已经公开为 Resource。
 
 HTTP inference provider 只有在宿主二进制启用对应 `nexus-standard` feature 时才会编译。
 运行时声明放在 `state://kernel/inference/*` 和 `state://kernel/routing/inference`；

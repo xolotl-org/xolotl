@@ -355,23 +355,15 @@ fn assert_limit_contains(err: GatewayError, needle: &str) -> anyhow::Result<()> 
 }
 
 fn restricted_anchor(boot: &Bootstrap, selector: &str) -> anyhow::Result<ProcessId> {
-    let anchor = boot.kernel.processes.fresh_id();
-    let mut entry =
-        nexus_kernel::ProcessEntry::new(anchor, Some(boot.root), nexus_types::IdentityRef::ROOT);
-    entry.status = nexus_types::ProcessStatus::Running;
-    boot.kernel.processes.insert(entry);
-    boot.kernel.registry.register_grant(nexus_types::Grant {
-        id: boot.kernel.registry.next_grant_id(),
-        holder: anchor,
-        selector: nexus_types::ResourceSelector::parse(selector)?,
-        rights: nexus_types::Rights::new(
-            nexus_types::MethodBitmap::ALL,
-            nexus_types::RightFlags::empty(),
-        ),
-        constraints: nexus_types::ConstraintSet::empty(),
-        expires: nexus_types::Expiry::Never,
-    });
-    Ok(anchor)
+    boot.spawn_request_process_under_with_request_grants(
+        boot.root,
+        nexus_types::IdentityRef::ROOT,
+        &[nexus_kernel::RequestGrantTemplate {
+            literal: selector,
+            methods: nexus_types::MethodBitmap::ALL,
+        }],
+    )
+    .map_err(Into::into)
 }
 
 fn expect_error<T: Debug, E>(result: Result<T, E>) -> anyhow::Result<E> {

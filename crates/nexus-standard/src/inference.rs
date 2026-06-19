@@ -31,9 +31,9 @@ pub(crate) const INFERENCE_METHODS: &[MethodSpec] = &[
     MethodSpec::new("plan", Purity::Effectful, MethodSpec::STREAM_ASYNC),
 ];
 
-/// A model backend used by [`InferenceDriver`].
+/// A model backend used by the standard inference driver.
 #[async_trait]
-pub(crate) trait InferenceBackend: Send + Sync + 'static {
+pub trait InferenceBackend: Send + Sync + 'static {
     /// Produce a completion for a prompt value (text or mixed parts).
     async fn infer(&self, input: &Value) -> Result<Value, String>;
     /// Produce a planning response. The default uses [`InferenceBackend::infer`].
@@ -55,15 +55,15 @@ pub(crate) trait InferenceBackend: Send + Sync + 'static {
 
 /// Which `effect://inference/*` methods a model backend can serve.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct InferenceMethodSupport {
+pub struct InferenceMethodSupport {
     /// Supports `effect://inference/infer`.
-    pub(crate) infer: bool,
+    pub infer: bool,
     /// Supports `effect://inference/embed`.
-    pub(crate) embed: bool,
+    pub embed: bool,
     /// Supports `effect://inference/rerank`.
-    pub(crate) rerank: bool,
+    pub rerank: bool,
     /// Supports `effect://inference/plan`.
-    pub(crate) plan: bool,
+    pub plan: bool,
 }
 
 impl Default for InferenceMethodSupport {
@@ -80,21 +80,21 @@ impl Default for InferenceMethodSupport {
 /// Capability flags a model declares, used to filter candidates by the
 /// request's required modality and features (tools/vision/audio/json/streaming).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ModelCapabilities {
+pub struct ModelCapabilities {
     /// Inference methods this model can serve.
-    pub(crate) methods: InferenceMethodSupport,
+    pub methods: InferenceMethodSupport,
     /// Modalities this model can accept or produce.
-    pub(crate) modality: nexus_types::ModalitySet,
+    pub modality: nexus_types::ModalitySet,
     /// Whether the model supports tool-use prompts or tool schemas.
-    pub(crate) tools: bool,
+    pub tools: bool,
     /// Whether the model supports image/blob vision input.
-    pub(crate) vision: bool,
+    pub vision: bool,
     /// Whether the model supports audio input.
-    pub(crate) audio: bool,
+    pub audio: bool,
     /// Whether the model can constrain output to JSON.
-    pub(crate) json: bool,
+    pub json: bool,
     /// Whether the model can stream output chunks.
-    pub(crate) streaming: bool,
+    pub streaming: bool,
 }
 
 impl Default for ModelCapabilities {
@@ -149,11 +149,11 @@ impl ModelCapabilities {
 ///   completion that quotes the salient request), not a placeholder.
 /// * `embed` hashes the input into a small fixed-dim tensor with a declared
 ///   embedding space, so Memory retrieval is internally consistent.
-pub(crate) struct EchoBackend;
+pub struct EchoBackend;
 
 /// The embedding space id the baseline tags its vectors with. Retrieval
 /// only compares vectors sharing a space; the baseline is its own space.
-pub(crate) const BASELINE_EMBEDDING_SPACE: &str = "nexus-baseline-blake3-8d";
+pub const BASELINE_EMBEDDING_SPACE: &str = "nexus-baseline-blake3-8d";
 
 #[async_trait]
 impl InferenceBackend for EchoBackend {
@@ -260,15 +260,6 @@ pub(crate) struct InferenceDriver {
 }
 
 enum InferenceRouterSource {
-    #[cfg(any(
-        test,
-        not(any(
-            feature = "openai-responses",
-            feature = "openai-chat",
-            feature = "anthropic-messages",
-            feature = "gemini-generate-content"
-        ))
-    ))]
     Static(Arc<crate::router::Router>),
     #[cfg(any(
         feature = "openai-responses",
@@ -285,6 +276,15 @@ impl InferenceDriver {
     pub(crate) fn with_router_arc(router: Arc<crate::router::Router>) -> Self {
         Self {
             router: InferenceRouterSource::Static(router),
+        }
+    }
+
+    /// Build a driver over one host-provided backend.
+    pub(crate) fn with_backend(backend: Arc<dyn InferenceBackend>) -> Self {
+        Self {
+            router: InferenceRouterSource::Static(Arc::new(crate::router::Router::new(vec![
+                crate::router::ModelEntry::new("host/custom", backend),
+            ]))),
         }
     }
 
@@ -319,15 +319,6 @@ impl InferenceDriver {
 
     async fn router(&self) -> Result<Arc<crate::router::Router>, DriverError> {
         match &self.router {
-            #[cfg(any(
-                test,
-                not(any(
-                    feature = "openai-responses",
-                    feature = "openai-chat",
-                    feature = "anthropic-messages",
-                    feature = "gemini-generate-content"
-                ))
-            ))]
             InferenceRouterSource::Static(router) => Ok(router.clone()),
             #[cfg(any(
                 feature = "openai-responses",

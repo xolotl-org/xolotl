@@ -121,12 +121,10 @@ pub const ACTION_EXTERNAL_MANIFEST_LIST: &str = "external.manifest.list";
 pub const ACTION_EXTERNAL_MANIFEST_READ: &str = "external.manifest.read";
 /// Compare-and-swap one external manifest.
 pub const ACTION_EXTERNAL_MANIFEST_WRITE_CAS: &str = "external.manifest.write_cas";
-/// List in-process projection declarations.
-pub const ACTION_PROJECTION_IN_PROCESS_LIST: &str = "projection.in_process.list";
-/// Read one in-process projection declaration.
-pub const ACTION_PROJECTION_IN_PROCESS_READ: &str = "projection.in_process.read";
-/// Compare-and-swap one in-process projection declaration.
-pub const ACTION_PROJECTION_IN_PROCESS_WRITE_CAS: &str = "projection.in_process.write_cas";
+/// List in-process projection reconcile statuses.
+pub const ACTION_PROJECTION_IN_PROCESS_STATUS_LIST: &str = "projection.in_process.status.list";
+/// Read one in-process projection reconcile status.
+pub const ACTION_PROJECTION_IN_PROCESS_STATUS_READ: &str = "projection.in_process.status.read";
 /// List inference backend declarations.
 pub const ACTION_INFERENCE_BACKEND_LIST: &str = "inference.backend.list";
 /// Read one inference backend declaration.
@@ -836,11 +834,11 @@ pub(crate) fn resource_type_list_value() -> Value {
                 ImplementationStatus::Implemented,
             ),
             resource_type_summary(
-                "projection.in_process",
-                "In-process projection",
-                "projection.in_process",
-                ACTION_PROJECTION_IN_PROCESS_READ,
-                Some(ACTION_PROJECTION_IN_PROCESS_WRITE_CAS),
+                "projection.in_process.status",
+                "In-process projection status",
+                "projection.in_process.status",
+                ACTION_PROJECTION_IN_PROCESS_STATUS_READ,
+                None,
                 ImplementationStatus::Implemented,
             ),
             resource_type_summary(
@@ -1133,46 +1131,28 @@ pub(crate) fn resource_type_descriptor_value(resource_type: &str) -> Option<Valu
             ],
             vec!["platform"],
         )),
-        "projection.in_process" => Some(resource_type_descriptor(
+        "projection.in_process.status" => Some(resource_type_descriptor(
             ResourceTypeDescriptorMeta {
-                resource_type: "projection.in_process",
-                title: "In-process projection",
-                default_view: "projection.in_process",
+                resource_type: "projection.in_process.status",
+                title: "In-process projection status",
+                default_view: "projection.in_process.status",
                 status: ImplementationStatus::Implemented,
             },
             ResourceTypeDescriptorActions {
-                read: ACTION_PROJECTION_IN_PROCESS_READ,
-                list: Some(ACTION_PROJECTION_IN_PROCESS_LIST),
-                update: Some(ACTION_PROJECTION_IN_PROCESS_WRITE_CAS),
+                read: ACTION_PROJECTION_IN_PROCESS_STATUS_READ,
+                list: Some(ACTION_PROJECTION_IN_PROCESS_STATUS_LIST),
+                update: None,
                 validate: None,
             },
-            vec![
-                semantic_contract_field(
-                    "id",
-                    "string",
-                    true,
-                    "resource_ref",
-                    "management_state",
-                    false,
-                ),
-                semantic_contract_field(
-                    "def",
-                    "value",
-                    true,
-                    "json_value",
-                    "management_state",
-                    false,
-                ),
-                semantic_contract_field(
-                    "expected_version",
-                    "u64|null",
-                    false,
-                    "revision",
-                    "public_control",
-                    false,
-                ),
-            ],
-            vec!["id", "implementation"],
+            vec![semantic_contract_field(
+                "id",
+                "string",
+                true,
+                "resource_ref",
+                "management_state",
+                false,
+            )],
+            vec!["id"],
         )),
         "inference.backend" => Some(resource_type_descriptor(
             ResourceTypeDescriptorMeta {
@@ -1379,12 +1359,19 @@ pub(crate) fn resource_view_descriptor_value(view: &str) -> Option<Value> {
             STREAM_STATE_WATCH,
             vec!["platform", "version", "projection_count"],
         )),
-        "projection.in_process" => Some(resource_view_descriptor(
-            "projection.in_process",
-            "projection.in_process",
-            ACTION_PROJECTION_IN_PROCESS_LIST,
+        "projection.in_process.status" => Some(resource_view_descriptor(
+            "projection.in_process.status",
+            "projection.in_process.status",
+            ACTION_PROJECTION_IN_PROCESS_STATUS_LIST,
             STREAM_STATE_WATCH,
-            vec!["id", "role", "implementation", "provides", "version"],
+            vec![
+                "id",
+                "phase",
+                "implementation",
+                "desired_version",
+                "active_version",
+                "error_code",
+            ],
         )),
         "inference.backends" => Some(resource_view_descriptor(
             "inference.backends",
@@ -1843,7 +1830,7 @@ fn build_action_descriptors() -> Vec<ActionDescriptor> {
                 ],
                 vec![
                     "requires MFA step-up",
-                    "runtime config paths with dedicated actions must use access.*, external.*, projection.in_process.*, inference.*, or pairing.*",
+                    "runtime config paths with dedicated actions must use access.*, external.*, inference.*, or pairing.*",
                 ],
             ),
             schema("protocol.empty", "null", vec![], vec![]),
@@ -2075,27 +2062,17 @@ fn build_action_descriptors() -> Vec<ActionDescriptor> {
                 field("expected_version", "u64|null", false),
             ],
         ),
-        projection_action(
-            ACTION_PROJECTION_IN_PROCESS_LIST,
+        projection_status_action(
+            ACTION_PROJECTION_IN_PROCESS_STATUS_LIST,
             ActionKind::View,
             false,
             vec![],
         ),
-        projection_action(
-            ACTION_PROJECTION_IN_PROCESS_READ,
+        projection_status_action(
+            ACTION_PROJECTION_IN_PROCESS_STATUS_READ,
             ActionKind::View,
             false,
             vec![field("id", "string", true)],
-        ),
-        projection_action(
-            ACTION_PROJECTION_IN_PROCESS_WRITE_CAS,
-            ActionKind::Mutation,
-            true,
-            vec![
-                field("id", "string", true),
-                field("def", "value", true),
-                field("expected_version", "u64|null", false),
-            ],
         ),
         inference_action(
             ACTION_INFERENCE_BACKEND_LIST,
@@ -2357,7 +2334,7 @@ fn external_authority(id: &str) -> Vec<RequiredAuthority> {
     }
 }
 
-fn projection_action(
+fn projection_status_action(
     id: &str,
     kind: ActionKind,
     requires_step_up: bool,
@@ -2376,23 +2353,13 @@ fn projection_action(
             VisibilityTier::ManagementState,
             requires_step_up,
         ),
-        projection_authority(id),
+        vec![authority(
+            "read",
+            "state://kernel/projection-status/in-process/**",
+        )],
         schema(&format!("{id}.input"), "map", fields, vec![]),
         schema(&format!("{id}.output"), "value", vec![], vec![]),
     )
-}
-
-fn projection_authority(id: &str) -> Vec<RequiredAuthority> {
-    let (verb, target) = match id {
-        ACTION_PROJECTION_IN_PROCESS_LIST | ACTION_PROJECTION_IN_PROCESS_READ => {
-            ("read", "state://kernel/projections/in-process/**")
-        }
-        ACTION_PROJECTION_IN_PROCESS_WRITE_CAS => {
-            ("write", "state://kernel/projections/in-process/**")
-        }
-        _ => ("read", "state://kernel/projections/in-process/**"),
-    };
-    vec![authority(verb, target)]
 }
 
 fn inference_action(
@@ -3099,14 +3066,6 @@ mod tests {
                 required.verb == "write" && required.target == "state://kernel/routing/inference"
             }),
             "inference routing write missing routing authority"
-        );
-        let projection = find_action(&actions, ACTION_PROJECTION_IN_PROCESS_WRITE_CAS)?;
-        ensure!(
-            projection.required_authority.iter().any(|required| {
-                required.verb == "write"
-                    && required.target == "state://kernel/projections/in-process/**"
-            }),
-            "in-process projection write missing projection authority"
         );
         Ok(())
     }

@@ -15,7 +15,7 @@ use nexus_types::{MethodId, Outcome, OutputMode, Path, Purity, Value};
 /// `invoke`.
 pub(crate) const LOCK_METHODS: &[MethodSpec] = &[
     MethodSpec::new("acquire", Purity::Effectful, MethodSpec::UNARY_ASYNC),
-    MethodSpec::new("release", Purity::Effectful, MethodSpec::UNARY_ASYNC),
+    MethodSpec::new("release", Purity::Effectful, MethodSpec::UNARY_ASYNC).finalize_allowed(),
 ];
 
 /// Drives the lock actions.

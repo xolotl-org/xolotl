@@ -31,8 +31,8 @@ use tokio::process::{Child, Command};
 /// pure read of external process state.
 pub(crate) const PROC_METHODS: &[MethodSpec] = &[
     MethodSpec::new("spawn", Purity::Effectful, MethodSpec::UNARY_ASYNC),
-    MethodSpec::new("kill", Purity::Effectful, MethodSpec::UNARY_ASYNC),
-    MethodSpec::new("signal", Purity::Effectful, MethodSpec::UNARY_ASYNC),
+    MethodSpec::new("kill", Purity::Effectful, MethodSpec::UNARY_ASYNC).finalize_allowed(),
+    MethodSpec::new("signal", Purity::Effectful, MethodSpec::UNARY_ASYNC).finalize_allowed(),
     MethodSpec::new("status", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external(),
     MethodSpec::new("heartbeat", Purity::Effectful, MethodSpec::UNARY_ASYNC),
 ];

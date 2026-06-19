@@ -46,14 +46,21 @@ pub(crate) enum MgmtError {
 /// Only `state://kernel/*` is manageable from the console. The vault and fact
 /// prefixes are never writable here.
 fn ensure_manageable(path: &Path) -> Result<(), MgmtError> {
-    let s = path.to_string();
-    if !s.starts_with("state://kernel/") {
-        return Err(MgmtError::NotManageable(s));
+    if !is_local_kernel_state_subtree(path) {
+        return Err(MgmtError::NotManageable(path.to_string()));
     }
     if nexus_types::is_vault_reserved(path) {
-        return Err(MgmtError::NotManageable(s));
+        return Err(MgmtError::NotManageable(path.to_string()));
     }
     Ok(())
+}
+
+fn is_local_kernel_state_subtree(path: &Path) -> bool {
+    let segs = path.segments();
+    path.scheme() == "state"
+        && path.cluster().is_none()
+        && segs.first().map(|s| s.as_str()) == Some("kernel")
+        && segs.len() > 1
 }
 
 /// Read a management config value.
@@ -197,7 +204,10 @@ async fn write_config_inner(
 
 pub(crate) fn is_dedicated_runtime_config_path(path: &Path) -> bool {
     let segs = path.segments();
-    if path.scheme() != "state" || segs.first().map(|s| s.as_str()) != Some("kernel") {
+    if path.scheme() != "state"
+        || path.cluster().is_some()
+        || segs.first().map(|s| s.as_str()) != Some("kernel")
+    {
         return false;
     }
     matches!(
@@ -210,12 +220,11 @@ pub(crate) fn is_dedicated_runtime_config_path(path: &Path) -> bool {
                 | "external-credential-revocations"
                 | "inference"
                 | "manifests"
+                | "projection-status"
                 | "procs"
         )
-    ) || (segs.get(1).map(|s| s.as_str()) == Some("projections")
-        && segs.get(2).map(|s| s.as_str()) == Some("in-process"))
-        || (segs.get(1).map(|s| s.as_str()) == Some("routing")
-            && segs.get(2).map(|s| s.as_str()) == Some("inference"))
+    ) || (segs.get(1).map(|s| s.as_str()) == Some("routing")
+        && segs.get(2).map(|s| s.as_str()) == Some("inference"))
 }
 
 fn reject_dedicated_runtime_config_path(path: &Path) -> Result<(), MgmtError> {
@@ -229,13 +238,10 @@ fn reject_dedicated_runtime_config_path(path: &Path) -> Result<(), MgmtError> {
 
 fn reject_dedicated_runtime_config_prefix(path: &Path) -> Result<(), MgmtError> {
     let segs = path.segments();
-    let contains_dedicated_subtree = if path.scheme() == "state" {
+    let contains_dedicated_subtree = if path.scheme() == "state" && path.cluster().is_none() {
         match segs {
             [kernel] => kernel.as_str() == "kernel",
-            [kernel, routing] => {
-                kernel.as_str() == "kernel"
-                    && (routing.as_str() == "routing" || routing.as_str() == "projections")
-            }
+            [kernel, routing] => kernel.as_str() == "kernel" && routing.as_str() == "routing",
             _ => false,
         }
     } else {
@@ -278,7 +284,10 @@ async fn admit_kernel_config(
     value: &mut Value,
 ) -> Result<(), MgmtError> {
     let segs = path.segments();
-    if path.scheme() != "state" || segs.first().map(|s| s.as_str()) != Some("kernel") {
+    if path.scheme() != "state"
+        || path.cluster().is_some()
+        || segs.first().map(|s| s.as_str()) != Some("kernel")
+    {
         return Err(MgmtError::NotManageable(path.to_string()));
     }
 
@@ -302,7 +311,7 @@ async fn admit_kernel_config(
             admit_console_role(value)
         }
         s if is_exact_path(s, &["kernel", "audit", "rules"]) => {
-            let _: AuditRules = decode_config_value(value, "AuditRules")?;
+            decode_config_value::<AuditRules>(value, "AuditRules")?;
             Ok(())
         }
         _ => Err(MgmtError::Admission(format!(
@@ -543,8 +552,9 @@ mod tests {
     use nexus_kernel::Bootstrap;
     use nexus_standard::{StandardConfig, install_standard};
     use nexus_types::{
-        EffectCapability, ExternalInstallationDef, ExternalProjectionDef, InferenceApiDialect,
-        InferenceAuthRef, InferenceBackendDef, Purity, Role, Transport, TrustLevel,
+        EffectCapability, ExternalInstallationDef, ExternalProjectionDef, InProcessProjectionDef,
+        InferenceApiDialect, InferenceAuthRef, InferenceBackendDef, Purity, Role, Transport,
+        TrustLevel,
     };
     use std::collections::BTreeMap;
 
@@ -606,6 +616,21 @@ mod tests {
             request_overrides: BTreeMap::new(),
             api_version: None,
             version: 0,
+        })
+    }
+
+    fn in_process_projection(id: &str, version: u64) -> anyhow::Result<Value> {
+        value_from(&InProcessProjectionDef {
+            id: id.into(),
+            role: Role::Provider,
+            implementation: "standard.fetch".into(),
+            provides: vec![EffectCapability::new(
+                "effect://fetch/get",
+                Purity::Idempotent,
+            )],
+            emits: None,
+            config: Value::Null,
+            version,
         })
     }
 
@@ -714,7 +739,25 @@ mod tests {
         let root = root_principal(&st).await?;
         expect_not_manageable(inspect(&st, &root, "state://memory/alice").await)?;
         expect_not_manageable(
+            inspect_config(
+                &st,
+                &root,
+                "path://remote/state/kernel/projections/in-process/fetch",
+            )
+            .await,
+        )?;
+        expect_not_manageable(
             write_config(&st, &root, "state://vault/secret", obj(None), None).await,
+        )?;
+        expect_not_manageable(
+            write_config(
+                &st,
+                &root,
+                "path://remote/state/kernel/projections/in-process/fetch",
+                in_process_projection("fetch", 0)?,
+                None,
+            )
+            .await,
         )?;
         Ok(())
     }
@@ -773,13 +816,34 @@ mod tests {
             write_config(
                 &st,
                 &root,
-                "state://kernel/projections/in-process/fetch",
+                "state://kernel/projection-status/in-process/fetch",
                 obj(None),
                 None,
             )
             .await,
             "runtime config path must use its dedicated console action",
         )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generic_config_manages_in_process_projection_declarations() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let root = root_principal(&st).await?;
+        let path = "state://kernel/projections/in-process/fetch";
+        write_config(&st, &root, path, in_process_projection("fetch", 0)?, None).await?;
+        let value = inspect_config(&st, &root, path)
+            .await?
+            .context("in-process projection config missing")?;
+        ensure!(
+            value_version(&value)? == Some(1),
+            "projection config version was not initialized"
+        );
+        let entries = inspect_config_prefix(&st, &root, "state://kernel/projections").await?;
+        ensure!(
+            entries.iter().any(|(entry_path, _)| entry_path == path),
+            "projection config prefix did not include written declaration"
+        );
         Ok(())
     }
 
@@ -804,7 +868,7 @@ mod tests {
             "runtime config path must use its dedicated console action",
         )?;
         expect_admission_message(
-            inspect_config_prefix(&st, &root, "state://kernel/projections").await,
+            inspect_config_prefix(&st, &root, "state://kernel/projection-status").await,
             "runtime config path must use its dedicated console action",
         )?;
         Ok(())

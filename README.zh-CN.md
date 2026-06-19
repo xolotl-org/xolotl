@@ -96,12 +96,19 @@ Process
 | `nexus-plan`, `nexus-sim` | 规划与仿真 crate。 |
 
 `nexus-standard` 使用 Cargo feature 选择要编译的模块。默认 `standard` 会编译标准进程内
-实现。gateway 相关 crate 只启用 `external-session`，其中包含
+实现。嵌入式宿主可以用 `StandardConfig::with_modules` 选择更小的安装模块集合，
+也可以用 `StandardConfig::with_inference_backend` 为标准模型类 effect 提供自己的模型 backend。
+gateway 相关 crate 只启用 `external-session`，其中包含
 external Provider 和 Source endpoint 的 session 处理代码。
 
 `nexus-sdk` 默认只构建最小内存内核。嵌入式宿主通过 `NexusBuilder` 提供自己的状态后端
 和事实记录接收端。标准 Provider 通过 SDK 的 `standard` feature 或 `nexus-standard`
 安装入口接入。
+`ActorSpec` 可通过 `nexus-graph` 和 `nexus-sdk` 使用；内核可以通过
+`Bootstrap::spawn_actor_under` 把它启动为命名长寿 Process，SDK 也提供
+`Nexus::spawn_actor` 便捷入口。body 或终结器如果引用进程本地 `StepRef`，宿主应在启动时
+通过 `Bootstrap::spawn_actor_under_with_steps` 或 `Nexus::spawn_actor_with_steps`
+传入对应函数。Actor 声明可以使用 `state://process/self/...`；启动时会在 lint 和执行前绑定为具体 Process id。
 
 ## 环境要求
 
@@ -195,7 +202,7 @@ Provider/Source 投影嵌在每个 external installation 声明中。
 
 ### MCP
 
-`nexus-gateway-mcp` 把选定 Gateway publication 暴露为 MCP tool、resource、resource template 和 prompt。每个 publication 引用一个 Gateway surface；该 surface 必须有显式 publish capability，MCP 调用、资源读取和 prompt 请求都会转换为标准能力约束操作。adapter 优先协商 `2025-11-25`，支持来自 publication properties 的 completion，并在返回原生 MCP content block 前进行校验。
+`nexus-gateway-mcp` 把选定 Gateway publication 暴露为 MCP tool、resource、resource template 和 prompt。每个 publication 引用一个 Gateway surface；该 surface 必须有显式 publish capability，MCP 调用、资源读取和 prompt 请求都会转换为标准能力约束操作。adapter 优先协商 `2025-11-25`，保留已支持的已发布 MCP 协议修订，只在对应修订定义 completion 时声明 completion，并在返回原生 MCP content block 前进行校验。
 
 ## 路径与能力规则
 

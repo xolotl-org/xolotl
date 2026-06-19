@@ -19,17 +19,19 @@
 //! - `Wait` blocks on a signal path or a wall-clock deadline.
 
 use crate::dataplane::DataPlane;
+use crate::open::{OpenRequest, open_resource_with_attached};
 use crate::registry::Registry;
 use crate::step::StepTable;
 use nexus_graph::{
     BranchKind, DoNode, EdgeKind, ExecutionGraph, JoinKind, NodeKind, OperationTemplate, StepRef,
-    WaitSpec, compile_do,
+    WaitSpec, compile_do, operation_capability_verb,
 };
 use nexus_types::{
-    DecisionTag, IdentityRef, NodeId, Operation, OperationId, Outcome, ProcessId, ReplayClass,
-    ResourceName, Value,
+    DecisionTag, HandleId, IdentityRef, MethodBitmap, NodeId, Operation, OperationId, Outcome,
+    ProcessId, ReplayClass, ResourceName, RightFlags, Rights, Value,
 };
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -45,19 +47,23 @@ pub enum ExecError {
 /// bounded so a buggy program can't hang the executor.
 const MAX_DEPTH: usize = 4096;
 
+type OpenHandleMap = HashMap<(ResourceName, IdentityRef), HandleId>;
+type MethodHandleMap = HashMap<(ResourceName, String, IdentityRef), HandleId>;
+type MethodMetaMap = HashMap<(ResourceName, String), MethodMeta>;
+
 /// Drives one Process's program to completion. Holds the data plane (for
 /// Operation dispatch), the registry (to resolve target names → handles), and
 /// the step table (named continuations).
 pub struct Executor {
     /// Process whose graph this executor is running.
-    pub process: ProcessId,
+    process: ProcessId,
     /// Data-plane dispatcher used for operation nodes.
-    pub data_plane: DataPlane,
+    data_plane: DataPlane,
     /// Control-plane registry used before data-plane dispatch to resolve names
     /// and method metadata.
-    pub registry: Registry,
+    registry: Registry,
     /// Table of named pure continuation steps.
-    pub steps: StepTable,
+    pub(crate) steps: StepTable,
     /// Optional state backend, used to resolve `Wait(Signal)` nodes.
     /// `None` for executors that never wait on a signal path.
     state: Option<nexus_state::Backend>,
@@ -69,14 +75,18 @@ pub struct Executor {
     /// short-circuit to their recorded outcome.
     /// `None` / empty for a fresh run.
     replay: Option<Arc<crate::recovery::ReplayMap>>,
-    /// Maps an opened ResourceName → the HandleId the process holds for it, so
-    /// repeated Operations on the same effect reuse the compiled handle.
-    open_handles: Arc<parking_lot::RwLock<HashMap<ResourceName, nexus_types::HandleId>>>,
+    /// Handles explicitly bound by host code. The acting identity is part of
+    /// the key because open-time policy is identity-sensitive.
+    open_handles: Arc<parking_lot::RwLock<OpenHandleMap>>,
+    /// Method-specific handles opened or bound for one acting identity.
+    method_handles: Arc<parking_lot::RwLock<MethodHandleMap>>,
     /// Per-(resource, method) compiled metadata cache: the data
     /// plane must not re-query the Registry on every Operation. The first op on
     /// a (target, method) resolves it once; subsequent ops read this cache, so
     /// the hot path never walks the Registry again.
-    method_cache: Arc<parking_lot::RwLock<HashMap<(ResourceName, String), MethodMeta>>>,
+    method_cache: Arc<parking_lot::RwLock<MethodMetaMap>>,
+    /// Whether this executor is running process finalizers.
+    finalizer_mode: bool,
 }
 
 /// Compiled, cached metadata for one (resource, method): the bit position,
@@ -84,12 +94,14 @@ pub struct Executor {
 /// plane needs to dispatch without touching the Registry again.
 #[derive(Clone)]
 struct MethodMeta {
+    resource_id: nexus_types::ResourceId,
     method_index: u32,
     method_id: nexus_types::MethodId,
     replay: ReplayClass,
     supports: nexus_types::OutputModeSet,
     cost: nexus_types::CostModel,
     batchable: bool,
+    finalize_allowed: bool,
 }
 
 /// Block-scoped evaluation environment: `Let`-bound values keyed by the
@@ -108,11 +120,11 @@ struct Env {
 }
 
 impl Env {
-    fn root() -> Self {
+    fn root(acting: IdentityRef) -> Self {
         Self {
             bindings: HashMap::new(),
             binding_taint: HashMap::new(),
-            acting: IdentityRef::ROOT,
+            acting,
             taint: nexus_types::TaintSet::pristine(),
         }
     }
@@ -127,7 +139,7 @@ impl Env {
 
 impl Executor {
     /// Create an executor bound to one process.
-    pub fn new(
+    pub(crate) fn new(
         process: ProcessId,
         data_plane: DataPlane,
         registry: Registry,
@@ -142,7 +154,9 @@ impl Executor {
             processes: None,
             replay: None,
             open_handles: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            method_handles: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             method_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            finalizer_mode: false,
         }
     }
 
@@ -166,23 +180,49 @@ impl Executor {
         self
     }
 
+    /// Permit Operation nodes while the owning process is in Finalizing.
+    pub(crate) fn with_finalizer_mode(mut self) -> Self {
+        self.finalizer_mode = true;
+        self
+    }
+
     /// Whether this process has been cancelled or moved past Running.
     /// Returns false when no process table is attached (standalone executors).
     fn is_cancelled(&self) -> bool {
         match &self.processes {
-            Some(p) => matches!(
-                p.status(self.process),
-                Some(nexus_types::ProcessStatus::Cancelled)
-                    | Some(nexus_types::ProcessStatus::Finalizing)
-            ),
+            Some(p) => match p.status(self.process) {
+                Some(nexus_types::ProcessStatus::Cancelled) => true,
+                Some(nexus_types::ProcessStatus::Finalizing) => !self.finalizer_mode,
+                _ => false,
+            },
             None => false,
         }
     }
 
-    /// Pre-register a resolved handle for a resource name (used by bootstrap /
-    /// open ahead of execution).
+    /// Pre-register a resolved handle for a resource name.
     pub fn bind_handle(&self, name: ResourceName, handle: nexus_types::HandleId) {
-        self.open_handles.write().insert(name, handle);
+        self.open_handles
+            .write()
+            .insert((name, self.default_acting()), handle);
+    }
+
+    /// Pre-register a resolved handle for one resource method.
+    pub fn bind_method_handle(
+        &self,
+        name: ResourceName,
+        method: impl Into<String>,
+        handle: nexus_types::HandleId,
+    ) {
+        self.method_handles
+            .write()
+            .insert((name, method.into(), self.default_acting()), handle);
+    }
+
+    fn default_acting(&self) -> IdentityRef {
+        self.processes
+            .as_ref()
+            .and_then(|processes| processes.identity(self.process))
+            .unwrap_or(IdentityRef::ROOT)
     }
 
     /// Evaluate a whole program to an Outcome. Compiles the `Do<A>` into one
@@ -238,7 +278,7 @@ impl Executor {
         // their CausalPositions never collide with the parent graph or each
         // other. It starts past the highest compiled id.
         let next_base = Arc::new(std::sync::atomic::AtomicU32::new(graph.len() as u32));
-        let env = Env::root().with_taint(entry_taint);
+        let env = Env::root(self.default_acting()).with_taint(entry_taint);
         self.run_node(graph, graph.root, Value::Null, &env, 0, &next_base)
             .await
     }
@@ -312,10 +352,9 @@ impl Executor {
                             .continue_with(graph, id, recorded, env, depth, next_base)
                             .await;
                     }
-                    // Record a Fact when the op has side effects or its output
-                    // is consumed by downstream control flow. An unconsumed
-                    // pure read may skip because recovery can recompute it.
-                    let record = graph.output_is_consumed(id);
+                    // Finalizers always record; cleanup side effects must stay
+                    // visible even when their output is not consumed.
+                    let record = self.finalizer_mode || graph.output_is_consumed(id);
                     let (out, out_taint) = self.run_operation(tmpl, input, env, id, record).await;
                     // The result flows on carrying the operation's taint.
                     let env2 = env.with_taint(out_taint);
@@ -550,7 +589,17 @@ impl Executor {
             ));
         }
         let sub = match self.steps.get(self.process, &sref.name) {
-            Some(f) => f(piped, sref.arg.clone()),
+            Some(f) => {
+                match std::panic::catch_unwind(AssertUnwindSafe(|| f(piped, sref.arg.clone()))) {
+                    Ok(sub) => sub,
+                    Err(payload) => {
+                        return Outcome::Fail(nexus_types::Failure::HandlerError {
+                            kind: "panic".into(),
+                            message: crate::bootstrap::panic_payload_message("step", payload),
+                        });
+                    }
+                }
+            }
             None => {
                 return Outcome::Fail(nexus_types::Failure::policy(
                     "executor",
@@ -673,8 +722,8 @@ impl Executor {
         // resolution so a tainted exfiltration attempt is denied on structure
         // alone: a value whose lineage touched a Protected source must not flow
         // out through an outbound Operation (post / send / publish). This is a
-        // blood-line fact, not a hash match — a model paraphrasing the secret
-        // cannot evade it.
+        // lineage check, not a hash match; a model paraphrasing the secret
+        // cannot evade the protected-source taint.
         if is_outbound(&tmpl.target) && op_taint.has_protected() {
             return (
                 Outcome::Fail(nexus_types::Failure::PolicyViolation {
@@ -699,28 +748,36 @@ impl Executor {
                 env.taint.clone(),
             );
         };
-        let Some(handle) = self.handle_for(&tmpl.target) else {
-            return (
-                Outcome::Fail(nexus_types::Failure::policy(
-                    "executor",
-                    format!("no open handle for {}", tmpl.target.path()),
-                )),
-                env.taint.clone(),
-            );
-        };
         let MethodMeta {
+            resource_id,
             method_index,
             method_id,
             replay,
             supports,
             cost,
             batchable,
+            finalize_allowed,
             ..
         } = meta;
 
+        if !self.finalizer_allows_operation(&tmpl.target, &tmpl.method, finalize_allowed) {
+            return (
+                Outcome::Fail(nexus_types::Failure::PolicyViolation {
+                    policy: "finalizer".into(),
+                    detail: format!(
+                        "method {} on {} is not allowed while process {} is finalizing",
+                        tmpl.method,
+                        tmpl.target.path(),
+                        self.process.get()
+                    ),
+                }),
+                op_taint,
+            );
+        }
+
         // The requested OutputMode must be in the method's supported set.
-        // Reject early (before dispatch) so a caller can't ask a Unary-only
-        // method to stream, or vice versa.
+        // Reject before opening a handle so invalid requests do not mutate the
+        // handle table.
         if !tmpl.output.is_supported_by(supports) {
             return (
                 Outcome::Fail(nexus_types::Failure::InvalidInput {
@@ -732,6 +789,30 @@ impl Executor {
                 op_taint,
             );
         }
+
+        let handle = match self.handle_for_or_open(
+            &tmpl.target,
+            &tmpl.method,
+            env.acting,
+            resource_id,
+            method_index,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                return (
+                    Outcome::Fail(nexus_types::Failure::policy(
+                        "open",
+                        format!(
+                            "open {} method {} failed for {}: {error}",
+                            operation_capability_verb(&tmpl.method),
+                            tmpl.method,
+                            tmpl.target.path()
+                        ),
+                    )),
+                    env.taint.clone(),
+                );
+            }
+        };
 
         let op = Operation {
             id: OperationId::new(self.process, position, 0),
@@ -817,15 +898,99 @@ impl Executor {
     /// identities they were explicitly delegated.
     fn authorize_act_as(&self, identity: &nexus_types::Path) -> bool {
         let now = now_millis();
-        self.registry.grants_of(self.process).into_iter().any(|g| {
+        let mut grants = self.registry.grants_of(self.process);
+        if let Some(processes) = &self.processes {
+            grants.extend(processes.attached_grants(self.process));
+        }
+        grants.into_iter().any(|g| {
             !g.expires.is_expired(now)
                 && g.rights.flags.contains(nexus_types::RightFlags::DELEGATE)
                 && g.selector.matches("act-as", identity)
         })
     }
 
-    fn handle_for(&self, name: &ResourceName) -> Option<nexus_types::HandleId> {
-        self.open_handles.read().get(name).copied()
+    fn handle_for(
+        &self,
+        name: &ResourceName,
+        method: &str,
+        acting: IdentityRef,
+        resource_id: nexus_types::ResourceId,
+        method_index: u32,
+    ) -> Option<nexus_types::HandleId> {
+        let key = (name.clone(), method.to_string(), acting);
+        if let Some(handle) = self.method_handles.read().get(&key).copied()
+            && self.cached_handle_allows(handle, resource_id, method_index)
+        {
+            return Some(handle);
+        }
+        let handle = self
+            .open_handles
+            .read()
+            .get(&(name.clone(), acting))
+            .copied()?;
+        if self.cached_handle_allows(handle, resource_id, method_index) {
+            Some(handle)
+        } else {
+            None
+        }
+    }
+
+    fn cached_handle_allows(
+        &self,
+        handle: nexus_types::HandleId,
+        resource_id: nexus_types::ResourceId,
+        method_index: u32,
+    ) -> bool {
+        self.data_plane
+            .handles
+            .read()
+            .get(handle)
+            .map(|handle| {
+                handle.check_owner(self.process)
+                    && handle.resource == resource_id
+                    && handle.is_active()
+                    && handle.allows_method(method_index)
+            })
+            .unwrap_or(false)
+    }
+
+    fn handle_for_or_open(
+        &self,
+        name: &ResourceName,
+        method: &str,
+        acting: IdentityRef,
+        resource_id: nexus_types::ResourceId,
+        method_index: u32,
+    ) -> Result<nexus_types::HandleId, crate::open::OpenError> {
+        if let Some(handle) = self.handle_for(name, method, acting, resource_id, method_index) {
+            return Ok(handle);
+        }
+        let attached_grants = self
+            .processes
+            .as_ref()
+            .map(|processes| processes.attached_grants(self.process))
+            .unwrap_or_default();
+        let handle = {
+            let mut handles = self.data_plane.handles.write();
+            open_resource_with_attached(
+                &self.registry,
+                &mut handles,
+                OpenRequest {
+                    process: self.process,
+                    resource: resource_id,
+                    verb: operation_capability_verb(method).to_string(),
+                    rights: Rights::new(MethodBitmap::method(method_index), RightFlags::empty()),
+                    acting,
+                    requested_path: Some(name.path().clone()),
+                    now_millis: now_millis(),
+                },
+                &attached_grants,
+            )?
+        };
+        self.method_handles
+            .write()
+            .insert((name.clone(), method.to_string(), acting), handle);
+        Ok(handle)
     }
 
     /// Resolve cached [`MethodMeta`] for a (target, method). A cache miss
@@ -860,18 +1025,55 @@ impl Executor {
                     && let Some((idx, method)) = iface.method_index(method_name)
                 {
                     return Some(MethodMeta {
+                        resource_id,
                         method_index: idx,
                         method_id: method.id,
                         replay: method.replay,
                         supports: method.supports,
                         cost: method.cost,
                         batchable: method.batchable,
+                        finalize_allowed: method.finalize_allowed,
                     });
                 }
             }
         }
         None
     }
+
+    fn finalizer_allows_operation(
+        &self,
+        target: &ResourceName,
+        method: &str,
+        finalize_allowed: bool,
+    ) -> bool {
+        if !self.finalizer_mode {
+            return true;
+        }
+        if finalize_allowed {
+            return true;
+        }
+        let verb = operation_capability_verb(method);
+        (verb == "read" || verb == "write")
+            && is_process_local_state_path(target.path(), self.process)
+    }
+}
+
+fn is_process_local_state_path(path: &nexus_types::Path, process: ProcessId) -> bool {
+    if path.scheme() != "state" || path.cluster().is_some() {
+        return false;
+    }
+    let segments = path.segments();
+    let Some(first) = segments.first() else {
+        return false;
+    };
+    let Some(second) = segments.get(1) else {
+        return false;
+    };
+    first.as_str() == "process"
+        && second
+            .as_str()
+            .parse::<u64>()
+            .is_ok_and(|pid| pid == process.get())
 }
 
 fn billable_input_tokens(value: &Value, batchable: bool) -> u64 {
@@ -1083,6 +1285,7 @@ mod tests {
                 supports: OutputModeSet::UNARY,
                 cost: Default::default(),
                 batchable: false,
+                finalize_allowed: false,
             }],
             laws: Vec::new(),
         });
@@ -1204,7 +1407,8 @@ mod tests {
             None,
             IdentityRef::ROOT,
         ));
-        procs.set_status(ProcessId::new(1), nexus_types::ProcessStatus::Cancelled);
+        let cancelled = procs.cancel_if_non_terminal(ProcessId::new(1));
+        ensure!(cancelled == Some(true), "process should be cancelled");
         let ex = Executor::new(ProcessId::new(1), dp, Registry::new(), StepTable::new())
             .with_processes(procs);
         // A bare Operation node (target need not resolve — the cancel check fires
@@ -1220,6 +1424,90 @@ mod tests {
         ensure!(
             out == Outcome::Fail(nexus_types::Failure::Cancelled),
             "cancelled process should short-circuit, got {out:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bound_handle_must_match_target_resource() -> anyhow::Result<()> {
+        let (facts, _) = FactSink::in_memory();
+        let handles = Arc::new(RwLock::new(HandleTable::new()));
+        let dp = DataPlane::new(handles.clone(), facts, test_state());
+        let reg = Registry::new();
+        let (first_resource, first_name) = register_test_resource(
+            &reg,
+            TestResourceSpec {
+                path: "effect://cache/first",
+                kind: ResourceKind::Effect,
+                family: InterfaceFamily::Callable,
+                method_name: "invoke",
+                method_id: 0,
+                purity: Purity::Effectful,
+                replay: ReplayClass::NonIdempotentEffect,
+                driver_name: "first",
+                selector: "perform://effect/cache/first",
+            },
+            Arc::new(EchoDriver),
+        )?;
+        let (_, second_name) = register_test_resource(
+            &reg,
+            TestResourceSpec {
+                path: "effect://cache/second",
+                kind: ResourceKind::Effect,
+                family: InterfaceFamily::Callable,
+                method_name: "invoke",
+                method_id: 0,
+                purity: Purity::Effectful,
+                replay: ReplayClass::NonIdempotentEffect,
+                driver_name: "second",
+                selector: "perform://effect/cache/second",
+            },
+            Arc::new(EchoDriver),
+        )?;
+        reg.register_grant(Grant {
+            id: reg.next_grant_id(),
+            holder: ProcessId::new(1),
+            selector: ResourceSelector::parse("perform://effect/cache/first")?,
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            constraints: ConstraintSet::empty(),
+            expires: Expiry::Never,
+        });
+        let handle = {
+            let mut table = handles.write();
+            open_resource(
+                &reg,
+                &mut table,
+                OpenRequest {
+                    process: ProcessId::new(1),
+                    resource: first_resource,
+                    verb: "perform".into(),
+                    rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+                    acting: IdentityRef::ROOT,
+                    requested_path: Some(first_name.path().clone()),
+                    now_millis: 0,
+                },
+            )
+            .context("first resource open failed")?
+        };
+        let ex = Executor::new(ProcessId::new(1), dp, reg, StepTable::new());
+        ex.bind_handle(second_name.clone(), handle);
+
+        let out = ex
+            .eval(&DoNode::op(OperationTemplate {
+                target: second_name,
+                method: "invoke".into(),
+                method_id: None,
+                output: nexus_types::OutputMode::Unary,
+                literal_input: Some(Value::Null),
+            }))
+            .await;
+        ensure!(
+            matches!(
+                out,
+                Outcome::Fail(nexus_types::Failure::PolicyViolation { ref policy, .. })
+                    if policy == "open"
+            ),
+            "mismatched bound handle was accepted: {out:?}"
         );
         Ok(())
     }
@@ -1265,7 +1553,7 @@ mod tests {
         ex.steps.install(ex.process, "double", |v, _| match v {
             Value::Int(i) => DoNode::pure(Value::Int(i * 2)),
             _ => DoNode::pure(Value::Null),
-        });
+        })?;
         let prog = DoNode::pure(Value::Int(21)).and_then(s("double"));
         let out = ex.eval(&prog).await;
         ensure!(
@@ -1281,7 +1569,7 @@ mod tests {
         ex.steps.install(ex.process, "double", |v, _| match v {
             Value::Int(i) => DoNode::pure(Value::Int(i * 2)),
             _ => DoNode::pure(Value::Null),
-        });
+        })?;
         let prog = DoNode::pure(Value::Int(21)).and_then(StepRef::new(ProcessId::new(2), "double"));
         let out = ex.eval(&prog).await;
         ensure!(
@@ -1296,7 +1584,7 @@ mod tests {
         let ex = executor();
         ex.steps.install(ex.process, "fallback", |_, _| {
             DoNode::pure(Value::Str("ok".into()))
-        });
+        })?;
         let prog = DoNode::fail(nexus_types::Failure::Cancelled).or_else(s("fallback"));
         let out = ex.eval(&prog).await;
         ensure!(
@@ -1311,7 +1599,7 @@ mod tests {
         let ex = executor();
         ex.steps.install(ex.process, "never", |_, _| {
             DoNode::pure(Value::Str("recovered".into()))
-        });
+        })?;
         let prog = DoNode::pure(Value::Int(1)).or_else(s("never"));
         let out = ex.eval(&prog).await;
         ensure!(
@@ -1397,7 +1685,7 @@ mod tests {
         ex.steps.install(ex.process, "inc", |v, _| match v {
             Value::Int(i) => DoNode::pure(Value::Int(i + 1)),
             _ => DoNode::pure(Value::Null),
-        });
+        })?;
         let prog = DoNode::pure(Value::Int(0))
             .and_then(s("inc"))
             .and_then(s("inc"))
@@ -1552,7 +1840,7 @@ mod tests {
         // resource resolution would.
         use nexus_graph::OperationTemplate;
         let ex = executor();
-        let env = Env::root().with_taint(nexus_types::TaintSet::of(
+        let env = Env::root(IdentityRef::ROOT).with_taint(nexus_types::TaintSet::of(
             nexus_types::TaintSource::Protected {
                 path: nexus_types::Path::parse("state://vault/alice/x")?,
             },
@@ -1689,7 +1977,7 @@ mod tests {
                 output: nexus_types::OutputMode::Unary,
                 literal_input: None,
             })
-        });
+        })?;
 
         let prog = DoNode::op(OperationTemplate {
             target: read_target,

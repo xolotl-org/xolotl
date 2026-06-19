@@ -162,12 +162,19 @@ policy-managed state belong in Nexus state and are managed through Console
 WebSocket actions.
 External projections are part of each installation declaration. External
 declarations use `external.*`; inference declarations use `inference.*`;
-in-process projection declarations use `projection.in_process.*`. Generic `config.*`
-actions reject runtime config paths that have a dedicated action family.
+in-process projection declarations use `config.*` under
+`state://kernel/projections/in-process/<id>`. Generic `config.*` actions reject
+runtime config paths that have a dedicated action family.
 
 `nexus-standard` Cargo features decide which in-process implementations are
 compiled into the host binary. Optional in-process projection declarations live under
-`state://kernel/projections/in-process/<id>`.
+`state://kernel/projections/in-process/<id>`. Reconcile status is written under
+`state://kernel/projection-status/in-process/<id>` and is read through
+`projection.in_process.status.*`; it separates the desired declaration version
+from the active registry version.
+Embedded hosts can also choose which compiled standard-core modules are
+installed with `StandardConfig::with_modules`; compiled code is not exposed as a
+Resource until the host installs it.
 
 HTTP inference providers are compiled only when the host binary enables the
 matching `nexus-standard` feature. Runtime declarations live under

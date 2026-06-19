@@ -77,6 +77,16 @@ installation API for hosts that include the standard in-process providers.
 Embedders can still provide their own policy sources, drivers, and host
 assembly.
 
+`ActorSpec` is a declaration for a named long-lived Process. It carries a
+serializable `DoNode` body, declared capabilities, budget, and finalizers.
+`Bootstrap::spawn_actor_under` checks the body and finalizers
+against the declared capability ceiling, derives process-attached grants from
+the parent Process, writes `state://agents/<identity>/<name>`, and runs the body
+with the ordinary Executor. If the body or finalizers use process-local
+`StepRef`s, the host passes those step functions to
+`Bootstrap::spawn_actor_under_with_steps` so they are installed before execution
+starts.
+
 ## Standard Package Features
 
 `nexus-standard` contains the standard in-process Provider and Source
@@ -95,10 +105,20 @@ inference dialects. The individual dialect features are `openai-responses`,
 
 High-risk in-process implementations such as `fetch`, `fs`, and `terminal`
 must stay behind separate `nexus-standard` features. A daemon or embedded host may
-expose them only through kernel-state declarations and fixed Console actions.
+expose them only through kernel-state declarations admitted by `config.*`.
 Runtime in-process projection declarations are stored in Nexus state.
 
+Compiled modules and installed modules are separate. `StandardConfig` defaults
+to installing every standard-core module, but hosts may pass
+`StandardModules::none`, `StandardModules::state_only`, or a custom
+`StandardModules` value. Standard model-backed effects can use the built-in
+baseline, HTTP provider state when HTTP dialect features are enabled, or a host
+backend supplied with `StandardConfig::with_inference_backend`.
+
 Optional in-process projection declarations are runtime state under
-`state://kernel/projections/in-process/<id>`. They use `projection.in_process.*`
-Console actions, kernel state admission, and host-side reconciliation into
-ordinary Resource, Interface, Driver, and Binding registry entries.
+`state://kernel/projections/in-process/<id>`. They use generic `config.*`
+Console actions, shared kernel state admission, and host-side reconciliation
+into ordinary Resource, Interface, Driver, and Binding registry entries.
+Reconcile results are stored under
+`state://kernel/projection-status/in-process/<id>` and read through
+`projection.in_process.status.*`.

@@ -188,7 +188,7 @@ HTTP 认证错误映射：
 | 控制台访问 | `access.user.*`、`access.role.*`、`access.session.*`、`access.session.current.logout` |
 | 运行时、审计和来源链 | `runtime.process.inspect`、`audit.facts.recent`、`lineage.trace.read`、`lineage.fact.read`、`health.summary` |
 | 外部程序和配对 | `external.manifest.*`、`external.installation.*`、`pairing.create`、`pairing.approve`、`pairing.deny`、`pairing.replace` |
-| 进程内 Provider/Source projection 声明 | `projection.in_process.list`、`projection.in_process.read`、`projection.in_process.write_cas` |
+| 进程内 projection 状态 | `projection.in_process.status.list`、`projection.in_process.status.read` |
 | Inference 路由 | `inference.backend.*`、`inference.model.*`、`inference.group.*`、`inference.routing.*` |
 
 上表只列出可执行的动作族。每个 action 描述符还包含
@@ -196,8 +196,11 @@ HTTP 认证错误映射：
 只用于覆盖范围统计和授权解释，直接发起 `Call` 会返回错误。
 
 泛用 `config.*` action 会拒绝已经有专用动作族的运行时配置路径。对这些
-路径使用 `access.*`、`external.*`、`projection.in_process.*`、`inference.*` 和
-`pairing.*`，让校验、授权、CAS 和审计绑定到声明的资源类型。
+路径使用 `access.*`、`external.*`、`inference.*` 和 `pairing.*`，让校验、
+授权、CAS 和审计绑定到声明的资源类型。进程内 Provider/Source projection
+声明通过 `config.*` 写入 `state://kernel/projections/in-process/<id>`，并走
+共享 kernel config 准入。Projection status 只通过
+`projection.in_process.status.*` 读取。
 External projection 是 external installation 声明的一部分，仍通过
 `external.installation.*` 管理。
 

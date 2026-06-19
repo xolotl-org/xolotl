@@ -25,9 +25,9 @@ use crate::protocol::{
     ACTION_INFERENCE_MODEL_READ, ACTION_INFERENCE_MODEL_WRITE_CAS, ACTION_INFERENCE_ROUTING_READ,
     ACTION_INFERENCE_ROUTING_WRITE_CAS, ACTION_LINEAGE_FACT_READ, ACTION_LINEAGE_TRACE_READ,
     ACTION_PAIRING_APPROVE, ACTION_PAIRING_CREATE, ACTION_PAIRING_DENY, ACTION_PAIRING_REPLACE,
-    ACTION_PROJECTION_IN_PROCESS_LIST, ACTION_PROJECTION_IN_PROCESS_READ,
-    ACTION_PROJECTION_IN_PROCESS_WRITE_CAS, ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET,
-    ACTION_PROTOCOL_DESCRIBE, ACTION_PROTOCOL_REGISTRY_SNAPSHOT, ACTION_REGISTRY_COVERAGE_REPORT,
+    ACTION_PROJECTION_IN_PROCESS_STATUS_LIST, ACTION_PROJECTION_IN_PROCESS_STATUS_READ,
+    ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET, ACTION_PROTOCOL_DESCRIBE,
+    ACTION_PROTOCOL_REGISTRY_SNAPSHOT, ACTION_REGISTRY_COVERAGE_REPORT,
     ACTION_RESOURCE_TYPE_DESCRIBE, ACTION_RESOURCE_TYPE_LIST, ACTION_RESOURCE_VIEW_DESCRIBE,
     ACTION_RUNTIME_PROCESS_INSPECT, ACTION_SECRET_CATALOG, ACTION_SECRET_REVEAL,
     ACTION_STATE_SNAPSHOT, ACTION_VISIBILITY_AUTHORITY_DESCRIBE, ACTION_VISIBILITY_STATE_LIST,
@@ -49,7 +49,7 @@ use nexus_kernel::RequestGrantTemplate;
 use nexus_state::StateEvent;
 use nexus_types::{
     Capability, ExternalInstallationDef, NodeId, OperationId, Outcome, OutputMode, Path, ProcSpec,
-    ProcessId, ResourceName, RestartPolicy, TaintSet, Transport, Value,
+    ProcessId, ProcessStatus, ResourceName, RestartPolicy, TaintSet, Transport, Value,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -1052,43 +1052,26 @@ async fn dispatch_call(
             .await?;
             return Ok(ActionResult::empty(server_rev(sess)));
         }
-        ACTION_PROJECTION_IN_PROCESS_LIST => {
+        ACTION_PROJECTION_IN_PROCESS_STATUS_LIST => {
             let entries = mgmt::inspect_prefix(
                 &sess.state,
                 principal,
-                "state://kernel/projections/in-process",
+                "state://kernel/projection-status/in-process",
             )
             .await?;
             entries_value(entries)
         }
-        ACTION_PROJECTION_IN_PROCESS_READ => {
+        ACTION_PROJECTION_IN_PROCESS_STATUS_READ => {
             let mut input = input_map(input_value(&call.input)?)?;
             let id = string_arg(&mut input, "id")?;
             validate_path_segment(&id, "in-process projection id")?;
             let value = mgmt::inspect(
                 &sess.state,
                 principal,
-                &format!("state://kernel/projections/in-process/{id}"),
+                &format!("state://kernel/projection-status/in-process/{id}"),
             )
             .await?;
             value.unwrap_or(Value::Null)
-        }
-        ACTION_PROJECTION_IN_PROCESS_WRITE_CAS => {
-            let mut input = input_map(input_value(&call.input)?)?;
-            let id = string_arg(&mut input, "id")?;
-            let def = value_arg(&mut input, "def")?;
-            let expected_version = optional_u64_arg(&mut input, "expected_version")?;
-            require_step_up(principal)?;
-            validate_path_segment(&id, "in-process projection id")?;
-            mgmt::write_dedicated_config(
-                &sess.state,
-                principal,
-                &format!("state://kernel/projections/in-process/{id}"),
-                def,
-                expected_version,
-            )
-            .await?;
-            return Ok(ActionResult::empty(server_rev(sess)));
         }
         ACTION_INFERENCE_BACKEND_LIST => {
             let entries =
@@ -1597,11 +1580,17 @@ async fn run_state_op(
             }],
         )
         .map_err(|e| ConsoleError::Operation(e.to_string()))?;
-    let handle = sess
-        .state
-        .boot
-        .open_for(process, &target, verb)
-        .map_err(|e| ConsoleError::Operation(e.to_string()))?;
+    let handle = match sess.state.boot.open_for(process, &target, verb) {
+        Ok(handle) => handle,
+        Err(error) => {
+            return finish_console_request_as_failed(
+                &sess.state.boot,
+                process,
+                ConsoleError::Operation(error.to_string()),
+            )
+            .await;
+        }
+    };
     let ex = sess.state.boot.kernel.executor_for(process);
     ex.bind_handle(target.clone(), handle);
     let op = DoNode::Op(OperationTemplate {
@@ -1611,9 +1600,30 @@ async fn run_state_op(
         output: OutputMode::Unary,
         literal_input: Some(input),
     });
-    match ex.eval_tainted(&op, TaintSet::author()).await {
-        Outcome::Done(v) | Outcome::Short(v) => Ok(v),
+    let outcome = ex.eval_tainted(&op, TaintSet::author()).await;
+    let result = match &outcome {
+        Outcome::Done(v) | Outcome::Short(v) => Ok(v.clone()),
         Outcome::Fail(f) => Err(ConsoleError::Operation(f.to_string())),
+    };
+    sess.state
+        .boot
+        .finish_request_process(process, &outcome)
+        .await
+        .map_err(|e| ConsoleError::Operation(e.to_string()))?;
+    result
+}
+
+async fn finish_console_request_as_failed<T>(
+    boot: &nexus_kernel::Bootstrap,
+    process: ProcessId,
+    error: ConsoleError,
+) -> Result<T, ConsoleError> {
+    let original = error.to_string();
+    match boot.finish_process_as(process, ProcessStatus::Failed).await {
+        Ok(()) => Err(error),
+        Err(cleanup_error) => Err(ConsoleError::Operation(format!(
+            "{original}; request cleanup failed: {cleanup_error}"
+        ))),
     }
 }
 
@@ -2008,7 +2018,8 @@ async fn authority_resource_access(
             "authority.resource.access requires a concrete target path".into(),
         ));
     }
-    if path.scheme() == "state" && nexus_types::is_vault_reserved(&path) {
+    let is_local_state = path.scheme() == "state" && path.cluster().is_none();
+    if is_local_state && nexus_types::is_vault_reserved(&path) {
         return Ok(map_value([
             ("target", Value::Str(path.to_string())),
             ("verb", Value::Str(verb.to_string())),
@@ -2017,7 +2028,7 @@ async fn authority_resource_access(
         ]));
     }
 
-    let result = if matches!(verb, "read" | "write" | "subscribe") && path.scheme() == "state" {
+    let result = if matches!(verb, "read" | "write" | "subscribe") && is_local_state {
         auth::authorize_path(&sess.state.state, principal, verb, &path, None)
             .await
             .map(|_| "auth.authorize_path")
@@ -2168,11 +2179,17 @@ async fn invoke_effect(
             }],
         )
         .map_err(|e| ConsoleError::Operation(e.to_string()))?;
-    let handle = sess
-        .state
-        .boot
-        .open_for(process, &target, "perform")
-        .map_err(|e| ConsoleError::Operation(e.to_string()))?;
+    let handle = match sess.state.boot.open_for(process, &target, "perform") {
+        Ok(handle) => handle,
+        Err(error) => {
+            return finish_console_request_as_failed(
+                &sess.state.boot,
+                process,
+                ConsoleError::Operation(error.to_string()),
+            )
+            .await;
+        }
+    };
     let ex = sess.state.boot.kernel.executor_for(process);
     ex.bind_handle(target.clone(), handle);
     let op = DoNode::Op(OperationTemplate {
@@ -2182,10 +2199,17 @@ async fn invoke_effect(
         output: OutputMode::Unary,
         literal_input: Some(input),
     });
-    match ex.eval_tainted(&op, TaintSet::author()).await {
-        Outcome::Done(v) | Outcome::Short(v) => Ok(v),
+    let outcome = ex.eval_tainted(&op, TaintSet::author()).await;
+    let result = match &outcome {
+        Outcome::Done(v) | Outcome::Short(v) => Ok(v.clone()),
         Outcome::Fail(f) => Err(ConsoleError::Operation(f.to_string())),
-    }
+    };
+    sess.state
+        .boot
+        .finish_request_process(process, &outcome)
+        .await
+        .map_err(|e| ConsoleError::Operation(e.to_string()))?;
+    result
 }
 
 fn decode_frame(bytes: &[u8], configured_max_frame_bytes: usize) -> Result<ClientFrame, String> {
@@ -2894,9 +2918,9 @@ fn protocol_metadata(sess: &WsSession) -> protocol::ProtocolMetadata {
 }
 
 fn ensure_observable_state_path(path: &Path) -> Result<(), ConsoleError> {
-    if path.scheme() != "state" {
+    if path.scheme() != "state" || path.cluster().is_some() {
         return Err(ConsoleError::BadRequest(
-            "visibility.state actions require state:// paths".into(),
+            "visibility.state actions require local state:// paths".into(),
         ));
     }
     if nexus_types::is_vault_reserved(path) {
@@ -2928,6 +2952,9 @@ fn blocked_visibility_target(raw: &str) -> String {
     };
     if path.scheme() != "state" {
         return "non_state_target".into();
+    }
+    if path.cluster().is_some() {
+        return "non_local_state_target".into();
     }
     if nexus_types::is_vault_reserved(&path) {
         return "state://vault/**".into();
@@ -5160,6 +5187,27 @@ mod tests {
         ensure!(
             matches!(err, ConsoleError::BadRequest(_)),
             "unexpected vault visibility error: {err:?}"
+        );
+
+        let err = match dispatch_call(
+            &mut sess,
+            &principal,
+            visibility_call(
+                ACTION_VISIBILITY_STATE_READ,
+                map_value([(
+                    "path",
+                    Value::Str("path://remote/state/chat/source/messages/1".into()),
+                )]),
+            )?,
+        )
+        .await
+        {
+            Ok(_) => bail!("clustered visibility read unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::BadRequest(_)),
+            "unexpected clustered visibility error: {err:?}"
         );
         let outcomes = audit_outcomes(&st, "console_visibility")?;
         ensure!(

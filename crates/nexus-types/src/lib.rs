@@ -67,7 +67,10 @@ pub use ids::{
     BindingId, CausalPosition, DriverId, EndpointId, GrantId, GraphId, HandleId, IdentityRef,
     InterfaceId, MethodId, NodeId, ProcessId, ResourceId, SchemaId, Timestamp,
 };
-pub use in_process_projection::{InProcessProjectionConfigError, InProcessProjectionDef};
+pub use in_process_projection::{
+    InProcessProjectionConfigError, InProcessProjectionDef, InProcessProjectionPhase,
+    InProcessProjectionStatus,
+};
 pub use inference::{
     InferenceApiDialect, InferenceAuthRef, InferenceBackendDef, InferenceConfigError,
     InferenceGroupDef, InferenceGroupPolicy, InferenceMethodSet, InferenceModelCapabilities,

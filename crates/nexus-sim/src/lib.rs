@@ -369,7 +369,8 @@ pub fn why_not(facts: &[nexus_types::Fact], op: nexus_types::OperationId) -> Opt
 mod tests {
     use super::*;
     use anyhow::{Context, bail, ensure};
-    use nexus_graph::{DoNode, OperationTemplate, StepRef};
+    use nexus_graph::{ActorSpec, DoNode, OperationTemplate, StepRef};
+    use nexus_kernel::ProcessStepBinding;
     use nexus_types::OutputMode;
 
     fn run_prog(name: nexus_types::ResourceName) -> DoNode {
@@ -384,6 +385,34 @@ mod tests {
             output: OutputMode::Unary,
             literal_input: Some(input),
         })
+    }
+
+    async fn wait_actor_status(
+        boot: &Bootstrap,
+        directory: &nexus_types::Path,
+        status: &str,
+    ) -> anyhow::Result<Value> {
+        for _ in 0..100 {
+            if let Some(value) = boot.kernel.state.read(directory).await?
+                && value
+                    .as_map()
+                    .and_then(|map| map.get("status"))
+                    .and_then(Value::as_str)
+                    == Some(status)
+            {
+                return Ok(value);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        bail!("actor directory did not reach status {status}");
+    }
+
+    fn is_process_finalized_fact(fact: &nexus_types::Fact) -> bool {
+        matches!(
+            &fact.outcome_ref,
+            nexus_types::OutcomeRef::Inline(Value::Map(map))
+                if map.get("event").and_then(Value::as_str) == Some("ProcessFinalized")
+        )
     }
 
     #[tokio::test]
@@ -410,30 +439,60 @@ mod tests {
         let driver = Arc::new(ScriptedDriver::new("primary"));
         driver.enqueue(Outcome::Fail(nexus_types::Failure::Cancelled));
         let name = sim.scripted_effect("effect://primary/fallible", driver.clone())?;
-        let handle = sim.boot.open_for(sim.boot.root, &name, "perform")?;
-        let ex = sim.boot.kernel.executor_for(sim.boot.root);
-        ex.bind_handle(name.clone(), handle);
-        ex.steps.install(sim.boot.root, "fallback", |v, _| match v {
-            Value::Str(reason) if reason.contains("cancelled") => {
-                DoNode::pure(Value::Str("fallback".into()))
-            }
-            other => DoNode::pure(Value::Str(format!("unexpected recovery input: {other:?}"))),
-        });
-
-        let prog = run_prog(name).or_else(StepRef::new(sim.boot.root, "fallback"));
-        let out = ex.eval(&prog).await;
-
+        let spec = ActorSpec {
+            name: "fallible-recovery".into(),
+            body: run_prog(name).or_else(StepRef::new(sim.boot.root, "fallback")),
+            declared_capabilities: vec!["perform://effect/primary/fallible".into()],
+            ..ActorSpec::default()
+        };
+        let actor = sim
+            .boot
+            .spawn_actor_under_with_steps(
+                sim.boot.root,
+                nexus_types::IdentityRef::ROOT,
+                "root",
+                &spec,
+                [ProcessStepBinding::new(
+                    "fallback",
+                    Arc::new(|v, _| match v {
+                        Value::Str(reason) if reason.contains("cancelled") => {
+                            DoNode::pure(Value::Str("fallback".into()))
+                        }
+                        other => DoNode::pure(Value::Str(format!(
+                            "unexpected recovery input: {other:?}"
+                        ))),
+                    }),
+                )],
+            )
+            .await?;
+        let value = wait_actor_status(&sim.boot, &actor.directory, "completed").await?;
         ensure!(
-            out == Outcome::Done(Value::Str("fallback".into())),
-            "unexpected recovery outcome: {out:?}"
+            value
+                .as_map()
+                .and_then(|map| map.get("status"))
+                .and_then(Value::as_str)
+                == Some("completed"),
+            "unexpected actor directory entry: {value:?}"
         );
         ensure!(driver.calls().len() == 1, "unexpected call count");
-        let facts = sim.boot.kernel.facts.facts_of(sim.boot.root)?;
-        ensure!(facts.len() == 1, "unexpected fact count: {}", facts.len());
+        let facts = sim.boot.kernel.facts.facts_of(actor.process)?;
+        let operation_facts = facts
+            .iter()
+            .filter(|fact| !is_process_finalized_fact(fact))
+            .collect::<Vec<_>>();
         ensure!(
-            facts[0].decision == nexus_types::DecisionTag::DriverError,
+            operation_facts.len() == 1,
+            "unexpected operation fact count: {}",
+            operation_facts.len()
+        );
+        let fact = operation_facts
+            .first()
+            .copied()
+            .context("missing operation fact")?;
+        ensure!(
+            fact.decision == nexus_types::DecisionTag::DriverError,
             "unexpected decision: {:?}",
-            facts[0].decision
+            fact.decision
         );
         Ok(())
     }
@@ -474,12 +533,15 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        sim.boot.kernel.processes.set_budget_spec(
-            sim.boot.root,
-            nexus_types::BudgetSpec {
-                daily_micro_usd: Some(999),
-                ..Default::default()
-            },
+        ensure!(
+            sim.boot.kernel.processes.set_budget_spec(
+                sim.boot.root,
+                nexus_types::BudgetSpec {
+                    daily_micro_usd: Some(999),
+                    ..Default::default()
+                },
+            ),
+            "root process missing while setting test budget"
         );
         let handle = sim.boot.open_for(sim.boot.root, &name, "perform")?;
         let ex = sim.boot.kernel.executor_for(sim.boot.root);

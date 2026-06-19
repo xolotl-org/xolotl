@@ -67,7 +67,10 @@ pub fn admit_kernel_config(
     value: &Value,
 ) -> Result<KernelConfigAdmission, KernelConfigAdmissionError> {
     let segs = path.segments();
-    if path.scheme() != "state" || segs.first().map(|s| s.as_str()) != Some("kernel") {
+    if path.scheme() != "state"
+        || path.cluster().is_some()
+        || segs.first().map(|s| s.as_str()) != Some("kernel")
+    {
         return Err(KernelConfigAdmissionError::NotKernelState(path.to_string()));
     }
 
@@ -483,6 +486,20 @@ mod tests {
         ensure!(
             result == KernelConfigAdmission::Admitted,
             "admission result: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_clustered_kernel_config_path() -> Result<()> {
+        let result = admit_kernel_config(
+            &path("path://remote/state/kernel/projections/in-process/fetch")?,
+            &in_process_projection("fetch")?,
+        );
+
+        ensure!(
+            matches!(result, Err(KernelConfigAdmissionError::NotKernelState(_))),
+            "expected clustered path rejection, got {result:?}"
         );
         Ok(())
     }

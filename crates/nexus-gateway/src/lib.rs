@@ -1795,9 +1795,8 @@ impl GatewayRequestRegistry {
             release_budget_reservation(&mut inner, budget_reservation_id);
             process
         };
-        boot.kernel
-            .processes
-            .set_status(process, ProcessStatus::Cancelled);
+        boot.cancel_process(process)
+            .map_err(|error| GatewayError::Rejected(error.to_string()))?;
         Ok(true)
     }
 
@@ -2072,9 +2071,13 @@ fn spawn_deadline_sweeper(boot: &Arc<Bootstrap>, registry: &Arc<GatewayRequestRe
                 break;
             };
             for expired in registry.expire_deadlines(now_millis()) {
-                boot.kernel
-                    .processes
-                    .set_status(expired.request_process, ProcessStatus::Cancelled);
+                if let Err(error) = boot.cancel_process(expired.request_process) {
+                    tracing::error!(
+                        process = expired.request_process.get(),
+                        error = %error,
+                        "deadline sweeper failed to cancel request process"
+                    );
+                }
             }
         }
     });
@@ -2161,10 +2164,13 @@ impl GatewayRuntime {
         let expired = self.requests.expire_deadlines(now_millis());
         let count = expired.len();
         for request in expired {
-            self.boot
-                .kernel
-                .processes
-                .set_status(request.request_process, ProcessStatus::Cancelled);
+            if let Err(error) = self.boot.cancel_process(request.request_process) {
+                tracing::error!(
+                    process = request.request_process.get(),
+                    error = %error,
+                    "deadline sweep failed to cancel request process"
+                );
+            }
         }
         count
     }
@@ -2389,17 +2395,18 @@ impl GatewayRuntime {
                 .await;
             }
         };
-        let (request_process, executor) = match self.executor_for(&profile, session, &surface_ids) {
-            Ok(ex) => ex,
-            Err(e) => {
-                return release_submission_idempotency_reservation_and_fail(
-                    &self.boot.kernel.state,
-                    idempotency.as_deref(),
-                    e,
-                )
-                .await;
-            }
-        };
+        let (request_process, executor) =
+            match self.executor_for(&profile, session, &surface_ids).await {
+                Ok(ex) => ex,
+                Err(e) => {
+                    return release_submission_idempotency_reservation_and_fail(
+                        &self.boot.kernel.state,
+                        idempotency.as_deref(),
+                        e,
+                    )
+                    .await;
+                }
+            };
         let entry = GatewayRequestEntry {
             accepted: accepted.clone(),
             request_process,
@@ -2420,8 +2427,9 @@ impl GatewayRuntime {
         {
             Ok(guard) => guard,
             Err(e) => {
-                return release_submission_idempotency_reservation_and_fail(
-                    &self.boot.kernel.state,
+                return finish_request_release_idempotency_and_fail(
+                    &self.boot,
+                    request_process,
                     idempotency.as_deref(),
                     e,
                 )
@@ -2488,8 +2496,9 @@ impl GatewayRuntime {
         {
             Ok(lowered) => lowered,
             Err(e) => {
-                return release_submission_idempotency_reservation_and_fail(
-                    &self.boot.kernel.state,
+                return finish_request_release_idempotency_and_fail(
+                    &self.boot,
+                    request_process,
                     idempotency.as_deref(),
                     e,
                 )
@@ -2505,8 +2514,9 @@ impl GatewayRuntime {
         ) {
             Ok(admission) => admission,
             Err(e) => {
-                return release_submission_idempotency_reservation_and_fail(
-                    &self.boot.kernel.state,
+                return finish_request_release_idempotency_and_fail(
+                    &self.boot,
+                    request_process,
                     idempotency.as_deref(),
                     e,
                 )
@@ -2525,17 +2535,25 @@ impl GatewayRuntime {
             )
             .await
         {
-            return release_submission_idempotency_reservation_and_fail(
-                &self.boot.kernel.state,
+            return finish_request_release_idempotency_and_fail(
+                &self.boot,
+                request_process,
                 idempotency.as_deref(),
                 e,
             )
             .await;
         }
         if admission.requires_idempotency && idempotency.is_none() {
-            return Err(GatewayError::Rejected(
-                "idempotency_key or submission_token is required for non-idempotent effects".into(),
-            ));
+            return finish_request_release_idempotency_and_fail(
+                &self.boot,
+                request_process,
+                idempotency.as_deref(),
+                GatewayError::Rejected(
+                    "idempotency_key or submission_token is required for non-idempotent effects"
+                        .into(),
+                ),
+            )
+            .await;
         }
         let entry_taint = TaintSet::of(TaintSource::Inbound {
             source: Self::source_label(&profile).into(),
@@ -2556,8 +2574,9 @@ impl GatewayRuntime {
             &lowered.program,
             outcome,
         );
-        commit_submission_idempotency_outcome(
-            &self.boot.kernel.state,
+        commit_submission_idempotency_and_finish_request(
+            &self.boot,
+            request_process,
             idempotency.as_deref(),
             &accepted,
             &outcome,
@@ -2573,8 +2592,9 @@ impl GatewayRuntime {
         stream: GatewayAcceptedInputStream,
         _reason: &str,
     ) -> Result<(), GatewayError> {
-        release_submission_idempotency_reservation(
-            &self.boot.kernel.state,
+        finish_request_and_release_idempotency(
+            &self.boot,
+            stream.request_process,
             stream.idempotency.as_deref(),
         )
         .await
@@ -2636,10 +2656,13 @@ impl GatewayRuntime {
                     "authority anchor process {anchor} does not exist"
                 )));
             }
-            let anchor_grants = boot.kernel.registry.grants_of(anchor);
+            let now_millis = nexus_kernel::now_millis();
+            let mut anchor_grants = boot.kernel.registry.grants_of(anchor);
+            anchor_grants.extend(boot.kernel.processes.attached_grants(anchor));
             for surface in &profile.surface_descriptors {
                 if !anchor_grants.iter().any(|grant| {
-                    surface.method_bitmap.is_subset_of(grant.rights.methods)
+                    !grant.expires.is_expired(now_millis)
+                        && surface.method_bitmap.is_subset_of(grant.rights.methods)
                         && grant.selector.pattern.covers_cap(&surface.grant_capability)
                 }) {
                     return Err(GatewayError::InvalidProfile(format!(
@@ -2721,15 +2744,15 @@ impl GatewayRuntime {
             .map_err(|e| GatewayError::Rejected(e.to_string()))
     }
 
-    fn executor_for(
+    async fn executor_for(
         &self,
         profile: &CompiledGatewayProfile,
         session: &GatewaySession,
         surface_ids: &BTreeSet<String>,
     ) -> Result<(ProcessId, Executor), GatewayError> {
+        let surfaces = profile.surface_descriptors_for_ids(surface_ids)?;
         let proc = self.spawn_gateway_request_process(profile, session, surface_ids)?;
         let ex = self.boot.kernel.executor_for(proc);
-        let surfaces = profile.surface_descriptors_for_ids(surface_ids)?;
         let mut opened = BTreeSet::new();
         for surface in surfaces {
             let key = format!("{}\0{}", surface.target.path(), GATEWAY_EFFECT_HANDLE_VERB);
@@ -2739,7 +2762,14 @@ impl GatewayRuntime {
             let opened = self
                 .boot
                 .open_for(proc, &surface.target, GATEWAY_EFFECT_HANDLE_VERB)
-                .map_err(|e| GatewayError::Rejected(e.to_string()))?;
+                .map_err(|e| GatewayError::Rejected(e.to_string()));
+            let opened = match opened {
+                Ok(opened) => opened,
+                Err(error) => {
+                    return finish_request_without_idempotency_and_fail(&self.boot, proc, error)
+                        .await;
+                }
+            };
             ex.bind_handle(surface.target.clone(), opened);
         }
         Ok((proc, ex))
@@ -3013,7 +3043,7 @@ impl Gateway for GatewayRuntime {
                 .await;
             }
         };
-        let (request_process, ex) = match self.executor_for(&profile, session, &surface_ids) {
+        let (request_process, ex) = match self.executor_for(&profile, session, &surface_ids).await {
             Ok(ex) => ex,
             Err(e) => {
                 return release_submission_idempotency_reservation_and_fail(
@@ -3044,8 +3074,9 @@ impl Gateway for GatewayRuntime {
         {
             Ok(guard) => guard,
             Err(e) => {
-                return release_submission_idempotency_reservation_and_fail(
-                    &self.boot.kernel.state,
+                return finish_request_release_idempotency_and_fail(
+                    &self.boot,
+                    request_process,
                     idempotency.as_ref(),
                     e,
                 )
@@ -3080,8 +3111,9 @@ impl Gateway for GatewayRuntime {
             &lowered.program,
             outcome,
         );
-        commit_submission_idempotency_outcome(
-            &self.boot.kernel.state,
+        commit_submission_idempotency_and_finish_request(
+            &self.boot,
+            request_process,
             idempotency.as_ref(),
             &accepted,
             &outcome,
@@ -3507,12 +3539,26 @@ async fn eval_tainted_with_deadline(
     };
     let remaining_ms = deadline_at_ms.saturating_sub(now_millis());
     if remaining_ms <= 0 {
-        boot.kernel
-            .processes
-            .set_status(request_process, ProcessStatus::Cancelled);
+        if let Err(error) = boot.cancel_process(request_process) {
+            tracing::error!(
+                process = request_process.get(),
+                error = %error,
+                "request deadline cancellation failed"
+            );
+        }
         return Outcome::Fail(Failure::Timeout);
     }
-    let remaining_ms = u64::try_from(remaining_ms).unwrap_or(u64::MAX);
+    let remaining_ms = match u64::try_from(remaining_ms) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(
+                value = remaining_ms,
+                error = %error,
+                "request deadline conversion failed"
+            );
+            u64::MAX
+        }
+    };
     match tokio::time::timeout(
         std::time::Duration::from_millis(remaining_ms),
         executor.eval_tainted(program, entry_taint),
@@ -3521,9 +3567,13 @@ async fn eval_tainted_with_deadline(
     {
         Ok(outcome) => outcome,
         Err(_) => {
-            boot.kernel
-                .processes
-                .set_status(request_process, ProcessStatus::Cancelled);
+            if let Err(error) = boot.cancel_process(request_process) {
+                tracing::error!(
+                    process = request_process.get(),
+                    error = %error,
+                    "request timeout cancellation failed"
+                );
+            }
             Outcome::Fail(Failure::Timeout)
         }
     }
@@ -3945,6 +3995,30 @@ async fn commit_submission_idempotency_outcome(
         })
 }
 
+async fn commit_submission_idempotency_and_finish_request(
+    boot: &Bootstrap,
+    process: ProcessId,
+    reservation: Option<&GatewayIdempotencyReservation>,
+    accepted: &GatewayAccepted,
+    outcome: &Outcome,
+) -> Result<(), GatewayError> {
+    let commit =
+        commit_submission_idempotency_outcome(&boot.kernel.state, reservation, accepted, outcome)
+            .await;
+    let finish = boot
+        .finish_request_process(process, outcome)
+        .await
+        .map_err(|error| GatewayError::Rejected(error.to_string()));
+    match (commit, finish) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(commit_error), Ok(())) => Err(commit_error),
+        (Ok(()), Err(finish_error)) => Err(finish_error),
+        (Err(commit_error), Err(finish_error)) => Err(GatewayError::Rejected(format!(
+            "{commit_error}; request cleanup failed: {finish_error}"
+        ))),
+    }
+}
+
 async fn release_submission_idempotency_reservation(
     state: &nexus_state::Backend,
     reservation: Option<&GatewayIdempotencyReservation>,
@@ -3965,6 +4039,52 @@ async fn release_submission_idempotency_reservation_and_fail<T>(
 ) -> Result<T, GatewayError> {
     release_submission_idempotency_reservation(state, reservation).await?;
     Err(error)
+}
+
+async fn finish_request_release_idempotency_and_fail<T>(
+    boot: &Bootstrap,
+    process: ProcessId,
+    reservation: Option<&GatewayIdempotencyReservation>,
+    error: GatewayError,
+) -> Result<T, GatewayError> {
+    let original = error.to_string();
+    match finish_request_and_release_idempotency(boot, process, reservation).await {
+        Ok(()) => Err(error),
+        Err(cleanup_error) => Err(GatewayError::Rejected(format!(
+            "{original}; request cleanup failed: {cleanup_error}"
+        ))),
+    }
+}
+
+async fn finish_request_without_idempotency_and_fail<T>(
+    boot: &Bootstrap,
+    process: ProcessId,
+    error: GatewayError,
+) -> Result<T, GatewayError> {
+    let original = error.to_string();
+    match boot.finish_process_as(process, ProcessStatus::Failed).await {
+        Ok(()) => Err(error),
+        Err(cleanup_error) => Err(GatewayError::Rejected(format!(
+            "{original}; request cleanup failed: {cleanup_error}"
+        ))),
+    }
+}
+
+async fn finish_request_and_release_idempotency(
+    boot: &Bootstrap,
+    process: ProcessId,
+    reservation: Option<&GatewayIdempotencyReservation>,
+) -> Result<(), GatewayError> {
+    let finish = boot.finish_process_as(process, ProcessStatus::Failed).await;
+    let release = release_submission_idempotency_reservation(&boot.kernel.state, reservation).await;
+    match (finish, release) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(finish_error), Ok(())) => Err(GatewayError::Rejected(finish_error.to_string())),
+        (Ok(()), Err(release_error)) => Err(release_error),
+        (Err(finish_error), Err(release_error)) => Err(GatewayError::Rejected(format!(
+            "{finish_error}; {release_error}"
+        ))),
+    }
 }
 
 fn initial_idempotency_material(

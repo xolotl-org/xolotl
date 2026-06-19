@@ -72,9 +72,13 @@ mod terminal;
 mod time;
 
 #[cfg(feature = "standard-core")]
+pub use inference::{EchoBackend, InferenceBackend, InferenceMethodSupport, ModelCapabilities};
+#[cfg(feature = "standard-core")]
 pub use install::{
-    IN_PROCESS_PROJECTION_CONFIG_PREFIX, InstallError, StandardConfig,
-    install_declared_in_process_projections, install_in_process_projection_value, install_standard,
+    IN_PROCESS_PROJECTION_CONFIG_PREFIX, InProcessProjectionInstallEntry,
+    InProcessProjectionInstallReport, InProcessProjectionInstalled, InstallError, StandardConfig,
+    StandardModule, StandardModules, install_declared_in_process_projections,
+    install_in_process_projection_value, install_standard,
 };
 #[cfg(feature = "standard-core")]
 pub use pairing::PairingDisplayEdge;

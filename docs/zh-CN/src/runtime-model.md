@@ -17,7 +17,12 @@ Nexus 只有一个主动实体：`Process`。
 
 派生会衰减授权范围。子进程权限由父进程授予的权限位限定。
 
-终结会取消后代进程，按反向顺序运行终结器，撤销进程句柄，记录 `ProcessFinalized` 事实记录，并写入一个状态标记方便快速查询。
+终结会取消后代进程，按反向顺序运行终结器，撤销进程句柄，记录 `ProcessFinalized` 事实记录，并写入一个状态标记方便快速查询。终结器失败时，生命周期事实记录会写入失败数量和详情，同时继续完成清理。SDK、Console 和 Gateway 入口创建的 request Process 会在程序返回后终结，包括失败和取消结果。终结期间，操作只允许访问当前进程的 `state://process/<process-id>/...` 子树，或调用接口元数据标记为可用于终结器的方法。
+
+Actor 是命名长寿 Process。`ActorSpec` 声明 body、能力上限、预算和终结器。
+启动 Actor 会检查 body 和终结器，创建普通 Process，附着衰减后的 grant，通过同一个 Executor
+运行 body，并在 `state://agents/<identity>/<name>` 写入目录项供发现。body 或终结器引用
+`StepRef` 时，进程本地步骤函数由宿主在启动时安装。Actor 声明可以在 body、终结器和 declared capabilities 中使用 `state://process/self/...`；启动时会在 lint、grant planning 和执行前绑定为具体 Process id。
 
 ## 资源与接口
 

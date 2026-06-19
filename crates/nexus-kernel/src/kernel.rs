@@ -31,7 +31,7 @@ pub struct Kernel {
     /// Runtime process tree and per-process mutable state.
     pub processes: ProcessTable,
     /// Named pure continuation table used by graph `Step` nodes.
-    pub steps: StepTable,
+    pub(crate) steps: StepTable,
     /// State-plane backend serving `state://` reads, writes, and subscriptions.
     pub state: Backend,
 }

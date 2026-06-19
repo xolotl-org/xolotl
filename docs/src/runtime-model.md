@@ -23,7 +23,24 @@ parent grant.
 
 Finalization cancels descendants, runs finalizers in reverse order, revokes the
 Process handles, records a `ProcessFinalized` Fact, and writes a state marker
-for quick lookup.
+for quick lookup. If a finalizer fails, the lifecycle Fact records the failure
+count and details while cleanup continues.
+Request Processes created by SDK, Console, or Gateway entry points are finalized
+after their program returns, including failure and cancellation outcomes.
+During finalization, operations are limited to the current Process subtree
+`state://process/<process-id>/...` and methods whose interface metadata marks
+them as finalizer-safe.
+
+An Actor is a named long-lived Process. `ActorSpec` is the declaration shape:
+body, declared capabilities, budget, and finalizers. Spawning an actor checks
+the body and finalizers, creates a normal
+Process with attenuated grants, runs the body through the same Executor, and
+publishes a directory entry under `state://agents/<identity>/<name>` for
+discovery. Process-local steps are host functions installed at spawn time when
+the body or finalizers reference `StepRef`s. Actor declarations may use
+`state://process/self/...` in body, finalizers, and declared capabilities; the
+placeholder is bound to the concrete Process id before linting, grant planning,
+and execution.
 
 ## Resource And Interface
 

@@ -96,7 +96,10 @@ enum FactScope {
 
 fn fact_path_scope(path: &nexus_types::Path) -> Result<FactScope, Failure> {
     let segs = path.segments();
-    if path.scheme() != "state" || segs.first().map(|s| s.as_str()) != Some("fact") {
+    if path.scheme() != "state"
+        || path.cluster().is_some()
+        || segs.first().map(|s| s.as_str()) != Some("fact")
+    {
         return Err(Failure::InvalidInput {
             reason: "fact read target must be state://fact or state://fact/<process>".into(),
         });
@@ -218,7 +221,11 @@ mod tests {
             .context("write fact")?;
         let d = FactDriver::new(store);
 
-        for target in ["state://fact/not-a-process", "state://fact/1/extra"] {
+        for target in [
+            "state://fact/not-a-process",
+            "state://fact/1/extra",
+            "path://remote/state/fact/1",
+        ] {
             let ctx = ctx_with_target(target)?;
             let out = d
                 .call(MethodId::new(0), Value::Null, OutputMode::Unary, &ctx)

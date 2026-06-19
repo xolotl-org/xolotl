@@ -11,7 +11,10 @@
 //! serializable and avoid cross-identity code injection.
 
 use crate::graph::{OperationTemplate, StepRef, WaitSpec};
-use nexus_types::{Failure, Path, Value};
+use nexus_types::{
+    CapError, Capability, Failure, Path, PathError, PredOp, Predicate, ProcessId, ResourceName,
+    Value,
+};
 use serde::{Deserialize, Serialize};
 
 /// The nine combinators plus an `Op` leaf and a `Wait` leaf. Erased
@@ -210,6 +213,42 @@ impl DoNode {
         out
     }
 
+    /// Return a copy with process-local references bound to `process`.
+    pub fn bind_process_local_refs(&self, process: ProcessId) -> Result<Self, PathError> {
+        match self {
+            DoNode::Pure(value) => Ok(DoNode::Pure(value.clone())),
+            DoNode::AndThen { d, then } => Ok(DoNode::AndThen {
+                d: Box::new(d.bind_process_local_refs(process)?),
+                then: bind_step_ref(then, process),
+            }),
+            DoNode::OrElse { d, or } => Ok(DoNode::OrElse {
+                d: Box::new(d.bind_process_local_refs(process)?),
+                or: bind_step_ref(or, process),
+            }),
+            DoNode::Both(left, right) => Ok(DoNode::Both(
+                Box::new(left.bind_process_local_refs(process)?),
+                Box::new(right.bind_process_local_refs(process)?),
+            )),
+            DoNode::Race(left, right) => Ok(DoNode::Race(
+                Box::new(left.bind_process_local_refs(process)?),
+                Box::new(right.bind_process_local_refs(process)?),
+            )),
+            DoNode::Let { name, value, body } => Ok(DoNode::Let {
+                name: name.clone(),
+                value: Box::new(value.bind_process_local_refs(process)?),
+                body: Box::new(body.bind_process_local_refs(process)?),
+            }),
+            DoNode::Use(name) => Ok(DoNode::Use(name.clone())),
+            DoNode::Acting { identity, body } => Ok(DoNode::Acting {
+                identity: identity.clone(),
+                body: Box::new(body.bind_process_local_refs(process)?),
+            }),
+            DoNode::Fail(failure) => Ok(DoNode::Fail(failure.clone())),
+            DoNode::Wait(spec) => Ok(DoNode::Wait(bind_wait_spec(spec, process)?)),
+            DoNode::Op(template) => Ok(DoNode::Op(bind_operation_template(template, process)?)),
+        }
+    }
+
     fn collect_ops<'a>(&'a self, out: &mut Vec<&'a OperationTemplate>) {
         match self {
             DoNode::Op(t) => out.push(t),
@@ -229,10 +268,107 @@ impl DoNode {
     }
 }
 
+fn bind_step_ref(step: &StepRef, process: ProcessId) -> StepRef {
+    StepRef {
+        process,
+        name: step.name.clone(),
+        arg: step.arg.clone(),
+    }
+}
+
+fn bind_wait_spec(spec: &WaitSpec, process: ProcessId) -> Result<WaitSpec, PathError> {
+    match spec {
+        WaitSpec::Signal(path) => Ok(WaitSpec::Signal(bind_process_self_path(path, process)?)),
+        WaitSpec::Deadline(at_millis) => Ok(WaitSpec::Deadline(*at_millis)),
+    }
+}
+
+fn bind_operation_template(
+    template: &OperationTemplate,
+    process: ProcessId,
+) -> Result<OperationTemplate, PathError> {
+    Ok(OperationTemplate {
+        target: ResourceName::new(bind_process_self_path(template.target.path(), process)?),
+        method: template.method.clone(),
+        method_id: template.method_id,
+        output: template.output,
+        literal_input: template.literal_input.clone(),
+    })
+}
+
+pub(crate) fn bind_process_self_path(path: &Path, process: ProcessId) -> Result<Path, PathError> {
+    let segments = path.segments();
+    if path.scheme() != "state"
+        || path.cluster().is_some()
+        || segments.first().map(|segment| segment.as_str()) != Some("process")
+        || segments.get(1).map(|segment| segment.as_str()) != Some("self")
+    {
+        return Ok(path.clone());
+    }
+    let mut bound = Path::try_new("state")?
+        .try_push("process")?
+        .try_push(process.get().to_string())?;
+    for segment in &segments[2..] {
+        bound = bound.try_push(segment.as_str())?;
+    }
+    Ok(bound)
+}
+
+pub(crate) fn bind_process_self_capability_literal(
+    literal: &str,
+    process: ProcessId,
+) -> Result<String, CapError> {
+    let capability = Capability::parse(literal)?;
+    let changed = capability.scheme == "state"
+        && capability
+            .segments
+            .first()
+            .is_some_and(|segment| segment.as_str() == "process")
+        && capability
+            .segments
+            .get(1)
+            .is_some_and(|segment| segment.as_str() == "self");
+    if !changed {
+        return Ok(literal.to_string());
+    }
+
+    let mut segments = Vec::with_capacity(capability.segments.len());
+    for (index, segment) in capability.segments.iter().enumerate() {
+        if index == 1 {
+            segments.push(process.get().to_string());
+        } else {
+            segments.push(segment.to_string());
+        }
+    }
+    let mut bound = format!(
+        "{}://{}/{}",
+        capability.verb,
+        capability.scheme,
+        segments.join("/")
+    );
+    if let Some(predicate) = &capability.predicate {
+        bound.push_str(&format_predicate(predicate));
+    }
+    Capability::parse(&bound)?;
+    Ok(bound)
+}
+
+fn format_predicate(predicate: &Predicate) -> String {
+    let op = match predicate.op {
+        PredOp::Eq => "=",
+        PredOp::Ne => "!=",
+        PredOp::Le => "<=",
+        PredOp::Lt => "<",
+        PredOp::Ge => ">=",
+        PredOp::Gt => ">",
+    };
+    format!("@{}{}{}", predicate.key, op, predicate.value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::{anyhow, bail, ensure};
+    use anyhow::{Context, anyhow, bail, ensure};
     use nexus_types::{ProcessId, ResourceName};
 
     fn s(name: &str) -> StepRef {
@@ -326,6 +462,43 @@ mod tests {
         let s = serde_json::to_string(&d)?;
         let back: DoNode = serde_json::from_str(&s)?;
         ensure!(d == back, "round trip changed node: {back:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn bind_process_local_refs_rewrites_structured_paths_only() -> anyhow::Result<()> {
+        let process = ProcessId::new(42);
+        let d = DoNode::Both(
+            Box::new(DoNode::op(op("state://process/self/scratch")?)),
+            Box::new(DoNode::wait_signal(Path::parse(
+                "state://process/self/signal",
+            )?)),
+        );
+        let bound = d.bind_process_local_refs(process)?;
+        let ops = bound.ops();
+        let target = ops.first().context("missing op")?.target.path().to_string();
+        ensure!(
+            target == "state://process/42/scratch",
+            "unexpected bound op target: {target}"
+        );
+        match bound {
+            DoNode::Both(_, right) => match *right {
+                DoNode::Wait(WaitSpec::Signal(path)) => {
+                    ensure!(
+                        path.to_string() == "state://process/42/signal",
+                        "unexpected bound wait path: {path}"
+                    );
+                }
+                other => bail!("unexpected right node: {other:?}"),
+            },
+            other => bail!("unexpected bound node: {other:?}"),
+        }
+
+        let value = DoNode::pure(Value::Str("state://process/self/not-a-path".into()));
+        ensure!(
+            value.bind_process_local_refs(process)? == value,
+            "plain string value should not be rebound"
+        );
         Ok(())
     }
 

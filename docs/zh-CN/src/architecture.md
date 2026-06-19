@@ -61,6 +61,13 @@ Nexus 让执行热路径保持很小：
 前提供自己的状态后端和事实记录接收端。SDK 的 `standard` feature 提供标准包安装 API，
 供包含标准进程内 Provider 的宿主使用。嵌入方仍可替换策略来源、driver 和宿主装配。
 
+`ActorSpec` 是命名长寿 Process 的声明形态，包含可序列化的 `DoNode` body、声明能力、
+预算和终结器。`Bootstrap::spawn_actor_under` 会检查 body 和终结器是否超出声明能力上限，
+从父 Process 衰减出进程附着 grant，写入 `state://agents/<identity>/<name>`，并用普通
+Executor 运行 body。body 如果使用进程本地 `StepRef`，宿主通过
+`Bootstrap::spawn_actor_under_with_steps` 在执行开始前安装对应函数；终结器中的
+`StepRef` 也必须在启动时提供。
+
 ## 标准包 feature 选择
 
 `nexus-standard` 包含标准进程内 Provider 和 Source 实现。某个二进制不需要全部实现时，可以
@@ -79,7 +86,15 @@ feature 转发给 `nexus-standard`。
 feature 后面。daemon 或嵌入式宿主只能通过 kernel state 声明和固定 Console action
 暴露它们。运行时进程内 projection 声明存储在 Nexus state 中。
 
+编译进二进制和实际安装是两件事。`StandardConfig` 默认安装全部 standard-core 模块；
+宿主可以使用 `StandardModules::none`、`StandardModules::state_only` 或自定义
+`StandardModules` 选择公开哪些模块。标准模型类 effect 可以使用内置 baseline、启用
+HTTP dialect feature 后的运行时 Provider state，或通过
+`StandardConfig::with_inference_backend` 接入宿主自己的 backend。
+
 可选进程内 projection 声明属于运行时状态，路径为
-`state://kernel/projections/in-process/<id>`。它们通过 `projection.in_process.*`
-Console action、kernel state 准入和宿主侧 reconcile 转换为普通
-Resource、Interface、Driver 和 Binding 注册项。
+`state://kernel/projections/in-process/<id>`。它们通过泛用 `config.*`
+Console action、共享 kernel state 准入和宿主侧 reconcile 转换为普通
+Resource、Interface、Driver 和 Binding 注册项。reconcile 结果写在
+`state://kernel/projection-status/in-process/<id>`，通过
+`projection.in_process.status.*` 读取。

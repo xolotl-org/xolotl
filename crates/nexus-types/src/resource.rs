@@ -199,6 +199,10 @@ pub struct Method {
     /// declare this true. Defaults to false (one call, one Fact).
     #[serde(default)]
     pub batchable: bool,
+    /// Whether this method may run from a Process finalizer after the Process
+    /// has entered `Finalizing`.
+    #[serde(default)]
+    pub finalize_allowed: bool,
 }
 
 /// An algebraic law an [`Interface`] declares, used by validation,
@@ -321,14 +325,16 @@ pub enum ResourceKind {
     Kernel,
 }
 
-/// Free-form metadata attached to a Resource descriptor (display name, tags,
-/// provider id). Console-facing; not consulted on the hot path.
+/// Control-plane metadata attached to a Resource descriptor.
+///
+/// Metadata is used for discovery and projection attribution. It is not
+/// consulted by data-plane dispatch.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Metadata {
     /// Optional display label for consoles and descriptors.
     #[serde(default)]
     pub display_name: Option<String>,
-    /// Optional provider id that projected this resource.
+    /// Optional Provider or projection id that registered this resource.
     #[serde(default)]
     pub provider_id: Option<String>,
     /// Free-form tags for discovery and filtering.

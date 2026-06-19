@@ -54,6 +54,9 @@ pub struct EffectCapability {
     pub effect_path: String,
     /// Declared purity for replay classification.
     pub purity: Purity,
+    /// Whether this effect may run from a Process finalizer.
+    #[serde(default)]
+    pub finalize_allowed: bool,
     /// Optional human-readable description.
     #[serde(default)]
     pub description: Option<String>,
@@ -78,6 +81,7 @@ impl EffectCapability {
         Self {
             effect_path: effect_path.into(),
             purity,
+            finalize_allowed: false,
             description: None,
             input_schema: None,
             output_schema: None,

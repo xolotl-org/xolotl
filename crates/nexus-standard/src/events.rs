@@ -21,7 +21,7 @@ use nexus_types::{MethodId, Outcome, OutputMode, Path, Purity, Value};
 /// one as a separate `effect://events/<method>` Resource with public method
 /// `invoke`.
 pub(crate) const EVENTS_METHODS: &[MethodSpec] = &[
-    MethodSpec::new("publish", Purity::Effectful, MethodSpec::UNARY_ASYNC),
+    MethodSpec::new("publish", Purity::Effectful, MethodSpec::UNARY_ASYNC).finalize_allowed(),
     MethodSpec::new("subscribe", Purity::Pure, MethodSpec::STREAM_ASYNC).observes_external(),
 ];
 

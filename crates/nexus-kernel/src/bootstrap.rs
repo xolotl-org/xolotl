@@ -16,14 +16,19 @@
 use crate::driver::{DriverDescriptor, DynDriver};
 use crate::kernel::Kernel;
 use crate::open::{OpenError, OpenRequest, open_resource_with_attached};
-use crate::process::ProcessEntry;
+use crate::process::{FinalizeStart, ProcessEntry, TaskAttachment};
 use crate::registry::{AdmissionError, ResolveError};
+use crate::step::{StepFn, StepInstallError};
+use futures_util::FutureExt;
+use nexus_graph::{ActorSpec, DoNode, LintSeverity, lint_actor};
 use nexus_types::{
     Binding, CapError, ConstraintSet, DriverRef, Expiry, Fact, Grant, HandleId, IdentityRef,
     Interface, InterfaceFamily, InterfaceSet, Metadata, Method, MethodBitmap, ModalitySet,
     OutputModeSet, Path, PathError, ProcessId, ProcessStatus, Purity, Resource, ResourceDescriptor,
     ResourceKind, ResourceName, ResourceSelector, RightFlags, Rights, SchemaId, Transport,
 };
+use std::collections::{BTreeMap, BTreeSet};
+use std::panic::AssertUnwindSafe;
 use thiserror::Error;
 
 /// A ready kernel plus the root Process id. The root holds an
@@ -69,9 +74,53 @@ pub struct CompiledRequestGrantTemplate {
     pub methods: MethodBitmap,
 }
 
+/// A spawned actor process.
+pub struct SpawnedActor {
+    /// Process created for the actor body.
+    pub process: ProcessId,
+    /// Directory entry written under `state://agents/<identity>/<name>`.
+    pub directory: Path,
+}
+
+/// Process-local step installed before a spawned actor body starts.
+#[derive(Clone)]
+pub struct ProcessStepBinding {
+    /// Name referenced by `StepRef`.
+    pub name: String,
+    /// Step function registered under `name`.
+    pub step: StepFn,
+}
+
+impl ProcessStepBinding {
+    /// Create a process-local step binding.
+    pub fn new(name: impl Into<String>, step: StepFn) -> Self {
+        Self {
+            name: name.into(),
+            step,
+        }
+    }
+}
+
+struct EffectRegistration<'a> {
+    path: &'a str,
+    methods: &'a [MethodSpec],
+    driver: DynDriver,
+    cost: nexus_types::CostModel,
+    metadata: Metadata,
+    generation: u64,
+    relink_existing: bool,
+}
+
 struct ParsedRequestGrantTemplate {
     selector: ResourceSelector,
     methods: Option<MethodBitmap>,
+}
+
+struct PlannedRequestGrant {
+    selector: ResourceSelector,
+    rights: Rights,
+    constraints: ConstraintSet,
+    expires: Expiry,
 }
 
 /// Errors raised while assembling built-in resources, drivers, and bootstrap
@@ -114,12 +163,61 @@ pub enum BootstrapError {
         /// Request grant literal that exceeded the anchor.
         literal: String,
     },
+    /// The requested Process does not exist.
+    #[error("process {process} not found")]
+    NoSuchProcess {
+        /// Process id supplied by the caller.
+        process: ProcessId,
+    },
     /// Writing a bootstrap fact failed.
     #[error("fact write failed: {0}")]
     Fact(#[from] crate::FactError),
     /// Writing bootstrap state failed.
     #[error("state write failed: {0}")]
     State(#[source] Box<nexus_state::StateError>),
+    /// Actor admission rejected a declaration before execution.
+    #[error("actor {actor:?} rejected: {message}")]
+    ActorAdmission {
+        /// Actor name.
+        actor: String,
+        /// Admission failure.
+        message: String,
+    },
+    /// Actor body uses capabilities outside its declared ceiling.
+    #[error("actor {actor:?} failed capability lint: {message}")]
+    ActorLint {
+        /// Actor name.
+        actor: String,
+        /// Lint failure.
+        message: String,
+    },
+    /// Actor step bindings contain the same name more than once.
+    #[error("actor {actor:?} has duplicate step binding {name:?}")]
+    DuplicateStepBinding {
+        /// Actor name.
+        actor: String,
+        /// Step name.
+        name: String,
+    },
+    /// Installing a process-local step failed.
+    #[error("actor {actor:?} step {name:?} install failed: {source}")]
+    StepInstall {
+        /// Actor name.
+        actor: String,
+        /// Step name.
+        name: String,
+        /// Step table error.
+        #[source]
+        source: StepInstallError,
+    },
+    /// Actor body or finalizer references a step that was not supplied.
+    #[error("actor {actor:?} references missing step binding {name:?}")]
+    MissingStepBinding {
+        /// Actor name.
+        actor: String,
+        /// Missing step name.
+        name: String,
+    },
 }
 
 impl From<nexus_state::StateError> for BootstrapError {
@@ -142,6 +240,8 @@ pub struct MethodSpec {
     /// Whether the method observes external state and must record observations
     /// that affect recovery.
     pub observes_external: bool,
+    /// Whether the method may run while the owning Process is finalizing.
+    pub finalize_allowed: bool,
 }
 
 impl MethodSpec {
@@ -160,6 +260,7 @@ impl MethodSpec {
             supports,
             batchable: false,
             observes_external: false,
+            finalize_allowed: false,
         }
     }
 
@@ -172,6 +273,12 @@ impl MethodSpec {
     /// Mark this method as explicitly batchable.
     pub const fn batchable(mut self) -> Self {
         self.batchable = true;
+        self
+    }
+
+    /// Allow this method to be called from a Process finalizer.
+    pub const fn finalize_allowed(mut self) -> Self {
+        self.finalize_allowed = true;
         self
     }
 
@@ -261,7 +368,15 @@ impl Bootstrap {
         driver: DynDriver,
         cost: nexus_types::CostModel,
     ) -> Result<ResourceName, BootstrapError> {
-        self.register_effect_inner(path, methods, driver, cost, Metadata::default(), 1, false)
+        self.register_effect_inner(EffectRegistration {
+            path,
+            methods,
+            driver,
+            cost,
+            metadata: Metadata::default(),
+            generation: 1,
+            relink_existing: false,
+        })
     }
 
     /// Register or relink a Callable effect Resource backed by an in-process
@@ -275,19 +390,30 @@ impl Bootstrap {
         metadata: Metadata,
         generation: u64,
     ) -> Result<ResourceName, BootstrapError> {
-        self.register_effect_inner(path, methods, driver, cost, metadata, generation, true)
+        self.register_effect_inner(EffectRegistration {
+            path,
+            methods,
+            driver,
+            cost,
+            metadata,
+            generation,
+            relink_existing: true,
+        })
     }
 
     fn register_effect_inner(
         &self,
-        path: &str,
-        methods: &[MethodSpec],
-        driver: DynDriver,
-        cost: nexus_types::CostModel,
-        metadata: Metadata,
-        generation: u64,
-        relink_existing: bool,
+        registration: EffectRegistration<'_>,
     ) -> Result<ResourceName, BootstrapError> {
+        let EffectRegistration {
+            path,
+            methods,
+            driver,
+            cost,
+            metadata,
+            generation,
+            relink_existing,
+        } = registration;
         if methods.len() != 1 || methods[0].name != "invoke" {
             return Err(BootstrapError::InvalidMethodSpec {
                 resource: path.to_string(),
@@ -489,8 +615,7 @@ impl Bootstrap {
         Ok(name)
     }
 
-    /// Open a handle for `process` against a registered resource and bind it on
-    /// the executor that will run that process's program. Returns the handle.
+    /// Open a handle for `process` against a registered resource.
     pub fn open_for(
         &self,
         process: ProcessId,
@@ -503,13 +628,11 @@ impl Bootstrap {
             .resolve_resource(name)
             .map_err(|_| OpenError::NoSuchResource(nexus_types::ResourceId::new(0)))?;
         let mut handles = self.kernel.handles.write();
-        // The acting identity is the opening Process's own identity;
-        // root's internal opens fall back to ROOT.
         let acting = self
             .kernel
             .processes
             .identity(process)
-            .unwrap_or(IdentityRef::ROOT);
+            .ok_or(OpenError::NoSuchProcess(process))?;
         let attached_grants = self.kernel.processes.attached_grants(process);
         open_resource_with_attached(
             &self.kernel.registry,
@@ -602,17 +725,34 @@ impl Bootstrap {
         identity: IdentityRef,
         grants: &[ParsedRequestGrantTemplate],
     ) -> Result<ProcessId, BootstrapError> {
-        // Resolve every covering grant before allocating the child so a
-        // rejection leaves no Process or grant behind.
-        let anchor_grants = self.kernel.registry.grants_of(anchor);
-        let mut planned: Vec<(ResourceSelector, Rights)> = Vec::with_capacity(anchor_grants.len());
+        let planned = self.plan_request_grants(anchor, grants)?;
+        let child = self.kernel.processes.fresh_id();
+        let entry = self.request_process_entry(child, anchor, identity, planned);
+        self.kernel.processes.insert(entry);
+        Ok(child)
+    }
+
+    fn plan_request_grants(
+        &self,
+        anchor: ProcessId,
+        grants: &[ParsedRequestGrantTemplate],
+    ) -> Result<Vec<PlannedRequestGrant>, BootstrapError> {
+        if !self.kernel.processes.exists(anchor) {
+            return Err(BootstrapError::NoSuchProcess { process: anchor });
+        }
+        let now_millis = crate::executor::now_millis();
+        let mut anchor_grants = self.kernel.registry.grants_of(anchor);
+        anchor_grants.extend(self.kernel.processes.attached_grants(anchor));
+        let mut planned: Vec<PlannedRequestGrant> = Vec::with_capacity(grants.len());
         for grant in grants {
-            let selector = &grant.selector;
+            let (selector, requested_predicate) =
+                Self::normalize_selector_constraints(&grant.selector);
             // covers_cap matches on verb + scheme + segments; the anchor pattern
             // must be at least as broad as the declared one.
             let covering = anchor_grants.iter().find(|g| {
                 let requested = grant.methods.unwrap_or(g.rights.methods);
                 !requested.is_empty()
+                    && !g.expires.is_expired(now_millis)
                     && requested.is_subset_of(g.rights.methods)
                     && g.selector.pattern.covers_cap(&selector.pattern)
             });
@@ -622,32 +762,244 @@ impl Bootstrap {
                         grant.methods.unwrap_or(g.rights.methods),
                         RightFlags::empty(),
                     );
-                    planned.push((selector.clone(), rights));
+                    planned.push(PlannedRequestGrant {
+                        selector,
+                        rights,
+                        constraints: Self::derived_grant_constraints(g, requested_predicate),
+                        expires: g.expires,
+                    });
                 }
                 None => {
                     return Err(BootstrapError::CapabilityCeiling {
-                        literal: selector.pattern.to_string(),
+                        literal: grant.selector.pattern.to_string(),
                     });
                 }
             }
         }
+        Ok(planned)
+    }
 
-        let child = self.kernel.processes.fresh_id();
+    fn request_process_entry(
+        &self,
+        child: ProcessId,
+        anchor: ProcessId,
+        identity: IdentityRef,
+        planned: Vec<PlannedRequestGrant>,
+    ) -> ProcessEntry {
         let mut entry = ProcessEntry::new(child, Some(anchor), identity);
         entry.status = ProcessStatus::Running;
 
-        for (selector, rights) in planned {
+        for grant in planned {
             entry.attached_grants.push(Grant {
                 id: self.kernel.processes.fresh_attached_grant_id(),
                 holder: child,
-                selector,
-                rights,
-                constraints: ConstraintSet::empty(),
-                expires: Expiry::Never,
+                selector: grant.selector,
+                rights: grant.rights,
+                constraints: grant.constraints,
+                expires: grant.expires,
             });
         }
+        entry
+    }
+
+    fn normalize_selector_constraints(
+        selector: &ResourceSelector,
+    ) -> (ResourceSelector, Option<nexus_types::Predicate>) {
+        let mut selector = selector.clone();
+        let predicate = selector.pattern.predicate.take();
+        (selector, predicate)
+    }
+
+    fn derived_grant_constraints(
+        parent: &Grant,
+        requested_predicate: Option<nexus_types::Predicate>,
+    ) -> ConstraintSet {
+        let mut predicates = Vec::with_capacity(
+            usize::from(parent.selector.pattern.predicate.is_some())
+                + parent.constraints.predicates.len()
+                + usize::from(requested_predicate.is_some()),
+        );
+        if let Some(predicate) = parent.selector.pattern.predicate.clone() {
+            predicates.push(predicate);
+        }
+        predicates.extend(parent.constraints.predicates.iter().cloned());
+        if let Some(predicate) = requested_predicate {
+            predicates.push(predicate);
+        }
+        ConstraintSet { predicates }
+    }
+
+    /// Spawn a named long-lived actor Process under `anchor`.
+    ///
+    /// The actor receives only the capabilities declared by
+    /// `spec.declared_capabilities`, intersected with the anchor's grants. Its
+    /// body still runs through the ordinary Executor and every effect goes
+    /// through `open()`, Handle checks, Policy, Driver dispatch, and Facts.
+    pub async fn spawn_actor_under(
+        &self,
+        anchor: ProcessId,
+        identity: IdentityRef,
+        identity_segment: &str,
+        spec: &ActorSpec,
+    ) -> Result<SpawnedActor, BootstrapError> {
+        self.spawn_actor_under_with_steps(
+            anchor,
+            identity,
+            identity_segment,
+            spec,
+            std::iter::empty::<ProcessStepBinding>(),
+        )
+        .await
+    }
+
+    /// Spawn a named long-lived actor Process with process-local steps already
+    /// installed before the body starts.
+    pub async fn spawn_actor_under_with_steps<I>(
+        &self,
+        anchor: ProcessId,
+        identity: IdentityRef,
+        identity_segment: &str,
+        spec: &ActorSpec,
+        step_bindings: I,
+    ) -> Result<SpawnedActor, BootstrapError>
+    where
+        I: IntoIterator<Item = ProcessStepBinding>,
+    {
+        let step_bindings: Vec<ProcessStepBinding> = step_bindings.into_iter().collect();
+        validate_actor_segment("actor name", &spec.name)?;
+        validate_actor_segment("actor identity segment", identity_segment)?;
+        validate_actor_step_bindings(spec, &step_bindings)?;
+        let child = self.kernel.processes.fresh_id();
+        let spec = spec.bind_process_local_refs(child).map_err(|source| {
+            BootstrapError::ActorAdmission {
+                actor: spec.name.clone(),
+                message: source.to_string(),
+            }
+        })?;
+        nexus_graph::compile_do(&spec.body).map_err(|source| BootstrapError::ActorAdmission {
+            actor: spec.name.clone(),
+            message: source.to_string(),
+        })?;
+        for (index, finalizer) in spec.finalizers.iter().enumerate() {
+            nexus_graph::compile_do(finalizer).map_err(|source| {
+                BootstrapError::ActorAdmission {
+                    actor: spec.name.clone(),
+                    message: format!("finalizer[{index}] compile failed: {source}"),
+                }
+            })?;
+        }
+
+        let lint_message = actor_lint_message(&spec);
+        if let Some(message) = lint_message {
+            return Err(BootstrapError::ActorLint {
+                actor: spec.name.clone(),
+                message,
+            });
+        }
+
+        let parsed = spec
+            .declared_capabilities
+            .iter()
+            .map(|literal| {
+                ResourceSelector::parse(literal)
+                    .map(|selector| ParsedRequestGrantTemplate {
+                        selector,
+                        methods: None,
+                    })
+                    .map_err(|source| BootstrapError::Selector {
+                        literal: literal.clone(),
+                        source,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let directory = actor_directory_path(identity_segment, &spec.name)?;
+        let inbox = actor_inbox_path(identity_segment, &spec.name)?;
+        let planned = self.plan_request_grants(anchor, &parsed)?;
+        let mut entry = self.request_process_entry(child, anchor, identity, planned);
+        entry.budget_spec = spec.budget.clone();
+        let body = spec.body.clone();
+        let finalizers: Vec<DoNode> = spec.finalizers.clone();
+        entry.on_finalize.extend(finalizers.iter().cloned());
+        entry.directory = Some(directory.clone());
+
+        let initial = actor_directory_value(&spec, child, ProcessStatus::Running, &inbox);
+        install_process_step_bindings(&self.kernel.steps, child, &spec.name, &step_bindings)?;
+        if let Err(source) = self.kernel.state.write_cas(&directory, None, initial).await {
+            self.kernel.handles.write().revoke_owned_by(child);
+            cleanup_process_steps(&self.kernel.steps, child);
+            return Err(BootstrapError::State(Box::new(source)));
+        }
+
         self.kernel.processes.insert(entry);
-        Ok(child)
+
+        let kernel = self.kernel.clone();
+        let actor_name = spec.name.clone();
+        let task = tokio::spawn(async move {
+            let outcome = match AssertUnwindSafe(kernel.executor_for(child).eval(&body))
+                .catch_unwind()
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(payload) => nexus_types::Outcome::Fail(nexus_types::Failure::HandlerError {
+                    kind: "panic".into(),
+                    message: panic_payload_message("actor process", payload),
+                }),
+            };
+            let status = match &outcome {
+                nexus_types::Outcome::Fail(_) => ProcessStatus::Failed,
+                _ => ProcessStatus::Completed,
+            };
+            match kernel.processes.begin_finalizing(child) {
+                FinalizeStart::Started => {
+                    if let Err(error) =
+                        finish_process_terminal_attempt(&kernel, child, status).await
+                    {
+                        tracing::error!(
+                            actor = %actor_name,
+                            process = child.get(),
+                            error = %error,
+                            "actor process terminal finalization failed"
+                        );
+                    }
+                }
+                FinalizeStart::AlreadyFinalizing | FinalizeStart::AlreadyTerminal => {}
+                FinalizeStart::NoSuchProcess => {
+                    tracing::error!(
+                        actor = %actor_name,
+                        process = child.get(),
+                        "actor process disappeared before terminal finalization"
+                    );
+                }
+            }
+            kernel.processes.remove_task(child);
+            outcome
+        });
+        match self
+            .kernel
+            .processes
+            .attach_task(child, task.abort_handle())
+        {
+            TaskAttachment::Attached | TaskAttachment::AlreadyTerminal => {}
+            TaskAttachment::NoSuchProcess => {
+                task.abort();
+                cleanup_process_steps(&self.kernel.steps, child);
+                return Err(BootstrapError::NoSuchProcess { process: child });
+            }
+            TaskAttachment::AlreadyAttached => {
+                task.abort();
+                cleanup_process_steps(&self.kernel.steps, child);
+                return Err(BootstrapError::ActorAdmission {
+                    actor: spec.name.clone(),
+                    message: "process already has an attached task".into(),
+                });
+            }
+        }
+
+        Ok(SpawnedActor {
+            process: child,
+            directory,
+        })
     }
 
     /// Recover every unfinished Process from its Fact stream, persisting any
@@ -728,76 +1080,89 @@ impl Bootstrap {
     /// `ProcessFinalized` lifecycle marker.
     pub async fn finalize_process(&self, process: ProcessId) -> Result<(), BootstrapError> {
         let procs = &self.kernel.processes;
-        // Enter teardown before touching descendants or handles.
-        procs.set_status(process, ProcessStatus::Finalizing);
+        let terminal_status = procs
+            .status(process)
+            .filter(|current| current.is_terminal())
+            .unwrap_or(ProcessStatus::Completed);
+        match procs.begin_finalizing(process) {
+            FinalizeStart::Started => {}
+            FinalizeStart::AlreadyFinalizing | FinalizeStart::AlreadyTerminal => return Ok(()),
+            FinalizeStart::NoSuchProcess => return Err(BootstrapError::NoSuchProcess { process }),
+        }
 
         // Cancel descendants deepest-first while this process remains in
         // Finalizing until its own cleanup completes.
         for descendant in procs.subtree_post_order(process) {
             if descendant != process {
-                procs.set_status(descendant, ProcessStatus::Cancelled);
+                let cancelled = procs.cancel_if_non_terminal(descendant).ok_or(
+                    BootstrapError::NoSuchProcess {
+                        process: descendant,
+                    },
+                )?;
+                procs.abort_task(descendant);
                 self.kernel.handles.write().revoke_owned_by(descendant);
+                cleanup_process_steps(&self.kernel.steps, descendant);
+                if cancelled && let Some(directory) = procs.directory(descendant) {
+                    update_actor_directory_status(
+                        &self.kernel.state,
+                        &directory,
+                        ProcessStatus::Cancelled,
+                    )
+                    .await?;
+                }
             }
         }
+        procs.abort_task(process);
 
-        // Run finalizers in reverse registration order.
-        for body in procs.take_finalizers(process) {
-            let ex = self.kernel.executor_for(process);
-            if let nexus_types::Outcome::Fail(failure) = ex.eval(&body).await {
-                tracing::warn!(
-                    process = process.get(),
-                    %failure,
-                    "process finalizer failed"
-                );
-            }
-        }
+        finish_process_terminal_attempt(&self.kernel, process, terminal_status).await
+    }
 
-        // Revoke handles owned by the process after finalizers have run.
-        let revoked = self.kernel.handles.write().revoke_owned_by(process);
-
-        // Write a ProcessFinalized Fact to the Fact stream as the authoritative
-        // lifecycle record, mark Completed, and write a state marker for quick
-        // lookup. The Fact uses a reserved high CausalPosition so it never
-        // collides with a program node's id. If the Fact cannot be recorded,
-        // leave the Process in Finalizing for operator inspection.
-        let finalized = Fact {
-            id: nexus_types::OperationId::new(process, FINALIZED_NODE, 0),
-            schema_version: Fact::SCHEMA_VERSION,
-            caller: process,
-            acting: procs.identity(process).unwrap_or(IdentityRef::ROOT),
-            handle: nexus_types::HandleId::new(0, 0),
-            resource: nexus_types::ResourceId::new(0),
-            method: nexus_types::MethodId::new(0),
-            input_ref: nexus_types::ValueRef::Inline(nexus_types::Value::Null),
-            taint: nexus_types::TaintSet::pristine(),
-            decision: nexus_types::DecisionTag::Ok,
-            outcome_ref: nexus_types::OutcomeRef::Inline(nexus_types::Value::Map({
-                let mut m = std::collections::BTreeMap::new();
-                m.insert(
-                    "event".into(),
-                    nexus_types::Value::Str("ProcessFinalized".into()),
-                );
-                m.insert(
-                    "revoked_handles".into(),
-                    nexus_types::Value::Int(revoked as i64),
-                );
-                m
-            })),
-            batch: None,
-            replay: nexus_types::ReplayClass::Observation,
-            timestamp: nexus_types::Timestamp::millis(crate::executor::now_millis()),
-        };
-        self.kernel.facts.complete(finalized)?;
-        procs.set_status(process, ProcessStatus::Completed);
-        let path = finalized_marker_path(process).map_err(|source| BootstrapError::Path {
-            literal: format!("state://kernel/process/{}/finalized", process.get()),
-            source,
-        })?;
+    /// Mark a Process cancelled so its next execution boundary stops work.
+    pub fn cancel_process(&self, process: ProcessId) -> Result<bool, BootstrapError> {
         self.kernel
-            .state
-            .write_set(&path, nexus_types::Value::Int(revoked as i64))
-            .await?;
-        Ok(())
+            .processes
+            .cancel_if_non_terminal(process)
+            .ok_or(BootstrapError::NoSuchProcess { process })
+    }
+
+    /// Finish a request Process after its program returned an outcome.
+    pub async fn finish_request_process(
+        &self,
+        process: ProcessId,
+        outcome: &nexus_types::Outcome,
+    ) -> Result<(), BootstrapError> {
+        let status = match outcome {
+            nexus_types::Outcome::Fail(
+                nexus_types::Failure::Cancelled | nexus_types::Failure::Timeout,
+            ) => ProcessStatus::Cancelled,
+            nexus_types::Outcome::Fail(_) => ProcessStatus::Failed,
+            nexus_types::Outcome::Done(_) | nexus_types::Outcome::Short(_) => {
+                ProcessStatus::Completed
+            }
+        };
+        self.finish_process_as(process, status).await
+    }
+
+    /// Run finalizers, revoke handles, and record lifecycle state with an
+    /// explicit terminal status.
+    pub async fn finish_process_as(
+        &self,
+        process: ProcessId,
+        status: ProcessStatus,
+    ) -> Result<(), BootstrapError> {
+        let terminal_status = self
+            .kernel
+            .processes
+            .status(process)
+            .filter(|current| current.is_terminal())
+            .unwrap_or(status);
+        match self.kernel.processes.begin_finalizing(process) {
+            FinalizeStart::Started => {
+                finish_process_terminal_attempt(&self.kernel, process, terminal_status).await
+            }
+            FinalizeStart::AlreadyFinalizing | FinalizeStart::AlreadyTerminal => Ok(()),
+            FinalizeStart::NoSuchProcess => Err(BootstrapError::NoSuchProcess { process }),
+        }
     }
 }
 
@@ -812,6 +1177,412 @@ fn finalized_marker_path(process: ProcessId) -> Result<Path, PathError> {
         .try_push("process")?
         .try_push(process.get().to_string())?
         .try_push("finalized")
+}
+
+async fn finish_process_terminal_attempt(
+    kernel: &Kernel,
+    process: ProcessId,
+    terminal_status: ProcessStatus,
+) -> Result<(), BootstrapError> {
+    let result = finish_process_terminal(kernel, process, terminal_status).await;
+    if result.is_err() {
+        if kernel.processes.release_finalizing(process).is_none() {
+            tracing::error!(
+                process = process.get(),
+                "process disappeared while releasing failed finalization attempt"
+            );
+        }
+    }
+    result
+}
+
+async fn finish_process_terminal(
+    kernel: &Kernel,
+    process: ProcessId,
+    terminal_status: ProcessStatus,
+) -> Result<(), BootstrapError> {
+    let mut finalizer_failures = kernel
+        .processes
+        .finalizer_failures(process)
+        .ok_or(BootstrapError::NoSuchProcess { process })?;
+    let base_failure_index = finalizer_failures.len();
+    for (index, body) in kernel
+        .processes
+        .take_finalizers(process)
+        .into_iter()
+        .enumerate()
+    {
+        let ex = kernel.executor_for(process).with_finalizer_mode();
+        if let nexus_types::Outcome::Fail(failure) = ex.eval(&body).await {
+            let failure = failure.to_string();
+            tracing::warn!(
+                process = process.get(),
+                %failure,
+                "process finalizer failed"
+            );
+            let mut item = BTreeMap::new();
+            item.insert(
+                "index".into(),
+                nexus_types::Value::Int((base_failure_index + index) as i64),
+            );
+            item.insert("failure".into(), nexus_types::Value::Str(failure));
+            finalizer_failures.push(nexus_types::Value::Map(item));
+        }
+    }
+    kernel
+        .processes
+        .set_finalizer_failures(process, finalizer_failures.clone())
+        .ok_or(BootstrapError::NoSuchProcess { process })?;
+
+    let revoked = kernel.handles.write().revoke_owned_by(process);
+    let finalizer_failure_count = finalizer_failures.len();
+    let finalized = Fact {
+        id: nexus_types::OperationId::new(process, FINALIZED_NODE, 0),
+        schema_version: Fact::SCHEMA_VERSION,
+        caller: process,
+        acting: kernel
+            .processes
+            .identity(process)
+            .ok_or(BootstrapError::NoSuchProcess { process })?,
+        handle: nexus_types::HandleId::new(0, 0),
+        resource: nexus_types::ResourceId::new(0),
+        method: nexus_types::MethodId::new(0),
+        input_ref: nexus_types::ValueRef::Inline(nexus_types::Value::Null),
+        taint: nexus_types::TaintSet::pristine(),
+        decision: nexus_types::DecisionTag::Ok,
+        outcome_ref: nexus_types::OutcomeRef::Inline(nexus_types::Value::Map({
+            let mut m = BTreeMap::new();
+            m.insert(
+                "event".into(),
+                nexus_types::Value::Str("ProcessFinalized".into()),
+            );
+            m.insert(
+                "status".into(),
+                nexus_types::Value::Str(process_status_label(terminal_status).into()),
+            );
+            m.insert(
+                "revoked_handles".into(),
+                nexus_types::Value::Int(revoked as i64),
+            );
+            m.insert(
+                "finalizer_failure_count".into(),
+                nexus_types::Value::Int(finalizer_failure_count as i64),
+            );
+            if !finalizer_failures.is_empty() {
+                m.insert(
+                    "finalizer_failures".into(),
+                    nexus_types::Value::List(finalizer_failures),
+                );
+            }
+            m
+        })),
+        batch: None,
+        replay: nexus_types::ReplayClass::Observation,
+        timestamp: nexus_types::Timestamp::millis(crate::executor::now_millis()),
+    };
+    kernel.facts.complete(finalized)?;
+    let actual_status = kernel
+        .processes
+        .mark_terminal_status(process, terminal_status)
+        .ok_or(BootstrapError::NoSuchProcess { process })?;
+
+    let marker_path = finalized_marker_path(process).map_err(|source| BootstrapError::Path {
+        literal: format!("state://kernel/process/{}/finalized", process.get()),
+        source,
+    })?;
+    let marker_result = kernel
+        .state
+        .write_set(&marker_path, nexus_types::Value::Int(revoked as i64))
+        .await
+        .map_err(BootstrapError::from);
+    let directory_result = match kernel.processes.directory(process) {
+        Some(directory) => {
+            update_actor_directory_status(&kernel.state, &directory, actual_status).await
+        }
+        None => Ok(()),
+    };
+
+    match (marker_result, directory_result) {
+        (Ok(()), Ok(())) => {
+            cleanup_process_steps(&kernel.steps, process);
+            kernel
+                .processes
+                .complete_finalization(process)
+                .ok_or(BootstrapError::NoSuchProcess { process })
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(primary), Err(secondary)) => {
+            tracing::error!(
+                process = process.get(),
+                error = %secondary,
+                "process directory update failed after finalize marker failure"
+            );
+            Err(primary)
+        }
+    }
+}
+
+fn actor_lint_message(spec: &ActorSpec) -> Option<String> {
+    let mut messages = Vec::new();
+    for finding in lint_actor(spec) {
+        if finding.severity == LintSeverity::Error {
+            messages.push(finding.message);
+        }
+    }
+    if messages.is_empty() {
+        None
+    } else {
+        Some(messages.join("; "))
+    }
+}
+
+pub(crate) fn panic_payload_message(
+    context: &str,
+    payload: Box<dyn std::any::Any + Send>,
+) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return format!("{context} panicked: {message}");
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return format!("{context} panicked: {message}");
+    }
+    format!("{context} panicked")
+}
+
+fn validate_actor_segment(label: &'static str, value: &str) -> Result<(), BootstrapError> {
+    if value.trim().is_empty() {
+        return Err(BootstrapError::ActorAdmission {
+            actor: value.to_string(),
+            message: format!("{label} must not be empty"),
+        });
+    }
+    let mut chars = value.chars();
+    let valid = matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if valid {
+        Ok(())
+    } else {
+        Err(BootstrapError::ActorAdmission {
+            actor: value.to_string(),
+            message: format!(
+                "{label} must start with an ASCII letter or digit and contain only ASCII letters, digits, '_' or '-'"
+            ),
+        })
+    }
+}
+
+fn validate_process_step_bindings(
+    actor: &str,
+    bindings: &[ProcessStepBinding],
+) -> Result<BTreeSet<String>, BootstrapError> {
+    let mut seen = BTreeSet::new();
+    for binding in bindings {
+        if binding.name.trim().is_empty() {
+            return Err(BootstrapError::ActorAdmission {
+                actor: actor.to_string(),
+                message: "step name must not be empty".into(),
+            });
+        }
+        if !seen.insert(binding.name.clone()) {
+            return Err(BootstrapError::DuplicateStepBinding {
+                actor: actor.to_string(),
+                name: binding.name.clone(),
+            });
+        }
+    }
+    Ok(seen)
+}
+
+fn validate_actor_step_bindings(
+    spec: &ActorSpec,
+    bindings: &[ProcessStepBinding],
+) -> Result<(), BootstrapError> {
+    let provided = validate_process_step_bindings(&spec.name, bindings)?;
+    let mut required = BTreeSet::new();
+    collect_step_names(&spec.name, &spec.body, &mut required)?;
+    for finalizer in &spec.finalizers {
+        collect_step_names(&spec.name, finalizer, &mut required)?;
+    }
+    for name in required {
+        if !provided.contains(name.as_str()) {
+            return Err(BootstrapError::MissingStepBinding {
+                actor: spec.name.clone(),
+                name,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn collect_step_names(
+    actor: &str,
+    node: &DoNode,
+    out: &mut BTreeSet<String>,
+) -> Result<(), BootstrapError> {
+    match node {
+        DoNode::AndThen { d, then } => {
+            collect_step_names(actor, d, out)?;
+            insert_step_name(actor, &then.name, out)
+        }
+        DoNode::OrElse { d, or } => {
+            collect_step_names(actor, d, out)?;
+            insert_step_name(actor, &or.name, out)
+        }
+        DoNode::Both(left, right) | DoNode::Race(left, right) => {
+            collect_step_names(actor, left, out)?;
+            collect_step_names(actor, right, out)
+        }
+        DoNode::Let { value, body, .. } => {
+            collect_step_names(actor, value, out)?;
+            collect_step_names(actor, body, out)
+        }
+        DoNode::Acting { body, .. } => collect_step_names(actor, body, out),
+        DoNode::Pure(_) | DoNode::Use(_) | DoNode::Fail(_) | DoNode::Wait(_) | DoNode::Op(_) => {
+            Ok(())
+        }
+    }
+}
+
+fn insert_step_name(
+    actor: &str,
+    name: &str,
+    out: &mut BTreeSet<String>,
+) -> Result<(), BootstrapError> {
+    if name.trim().is_empty() {
+        return Err(BootstrapError::ActorAdmission {
+            actor: actor.to_string(),
+            message: "step reference name must not be empty".into(),
+        });
+    }
+    out.insert(name.to_string());
+    Ok(())
+}
+
+fn install_process_step_bindings(
+    steps: &crate::step::StepTable,
+    process: ProcessId,
+    actor: &str,
+    bindings: &[ProcessStepBinding],
+) -> Result<(), BootstrapError> {
+    for binding in bindings {
+        if let Err(source) =
+            steps.install_step_fn(process, binding.name.clone(), binding.step.clone())
+        {
+            cleanup_process_steps(steps, process);
+            return Err(BootstrapError::StepInstall {
+                actor: actor.to_string(),
+                name: binding.name.clone(),
+                source,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_process_steps(steps: &crate::step::StepTable, process: ProcessId) {
+    let removed_steps = steps.remove_process(process);
+    if removed_steps > 0 {
+        tracing::debug!(
+            process = process.get(),
+            removed_steps,
+            "removed process-local steps"
+        );
+    }
+}
+
+fn actor_directory_path(identity_segment: &str, name: &str) -> Result<Path, BootstrapError> {
+    Path::try_new("state")
+        .and_then(|path| path.try_push("agents"))
+        .and_then(|path| path.try_push(identity_segment))
+        .and_then(|path| path.try_push(name))
+        .map_err(|source| BootstrapError::Path {
+            literal: format!("state://agents/{identity_segment}/{name}"),
+            source,
+        })
+}
+
+fn actor_inbox_path(identity_segment: &str, name: &str) -> Result<Path, BootstrapError> {
+    actor_directory_path(identity_segment, name)?
+        .try_push("inbox")
+        .map_err(|source| BootstrapError::Path {
+            literal: format!("state://agents/{identity_segment}/{name}/inbox"),
+            source,
+        })
+}
+
+fn actor_directory_value(
+    spec: &ActorSpec,
+    process: ProcessId,
+    status: ProcessStatus,
+    inbox: &Path,
+) -> nexus_types::Value {
+    let mut m = BTreeMap::new();
+    m.insert("name".into(), nexus_types::Value::Str(spec.name.clone()));
+    m.insert(
+        "path".into(),
+        nexus_types::Value::Str(format!("process://{}", process.get())),
+    );
+    m.insert(
+        "process".into(),
+        nexus_types::Value::Str(process.get().to_string()),
+    );
+    m.insert(
+        "status".into(),
+        nexus_types::Value::Str(process_status_label(status).into()),
+    );
+    m.insert("inbox".into(), nexus_types::Value::Str(inbox.to_string()));
+    m.insert(
+        "declared_capabilities".into(),
+        nexus_types::Value::List(
+            spec.declared_capabilities
+                .iter()
+                .cloned()
+                .map(nexus_types::Value::Str)
+                .collect(),
+        ),
+    );
+    nexus_types::Value::Map(m)
+}
+
+async fn update_actor_directory_status(
+    state: &nexus_state::Backend,
+    directory: &Path,
+    status: ProcessStatus,
+) -> Result<(), BootstrapError> {
+    let Some(mut value) = state.read(directory).await? else {
+        return Err(BootstrapError::ActorAdmission {
+            actor: directory.to_string(),
+            message: "actor directory entry is missing".into(),
+        });
+    };
+    match &mut value {
+        nexus_types::Value::Map(map) => {
+            map.insert(
+                "status".into(),
+                nexus_types::Value::Str(process_status_label(status).into()),
+            );
+            state.write_set(directory, value).await?;
+            Ok(())
+        }
+        _ => Err(BootstrapError::ActorAdmission {
+            actor: directory.to_string(),
+            message: "actor directory entry must be a map".into(),
+        }),
+    }
+}
+
+fn process_status_label(status: ProcessStatus) -> &'static str {
+    match status {
+        ProcessStatus::Created => "created",
+        ProcessStatus::Running => "running",
+        ProcessStatus::Waiting => "waiting",
+        ProcessStatus::Suspended => "suspended",
+        ProcessStatus::Finalizing => "finalizing",
+        ProcessStatus::Completed => "completed",
+        ProcessStatus::Failed => "failed",
+        ProcessStatus::Cancelled => "cancelled",
+    }
 }
 
 fn method_bitmap_for_verb(
@@ -877,6 +1648,7 @@ fn build_methods(
             supports: spec.supports,
             cost,
             batchable: spec.batchable,
+            finalize_allowed: spec.finalize_allowed,
         })
         .collect()
 }
@@ -891,7 +1663,7 @@ mod tests {
     use super::*;
     use crate::driver::EchoDriver;
     use anyhow::{Context, bail, ensure};
-    use nexus_graph::{DoNode, OperationTemplate};
+    use nexus_graph::{ActorSpec, DoNode, OperationTemplate, StepRef};
     use nexus_types::{OutputMode, Value};
     use std::sync::Arc;
 
@@ -902,6 +1674,652 @@ mod tests {
             Ok(_) => bail!("expected bootstrap error"),
             Err(err) => Ok(err),
         }
+    }
+
+    async fn wait_actor_status(
+        boot: &Bootstrap,
+        directory: &Path,
+        status: &str,
+    ) -> anyhow::Result<Value> {
+        for _ in 0..100 {
+            if let Some(value) = boot.kernel.state.read(directory).await?
+                && value
+                    .as_map()
+                    .and_then(|map| map.get("status"))
+                    .and_then(Value::as_str)
+                    == Some(status)
+            {
+                return Ok(value);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        bail!("actor directory did not reach status {status}");
+    }
+
+    #[tokio::test]
+    async fn actor_spawn_runs_body_and_writes_directory() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let spec = ActorSpec {
+            name: "housekeeper".into(),
+            body: DoNode::pure(Value::Str("done".into())),
+            ..ActorSpec::default()
+        };
+        let actor = boot
+            .spawn_actor_under(boot.root, nexus_types::IdentityRef::ROOT, "root", &spec)
+            .await?;
+        let value = wait_actor_status(&boot, &actor.directory, "completed").await?;
+        let Value::Map(map) = value else {
+            bail!("actor directory entry must be a map");
+        };
+        ensure!(
+            map.get("status").and_then(Value::as_str) == Some("completed"),
+            "actor status was not completed: {map:?}"
+        );
+        ensure!(
+            map.get("path").and_then(Value::as_str)
+                == Some(format!("process://{}", actor.process.get()).as_str()),
+            "actor process path mismatch: {map:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_body_operation_opens_through_declared_capability() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let name = boot.register_effect(
+            "effect://echo/actor-body",
+            &[
+                MethodSpec::new("invoke", Purity::Effectful, MethodSpec::UNARY_ASYNC)
+                    .finalize_allowed(),
+            ],
+            Arc::new(EchoDriver),
+        )?;
+        let spec = ActorSpec {
+            name: "body_op".into(),
+            body: DoNode::op(OperationTemplate {
+                target: name.clone(),
+                method: "invoke".into(),
+                method_id: None,
+                output: OutputMode::Unary,
+                literal_input: Some(Value::Str("hello".into())),
+            }),
+            declared_capabilities: vec!["perform://effect/echo/actor-body".into()],
+            ..ActorSpec::default()
+        };
+
+        let actor = boot
+            .spawn_actor_under(boot.root, nexus_types::IdentityRef::ROOT, "root", &spec)
+            .await?;
+        wait_actor_status(&boot, &actor.directory, "completed").await?;
+        let facts = boot.kernel.facts.facts_of(actor.process)?;
+        ensure!(
+            facts.iter().any(|fact| fact.caller == actor.process),
+            "actor operation should record a fact"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_spawn_rejects_missing_step_binding() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let before = boot.kernel.processes.count();
+        let spec = ActorSpec {
+            name: "missing_step".into(),
+            body: DoNode::pure(Value::Null).and_then(StepRef::new(boot.root, "send")),
+            ..ActorSpec::default()
+        };
+        let err = expect_bootstrap_error(
+            boot.spawn_actor_under(boot.root, nexus_types::IdentityRef::ROOT, "root", &spec)
+                .await,
+        )?;
+        ensure!(
+            matches!(err, BootstrapError::MissingStepBinding { .. }),
+            "unexpected missing step error: {err:?}"
+        );
+        ensure!(
+            boot.kernel.processes.count() == before,
+            "missing step binding should not create a process"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_spawn_with_step_binding_runs_immediately() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let name = boot.register_effect(
+            "effect://echo/actor-bound-step",
+            &[
+                MethodSpec::new("invoke", Purity::Effectful, MethodSpec::UNARY_ASYNC)
+                    .finalize_allowed(),
+            ],
+            Arc::new(EchoDriver),
+        )?;
+        let spec = ActorSpec {
+            name: "bound_step".into(),
+            body: DoNode::pure(Value::Null).and_then(StepRef::new(boot.root, "send")),
+            declared_capabilities: vec!["perform://effect/echo/actor-bound-step".into()],
+            ..ActorSpec::default()
+        };
+        let step_target = name.clone();
+        let actor = boot
+            .spawn_actor_under_with_steps(
+                boot.root,
+                nexus_types::IdentityRef::ROOT,
+                "root",
+                &spec,
+                [ProcessStepBinding::new(
+                    "send",
+                    Arc::new(move |_, _| {
+                        DoNode::op(OperationTemplate {
+                            target: step_target.clone(),
+                            method: "invoke".into(),
+                            method_id: None,
+                            output: OutputMode::Unary,
+                            literal_input: Some(Value::Str("from-bound-step".into())),
+                        })
+                    }),
+                )],
+            )
+            .await?;
+        wait_actor_status(&boot, &actor.directory, "completed").await?;
+        let facts = boot.kernel.facts.facts_of(actor.process)?;
+        ensure!(
+            facts.iter().any(|fact| fact.caller == actor.process),
+            "bound step operation should record a fact"
+        );
+        ensure!(
+            boot.kernel.steps.get(actor.process, "send").is_none(),
+            "process-local step should be removed after actor completion"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_completion_runs_finalizers_before_step_cleanup() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let name = boot.register_effect(
+            "effect://echo/actor-completion-finalizer",
+            &[
+                MethodSpec::new("invoke", Purity::Effectful, MethodSpec::UNARY_ASYNC)
+                    .finalize_allowed(),
+            ],
+            Arc::new(EchoDriver),
+        )?;
+        let resource_id = boot
+            .kernel
+            .registry
+            .resolve_resource(&name)
+            .context("registered completion finalizer effect did not resolve")?;
+        let spec = ActorSpec {
+            name: "completion_finalizer".into(),
+            body: DoNode::pure(Value::Null),
+            declared_capabilities: vec!["perform://effect/echo/actor-completion-finalizer".into()],
+            finalizers: vec![
+                DoNode::pure(Value::Null).and_then(StepRef::new(boot.root, "cleanup")),
+            ],
+            ..ActorSpec::default()
+        };
+        let step_target = name.clone();
+        let actor = boot
+            .spawn_actor_under_with_steps(
+                boot.root,
+                nexus_types::IdentityRef::ROOT,
+                "root",
+                &spec,
+                [ProcessStepBinding::new(
+                    "cleanup",
+                    Arc::new(move |_, _| {
+                        DoNode::op(OperationTemplate {
+                            target: step_target.clone(),
+                            method: "invoke".into(),
+                            method_id: None,
+                            output: OutputMode::Unary,
+                            literal_input: Some(Value::Str("cleanup".into())),
+                        })
+                    }),
+                )],
+            )
+            .await?;
+
+        wait_actor_status(&boot, &actor.directory, "completed").await?;
+        let facts = boot.kernel.facts.facts_of(actor.process)?;
+        ensure!(
+            facts.iter().any(|fact| fact.resource == resource_id),
+            "completion finalizer operation should record a fact"
+        );
+        ensure!(
+            boot.kernel.steps.get(actor.process, "cleanup").is_none(),
+            "finalizer step should be removed after actor completion"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalizer_failure_is_recorded_in_lifecycle_fact() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let spec = ActorSpec {
+            name: "failing_finalizer".into(),
+            body: DoNode::pure(Value::Null),
+            finalizers: vec![DoNode::Fail(nexus_types::Failure::InvalidInput {
+                reason: "cleanup failed".into(),
+            })],
+            ..ActorSpec::default()
+        };
+        let actor = boot
+            .spawn_actor_under(boot.root, nexus_types::IdentityRef::ROOT, "root", &spec)
+            .await?;
+
+        wait_actor_status(&boot, &actor.directory, "completed").await?;
+        let facts = boot.kernel.facts.facts_of(actor.process)?;
+        let finalized = facts
+            .iter()
+            .find(|fact| fact.id.position == FINALIZED_NODE)
+            .context("missing ProcessFinalized fact")?;
+        let nexus_types::OutcomeRef::Inline(Value::Map(map)) = &finalized.outcome_ref else {
+            bail!("ProcessFinalized outcome must be a map");
+        };
+        ensure!(
+            map.get("finalizer_failure_count").and_then(Value::as_int) == Some(1),
+            "finalizer failure count was not recorded: {map:?}"
+        );
+        let Some(Value::List(failures)) = map.get("finalizer_failures") else {
+            bail!("finalizer failures list missing");
+        };
+        ensure!(failures.len() == 1, "unexpected failures: {failures:?}");
+        ensure!(
+            failures
+                .first()
+                .and_then(Value::as_map)
+                .and_then(|item| item.get("failure"))
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("cleanup failed")),
+            "finalizer failure detail was not recorded: {failures:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_does_not_overwrite_terminal_actor_status() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let spec = ActorSpec {
+            name: "failed_actor".into(),
+            body: DoNode::Fail(nexus_types::Failure::InvalidInput {
+                reason: "body failed".into(),
+            }),
+            ..ActorSpec::default()
+        };
+        let actor = boot
+            .spawn_actor_under(boot.root, nexus_types::IdentityRef::ROOT, "root", &spec)
+            .await?;
+
+        wait_actor_status(&boot, &actor.directory, "failed").await?;
+        boot.finalize_process(actor.process).await?;
+        let value = boot
+            .kernel
+            .state
+            .read(&actor.directory)
+            .await?
+            .context("missing actor directory entry")?;
+        ensure!(
+            value
+                .as_map()
+                .and_then(|map| map.get("status"))
+                .and_then(Value::as_str)
+                == Some("failed"),
+            "terminal actor status was overwritten: {value:?}"
+        );
+        let facts = boot.kernel.facts.facts_of(actor.process)?;
+        let finalized = facts
+            .iter()
+            .find(|fact| fact.id.position == FINALIZED_NODE)
+            .context("missing ProcessFinalized fact")?;
+        let nexus_types::OutcomeRef::Inline(Value::Map(map)) = &finalized.outcome_ref else {
+            bail!("ProcessFinalized outcome must be a map");
+        };
+        ensure!(
+            map.get("status").and_then(Value::as_str) == Some("failed"),
+            "ProcessFinalized status was overwritten: {map:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_spawn_rejects_duplicate_step_bindings() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let before = boot.kernel.processes.count();
+        let spec = ActorSpec {
+            name: "duplicate_steps".into(),
+            body: DoNode::pure(Value::Null),
+            ..ActorSpec::default()
+        };
+        let step: StepFn = Arc::new(|v, _| DoNode::pure(v));
+        let err = expect_bootstrap_error(
+            boot.spawn_actor_under_with_steps(
+                boot.root,
+                nexus_types::IdentityRef::ROOT,
+                "root",
+                &spec,
+                [
+                    ProcessStepBinding::new("same", step.clone()),
+                    ProcessStepBinding::new("same", step),
+                ],
+            )
+            .await,
+        )?;
+        ensure!(
+            matches!(err, BootstrapError::DuplicateStepBinding { .. }),
+            "unexpected duplicate binding error: {err:?}"
+        );
+        ensure!(
+            boot.kernel.processes.count() == before,
+            "duplicate step bindings should not create a process"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_spawn_rejects_undeclared_capability() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let before = boot.kernel.processes.count();
+        let spec = ActorSpec {
+            name: "bad_actor".into(),
+            body: DoNode::op(OperationTemplate {
+                target: nexus_types::ResourceName::new(nexus_types::Path::parse(
+                    "effect://fetch/get",
+                )?),
+                method: "invoke".into(),
+                method_id: None,
+                output: OutputMode::Unary,
+                literal_input: Some(Value::Null),
+            }),
+            ..ActorSpec::default()
+        };
+        let err = expect_bootstrap_error(
+            boot.spawn_actor_under(boot.root, nexus_types::IdentityRef::ROOT, "root", &spec)
+                .await,
+        )?;
+        ensure!(
+            matches!(err, BootstrapError::ActorLint { .. }),
+            "unexpected error: {err:?}"
+        );
+        ensure!(
+            boot.kernel.processes.count() == before,
+            "rejected actor should not create a process"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_spawn_directory_conflict_does_not_insert_process() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let spec = ActorSpec {
+            name: "singleton".into(),
+            body: DoNode::pure(Value::Null),
+            ..ActorSpec::default()
+        };
+        let first = boot
+            .spawn_actor_under(boot.root, nexus_types::IdentityRef::ROOT, "root", &spec)
+            .await?;
+        let before_second = boot.kernel.processes.count();
+        let err = expect_bootstrap_error(
+            boot.spawn_actor_under(boot.root, nexus_types::IdentityRef::ROOT, "root", &spec)
+                .await,
+        )?;
+        ensure!(
+            matches!(err, BootstrapError::State(_)),
+            "unexpected error: {err:?}"
+        );
+        ensure!(
+            boot.kernel.processes.count() == before_second,
+            "conflicting actor should not create a process"
+        );
+        wait_actor_status(&boot, &first.directory, "completed").await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_actor_aborts_task_and_updates_directory() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let signal = Path::parse("state://signals/never")?;
+        let spec = ActorSpec {
+            name: "waiter".into(),
+            body: DoNode::wait_signal(signal),
+            ..ActorSpec::default()
+        };
+        let actor = boot
+            .spawn_actor_under(boot.root, nexus_types::IdentityRef::ROOT, "root", &spec)
+            .await?;
+        boot.finalize_process(actor.process).await?;
+        let value = boot
+            .kernel
+            .state
+            .read(&actor.directory)
+            .await?
+            .context("missing actor directory entry")?;
+        ensure!(
+            value
+                .as_map()
+                .and_then(|map| map.get("status"))
+                .and_then(Value::as_str)
+                == Some("completed"),
+            "actor directory status was not completed: {value:?}"
+        );
+        ensure!(
+            !boot.kernel.processes.abort_task(actor.process),
+            "actor task should have been removed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_finalizer_operation_opens_while_finalizing() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let name = boot.register_effect(
+            "effect://echo/actor-finalizer",
+            &[
+                MethodSpec::new("invoke", Purity::Effectful, MethodSpec::UNARY_ASYNC)
+                    .finalize_allowed(),
+            ],
+            Arc::new(EchoDriver),
+        )?;
+        let resource_id = boot
+            .kernel
+            .registry
+            .resolve_resource(&name)
+            .context("registered finalizer effect did not resolve")?;
+        let spec = ActorSpec {
+            name: "finalizer_op".into(),
+            body: DoNode::wait_signal(Path::parse("state://signals/finalizer-never")?),
+            declared_capabilities: vec!["perform://effect/echo/actor-finalizer".into()],
+            finalizers: vec![DoNode::op(OperationTemplate {
+                target: name,
+                method: "invoke".into(),
+                method_id: None,
+                output: OutputMode::Unary,
+                literal_input: Some(Value::Str("cleanup".into())),
+            })],
+            ..ActorSpec::default()
+        };
+        let actor = boot
+            .spawn_actor_under(boot.root, nexus_types::IdentityRef::ROOT, "root", &spec)
+            .await?;
+
+        boot.finalize_process(actor.process).await?;
+        let facts = boot.kernel.facts.facts_of(actor.process)?;
+        ensure!(
+            facts.iter().any(|fact| fact.resource == resource_id),
+            "finalizer operation should record a fact for the effect resource"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_finalizer_rejects_method_without_finalize_allowance() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let name = boot.register_effect(
+            "effect://echo/not-finalize-allowed",
+            &[MethodSpec::new(
+                "invoke",
+                Purity::Effectful,
+                MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(EchoDriver),
+        )?;
+        let resource_id = boot
+            .kernel
+            .registry
+            .resolve_resource(&name)
+            .context("registered finalizer denial effect did not resolve")?;
+        let spec = ActorSpec {
+            name: "finalizer_denied".into(),
+            body: DoNode::pure(Value::Null),
+            declared_capabilities: vec!["perform://effect/echo/not-finalize-allowed".into()],
+            finalizers: vec![DoNode::op(OperationTemplate {
+                target: name,
+                method: "invoke".into(),
+                method_id: None,
+                output: OutputMode::Unary,
+                literal_input: Some(Value::Str("cleanup".into())),
+            })],
+            ..ActorSpec::default()
+        };
+        let actor = boot
+            .spawn_actor_under(boot.root, nexus_types::IdentityRef::ROOT, "root", &spec)
+            .await?;
+
+        wait_actor_status(&boot, &actor.directory, "completed").await?;
+        let facts = boot.kernel.facts.facts_of(actor.process)?;
+        ensure!(
+            !facts.iter().any(|fact| fact.resource == resource_id),
+            "finalizer-only denied operation should not dispatch"
+        );
+        let finalized = facts
+            .iter()
+            .find(|fact| fact.id.position == FINALIZED_NODE)
+            .context("missing ProcessFinalized fact")?;
+        let nexus_types::OutcomeRef::Inline(Value::Map(map)) = &finalized.outcome_ref else {
+            bail!("ProcessFinalized outcome must be a map");
+        };
+        ensure!(
+            map.get("finalizer_failure_count").and_then(Value::as_int) == Some(1),
+            "denied finalizer failure was not recorded: {map:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalizer_mode_allows_only_current_process_state_subtree() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        boot.register_subtree_resource(
+            "state",
+            InterfaceFamily::Value,
+            &[MethodSpec::new(
+                "write",
+                Purity::Idempotent,
+                MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(EchoDriver),
+        )?;
+        let ex = boot.kernel.executor_for(boot.root).with_finalizer_mode();
+        let local_target = ResourceName::new(Path::parse(&format!(
+            "state://process/{}/cleanup",
+            boot.root.get()
+        ))?);
+        let local = ex
+            .eval(&DoNode::op(OperationTemplate {
+                target: local_target,
+                method: "write".into(),
+                method_id: None,
+                output: OutputMode::Unary,
+                literal_input: Some(Value::Str("cleanup".into())),
+            }))
+            .await;
+        ensure!(
+            matches!(local, nexus_types::Outcome::Done(_)),
+            "current process state write should be allowed in finalizer mode: {local:?}"
+        );
+
+        let sibling_target = ResourceName::new(Path::parse("state://process/999999/cleanup")?);
+        let sibling = ex
+            .eval(&DoNode::op(OperationTemplate {
+                target: sibling_target,
+                method: "write".into(),
+                method_id: None,
+                output: OutputMode::Unary,
+                literal_input: Some(Value::Str("cleanup".into())),
+            }))
+            .await;
+        ensure!(
+            matches!(
+                sibling,
+                nexus_types::Outcome::Fail(nexus_types::Failure::PolicyViolation { .. })
+            ),
+            "other process state write should be denied in finalizer mode: {sibling:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_spawn_rejects_undeclared_finalizer_capability() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let before = boot.kernel.processes.count();
+        let spec = ActorSpec {
+            name: "bad_finalizer".into(),
+            finalizers: vec![DoNode::op(OperationTemplate {
+                target: nexus_types::ResourceName::new(nexus_types::Path::parse(
+                    "effect://fetch/get",
+                )?),
+                method: "invoke".into(),
+                method_id: None,
+                output: OutputMode::Unary,
+                literal_input: Some(Value::Null),
+            })],
+            ..ActorSpec::default()
+        };
+        let err = expect_bootstrap_error(
+            boot.spawn_actor_under(boot.root, nexus_types::IdentityRef::ROOT, "root", &spec)
+                .await,
+        )?;
+        ensure!(
+            matches!(err, BootstrapError::ActorLint { .. }),
+            "unexpected error: {err:?}"
+        );
+        ensure!(
+            boot.kernel.processes.count() == before,
+            "rejected actor should not create a process"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_rejects_missing_process() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let err = expect_bootstrap_error(boot.finalize_process(ProcessId::new(99_999)).await)?;
+        ensure!(
+            matches!(err, BootstrapError::NoSuchProcess { .. }),
+            "unexpected error: {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn open_for_rejects_missing_process() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let name = boot.register_effect(
+            "effect://echo/missing-process",
+            &[MethodSpec::new(
+                "invoke",
+                Purity::Pure,
+                MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(EchoDriver),
+        )?;
+        let err = boot.open_for(ProcessId::new(99_999), &name, "perform");
+        ensure!(
+            matches!(err, Err(OpenError::NoSuchProcess(_))),
+            "unexpected result: {err:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -981,6 +2399,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_output_mode_does_not_open_handle() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let name = boot.register_effect(
+            "effect://echo/unary-lazy",
+            &[MethodSpec::new(
+                "invoke",
+                Purity::Pure,
+                MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(EchoDriver),
+        )?;
+        let before = boot.kernel.handles.read().len();
+        let ex = boot.kernel.executor_for(boot.root);
+        let prog = DoNode::Op(OperationTemplate {
+            target: name,
+            method: "invoke".into(),
+            method_id: None,
+            output: OutputMode::Stream,
+            literal_input: Some(Value::Str("hello".into())),
+        });
+        match ex.eval(&prog).await {
+            nexus_types::Outcome::Fail(nexus_types::Failure::InvalidInput { reason }) => {
+                ensure!(
+                    reason.contains("does not support output mode"),
+                    "unexpected failure reason: {reason}"
+                );
+            }
+            other => bail!("expected unsupported stream request, got {other:?}"),
+        }
+        ensure!(
+            boot.kernel.handles.read().len() == before,
+            "invalid output mode should not open a handle"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn budget_exhaustion_denies_costly_op_before_effect() -> anyhow::Result<()> {
         // A process with a tiny daily budget running a costed effect is denied
         // with BudgetExhausted because the reservation fires before dispatch.
@@ -1000,12 +2455,15 @@ mod tests {
             },
         )?;
         // Root's daily budget is only 500_000 micro-USD — below one call.
-        boot.kernel.processes.set_budget_spec(
-            boot.root,
-            nexus_types::BudgetSpec {
-                daily_micro_usd: Some(500_000),
-                ..Default::default()
-            },
+        ensure!(
+            boot.kernel.processes.set_budget_spec(
+                boot.root,
+                nexus_types::BudgetSpec {
+                    daily_micro_usd: Some(500_000),
+                    ..Default::default()
+                },
+            ),
+            "root process missing while setting test budget"
         );
         let handle = boot.open_for(boot.root, &name, "perform")?;
         let ex = boot.kernel.executor_for(boot.root);
@@ -1043,12 +2501,15 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        boot.kernel.processes.set_budget_spec(
-            boot.root,
-            nexus_types::BudgetSpec {
-                daily_micro_usd: Some(250),
-                ..Default::default()
-            },
+        ensure!(
+            boot.kernel.processes.set_budget_spec(
+                boot.root,
+                nexus_types::BudgetSpec {
+                    daily_micro_usd: Some(250),
+                    ..Default::default()
+                },
+            ),
+            "root process missing while setting test budget"
         );
         let handle = boot.open_for(boot.root, &name, "perform")?;
         let ex = boot.kernel.executor_for(boot.root);
@@ -1113,12 +2574,15 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        boot.kernel.processes.set_budget_spec(
-            boot.root,
-            nexus_types::BudgetSpec {
-                daily_micro_usd: Some(1_000_000),
-                ..Default::default()
-            },
+        ensure!(
+            boot.kernel.processes.set_budget_spec(
+                boot.root,
+                nexus_types::BudgetSpec {
+                    daily_micro_usd: Some(1_000_000),
+                    ..Default::default()
+                },
+            ),
+            "root process missing while setting test budget"
         );
         let handle = boot.open_for(boot.root, &name, "perform")?;
         let ex = boot.kernel.executor_for(boot.root);
@@ -1169,7 +2633,7 @@ mod tests {
         let ex = boot.kernel.executor_for(boot.root);
         ex.bind_handle(name.clone(), handle);
         ex.steps
-            .install(boot.root, "echo_back", |v, _| DoNode::pure(v));
+            .install(boot.root, "echo_back", |v, _| DoNode::pure(v))?;
         let prog = DoNode::Op(OperationTemplate {
             target: name,
             method: "invoke".into(),
@@ -1231,6 +2695,39 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn finalize_preserves_cancelled_request_status() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let child = boot.spawn_request_process_under_with_request_grants(
+            boot.root,
+            nexus_types::IdentityRef::ROOT,
+            &[],
+        )?;
+        ensure!(
+            boot.cancel_process(child)?,
+            "request process should be newly cancelled"
+        );
+
+        boot.finalize_process(child).await?;
+        ensure!(
+            boot.kernel.processes.status(child) == Some(nexus_types::ProcessStatus::Cancelled),
+            "finalize should preserve cancelled status"
+        );
+        let facts = boot.kernel.facts.facts_of(child)?;
+        let finalized = facts
+            .iter()
+            .find(|fact| fact.id.position == FINALIZED_NODE)
+            .context("missing ProcessFinalized fact")?;
+        let nexus_types::OutcomeRef::Inline(Value::Map(map)) = &finalized.outcome_ref else {
+            bail!("ProcessFinalized outcome must be a map");
+        };
+        ensure!(
+            map.get("status").and_then(Value::as_str) == Some("cancelled"),
+            "ProcessFinalized status should remain cancelled: {map:?}"
+        );
+        Ok(())
+    }
+
     struct FailingFinalizeFactStore;
 
     impl crate::fact::FactStore for FailingFinalizeFactStore {
@@ -1262,6 +2759,55 @@ mod tests {
         }
     }
 
+    struct FailOnceCompleteFactStore {
+        inner: crate::fact::InMemoryFactStore,
+        fail_next_complete: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailOnceCompleteFactStore {
+        fn new() -> Self {
+            Self {
+                inner: crate::fact::InMemoryFactStore::new(),
+                fail_next_complete: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl crate::fact::FactStore for FailOnceCompleteFactStore {
+        fn append(&self, fact: Fact) -> Result<u64, crate::fact::FactError> {
+            self.inner.append(fact)
+        }
+
+        fn complete(&self, fact: Fact) -> Result<(), crate::fact::FactError> {
+            if self
+                .fail_next_complete
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::fact::FactError("simulated complete failure".into()));
+            }
+            self.inner.complete(fact)
+        }
+
+        fn sync(&self) -> Result<(), crate::fact::FactError> {
+            self.inner.sync()
+        }
+
+        fn facts_of(
+            &self,
+            process: nexus_types::ProcessId,
+        ) -> Result<Vec<Fact>, crate::fact::FactError> {
+            self.inner.facts_of(process)
+        }
+
+        fn all_facts(&self) -> Result<Vec<Fact>, crate::fact::FactError> {
+            self.inner.all_facts()
+        }
+
+        fn cursor(&self) -> u64 {
+            self.inner.cursor()
+        }
+    }
+
     #[tokio::test]
     async fn finalize_fact_failure_keeps_process_finalizing() -> anyhow::Result<()> {
         let facts = crate::fact::FactSink::new(Arc::new(FailingFinalizeFactStore));
@@ -1281,6 +2827,48 @@ mod tests {
         ensure!(
             boot.kernel.processes.status(child) == Some(nexus_types::ProcessStatus::Finalizing),
             "a terminal status requires the authoritative finalization Fact"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalize_can_retry_after_fact_failure() -> anyhow::Result<()> {
+        let facts = crate::fact::FactSink::new(Arc::new(FailOnceCompleteFactStore::new()));
+        let state: nexus_state::Backend = Arc::new(nexus_state::InMemoryBackend::new());
+        let boot = Bootstrap::from_kernel(crate::Kernel::with_backends(state, facts));
+        let child = boot.spawn_request_process_under_with_request_grants(
+            boot.root,
+            nexus_types::IdentityRef::ROOT,
+            &[],
+        )?;
+
+        let err = expect_bootstrap_error(boot.finalize_process(child).await)?;
+        ensure!(
+            matches!(err, BootstrapError::Fact(_)),
+            "unexpected first finalize error: {err:?}"
+        );
+        ensure!(
+            boot.kernel.processes.status(child) == Some(nexus_types::ProcessStatus::Finalizing),
+            "failed finalize should leave process retryable"
+        );
+
+        boot.finalize_process(child).await?;
+        ensure!(
+            boot.kernel.processes.status(child) == Some(nexus_types::ProcessStatus::Completed),
+            "retry should complete process finalization"
+        );
+        ensure!(
+            boot.kernel
+                .state
+                .read(&finalized_marker_path(child)?)
+                .await?
+                .is_some(),
+            "retry should write the finalized marker"
+        );
+        let facts = boot.kernel.facts.facts_of(child)?;
+        ensure!(
+            facts.iter().any(|fact| fact.id.position == FINALIZED_NODE),
+            "retry should record the ProcessFinalized fact"
         );
         Ok(())
     }
@@ -1502,6 +3090,95 @@ mod tests {
     }
 
     #[test]
+    fn request_grant_derivation_preserves_parent_limits() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let anchor = boot.kernel.processes.fresh_id();
+        let mut entry = ProcessEntry::new(anchor, Some(boot.root), nexus_types::IdentityRef::ROOT);
+        entry.status = ProcessStatus::Running;
+        boot.kernel.processes.insert(entry);
+        let expires = Expiry::At(crate::executor::now_millis() + 60_000);
+        boot.kernel.registry.register_grant(Grant {
+            id: boot.kernel.registry.next_grant_id(),
+            holder: anchor,
+            selector: ResourceSelector::parse("perform://effect/echo/**@tenant=acme")?,
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            constraints: ConstraintSet {
+                predicates: vec![nexus_types::Predicate::parse("account=alice")?],
+            },
+            expires,
+        });
+
+        let child = boot.spawn_request_process_under_with_request_grants(
+            anchor,
+            nexus_types::IdentityRef::ROOT,
+            &[RequestGrantTemplate {
+                literal: "perform://effect/echo/say@purpose=test",
+                methods: MethodBitmap::method(0),
+            }],
+        )?;
+        let grants = boot.kernel.processes.attached_grants(child);
+        let grant = grants.first().context("missing derived grant")?;
+        ensure!(grant.expires == expires, "grant expiry was not preserved");
+        ensure!(
+            grant.selector.pattern.predicate.is_none(),
+            "selector predicate should be normalized into constraints"
+        );
+        ensure!(
+            grant.constraints.predicates.len() == 3,
+            "parent/request predicates were not all retained: {:?}",
+            grant.constraints.predicates
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_grant_derivation_uses_attached_anchor_grants() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let anchor = boot.spawn_request_process_under_with_request_grants(
+            boot.root,
+            nexus_types::IdentityRef::ROOT,
+            &[RequestGrantTemplate {
+                literal: "perform://effect/echo/**",
+                methods: MethodBitmap::method(0),
+            }],
+        )?;
+
+        let child = boot.spawn_request_process_under_with_request_grants(
+            anchor,
+            nexus_types::IdentityRef::ROOT,
+            &[RequestGrantTemplate {
+                literal: "perform://effect/echo/say",
+                methods: MethodBitmap::method(0),
+            }],
+        )?;
+        ensure!(
+            boot.kernel.processes.attached_grants(child).len() == 1,
+            "child should derive from anchor's attached grant"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_process_rejects_missing_anchor() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let before = boot.kernel.processes.all_ids().len();
+        let err = expect_bootstrap_error(boot.spawn_request_process_under_with_request_grants(
+            ProcessId::new(99_999),
+            nexus_types::IdentityRef::ROOT,
+            &[],
+        ))?;
+        ensure!(
+            matches!(err, BootstrapError::NoSuchProcess { .. }),
+            "unexpected missing-anchor error: {err:?}"
+        );
+        ensure!(
+            boot.kernel.processes.all_ids().len() == before,
+            "missing anchor should not create a child process"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn compiled_request_grant_template_uses_anchor_backstop() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
         let anchor = boot.kernel.processes.fresh_id();
@@ -1591,7 +3268,7 @@ mod tests {
         let ex1 = boot.kernel.executor_for(boot.root);
         ex1.bind_handle(name.clone(), handle);
         ex1.steps
-            .install(boot.root, "use_it", |v, _| DoNode::pure(v));
+            .install(boot.root, "use_it", |v, _| DoNode::pure(v))?;
         let first = ex1.eval(&prog).await;
         ensure!(
             first == nexus_types::Outcome::Done(Value::Int(7)),
@@ -1609,8 +3286,6 @@ mod tests {
         let handle2 = boot.open_for(boot.root, &name, "perform")?;
         let ex2 = boot.kernel.executor_for(boot.root).with_replay(replay);
         ex2.bind_handle(name.clone(), handle2);
-        ex2.steps
-            .install(boot.root, "use_it", |v, _| DoNode::pure(v));
         let out = ex2.eval(&prog).await;
 
         ensure!(

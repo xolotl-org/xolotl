@@ -198,6 +198,9 @@ pub enum ExternalAdmissionError {
     /// Provider effect path could not be parsed.
     #[error("provider effect path is malformed: {0}")]
     MalformedEffectPath(String),
+    /// Provider effect path was not a concrete effect resource.
+    #[error("provider effect path must be a concrete effect:// path: {0}")]
+    BadEffectPath(String),
     /// Provider effect path escaped the declared namespace.
     #[error("provider effect {effect} escapes namespace {namespace}")]
     NamespaceEscape {
@@ -253,6 +256,15 @@ impl ExternalProjectionDef {
                     let effect = Path::parse(&cap.effect_path).map_err(|_| {
                         ExternalAdmissionError::MalformedEffectPath(cap.effect_path.clone())
                     })?;
+                    let concrete = effect
+                        .segments()
+                        .iter()
+                        .all(|segment| !matches!(segment.as_str(), "*" | "**"));
+                    if effect.scheme() != "effect" || effect.segments().is_empty() || !concrete {
+                        return Err(ExternalAdmissionError::BadEffectPath(
+                            cap.effect_path.clone(),
+                        ));
+                    }
                     if !effects.insert(effect.clone()) {
                         return Err(ExternalAdmissionError::DuplicateProviderEffect(
                             cap.effect_path.clone(),
@@ -1191,6 +1203,23 @@ mod tests {
             ),
             "sibling namespace escape was accepted"
         );
+
+        let mut wildcard_effect = valid.clone();
+        wildcard_effect.provides[0].effect_path = "effect://external-provider/acme/*".into();
+        check_eq(
+            wildcard_effect.validate_admission(
+                "acme",
+                TrustLevel::Sandboxed,
+                &Transport::Stdio {
+                    command: Some("acme-plugin".into()),
+                    args: vec![],
+                },
+            ),
+            Err(ExternalAdmissionError::BadEffectPath(
+                "effect://external-provider/acme/*".into(),
+            )),
+            "wildcard provider effect",
+        )?;
 
         let mut bad_namespace = valid.clone();
         bad_namespace.namespace =

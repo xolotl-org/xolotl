@@ -49,7 +49,8 @@ use nexus_kernel::driver::{DriverDescriptor, DriverError, RemoteEndpoint, Remote
 use nexus_kernel::{EchoDriver, Registry, ResolveError};
 use nexus_sdk::{Backend, Bootstrap, FactSink, Kernel};
 use nexus_standard::{
-    IN_PROCESS_PROJECTION_CONFIG_PREFIX, PairingDisplayEdge, StandardConfig,
+    IN_PROCESS_PROJECTION_CONFIG_PREFIX, InProcessProjectionInstallEntry,
+    InProcessProjectionInstalled, InstallError, PairingDisplayEdge, StandardConfig,
     install_declared_in_process_projections, install_in_process_projection_value, install_standard,
 };
 use nexus_state::StateEvent;
@@ -75,9 +76,10 @@ use nexus_types::{
 };
 #[cfg(feature = "external-gateway")]
 use nexus_types::{IdentityRef, ResourceId};
-use nexus_types::{Path, Value};
+use nexus_types::{InProcessProjectionPhase, InProcessProjectionStatus, Path, Value};
 #[cfg(feature = "external-gateway")]
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 #[cfg(feature = "external-gateway")]
 use std::collections::HashMap;
 #[cfg(feature = "external-gateway")]
@@ -238,11 +240,15 @@ async fn serve() -> Result<()> {
     let pairing_display = PairingDisplayEdge::default();
     let standard_config = standard_config(pairing_display.clone());
     install_standard(&boot, &standard_config)?;
-    let declared_projections = install_declared_in_process_projections(&boot).await?;
-    if declared_projections > 0 {
+    let projection_report = install_declared_in_process_projections(&boot).await?;
+    let declared_projections = projection_report.installed_count();
+    let rejected_projections = projection_report.rejected_count();
+    reconcile_in_process_projection_report_status(&boot, projection_report.entries).await?;
+    if declared_projections > 0 || rejected_projections > 0 {
         tracing::info!(
             projections = declared_projections,
-            "in-process projection declarations installed"
+            rejected = rejected_projections,
+            "in-process projection declarations reconciled"
         );
     }
     tracing::info!(
@@ -355,7 +361,15 @@ async fn start_in_process_projection_reconciler(
         loop {
             match events.recv().await {
                 Ok(StateEvent::Set { path, value, .. }) => {
-                    if let Err(error) = install_in_process_projection_value(&boot, &path, value) {
+                    let id = in_process_projection_declaration_id(&path);
+                    let result = install_in_process_projection_value(&boot, &path, value);
+                    if let Err(error) =
+                        write_in_process_projection_result_status(&boot, id.as_deref(), &result)
+                            .await
+                    {
+                        tracing::error!(path = %path, error = %error, "projection status write failed");
+                    }
+                    if let Err(error) = result {
                         tracing::error!(
                             path = %path,
                             error = %error,
@@ -370,6 +384,13 @@ async fn start_in_process_projection_reconciler(
                     );
                 }
                 Ok(StateEvent::Delete { path }) => {
+                    if let Err(error) = delete_in_process_projection_status(&boot, &path).await {
+                        tracing::error!(
+                            path = %path,
+                            error = %error,
+                            "projection delete status write failed"
+                        );
+                    }
                     tracing::error!(
                         path = %path,
                         "in-process projection declaration was deleted; live registry entries remain until restart"
@@ -380,11 +401,24 @@ async fn start_in_process_projection_reconciler(
                         skipped,
                         "in-process projection declaration watcher lagged; reconciling declarations"
                     );
-                    if let Err(error) = install_declared_in_process_projections(&boot).await {
-                        tracing::error!(
-                            error = %error,
-                            "in-process projection declaration reconcile failed"
-                        );
+                    match install_declared_in_process_projections(&boot).await {
+                        Ok(report) => {
+                            if let Err(error) =
+                                reconcile_in_process_projection_report_status(&boot, report.entries)
+                                    .await
+                            {
+                                tracing::error!(
+                                    error = %error,
+                                    "in-process projection status reconcile failed"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                error = %error,
+                                "in-process projection declaration reconcile failed"
+                            );
+                        }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -394,6 +428,213 @@ async fn start_in_process_projection_reconciler(
             }
         }
     }))
+}
+
+async fn reconcile_in_process_projection_report_status(
+    boot: &Bootstrap,
+    entries: Vec<InProcessProjectionInstallEntry>,
+) -> Result<()> {
+    let mut declared_ids = BTreeSet::new();
+    for entry in entries {
+        declared_ids.insert(entry.id.clone());
+        write_in_process_projection_entry_status(boot, entry).await?;
+    }
+    delete_stale_in_process_projection_statuses(boot, &declared_ids).await?;
+    Ok(())
+}
+
+async fn write_in_process_projection_entry_status(
+    boot: &Bootstrap,
+    entry: InProcessProjectionInstallEntry,
+) -> Result<()> {
+    let status = match entry.result {
+        Ok(installed) => active_projection_status(&installed),
+        Err(error) => rejected_projection_status(&entry.id, entry.desired.as_ref(), &error),
+    };
+    write_in_process_projection_status(boot, &status).await
+}
+
+async fn write_in_process_projection_result_status(
+    boot: &Bootstrap,
+    id: Option<&str>,
+    result: &Result<InProcessProjectionInstalled, InstallError>,
+) -> Result<()> {
+    let status = match result {
+        Ok(installed) => active_projection_status(installed),
+        Err(error) => {
+            let id = id
+                .ok_or_else(|| anyhow::anyhow!("invalid in-process projection declaration path"))?;
+            rejected_projection_status(id, None, error)
+        }
+    };
+    write_in_process_projection_status(boot, &status).await
+}
+
+async fn delete_in_process_projection_status(
+    boot: &Bootstrap,
+    declaration_path: &Path,
+) -> Result<()> {
+    let id = in_process_projection_declaration_id(declaration_path).ok_or_else(|| {
+        anyhow::anyhow!("invalid in-process projection declaration path {declaration_path}")
+    })?;
+    let path = in_process_projection_status_path(&id)?;
+    boot.kernel.state.write_delete(&path).await?;
+    Ok(())
+}
+
+async fn delete_stale_in_process_projection_statuses(
+    boot: &Bootstrap,
+    declared_ids: &BTreeSet<String>,
+) -> Result<()> {
+    let prefix = in_process_projection_status_prefix()?;
+    let statuses = boot.kernel.state.read_prefix(&prefix).await?;
+    for (path, _) in statuses {
+        let Some(id) = in_process_projection_status_path_id(&path) else {
+            continue;
+        };
+        if !declared_ids.contains(&id) {
+            boot.kernel.state.write_delete(&path).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn write_in_process_projection_status(
+    boot: &Bootstrap,
+    status: &InProcessProjectionStatus,
+) -> Result<()> {
+    let path = in_process_projection_status_path(&status.id)?;
+    let value = status.to_value()?;
+    boot.kernel.state.write_set(&path, value).await?;
+    Ok(())
+}
+
+fn active_projection_status(installed: &InProcessProjectionInstalled) -> InProcessProjectionStatus {
+    InProcessProjectionStatus {
+        id: installed.id.clone(),
+        phase: InProcessProjectionPhase::Active,
+        implementation: Some(installed.implementation.clone()),
+        role: Some(installed.role),
+        desired_version: Some(installed.version),
+        active_version: Some(installed.version),
+        error_code: None,
+        error_message: None,
+        updated_at: now_millis(),
+    }
+}
+
+fn rejected_projection_status(
+    id: &str,
+    desired: Option<&InProcessProjectionInstalled>,
+    error: &InstallError,
+) -> InProcessProjectionStatus {
+    let (phase, code) = projection_error_phase_code(error);
+    InProcessProjectionStatus {
+        id: id.to_string(),
+        phase,
+        implementation: projection_error_implementation(error)
+            .or_else(|| desired.map(|value| value.implementation.clone())),
+        role: projection_error_role(error).or_else(|| desired.map(|value| value.role)),
+        desired_version: desired.map(|value| value.version),
+        active_version: None,
+        error_code: Some(code.into()),
+        error_message: Some(error.to_string()),
+        updated_at: now_millis(),
+    }
+}
+
+fn projection_error_phase_code(error: &InstallError) -> (InProcessProjectionPhase, &'static str) {
+    match error {
+        InstallError::FeatureNotEnabled { .. } => (
+            InProcessProjectionPhase::FeatureDisabled,
+            "feature_not_enabled",
+        ),
+        InstallError::ImplementationUnavailable { .. } => (
+            InProcessProjectionPhase::Unsupported,
+            "implementation_unavailable",
+        ),
+        InstallError::RoleUnsupported { .. } => {
+            (InProcessProjectionPhase::Unsupported, "role_unsupported")
+        }
+        InstallError::Decode { .. } => (InProcessProjectionPhase::Rejected, "decode_failed"),
+        InstallError::Declaration { .. } => {
+            (InProcessProjectionPhase::Rejected, "declaration_rejected")
+        }
+        InstallError::InvalidConfig { .. } => {
+            (InProcessProjectionPhase::Rejected, "config_rejected")
+        }
+        InstallError::InvalidProvides { .. } => {
+            (InProcessProjectionPhase::Rejected, "provides_rejected")
+        }
+        InstallError::Bootstrap(_) => (InProcessProjectionPhase::Rejected, "bootstrap_failed"),
+        InstallError::MethodNotFound { .. } => {
+            (InProcessProjectionPhase::Rejected, "method_not_found")
+        }
+        InstallError::Path { .. } => (InProcessProjectionPhase::Rejected, "path_invalid"),
+        InstallError::State(_) => (InProcessProjectionPhase::Rejected, "state_failed"),
+        InstallError::Assembly { .. } => (InProcessProjectionPhase::Rejected, "assembly_failed"),
+    }
+}
+
+fn projection_error_implementation(error: &InstallError) -> Option<String> {
+    match error {
+        InstallError::ImplementationUnavailable { implementation }
+        | InstallError::FeatureNotEnabled { implementation, .. }
+        | InstallError::RoleUnsupported { implementation, .. }
+        | InstallError::InvalidConfig { implementation, .. }
+        | InstallError::InvalidProvides { implementation, .. } => Some(implementation.clone()),
+        _ => None,
+    }
+}
+
+fn projection_error_role(error: &InstallError) -> Option<nexus_types::Role> {
+    match error {
+        InstallError::RoleUnsupported { role, .. } => Some(*role),
+        _ => None,
+    }
+}
+
+fn in_process_projection_status_path(id: &str) -> Result<Path> {
+    Ok(in_process_projection_status_prefix()?.try_push(id)?)
+}
+
+fn in_process_projection_status_prefix() -> Result<Path> {
+    Ok(Path::try_new("state")?
+        .try_push("kernel")?
+        .try_push("projection-status")?
+        .try_push("in-process")?)
+}
+
+fn in_process_projection_declaration_id(path: &Path) -> Option<String> {
+    let segments = path.segments();
+    match segments {
+        [kernel, projections, in_process, id]
+            if path.scheme() == "state"
+                && path.cluster().is_none()
+                && kernel.as_str() == "kernel"
+                && projections.as_str() == "projections"
+                && in_process.as_str() == "in-process" =>
+        {
+            Some(id.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn in_process_projection_status_path_id(path: &Path) -> Option<String> {
+    let segments = path.segments();
+    match segments {
+        [kernel, projection_status, in_process, id]
+            if path.scheme() == "state"
+                && path.cluster().is_none()
+                && kernel.as_str() == "kernel"
+                && projection_status.as_str() == "projection-status"
+                && in_process.as_str() == "in-process" =>
+        {
+            Some(id.to_string())
+        }
+        _ => None,
+    }
 }
 
 fn write_bootstrap_credentials(username: &str, password: &str) -> std::io::Result<()> {
@@ -589,6 +830,7 @@ struct ProviderEndpointKey {
 struct ProviderBindingDeclaration {
     path: Path,
     purity: nexus_types::Purity,
+    finalize_allowed: bool,
     selector: ResourceSelector,
 }
 
@@ -2076,6 +2318,7 @@ fn validate_provider_projection_bindings(
         bindings.push(ProviderBindingDeclaration {
             path,
             purity: capability.purity,
+            finalize_allowed: capability.finalize_allowed,
             selector,
         });
     }
@@ -2130,6 +2373,7 @@ fn register_provider_binding(
             supports: OutputModeSet::UNARY | OutputModeSet::ASYNC_PROCESS,
             cost: CostModel::default(),
             batchable: false,
+            finalize_allowed: declaration.finalize_allowed,
         }],
         laws: Vec::new(),
     });
@@ -2552,6 +2796,58 @@ mod tests {
         install_standard(&boot, &StandardConfig::default())
             .map_err(|error| anyhow::anyhow!("installing standard providers: {error}"))?;
         assert!(boot.kernel.registry.resource_count() >= 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projection_status_reconcile_deletes_stale_entries() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        write_in_process_projection_status(
+            &boot,
+            &InProcessProjectionStatus {
+                id: "stale".into(),
+                phase: InProcessProjectionPhase::Active,
+                implementation: Some("standard.fetch".into()),
+                role: Some(nexus_types::Role::Provider),
+                desired_version: Some(1),
+                active_version: Some(1),
+                error_code: None,
+                error_message: None,
+                updated_at: 1,
+            },
+        )
+        .await?;
+
+        let installed = InProcessProjectionInstalled {
+            id: "fetch".into(),
+            implementation: "standard.fetch".into(),
+            role: nexus_types::Role::Provider,
+            version: 1,
+        };
+        reconcile_in_process_projection_report_status(
+            &boot,
+            vec![InProcessProjectionInstallEntry {
+                id: installed.id.clone(),
+                path: Path::parse("state://kernel/projections/in-process/fetch")?,
+                desired: Some(installed.clone()),
+                result: Ok(installed),
+            }],
+        )
+        .await?;
+
+        let stale_path = in_process_projection_status_path("stale")?;
+        assert!(boot.kernel.state.read(&stale_path).await?.is_none());
+        let active_path = in_process_projection_status_path("fetch")?;
+        let active = boot
+            .kernel
+            .state
+            .read(&active_path)
+            .await?
+            .context("active projection status missing")?;
+        let status: InProcessProjectionStatus =
+            serde_json::from_value(serde_json::to_value(active)?)?;
+        assert_eq!(status.phase, InProcessProjectionPhase::Active);
+        assert_eq!(status.id, "fetch");
         Ok(())
     }
 
@@ -4318,6 +4614,7 @@ mod tests {
         let declaration = ProviderBindingDeclaration {
             path: path.clone(),
             purity: nexus_types::Purity::Effectful,
+            finalize_allowed: true,
             selector: ResourceSelector::parse("perform://effect/external-provider/chat/search")?,
         };
 
@@ -4343,6 +4640,25 @@ mod tests {
             )
             .context("provider binding should exist")?;
         assert_eq!(binding.generation, 2);
+        let resource = registry
+            .resource(resource_id)
+            .context("provider resource descriptor should exist")?;
+        let iface_id = resource
+            .interfaces
+            .interfaces
+            .first()
+            .copied()
+            .context("provider resource should expose an interface")?;
+        let iface = registry
+            .interface(iface_id)
+            .context("provider interface should exist")?;
+        assert!(
+            iface
+                .methods
+                .first()
+                .is_some_and(|method| method.finalize_allowed),
+            "provider binding did not carry finalizer metadata"
+        );
 
         let stale = register_provider_binding(registry, &declaration, endpoint, 1);
         assert!(

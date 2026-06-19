@@ -31,6 +31,58 @@ pub struct InProcessProjectionDef {
     pub version: u64,
 }
 
+/// Reconcile status for an in-process projection declaration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InProcessProjectionStatus {
+    /// Declaration id used in the state path.
+    pub id: String,
+    /// Current reconcile phase.
+    pub phase: InProcessProjectionPhase,
+    /// Implementation requested by the desired declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementation: Option<String>,
+    /// Role requested by the desired declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
+    /// Version from the desired declaration, when one decoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_version: Option<u64>,
+    /// Version currently installed in the live registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_version: Option<u64>,
+    /// Stable error code for rejected declarations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Error detail safe for Console display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// Millis since Unix epoch when this status was written.
+    pub updated_at: i64,
+}
+
+/// Current reconcile phase for an in-process projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InProcessProjectionPhase {
+    /// Desired declaration is active in the live registry.
+    Active,
+    /// Desired declaration was rejected by admission or installer validation.
+    Rejected,
+    /// Desired declaration names an implementation not compiled into this host.
+    FeatureDisabled,
+    /// Desired declaration is well formed but not implemented by this host.
+    Unsupported,
+}
+
+impl InProcessProjectionStatus {
+    /// Convert this status to a Nexus value.
+    pub fn to_value(&self) -> Result<Value, serde_json::Error> {
+        let json = serde_json::to_value(self)?;
+        serde_json::from_value(json)
+    }
+}
+
 /// Admission failures for in-process projection declarations.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum InProcessProjectionConfigError {
@@ -142,7 +194,11 @@ impl InProcessProjectionDef {
             let effect = Path::parse(&capability.effect_path).map_err(|_| {
                 InProcessProjectionConfigError::MalformedEffectPath(capability.effect_path.clone())
             })?;
-            if effect.scheme() != "effect" || effect.segments().is_empty() {
+            let concrete = effect
+                .segments()
+                .iter()
+                .all(|segment| !matches!(segment.as_str(), "*" | "**"));
+            if effect.scheme() != "effect" || effect.segments().is_empty() || !concrete {
                 return Err(InProcessProjectionConfigError::BadEffectPath(
                     capability.effect_path.clone(),
                 ));
@@ -313,6 +369,21 @@ mod tests {
                 Err(InProcessProjectionConfigError::KernelEffectPath)
             ),
             "expected kernel effect rejection, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_wildcard_provider_effect_path() -> Result<()> {
+        let mut value = provider_def("bad");
+        value.provides[0].effect_path = "effect://fetch/*".into();
+        let result = value.validate_admission("bad");
+        ensure!(
+            matches!(
+                result,
+                Err(InProcessProjectionConfigError::BadEffectPath(_))
+            ),
+            "expected wildcard effect rejection, got {result:?}"
         );
         Ok(())
     }

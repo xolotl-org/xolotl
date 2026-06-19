@@ -200,7 +200,7 @@ Implemented action families include:
 | Console access | `access.user.*`, `access.role.*`, `access.session.*`, `access.session.current.logout` |
 | Runtime, audit, and lineage | `runtime.process.inspect`, `audit.facts.recent`, `lineage.trace.read`, `lineage.fact.read`, `health.summary` |
 | External programs and pairing | `external.manifest.*`, `external.installation.*`, `pairing.create`, `pairing.approve`, `pairing.deny`, `pairing.replace` |
-| In-process Provider/Source projection declarations | `projection.in_process.list`, `projection.in_process.read`, `projection.in_process.write_cas` |
+| In-process projection status | `projection.in_process.status.list`, `projection.in_process.status.read` |
 | Inference routing | `inference.backend.*`, `inference.model.*`, `inference.group.*`, `inference.routing.*` |
 
 The table lists executable action families. Action descriptors also carry
@@ -209,9 +209,12 @@ status are discoverable for coverage and authority explanation, and direct
 `Call` execution returns an error.
 
 Generic `config.*` actions reject runtime config paths that have dedicated
-action families. Use `access.*`, `external.*`, `projection.in_process.*`,
-`inference.*`, and `pairing.*` for those paths so validation, authorization,
-CAS, and audit stay tied to the declared resource type.
+action families. Use `access.*`, `external.*`, `inference.*`, and `pairing.*`
+for those paths so validation, authorization, CAS, and audit stay tied to the
+declared resource type. In-process Provider/Source projection declarations use
+`config.*` under `state://kernel/projections/in-process/<id>` and shared kernel
+config admission. Projection status is read-only through
+`projection.in_process.status.*`.
 External projections remain part of their external installation declaration and
 are managed through `external.installation.*`.
 

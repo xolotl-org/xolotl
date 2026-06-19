@@ -15,6 +15,10 @@ use thiserror::Error;
 /// Errors returned while compiling an open request into a handle.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum OpenError {
+    /// The caller tried to open a resource for a process not present in the
+    /// process table.
+    #[error("process {0} not found")]
+    NoSuchProcess(ProcessId),
     /// The process holds no grant whose selector matches the resource/path.
     #[error("no grant held by {process} matches resource {resource}")]
     NoMatchingGrant {
@@ -145,7 +149,7 @@ pub fn open_resource_with_attached(
 
     // Evaluate constraints that do not require per-operation input at open time.
     // The remaining residual policy is carried into the handle plan.
-    let constraints = grant.constraints.clone();
+    let constraints = effective_grant_constraints(&grant);
     let cache_key = OpenCacheKey::new(
         grant.id,
         req.resource,
@@ -276,6 +280,16 @@ fn compile_policy_snapshot(constraints: &ConstraintSet) -> PolicySnapshot {
     }
 }
 
+fn effective_grant_constraints(grant: &Grant) -> ConstraintSet {
+    let Some(predicate) = grant.selector.pattern.predicate.clone() else {
+        return grant.constraints.clone();
+    };
+    let mut predicates = Vec::with_capacity(grant.constraints.predicates.len() + 1);
+    predicates.push(predicate);
+    predicates.extend(grant.constraints.predicates.iter().cloned());
+    ConstraintSet { predicates }
+}
+
 /// Derive a child handle by attenuation: rights must be a subset and the
 /// requested derivation kind must be permitted by the parent's flags.
 pub fn derive_handle(
@@ -321,7 +335,7 @@ mod tests {
         Binding, EndpointId, Expiry, Grant, Interface, InterfaceFamily, InterfaceSet, Invoke,
         InvokeResult, Metadata, Method, MethodBitmap, ModalitySet, OutputModeSet, Path, Purity,
         ReplayClass, Resource, ResourceDescriptor, ResourceKind, ResourceName, ResourceSelector,
-        RightFlags, Rights, SchemaId,
+        RightFlags, Rights, SchemaId, Value,
     };
     use parking_lot::Mutex;
 
@@ -341,6 +355,7 @@ mod tests {
                 supports: OutputModeSet::UNARY,
                 cost: Default::default(),
                 batchable: false,
+                finalize_allowed: false,
             }],
             laws: Vec::new(),
         });
@@ -402,6 +417,7 @@ mod tests {
                 supports: OutputModeSet::UNARY | OutputModeSet::STREAM,
                 cost: Default::default(),
                 batchable: false,
+                finalize_allowed: false,
             }],
             laws: Vec::new(),
         });
@@ -464,6 +480,7 @@ mod tests {
                 supports: OutputModeSet::UNARY,
                 cost: Default::default(),
                 batchable: false,
+                finalize_allowed: false,
             }],
             laws: Vec::new(),
         });
@@ -566,6 +583,71 @@ mod tests {
         ensure!(
             h.driver_plan.supports(nexus_types::MethodId::new(100)),
             "driver plan should support method 100"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selector_predicate_becomes_residual_constraint() -> anyhow::Result<()> {
+        let reg = Registry::new();
+        let rid = setup_resource(&reg, "effect://x/post")?;
+        reg.register_grant(Grant {
+            id: reg.next_grant_id(),
+            holder: ProcessId::new(1),
+            selector: ResourceSelector::parse("perform://effect/x/post@tenant=acme")?,
+            rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
+            constraints: ConstraintSet::empty(),
+            expires: Expiry::Never,
+        });
+        let mut handles = HandleTable::new();
+        let id = open_resource(
+            &reg,
+            &mut handles,
+            OpenRequest {
+                process: ProcessId::new(1),
+                resource: rid,
+                verb: "perform".into(),
+                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+                acting: IdentityRef::ROOT,
+                requested_path: None,
+                now_millis: 0,
+            },
+        )
+        .context("open_resource failed")?;
+        let h = handles.get(id).context("opened handle did not resolve")?;
+        let FastPath::Conditional(snapshot) = &h.fast_path else {
+            bail!("selector predicate should produce a conditional handle");
+        };
+
+        let deny = snapshot
+            .check(&crate::policy::CheckCtx {
+                input: &Value::Null,
+                acting: IdentityRef::ROOT,
+                now_millis: 0,
+                target: rid,
+            })
+            .await;
+        ensure!(
+            matches!(deny, crate::policy::PolicyDecision::Deny { .. }),
+            "missing predicate input should be denied: {deny:?}"
+        );
+
+        let input = Value::Map(
+            [("tenant".into(), Value::Str("acme".into()))]
+                .into_iter()
+                .collect(),
+        );
+        let allow = snapshot
+            .check(&crate::policy::CheckCtx {
+                input: &input,
+                acting: IdentityRef::ROOT,
+                now_millis: 0,
+                target: rid,
+            })
+            .await;
+        ensure!(
+            allow == crate::policy::PolicyDecision::Allow,
+            "matching predicate input should be allowed: {allow:?}"
         );
         Ok(())
     }

@@ -407,7 +407,11 @@ fn validate_auth_ref(auth: &InferenceAuthRef) -> Result<(), InferenceConfigError
 }
 
 fn validate_secret_ref(path: &Path) -> Result<(), InferenceConfigError> {
-    if path.scheme() != "state" || !is_vault_reserved(path) || path.segments().len() < 2 {
+    if path.scheme() != "state"
+        || path.cluster().is_some()
+        || !is_vault_reserved(path)
+        || path.segments().len() < 2
+    {
         return Err(InferenceConfigError::BadSecretRef);
     }
     Ok(())
@@ -578,6 +582,15 @@ mod tests {
         ensure!(
             bad.validate_admission("deepseek") == Err(InferenceConfigError::BadSecretRef),
             "bad secret ref was accepted"
+        );
+
+        let mut clustered = def.clone();
+        clustered.auth = InferenceAuthRef::BearerToken {
+            token_ref: vault("path://remote/state/vault/inference/deepseek/api_key")?,
+        };
+        ensure!(
+            clustered.validate_admission("deepseek") == Err(InferenceConfigError::BadSecretRef),
+            "clustered secret ref was accepted"
         );
         Ok(())
     }
