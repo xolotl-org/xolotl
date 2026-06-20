@@ -342,7 +342,14 @@ impl DataPlane {
                             batchable,
                         }))
                     {
-                        tracing::error!(?e, op = ?op.id, "idempotent-dedup fact record failed");
+                        tracing::error!(?e, op = ?op.id, "idempotent-dedup fact record failed; denying op");
+                        return ExecOutput {
+                            outcome: Outcome::Fail(Failure::policy(
+                                "durability",
+                                format!("dedup fact record failed: {e}"),
+                            )),
+                            output_taint: TaintSet::pristine(),
+                        };
                     }
                     return ExecOutput {
                         outcome: short,
@@ -505,7 +512,7 @@ impl DataPlane {
             None => None,
         };
 
-        let (decision, outcome) = match async_result {
+        let (mut decision, mut outcome) = match async_result {
             Some(out) => (
                 if out.is_success() {
                     DecisionTag::Ok
@@ -539,6 +546,18 @@ impl DataPlane {
             },
         };
 
+        if let Some(key) = idem_key.as_ref()
+            && outcome.is_success()
+            && let Err(e) = self.write_idempotent_outcome(key, &outcome).await
+        {
+            tracing::error!(?e, op = ?op.id, "idempotency state write failed; denying op");
+            decision = DecisionTag::RejectedByPolicy;
+            outcome = Outcome::Fail(Failure::policy(
+                "idempotency",
+                format!("state write failed: {e}"),
+            ));
+        }
+
         let output_taint = if outcome.is_success() {
             driver_output_taint
         } else {
@@ -566,15 +585,6 @@ impl DataPlane {
             tracing::error!(?e, op = ?op.id, "post-effect fact completion failed; recovery will reconcile");
         }
 
-        // Cache a successful IdempotentEffect outcome under its key so a later
-        // op with the same key dedupes to it. Failures are not cached —
-        // Failed idempotent operations are re-attempted.
-        if let Some(key) = idem_key
-            && outcome.is_success()
-            && let Err(e) = self.write_idempotent_outcome(&key, &outcome).await
-        {
-            tracing::error!(?e, op = ?op.id, "idempotency state write failed");
-        }
         ExecOutput {
             outcome,
             output_taint,
@@ -980,8 +990,8 @@ impl DataPlane {
 fn stream_path(op: &Operation) -> Result<Path, nexus_types::PathError> {
     Path::try_new("state")?
         .try_push("stream")?
-        .try_push(op.process.get().to_string())?
-        .try_push(op.id.position.get().to_string())
+        .try_push_literal(op.process.get().to_string())?
+        .try_push_literal(op.id.position.get().to_string())
 }
 
 fn collect_stream_path() -> Result<Path, nexus_types::PathError> {
@@ -994,20 +1004,20 @@ fn idempotency_path(key: &str) -> Result<Path, nexus_types::PathError> {
     let hash = blake3::hash(key.as_bytes());
     Path::try_new("state")?
         .try_push("idemp")?
-        .try_push(hash.to_hex())
+        .try_push_literal(hash.to_hex())
 }
 
 fn async_proc_path(process: nexus_types::ProcessId) -> Result<Path, nexus_types::PathError> {
     Path::try_new("proc")?
         .try_push("async")?
-        .try_push(process.get().to_string())
+        .try_push_literal(process.get().to_string())
 }
 
 fn async_status_path(process: nexus_types::ProcessId) -> Result<Path, nexus_types::PathError> {
     Path::try_new("state")?
         .try_push("kernel")?
         .try_push("async")?
-        .try_push(process.get().to_string())?
+        .try_push_literal(process.get().to_string())?
         .try_push("status")
 }
 
@@ -1015,7 +1025,7 @@ fn async_outcome_path(process: nexus_types::ProcessId) -> Result<Path, nexus_typ
     Path::try_new("state")?
         .try_push("kernel")?
         .try_push("async")?
-        .try_push(process.get().to_string())?
+        .try_push_literal(process.get().to_string())?
         .try_push("outcome")
 }
 
@@ -1207,7 +1217,9 @@ mod tests {
     use crate::fact::FactStore;
     use crate::handle::{Handle, HandleState};
     use anyhow::{Context, bail, ensure};
-    use nexus_state::{Backend, InMemoryBackend, StateError, StateResult, StateStream};
+    use nexus_state::{
+        Backend, InMemoryBackend, StateBackend, StateError, StateResult, StateStream, TaintedValue,
+    };
     use nexus_types::{
         DriverId, HandleId, IdentityRef, MethodBitmap, MethodId, NodeId, OperationId, OutputMode,
         OutputModeSet, ProcessId, ReplayClass, ResourceId, RightFlags, Rights, Value,
@@ -1219,6 +1231,58 @@ mod tests {
 
     fn test_state() -> Backend {
         Arc::new(InMemoryBackend::new())
+    }
+
+    struct FailingWriteState;
+
+    #[async_trait::async_trait]
+    impl StateBackend for FailingWriteState {
+        async fn read_tainted(&self, _path: &Path) -> StateResult<Option<TaintedValue>> {
+            Ok(None)
+        }
+
+        async fn write_set_tainted(
+            &self,
+            _path: &Path,
+            _value: Value,
+            _taint: TaintSet,
+        ) -> StateResult<()> {
+            Err(StateError::Backend("simulated state write failure".into()))
+        }
+
+        async fn write_append_tainted(
+            &self,
+            _path: &Path,
+            _item: Value,
+            _taint: TaintSet,
+        ) -> StateResult<()> {
+            Err(StateError::Unsupported("write_append_tainted"))
+        }
+
+        async fn write_cas_tainted(
+            &self,
+            _path: &Path,
+            _expected: Option<Value>,
+            _new: Value,
+            _taint: TaintSet,
+        ) -> StateResult<()> {
+            Err(StateError::Unsupported("write_cas_tainted"))
+        }
+
+        async fn write_delete(&self, _path: &Path) -> StateResult<()> {
+            Err(StateError::Unsupported("write_delete"))
+        }
+
+        async fn subscribe(&self, _pattern: &Path) -> StateResult<StateStream> {
+            Err(StateError::Unsupported("subscribe"))
+        }
+
+        async fn read_prefix_tainted(
+            &self,
+            _prefix: &Path,
+        ) -> StateResult<Vec<(Path, TaintedValue)>> {
+            Err(StateError::Unsupported("read_prefix_tainted"))
+        }
     }
 
     fn dataplane_with_handle(rights: Rights, fast_path: FastPath) -> (DataPlane, HandleId) {
@@ -1775,6 +1839,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idempotent_effect_denies_when_idempotency_write_fails() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+
+        let mut table = HandleTable::new();
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        plan.insert(
+            MethodId::new(7),
+            Arc::new(FnDriver(|_m: MethodId, _in: Value| {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                Ok(Value::Int(100))
+            })),
+        );
+        let id = table.insert(Handle {
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            resource: ResourceId::new(5),
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            driver_plan: plan,
+            fast_path: FastPath::Unconditional,
+            state: HandleState::Active,
+            bound_path: None,
+        });
+        let (facts, store) = FactSink::in_memory();
+        let dp = DataPlane::new(
+            Arc::new(RwLock::new(table)),
+            facts,
+            Arc::new(FailingWriteState),
+        );
+
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("_idem_key".to_string(), Value::Str("order-1".into()));
+        let out = dp
+            .execute(
+                &op(id, 7, Value::Map(m)),
+                0,
+                ReplayClass::IdempotentEffect,
+                SUPPORTS_UNARY,
+                0,
+                false,
+            )
+            .await;
+
+        ensure!(CALLS.load(Ordering::SeqCst) == 1, "driver should run once");
+        ensure!(
+            matches!(
+                &out.outcome,
+                Outcome::Fail(Failure::PolicyViolation { policy, detail })
+                    if policy == "idempotency" && detail.contains("state write failed")
+            ),
+            "idempotency persistence failure should deny the op, got {:?}",
+            out.outcome
+        );
+        ensure!(
+            out.output_taint == TaintSet::pristine(),
+            "failed idempotency write should expose no output taint"
+        );
+
+        let facts = store
+            .facts_of(ProcessId::new(1))
+            .context("reading facts failed")?;
+        let fact = facts.first().context("missing idempotency failure fact")?;
+        ensure!(facts.len() == 1, "unexpected fact count: {}", facts.len());
+        ensure!(
+            fact.decision == DecisionTag::RejectedByPolicy,
+            "unexpected fact decision: {:?}",
+            fact.decision
+        );
+        ensure!(
+            fact.outcome_ref == OutcomeRef::None,
+            "failure fact should not inline the successful driver output"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn idempotent_effect_dedupes_across_data_plane_instances() -> anyhow::Result<()> {
         // Idempotency records live in state://idemp/*, so a restarted DataPlane
         // sharing the backend still dedupes the same effective key.
@@ -1878,6 +2019,91 @@ mod tests {
         fn cursor(&self) -> u64 {
             0
         }
+    }
+
+    #[tokio::test]
+    async fn idempotent_dedup_denies_when_retry_fact_record_fails() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+
+        let mk_table = || {
+            let mut table = HandleTable::new();
+            let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+            plan.insert(
+                MethodId::new(7),
+                Arc::new(FnDriver(|_m: MethodId, _in: Value| {
+                    CALLS.fetch_add(1, Ordering::SeqCst);
+                    Ok(Value::Int(100))
+                })),
+            );
+            let id = table.insert(Handle {
+                id: HandleId::new(0, 0),
+                process: ProcessId::new(1),
+                resource: ResourceId::new(5),
+                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+                driver_plan: plan,
+                fast_path: FastPath::Unconditional,
+                state: HandleState::Active,
+                bound_path: None,
+            });
+            (table, id)
+        };
+
+        let state = test_state();
+        let (table, id) = mk_table();
+        let (facts, _) = FactSink::in_memory();
+        let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, state.clone());
+
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("_idem_key".to_string(), Value::Str("order-1".into()));
+        let input = Value::Map(m);
+        let first = dp
+            .execute(
+                &op(id, 7, input.clone()),
+                0,
+                ReplayClass::IdempotentEffect,
+                SUPPORTS_UNARY,
+                0,
+                false,
+            )
+            .await;
+        ensure!(
+            first.outcome == Outcome::Done(Value::Int(100)),
+            "first idempotent outcome mismatch: {:?}",
+            first.outcome
+        );
+
+        let (table, id) = mk_table();
+        let failing_facts = FactSink::new(Arc::new(FailingFactStore));
+        let failing_dp = DataPlane::new(Arc::new(RwLock::new(table)), failing_facts, state);
+        let mut retry = op(id, 7, input);
+        retry.id = retry.id.retry();
+        let second = failing_dp
+            .execute(
+                &retry,
+                0,
+                ReplayClass::IdempotentEffect,
+                SUPPORTS_UNARY,
+                0,
+                false,
+            )
+            .await;
+
+        ensure!(
+            CALLS.load(Ordering::SeqCst) == 1,
+            "cached retry should not call driver again"
+        );
+        ensure!(
+            matches!(
+                &second.outcome,
+                Outcome::Fail(Failure::PolicyViolation { policy, detail })
+                    if policy == "durability" && detail.contains("dedup fact record failed")
+            ),
+            "dedup fact failure should deny the retry, got {:?}",
+            second.outcome
+        );
+        Ok(())
     }
 
     #[tokio::test]

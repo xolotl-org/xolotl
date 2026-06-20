@@ -129,17 +129,26 @@ impl Driver for RankerDriver {
                 // Resolve weights: input override → state config → default.
                 let weights = self.resolve_weights(&m).await?;
                 let signals = match m.get("signals") {
-                    Some(Value::List(s)) => s.clone(),
-                    _ => vec![],
+                    Some(Value::List(signals)) => signals,
+                    Some(_) => {
+                        return Err(DriverError::InvalidInput(
+                            "rank.score signals must be a list".into(),
+                        ));
+                    }
+                    None => {
+                        return Err(DriverError::InvalidInput(
+                            "rank.score requires signals".into(),
+                        ));
+                    }
                 };
                 let mut scored = Vec::with_capacity(signals.len());
-                for cand in &signals {
+                for cand in signals {
                     let Some(cm) = cand.as_map() else {
                         return Err(DriverError::InvalidInput(
                             "rank.score signals entries must be maps".into(),
                         ));
                     };
-                    let id = cm.get("id").cloned().unwrap_or(Value::Null);
+                    let id = Value::Str(required_candidate_id(cm)?);
                     let score: f64 = weights
                         .iter()
                         .map(|(sig, w)| as_f64(cm.get(sig)).map(|signal| w * signal))
@@ -154,30 +163,39 @@ impl Driver for RankerDriver {
             // fuse(lists): Reciprocal Rank Fusion over several ranked id-lists.
             1 => {
                 let lists = match m.get("lists") {
-                    Some(Value::List(ls)) => ls.clone(),
-                    _ => vec![],
+                    Some(Value::List(lists)) => lists,
+                    Some(_) => {
+                        return Err(DriverError::InvalidInput(
+                            "rank.fuse lists must be a list".into(),
+                        ));
+                    }
+                    None => {
+                        return Err(DriverError::InvalidInput("rank.fuse requires lists".into()));
+                    }
                 };
                 let mut acc: BTreeMap<String, f64> = BTreeMap::new();
-                for list in &lists {
-                    if let Value::List(items) = list {
-                        for (rank, item) in items.iter().enumerate() {
-                            // Each item is an id (or a map with `id`).
-                            let id = match item {
-                                Value::Str(s) => s.clone(),
-                                Value::Map(im) => im
-                                    .get("id")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|id| !id.is_empty())
-                                    .map(str::to_string)
-                                    .ok_or_else(|| {
-                                        DriverError::InvalidInput(
-                                            "rank.fuse map items require non-empty id".into(),
-                                        )
-                                    })?,
-                                _ => continue,
-                            };
-                            *acc.entry(id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f64) + 1.0);
-                        }
+                for list in lists {
+                    let Value::List(items) = list else {
+                        return Err(DriverError::InvalidInput(
+                            "rank.fuse entries must be lists".into(),
+                        ));
+                    };
+                    for (rank, item) in items.iter().enumerate() {
+                        let id = match item {
+                            Value::Str(id) if !id.is_empty() => id.clone(),
+                            Value::Str(_) => {
+                                return Err(DriverError::InvalidInput(
+                                    "rank.fuse ids must be non-empty".into(),
+                                ));
+                            }
+                            Value::Map(im) => required_candidate_id(im)?,
+                            _ => {
+                                return Err(DriverError::InvalidInput(
+                                    "rank.fuse items must be ids or maps with id".into(),
+                                ));
+                            }
+                        };
+                        *acc.entry(id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f64) + 1.0);
                     }
                 }
                 let mut scored: Vec<(Value, f64)> =
@@ -190,6 +208,21 @@ impl Driver for RankerDriver {
                 method.get()
             ))),
         }
+    }
+}
+
+fn required_candidate_id(m: &BTreeMap<String, Value>) -> Result<String, DriverError> {
+    match m.get("id") {
+        Some(Value::Str(id)) if !id.is_empty() => Ok(id.clone()),
+        Some(Value::Str(_)) => Err(DriverError::InvalidInput(
+            "rank candidate id must be non-empty".into(),
+        )),
+        Some(_) => Err(DriverError::InvalidInput(
+            "rank candidate id must be a string".into(),
+        )),
+        None => Err(DriverError::InvalidInput(
+            "rank candidate requires id".into(),
+        )),
     }
 }
 
@@ -312,6 +345,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn score_rejects_missing_or_malformed_signals() -> Result<()> {
+        let d = RankerDriver::new();
+        let mut missing_id = BTreeMap::new();
+        missing_id.insert("semantic_sim".into(), Value::Float(FloatBits(1.0)));
+
+        for input in [
+            Value::Map(BTreeMap::new()),
+            Value::Map(BTreeMap::from([(
+                "signals".into(),
+                Value::Str("bad".into()),
+            )])),
+            Value::Map(BTreeMap::from([(
+                "signals".into(),
+                Value::List(vec![Value::Map(missing_id)]),
+            )])),
+        ] {
+            let out = d
+                .call(MethodId::new(0), input, OutputMode::Unary, &ctx())
+                .await;
+            ensure!(out.is_err(), "malformed rank.score input was accepted");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn fuse_combines_lists_by_rrf() -> Result<()> {
         let d = RankerDriver::new();
         let l1 = Value::List(vec![Value::Str("x".into()), Value::Str("y".into())]);
@@ -324,6 +382,29 @@ mod tests {
             .context("fuse rank lists")?;
         let first = first_ranked_id(out)?;
         ensure!(first == "y", "first ranked id: {first}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fuse_rejects_malformed_lists() -> Result<()> {
+        let d = RankerDriver::new();
+        for input in [
+            Value::Map(BTreeMap::new()),
+            Value::Map(BTreeMap::from([("lists".into(), Value::Str("bad".into()))])),
+            Value::Map(BTreeMap::from([(
+                "lists".into(),
+                Value::List(vec![Value::Str("bad".into())]),
+            )])),
+            Value::Map(BTreeMap::from([(
+                "lists".into(),
+                Value::List(vec![Value::List(vec![Value::Null])]),
+            )])),
+        ] {
+            let out = d
+                .call(MethodId::new(1), input, OutputMode::Unary, &ctx())
+                .await;
+            ensure!(out.is_err(), "malformed rank.fuse input was accepted");
+        }
         Ok(())
     }
 }

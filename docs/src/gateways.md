@@ -43,19 +43,10 @@ listener address and frame encoding:
 External gateway sessions are described in [External Gateway](external-gateway.md).
 Provider and Source are the only external projection roles.
 
-The daemon owns session admission and authority:
-
-1. the external program sends `RoleSessionClientHello`;
-2. the daemon loads the installation, its selected projection, pairing, and
-   approved session state;
-3. the daemon sends `SessionContext` with authoritative generations and limits;
-4. the external program replies with `RoleReady`;
-5. business frames flow only after the session is ready.
-
-Provider bindings come from the installation projection; `RoleReady` only
-confirms the selected session context. Source events are admitted only after
-generation checks, schema checks, dedupe, capacity checks, rate checks, and
-policy checks pass.
+Use this entry point when a program runs outside the Nexus process but should be
+projected into the runtime as declared effects or declared event streams. The
+daemon owns session admission, generation checks, binding selection, and
+runtime limits; external programs do not self-declare authority.
 
 ## MCP
 
@@ -90,8 +81,6 @@ path. Tool results may return native MCP `content`, `structuredContent`,
 Console HTTP is limited to health and authentication. Logged-in management uses
 Console WebSocket with authorization, CAS, visibility gates, and audit records.
 
-Console transport security is daemon-owned and configured in
-`[console.transport_security]`. The current console listener is plain:
-`local_trusted` is valid only on loopback, `trusted_reverse_proxy` is used when
-TLS terminates at a trusted front proxy, and `production_tls` fails closed until
-the console listener has daemon-owned TLS material.
+Console transport security is deployment configuration and is documented in
+[Configuration](configuration.md). This page only identifies the console
+protocol entry point.

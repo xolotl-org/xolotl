@@ -47,13 +47,11 @@ impl BlobDriver {
     /// Operation input, so an illegal path segment is a caller error (returned as
     /// `DriverError`), never a panic.
     fn blob_path(hash: &str) -> Result<Path, DriverError> {
-        Path::parse(&format!("state://blob/{hash}"))
-            .map_err(|e| DriverError::Other(format!("invalid blob hash {hash:?}: {e}")))
+        blob_state_path("blob", hash)
     }
 
     fn refcount_path(hash: &str) -> Result<Path, DriverError> {
-        Path::parse(&format!("state://blob-refcount/{hash}"))
-            .map_err(|e| DriverError::Other(format!("invalid blob hash {hash:?}: {e}")))
+        blob_state_path("blob-refcount", hash)
     }
 
     /// Drop one persisted reference to `hash`. Returns true when the count
@@ -66,7 +64,7 @@ impl BlobDriver {
                 .read(&path)
                 .await
                 .map_err(|e| DriverError::Other(e.to_string()))?;
-            let n = current.as_ref().and_then(Value::as_int).unwrap_or(0);
+            let n = refcount_value(current.as_ref(), hash)?;
             if n <= 1 {
                 match self.state.write_cas(&path, current, Value::Int(0)).await {
                     Ok(()) => {
@@ -131,9 +129,9 @@ impl Driver for BlobDriver {
             // delete: drop one reference. The bytes are physically
             // removed only when the refcount reaches zero.
             2 => {
-                if let Some(hash) = blob_hash(&input)
-                    && self.decref(&hash).await?
-                {
+                let hash = blob_hash(&input)
+                    .ok_or_else(|| DriverError::Other("delete expects a blob ref".into()))?;
+                if self.decref(&hash).await? {
                     self.state
                         .write_delete(&Self::blob_path(&hash)?)
                         .await
@@ -144,6 +142,13 @@ impl Driver for BlobDriver {
             _ => Err(DriverError::NoSuchMethod(method)),
         }
     }
+}
+
+fn blob_state_path(prefix: &str, hash: &str) -> Result<Path, DriverError> {
+    Path::try_new("state")
+        .and_then(|path| path.try_push_literal(prefix))
+        .and_then(|path| path.try_push_literal(hash))
+        .map_err(|e| DriverError::Other(format!("invalid blob hash {hash:?}: {e}")))
 }
 
 /// Persist `bytes` under the standard blob content-addressed state path and
@@ -172,13 +177,26 @@ async fn incref_hash(state: &Backend, hash: &str) -> Result<(), DriverError> {
             .read(&path)
             .await
             .map_err(|e| DriverError::Other(e.to_string()))?;
-        let n = current.as_ref().and_then(Value::as_int).unwrap_or(0);
+        let n = refcount_value(current.as_ref(), hash)?;
         let next = Value::Int(n.saturating_add(1));
         match state.write_cas(&path, current, next).await {
             Ok(()) => return Ok(()),
             Err(nexus_state::StateError::CasFailed { .. }) => continue,
             Err(e) => return Err(DriverError::Other(e.to_string())),
         }
+    }
+}
+
+fn refcount_value(value: Option<&Value>, hash: &str) -> Result<i64, DriverError> {
+    match value {
+        Some(Value::Int(count)) if *count >= 0 => Ok(*count),
+        Some(Value::Int(_)) => Err(DriverError::Other(format!(
+            "blob refcount for {hash:?} must be nonnegative"
+        ))),
+        Some(_) => Err(DriverError::Other(format!(
+            "blob refcount for {hash:?} must be an integer"
+        ))),
+        None => Ok(0),
     }
 }
 
@@ -407,6 +425,141 @@ mod tests {
         ensure!(
             gone == Outcome::Done(Value::Null),
             "shared blob remained after final delete: {gone:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_refcount_rejects_delete_without_dropping_bytes() -> anyhow::Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = BlobDriver::new(state.clone());
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+
+        let blob = blob_from(
+            d.call(
+                MethodId::new(0),
+                Value::Str("corrupt-refcount".into()),
+                OutputMode::Unary,
+                &ctx,
+            )
+            .await?,
+        )?;
+        let refcount_path = BlobDriver::refcount_path(&blob.hash).context("build refcount path")?;
+        state
+            .write_set(&refcount_path, Value::Str("bad".into()))
+            .await?;
+
+        let out = d
+            .call(
+                MethodId::new(2),
+                Value::Blob(blob.clone()),
+                OutputMode::Unary,
+                &ctx,
+            )
+            .await;
+        ensure!(out.is_err(), "malformed refcount delete was accepted");
+
+        let read = d
+            .call(MethodId::new(1), Value::Blob(blob), OutputMode::Unary, &ctx)
+            .await?;
+        ensure!(
+            read == Outcome::Done(Value::Bytes(b"corrupt-refcount".to_vec())),
+            "blob bytes were dropped despite malformed refcount: {read:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_refcount_rejects_increment() -> anyhow::Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = BlobDriver::new(state.clone());
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+
+        let blob = blob_from(
+            d.call(
+                MethodId::new(0),
+                Value::Str("bad-increment".into()),
+                OutputMode::Unary,
+                &ctx,
+            )
+            .await?,
+        )?;
+        let refcount_path = BlobDriver::refcount_path(&blob.hash).context("build refcount path")?;
+        state.write_set(&refcount_path, Value::Int(-1)).await?;
+
+        let out = d
+            .call(
+                MethodId::new(0),
+                Value::Str("bad-increment".into()),
+                OutputMode::Unary,
+                &ctx,
+            )
+            .await;
+        ensure!(out.is_err(), "malformed refcount increment was accepted");
+        ensure!(
+            state.read(&refcount_path).await? == Some(Value::Int(-1)),
+            "malformed refcount should not be overwritten"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn caller_blob_hash_must_be_one_path_segment() -> anyhow::Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = BlobDriver::new(state);
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+
+        let read_error = match d
+            .call(
+                MethodId::new(1),
+                Value::Str("bad/hash".into()),
+                OutputMode::Unary,
+                &ctx,
+            )
+            .await
+        {
+            Ok(outcome) => bail!("bad hash read returned {outcome:?}"),
+            Err(error) => error,
+        };
+        ensure!(
+            read_error.to_string().contains("invalid blob hash"),
+            "unexpected read error: {read_error:?}"
+        );
+
+        let delete_error = match d
+            .call(
+                MethodId::new(2),
+                Value::Str("bad/hash".into()),
+                OutputMode::Unary,
+                &ctx,
+            )
+            .await
+        {
+            Ok(outcome) => bail!("bad hash delete returned {outcome:?}"),
+            Err(error) => error,
+        };
+        ensure!(
+            delete_error.to_string().contains("invalid blob hash"),
+            "unexpected delete error: {delete_error:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_requires_blob_reference() -> anyhow::Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = BlobDriver::new(state);
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+        let error = match d
+            .call(MethodId::new(2), Value::Null, OutputMode::Unary, &ctx)
+            .await
+        {
+            Ok(outcome) => bail!("missing delete hash returned {outcome:?}"),
+            Err(error) => error,
+        };
+        ensure!(
+            error.to_string().contains("delete expects a blob ref"),
+            "unexpected delete error: {error:?}"
         );
         Ok(())
     }

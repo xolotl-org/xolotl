@@ -46,9 +46,17 @@ pub const DEFAULT_EXTERNAL_PROVIDER_MAX_IN_FLIGHT_PER_EFFECT: usize = 256;
 #[cfg(feature = "external-gateway")]
 pub const HARD_EXTERNAL_PROVIDER_MAX_IN_FLIGHT_PER_EFFECT: usize = 65_536;
 #[cfg(feature = "external-gateway")]
+pub const DEFAULT_EXTERNAL_PROVIDER_MAX_INLINE_RESULT_BYTES: usize = 65_536;
+#[cfg(feature = "external-gateway")]
+pub const HARD_EXTERNAL_PROVIDER_MAX_INLINE_RESULT_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(feature = "external-gateway")]
 pub const DEFAULT_EXTERNAL_SOURCE_MAX_IN_FLIGHT_COMMANDS: usize = 1024;
 #[cfg(feature = "external-gateway")]
 pub const HARD_EXTERNAL_SOURCE_MAX_IN_FLIGHT_COMMANDS: usize = 65_536;
+#[cfg(feature = "external-gateway")]
+pub const DEFAULT_EXTERNAL_SOURCE_COMMAND_MAX_INLINE_RESULT_BYTES: usize = 65_536;
+#[cfg(feature = "external-gateway")]
+pub const HARD_EXTERNAL_SOURCE_COMMAND_MAX_INLINE_RESULT_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(feature = "external-gateway")]
 pub const DEFAULT_EXTERNAL_SOURCE_COMMAND_RATE_LIMIT_WINDOW_MS: u64 = 60_000;
 #[cfg(feature = "external-gateway")]
@@ -135,7 +143,9 @@ pub struct ExternalGatewaySessionLimits {
     pub provider_max_in_flight_invocations: usize,
     pub provider_max_in_flight_per_identity: usize,
     pub provider_max_in_flight_per_effect: usize,
+    pub provider_max_inline_result_bytes: usize,
     pub source_max_in_flight_commands: usize,
+    pub source_command_max_inline_result_bytes: usize,
     pub source_command_rate_limit_window_ms: u64,
     pub source_command_rate_limit_max: usize,
 }
@@ -150,7 +160,10 @@ impl Default for ExternalGatewaySessionLimits {
             provider_max_in_flight_per_identity:
                 default_external_provider_max_in_flight_per_identity(),
             provider_max_in_flight_per_effect: default_external_provider_max_in_flight_per_effect(),
+            provider_max_inline_result_bytes: default_external_provider_max_inline_result_bytes(),
             source_max_in_flight_commands: default_external_source_max_in_flight_commands(),
+            source_command_max_inline_result_bytes:
+                default_external_source_command_max_inline_result_bytes(),
             source_command_rate_limit_window_ms:
                 default_external_source_command_rate_limit_window_ms(),
             source_command_rate_limit_max: default_external_source_command_rate_limit_max(),
@@ -182,10 +195,20 @@ impl ExternalGatewaySessionLimits {
             DEFAULT_EXTERNAL_PROVIDER_MAX_IN_FLIGHT_PER_EFFECT,
             HARD_EXTERNAL_PROVIDER_MAX_IN_FLIGHT_PER_EFFECT,
         );
+        self.provider_max_inline_result_bytes = clamp_or_default(
+            self.provider_max_inline_result_bytes,
+            DEFAULT_EXTERNAL_PROVIDER_MAX_INLINE_RESULT_BYTES,
+            HARD_EXTERNAL_PROVIDER_MAX_INLINE_RESULT_BYTES,
+        );
         self.source_max_in_flight_commands = clamp_or_default(
             self.source_max_in_flight_commands,
             DEFAULT_EXTERNAL_SOURCE_MAX_IN_FLIGHT_COMMANDS,
             HARD_EXTERNAL_SOURCE_MAX_IN_FLIGHT_COMMANDS,
+        );
+        self.source_command_max_inline_result_bytes = clamp_or_default(
+            self.source_command_max_inline_result_bytes,
+            DEFAULT_EXTERNAL_SOURCE_COMMAND_MAX_INLINE_RESULT_BYTES,
+            HARD_EXTERNAL_SOURCE_COMMAND_MAX_INLINE_RESULT_BYTES,
         );
         self.source_command_rate_limit_window_ms = clamp_or_default_u64(
             self.source_command_rate_limit_window_ms,
@@ -215,8 +238,12 @@ pub struct ExternalGatewayGrpcConfig {
     pub provider_max_in_flight_per_identity: usize,
     #[serde(default = "default_external_provider_max_in_flight_per_effect")]
     pub provider_max_in_flight_per_effect: usize,
+    #[serde(default = "default_external_provider_max_inline_result_bytes")]
+    pub provider_max_inline_result_bytes: usize,
     #[serde(default = "default_external_source_max_in_flight_commands")]
     pub source_max_in_flight_commands: usize,
+    #[serde(default = "default_external_source_command_max_inline_result_bytes")]
+    pub source_command_max_inline_result_bytes: usize,
     #[serde(default = "default_external_source_command_rate_limit_window_ms")]
     pub source_command_rate_limit_window_ms: u64,
     #[serde(default = "default_external_source_command_rate_limit_max")]
@@ -233,7 +260,9 @@ impl Default for ExternalGatewayGrpcConfig {
             provider_max_in_flight_invocations: limits.provider_max_in_flight_invocations,
             provider_max_in_flight_per_identity: limits.provider_max_in_flight_per_identity,
             provider_max_in_flight_per_effect: limits.provider_max_in_flight_per_effect,
+            provider_max_inline_result_bytes: limits.provider_max_inline_result_bytes,
             source_max_in_flight_commands: limits.source_max_in_flight_commands,
+            source_command_max_inline_result_bytes: limits.source_command_max_inline_result_bytes,
             source_command_rate_limit_window_ms: limits.source_command_rate_limit_window_ms,
             source_command_rate_limit_max: limits.source_command_rate_limit_max,
         }
@@ -257,7 +286,9 @@ impl ExternalGatewayGrpcConfig {
         self.provider_max_in_flight_invocations = limits.provider_max_in_flight_invocations;
         self.provider_max_in_flight_per_identity = limits.provider_max_in_flight_per_identity;
         self.provider_max_in_flight_per_effect = limits.provider_max_in_flight_per_effect;
+        self.provider_max_inline_result_bytes = limits.provider_max_inline_result_bytes;
         self.source_max_in_flight_commands = limits.source_max_in_flight_commands;
+        self.source_command_max_inline_result_bytes = limits.source_command_max_inline_result_bytes;
         self.source_command_rate_limit_window_ms = limits.source_command_rate_limit_window_ms;
         self.source_command_rate_limit_max = limits.source_command_rate_limit_max;
     }
@@ -279,8 +310,12 @@ pub struct ExternalGatewayWebSocketConfig {
     pub provider_max_in_flight_per_identity: usize,
     #[serde(default = "default_external_provider_max_in_flight_per_effect")]
     pub provider_max_in_flight_per_effect: usize,
+    #[serde(default = "default_external_provider_max_inline_result_bytes")]
+    pub provider_max_inline_result_bytes: usize,
     #[serde(default = "default_external_source_max_in_flight_commands")]
     pub source_max_in_flight_commands: usize,
+    #[serde(default = "default_external_source_command_max_inline_result_bytes")]
+    pub source_command_max_inline_result_bytes: usize,
     #[serde(default = "default_external_source_command_rate_limit_window_ms")]
     pub source_command_rate_limit_window_ms: u64,
     #[serde(default = "default_external_source_command_rate_limit_max")]
@@ -298,7 +333,9 @@ impl Default for ExternalGatewayWebSocketConfig {
             provider_max_in_flight_invocations: limits.provider_max_in_flight_invocations,
             provider_max_in_flight_per_identity: limits.provider_max_in_flight_per_identity,
             provider_max_in_flight_per_effect: limits.provider_max_in_flight_per_effect,
+            provider_max_inline_result_bytes: limits.provider_max_inline_result_bytes,
             source_max_in_flight_commands: limits.source_max_in_flight_commands,
+            source_command_max_inline_result_bytes: limits.source_command_max_inline_result_bytes,
             source_command_rate_limit_window_ms: limits.source_command_rate_limit_window_ms,
             source_command_rate_limit_max: limits.source_command_rate_limit_max,
         }
@@ -323,7 +360,9 @@ impl ExternalGatewayWebSocketConfig {
         self.provider_max_in_flight_invocations = limits.provider_max_in_flight_invocations;
         self.provider_max_in_flight_per_identity = limits.provider_max_in_flight_per_identity;
         self.provider_max_in_flight_per_effect = limits.provider_max_in_flight_per_effect;
+        self.provider_max_inline_result_bytes = limits.provider_max_inline_result_bytes;
         self.source_max_in_flight_commands = limits.source_max_in_flight_commands;
+        self.source_command_max_inline_result_bytes = limits.source_command_max_inline_result_bytes;
         self.source_command_rate_limit_window_ms = limits.source_command_rate_limit_window_ms;
         self.source_command_rate_limit_max = limits.source_command_rate_limit_max;
     }
@@ -337,7 +376,9 @@ impl From<&ExternalGatewayGrpcConfig> for ExternalGatewaySessionLimits {
             provider_max_in_flight_invocations: config.provider_max_in_flight_invocations,
             provider_max_in_flight_per_identity: config.provider_max_in_flight_per_identity,
             provider_max_in_flight_per_effect: config.provider_max_in_flight_per_effect,
+            provider_max_inline_result_bytes: config.provider_max_inline_result_bytes,
             source_max_in_flight_commands: config.source_max_in_flight_commands,
+            source_command_max_inline_result_bytes: config.source_command_max_inline_result_bytes,
             source_command_rate_limit_window_ms: config.source_command_rate_limit_window_ms,
             source_command_rate_limit_max: config.source_command_rate_limit_max,
         }
@@ -352,7 +393,9 @@ impl From<&ExternalGatewayWebSocketConfig> for ExternalGatewaySessionLimits {
             provider_max_in_flight_invocations: config.provider_max_in_flight_invocations,
             provider_max_in_flight_per_identity: config.provider_max_in_flight_per_identity,
             provider_max_in_flight_per_effect: config.provider_max_in_flight_per_effect,
+            provider_max_inline_result_bytes: config.provider_max_inline_result_bytes,
             source_max_in_flight_commands: config.source_max_in_flight_commands,
+            source_command_max_inline_result_bytes: config.source_command_max_inline_result_bytes,
             source_command_rate_limit_window_ms: config.source_command_rate_limit_window_ms,
             source_command_rate_limit_max: config.source_command_rate_limit_max,
         }
@@ -723,8 +766,18 @@ fn default_external_provider_max_in_flight_per_effect() -> usize {
 }
 
 #[cfg(feature = "external-gateway")]
+fn default_external_provider_max_inline_result_bytes() -> usize {
+    DEFAULT_EXTERNAL_PROVIDER_MAX_INLINE_RESULT_BYTES
+}
+
+#[cfg(feature = "external-gateway")]
 fn default_external_source_max_in_flight_commands() -> usize {
     DEFAULT_EXTERNAL_SOURCE_MAX_IN_FLIGHT_COMMANDS
+}
+
+#[cfg(feature = "external-gateway")]
+fn default_external_source_command_max_inline_result_bytes() -> usize {
+    DEFAULT_EXTERNAL_SOURCE_COMMAND_MAX_INLINE_RESULT_BYTES
 }
 
 #[cfg(feature = "external-gateway")]
@@ -1500,7 +1553,9 @@ source_dedupe_window_ms = 0
 provider_max_in_flight_invocations = 0
 provider_max_in_flight_per_identity = 0
 provider_max_in_flight_per_effect = 0
+provider_max_inline_result_bytes = 0
 source_max_in_flight_commands = 0
+source_command_max_inline_result_bytes = 0
 source_command_rate_limit_window_ms = 0
 source_command_rate_limit_max = 0
 
@@ -1512,7 +1567,9 @@ source_dedupe_window_ms = 0
 provider_max_in_flight_invocations = 0
 provider_max_in_flight_per_identity = 0
 provider_max_in_flight_per_effect = 0
+provider_max_inline_result_bytes = 0
 source_max_in_flight_commands = 0
+source_command_max_inline_result_bytes = 0
 source_command_rate_limit_window_ms = 0
 source_command_rate_limit_max = 0
 
@@ -1937,7 +1994,9 @@ source_dedupe_window_ms = 999999999999
 provider_max_in_flight_invocations = 999999999999
 provider_max_in_flight_per_identity = 999999999999
 provider_max_in_flight_per_effect = 999999999999
+provider_max_inline_result_bytes = 999999999999
 source_max_in_flight_commands = 999999999999
+source_command_max_inline_result_bytes = 999999999999
 source_command_rate_limit_window_ms = 999999999999
 source_command_rate_limit_max = 999999999999
 
@@ -1946,7 +2005,9 @@ source_dedupe_window_ms = 999999999999
 provider_max_in_flight_invocations = 999999999999
 provider_max_in_flight_per_identity = 999999999999
 provider_max_in_flight_per_effect = 999999999999
+provider_max_inline_result_bytes = 999999999999
 source_max_in_flight_commands = 999999999999
+source_command_max_inline_result_bytes = 999999999999
 source_command_rate_limit_window_ms = 999999999999
 source_command_rate_limit_max = 999999999999
 "#,
@@ -1973,7 +2034,10 @@ source_command_rate_limit_max = 999999999999
             provider_max_in_flight_invocations: HARD_EXTERNAL_PROVIDER_MAX_IN_FLIGHT_INVOCATIONS,
             provider_max_in_flight_per_identity: HARD_EXTERNAL_PROVIDER_MAX_IN_FLIGHT_PER_IDENTITY,
             provider_max_in_flight_per_effect: HARD_EXTERNAL_PROVIDER_MAX_IN_FLIGHT_PER_EFFECT,
+            provider_max_inline_result_bytes: HARD_EXTERNAL_PROVIDER_MAX_INLINE_RESULT_BYTES,
             source_max_in_flight_commands: HARD_EXTERNAL_SOURCE_MAX_IN_FLIGHT_COMMANDS,
+            source_command_max_inline_result_bytes:
+                HARD_EXTERNAL_SOURCE_COMMAND_MAX_INLINE_RESULT_BYTES,
             source_command_rate_limit_window_ms: HARD_EXTERNAL_SOURCE_COMMAND_RATE_LIMIT_WINDOW_MS,
             source_command_rate_limit_max: HARD_EXTERNAL_SOURCE_COMMAND_RATE_LIMIT_MAX,
         }

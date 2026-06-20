@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};
 use nexus_types::{MethodId, Outcome, OutputMode, Purity, Value};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 /// Method names for `effect://context/assemble`; the public method is `invoke`
@@ -37,12 +38,58 @@ fn est_tokens(s: &str) -> usize {
 }
 
 /// Render one layer's value to its text contribution.
-fn layer_text(v: &Value) -> String {
+fn layer_text<'a>(v: &'a Value, layer: &str) -> Result<Cow<'a, str>, DriverError> {
     match v {
-        Value::Str(s) => s.clone(),
-        Value::List(items) => items.iter().map(layer_text).collect::<Vec<_>>().join("\n"),
-        Value::Map(m) => m.get("text").map(layer_text).unwrap_or_default(),
-        _ => String::new(),
+        Value::Str(s) => Ok(Cow::Borrowed(s.as_str())),
+        Value::List(items) => {
+            let mut rendered = String::new();
+            for item in items {
+                let text = layer_text(item, layer)?;
+                if !rendered.is_empty() {
+                    rendered.push('\n');
+                }
+                rendered.push_str(text.as_ref());
+            }
+            Ok(Cow::Owned(rendered))
+        }
+        Value::Map(m) => {
+            let text = m.get("text").ok_or_else(|| {
+                DriverError::InvalidInput(format!("context layer {layer:?} missing text"))
+            })?;
+            layer_text(text, layer)
+        }
+        _ => Err(DriverError::InvalidInput(format!(
+            "context layer {layer:?} must be text, list, or map with text"
+        ))),
+    }
+}
+
+fn parse_budget(value: Option<&Value>) -> Result<usize, DriverError> {
+    match value {
+        Some(Value::Int(value)) if *value >= 0 => usize::try_from(*value).map_err(|_| {
+            DriverError::InvalidInput("context token_budget is too large for this platform".into())
+        }),
+        Some(Value::Int(_)) => Err(DriverError::InvalidInput(
+            "context token_budget must be nonnegative".into(),
+        )),
+        Some(_) => Err(DriverError::InvalidInput(
+            "context token_budget must be an integer".into(),
+        )),
+        None => Err(DriverError::InvalidInput(
+            "context.assemble requires token_budget".into(),
+        )),
+    }
+}
+
+fn required_layers(m: &BTreeMap<String, Value>) -> Result<&BTreeMap<String, Value>, DriverError> {
+    match m.get("layers") {
+        Some(Value::Map(layers)) => Ok(layers),
+        Some(_) => Err(DriverError::InvalidInput(
+            "context.assemble layers must be a map".into(),
+        )),
+        None => Err(DriverError::InvalidInput(
+            "context.assemble requires layers".into(),
+        )),
     }
 }
 
@@ -70,35 +117,27 @@ impl Driver for ContextDriver {
             return Err(DriverError::NoSuchMethod(method));
         }
         let m = crate::input::map(input, "context.assemble")?;
-        let budget = m
-            .get("token_budget")
-            .and_then(|v| v.as_int())
-            .unwrap_or(4096)
-            .max(0) as usize;
-        let layers = m
-            .get("layers")
-            .and_then(|v| v.as_map())
-            .cloned()
-            .unwrap_or_default();
+        let budget = parse_budget(m.get("token_budget"))?;
+        let layers = required_layers(&m)?;
 
         // Fill layers high-priority-first until the budget is exhausted.
-        let mut included: Vec<(String, String, usize)> = Vec::new();
+        let mut included: Vec<(&str, Cow<'_, str>, usize)> = Vec::new();
         let mut used = 0usize;
         for (i, layer) in LAYER_ORDER.iter().enumerate() {
             let Some(v) = layers.get(*layer) else {
                 continue;
             };
-            let text = layer_text(v);
-            if text.is_empty() {
+            let text = layer_text(v, layer)?;
+            if text.as_ref().is_empty() {
                 continue;
             }
-            let cost = est_tokens(&text);
+            let cost = est_tokens(text.as_ref());
             if i < NEVER_EVICT {
                 // Anchors are always included even if they alone exceed budget.
-                included.push((layer.to_string(), text, cost));
+                included.push((*layer, text, cost));
                 used += cost;
             } else if used + cost <= budget {
-                included.push((layer.to_string(), text, cost));
+                included.push((*layer, text, cost));
                 used += cost;
             }
             // else: this lower-priority layer doesn't fit; skip it (it would be
@@ -114,14 +153,19 @@ impl Driver for ContextDriver {
         }
 
         // Compose the one-shot prompt in priority order.
-        let prompt = included
-            .iter()
-            .map(|(name, text, _)| format!("## {name}\n{text}"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let mut prompt = String::new();
+        for (name, text, _) in &included {
+            if !prompt.is_empty() {
+                prompt.push_str("\n\n");
+            }
+            prompt.push_str("## ");
+            prompt.push_str(name);
+            prompt.push('\n');
+            prompt.push_str(text.as_ref());
+        }
         let layers_used: Vec<Value> = included
             .iter()
-            .map(|(name, _, _)| Value::Str(name.clone()))
+            .map(|(name, _, _)| Value::Str((*name).to_string()))
             .collect();
 
         let mut out = BTreeMap::new();
@@ -280,6 +324,46 @@ mod tests {
             prompt.contains("core identity"),
             "anchor layer missing from prompt"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn assemble_rejects_malformed_input() -> Result<()> {
+        let d = ContextDriver::new();
+        let mut missing_layers = BTreeMap::new();
+        missing_layers.insert("token_budget".into(), Value::Int(10));
+
+        let mut missing_budget = BTreeMap::new();
+        missing_budget.insert("layers".into(), Value::Map(BTreeMap::new()));
+
+        let mut malformed_layer = BTreeMap::new();
+        malformed_layer.insert("persona".into(), Value::Map(BTreeMap::new()));
+        let mut malformed_layer_input = BTreeMap::new();
+        malformed_layer_input.insert("token_budget".into(), Value::Int(10));
+        malformed_layer_input.insert("layers".into(), Value::Map(malformed_layer));
+
+        for input in [
+            Value::Map(missing_layers),
+            Value::Map(missing_budget),
+            Value::Map(BTreeMap::from([
+                ("token_budget".into(), Value::Str("10".into())),
+                ("layers".into(), Value::Map(BTreeMap::new())),
+            ])),
+            Value::Map(BTreeMap::from([
+                ("token_budget".into(), Value::Int(-1)),
+                ("layers".into(), Value::Map(BTreeMap::new())),
+            ])),
+            Value::Map(BTreeMap::from([
+                ("token_budget".into(), Value::Int(10)),
+                ("layers".into(), Value::Str("bad".into())),
+            ])),
+            Value::Map(malformed_layer_input),
+        ] {
+            let out = d
+                .call(MethodId::new(0), input, OutputMode::Unary, &ctx())
+                .await;
+            ensure!(out.is_err(), "malformed context input was accepted");
+        }
         Ok(())
     }
 }

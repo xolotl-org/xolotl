@@ -310,6 +310,7 @@ impl MemoryDriver {
                 .ok_or_else(|| {
                     DriverError::Other(format!("index hit {id:?} has no state entry at {path}"))
                 })?;
+            validate_stored_entry(&path, owner, namespace, &entry)?;
             if let Some(kind_filter) = kind
                 && entry_kind(&entry) != Some(kind_filter)
             {
@@ -440,10 +441,15 @@ impl MemoryDriver {
         namespace: &str,
     ) -> Result<Vec<(Path, Value)>, DriverError> {
         let root = namespace_path(owner, namespace)?;
-        self.state
+        let entries = self
+            .state
             .read_prefix(&root)
             .await
-            .map_err(|e| DriverError::Other(e.to_string()))
+            .map_err(|e| DriverError::Other(e.to_string()))?;
+        for (path, entry) in &entries {
+            validate_stored_entry(path, owner, namespace, entry)?;
+        }
+        Ok(entries)
     }
 
     async fn stamp_and_index(&self, path: &Path, entry: &mut Value) -> Result<(), DriverError> {
@@ -538,7 +544,9 @@ fn build_entry(
         .get("content")
         .or_else(|| input.get("entry"))
         .cloned()
-        .unwrap_or(Value::Null);
+        .ok_or_else(|| {
+            DriverError::InvalidInput("memory store requires `content` or `entry`".into())
+        })?;
     let kind = optional_segment(input, "kind")?.unwrap_or_else(|| {
         if namespace == SKILLS_NAMESPACE {
             "method".to_string()
@@ -611,13 +619,13 @@ fn consolidate(
         }
         let mut cluster_texts = vec![texts[i].clone()];
         let mut source_ids = vec![entry_required_str(candidates[i], "id")?.to_string()];
-        let mut low_trust = entry_bool(candidates[i], "low_trust", false)?;
+        let mut low_trust = entry_required_bool(candidates[i], "low_trust")?;
         used[i] = true;
         for j in (i + 1)..texts.len() {
             if !used[j] && overlap(&texts[i], &texts[j]) >= THRESHOLD {
                 cluster_texts.push(texts[j].clone());
                 source_ids.push(entry_required_str(candidates[j], "id")?.to_string());
-                low_trust |= entry_bool(candidates[j], "low_trust", false)?;
+                low_trust |= entry_required_bool(candidates[j], "low_trust")?;
                 used[j] = true;
             }
         }
@@ -715,15 +723,15 @@ fn tier_from_input(input: &BTreeMap<String, Value>) -> Result<Tier, DriverError>
 
 fn memory_path(owner: &str, namespace: &str, id: &str) -> Result<Path, DriverError> {
     namespace_path(owner, namespace)?
-        .try_push(id)
+        .try_push_literal(id)
         .map_err(|e| DriverError::InvalidInput(format!("invalid memory id {id:?}: {e}")))
 }
 
 fn namespace_path(owner: &str, namespace: &str) -> Result<Path, DriverError> {
     Path::try_new("state")
         .and_then(|path| path.try_push("memory"))
-        .and_then(|path| path.try_push(owner))
-        .and_then(|path| path.try_push(namespace))
+        .and_then(|path| path.try_push_literal(owner))
+        .and_then(|path| path.try_push_literal(namespace))
         .map_err(|e| {
             DriverError::InvalidInput(format!(
                 "invalid memory owner/namespace {owner:?}/{namespace:?}: {e}"
@@ -750,13 +758,8 @@ fn optional_segment(
 }
 
 fn validate_segment(field: &'static str, value: &str) -> Result<String, DriverError> {
-    if matches!(value, "*" | "**") {
-        return Err(DriverError::InvalidInput(format!(
-            "{field} must be a concrete path segment"
-        )));
-    }
     Path::try_new("state")
-        .and_then(|path| path.try_push(value))
+        .and_then(|path| path.try_push_literal(value))
         .map_err(|e| DriverError::InvalidInput(format!("{field} is not a safe segment: {e}")))?;
     Ok(value.to_string())
 }
@@ -844,6 +847,46 @@ fn optional_nonnegative_usize(
     }
 }
 
+fn validate_stored_entry(
+    path: &Path,
+    owner: &str,
+    namespace: &str,
+    entry: &Value,
+) -> Result<(), DriverError> {
+    let entry_owner = entry_required_str(entry, "owner")?;
+    let entry_namespace = entry_required_str(entry, "namespace")?;
+    let id = entry_required_str(entry, "id")?;
+    if entry_owner != owner || entry_namespace != namespace {
+        return Err(DriverError::Other(format!(
+            "memory entry identity mismatch at {path}"
+        )));
+    }
+    let expected_path = memory_path(entry_owner, entry_namespace, id)?;
+    if &expected_path != path {
+        return Err(DriverError::Other(format!(
+            "memory entry path mismatch at {path}"
+        )));
+    }
+    entry_required_str(entry, "kind")?;
+    validate_stored_tier(entry_required_str(entry, "tier")?)?;
+    entry_required_field(entry, "content")?;
+    entry_required_map(entry, "facets")?;
+    entry_required_number(entry, "weight")?;
+    entry_required_number(entry, "confidence")?;
+    entry_required_int(entry, "access_count")?;
+    entry_required_bool(entry, "low_trust")?;
+    entry_required_map(entry, "links")?;
+    entry_required_field(entry, "provenance")?;
+    entry_required_int(entry, "version")?;
+    let indexed = indexed_entry(entry)?;
+    if indexed.id != id {
+        return Err(DriverError::Other(format!(
+            "memory index metadata id mismatch at {path}"
+        )));
+    }
+    Ok(())
+}
+
 fn entry_map(entry: &Value) -> Result<&BTreeMap<String, Value>, DriverError> {
     entry
         .as_map()
@@ -858,19 +901,76 @@ fn entry_map_mut(entry: &mut Value) -> Result<&mut BTreeMap<String, Value>, Driv
 }
 
 fn entry_required_str<'a>(entry: &'a Value, field: &'static str) -> Result<&'a str, DriverError> {
+    match entry_map(entry)?.get(field) {
+        Some(Value::Str(value)) if !value.is_empty() => Ok(value.as_str()),
+        Some(Value::Str(_)) => Err(DriverError::Other(format!(
+            "memory entry field {field} must not be empty"
+        ))),
+        Some(_) => Err(DriverError::Other(format!(
+            "memory entry field {field} must be string"
+        ))),
+        None => Err(DriverError::Other(format!("memory entry missing {field}"))),
+    }
+}
+
+fn entry_required_field<'a>(
+    entry: &'a Value,
+    field: &'static str,
+) -> Result<&'a Value, DriverError> {
     entry_map(entry)?
         .get(field)
-        .and_then(|value| value.as_str())
         .ok_or_else(|| DriverError::Other(format!("memory entry missing {field}")))
 }
 
-fn entry_bool(entry: &Value, field: &'static str, default: bool) -> Result<bool, DriverError> {
-    match entry_map(entry)?.get(field) {
-        Some(Value::Bool(value)) => Ok(*value),
-        Some(_) => Err(DriverError::Other(format!(
+fn entry_required_map<'a>(
+    entry: &'a Value,
+    field: &'static str,
+) -> Result<&'a BTreeMap<String, Value>, DriverError> {
+    match entry_required_field(entry, field)? {
+        Value::Map(map) => Ok(map),
+        _ => Err(DriverError::Other(format!(
+            "memory entry field {field} must be map"
+        ))),
+    }
+}
+
+fn entry_required_bool(entry: &Value, field: &'static str) -> Result<bool, DriverError> {
+    match entry_required_field(entry, field)? {
+        Value::Bool(value) => Ok(*value),
+        _ => Err(DriverError::Other(format!(
             "memory entry field {field} must be bool"
         ))),
-        None => Ok(default),
+    }
+}
+
+fn entry_required_number(entry: &Value, field: &'static str) -> Result<(), DriverError> {
+    match entry_required_field(entry, field)? {
+        Value::Int(_) => Ok(()),
+        Value::Float(FloatBits(value)) if value.is_finite() => Ok(()),
+        Value::Float(_) => Err(DriverError::Other(format!(
+            "memory entry field {field} must be finite"
+        ))),
+        _ => Err(DriverError::Other(format!(
+            "memory entry field {field} must be numeric"
+        ))),
+    }
+}
+
+fn entry_required_int(entry: &Value, field: &'static str) -> Result<i64, DriverError> {
+    match entry_required_field(entry, field)? {
+        Value::Int(value) => Ok(*value),
+        _ => Err(DriverError::Other(format!(
+            "memory entry field {field} must be integer"
+        ))),
+    }
+}
+
+fn validate_stored_tier(tier: &str) -> Result<(), DriverError> {
+    match tier {
+        "working" | "recent" | "long_term" | "archive" => Ok(()),
+        other => Err(DriverError::Other(format!(
+            "memory entry has unknown tier {other:?}"
+        ))),
     }
 }
 
@@ -1125,6 +1225,24 @@ mod tests {
             Outcome::Done(Value::Map(values)) => Ok(values),
             other => bail!("expected map outcome, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn store_rejects_missing_content() -> anyhow::Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = driver(state);
+        let mut input = BTreeMap::new();
+        input.insert("owner".into(), Value::Str("alice".into()));
+        let out = d
+            .call(
+                MethodId::new(0),
+                Value::Map(input),
+                OutputMode::Unary,
+                &ctx(1),
+            )
+            .await;
+        ensure!(out.is_err(), "memory store accepted missing content");
+        Ok(())
     }
 
     #[tokio::test]
@@ -1471,6 +1589,66 @@ mod tests {
                 .and_then(Value::as_str)
                 == Some("recent"),
             "committed memory tier mismatch"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_persisted_memory_entries_fail_closed() -> anyhow::Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = driver(state.clone());
+        d.call(
+            MethodId::new(0),
+            store_with_id(
+                "alice",
+                DEFAULT_NAMESPACE,
+                "bad",
+                Value::Str("coffee".into()),
+            ),
+            OutputMode::Unary,
+            &ctx(1),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+        let path = memory_path("alice", DEFAULT_NAMESPACE, "bad").map_err(anyhow::Error::msg)?;
+        let mut entry = state
+            .read(&path)
+            .await?
+            .context("stored memory entry should exist")?;
+        let Value::Map(map) = &mut entry else {
+            bail!("stored memory entry was not a map");
+        };
+        map.remove("low_trust");
+        state.write_set(&path, entry).await?;
+
+        let consolidate = d
+            .call(
+                MethodId::new(4),
+                Value::Map(BTreeMap::from([(
+                    "owner".into(),
+                    Value::Str("alice".into()),
+                )])),
+                OutputMode::Unary,
+                &ctx(2),
+            )
+            .await;
+        ensure!(
+            consolidate.is_err(),
+            "consolidate should reject malformed persisted memory"
+        );
+
+        let recall = d
+            .call(
+                MethodId::new(1),
+                recall_input("alice", DEFAULT_NAMESPACE, "coffee", 1),
+                OutputMode::Unary,
+                &ctx(3),
+            )
+            .await;
+        ensure!(
+            recall.is_err(),
+            "recall should reject malformed persisted memory"
         );
         Ok(())
     }

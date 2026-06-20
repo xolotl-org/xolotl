@@ -123,24 +123,23 @@ pub const BOOTSTRAP_PHASE_PATH: &str = "state://kernel/bootstrap/phase";
 
 /// Returns `true` if `path` is under a kernel-reserved prefix.
 pub fn is_kernel_reserved(path: &Path) -> bool {
-    let s = path.to_string();
-    s == "state://kernel"
-        || s == "effect://kernel"
-        || KERNEL_RESERVED_PREFIXES
-            .iter()
-            .any(|prefix| s.starts_with(prefix))
+    path.cluster().is_none()
+        && matches!(path.scheme(), "state" | "effect")
+        && path.segments().first().map(|s| s.as_str()) == Some("kernel")
 }
 
 /// Returns `true` if `path` is under the credential-vault prefix.
 pub fn is_vault_reserved(path: &Path) -> bool {
-    let s = path.to_string();
-    s == "state://vault" || s.starts_with(VAULT_PREFIX)
+    path.cluster().is_none()
+        && path.scheme() == "state"
+        && path.segments().first().map(|s| s.as_str()) == Some("vault")
 }
 
 /// Returns `true` if `path` is under the read-only Fact projection prefix.
 pub fn is_fact_reserved(path: &Path) -> bool {
-    let s = path.to_string();
-    s == "state://fact" || s.starts_with(FACT_PREFIX)
+    path.cluster().is_none()
+        && path.scheme() == "state"
+        && path.segments().first().map(|s| s.as_str()) == Some("fact")
 }
 
 #[cfg(test)]

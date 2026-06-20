@@ -401,11 +401,11 @@ fn rate_limit_path(
     target: ResourceId,
     acting: IdentityRef,
 ) -> Result<Path, nexus_types::PathError> {
-    Path::parse(&format!(
-        "state://kernel/ratelimit/resource:{}/identity:{}",
-        target.get(),
-        acting.get()
-    ))
+    Path::try_new("state")?
+        .try_push("kernel")?
+        .try_push("ratelimit")?
+        .try_push_literal(format!("resource:{}", target.get()))?
+        .try_push_literal(format!("identity:{}", acting.get()))
 }
 
 fn decode_rate_hits(value: Option<Value>) -> Result<Vec<i64>, String> {

@@ -314,6 +314,21 @@ fn parse_vector(v: Option<&Value>, field: &str) -> Result<Vec<f32>, DriverError>
     }
 }
 
+fn parse_search_limit(v: Option<&Value>) -> Result<usize, DriverError> {
+    match v {
+        Some(Value::Int(k)) if *k >= 0 => usize::try_from(*k).map_err(|_| {
+            DriverError::InvalidInput("index.search k is too large for this platform".into())
+        }),
+        Some(Value::Int(_)) => Err(DriverError::InvalidInput(
+            "index.search k must be nonnegative".into(),
+        )),
+        Some(_) => Err(DriverError::InvalidInput(
+            "index.search k must be an integer".into(),
+        )),
+        None => Ok(10),
+    }
+}
+
 /// Cosine similarity in [-1, 1]; 0 for degenerate (zero-norm) vectors.
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
@@ -435,7 +450,7 @@ impl Driver for IndexDriver {
                     .to_string();
                 let query =
                     parse_vector(m.get("query_vec").or_else(|| m.get("vector")), "query_vec")?;
-                let k = m.get("k").and_then(|v| v.as_int()).unwrap_or(10).max(0) as usize;
+                let k = parse_search_limit(m.get("k"))?;
                 let search = {
                     let spaces = self.spaces.lock();
                     let index = match spaces.get(&space) {
@@ -507,11 +522,10 @@ impl Driver for IndexDriver {
 impl IndexDriver {
     fn upsert_one(&self, input: &Value) -> Result<(), DriverError> {
         let m = match input {
-            Value::Null => BTreeMap::new(),
-            Value::Map(m) => m.clone(),
+            Value::Map(m) => m,
             _ => {
                 return Err(DriverError::InvalidInput(
-                    "index.upsert input must be a map or null".into(),
+                    "index.upsert input must be a map".into(),
                 ));
             }
         };
@@ -764,6 +778,23 @@ mod tests {
             )
             .await;
         ensure!(out.is_err(), "missing space id was accepted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_search_limit_is_rejected() -> anyhow::Result<()> {
+        let d = IndexDriver::new();
+        upsert(&d, "s1", "a", &[1.0, 0.0]).await?;
+        for k in [Value::Int(-1), Value::Str("1".into())] {
+            let mut q = BTreeMap::new();
+            q.insert("space_id".into(), Value::Str("s1".into()));
+            q.insert("query_vec".into(), vec_val(&[1.0, 0.0]));
+            q.insert("k".into(), k);
+            let out = d
+                .call(MethodId::new(1), Value::Map(q), OutputMode::Unary, &ctx())
+                .await;
+            ensure!(out.is_err(), "malformed search k was accepted");
+        }
         Ok(())
     }
 }

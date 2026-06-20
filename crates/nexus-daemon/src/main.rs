@@ -49,9 +49,9 @@ use nexus_kernel::driver::{DriverDescriptor, DriverError, RemoteEndpoint, Remote
 use nexus_kernel::{EchoDriver, Registry, ResolveError};
 use nexus_sdk::{Backend, Bootstrap, FactSink, Kernel};
 use nexus_standard::{
-    IN_PROCESS_PROJECTION_CONFIG_PREFIX, InProcessProjectionInstallEntry,
-    InProcessProjectionInstalled, InstallError, PairingDisplayEdge, StandardConfig,
-    install_declared_in_process_projections, install_in_process_projection_value, install_standard,
+    InProcessProjectionInstallEntry, InProcessProjectionInstalled, InstallError,
+    PairingDisplayEdge, StandardConfig, install_declared_in_process_projections,
+    install_in_process_projection_value, install_standard,
 };
 use nexus_state::StateEvent;
 use nexus_storage_redb::RedbStore;
@@ -343,6 +343,14 @@ fn standard_config(pairing_display: PairingDisplayEdge) -> StandardConfig {
     StandardConfig::default().with_pairing_display(pairing_display)
 }
 
+fn in_process_projection_watch_pattern() -> Result<Path, nexus_types::PathError> {
+    Path::try_new("state")?
+        .try_push("kernel")?
+        .try_push("projections")?
+        .try_push("in-process")?
+        .try_push("**")
+}
+
 struct StandardPairingSecretDisplay(PairingDisplayEdge);
 
 impl PairingSecretDisplay for StandardPairingSecretDisplay {
@@ -354,8 +362,8 @@ impl PairingSecretDisplay for StandardPairingSecretDisplay {
 async fn start_in_process_projection_reconciler(
     boot: Arc<Bootstrap>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let pattern = Path::parse(&format!("{IN_PROCESS_PROJECTION_CONFIG_PREFIX}/**"))
-        .map_err(|error| anyhow::anyhow!("parse in-process projection watch pattern: {error}"))?;
+    let pattern = in_process_projection_watch_pattern()
+        .map_err(|error| anyhow::anyhow!("build in-process projection watch pattern: {error}"))?;
     let mut events = boot.kernel.state.subscribe(&pattern).await?;
     Ok(tokio::spawn(async move {
         loop {
@@ -595,7 +603,7 @@ fn projection_error_role(error: &InstallError) -> Option<nexus_types::Role> {
 }
 
 fn in_process_projection_status_path(id: &str) -> Result<Path> {
-    Ok(in_process_projection_status_prefix()?.try_push(id)?)
+    Ok(in_process_projection_status_prefix()?.try_push_literal(id)?)
 }
 
 fn in_process_projection_status_prefix() -> Result<Path> {
@@ -934,7 +942,9 @@ impl RemoteEndpoint for ProviderRoleEndpoint {
                     max_effect_in_flight: Some(
                         self.session_limits.provider_max_in_flight_per_effect,
                     ),
-                    max_inline_result_bytes: None,
+                    max_inline_result_bytes: Some(
+                        self.session_limits.provider_max_inline_result_bytes,
+                    ),
                     output_schema,
                 })
                 .map_err(|error| DriverError::Transport(error.to_string()))?;
@@ -1304,7 +1314,9 @@ impl DaemonExternalSessionHandler {
                     max_effect_in_flight: Some(
                         self.session_limits.provider_max_in_flight_per_effect,
                     ),
-                    max_inline_result_bytes: None,
+                    max_inline_result_bytes: Some(
+                        self.session_limits.provider_max_inline_result_bytes,
+                    ),
                     output_schema,
                 })
                 .map_err(provider_invocation_status)?;
@@ -1406,7 +1418,9 @@ impl DaemonExternalSessionHandler {
                     now_millis: now_millis(),
                     deadline_ms,
                     max_in_flight: Some(self.session_limits.source_max_in_flight_commands),
-                    max_inline_result_bytes: None,
+                    max_inline_result_bytes: Some(
+                        self.session_limits.source_command_max_inline_result_bytes,
+                    ),
                     idempotency_window_ms: self.session_limits.source_dedupe_window_ms,
                     rate_limit_window_ms: self.session_limits.source_command_rate_limit_window_ms,
                     rate_limit_max_commands: self.session_limits.source_command_rate_limit_max,
@@ -2005,12 +2019,10 @@ async fn load_external_installation(
     installation_id: &str,
 ) -> Result<ExternalInstallationDef, tonic::Status> {
     validate_external_path_segment(installation_id, "external installation id")?;
-    let path = Path::parse(&format!(
-        "state://kernel/external-installations/{installation_id}"
-    ))
-    .map_err(|error| {
-        tonic::Status::invalid_argument(format!("external installation id is invalid: {error}"))
-    })?;
+    let path =
+        external_state_path(&["external-installations", installation_id]).map_err(|error| {
+            tonic::Status::invalid_argument(format!("external installation id is invalid: {error}"))
+        })?;
     let Some(value) = state.read(&path).await.map_err(|error| {
         tonic::Status::unavailable(format!("external state read failed: {error}"))
     })?
@@ -2044,12 +2056,10 @@ async fn load_external_session(
 ) -> Result<ExternalSessionState, tonic::Status> {
     validate_external_path_segment(installation_id, "external installation id")?;
     let role = role_slug(role);
-    let path = Path::parse(&format!(
-        "state://kernel/external-sessions/{installation_id}/{role}"
-    ))
-    .map_err(|error| {
-        tonic::Status::invalid_argument(format!("external session id is invalid: {error}"))
-    })?;
+    let path =
+        external_state_path(&["external-sessions", installation_id, role]).map_err(|error| {
+            tonic::Status::invalid_argument(format!("external session id is invalid: {error}"))
+        })?;
     let Some(value) = state.read(&path).await.map_err(|error| {
         tonic::Status::unavailable(format!("external session state read failed: {error}"))
     })?
@@ -2089,12 +2099,11 @@ async fn ensure_external_not_revoked(
     credential_generation: u64,
 ) -> Result<(), tonic::Status> {
     validate_external_path_segment(installation_id, "external installation id")?;
-    let path = Path::parse(&format!(
-        "state://kernel/external-credential-revocations/{installation_id}"
-    ))
-    .map_err(|error| {
-        tonic::Status::invalid_argument(format!("external revocation id is invalid: {error}"))
-    })?;
+    let path = external_state_path(&["external-credential-revocations", installation_id]).map_err(
+        |error| {
+            tonic::Status::invalid_argument(format!("external revocation id is invalid: {error}"))
+        },
+    )?;
     let Some(value) = state.read(&path).await.map_err(|error| {
         tonic::Status::unavailable(format!("external revocation state read failed: {error}"))
     })?
@@ -2212,6 +2221,15 @@ fn validate_external_path_segment(segment: &str, label: &'static str) -> Result<
             "{label} is invalid"
         )))
     }
+}
+
+#[cfg(feature = "external-gateway")]
+fn external_state_path(segments: &[&str]) -> Result<Path, nexus_types::PathError> {
+    let mut path = Path::try_new("state")?.try_push("kernel")?;
+    for segment in segments {
+        path = path.try_push_literal(segment)?;
+    }
+    Ok(path)
 }
 
 #[cfg(feature = "external-gateway")]
@@ -3785,6 +3803,78 @@ mod tests {
         assert!(receiver.await.is_err());
         assert!(lock_test(&handler.source_commands, "source_commands")?.is_empty());
         assert!(lock_test(&handler.source_waiters, "source_waiters")?.is_empty());
+
+        let receiver = handler
+            .send_source_command(
+                nexus_types::external::OutboundCommand {
+                    id: "cmd-large-result".into(),
+                    action: Value::Str("sync".into()),
+                    observed: Default::default(),
+                },
+                &session,
+                &context,
+                None,
+            )
+            .await
+            .context("sending source command with oversized result payload")?;
+        recv_external_frame(&mut outbound_rx, "source command with oversized result").await?;
+        let err = match ExternalSessionHandler::on_command_result(
+            &handler,
+            CommandResult {
+                id: "cmd-large-result".into(),
+                outcome: Ok(Value::Str("x".repeat(
+                    config::DEFAULT_EXTERNAL_SOURCE_COMMAND_MAX_INLINE_RESULT_BYTES + 1,
+                ))),
+            },
+            &session,
+            context.clone(),
+        )
+        .await
+        {
+            Ok(()) => bail!("expected oversized command result rejection"),
+            Err(error) => error,
+        };
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(receiver.await.is_err());
+        assert!(lock_test(&handler.source_commands, "source_commands")?.is_empty());
+        assert!(lock_test(&handler.source_waiters, "source_waiters")?.is_empty());
+
+        let receiver = handler
+            .send_source_command(
+                nexus_types::external::OutboundCommand {
+                    id: "cmd-large-error".into(),
+                    action: Value::Str("sync".into()),
+                    observed: Default::default(),
+                },
+                &session,
+                &context,
+                None,
+            )
+            .await
+            .context("sending source command with oversized error result")?;
+        recv_external_frame(&mut outbound_rx, "source command with oversized error").await?;
+        let err = match ExternalSessionHandler::on_command_result(
+            &handler,
+            CommandResult {
+                id: "cmd-large-error".into(),
+                outcome: Err(nexus_types::ErrorInfo {
+                    kind: "remote".into(),
+                    message: "x"
+                        .repeat(config::DEFAULT_EXTERNAL_SOURCE_COMMAND_MAX_INLINE_RESULT_BYTES),
+                }),
+            },
+            &session,
+            context.clone(),
+        )
+        .await
+        {
+            Ok(()) => bail!("expected oversized command error result rejection"),
+            Err(error) => error,
+        };
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(receiver.await.is_err());
+        assert!(lock_test(&handler.source_commands, "source_commands")?.is_empty());
+        assert!(lock_test(&handler.source_waiters, "source_waiters")?.is_empty());
         Ok(())
     }
 
@@ -4128,6 +4218,73 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let invoke = nexus_types::external::Invoke {
+            invocation_id: "invoke-large".into(),
+            effect_path: parse_test_path("effect://external-provider/chat/search")?,
+            method_id: nexus_types::MethodId::new(0),
+            input: Value::Str("query".into()),
+            deadline_ms: None,
+            output_stream_to: None,
+        };
+        let receiver = handler
+            .register_provider_invoke(&invoke, &session, &context)
+            .await
+            .context("registering provider invocation with oversized result payload")?;
+        let err = match ExternalSessionHandler::on_invoke_result(
+            &handler,
+            InvokeResult {
+                invocation_id: "invoke-large".into(),
+                outcome: Ok(Value::Str("x".repeat(
+                    config::DEFAULT_EXTERNAL_PROVIDER_MAX_INLINE_RESULT_BYTES + 1,
+                ))),
+            },
+            &session,
+            context.clone(),
+        )
+        .await
+        {
+            Ok(()) => bail!("expected oversized provider invoke result rejection"),
+            Err(error) => error,
+        };
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(receiver.await.is_err());
+        assert!(lock_test(&handler.provider_invocations, "provider_invocations")?.is_empty());
+        assert!(lock_test(&handler.provider_waiters, "provider_waiters")?.is_empty());
+
+        let invoke = nexus_types::external::Invoke {
+            invocation_id: "invoke-large-error".into(),
+            effect_path: parse_test_path("effect://external-provider/chat/search")?,
+            method_id: nexus_types::MethodId::new(0),
+            input: Value::Str("query".into()),
+            deadline_ms: None,
+            output_stream_to: None,
+        };
+        let receiver = handler
+            .register_provider_invoke(&invoke, &session, &context)
+            .await
+            .context("registering provider invocation with oversized error result")?;
+        let err = match ExternalSessionHandler::on_invoke_result(
+            &handler,
+            InvokeResult {
+                invocation_id: "invoke-large-error".into(),
+                outcome: Err(nexus_types::ErrorInfo {
+                    kind: "remote".into(),
+                    message: "x".repeat(config::DEFAULT_EXTERNAL_PROVIDER_MAX_INLINE_RESULT_BYTES),
+                }),
+            },
+            &session,
+            context.clone(),
+        )
+        .await
+        {
+            Ok(()) => bail!("expected oversized provider invoke error result rejection"),
+            Err(error) => error,
+        };
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(receiver.await.is_err());
+        assert!(lock_test(&handler.provider_invocations, "provider_invocations")?.is_empty());
+        assert!(lock_test(&handler.provider_waiters, "provider_waiters")?.is_empty());
 
         let invoke = nexus_types::external::Invoke {
             invocation_id: "invoke-schema".into(),

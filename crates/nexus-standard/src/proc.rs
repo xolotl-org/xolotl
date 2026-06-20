@@ -71,15 +71,13 @@ impl ProcDriver {
     /// illegal path segment is a caller error (returned as `DriverError`), never
     /// a panic.
     fn status_path(id: &str) -> Result<Path, DriverError> {
-        Path::parse(&format!("state://kernel/procs/{id}/status"))
-            .map_err(|e| DriverError::Other(format!("invalid proc id {id:?}: {e}")))
+        proc_state_path(id, "status")
     }
 
     /// Build a process's health path: `last_heartbeat`, `rtt_ms`,
     /// `inflight` live here, updated on each heartbeat.
     fn health_path(id: &str) -> Result<Path, DriverError> {
-        Path::parse(&format!("state://kernel/procs/{id}/health"))
-            .map_err(|e| DriverError::Other(format!("invalid proc id {id:?}: {e}")))
+        proc_state_path(id, "health")
     }
 
     fn status_value(
@@ -141,8 +139,12 @@ impl ProcDriver {
         let Some(exit) = exit else {
             return Ok(None);
         };
+        let restarts = match self.read_status(id).await? {
+            Some(status) => stored_proc_status(&status)?.restarts,
+            None => 0,
+        };
         self.children.lock().remove(id);
-        let status = Self::status_value(PHASE_DEAD, 0, None, Some(live.pid), exit.code());
+        let status = Self::status_value(PHASE_DEAD, restarts, None, Some(live.pid), exit.code());
         self.state
             .write_set(&Self::status_path(id)?, status.clone())
             .await
@@ -156,14 +158,14 @@ impl ProcDriver {
                 "proc {id:?} is already running"
             )));
         }
-        if let Some(Value::Map(status)) = self.read_status(id).await?
-            && let Some(PHASE_STARTING | PHASE_READY | PHASE_DRAINING) =
-                status.get("phase").and_then(Value::as_str)
-        {
-            return Err(DriverError::Other(format!(
-                "proc {id:?} is already in phase {:?}",
-                status.get("phase").and_then(Value::as_str)
-            )));
+        if let Some(status) = self.read_status(id).await? {
+            let status = stored_proc_status(&status)?;
+            if matches!(status.phase, PHASE_STARTING | PHASE_READY | PHASE_DRAINING) {
+                return Err(DriverError::Other(format!(
+                    "proc {id:?} is already in phase {:?}",
+                    status.phase
+                )));
+            }
         }
         Ok(())
     }
@@ -228,7 +230,7 @@ impl Driver for ProcDriver {
             // Starting until EndpointSupervisor reports readiness.
             0 => {
                 let restarts = match &input {
-                    Value::Map(m) => m.get("restarts").and_then(|v| v.as_int()).unwrap_or(0),
+                    Value::Map(m) => optional_non_negative_int(m, "restarts", 0)?,
                     _ => {
                         return Err(DriverError::InvalidInput(
                             "proc.spawn input must be a ProcSpec map".into(),
@@ -253,23 +255,24 @@ impl Driver for ProcDriver {
             1 => {
                 let m = crate::input::map(input, "proc.kill")?;
                 let id = required_id(&m)?;
-                let had_status = self.read_status(&id).await?.is_some();
+                let stored_status = self.read_status(&id).await?;
+                let restarts = match stored_status.as_ref() {
+                    Some(status) => stored_proc_status(status)?.restarts,
+                    None => 0,
+                };
+                let had_status = stored_status.is_some();
                 let pid = self.kill_child(&id).await?;
                 if pid.is_none() && !had_status {
                     return Err(DriverError::Other(format!("unknown proc id {id:?}")));
                 }
-                let status = Self::status_value(PHASE_DEAD, 0, None, pid, None);
+                let status = Self::status_value(PHASE_DEAD, restarts, None, pid, None);
                 self.write_status(&id, status).await
             }
             // signal: deliver a signal to a managed Stdio child.
             2 => {
                 let m = crate::input::map(input, "proc.signal")?;
                 let id = required_id(&m)?;
-                let sig = m
-                    .get("signal")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("TERM")
-                    .to_string();
+                let sig = optional_signal(&m)?.to_string();
                 let live = self.live_child(&id).ok_or_else(|| {
                     DriverError::Other(format!("proc {id:?} has no managed child to signal"))
                 })?;
@@ -283,9 +286,13 @@ impl Driver for ProcDriver {
                 if let Some(status) = self.refresh_child_status(&id).await? {
                     return Ok(Outcome::Done(status));
                 }
-                Ok(Outcome::Done(
-                    self.read_status(&id).await?.unwrap_or(Value::Null),
-                ))
+                match self.read_status(&id).await? {
+                    Some(status) => {
+                        stored_proc_status(&status)?;
+                        Ok(Outcome::Done(status))
+                    }
+                    None => Ok(Outcome::Done(Value::Null)),
+                }
             }
             // heartbeat: record liveness to the health path. Input may
             // carry `rtt_ms` / `inflight`; we stamp `last_heartbeat` from the
@@ -293,8 +300,19 @@ impl Driver for ProcDriver {
             4 => {
                 let m = crate::input::map(input, "proc.heartbeat")?;
                 let id = required_id(&m)?;
-                let rtt = m.get("rtt_ms").and_then(|v| v.as_int()).unwrap_or(0);
-                let inflight = m.get("inflight").and_then(|v| v.as_int()).unwrap_or(0);
+                let rtt = optional_non_negative_int(&m, "rtt_ms", 0)?;
+                let inflight = optional_non_negative_int(&m, "inflight", 0)?;
+                let promotion = match self.read_status(&id).await? {
+                    Some(status) => {
+                        let status = stored_proc_status(&status)?;
+                        if status.phase == PHASE_STARTING {
+                            Some((status.restarts, status.pid))
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
                 let mut health = BTreeMap::new();
                 health.insert(
                     "last_heartbeat".into(),
@@ -306,16 +324,7 @@ impl Driver for ProcDriver {
                     .write_set(&Self::health_path(&id)?, Value::Map(health))
                     .await
                     .map_err(|e| DriverError::Other(e.to_string()))?;
-                if let Some(Value::Map(status)) = self.read_status(&id).await?
-                    && status.get("phase").and_then(Value::as_str) == Some(PHASE_STARTING)
-                {
-                    let restarts = status.get("restarts").and_then(Value::as_int).unwrap_or(0);
-                    let pid = match status.get("pid").and_then(Value::as_int) {
-                        Some(pid) => Some(u32::try_from(pid).map_err(|_| {
-                            DriverError::Other("stored proc pid is out of range".into())
-                        })?),
-                        None => None,
-                    };
+                if let Some((restarts, pid)) = promotion {
                     let promoted = Self::status_value(PHASE_READY, restarts, None, pid, None);
                     self.state
                         .write_set(&Self::status_path(&id)?, promoted)
@@ -332,14 +341,18 @@ impl Driver for ProcDriver {
     }
 }
 
+struct StoredProcStatus<'a> {
+    phase: &'a str,
+    restarts: i64,
+    pid: Option<u32>,
+}
+
 fn parse_proc_spec(input: Value) -> Result<ProcSpec, DriverError> {
     let json = serde_json::to_value(&input)
         .map_err(|e| DriverError::Other(format!("proc spec serialization failed: {e}")))?;
     let spec: ProcSpec = serde_json::from_value(json)
         .map_err(|e| DriverError::Other(format!("proc.spawn requires ProcSpec input: {e}")))?;
-    if spec.id.is_empty() {
-        return Err(DriverError::Other("proc id must not be empty".into()));
-    }
+    validate_proc_id(&spec.id)?;
     match &spec.transport {
         Transport::Stdio { command, args } => {
             let argv = spec.command.as_ref().ok_or_else(|| {
@@ -381,12 +394,148 @@ fn parse_proc_spec(input: Value) -> Result<ProcSpec, DriverError> {
     Ok(spec)
 }
 
+fn proc_state_path(id: &str, leaf: &str) -> Result<Path, DriverError> {
+    validate_proc_id(id)?;
+    Path::try_new("state")
+        .and_then(|path| path.try_push("kernel"))
+        .and_then(|path| path.try_push("procs"))
+        .and_then(|path| path.try_push_literal(id))
+        .and_then(|path| path.try_push_literal(leaf))
+        .map_err(|e| DriverError::Other(format!("invalid proc id {id:?}: {e}")))
+}
+
+fn validate_proc_id(id: &str) -> Result<(), DriverError> {
+    Path::try_new("state")
+        .and_then(|path| path.try_push_literal(id))
+        .map(|_| ())
+        .map_err(|e| DriverError::Other(format!("invalid proc id {id:?}: {e}")))
+}
+
 fn required_id(m: &BTreeMap<String, Value>) -> Result<String, DriverError> {
-    m.get("id")
+    let id = m
+        .get("id")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| DriverError::Other("proc op requires id".into()))
+        .ok_or_else(|| DriverError::Other("proc op requires id".into()))?;
+    validate_proc_id(id)?;
+    Ok(id.to_string())
+}
+
+fn optional_non_negative_int(
+    m: &BTreeMap<String, Value>,
+    field: &'static str,
+    default: i64,
+) -> Result<i64, DriverError> {
+    match m.get(field) {
+        None => Ok(default),
+        Some(Value::Int(value)) if *value >= 0 => Ok(*value),
+        Some(Value::Int(_)) => Err(DriverError::InvalidInput(format!(
+            "proc {field} must be non-negative"
+        ))),
+        Some(_) => Err(DriverError::InvalidInput(format!(
+            "proc {field} must be an integer"
+        ))),
+    }
+}
+
+fn stored_proc_status(value: &Value) -> Result<StoredProcStatus<'_>, DriverError> {
+    let Value::Map(m) = value else {
+        return Err(DriverError::Other(
+            "malformed proc status: not a map".into(),
+        ));
+    };
+    let phase = match m.get("phase") {
+        Some(Value::Str(phase))
+            if matches!(
+                phase.as_str(),
+                PHASE_STARTING | PHASE_READY | PHASE_DRAINING | PHASE_DEAD
+            ) =>
+        {
+            phase.as_str()
+        }
+        Some(Value::Str(phase)) => {
+            return Err(DriverError::Other(format!(
+                "malformed proc status: unknown phase {phase:?}"
+            )));
+        }
+        Some(_) => {
+            return Err(DriverError::Other(
+                "malformed proc status: phase must be a string".into(),
+            ));
+        }
+        None => {
+            return Err(DriverError::Other(
+                "malformed proc status: missing phase".into(),
+            ));
+        }
+    };
+    let restarts = required_stored_non_negative_int(m, "restarts")?;
+    let pid = optional_stored_pid(m)?;
+    if let Some(value) = m.get("transport")
+        && !matches!(value, Value::Str(_))
+    {
+        return Err(DriverError::Other(
+            "malformed proc status: transport must be a string".into(),
+        ));
+    }
+    if let Some(value) = m.get("exit_code")
+        && !matches!(value, Value::Int(_))
+    {
+        return Err(DriverError::Other(
+            "malformed proc status: exit_code must be an integer".into(),
+        ));
+    }
+    Ok(StoredProcStatus {
+        phase,
+        restarts,
+        pid,
+    })
+}
+
+fn required_stored_non_negative_int(
+    m: &BTreeMap<String, Value>,
+    field: &'static str,
+) -> Result<i64, DriverError> {
+    match m.get(field) {
+        Some(Value::Int(value)) if *value >= 0 => Ok(*value),
+        Some(Value::Int(_)) => Err(DriverError::Other(format!(
+            "malformed proc status: {field} must be non-negative"
+        ))),
+        Some(_) => Err(DriverError::Other(format!(
+            "malformed proc status: {field} must be an integer"
+        ))),
+        None => Err(DriverError::Other(format!(
+            "malformed proc status: missing {field}"
+        ))),
+    }
+}
+
+fn optional_stored_pid(m: &BTreeMap<String, Value>) -> Result<Option<u32>, DriverError> {
+    match m.get("pid") {
+        None => Ok(None),
+        Some(Value::Int(pid)) if *pid > 0 => u32::try_from(*pid)
+            .map(Some)
+            .map_err(|_| DriverError::Other("malformed proc status: pid is out of range".into())),
+        Some(Value::Int(_)) => Err(DriverError::Other(
+            "malformed proc status: pid must be positive".into(),
+        )),
+        Some(_) => Err(DriverError::Other(
+            "malformed proc status: pid must be an integer".into(),
+        )),
+    }
+}
+
+fn optional_signal(m: &BTreeMap<String, Value>) -> Result<&str, DriverError> {
+    match m.get("signal") {
+        None => Ok("TERM"),
+        Some(Value::Str(signal)) if !signal.is_empty() => Ok(signal),
+        Some(Value::Str(_)) => Err(DriverError::InvalidInput(
+            "proc signal must not be empty".into(),
+        )),
+        Some(_) => Err(DriverError::InvalidInput(
+            "proc signal must be a string".into(),
+        )),
+    }
 }
 
 fn transport_name(t: &Transport) -> &'static str {
@@ -530,6 +679,20 @@ mod tests {
         Ok(serde_json::from_value(serde_json::to_value(spec)?)?)
     }
 
+    fn websocket_spec_input(id: &str) -> anyhow::Result<Value> {
+        let spec = ProcSpec {
+            id: id.into(),
+            transport: Transport::WebSocket {
+                endpoint: Some("wss://example.test/ext".into()),
+            },
+            command: None,
+            env: BTreeMap::new(),
+            cwd: None,
+            restart: nexus_types::RestartPolicy::Never,
+        };
+        Ok(serde_json::from_value(serde_json::to_value(spec)?)?)
+    }
+
     #[tokio::test]
     async fn spawn_requires_proc_spec_not_id_shorthand() -> anyhow::Result<()> {
         let state: Backend = Arc::new(InMemoryBackend::new());
@@ -595,6 +758,50 @@ mod tests {
         ensure!(
             matches!(out, Err(DriverError::Other(ref message)) if message.contains("non-stdio")),
             "unexpected endpoint transport command result: {out:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_proc_id_path_delimiters() -> anyhow::Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = ProcDriver::new(state);
+        let spec = ProcSpec {
+            id: "ext/bad".into(),
+            transport: Transport::WebSocket {
+                endpoint: Some("wss://example.test/ext".into()),
+            },
+            command: None,
+            env: BTreeMap::new(),
+            cwd: None,
+            restart: nexus_types::RestartPolicy::Never,
+        };
+        let input = serde_json::from_value(serde_json::to_value(spec)?)?;
+
+        let out = d
+            .call(MethodId::new(0), input, OutputMode::Unary, &ctx())
+            .await;
+        ensure!(
+            matches!(out, Err(DriverError::Other(ref message)) if message.contains("invalid proc id")),
+            "unexpected invalid id result: {out:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signal_rejects_non_string_signal() -> anyhow::Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = ProcDriver::new(state);
+        let mut m = BTreeMap::new();
+        m.insert("id".into(), Value::Str("ext-sig".into()));
+        m.insert("signal".into(), Value::Int(15));
+
+        let out = d
+            .call(MethodId::new(2), Value::Map(m), OutputMode::Unary, &ctx())
+            .await;
+        ensure!(
+            matches!(out, Err(DriverError::InvalidInput(ref message)) if message.contains("signal")),
+            "unexpected invalid signal result: {out:?}"
         );
         Ok(())
     }
@@ -740,6 +947,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kill_preserves_stored_restart_count() -> anyhow::Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = ProcDriver::new(state.clone());
+        let mut status = BTreeMap::new();
+        status.insert("phase".into(), Value::Str(PHASE_READY.into()));
+        status.insert("restarts".into(), Value::Int(4));
+        state
+            .write_set(
+                &ProcDriver::status_path("ext-restarts")?,
+                Value::Map(status),
+            )
+            .await?;
+
+        let out = d
+            .call(
+                MethodId::new(1),
+                id_input("ext-restarts"),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await?;
+        match out {
+            Outcome::Done(Value::Map(m)) => {
+                ensure!(
+                    m.get("phase") == Some(&Value::Str(PHASE_DEAD.into())),
+                    "expected dead phase, got {:?}",
+                    m.get("phase")
+                );
+                ensure!(
+                    m.get("restarts") == Some(&Value::Int(4)),
+                    "kill reset restart count: {:?}",
+                    m.get("restarts")
+                );
+            }
+            other => bail!("expected status map, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn status_terminalizes_exited_stdio_child() -> anyhow::Result<()> {
         let state: Backend = Arc::new(InMemoryBackend::new());
         let d = ProcDriver::new(state);
@@ -819,6 +1066,127 @@ mod tests {
             matches!(hm.get("last_heartbeat"), Some(Value::Int(_))),
             "missing last heartbeat: {:?}",
             hm.get("last_heartbeat")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_invalid_id_and_metrics() -> anyhow::Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = ProcDriver::new(state);
+        let mut bad_id = BTreeMap::new();
+        bad_id.insert("id".into(), Value::Str("ext/h".into()));
+        let out = d
+            .call(
+                MethodId::new(4),
+                Value::Map(bad_id),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await;
+        ensure!(out.is_err(), "heartbeat accepted id with path delimiter");
+
+        let mut bad_metric = BTreeMap::new();
+        bad_metric.insert("id".into(), Value::Str("ext-h".into()));
+        bad_metric.insert("rtt_ms".into(), Value::Int(-1));
+        let out = d
+            .call(
+                MethodId::new(4),
+                Value::Map(bad_metric),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await;
+        ensure!(out.is_err(), "heartbeat accepted negative rtt_ms");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn status_rejects_malformed_persisted_state() -> anyhow::Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = ProcDriver::new(state.clone());
+        let mut status = BTreeMap::new();
+        status.insert("phase".into(), Value::Str(PHASE_STARTING.into()));
+        status.insert("restarts".into(), Value::Str("bad".into()));
+        state
+            .write_set(&ProcDriver::status_path("ext-corrupt")?, Value::Map(status))
+            .await?;
+
+        let out = d
+            .call(
+                MethodId::new(3),
+                id_input("ext-corrupt"),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await;
+        ensure!(
+            matches!(out, Err(DriverError::Other(ref message)) if message.contains("malformed proc status")),
+            "status accepted malformed persisted state: {out:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_malformed_status_without_writing_health() -> anyhow::Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = ProcDriver::new(state.clone());
+        let mut status = BTreeMap::new();
+        status.insert("phase".into(), Value::Str(PHASE_STARTING.into()));
+        status.insert("restarts".into(), Value::Str("bad".into()));
+        state
+            .write_set(
+                &ProcDriver::status_path("ext-corrupt-hb")?,
+                Value::Map(status),
+            )
+            .await?;
+
+        let out = d
+            .call(
+                MethodId::new(4),
+                id_input("ext-corrupt-hb"),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await;
+        ensure!(
+            matches!(out, Err(DriverError::Other(ref message)) if message.contains("malformed proc status")),
+            "heartbeat accepted malformed persisted status: {out:?}"
+        );
+        let health_path = nexus_types::Path::parse("state://kernel/procs/ext-corrupt-hb/health")
+            .context("parse health path")?;
+        ensure!(
+            state.read(&health_path).await?.is_none(),
+            "heartbeat wrote health for malformed proc status"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_malformed_persisted_status() -> anyhow::Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = ProcDriver::new(state.clone());
+        let mut status = BTreeMap::new();
+        status.insert("phase".into(), Value::Int(1));
+        status.insert("restarts".into(), Value::Int(0));
+        state
+            .write_set(
+                &ProcDriver::status_path("ext-corrupt-spawn")?,
+                Value::Map(status),
+            )
+            .await?;
+
+        let out = d
+            .call(
+                MethodId::new(0),
+                websocket_spec_input("ext-corrupt-spawn")?,
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await;
+        ensure!(
+            matches!(out, Err(DriverError::Other(ref message)) if message.contains("malformed proc status")),
+            "spawn accepted malformed persisted status: {out:?}"
         );
         Ok(())
     }

@@ -58,29 +58,21 @@ impl Driver for CompressDriver {
             // summary_tokens}. If the text already fits, it passes through
             // unchanged (no spurious model call).
             0 => {
-                let m = match &input {
-                    Value::Null | Value::Str(_) => BTreeMap::new(),
-                    Value::Map(m) => m.clone(),
+                let (text, max_tokens) = match &input {
+                    Value::Str(text) => (text.as_str(), 512usize),
+                    Value::Map(m) => (
+                        required_string(m, "text", "compress.summarize")?,
+                        optional_positive_usize(m, "max_tokens", 512, "compress.summarize")?,
+                    ),
                     _ => {
                         return Err(DriverError::InvalidInput(
-                            "compress.summarize input must be a map, string text, or null".into(),
+                            "compress.summarize input must be a map or string text".into(),
                         ));
                     }
                 };
-                let text = m
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .or_else(|| input.as_str().map(String::from))
-                    .unwrap_or_default();
-                let max_tokens = m
-                    .get("max_tokens")
-                    .and_then(|v| v.as_int())
-                    .unwrap_or(512)
-                    .max(1) as usize;
-                let original_tokens = approx_tokens(&text);
+                let original_tokens = approx_tokens(text);
                 let summary = if original_tokens <= max_tokens {
-                    text.clone()
+                    text.to_string()
                 } else {
                     // Delegate to the model to summarize under budget.
                     let prompt = format!(
@@ -92,7 +84,11 @@ impl Driver for CompressDriver {
                         .map_err(DriverError::Other)?
                         .as_str()
                         .map(String::from)
-                        .unwrap_or(text)
+                        .ok_or_else(|| {
+                            DriverError::Other(
+                                "compress.summarize backend returned non-string summary".into(),
+                            )
+                        })?
                 };
                 let mut out = BTreeMap::new();
                 out.insert("summary".into(), Value::Str(summary.clone()));
@@ -107,23 +103,37 @@ impl Driver for CompressDriver {
             // highest-priority `max_steps` (by an optional per-step `priority`,
             // else original order). Structural, pure.
             1 => {
-                let m = crate::input::map(input, "compress.trim-plan")?;
-                let max_steps = m
-                    .get("max_steps")
-                    .and_then(|v| v.as_int())
-                    .unwrap_or(0)
-                    .max(0) as usize;
-                let steps = match m.get("steps") {
-                    Some(Value::List(s)) => s.clone(),
-                    _ => vec![],
+                let Value::Map(m) = input else {
+                    return Err(DriverError::InvalidInput(
+                        "compress.trim-plan input must be a map".into(),
+                    ));
                 };
+                let max_steps = required_non_negative_usize(&m, "max_steps", "compress.trim-plan")?;
+                let steps = match m.get("steps") {
+                    Some(Value::List(s)) => s,
+                    Some(_) => {
+                        return Err(DriverError::InvalidInput(
+                            "compress.trim-plan `steps` must be a list".into(),
+                        ));
+                    }
+                    None => {
+                        return Err(DriverError::InvalidInput(
+                            "compress.trim-plan requires `steps`".into(),
+                        ));
+                    }
+                };
+                let priorities = steps
+                    .iter()
+                    .map(step_priority)
+                    .collect::<Result<Vec<_>, _>>()?;
                 let kept = if max_steps == 0 || steps.len() <= max_steps {
-                    steps
+                    steps.clone()
                 } else {
                     // Sort by descending priority (default 0), keep top max_steps,
                     // preserving relative order among kept steps.
-                    let mut indexed: Vec<(usize, &Value)> = steps.iter().enumerate().collect();
-                    indexed.sort_by_key(|(_, v)| std::cmp::Reverse(step_priority(v)));
+                    let mut indexed: Vec<(usize, i64)> =
+                        priorities.into_iter().enumerate().collect();
+                    indexed.sort_by_key(|(_, priority)| std::cmp::Reverse(*priority));
                     let mut keep: Vec<usize> = indexed
                         .into_iter()
                         .take(max_steps)
@@ -141,11 +151,71 @@ impl Driver for CompressDriver {
     }
 }
 
-fn step_priority(step: &Value) -> i64 {
-    step.as_map()
-        .and_then(|m| m.get("priority"))
-        .and_then(|v| v.as_int())
-        .unwrap_or(0)
+fn required_string<'a>(
+    m: &'a BTreeMap<String, Value>,
+    field: &'static str,
+    op: &'static str,
+) -> Result<&'a str, DriverError> {
+    match m.get(field) {
+        Some(Value::Str(value)) => Ok(value),
+        Some(_) => Err(DriverError::InvalidInput(format!(
+            "{op} `{field}` must be a string"
+        ))),
+        None => Err(DriverError::InvalidInput(format!(
+            "{op} requires `{field}`"
+        ))),
+    }
+}
+
+fn optional_positive_usize(
+    m: &BTreeMap<String, Value>,
+    field: &'static str,
+    default: usize,
+    op: &'static str,
+) -> Result<usize, DriverError> {
+    match m.get(field) {
+        None => Ok(default),
+        Some(Value::Int(value)) if *value > 0 => usize::try_from(*value)
+            .map_err(|_| DriverError::InvalidInput(format!("{op} `{field}` is out of range"))),
+        Some(Value::Int(_)) => Err(DriverError::InvalidInput(format!(
+            "{op} `{field}` must be positive"
+        ))),
+        Some(_) => Err(DriverError::InvalidInput(format!(
+            "{op} `{field}` must be an integer"
+        ))),
+    }
+}
+
+fn required_non_negative_usize(
+    m: &BTreeMap<String, Value>,
+    field: &'static str,
+    op: &'static str,
+) -> Result<usize, DriverError> {
+    match m.get(field) {
+        Some(Value::Int(value)) if *value >= 0 => usize::try_from(*value)
+            .map_err(|_| DriverError::InvalidInput(format!("{op} `{field}` is out of range"))),
+        Some(Value::Int(_)) => Err(DriverError::InvalidInput(format!(
+            "{op} `{field}` must be non-negative"
+        ))),
+        Some(_) => Err(DriverError::InvalidInput(format!(
+            "{op} `{field}` must be an integer"
+        ))),
+        None => Err(DriverError::InvalidInput(format!(
+            "{op} requires `{field}`"
+        ))),
+    }
+}
+
+fn step_priority(step: &Value) -> Result<i64, DriverError> {
+    let Some(priority) = step.as_map().and_then(|m| m.get("priority")) else {
+        return Ok(0);
+    };
+    match priority {
+        Value::Int(value) => Ok(*value),
+        _ => Err(DriverError::InvalidInput(
+            "compress.trim-plan step `priority` must be an integer".into(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -213,6 +283,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn summarize_rejects_malformed_input() -> Result<()> {
+        let mut missing_text = BTreeMap::new();
+        missing_text.insert("max_tokens".into(), Value::Int(10));
+        let out = driver()
+            .call(
+                MethodId::new(0),
+                Value::Map(missing_text),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await;
+        ensure!(out.is_err(), "summarize accepted missing text");
+
+        let mut bad_budget = BTreeMap::new();
+        bad_budget.insert("text".into(), Value::Str("hello".into()));
+        bad_budget.insert("max_tokens".into(), Value::Str("many".into()));
+        let out = driver()
+            .call(
+                MethodId::new(0),
+                Value::Map(bad_budget),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await;
+        ensure!(out.is_err(), "summarize accepted malformed max_tokens");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn trim_plan_keeps_highest_priority_steps() -> Result<()> {
         let step = |id: i64, prio: i64| {
             let mut s = BTreeMap::new();
@@ -245,5 +344,36 @@ mod tests {
             },
             other => bail!("expected trim map, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn trim_plan_rejects_malformed_input() -> Result<()> {
+        let mut missing_steps = BTreeMap::new();
+        missing_steps.insert("max_steps".into(), Value::Int(1));
+        let out = driver()
+            .call(
+                MethodId::new(1),
+                Value::Map(missing_steps),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await;
+        ensure!(out.is_err(), "trim-plan accepted missing steps");
+
+        let mut step = BTreeMap::new();
+        step.insert("priority".into(), Value::Str("high".into()));
+        let mut bad_priority = BTreeMap::new();
+        bad_priority.insert("steps".into(), Value::List(vec![Value::Map(step)]));
+        bad_priority.insert("max_steps".into(), Value::Int(1));
+        let out = driver()
+            .call(
+                MethodId::new(1),
+                Value::Map(bad_priority),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await;
+        ensure!(out.is_err(), "trim-plan accepted malformed priority");
+        Ok(())
     }
 }

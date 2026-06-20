@@ -13,4 +13,3 @@
 - [HTTP Inference Providers](http-inference-providers.md)
 - [Configuration](configuration.md)
 - [API Reference](api-reference.md)
-- [Documentation Policy](documentation-policy.md)

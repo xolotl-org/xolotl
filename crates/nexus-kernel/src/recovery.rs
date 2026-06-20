@@ -7,9 +7,12 @@
 
 use crate::fact::FactSink;
 use nexus_graph::GraphCursor;
-use nexus_types::{Fact, NodeId, Outcome, ProcessId, ReplayClass};
+use nexus_types::{
+    DecisionTag, Fact, NodeId, OperationId, Outcome, OutcomeRef, Path, ProcessId, ReplayClass,
+    Value, ValueRef,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A replay map: `CausalPosition` (NodeId) → the recorded outcome of a
 /// completed Operation. When a recovered Process re-runs its program, the
@@ -200,39 +203,201 @@ pub async fn recover_process_persisting(
 ) -> Result<RecoveryReport, crate::FactError> {
     let (report, quarantine, _replay) = recover_process(facts, process)?;
     for entry in &quarantine {
-        let path = nexus_types::Path::parse(&format!(
-            "{}{}/{}",
-            nexus_types::QUARANTINE_PREFIX,
-            process.get(),
-            entry.fact.id
-        ));
-        if let Ok(path) = path {
-            let v = nexus_types::Value::Str(format!(
-                "{:?} suggested={:?}",
-                entry.fact.id, entry.suggested_action
-            ));
-            if let Err(error) = state.write_set(&path, v).await {
-                tracing::warn!(
-                    ?error,
-                    %path,
-                    process = process.get(),
-                    fact = %entry.fact.id,
-                    "quarantine state write failed during recovery"
-                );
-            }
-        }
+        let path = quarantine_path(process, entry.fact.id)?;
+        let value = quarantine_entry_value(entry);
+        state.write_set(&path, value).await.map_err(|error| {
+            crate::FactError(format!("quarantine state write failed at {path}: {error}"))
+        })?;
     }
     Ok(report)
+}
+
+fn quarantine_path(process: ProcessId, op_id: OperationId) -> Result<Path, crate::FactError> {
+    Path::try_new("state")
+        .and_then(|path| path.try_push("quarantine"))
+        .and_then(|path| path.try_push_literal(process.get().to_string()))
+        .and_then(|path| path.try_push_literal(op_id.process.get().to_string()))
+        .and_then(|path| path.try_push_literal(op_id.position.get().to_string()))
+        .and_then(|path| path.try_push_literal(op_id.attempt.to_string()))
+        .map_err(|error| crate::FactError(format!("quarantine path construction failed: {error}")))
+}
+
+fn quarantine_entry_value(entry: &QuarantineEntry) -> Value {
+    let fact = &entry.fact;
+    let mut root = BTreeMap::new();
+    root.insert("kind".into(), Value::Str("quarantine_entry".into()));
+    root.insert("op_id".into(), Value::Str(fact.id.to_string()));
+    root.insert(
+        "suggested_action".into(),
+        Value::Str(quarantine_action_name(entry.suggested_action).into()),
+    );
+    root.insert("pending".into(), Value::Bool(!fact.is_complete()));
+    root.insert("fact".into(), fact_value(fact));
+    Value::Map(root)
+}
+
+fn fact_value(fact: &Fact) -> Value {
+    let mut map = BTreeMap::new();
+    map.insert(
+        "schema_version".into(),
+        Value::Int(i64::from(fact.schema_version)),
+    );
+    map.insert("caller".into(), u64_value(fact.caller.get()));
+    map.insert("acting".into(), u64_value(fact.acting.get()));
+    map.insert(
+        "handle".into(),
+        handle_value(fact.handle.index, fact.handle.generation),
+    );
+    map.insert("resource".into(), u64_value(fact.resource.get()));
+    map.insert("method".into(), u64_value(fact.method.get()));
+    map.insert("input_ref".into(), value_ref_value(&fact.input_ref));
+    map.insert(
+        "decision".into(),
+        Value::Str(decision_name(fact.decision).into()),
+    );
+    map.insert("outcome_ref".into(), outcome_ref_value(&fact.outcome_ref));
+    map.insert("replay".into(), Value::Str(replay_name(fact.replay).into()));
+    map.insert("timestamp".into(), Value::Int(fact.timestamp.get()));
+    map.insert("tainted".into(), Value::Bool(!fact.taint.is_pristine()));
+    map.insert("protected".into(), Value::Bool(fact.taint.has_protected()));
+    Value::Map(map)
+}
+
+fn handle_value(index: u32, generation: u32) -> Value {
+    Value::Map(BTreeMap::from([
+        ("index".into(), Value::Int(i64::from(index))),
+        ("generation".into(), Value::Int(i64::from(generation))),
+    ]))
+}
+
+fn value_ref_value(value_ref: &ValueRef) -> Value {
+    match value_ref {
+        ValueRef::Inline(value) => Value::Map(BTreeMap::from([
+            ("kind".into(), Value::Str("inline".into())),
+            ("value".into(), value.clone()),
+        ])),
+        ValueRef::External { hash, size } => Value::Map(BTreeMap::from([
+            ("kind".into(), Value::Str("external".into())),
+            ("hash".into(), Value::Str(hash.clone())),
+            ("size".into(), u64_value(*size)),
+        ])),
+    }
+}
+
+fn outcome_ref_value(outcome_ref: &OutcomeRef) -> Value {
+    match outcome_ref {
+        OutcomeRef::Inline(value) => Value::Map(BTreeMap::from([
+            ("kind".into(), Value::Str("inline".into())),
+            ("value".into(), value.clone()),
+        ])),
+        OutcomeRef::External { hash, size } => Value::Map(BTreeMap::from([
+            ("kind".into(), Value::Str("external".into())),
+            ("hash".into(), Value::Str(hash.clone())),
+            ("size".into(), u64_value(*size)),
+        ])),
+        OutcomeRef::None => {
+            Value::Map(BTreeMap::from([("kind".into(), Value::Str("none".into()))]))
+        }
+    }
+}
+
+fn u64_value(value: u64) -> Value {
+    Value::Str(value.to_string())
+}
+
+fn decision_name(decision: DecisionTag) -> &'static str {
+    match decision {
+        DecisionTag::Ok => "ok",
+        DecisionTag::Denied => "denied",
+        DecisionTag::RejectedByPolicy => "rejected_by_policy",
+        DecisionTag::DriverError => "driver_error",
+        DecisionTag::Timeout => "timeout",
+        DecisionTag::Cancelled => "cancelled",
+        DecisionTag::Quarantined => "quarantined",
+    }
+}
+
+fn replay_name(replay: ReplayClass) -> &'static str {
+    match replay {
+        ReplayClass::Deterministic => "deterministic",
+        ReplayClass::Observation => "observation",
+        ReplayClass::IdempotentEffect => "idempotent_effect",
+        ReplayClass::NonIdempotentEffect => "non_idempotent_effect",
+    }
+}
+
+fn quarantine_action_name(action: QuarantineAction) -> &'static str {
+    match action {
+        QuarantineAction::MigrateSchema => "migrate_schema",
+        QuarantineAction::ForceReplay => "force_replay",
+        QuarantineAction::Skip => "skip",
+        QuarantineAction::ManualComplete => "manual_complete",
+        QuarantineAction::Finalize => "finalize",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::{Context, ensure};
+    use nexus_state::{StateBackend, StateError, StateResult, TaintedValue};
     use nexus_types::{
         DecisionTag, HandleId, IdentityRef, MethodId, NodeId, OperationId, OutcomeRef, ResourceId,
-        Timestamp, Value, ValueRef,
+        TaintSet, Timestamp, Value, ValueRef,
     };
+    use std::sync::Arc;
+
+    struct FailingStateBackend;
+
+    #[async_trait::async_trait]
+    impl StateBackend for FailingStateBackend {
+        async fn read_tainted(&self, _path: &Path) -> StateResult<Option<TaintedValue>> {
+            Ok(None)
+        }
+
+        async fn write_set_tainted(
+            &self,
+            _path: &Path,
+            _value: Value,
+            _taint: TaintSet,
+        ) -> StateResult<()> {
+            Err(StateError::Backend("simulated state failure".into()))
+        }
+
+        async fn write_append_tainted(
+            &self,
+            _path: &Path,
+            _item: Value,
+            _taint: TaintSet,
+        ) -> StateResult<()> {
+            Err(StateError::Unsupported("write_append_tainted"))
+        }
+
+        async fn write_cas_tainted(
+            &self,
+            _path: &Path,
+            _expected: Option<Value>,
+            _new: Value,
+            _taint: TaintSet,
+        ) -> StateResult<()> {
+            Err(StateError::Unsupported("write_cas_tainted"))
+        }
+
+        async fn write_delete(&self, _path: &Path) -> StateResult<()> {
+            Err(StateError::Unsupported("write_delete"))
+        }
+
+        async fn subscribe(&self, _pattern: &Path) -> StateResult<nexus_state::StateStream> {
+            Err(StateError::Unsupported("subscribe"))
+        }
+
+        async fn read_prefix_tainted(
+            &self,
+            _prefix: &Path,
+        ) -> StateResult<Vec<(Path, TaintedValue)>> {
+            Err(StateError::Unsupported("read_prefix_tainted"))
+        }
+    }
 
     fn fact(pos: u32, replay: ReplayClass, complete: bool) -> Fact {
         Fact {
@@ -317,6 +482,66 @@ mod tests {
         ensure!(
             replay.is_empty(),
             "unsupported fact schema should not enter replay map"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_persists_structured_quarantine_entry() -> anyhow::Result<()> {
+        let (sink, _) = FactSink::in_memory();
+        let pending = fact(0, ReplayClass::NonIdempotentEffect, false);
+        sink.begin(pending.clone())?;
+        let state: nexus_state::Backend = Arc::new(nexus_state::InMemoryBackend::new());
+
+        let report = recover_process_persisting(&sink, &state, ProcessId::new(1)).await?;
+
+        ensure!(report.quarantined == 1, "unexpected report: {report:?}");
+        let path = quarantine_path(ProcessId::new(1), pending.id)?;
+        let value = state
+            .read(&path)
+            .await?
+            .context("missing persisted quarantine entry")?;
+        let root = value.as_map().context("quarantine entry must be a map")?;
+        ensure!(
+            root.get("suggested_action") == Some(&Value::Str("manual_complete".into())),
+            "unexpected suggested action: {root:?}"
+        );
+        ensure!(
+            root.get("pending") == Some(&Value::Bool(true)),
+            "quarantine entry should mark pending fact"
+        );
+        let fact = root
+            .get("fact")
+            .and_then(Value::as_map)
+            .context("quarantine entry missing structured fact")?;
+        ensure!(
+            fact.get("replay") == Some(&Value::Str("non_idempotent_effect".into())),
+            "unexpected replay field: {fact:?}"
+        );
+        ensure!(
+            fact.get("outcome_ref")
+                .and_then(Value::as_map)
+                .and_then(|m| m.get("kind"))
+                == Some(&Value::Str("none".into())),
+            "pending fact should retain empty outcome ref: {fact:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_returns_error_when_quarantine_state_write_fails() -> anyhow::Result<()> {
+        let (sink, _) = FactSink::in_memory();
+        sink.begin(fact(0, ReplayClass::NonIdempotentEffect, false))?;
+        let state: nexus_state::Backend = Arc::new(FailingStateBackend);
+
+        let error = recover_process_persisting(&sink, &state, ProcessId::new(1))
+            .await
+            .err()
+            .context("recovery unexpectedly ignored quarantine state write failure")?;
+
+        ensure!(
+            error.0.contains("quarantine state write failed"),
+            "unexpected recovery error: {error}"
         );
         Ok(())
     }

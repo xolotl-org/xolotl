@@ -372,57 +372,53 @@ fn admit_console_user(_username: &str, value: &Value) -> Result<(), MgmtError> {
         "console user",
     )?;
     optional_nonnegative_int(map, "version", "console user")?;
-    if let Some(identity_path) = optional_string(map, "identity_path", "console user")? {
-        let path = Path::parse(identity_path)
-            .map_err(|e| MgmtError::Admission(format!("console user identity_path: {e}")))?;
-        if path.scheme() != "identity" {
-            return Err(MgmtError::Admission(
-                "console user identity_path must use identity://".into(),
-            ));
-        }
-    }
-    if let Some(status) = optional_string(map, "status", "console user")?
-        && !matches!(status, "active" | "disabled")
+    let identity_path = required_string(map, "identity_path", "console user")?;
+    let path = Path::parse(identity_path)
+        .map_err(|e| MgmtError::Admission(format!("console user identity_path: {e}")))?;
+    if path.cluster().is_some()
+        || path.scheme() != "identity"
+        || path.segments().is_empty()
+        || !path.is_concrete()
     {
         return Err(MgmtError::Admission(
-            "console user status must be active or disabled".into(),
+            "console user identity_path must be a concrete identity path".into(),
         ));
     }
-    if let Some(authn) = map.get("authn") {
-        admit_console_user_authn(authn)?;
+    let status = required_string(map, "status", "console user")?;
+    if !matches!(status, "active" | "disabled" | "locked") {
+        return Err(MgmtError::Admission(
+            "console user status must be active, disabled, or locked".into(),
+        ));
     }
-    for role in optional_string_list(map, "roles", "console user")? {
+    admit_console_user_authn(required_value(map, "authn", "console user")?)?;
+    for role in required_string_list(map, "roles", "console user")? {
         auth::validate_username(role)
             .map_err(|e| MgmtError::Admission(format!("console user role: {e}")))?;
     }
-    validate_capability_list(map, "grants", "console user")?;
-    validate_capability_list(map, "authority_ceiling", "console user")?;
-    optional_string(map, "created_by", "console user")?;
-    optional_nonnegative_int(map, "created_at", "console user")?;
-    optional_nonnegative_int(map, "password_changed_at", "console user")?;
+    validate_required_capability_list(map, "grants", "console user")?;
+    validate_required_capability_list(map, "authority_ceiling", "console user")?;
+    required_string(map, "created_by", "console user")?;
+    required_nonnegative_int(map, "created_at", "console user")?;
+    required_nonnegative_int(map, "password_changed_at", "console user")?;
     Ok(())
 }
 
 fn admit_console_user_authn(value: &Value) -> Result<(), MgmtError> {
     let map = require_map_ref(value, "console user authn")?;
     validate_known_fields(map, &["password", "totp", "pubkeys"], "console user authn")?;
-    if let Some(password) = map.get("password") {
-        let password = require_map_ref(password, "console user password authn")?;
-        validate_known_fields(password, &["hash_ref"], "console user password authn")?;
-        optional_string(password, "hash_ref", "console user password authn")?;
-    }
-    if let Some(totp) = map.get("totp") {
-        let totp = require_map_ref(totp, "console user totp authn")?;
-        validate_known_fields(
-            totp,
-            &["enabled", "seed_ref", "last_step"],
-            "console user totp authn",
-        )?;
-        optional_bool(totp, "enabled", "console user totp authn")?;
-        optional_string(totp, "seed_ref", "console user totp authn")?;
-        optional_nonnegative_int(totp, "last_step", "console user totp authn")?;
-    }
-    optional_string_list(map, "pubkeys", "console user authn")?;
+    let password = required_map(map, "password", "console user authn")?;
+    validate_known_fields(password, &["hash_ref"], "console user password authn")?;
+    optional_string(password, "hash_ref", "console user password authn")?;
+    let totp = required_map(map, "totp", "console user authn")?;
+    validate_known_fields(
+        totp,
+        &["enabled", "seed_ref", "last_step"],
+        "console user totp authn",
+    )?;
+    optional_bool(totp, "enabled", "console user totp authn")?;
+    optional_string(totp, "seed_ref", "console user totp authn")?;
+    optional_nonnegative_int(totp, "last_step", "console user totp authn")?;
+    required_string_list(map, "pubkeys", "console user authn")?;
     Ok(())
 }
 
@@ -464,6 +460,46 @@ fn optional_string<'a>(
     }
 }
 
+fn required_value<'a>(
+    map: &'a BTreeMap<String, Value>,
+    name: &str,
+    label: &str,
+) -> Result<&'a Value, MgmtError> {
+    map.get(name)
+        .ok_or_else(|| MgmtError::Admission(format!("{label}.{name} is required")))
+}
+
+fn required_string<'a>(
+    map: &'a BTreeMap<String, Value>,
+    name: &str,
+    label: &str,
+) -> Result<&'a str, MgmtError> {
+    match map.get(name) {
+        Some(Value::Str(value)) if !value.is_empty() => Ok(value),
+        Some(Value::Str(_)) => Err(MgmtError::Admission(format!(
+            "{label}.{name} must not be empty"
+        ))),
+        Some(_) => Err(MgmtError::Admission(format!(
+            "{label}.{name} must be a string"
+        ))),
+        None => Err(MgmtError::Admission(format!("{label}.{name} is required"))),
+    }
+}
+
+fn required_map<'a>(
+    map: &'a BTreeMap<String, Value>,
+    name: &str,
+    label: &str,
+) -> Result<&'a BTreeMap<String, Value>, MgmtError> {
+    match map.get(name) {
+        Some(Value::Map(value)) => Ok(value),
+        Some(_) => Err(MgmtError::Admission(format!(
+            "{label}.{name} must be an object"
+        ))),
+        None => Err(MgmtError::Admission(format!("{label}.{name} is required"))),
+    }
+}
+
 fn optional_bool(
     map: &BTreeMap<String, Value>,
     name: &str,
@@ -492,6 +528,23 @@ fn optional_nonnegative_int(
             "{label}.{name} must be an integer"
         ))),
         None => Ok(None),
+    }
+}
+
+fn required_nonnegative_int(
+    map: &BTreeMap<String, Value>,
+    name: &str,
+    label: &str,
+) -> Result<i64, MgmtError> {
+    match map.get(name) {
+        Some(Value::Int(value)) if *value >= 0 => Ok(*value),
+        Some(Value::Int(_)) => Err(MgmtError::Admission(format!(
+            "{label}.{name} must be non-negative"
+        ))),
+        Some(_) => Err(MgmtError::Admission(format!(
+            "{label}.{name} must be an integer"
+        ))),
+        None => Err(MgmtError::Admission(format!("{label}.{name} is required"))),
     }
 }
 
@@ -525,12 +578,35 @@ fn optional_string_list<'a>(
     }
 }
 
+fn required_string_list<'a>(
+    map: &'a BTreeMap<String, Value>,
+    name: &str,
+    label: &str,
+) -> Result<Vec<&'a str>, MgmtError> {
+    if !map.contains_key(name) {
+        return Err(MgmtError::Admission(format!("{label}.{name} is required")));
+    }
+    optional_string_list(map, name, label)
+}
+
 fn validate_capability_list(
     map: &BTreeMap<String, Value>,
     name: &str,
     label: &str,
 ) -> Result<(), MgmtError> {
     for capability in optional_string_list(map, name, label)? {
+        Capability::parse(capability)
+            .map_err(|e| MgmtError::Admission(format!("{label}.{name}: {e}")))?;
+    }
+    Ok(())
+}
+
+fn validate_required_capability_list(
+    map: &BTreeMap<String, Value>,
+    name: &str,
+    label: &str,
+) -> Result<(), MgmtError> {
+    for capability in required_string_list(map, name, label)? {
         Capability::parse(capability)
             .map_err(|e| MgmtError::Admission(format!("{label}.{name}: {e}")))?;
     }
@@ -573,7 +649,43 @@ mod tests {
         Value::Map(m)
     }
 
+    fn complete_console_user(username: &str) -> anyhow::Result<Value> {
+        let password_ref = Path::try_new("state")
+            .and_then(|path| path.try_push("vault"))
+            .and_then(|path| path.try_push("console"))
+            .and_then(|path| path.try_push_literal(username))
+            .and_then(|path| path.try_push("password"))
+            .map(|path| path.to_string())?;
+        let mut password = BTreeMap::new();
+        password.insert("hash_ref".into(), Value::Str(password_ref));
+        let mut totp = BTreeMap::new();
+        totp.insert("enabled".into(), Value::Bool(false));
+        let mut authn = BTreeMap::new();
+        authn.insert("password".into(), Value::Map(password));
+        authn.insert("totp".into(), Value::Map(totp));
+        authn.insert("pubkeys".into(), Value::List(Vec::new()));
+
+        let mut user = BTreeMap::new();
+        user.insert(
+            "identity_path".into(),
+            Value::Str(format!("identity://console/{username}")),
+        );
+        user.insert("status".into(), Value::Str("active".into()));
+        user.insert("authn".into(), Value::Map(authn));
+        user.insert("roles".into(), Value::List(Vec::new()));
+        user.insert("grants".into(), Value::List(Vec::new()));
+        user.insert("authority_ceiling".into(), Value::List(Vec::new()));
+        user.insert("created_by".into(), Value::Str("test".into()));
+        user.insert("created_at".into(), Value::Int(1));
+        user.insert("password_changed_at".into(), Value::Int(1));
+        Ok(Value::Map(user))
+    }
+
     fn extension_installation(id: &str, version: u64) -> anyhow::Result<Value> {
+        let provider_namespace = Path::try_new("effect")?
+            .try_push("external-provider")?
+            .try_push_literal(id)?;
+        let search_effect = provider_namespace.clone().try_push("search")?.to_string();
         let def = ExternalInstallationDef {
             id: id.into(),
             platform: id.into(),
@@ -587,11 +699,8 @@ mod tests {
             projections: vec![ExternalProjectionDef {
                 id: "provider".into(),
                 role: Role::Provider,
-                namespace: Some(Path::parse(&format!("effect://external-provider/{id}"))?),
-                provides: vec![EffectCapability::new(
-                    format!("effect://external-provider/{id}/search"),
-                    Purity::Idempotent,
-                )],
+                namespace: Some(provider_namespace),
+                provides: vec![EffectCapability::new(search_effect, Purity::Idempotent)],
                 emits: None,
                 version: 1,
             }],
@@ -775,6 +884,74 @@ mod tests {
             matches!(err, MgmtError::Admission(ref message) if message.contains("unknown field")),
             "unexpected console user admission error: {err:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn console_user_admission_requires_complete_record_shape() -> anyhow::Result<()> {
+        let complete = complete_console_user("ops")?;
+        admit_console_user("ops", &complete).context("complete console user was rejected")?;
+
+        let mut missing_status = complete_console_user("ops")?;
+        let Value::Map(map) = &mut missing_status else {
+            bail!("console user fixture must be a map");
+        };
+        map.remove("status");
+        let err = match admit_console_user("ops", &missing_status) {
+            Ok(()) => bail!("console user missing status was admitted"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, MgmtError::Admission(ref message) if message.contains("status")),
+            "unexpected missing status admission error: {err:?}"
+        );
+
+        let mut missing_authn = complete_console_user("ops")?;
+        let Value::Map(map) = &mut missing_authn else {
+            bail!("console user fixture must be a map");
+        };
+        map.remove("authn");
+        let err = match admit_console_user("ops", &missing_authn) {
+            Ok(()) => bail!("console user missing authn was admitted"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, MgmtError::Admission(ref message) if message.contains("authn")),
+            "unexpected missing authn admission error: {err:?}"
+        );
+
+        let mut wildcard_identity = complete_console_user("ops")?;
+        let Value::Map(map) = &mut wildcard_identity else {
+            bail!("console user fixture must be a map");
+        };
+        map.insert(
+            "identity_path".into(),
+            Value::Str("identity://console/**".into()),
+        );
+        ensure!(
+            admit_console_user("ops", &wildcard_identity).is_err(),
+            "wildcard console identity path was admitted"
+        );
+
+        let mut clustered_identity = complete_console_user("ops")?;
+        let Value::Map(map) = &mut clustered_identity else {
+            bail!("console user fixture must be a map");
+        };
+        map.insert(
+            "identity_path".into(),
+            Value::Str("path://remote/identity/console/ops".into()),
+        );
+        ensure!(
+            admit_console_user("ops", &clustered_identity).is_err(),
+            "clustered console identity path was admitted"
+        );
+
+        let mut locked = complete_console_user("ops")?;
+        let Value::Map(map) = &mut locked else {
+            bail!("console user fixture must be a map");
+        };
+        map.insert("status".into(), Value::Str("locked".into()));
+        admit_console_user("ops", &locked).context("locked console user status was rejected")?;
         Ok(())
     }
 

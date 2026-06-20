@@ -201,9 +201,9 @@ impl Executor {
 
     /// Pre-register a resolved handle for a resource name.
     pub fn bind_handle(&self, name: ResourceName, handle: nexus_types::HandleId) {
-        self.open_handles
-            .write()
-            .insert((name, self.default_acting()), handle);
+        if let Some(acting) = self.default_acting() {
+            self.open_handles.write().insert((name, acting), handle);
+        }
     }
 
     /// Pre-register a resolved handle for one resource method.
@@ -213,16 +213,18 @@ impl Executor {
         method: impl Into<String>,
         handle: nexus_types::HandleId,
     ) {
-        self.method_handles
-            .write()
-            .insert((name, method.into(), self.default_acting()), handle);
+        if let Some(acting) = self.default_acting() {
+            self.method_handles
+                .write()
+                .insert((name, method.into(), acting), handle);
+        }
     }
 
-    fn default_acting(&self) -> IdentityRef {
-        self.processes
-            .as_ref()
-            .and_then(|processes| processes.identity(self.process))
-            .unwrap_or(IdentityRef::ROOT)
+    fn default_acting(&self) -> Option<IdentityRef> {
+        match &self.processes {
+            Some(processes) => processes.identity(self.process),
+            None => Some(IdentityRef::ROOT),
+        }
     }
 
     /// Evaluate a whole program to an Outcome. Compiles the `Do<A>` into one
@@ -278,7 +280,13 @@ impl Executor {
         // their CausalPositions never collide with the parent graph or each
         // other. It starts past the highest compiled id.
         let next_base = Arc::new(std::sync::atomic::AtomicU32::new(graph.len() as u32));
-        let env = Env::root(self.default_acting()).with_taint(entry_taint);
+        let Some(acting) = self.default_acting() else {
+            return Outcome::Fail(nexus_types::Failure::policy(
+                "executor",
+                format!("unknown process {}", self.process.get()),
+            ));
+        };
+        let env = Env::root(acting).with_taint(entry_taint);
         self.run_node(graph, graph.root, Value::Null, &env, 0, &next_base)
             .await
     }
@@ -312,10 +320,10 @@ impl Executor {
                     // `Use` nodes are Pure(Null) with an incoming Use-edge: the
                     // real value (and its taint) is the bound producer's output.
                     // A bare Pure literal is an author constant.
-                    let (out, taint) = if let Some((bound, t)) = self.resolve_use(graph, id, env) {
-                        (bound, t)
-                    } else {
-                        (v.clone(), nexus_types::TaintSet::author())
+                    let (out, taint) = match self.resolve_use(graph, id, env) {
+                        Ok(Some((bound, t))) => (bound, t),
+                        Ok(None) => (v.clone(), nexus_types::TaintSet::author()),
+                        Err(failure) => return Outcome::Fail(failure),
                     };
                     let env2 = env.with_taint(taint);
                     self.continue_then(graph, id, out, &env2, depth, next_base)
@@ -551,19 +559,28 @@ impl Executor {
         graph: &ExecutionGraph,
         id: NodeId,
         env: &Env,
-    ) -> Option<(Value, nexus_types::TaintSet)> {
-        let producer = graph
+    ) -> Result<Option<(Value, nexus_types::TaintSet)>, nexus_types::Failure> {
+        let Some(producer) = graph
             .edges
             .iter()
             .find(|e| e.to == id && e.kind == EdgeKind::Use)
-            .map(|e| e.from)?;
-        let v = env.bindings.get(&producer).cloned()?;
-        let taint = env
-            .binding_taint
-            .get(&producer)
-            .cloned()
-            .unwrap_or_default();
-        Some((v, taint))
+            .map(|e| e.from)
+        else {
+            return Ok(None);
+        };
+        let Some(v) = env.bindings.get(&producer).cloned() else {
+            return Err(nexus_types::Failure::policy(
+                "executor",
+                format!("missing binding for use edge from node {}", producer.get()),
+            ));
+        };
+        let Some(taint) = env.binding_taint.get(&producer).cloned() else {
+            return Err(nexus_types::Failure::policy(
+                "executor",
+                format!("missing taint for use edge from node {}", producer.get()),
+            ));
+        };
+        Ok(Some((v, taint)))
     }
     /// Splice and run a `Step`'s produced subgraph (the run-time face of
     /// `AndThen` / `OrElse` recovery). The step is a pure `Value -> Do<A>`
@@ -1336,6 +1353,23 @@ mod tests {
         ensure!(
             out == Outcome::Done(Value::Int(5)),
             "pure node outcome mismatch: {out:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attached_missing_process_does_not_run_as_root() -> anyhow::Result<()> {
+        let ex = executor().with_processes(crate::process::ProcessTable::new());
+        let out = ex.eval(&DoNode::pure(Value::Int(5))).await;
+        ensure!(
+            matches!(
+                out,
+                Outcome::Fail(nexus_types::Failure::PolicyViolation {
+                    ref policy,
+                    ref detail,
+                }) if policy == "executor" && detail.contains("unknown process 1")
+            ),
+            "missing process should fail closed, got {out:?}"
         );
         Ok(())
     }

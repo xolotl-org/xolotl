@@ -73,7 +73,9 @@ pub fn value_from_pb(v: &pb::Value) -> Value {
         Some(Kind::BlobVal(b)) => Value::Blob(blob_from_pb(b)),
         Some(Kind::TensorVal(t)) => tensor_from_pb(t).map_or(Value::Null, Value::Tensor),
         Some(Kind::FrameVal(fr)) => frame_from_pb(fr).map_or(Value::Null, Value::Frame),
-        Some(Kind::StreamEndVal(m)) => Value::StreamEnd(stream_marker_from_pb(m)),
+        Some(Kind::StreamEndVal(m)) => {
+            stream_marker_from_pb(m).map_or(Value::Null, Value::StreamEnd)
+        }
     }
 }
 
@@ -137,7 +139,7 @@ fn tensor_to_pb(t: &TensorRef) -> pb::TensorRef {
 fn tensor_from_pb(t: &pb::TensorRef) -> Option<TensorRef> {
     Some(TensorRef {
         blob: blob_from_pb(t.blob.as_ref()?),
-        dtype: dtype_from_str(&t.dtype).unwrap_or(DType::F32),
+        dtype: dtype_from_str(&t.dtype)?,
         shape: t.shape.clone(),
     })
 }
@@ -165,7 +167,7 @@ fn frame_from_pb(fr: &pb::FrameRef) -> Option<FrameRef> {
     Some(FrameRef {
         blob: blob_from_pb(fr.blob.as_ref()?),
         ts_nanos: fr.ts_nanos,
-        kind: frame_kind_from_str(&fr.kind).unwrap_or(FrameKind::Audio),
+        kind: frame_kind_from_str(&fr.kind)?,
     })
 }
 
@@ -189,14 +191,15 @@ fn stream_marker_to_pb(m: &StreamMarker) -> pb::StreamMarker {
     };
     pb::StreamMarker { kind: Some(kind) }
 }
-fn stream_marker_from_pb(m: &pb::StreamMarker) -> StreamMarker {
+fn stream_marker_from_pb(m: &pb::StreamMarker) -> Option<StreamMarker> {
     use pb::stream_marker::Kind;
-    match &m.kind {
+    Some(match &m.kind {
+        Some(Kind::Done(true)) => StreamMarker::Done,
         Some(Kind::Error(message)) => StreamMarker::Error {
             message: message.clone(),
         },
-        _ => StreamMarker::Done,
-    }
+        Some(Kind::Done(false)) | None => return None,
+    })
 }
 
 fn stream_marker_from_pb_checked(m: &pb::StreamMarker) -> Result<StreamMarker, ConvertError> {
@@ -270,19 +273,16 @@ pub fn path_to_pb(p: &Path) -> pb::Path {
     }
 }
 
-/// Wire `Path` → `Path`, validated through the canonical parser.
+/// Wire `Path` → `Path`.
 pub fn path_from_pb(p: &pb::Path) -> Result<Path, ConvertError> {
-    let mut s = match &p.cluster {
-        Some(cluster) => format!("path://{}/{}", cluster, p.scheme),
-        None => format!("{}://", p.scheme),
-    };
-    for (idx, seg) in p.segments.iter().enumerate() {
-        if idx > 0 || p.cluster.is_some() {
-            s.push('/');
-        }
-        s.push_str(seg);
+    let mut path = Path::try_new(&p.scheme)?;
+    if let Some(cluster) = &p.cluster {
+        path = path.try_with_cluster(cluster)?;
     }
-    Ok(Path::parse(&s)?)
+    for segment in &p.segments {
+        path = path.try_push(segment)?;
+    }
+    Ok(path)
 }
 
 // Capability conversions.
@@ -298,18 +298,19 @@ pub fn capability_to_pb(c: &Capability) -> pb::Capability {
     }
 }
 
-/// Wire `Capability` → `Capability`, validated through the canonical parser.
+/// Wire `Capability` → `Capability`.
 pub fn capability_from_pb(c: &pb::Capability) -> Result<Capability, ConvertError> {
-    let mut literal = format!("{}://{}", c.verb, c.scheme);
-    for seg in &c.segments {
-        literal.push('/');
-        literal.push_str(seg);
-    }
-    if let Some(predicate) = &c.predicate {
-        literal.push('@');
-        literal.push_str(predicate);
-    }
-    Ok(Capability::parse(&literal)?)
+    let predicate = c
+        .predicate
+        .as_deref()
+        .map(nexus_types::Predicate::parse)
+        .transpose()?;
+    Ok(Capability::try_new(
+        c.verb.as_str(),
+        c.scheme.as_str(),
+        c.segments.iter().map(String::as_str),
+        predicate,
+    )?)
 }
 
 // Program and DoNode conversions.
@@ -419,7 +420,7 @@ pub fn do_node_from_pb(node: &pb::DoNode) -> Result<DoNode, ConvertError> {
                 )?),
             ),
             Kind::Let(x) => DoNode::Let {
-                name: x.name.clone(),
+                name: required_nonblank(&x.name, "let.name")?,
                 value: Box::new(do_node_from_pb(
                     x.value
                         .as_deref()
@@ -429,7 +430,7 @@ pub fn do_node_from_pb(node: &pb::DoNode) -> Result<DoNode, ConvertError> {
                     x.body.as_deref().ok_or(ConvertError::Missing("let.body"))?,
                 )?),
             },
-            Kind::UseName(name) => DoNode::Use(name.clone()),
+            Kind::UseName(name) => DoNode::Use(required_nonblank(name, "use.name")?),
             Kind::Acting(x) => DoNode::Acting {
                 identity: path_from_pb(
                     x.identity
@@ -460,7 +461,7 @@ fn step_ref_to_pb(step: &StepRef) -> pb::StepRef {
 fn step_ref_from_pb(step: &pb::StepRef) -> Result<StepRef, ConvertError> {
     Ok(StepRef {
         process: ProcessId::new(step.process_id),
-        name: step.name.clone(),
+        name: required_nonblank(&step.name, "step.name")?,
         arg: step.arg.as_ref().map(value_from_pb_checked).transpose()?,
     })
 }
@@ -505,14 +506,13 @@ fn operation_template_from_pb(
                 .as_ref()
                 .ok_or(ConvertError::Missing("operation.target"))?,
         )?),
-        method: op.method.clone(),
+        method: required_nonblank(&op.method, "operation.method")?,
         method_id: op.method_id.map(MethodId::new),
-        output: op
-            .output
-            .as_ref()
-            .map(output_mode_from_pb)
-            .transpose()?
-            .unwrap_or_default(),
+        output: output_mode_from_pb(
+            op.output
+                .as_ref()
+                .ok_or(ConvertError::Missing("operation.output"))?,
+        )?,
         literal_input: op
             .literal_input
             .as_ref()
@@ -587,7 +587,8 @@ pub fn failure_to_pb(f: &Failure) -> pb::Failure {
 /// (stable kind + display message), so variants without enough structured
 /// fields are materialized as `Custom`.
 pub fn failure_from_pb(f: &pb::Failure) -> Result<Failure, ConvertError> {
-    Ok(match f.kind.as_str() {
+    let kind = required_nonblank(&f.kind, "failure.kind")?;
+    Ok(match kind.as_str() {
         "rate_limited" => Failure::RateLimited,
         "timeout" => Failure::Timeout,
         "cancelled" => Failure::Cancelled,
@@ -602,7 +603,7 @@ pub fn failure_from_pb(f: &pb::Failure) -> Result<Failure, ConvertError> {
         "permission_denied" | "no_handler" | "budget_exhausted" | "approval_pending"
         | "quarantined" | "policy_violation" | "path_invalid" | "custom" | "error" => {
             Failure::Custom {
-                kind: f.kind.clone(),
+                kind: kind.clone(),
                 message: f.message.clone(),
             }
         }
@@ -646,6 +647,13 @@ fn required_value_from_pb(
         .and_then(value_from_pb_checked)
 }
 
+fn required_nonblank(value: &str, field: &'static str) -> Result<String, ConvertError> {
+    if value.trim().is_empty() || value.trim() != value {
+        return Err(ConvertError::Missing(field));
+    }
+    Ok(value.to_string())
+}
+
 /// `RoleSessionClientHello` → wire `RoleSessionClientHello`.
 pub fn role_session_client_hello_to_pb(
     hello: &RoleSessionClientHello,
@@ -669,11 +677,12 @@ pub fn role_session_client_hello_from_pb(
         installation_id: hello.installation_id.clone(),
         projection_id: hello.projection_id.clone(),
         registry_hash: hello.registry_hash.clone(),
-        observed: hello
-            .observed
-            .as_ref()
-            .map(observed_generations_from_pb)
-            .unwrap_or_default(),
+        observed: observed_generations_from_pb(
+            hello
+                .observed
+                .as_ref()
+                .ok_or(ConvertError::Missing("hello.observed"))?,
+        ),
         config_schema: hello
             .config_schema
             .as_ref()
@@ -756,11 +765,12 @@ pub fn inbound_event_from_pb(event: &ext::InboundEvent) -> Result<InboundEvent, 
         id: event.id.clone(),
         payload: required_value_from_pb(event.payload.as_ref(), "inbound_event.payload")?,
         timestamp_ms: event.timestamp_ms,
-        observed: event
-            .observed
-            .as_ref()
-            .map(observed_generations_from_pb)
-            .unwrap_or_default(),
+        observed: observed_generations_from_pb(
+            event
+                .observed
+                .as_ref()
+                .ok_or(ConvertError::Missing("inbound_event.observed"))?,
+        ),
         stream_id: event.stream_id.clone(),
         seq: event.seq,
     })
@@ -814,7 +824,7 @@ pub fn invoke_result_to_pb(r: &InvokeResult) -> ext::InvokeResult {
 pub fn invoke_result_from_pb(r: &ext::InvokeResult) -> Result<InvokeResult, ConvertError> {
     let outcome = match &r.outcome {
         Some(ext::invoke_result::Outcome::Success(v)) => Ok(value_from_pb_checked(v)?),
-        Some(ext::invoke_result::Outcome::Error(e)) => Err(error_info_from_pb(e)),
+        Some(ext::invoke_result::Outcome::Error(e)) => Err(error_info_from_pb(e)?),
         None => return Err(ConvertError::Missing("invoke_result.outcome")),
     };
     Ok(InvokeResult {
@@ -837,11 +847,11 @@ pub fn outbound_command_from_pb(c: &ext::OutboundCommand) -> Result<OutboundComm
     Ok(OutboundCommand {
         id: c.id.clone(),
         action: required_value_from_pb(c.action.as_ref(), "outbound_command.action")?,
-        observed: c
-            .observed
-            .as_ref()
-            .map(observed_generations_from_pb)
-            .unwrap_or_default(),
+        observed: observed_generations_from_pb(
+            c.observed
+                .as_ref()
+                .ok_or(ConvertError::Missing("outbound_command.observed"))?,
+        ),
     })
 }
 
@@ -861,7 +871,7 @@ pub fn command_result_to_pb(r: &CommandResult) -> ext::CommandResult {
 pub fn command_result_from_pb(r: &ext::CommandResult) -> Result<CommandResult, ConvertError> {
     let outcome = match &r.outcome {
         Some(ext::command_result::Outcome::Success(v)) => Ok(value_from_pb_checked(v)?),
-        Some(ext::command_result::Outcome::Error(e)) => Err(error_info_from_pb(e)),
+        Some(ext::command_result::Outcome::Error(e)) => Err(error_info_from_pb(e)?),
         None => return Err(ConvertError::Missing("command_result.outcome")),
     };
     Ok(CommandResult {
@@ -1159,9 +1169,9 @@ pub fn error_info_to_pb(e: &ErrorInfo) -> ext::ErrorInfo {
 }
 
 /// Wire `ErrorInfo` → `ErrorInfo`.
-pub fn error_info_from_pb(e: &ext::ErrorInfo) -> ErrorInfo {
-    ErrorInfo {
-        kind: e.code.clone(),
+pub fn error_info_from_pb(e: &ext::ErrorInfo) -> Result<ErrorInfo, ConvertError> {
+    Ok(ErrorInfo {
+        kind: required_nonblank(&e.code, "error_info.code")?,
         message: e.message.clone(),
-    }
+    })
 }

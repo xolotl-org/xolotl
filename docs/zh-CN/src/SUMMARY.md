@@ -2,7 +2,6 @@
 
 - [Nexus 手册](README.md)
 - [架构](architecture.md)
-- [术语表](glossary.md)
 - [运行时模型](runtime-model.md)
 - [能力模型](capability-model.md)
 - [安全边界](security-and-boundaries.md)
@@ -14,4 +13,4 @@
 - [HTTP 推理 Provider](http-inference-providers.md)
 - [配置](configuration.md)
 - [API 参考](api-reference.md)
-- [文档策略](documentation-policy.md)
+- [术语表](glossary.md)

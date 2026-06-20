@@ -23,7 +23,9 @@ source_dedupe_window_ms = 86400000
 provider_max_in_flight_invocations = 1024
 provider_max_in_flight_per_identity = 256
 provider_max_in_flight_per_effect = 256
+provider_max_inline_result_bytes = 65536
 source_max_in_flight_commands = 1024
+source_command_max_inline_result_bytes = 65536
 source_command_rate_limit_window_ms = 60000
 source_command_rate_limit_max = 600
 
@@ -44,7 +46,9 @@ source_dedupe_window_ms = 86400000
 provider_max_in_flight_invocations = 1024
 provider_max_in_flight_per_identity = 256
 provider_max_in_flight_per_effect = 256
+provider_max_inline_result_bytes = 65536
 source_max_in_flight_commands = 1024
+source_command_max_inline_result_bytes = 65536
 source_command_rate_limit_window_ms = 60000
 source_command_rate_limit_max = 600
 

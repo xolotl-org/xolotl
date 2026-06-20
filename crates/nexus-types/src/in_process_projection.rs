@@ -194,11 +194,8 @@ impl InProcessProjectionDef {
             let effect = Path::parse(&capability.effect_path).map_err(|_| {
                 InProcessProjectionConfigError::MalformedEffectPath(capability.effect_path.clone())
             })?;
-            let concrete = effect
-                .segments()
-                .iter()
-                .all(|segment| !matches!(segment.as_str(), "*" | "**"));
-            if effect.scheme() != "effect" || effect.segments().is_empty() || !concrete {
+            if effect.scheme() != "effect" || effect.segments().is_empty() || !effect.is_concrete()
+            {
                 return Err(InProcessProjectionConfigError::BadEffectPath(
                     capability.effect_path.clone(),
                 ));
@@ -282,14 +279,10 @@ fn is_safe_dotted_id(id: &str) -> bool {
 }
 
 fn validate_source_event_sink(path: &Path) -> Result<(), InProcessProjectionConfigError> {
-    let concrete = path
-        .segments()
-        .iter()
-        .all(|seg| !matches!(seg.as_str(), "*" | "**"));
     if path.cluster().is_none()
         && path.scheme() == "state"
         && !path.segments().is_empty()
-        && concrete
+        && path.is_concrete()
         && !crate::is_kernel_reserved(path)
         && !crate::is_vault_reserved(path)
         && !crate::is_fact_reserved(path)

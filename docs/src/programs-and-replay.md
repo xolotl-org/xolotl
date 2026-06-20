@@ -25,8 +25,7 @@ Steps are named, pure continuations registered per Process. A `StepRef` names
 the Process and step name. The Executor looks up the step, calls it with the
 piped value, and splices the returned subgraph into the current cursor.
 
-Steps are named pure continuations. IO and other effects go through Operation
-nodes.
+IO and other effects go through Operation nodes, not through Step functions.
 
 ## Replay Classes
 

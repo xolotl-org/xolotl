@@ -13,6 +13,11 @@ Process
 
 The runtime is split into four code paths.
 
+The rest of the manual follows this split. Concept chapters explain Process,
+Resource, Capability, Operation, Fact, and replay. Gateway chapters explain how
+outside clients enter the runtime. Configuration chapters explain which
+listeners, features, and runtime declarations expose those pieces in a host.
+
 ## Control Path
 
 The control path parses, validates, resolves, and compiles. It owns registries,
@@ -90,30 +95,12 @@ starts.
 ## Standard Package Features
 
 `nexus-standard` contains the standard in-process Provider and Source
-implementations. A binary can compile only the modules it needs.
-
-The default `standard` feature builds the core standard in-process
-implementations. `standard-core` builds that core set and the pairing management
-effects. `fetch`, `fs`, and `terminal` each require their own feature. External
-Provider/Source session handling and `SecureEnvelope` code live in
-`nexus-gateway`.
-
-HTTP inference provider features are opt-in. `http-inference` enables all HTTP
-inference dialects. The individual dialect features are `openai-responses`,
-`openai-chat`, `anthropic-messages`, and `gemini-generate-content`.
-`nexus-daemon` forwards those feature names to `nexus-standard`.
+implementations. A binary can compile only the modules it needs, and compiled
+code is separate from installed Resources.
 
 High-risk in-process implementations such as `fetch`, `fs`, and `terminal`
 must stay behind separate `nexus-standard` features. A daemon or embedded host may
 expose them only through kernel-state declarations admitted by `config.*`.
-Runtime in-process projection declarations are stored in Nexus state.
-
-Compiled modules and installed modules are separate. `StandardConfig` defaults
-to installing every standard-core module, but hosts may pass
-`StandardModules::none`, `StandardModules::state_only`, or a custom
-`StandardModules` value. Standard model-backed effects can use the built-in
-baseline, HTTP provider state when HTTP dialect features are enabled, or a host
-backend supplied with `StandardConfig::with_inference_backend`.
 
 Optional in-process projection declarations are runtime state under
 `state://kernel/projections/in-process/<id>`. They use generic `config.*`
@@ -122,3 +109,8 @@ into ordinary Resource, Interface, Driver, and Binding registry entries.
 Reconcile results are stored under
 `state://kernel/projection-status/in-process/<id>` and read through
 `projection.in_process.status.*`.
+
+For deployment-level feature choices and runtime declaration paths, use
+[Configuration](configuration.md). For HTTP model-provider dialects, use
+[HTTP Inference Providers](http-inference-providers.md). For embedding APIs,
+use [API Reference](api-reference.md).

@@ -512,11 +512,15 @@ fn rerank(input: &Value) -> Result<Value, String> {
         Some(m) => m,
         None => return Err("inference.rerank input must be a map".into()),
     };
-    let query = m.get("query").map(render_text).unwrap_or_default();
+    let query = m
+        .get("query")
+        .map(render_text)
+        .ok_or_else(|| "inference.rerank requires `query`".to_string())?;
     let qh = blake3::hash(query.as_bytes());
     let candidates = match m.get("candidates") {
-        Some(Value::List(c)) => c.clone(),
-        _ => vec![],
+        Some(Value::List(c)) => c,
+        Some(_) => return Err("inference.rerank `candidates` must be a list".into()),
+        None => return Err("inference.rerank requires `candidates`".into()),
     };
     let mut scored: Vec<(usize, f64)> = candidates
         .iter()
@@ -752,6 +756,40 @@ mod tests {
             }
             other => bail!("expected ranked list, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn rerank_rejects_malformed_input() -> Result<()> {
+        let d = InferenceDriver::baseline();
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+        let mut missing_query = std::collections::BTreeMap::new();
+        missing_query.insert(
+            "candidates".into(),
+            Value::List(vec![Value::Str("a".into())]),
+        );
+        let out = d
+            .call(
+                MethodId::new(2),
+                Value::Map(missing_query),
+                OutputMode::Unary,
+                &ctx,
+            )
+            .await;
+        ensure!(out.is_err(), "rerank accepted missing query");
+
+        let mut bad_candidates = std::collections::BTreeMap::new();
+        bad_candidates.insert("query".into(), Value::Str("q".into()));
+        bad_candidates.insert("candidates".into(), Value::Str("a".into()));
+        let out = d
+            .call(
+                MethodId::new(2),
+                Value::Map(bad_candidates),
+                OutputMode::Unary,
+                &ctx,
+            )
+            .await;
+        ensure!(out.is_err(), "rerank accepted malformed candidates");
+        Ok(())
     }
 
     #[tokio::test]

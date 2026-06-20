@@ -18,6 +18,26 @@ It is separate from Rust API reference pages:
 Chinese manual HTML, after running `mdbook build docs/zh-CN`:
 [`docs/zh-CN/book/index.html`](../zh-CN/book/index.html).
 
+## How To Read This Manual
+
+Start with [Architecture](architecture.md) for the control path, data path,
+external adapters, and workspace map. Then read [Runtime Model](runtime-model.md)
+and [Capability Model](capability-model.md) before implementation details. These
+pages define the terms used by the rest of the manual.
+
+Use the operational pages when you need a boundary or deployment answer:
+
+| Need | Read |
+| --- | --- |
+| Understand execution, authority, replay, and state | [Runtime Model](runtime-model.md), [Capability Model](capability-model.md), [Programs And Replay](programs-and-replay.md), [State And Facts](state-and-facts.md) |
+| Check what is allowed across trust boundaries | [Security And Boundaries](security-and-boundaries.md) |
+| Choose a listener or protocol | [Gateways](gateways.md) |
+| Connect Provider or Source programs | [External Gateway](external-gateway.md) |
+| Build a console client | [Console Protocol](console-protocol.md) |
+| Configure `nexusd` | [Configuration](configuration.md) |
+| Configure HTTP model providers | [HTTP Inference Providers](http-inference-providers.md) |
+| Find Rust API contracts | [API Reference](api-reference.md) |
+
 ## Documentation Layers
 
 The public documentation has three layers:

@@ -184,6 +184,43 @@ pub enum CapError {
 }
 
 impl Capability {
+    /// Construct a capability from structured fields.
+    pub fn try_new<I, S>(
+        verb: impl AsRef<str>,
+        scheme: impl AsRef<str>,
+        segments: I,
+        predicate: Option<Predicate>,
+    ) -> Result<Self, CapError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let verb = verb.as_ref();
+        let scheme = scheme.as_ref();
+        if verb.is_empty() {
+            return Err(CapError::Malformed("empty verb".into()));
+        }
+        if !is_capability_verb(verb) {
+            return Err(CapError::Malformed(format!(
+                "unsupported capability verb: {}",
+                verb
+            )));
+        }
+        validate_capability_scheme(verb, scheme)?;
+        let mut parsed_segments = Vec::new();
+        for segment in segments {
+            let segment = segment.as_ref();
+            validate_capability_segment(segment)?;
+            parsed_segments.push(SmolStr::from(segment));
+        }
+        Ok(Self {
+            verb: verb.to_string(),
+            scheme: scheme.to_string(),
+            segments: parsed_segments,
+            predicate,
+        })
+    }
+
     /// Parse a capability literal.
     pub fn parse(s: &str) -> Result<Self, CapError> {
         let (verb, rest) = s
@@ -203,25 +240,21 @@ impl Capability {
             )));
         }
         let (scheme, body) = if head == "*" || head == "**" {
-            (head.to_string(), "**".to_string())
+            (head.to_string(), Some("**"))
         } else {
             match head.split_once('/') {
-                Some((s, b)) => (s.to_string(), b.to_string()),
-                None => (head.to_string(), String::new()),
+                Some((s, b)) => (s.to_string(), Some(b)),
+                None => (head.to_string(), None),
             }
         };
-        validate_capability_scheme(verb, &scheme)?;
-        let segments = if body.is_empty() {
-            Vec::new()
-        } else {
-            body.split('/').map(SmolStr::from).collect()
+        let segments = match body {
+            Some("") => {
+                return Err(CapError::Malformed("empty capability segment".into()));
+            }
+            Some(body) => body.split('/').collect(),
+            None => Vec::new(),
         };
-        Ok(Self {
-            verb: verb.to_string(),
-            scheme,
-            segments,
-            predicate,
-        })
+        Self::try_new(verb, &scheme, segments, predicate)
     }
 
     /// Check whether this capability covers (`verb`, `target`) **ignoring any
@@ -294,6 +327,11 @@ fn is_capability_verb(verb: &str) -> bool {
 }
 
 fn validate_capability_scheme(verb: &str, scheme: &str) -> Result<(), CapError> {
+    if scheme != "*" && scheme != "**" {
+        Path::try_new(scheme).map_err(|error| {
+            CapError::Malformed(format!("invalid capability scheme {scheme}: {error}"))
+        })?;
+    }
     if verb == "*" || scheme == "*" || scheme == "**" {
         return Ok(());
     }
@@ -313,6 +351,15 @@ fn validate_capability_scheme(verb: &str, scheme: &str) -> Result<(), CapError> 
         )));
     }
     Ok(())
+}
+
+fn validate_capability_segment(segment: &str) -> Result<(), CapError> {
+    Path::try_new("state")
+        .and_then(|path| path.try_push(segment))
+        .map(|_| ())
+        .map_err(|error| {
+            CapError::Malformed(format!("invalid capability segment {segment}: {error}"))
+        })
 }
 
 fn match_segments(pat: &[SmolStr], seg: &[SmolStr]) -> bool {
@@ -468,7 +515,7 @@ impl std::fmt::Display for Capability {
 mod tests {
     use super::*;
     use crate::path::p;
-    use anyhow::{Context, ensure};
+    use anyhow::{Context, bail, ensure};
 
     #[test]
     fn parse_simple_cap() -> anyhow::Result<()> {
@@ -479,6 +526,32 @@ mod tests {
             c.segments.len() == 2,
             "unexpected segments: {:?}",
             c.segments
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn structured_capability_builder_validates_parts() -> anyhow::Result<()> {
+        let c = Capability::try_new("perform", "effect", ["inference", "infer"], None)?;
+        ensure!(
+            c.to_string() == "perform://effect/inference/infer",
+            "unexpected capability: {c}"
+        );
+        let bad_segment = match Capability::try_new("perform", "effect", ["bad/slash"], None) {
+            Ok(c) => bail!("bad segment was accepted: {c}"),
+            Err(error) => error,
+        };
+        ensure!(
+            bad_segment.to_string().contains("bad/slash"),
+            "unexpected bad segment error: {bad_segment}"
+        );
+        let bad_scheme = match Capability::try_new("perform", "bad/scheme", ["x"], None) {
+            Ok(c) => bail!("bad scheme was accepted: {c}"),
+            Err(error) => error,
+        };
+        ensure!(
+            bad_scheme.to_string().contains("bad/scheme"),
+            "unexpected bad scheme error: {bad_scheme}"
         );
         Ok(())
     }
@@ -552,6 +625,14 @@ mod tests {
         ensure!(
             Capability::parse("perform://state/memory/alice").is_err(),
             "perform state cap was accepted"
+        );
+        ensure!(
+            Capability::parse("perform://effect/x//post").is_err(),
+            "empty capability segment was accepted"
+        );
+        ensure!(
+            Capability::parse("perform://effect/").is_err(),
+            "trailing empty capability segment was accepted"
         );
         Ok(())
     }

@@ -1175,7 +1175,7 @@ fn finalized_marker_path(process: ProcessId) -> Result<Path, PathError> {
     Path::try_new("state")?
         .try_push("kernel")?
         .try_push("process")?
-        .try_push(process.get().to_string())?
+        .try_push_literal(process.get().to_string())?
         .try_push("finalized")
 }
 
@@ -1185,13 +1185,11 @@ async fn finish_process_terminal_attempt(
     terminal_status: ProcessStatus,
 ) -> Result<(), BootstrapError> {
     let result = finish_process_terminal(kernel, process, terminal_status).await;
-    if result.is_err() {
-        if kernel.processes.release_finalizing(process).is_none() {
-            tracing::error!(
-                process = process.get(),
-                "process disappeared while releasing failed finalization attempt"
-            );
-        }
+    if result.is_err() && kernel.processes.release_finalizing(process).is_none() {
+        tracing::error!(
+            process = process.get(),
+            "process disappeared while releasing failed finalization attempt"
+        );
     }
     result
 }
@@ -1494,8 +1492,8 @@ fn cleanup_process_steps(steps: &crate::step::StepTable, process: ProcessId) {
 fn actor_directory_path(identity_segment: &str, name: &str) -> Result<Path, BootstrapError> {
     Path::try_new("state")
         .and_then(|path| path.try_push("agents"))
-        .and_then(|path| path.try_push(identity_segment))
-        .and_then(|path| path.try_push(name))
+        .and_then(|path| path.try_push_literal(identity_segment))
+        .and_then(|path| path.try_push_literal(name))
         .map_err(|source| BootstrapError::Path {
             literal: format!("state://agents/{identity_segment}/{name}"),
             source,

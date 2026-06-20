@@ -110,35 +110,33 @@ impl PairingDriver {
 
     fn pairing_path(id: &str) -> Result<Path, DriverError> {
         validate_id_segment(id, "pairing_id")?;
-        Path::parse(&format!("state://kernel/external-pairings/{id}"))
+        kernel_state_path(&["external-pairings", id])
             .map_err(|e| DriverError::Other(format!("invalid pairing id {id:?}: {e}")))
     }
 
     fn session_path(id: &str, role: &str) -> Result<Path, DriverError> {
         validate_id_segment(id, "installation_id")?;
         validate_id_segment(role, "role")?;
-        Path::parse(&format!("state://kernel/external-sessions/{id}/{role}"))
+        kernel_state_path(&["external-sessions", id, role])
             .map_err(|e| DriverError::Other(format!("invalid installation id {id:?}: {e}")))
     }
 
     fn installation_path(id: &str) -> Result<Path, DriverError> {
         validate_id_segment(id, "installation_id")?;
-        Path::parse(&format!("state://kernel/external-installations/{id}"))
+        kernel_state_path(&["external-installations", id])
             .map_err(|e| DriverError::Other(format!("invalid installation id {id:?}: {e}")))
     }
 
     fn manifest_path(platform: &str) -> Result<Path, DriverError> {
         validate_id_segment(platform, "manifest_platform")?;
-        Path::parse(&format!("state://kernel/manifests/{platform}"))
+        kernel_state_path(&["manifests", platform])
             .map_err(|e| DriverError::Other(format!("invalid manifest platform {platform:?}: {e}")))
     }
 
     fn revoke_path(id: &str) -> Result<Path, DriverError> {
         validate_id_segment(id, "installation_id")?;
-        Path::parse(&format!(
-            "state://kernel/external-credential-revocations/{id}"
-        ))
-        .map_err(|e| DriverError::Other(format!("invalid installation id {id:?}: {e}")))
+        kernel_state_path(&["external-credential-revocations", id])
+            .map_err(|e| DriverError::Other(format!("invalid installation id {id:?}: {e}")))
     }
 
     async fn read_record(&self, id: &str) -> Result<BTreeMap<String, Value>, DriverError> {
@@ -148,10 +146,12 @@ impl PairingDriver {
             .await
             .map_err(|e| DriverError::Other(e.to_string()))?
             .ok_or_else(|| DriverError::Other(format!("unknown pairing id {id:?}")))?;
-        value
-            .as_map()
-            .cloned()
-            .ok_or_else(|| DriverError::Other(format!("malformed pairing record {id:?}")))
+        match value {
+            Value::Map(record) => Ok(record),
+            _ => Err(DriverError::Other(format!(
+                "malformed pairing record {id:?}"
+            ))),
+        }
     }
 
     async fn write_record(
@@ -257,13 +257,13 @@ impl Driver for PairingDriver {
                 )?;
                 reject_inline_install_fields(&m, "pairing.create")?;
                 reject_pairing_claim_fields(&m, "pairing.create")?;
-                let pairing_id = match field_str(&m, "pairing_id") {
+                let pairing_id = match optional_str(&m, "pairing_id")? {
                     Some(id) => id.to_string(),
                     None => random_id()?,
                 };
                 let installation_id = required_str(&m, "installation_id")?.to_string();
                 let scope = self
-                    .load_pairing_scope(&installation_id, field_str(&m, "manifest_platform"))
+                    .load_pairing_scope(&installation_id, optional_str(&m, "manifest_platform")?)
                     .await?;
                 let requested_allowed = role_values(m.get("allowed_roles"), "allowed_roles")?;
                 let allowed_roles = if m.contains_key("allowed_roles") {
@@ -273,7 +273,7 @@ impl Driver for PairingDriver {
                     scope.roles.clone()
                 };
                 let secret = random_secret()?;
-                let expires_at = m.get("expires_at").and_then(|v| v.as_int()).unwrap_or(0);
+                let expires_at = optional_nonnegative_int(&m, "expires_at", 0)?;
                 let mut record = BTreeMap::new();
                 record.insert("pairing_id".into(), Value::Str(pairing_id.clone()));
                 record.insert("installation_id".into(), Value::Str(installation_id));
@@ -307,11 +307,11 @@ impl Driver for PairingDriver {
                 reject_approve_claim_fields(&m)?;
                 reject_unknown_fields(&m, "pairing.approve", &["pairing_id", "approved_roles"])?;
                 ensure_record_sas_verified(&record)?;
-                let installation_id = field_str(&record, "installation_id")
-                    .ok_or_else(|| DriverError::Other("approve requires installation_id".into()))?
-                    .to_string();
+                let installation_id = record_required_str(&record, "installation_id")?.to_string();
+                let manifest_platform =
+                    record_optional_str(&record, "manifest_platform")?.map(str::to_string);
                 let scope = self
-                    .load_pairing_scope(&installation_id, field_str(&record, "manifest_platform"))
+                    .load_pairing_scope(&installation_id, manifest_platform.as_deref())
                     .await?;
                 let allowed_roles =
                     role_values(record.get("allowed_roles"), "record.allowed_roles")?;
@@ -331,11 +331,9 @@ impl Driver for PairingDriver {
                     .into_iter()
                     .map(Value::Str)
                     .collect::<Vec<_>>();
-                let generation = record
-                    .get("credential_generation")
-                    .and_then(|v| v.as_int())
-                    .unwrap_or(0)
-                    + 1;
+                let generation = required_record_nonnegative_int(&record, "credential_generation")?
+                    .checked_add(1)
+                    .ok_or_else(|| DriverError::Other("credential_generation overflowed".into()))?;
                 record.insert("state".into(), Value::Str(STATE_APPROVED.into()));
                 record.insert(
                     "installation_id".into(),
@@ -403,43 +401,44 @@ impl Driver for PairingDriver {
                 let pairing_id = required_str(&m, "pairing_id")?;
                 let mut old = self.read_record(pairing_id).await?;
                 ensure_not_terminal(&old)?;
-                let replacement_id = match field_str(&m, "replacement_pairing_id") {
+                let replacement_id = match optional_str(&m, "replacement_pairing_id")? {
                     Some(id) => id.to_string(),
                     None => random_id()?,
                 };
-                old.insert("state".into(), Value::Str(STATE_REPLACED.into()));
-                old.insert(
-                    "replacement_pairing_id".into(),
-                    Value::Str(replacement_id.clone()),
-                );
-                self.state
-                    .write_set(&Self::pairing_path(pairing_id)?, Value::Map(old.clone()))
-                    .await
-                    .map_err(|e| DriverError::Other(e.to_string()))?;
-
-                let installation_id = field_str(&m, "installation_id")
-                    .or_else(|| field_str(&old, "installation_id"))
-                    .ok_or_else(|| DriverError::Other("replace requires installation_id".into()))?
-                    .to_string();
-                let manifest_platform = field_str(&m, "manifest_platform")
-                    .or_else(|| field_str(&old, "manifest_platform"));
-                let scope = self
-                    .load_pairing_scope(&installation_id, manifest_platform)
+                Self::pairing_path(&replacement_id)?;
+                let old_installation_id = record_required_str(&old, "installation_id")?;
+                let old_manifest_platform =
+                    record_optional_str(&old, "manifest_platform")?.map(str::to_string);
+                let old_scope = self
+                    .load_pairing_scope(old_installation_id, old_manifest_platform.as_deref())
                     .await?;
-                let requested_allowed = if m.contains_key("allowed_roles") {
-                    role_values(m.get("allowed_roles"), "allowed_roles")?
-                } else {
-                    role_values(old.get("allowed_roles"), "record.allowed_roles")?
+                let stored_allowed = role_values(old.get("allowed_roles"), "record.allowed_roles")?;
+                ensure_roles_allowed(&stored_allowed, &old_scope.roles)?;
+                required_record_nonnegative_int(&old, "expires_at")?;
+                required_record_nonnegative_int(&old, "credential_generation")?;
+                record_required_str(&old, "secret_hash")?;
+                record_required_str(&old, "display_checksum")?;
+
+                let installation_id = optional_str(&m, "installation_id")?
+                    .unwrap_or(old_installation_id)
+                    .to_string();
+                let manifest_platform = match optional_str(&m, "manifest_platform")? {
+                    Some(platform) => Some(platform.to_string()),
+                    None => record_optional_str(&old, "manifest_platform")?.map(str::to_string),
                 };
-                let allowed_roles =
-                    if requested_allowed.is_empty() && !m.contains_key("allowed_roles") {
-                        scope.roles.clone()
-                    } else {
-                        ensure_roles_allowed(&requested_allowed, &scope.roles)?;
-                        requested_allowed
-                    };
+                let scope = self
+                    .load_pairing_scope(&installation_id, manifest_platform.as_deref())
+                    .await?;
+                let allowed_roles = if m.contains_key("allowed_roles") {
+                    let requested_allowed = role_values(m.get("allowed_roles"), "allowed_roles")?;
+                    ensure_roles_allowed(&requested_allowed, &scope.roles)?;
+                    requested_allowed
+                } else {
+                    ensure_roles_allowed(&stored_allowed, &scope.roles)?;
+                    stored_allowed
+                };
+                let expires_at = optional_nonnegative_int(&m, "expires_at", 0)?;
                 let secret = random_secret()?;
-                let expires_at = m.get("expires_at").and_then(|v| v.as_int()).unwrap_or(0);
                 let mut replacement = BTreeMap::new();
                 replacement.insert("pairing_id".into(), Value::Str(replacement_id.clone()));
                 replacement.insert("installation_id".into(), Value::Str(installation_id));
@@ -456,6 +455,16 @@ impl Driver for PairingDriver {
                 replacement.insert("expires_at".into(), Value::Int(expires_at));
                 replacement.insert("replaces".into(), Value::Str(pairing_id.into()));
                 replacement.insert("credential_generation".into(), Value::Int(0));
+
+                old.insert("state".into(), Value::Str(STATE_REPLACED.into()));
+                old.insert(
+                    "replacement_pairing_id".into(),
+                    Value::Str(replacement_id.clone()),
+                );
+                self.state
+                    .write_set(&Self::pairing_path(pairing_id)?, Value::Map(old.clone()))
+                    .await
+                    .map_err(|e| DriverError::Other(e.to_string()))?;
                 let out = self.write_record(&replacement_id, replacement).await?;
                 self.stage_display_secret(&replacement_id, secret);
                 Ok(out)
@@ -510,8 +519,78 @@ fn field_str<'a>(m: &'a BTreeMap<String, Value>, key: &str) -> Option<&'a str> {
 }
 
 #[cfg(feature = "standard-core")]
+fn record_optional_str<'a>(
+    record: &'a BTreeMap<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>, DriverError> {
+    match record.get(key) {
+        None => Ok(None),
+        Some(Value::Str(value)) if !value.is_empty() => Ok(Some(value.as_str())),
+        Some(Value::Str(_)) => Err(DriverError::Other(format!(
+            "pairing record field {key} must not be empty"
+        ))),
+        Some(_) => Err(DriverError::Other(format!(
+            "pairing record field {key} must be a string"
+        ))),
+    }
+}
+
+#[cfg(feature = "standard-core")]
+fn record_required_str<'a>(
+    record: &'a BTreeMap<String, Value>,
+    key: &str,
+) -> Result<&'a str, DriverError> {
+    record_optional_str(record, key)?
+        .ok_or_else(|| DriverError::Other(format!("pairing record missing {key}")))
+}
+
+#[cfg(feature = "standard-core")]
+fn optional_str<'a>(
+    m: &'a BTreeMap<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>, DriverError> {
+    match m.get(key) {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Str(value)) if !value.is_empty() => Ok(Some(value.as_str())),
+        Some(Value::Str(_)) => Err(DriverError::Other(format!("{key} must not be empty"))),
+        Some(_) => Err(DriverError::Other(format!("{key} must be a string"))),
+    }
+}
+
+#[cfg(feature = "standard-core")]
 fn required_str<'a>(m: &'a BTreeMap<String, Value>, key: &str) -> Result<&'a str, DriverError> {
-    field_str(m, key).ok_or_else(|| DriverError::Other(format!("{key} is required")))
+    optional_str(m, key)?.ok_or_else(|| DriverError::Other(format!("{key} is required")))
+}
+
+#[cfg(feature = "standard-core")]
+fn optional_nonnegative_int(
+    m: &BTreeMap<String, Value>,
+    key: &str,
+    default: i64,
+) -> Result<i64, DriverError> {
+    match m.get(key) {
+        Some(Value::Null) | None => Ok(default),
+        Some(Value::Int(value)) if *value >= 0 => Ok(*value),
+        Some(Value::Int(_)) => Err(DriverError::Other(format!("{key} must be nonnegative"))),
+        Some(_) => Err(DriverError::Other(format!("{key} must be an integer"))),
+    }
+}
+
+#[cfg(feature = "standard-core")]
+fn required_record_nonnegative_int(
+    record: &BTreeMap<String, Value>,
+    key: &str,
+) -> Result<i64, DriverError> {
+    match record.get(key) {
+        Some(Value::Int(value)) if *value >= 0 => Ok(*value),
+        Some(Value::Int(_)) => Err(DriverError::Other(format!(
+            "pairing record field {key} must be nonnegative"
+        ))),
+        Some(_) => Err(DriverError::Other(format!(
+            "pairing record field {key} must be an integer"
+        ))),
+        None => Err(DriverError::Other(format!("pairing record missing {key}"))),
+    }
 }
 
 #[cfg(feature = "standard-core")]
@@ -527,6 +606,15 @@ fn validate_id_segment(id: &str, label: &str) -> Result<(), DriverError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(feature = "standard-core")]
+fn kernel_state_path(segments: &[&str]) -> Result<Path, nexus_types::PathError> {
+    let mut path = Path::try_new("state")?.try_push("kernel")?;
+    for segment in segments {
+        path = path.try_push_literal(segment)?;
+    }
+    Ok(path)
 }
 
 #[cfg(feature = "standard-core")]
@@ -573,10 +661,14 @@ fn role_values(v: Option<&Value>, field: &str) -> Result<Vec<String>, DriverErro
 #[cfg(feature = "standard-core")]
 fn ensure_not_terminal(record: &BTreeMap<String, Value>) -> Result<(), DriverError> {
     match field_str(record, "state") {
+        Some(STATE_CREATED) => Ok(()),
         Some(STATE_APPROVED | STATE_DENIED | STATE_EXPIRED | STATE_REPLACED | STATE_REVOKED) => {
             Err(DriverError::Other("pairing intent is terminal".into()))
         }
-        _ => Ok(()),
+        Some(state) => Err(DriverError::Other(format!(
+            "pairing intent has unknown state {state:?}"
+        ))),
+        None => Err(DriverError::Other("pairing intent has no state".into())),
     }
 }
 
@@ -593,10 +685,7 @@ fn ensure_created(record: &BTreeMap<String, Value>) -> Result<(), DriverError> {
 
 #[cfg(feature = "standard-core")]
 fn ensure_not_expired(record: &mut BTreeMap<String, Value>) -> Result<(), DriverError> {
-    let expires_at = record
-        .get("expires_at")
-        .and_then(Value::as_int)
-        .unwrap_or(0);
+    let expires_at = required_record_nonnegative_int(record, "expires_at")?;
     if expires_at > 0 && expires_at <= nexus_kernel::now_millis() {
         record.insert("state".into(), Value::Str(STATE_EXPIRED.into()));
         return Err(DriverError::Other("pairing intent has expired".into()));
@@ -930,20 +1019,20 @@ mod tests {
 
     fn external_installation(id: &str, role: Role) -> anyhow::Result<Value> {
         let projection = match role {
-            Role::Provider => nexus_types::ExternalProjectionDef {
-                id: "provider".into(),
-                role,
-                namespace: Some(
-                    Path::parse(&format!("effect://external-provider/{id}"))
-                        .context("parse provider namespace")?,
-                ),
-                provides: vec![EffectCapability::new(
-                    format!("effect://external-provider/{id}/search"),
-                    Purity::Idempotent,
-                )],
-                emits: None,
-                version: 1,
-            },
+            Role::Provider => {
+                let provider_namespace = Path::try_new("effect")?
+                    .try_push("external-provider")?
+                    .try_push_literal(id)?;
+                let search_effect = provider_namespace.clone().try_push("search")?.to_string();
+                nexus_types::ExternalProjectionDef {
+                    id: "provider".into(),
+                    role,
+                    namespace: Some(provider_namespace),
+                    provides: vec![EffectCapability::new(search_effect, Purity::Idempotent)],
+                    emits: None,
+                    version: 1,
+                }
+            }
             Role::Source => nexus_types::ExternalProjectionDef {
                 id: "source".into(),
                 role,
@@ -984,8 +1073,7 @@ mod tests {
     }
 
     async fn install_external(state: &Backend, id: &str, role: Role) -> anyhow::Result<()> {
-        let path = Path::parse(&format!("state://kernel/external-installations/{id}"))
-            .context("parse installation state path")?;
+        let path = PairingDriver::installation_path(id).context("build installation state path")?;
         state
             .write_set(&path, external_installation(id, role)?)
             .await?;
@@ -1017,6 +1105,27 @@ mod tests {
             ),
         );
         state.write_set(&path, Value::Map(record)).await?;
+        Ok(())
+    }
+
+    #[test]
+    fn pairing_state_paths_reject_path_delimiters() -> anyhow::Result<()> {
+        ensure!(
+            PairingDriver::pairing_path("pair/bad").is_err(),
+            "pairing id with delimiter was accepted"
+        );
+        ensure!(
+            PairingDriver::installation_path("ext/bad").is_err(),
+            "installation id with delimiter was accepted"
+        );
+        ensure!(
+            PairingDriver::session_path("ext", "provider/bad").is_err(),
+            "role with delimiter was accepted"
+        );
+        ensure!(
+            PairingDriver::manifest_path("platform/bad").is_err(),
+            "manifest platform with delimiter was accepted"
+        );
         Ok(())
     }
 
@@ -1183,6 +1292,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pairing_create_rejects_malformed_optional_fields() -> anyhow::Result<()> {
+        let (driver, state) = driver();
+        install_external(&state, "ext-malformed-optional", Role::Provider).await?;
+        for (field, value) in [
+            ("pairing_id", Value::Int(1)),
+            ("manifest_platform", Value::Int(1)),
+            ("expires_at", Value::Str("never".into())),
+            ("expires_at", Value::Int(-1)),
+        ] {
+            let mut input = BTreeMap::new();
+            input.insert(
+                "pairing_id".into(),
+                Value::Str(format!("pair-malformed-{field}")),
+            );
+            input.insert(
+                "installation_id".into(),
+                Value::Str("ext-malformed-optional".into()),
+            );
+            input.insert(field.into(), value);
+            let err = expected_driver_error(
+                driver
+                    .call(
+                        MethodId::new(0),
+                        Value::Map(input),
+                        OutputMode::Unary,
+                        &ctx(),
+                    )
+                    .await,
+                "create pairing with malformed optional field",
+            )?;
+            ensure!(
+                matches!(err, DriverError::Other(_)),
+                "unexpected malformed optional field error: {err:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn approve_projects_provider_external_state() -> anyhow::Result<()> {
         let (driver, state) = driver();
         install_external(&state, "ext-2", Role::Provider).await?;
@@ -1229,6 +1377,132 @@ mod tests {
             "unexpected credential generation: {:?}",
             m.get("credential_generation")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approve_rejects_malformed_persisted_security_fields() -> anyhow::Result<()> {
+        let (driver, state) = driver();
+        install_external(&state, "ext-persisted-security", Role::Provider).await?;
+
+        for (pairing_id, field, value) in [
+            ("pair-missing-expiry", "expires_at", None),
+            (
+                "pair-bad-expiry",
+                "expires_at",
+                Some(Value::Str("never".into())),
+            ),
+            ("pair-missing-generation", "credential_generation", None),
+            (
+                "pair-bad-generation",
+                "credential_generation",
+                Some(Value::Str("0".into())),
+            ),
+        ] {
+            let mut create = BTreeMap::new();
+            create.insert("pairing_id".into(), Value::Str(pairing_id.into()));
+            create.insert(
+                "installation_id".into(),
+                Value::Str("ext-persisted-security".into()),
+            );
+            driver
+                .call(
+                    MethodId::new(0),
+                    Value::Map(create),
+                    OutputMode::Unary,
+                    &ctx(),
+                )
+                .await?;
+            lock_pairing_claim(&state, pairing_id, &["provider"], true).await?;
+
+            let path = PairingDriver::pairing_path(pairing_id)
+                .context("build pairing path for malformed record")?;
+            let mut record = state
+                .read(&path)
+                .await?
+                .context("pairing record missing")?
+                .as_map()
+                .context("pairing record is not a map")?
+                .clone();
+            match value {
+                Some(value) => {
+                    record.insert(field.into(), value);
+                }
+                None => {
+                    record.remove(field);
+                }
+            }
+            state.write_set(&path, Value::Map(record)).await?;
+
+            let mut approve = BTreeMap::new();
+            approve.insert("pairing_id".into(), Value::Str(pairing_id.into()));
+            let err = expected_driver_error(
+                driver
+                    .call(
+                        MethodId::new(1),
+                        Value::Map(approve),
+                        OutputMode::Unary,
+                        &ctx(),
+                    )
+                    .await,
+                "approve malformed persisted pairing record",
+            )?;
+            ensure!(
+                matches!(err, DriverError::Other(_)),
+                "unexpected malformed persisted record error: {err:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_operations_reject_malformed_pairing_state() -> anyhow::Result<()> {
+        let (driver, state) = driver();
+        install_external(&state, "ext-bad-state", Role::Provider).await?;
+
+        for (pairing_id, method_id) in [("pair-bad-deny", 2), ("pair-bad-replace", 3)] {
+            let mut create = BTreeMap::new();
+            create.insert("pairing_id".into(), Value::Str(pairing_id.into()));
+            create.insert("installation_id".into(), Value::Str("ext-bad-state".into()));
+            driver
+                .call(
+                    MethodId::new(0),
+                    Value::Map(create),
+                    OutputMode::Unary,
+                    &ctx(),
+                )
+                .await?;
+
+            let path = PairingDriver::pairing_path(pairing_id)
+                .context("build pairing path for malformed state")?;
+            let mut record = state
+                .read(&path)
+                .await?
+                .context("pairing record missing")?
+                .as_map()
+                .context("pairing record is not a map")?
+                .clone();
+            record.remove("state");
+            state.write_set(&path, Value::Map(record)).await?;
+
+            let mut input = BTreeMap::new();
+            input.insert("pairing_id".into(), Value::Str(pairing_id.into()));
+            let err = expected_driver_error(
+                driver
+                    .call(
+                        MethodId::new(method_id),
+                        Value::Map(input),
+                        OutputMode::Unary,
+                        &ctx(),
+                    )
+                    .await,
+                "terminal operation with malformed pairing state",
+            )?;
+            ensure!(
+                matches!(err, DriverError::Other(_)),
+                "unexpected malformed state error: {err:?}"
+            );
+        }
         Ok(())
     }
 
@@ -1583,6 +1857,192 @@ mod tests {
         ensure!(
             pairing_state == Some(&Value::Str(STATE_CREATED.into())),
             "replacement pairing was not created"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_validation_failure_leaves_old_intent_created() -> anyhow::Result<()> {
+        let (driver, state) = driver();
+        install_external(&state, "ext-replace-validate", Role::Provider).await?;
+        let mut create = BTreeMap::new();
+        create.insert(
+            "pairing_id".into(),
+            Value::Str("pair-replace-validate".into()),
+        );
+        create.insert(
+            "installation_id".into(),
+            Value::Str("ext-replace-validate".into()),
+        );
+        driver
+            .call(
+                MethodId::new(0),
+                Value::Map(create),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await?;
+
+        for (replacement_id, expires_at) in [
+            ("pair-replace-validate-b", Value::Str("never".into())),
+            ("pair/replace/bad", Value::Int(0)),
+        ] {
+            let mut replace = BTreeMap::new();
+            replace.insert(
+                "pairing_id".into(),
+                Value::Str("pair-replace-validate".into()),
+            );
+            replace.insert(
+                "replacement_pairing_id".into(),
+                Value::Str(replacement_id.into()),
+            );
+            replace.insert("expires_at".into(), expires_at);
+            let err = expected_driver_error(
+                driver
+                    .call(
+                        MethodId::new(3),
+                        Value::Map(replace),
+                        OutputMode::Unary,
+                        &ctx(),
+                    )
+                    .await,
+                "replace with malformed input",
+            )?;
+            ensure!(
+                matches!(err, DriverError::Other(_)),
+                "unexpected malformed replace error: {err:?}"
+            );
+
+            let old = state
+                .read(&PairingDriver::pairing_path("pair-replace-validate")?)
+                .await?
+                .context("old pairing record missing")?;
+            let old_state = old
+                .as_map()
+                .context("old pairing record is not a map")?
+                .get("state");
+            ensure!(
+                old_state == Some(&Value::Str(STATE_CREATED.into())),
+                "old pairing was mutated before replace validation finished"
+            );
+            ensure!(
+                driver.take_display_secret(replacement_id).is_none(),
+                "replace staged a display secret after validation failure"
+            );
+        }
+        ensure!(
+            state
+                .read(&PairingDriver::pairing_path("pair-replace-validate-b")?)
+                .await?
+                .is_none(),
+            "replacement record was written after validation failure"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_rejects_missing_stored_allowed_roles() -> anyhow::Result<()> {
+        let (driver, state) = driver();
+        install_external(&state, "ext-replace-roles", Role::Provider).await?;
+        let mut create = BTreeMap::new();
+        create.insert("pairing_id".into(), Value::Str("pair-replace-roles".into()));
+        create.insert(
+            "installation_id".into(),
+            Value::Str("ext-replace-roles".into()),
+        );
+        driver
+            .call(
+                MethodId::new(0),
+                Value::Map(create),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await?;
+
+        let path = PairingDriver::pairing_path("pair-replace-roles")?;
+        let mut record = state
+            .read(&path)
+            .await?
+            .context("pairing record missing")?
+            .as_map()
+            .context("pairing record is not a map")?
+            .clone();
+        record.remove("allowed_roles");
+        state.write_set(&path, Value::Map(record)).await?;
+
+        let mut replace = BTreeMap::new();
+        replace.insert("pairing_id".into(), Value::Str("pair-replace-roles".into()));
+        replace.insert(
+            "replacement_pairing_id".into(),
+            Value::Str("pair-replace-roles-b".into()),
+        );
+        let err = expected_driver_error(
+            driver
+                .call(
+                    MethodId::new(3),
+                    Value::Map(replace),
+                    OutputMode::Unary,
+                    &ctx(),
+                )
+                .await,
+            "replace with missing stored allowed roles",
+        )?;
+        ensure!(
+            matches!(err, DriverError::Other(_)),
+            "unexpected missing allowed_roles error: {err:?}"
+        );
+        let old = state
+            .read(&path)
+            .await?
+            .context("old pairing record missing")?;
+        let old_state = old
+            .as_map()
+            .context("old pairing record is not a map")?
+            .get("state");
+        ensure!(
+            old_state == Some(&Value::Str(STATE_CREATED.into())),
+            "old pairing was replaced despite malformed stored allowed_roles"
+        );
+        ensure!(
+            state
+                .read(&PairingDriver::pairing_path("pair-replace-roles-b")?)
+                .await?
+                .is_none(),
+            "replacement record was created from malformed stored allowed_roles"
+        );
+
+        let mut replace_with_explicit_roles = BTreeMap::new();
+        replace_with_explicit_roles
+            .insert("pairing_id".into(), Value::Str("pair-replace-roles".into()));
+        replace_with_explicit_roles.insert(
+            "replacement_pairing_id".into(),
+            Value::Str("pair-replace-roles-c".into()),
+        );
+        replace_with_explicit_roles.insert(
+            "allowed_roles".into(),
+            Value::List(vec![Value::Str("provider".into())]),
+        );
+        let err = expected_driver_error(
+            driver
+                .call(
+                    MethodId::new(3),
+                    Value::Map(replace_with_explicit_roles),
+                    OutputMode::Unary,
+                    &ctx(),
+                )
+                .await,
+            "replace with explicit roles and missing stored allowed roles",
+        )?;
+        ensure!(
+            matches!(err, DriverError::Other(_)),
+            "unexpected explicit roles missing allowed_roles error: {err:?}"
+        );
+        ensure!(
+            state
+                .read(&PairingDriver::pairing_path("pair-replace-roles-c")?)
+                .await?
+                .is_none(),
+            "replacement with explicit roles was created from malformed stored allowed_roles"
         );
         Ok(())
     }

@@ -33,15 +33,7 @@
 
 External gateway session 见 [External Gateway](external-gateway.md)。Provider 和 Source 是唯一的外部 projection role。
 
-daemon 负责 session 准入和裁定：
-
-1. 外部程序发送 `RoleSessionClientHello`；
-2. daemon 读取 installation、其中选中的 projection、pairing 和已批准 session state；
-3. daemon 发送带权威 generation 和限制的 `SessionContext`；
-4. 外部程序回复 `RoleReady`；
-5. session ready 后才允许业务 frame 流动。
-
-Provider binding 来自 installation projection；`RoleReady` 只确认选定的 session context。Source event 只有通过 generation、schema、dedupe、capacity、rate 和 policy 检查后才会准入。
+外部程序运行在 Nexus 进程之外，但需要作为声明过的 effect 或事件流投影进运行时，就使用这个入口。daemon 持有 session 准入、generation 检查、binding 选择和运行时限制；外部程序不能自声明授权范围。
 
 ## MCP
 
@@ -57,7 +49,4 @@ MCP 专用字段留在 publication properties 中。`icons`、`mimeType`、`size
 
 控制台 HTTP 只负责健康检查和认证。登录后的管理功能通过 Console WebSocket 执行，带授权、CAS、可见性门槛和审计记录。
 
-控制台传输安全由 daemon 持有，并通过 `[console.transport_security]` 配置。当前控制台
-监听器是明文监听器：`local_trusted` 只允许 loopback，TLS 在可信前置代理终止时使用
-`trusted_reverse_proxy`，除非控制台监听器配置了 daemon 持有的 TLS 材料，否则
-`production_tls` 会拒绝启动。
+控制台传输安全属于部署配置，见[配置](configuration.md)。本页只说明控制台协议入口。

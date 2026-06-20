@@ -35,7 +35,9 @@ impl TensorDriver {
     }
 
     fn tensor_path(hash: &str) -> Result<Path, DriverError> {
-        Path::parse(&format!("state://tensor/{hash}"))
+        Path::try_new("state")
+            .and_then(|path| path.try_push("tensor"))
+            .and_then(|path| path.try_push_literal(hash))
             .map_err(|e| DriverError::Other(format!("invalid tensor hash {hash:?}: {e}")))
     }
 }
@@ -56,7 +58,7 @@ impl Driver for TensorDriver {
             // the TensorRef envelope.
             0 => {
                 let data = match m.get("data") {
-                    Some(Value::List(xs)) if !xs.is_empty() => xs.clone(),
+                    Some(Value::List(xs)) if !xs.is_empty() => xs,
                     Some(Value::List(_)) => {
                         return Err(DriverError::Other(
                             "tensor write requires non-empty `data` list".into(),
@@ -68,26 +70,16 @@ impl Driver for TensorDriver {
                         ));
                     }
                 };
-                let dtype = match m.get("dtype").and_then(|v| v.as_str()) {
-                    Some("f32") | None => DType::F32,
-                    Some("f64") => DType::F64,
-                    Some("i32") => DType::I32,
-                    Some("i64") => DType::I64,
-                    Some("u8") => DType::U8,
-                    Some(other) => {
-                        return Err(DriverError::Other(format!(
-                            "unsupported tensor dtype {other:?}"
-                        )));
-                    }
-                };
-                let bytes = serialize_tensor_bytes(&data, dtype)?;
+                let dtype = parse_dtype(m.get("dtype"))?;
+                let shape = parse_shape(m.get("shape"), data.len())?;
+                validate_shape_len(&shape, data.len())?;
+                let bytes = serialize_tensor_bytes(data, dtype)?;
                 let blob = crate::blob::write_blob_bytes(
                     &self.state,
                     bytes,
                     Some("application/x-nexus-tensor".into()),
                 )
                 .await?;
-                let shape = parse_shape(m.get("shape"), data.len())?;
                 let tensor = TensorRef {
                     blob: blob.clone(),
                     dtype,
@@ -151,6 +143,42 @@ fn parse_shape(shape: Option<&Value>, default_len: usize) -> Result<Vec<u64>, Dr
         )),
         Some(_) => Err(DriverError::Other("tensor shape must be a list".into())),
         None => Ok(vec![default_len as u64]),
+    }
+}
+
+fn parse_dtype(dtype: Option<&Value>) -> Result<DType, DriverError> {
+    match dtype {
+        None => Ok(DType::F32),
+        Some(Value::Str(dtype)) => match dtype.as_str() {
+            "f32" => Ok(DType::F32),
+            "f64" => Ok(DType::F64),
+            "i32" => Ok(DType::I32),
+            "i64" => Ok(DType::I64),
+            "u8" => Ok(DType::U8),
+            other => Err(DriverError::Other(format!(
+                "unsupported tensor dtype {other:?}"
+            ))),
+        },
+        Some(_) => Err(DriverError::InvalidInput(
+            "tensor dtype must be a string".into(),
+        )),
+    }
+}
+
+fn validate_shape_len(shape: &[u64], data_len: usize) -> Result<(), DriverError> {
+    let elements = shape.iter().try_fold(1usize, |acc, dim| {
+        let dim = usize::try_from(*dim).map_err(|_| {
+            DriverError::Other("tensor shape dimension is too large for this platform".into())
+        })?;
+        acc.checked_mul(dim)
+            .ok_or_else(|| DriverError::Other("tensor shape element count overflowed".into()))
+    })?;
+    if elements == data_len {
+        Ok(())
+    } else {
+        Err(DriverError::InvalidInput(format!(
+            "tensor shape describes {elements} elements but data has {data_len}"
+        )))
     }
 }
 
@@ -332,6 +360,58 @@ mod tests {
             .call(MethodId::new(0), Value::Map(m), OutputMode::Unary, &ctx())
             .await;
         ensure!(out.is_err(), "non numeric tensor data must be rejected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_dtype_is_rejected() -> Result<()> {
+        let d = driver();
+        let mut m = BTreeMap::new();
+        m.insert("data".into(), data(&[1.0]));
+        m.insert("dtype".into(), Value::Int(1));
+        let out = d
+            .call(MethodId::new(0), Value::Map(m), OutputMode::Unary, &ctx())
+            .await;
+        ensure!(out.is_err(), "non-string dtype defaulted to f32");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shape_must_match_data_before_blob_write() -> Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = driver_with_state(state.clone());
+        let mut m = BTreeMap::new();
+        m.insert("data".into(), data(&[1.0, 2.0]));
+        m.insert("shape".into(), Value::List(vec![Value::Int(3)]));
+        let out = d
+            .call(MethodId::new(0), Value::Map(m), OutputMode::Unary, &ctx())
+            .await;
+        ensure!(out.is_err(), "shape/data mismatch was accepted");
+        let blob_root = Path::parse("state://blob").context("parse blob root")?;
+        ensure!(
+            state.read_prefix(&blob_root).await?.is_empty(),
+            "tensor wrote blob state before shape validation finished"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn caller_tensor_hash_must_be_one_path_segment() -> Result<()> {
+        let d = driver();
+        let bad = Value::Map(BTreeMap::from([(
+            "hash".into(),
+            Value::Str("bad/hash".into()),
+        )]));
+
+        let read = d
+            .call(MethodId::new(1), bad.clone(), OutputMode::Unary, &ctx())
+            .await;
+        ensure!(read.is_err(), "bad tensor hash read was accepted");
+
+        let delete = d
+            .call(MethodId::new(2), bad, OutputMode::Unary, &ctx())
+            .await;
+        ensure!(delete.is_err(), "bad tensor hash delete was accepted");
         Ok(())
     }
 }

@@ -20,55 +20,13 @@ External WebSocket 监听 `[server].external_websocket_addr` 或 `NEXUS_EXTERNAL
 
 ## 配置
 
-`[external_gateway.grpc]` 和 `[external_gateway.websocket]` 使用同一组 Provider/Source 限制 key：
+监听地址、传输安全、WebSocket 传输上限和 Provider/Source 数值限制都归属[配置](configuration.md)。本页不重复 key 列表或默认 TOML 块。
 
-```toml
-[external_gateway.grpc]
-source_dedupe_window_ms = 86400000
-provider_max_in_flight_invocations = 1024
-provider_max_in_flight_per_identity = 256
-provider_max_in_flight_per_effect = 256
-source_max_in_flight_commands = 1024
-source_command_rate_limit_window_ms = 60000
-source_command_rate_limit_max = 600
-
-[external_gateway.websocket]
-source_dedupe_window_ms = 86400000
-provider_max_in_flight_invocations = 1024
-provider_max_in_flight_per_identity = 256
-provider_max_in_flight_per_effect = 256
-source_max_in_flight_commands = 1024
-source_command_rate_limit_window_ms = 60000
-source_command_rate_limit_max = 600
-```
-
-`source_dedupe_window_ms` 限制 Source event id 去重保留窗口，也限制 Source outbound command 在 result、deadline 或 session drain 后的 command idempotency 保留窗口。
-
-Provider in-flight 上限作用于每个 ready Provider session、该 session 内每个 acting identity、该 session 内每个 effect path。
-
-Source command 上限作用于每个 ready Source session。command rate limit 作用于每个 Source projection。
-
-Source event 的 payload 大小限制、stream 容量、溢出行为和 event-ingress 速率限制在每个 Source projection 上声明。
-
-## WebSocket 传输限制
-
-External WebSocket 有传输层限制：
-
-```toml
-[external_gateway.websocket.transport]
-max_frame_bytes = 1048576
-first_frame_timeout_ms = 10000
-idle_timeout_ms = 300000
-max_connections = 256
-```
-
-这些值会在监听启动前由 `nexus-gateway-websocket` 限制到硬上限内。
+session 准入后，这些设置限制 Provider dispatch、Provider result 解析、Source command dispatch、Source command result 解析、Source event ingress，以及 Source event 或 command 的 idempotency 保留。Source event 的 payload 大小限制、stream 容量、溢出行为和 event-ingress 速率限制在每个 Source projection 上声明。
 
 ## 传输安全
 
-External gRPC 支持 `production_tls`、`mtls`、`trusted_reverse_proxy`、`local_trusted`、`unsafe_plaintext` 和 `disabled_for_test`。
-
-External WebSocket 是明文监听器。外部 TLS 终止使用 `trusted_reverse_proxy`，仅 loopback 部署使用 `local_trusted`，只有部署明确接受明文时才使用 `unsafe_plaintext`。`production_tls` 和 `mtls` 在 WebSocket 明文监听器上会拒绝启动。
+传输安全模式及其需要的证书或代理字段见[配置](configuration.md)。某个监听器拒绝传输安全模式时，会在接受 external session 前停止启动。
 
 ## Session 状态
 

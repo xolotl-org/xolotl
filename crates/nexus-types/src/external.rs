@@ -178,8 +178,8 @@ pub enum ExternalAdmissionError {
     /// Source ingress rate limit was invalid.
     #[error("source rate_limit window_ms and max_events must be greater than zero")]
     InvalidSourceRateLimit,
-    /// Source event sink was not a concrete local state path.
-    #[error("source event sink must be a concrete local state:// path: {actual}")]
+    /// Source event sink was not a concrete local non-reserved state path.
+    #[error("source event sink must be a concrete local non-reserved state:// path: {actual}")]
     BadSourceEventSink {
         /// Event sink path supplied by the projection.
         actual: Box<Path>,
@@ -201,6 +201,9 @@ pub enum ExternalAdmissionError {
     /// Provider effect path was not a concrete effect resource.
     #[error("provider effect path must be a concrete effect:// path: {0}")]
     BadEffectPath(String),
+    /// Provider effect path targeted a kernel-reserved effect.
+    #[error("provider effect path must not target effect://kernel/*")]
+    KernelEffectPath,
     /// Provider effect path escaped the declared namespace.
     #[error("provider effect {effect} escapes namespace {namespace}")]
     NamespaceEscape {
@@ -256,14 +259,16 @@ impl ExternalProjectionDef {
                     let effect = Path::parse(&cap.effect_path).map_err(|_| {
                         ExternalAdmissionError::MalformedEffectPath(cap.effect_path.clone())
                     })?;
-                    let concrete = effect
-                        .segments()
-                        .iter()
-                        .all(|segment| !matches!(segment.as_str(), "*" | "**"));
-                    if effect.scheme() != "effect" || effect.segments().is_empty() || !concrete {
+                    if effect.scheme() != "effect"
+                        || effect.segments().is_empty()
+                        || !effect.is_concrete()
+                    {
                         return Err(ExternalAdmissionError::BadEffectPath(
                             cap.effect_path.clone(),
                         ));
+                    }
+                    if crate::is_kernel_reserved(&effect) {
+                        return Err(ExternalAdmissionError::KernelEffectPath);
                     }
                     if !effects.insert(effect.clone()) {
                         return Err(ExternalAdmissionError::DuplicateProviderEffect(
@@ -392,9 +397,11 @@ fn validate_trust_transport(
 
 fn validate_sandbox_namespace(id: &str, namespace: &Path) -> Result<(), ExternalAdmissionError> {
     let segs = namespace.segments();
-    let ok_prefix = namespace.scheme() == "effect"
-        && segs.len() >= 2
-        && segs[0].as_str() == "external-provider";
+    let ok_prefix = namespace.cluster().is_none()
+        && namespace.scheme() == "effect"
+        && segs.len() == 2
+        && segs[0].as_str() == "external-provider"
+        && namespace.is_concrete();
     if !ok_prefix {
         return Err(ExternalAdmissionError::BadSandboxNamespace);
     }
@@ -405,14 +412,13 @@ fn validate_sandbox_namespace(id: &str, namespace: &Path) -> Result<(), External
 }
 
 fn validate_source_event_sink(path: &Path) -> Result<(), ExternalAdmissionError> {
-    let concrete = path
-        .segments()
-        .iter()
-        .all(|seg| !matches!(seg.as_str(), "*" | "**"));
     if path.cluster().is_none()
         && path.scheme() == "state"
         && !path.segments().is_empty()
-        && concrete
+        && path.is_concrete()
+        && !crate::is_kernel_reserved(path)
+        && !crate::is_vault_reserved(path)
+        && !crate::is_fact_reserved(path)
     {
         Ok(())
     } else {
@@ -460,8 +466,8 @@ pub fn sandboxed_source_event_sink_path(
     Path::try_new("state")
         .and_then(|path| path.try_push("events"))
         .and_then(|path| path.try_push("external"))
-        .and_then(|path| path.try_push(installation_id))
-        .and_then(|path| path.try_push(projection_id))
+        .and_then(|path| path.try_push_literal(installation_id))
+        .and_then(|path| path.try_push_literal(projection_id))
         .map_err(|error| ExternalAdmissionError::MalformedSandboxEventSinkPath(error.to_string()))
 }
 
@@ -1237,6 +1243,60 @@ mod tests {
             "bad sandbox namespace",
         )?;
 
+        let mut wildcard_namespace = valid.clone();
+        wildcard_namespace.namespace = Some(
+            Path::parse("effect://external-provider/acme/**")
+                .context("parse wildcard namespace")?,
+        );
+        check_eq(
+            wildcard_namespace.validate_admission(
+                "acme",
+                TrustLevel::Sandboxed,
+                &Transport::Stdio {
+                    command: Some("acme-plugin".into()),
+                    args: vec![],
+                },
+            ),
+            Err(ExternalAdmissionError::BadSandboxNamespace),
+            "wildcard sandbox namespace",
+        )?;
+
+        let mut nested_namespace = valid.clone();
+        nested_namespace.namespace = Some(
+            Path::parse("effect://external-provider/acme/nested")
+                .context("parse nested namespace")?,
+        );
+        check_eq(
+            nested_namespace.validate_admission(
+                "acme",
+                TrustLevel::Sandboxed,
+                &Transport::Stdio {
+                    command: Some("acme-plugin".into()),
+                    args: vec![],
+                },
+            ),
+            Err(ExternalAdmissionError::BadSandboxNamespace),
+            "nested sandbox namespace",
+        )?;
+
+        let mut clustered_namespace = valid.clone();
+        clustered_namespace.namespace = Some(
+            Path::parse("path://phone/effect/external-provider/acme")
+                .context("parse clustered namespace")?,
+        );
+        check_eq(
+            clustered_namespace.validate_admission(
+                "acme",
+                TrustLevel::Sandboxed,
+                &Transport::Stdio {
+                    command: Some("acme-plugin".into()),
+                    args: vec![],
+                },
+            ),
+            Err(ExternalAdmissionError::BadSandboxNamespace),
+            "clustered sandbox namespace",
+        )?;
+
         let mut duplicate = valid.clone();
         duplicate.provides.push(EffectCapability::new(
             "effect://external-provider/acme/search",
@@ -1255,6 +1315,31 @@ mod tests {
                 "effect://external-provider/acme/search".into(),
             )),
             "duplicate provider effect",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn provider_effects_cannot_claim_kernel_namespace() -> anyhow::Result<()> {
+        let projection = ExternalProjectionDef {
+            id: "provider".into(),
+            role: Role::Provider,
+            provides: vec![EffectCapability::new(
+                "effect://kernel/process/inspect",
+                Purity::Pure,
+            )],
+            emits: None,
+            namespace: Some(Path::parse("effect://kernel").context("parse kernel namespace")?),
+            version: 1,
+        };
+        check_eq(
+            projection.validate_admission(
+                "kernel_claim",
+                TrustLevel::Full,
+                &Transport::Grpc { endpoint: None },
+            ),
+            Err(ExternalAdmissionError::KernelEffectPath),
+            "kernel provider effect",
         )?;
         Ok(())
     }
@@ -1561,6 +1646,21 @@ mod tests {
                 Err(ExternalAdmissionError::BadSourceEventSink { .. })
             ),
             "clustered event sink was accepted"
+        );
+
+        let mut reserved = source.clone();
+        emits_mut(&mut reserved)?.sink =
+            Path::parse("state://kernel/external/source").context("parse reserved sink")?;
+        ensure!(
+            matches!(
+                reserved.validate_admission(
+                    "bridge",
+                    TrustLevel::Full,
+                    &Transport::Grpc { endpoint: None }
+                ),
+                Err(ExternalAdmissionError::BadSourceEventSink { .. })
+            ),
+            "reserved event sink was accepted"
         );
         Ok(())
     }

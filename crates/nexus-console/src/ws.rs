@@ -584,11 +584,11 @@ async fn dispatch_call(
             protocol::resource_view_descriptor_value(&view)
                 .ok_or_else(|| ConsoleError::BadRequest(format!("unknown resource view: {view}")))?
         }
-        ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE => authority_principal_effective(principal),
+        ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE => authority_principal_effective(principal)?,
         ACTION_AUTHORITY_ACTION_MATRIX => {
             let mut input = input_map(input_value(&call.input)?)?;
             let domain = optional_string_arg(&mut input, "domain")?;
-            authority_action_matrix(principal, domain.as_deref())
+            authority_action_matrix(principal, domain.as_deref())?
         }
         ACTION_AUTHORITY_RESOURCE_ACCESS => {
             let mut input = input_map(input_value(&call.input)?)?;
@@ -690,13 +690,8 @@ async fn dispatch_call(
         ACTION_ACCESS_USER_READ => {
             let mut input = input_map(input_value(&call.input)?)?;
             let username = string_arg(&mut input, "username")?;
-            auth::validate_username(&username)?;
-            let value = mgmt::inspect(
-                &sess.state,
-                principal,
-                &format!("state://kernel/console/users/{username}"),
-            )
-            .await?;
+            let path = console_user_path(&username)?;
+            let value = mgmt::inspect(&sess.state, principal, &path).await?;
             value.unwrap_or(Value::Null)
         }
         ACTION_ACCESS_USER_LIST => {
@@ -711,15 +706,9 @@ async fn dispatch_call(
             let value = value_arg(&mut input, "value")?;
             let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
-            auth::validate_username(&username)?;
-            mgmt::write_dedicated_config(
-                &sess.state,
-                principal,
-                &format!("state://kernel/console/users/{username}"),
-                value,
-                expected_version,
-            )
-            .await?;
+            let path = console_user_path(&username)?;
+            mgmt::write_dedicated_config(&sess.state, principal, &path, value, expected_version)
+                .await?;
             return Ok(ActionResult::empty(server_rev(sess)));
         }
         ACTION_ACCESS_USER_DISABLE => {
@@ -727,8 +716,7 @@ async fn dispatch_call(
             let username = string_arg(&mut input, "username")?;
             let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
-            auth::validate_username(&username)?;
-            let path = format!("state://kernel/console/users/{username}");
+            let path = console_user_path(&username)?;
             let Some(mut value) = mgmt::inspect(&sess.state, principal, &path).await? else {
                 return Err(ConsoleError::BadRequest("unknown console user".into()));
             };
@@ -749,13 +737,8 @@ async fn dispatch_call(
         ACTION_ACCESS_ROLE_READ => {
             let mut input = input_map(input_value(&call.input)?)?;
             let role = string_arg(&mut input, "role")?;
-            auth::validate_username(&role)?;
-            let value = mgmt::inspect(
-                &sess.state,
-                principal,
-                &format!("state://kernel/console/roles/{role}"),
-            )
-            .await?;
+            let path = console_role_path(&role)?;
+            let value = mgmt::inspect(&sess.state, principal, &path).await?;
             value.unwrap_or(Value::Null)
         }
         ACTION_ACCESS_ROLE_LIST => {
@@ -770,15 +753,9 @@ async fn dispatch_call(
             let value = value_arg(&mut input, "value")?;
             let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
-            auth::validate_username(&role)?;
-            mgmt::write_dedicated_config(
-                &sess.state,
-                principal,
-                &format!("state://kernel/console/roles/{role}"),
-                value,
-                expected_version,
-            )
-            .await?;
+            let path = console_role_path(&role)?;
+            mgmt::write_dedicated_config(&sess.state, principal, &path, value, expected_version)
+                .await?;
             return Ok(ActionResult::empty(server_rev(sess)));
         }
         ACTION_ACCESS_SESSION_CURRENT_LOGOUT => {
@@ -873,7 +850,8 @@ async fn dispatch_call(
             let process = optional_u64_arg(&mut input, "process")?;
             let limit = optional_usize_arg(&mut input, "limit")?.unwrap_or(64);
             let target = process
-                .map(|pid| format!("state://fact/{pid}"))
+                .map(|pid| fact_path(pid).map(|path| path.to_string()))
+                .transpose()?
                 .unwrap_or_else(|| "state://fact".into());
             record_visibility_audit(
                 &sess.state,
@@ -900,7 +878,7 @@ async fn dispatch_call(
             let process = u64_arg(&mut input, "process")?;
             let from = optional_usize_arg(&mut input, "from")?.unwrap_or(0);
             let limit = optional_usize_arg(&mut input, "limit")?.unwrap_or(128);
-            let target = format!("state://fact/{process}");
+            let target = fact_path(process)?.to_string();
             record_visibility_audit(
                 &sess.state,
                 principal,
@@ -947,13 +925,8 @@ async fn dispatch_call(
         ACTION_EXTERNAL_INSTALLATION_READ => {
             let mut input = input_map(input_value(&call.input)?)?;
             let id = string_arg(&mut input, "id")?;
-            validate_path_segment(&id, "external installation id")?;
-            let value = mgmt::inspect(
-                &sess.state,
-                principal,
-                &format!("state://kernel/external-installations/{id}"),
-            )
-            .await?;
+            let path = external_installation_path(&id)?;
+            let value = mgmt::inspect(&sess.state, principal, &path).await?;
             value.unwrap_or(Value::Null)
         }
         ACTION_EXTERNAL_INSTALLATION_INSTALL | ACTION_EXTERNAL_INSTALLATION_UPDATE => {
@@ -962,16 +935,10 @@ async fn dispatch_call(
             let def = value_arg(&mut input, "def")?;
             let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
-            validate_path_segment(&id, "external installation id")?;
+            let path = external_installation_path(&id)?;
             validate_external_installation_def(&id, &def)?;
-            mgmt::write_dedicated_config(
-                &sess.state,
-                principal,
-                &format!("state://kernel/external-installations/{id}"),
-                def,
-                expected_version,
-            )
-            .await?;
+            mgmt::write_dedicated_config(&sess.state, principal, &path, def, expected_version)
+                .await?;
             return Ok(ActionResult::empty(server_rev(sess)));
         }
         ACTION_EXTERNAL_INSTALLATION_START => {
@@ -1026,13 +993,8 @@ async fn dispatch_call(
         ACTION_EXTERNAL_MANIFEST_READ => {
             let mut input = input_map(input_value(&call.input)?)?;
             let platform = string_arg(&mut input, "platform")?;
-            validate_path_segment(&platform, "external manifest platform")?;
-            let value = mgmt::inspect(
-                &sess.state,
-                principal,
-                &format!("state://kernel/manifests/{platform}"),
-            )
-            .await?;
+            let path = external_manifest_path(&platform)?;
+            let value = mgmt::inspect(&sess.state, principal, &path).await?;
             value.unwrap_or(Value::Null)
         }
         ACTION_EXTERNAL_MANIFEST_WRITE_CAS => {
@@ -1041,15 +1003,9 @@ async fn dispatch_call(
             let def = value_arg(&mut input, "def")?;
             let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
-            validate_path_segment(&platform, "external manifest platform")?;
-            mgmt::write_dedicated_config(
-                &sess.state,
-                principal,
-                &format!("state://kernel/manifests/{platform}"),
-                def,
-                expected_version,
-            )
-            .await?;
+            let path = external_manifest_path(&platform)?;
+            mgmt::write_dedicated_config(&sess.state, principal, &path, def, expected_version)
+                .await?;
             return Ok(ActionResult::empty(server_rev(sess)));
         }
         ACTION_PROJECTION_IN_PROCESS_STATUS_LIST => {
@@ -1064,13 +1020,8 @@ async fn dispatch_call(
         ACTION_PROJECTION_IN_PROCESS_STATUS_READ => {
             let mut input = input_map(input_value(&call.input)?)?;
             let id = string_arg(&mut input, "id")?;
-            validate_path_segment(&id, "in-process projection id")?;
-            let value = mgmt::inspect(
-                &sess.state,
-                principal,
-                &format!("state://kernel/projection-status/in-process/{id}"),
-            )
-            .await?;
+            let path = projection_status_path(&id)?;
+            let value = mgmt::inspect(&sess.state, principal, &path).await?;
             value.unwrap_or(Value::Null)
         }
         ACTION_INFERENCE_BACKEND_LIST => {
@@ -1082,13 +1033,8 @@ async fn dispatch_call(
         ACTION_INFERENCE_BACKEND_READ => {
             let mut input = input_map(input_value(&call.input)?)?;
             let id = string_arg(&mut input, "id")?;
-            validate_path_segment(&id, "inference backend id")?;
-            let value = mgmt::inspect(
-                &sess.state,
-                principal,
-                &format!("state://kernel/inference/backends/{id}"),
-            )
-            .await?;
+            let path = inference_backend_path(&id)?;
+            let value = mgmt::inspect(&sess.state, principal, &path).await?;
             value.unwrap_or(Value::Null)
         }
         ACTION_INFERENCE_BACKEND_WRITE_CAS => {
@@ -1097,15 +1043,9 @@ async fn dispatch_call(
             let def = value_arg(&mut input, "def")?;
             let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
-            validate_path_segment(&id, "inference backend id")?;
-            mgmt::write_dedicated_config(
-                &sess.state,
-                principal,
-                &format!("state://kernel/inference/backends/{id}"),
-                def,
-                expected_version,
-            )
-            .await?;
+            let path = inference_backend_path(&id)?;
+            mgmt::write_dedicated_config(&sess.state, principal, &path, def, expected_version)
+                .await?;
             return Ok(ActionResult::empty(server_rev(sess)));
         }
         ACTION_INFERENCE_MODEL_LIST => {
@@ -1117,13 +1057,8 @@ async fn dispatch_call(
         ACTION_INFERENCE_MODEL_READ => {
             let mut input = input_map(input_value(&call.input)?)?;
             let id = string_arg(&mut input, "id")?;
-            validate_path_segment(&id, "inference model id")?;
-            let value = mgmt::inspect(
-                &sess.state,
-                principal,
-                &format!("state://kernel/inference/models/{id}"),
-            )
-            .await?;
+            let path = inference_model_path(&id)?;
+            let value = mgmt::inspect(&sess.state, principal, &path).await?;
             value.unwrap_or(Value::Null)
         }
         ACTION_INFERENCE_MODEL_WRITE_CAS => {
@@ -1132,15 +1067,9 @@ async fn dispatch_call(
             let def = value_arg(&mut input, "def")?;
             let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
-            validate_path_segment(&id, "inference model id")?;
-            mgmt::write_dedicated_config(
-                &sess.state,
-                principal,
-                &format!("state://kernel/inference/models/{id}"),
-                def,
-                expected_version,
-            )
-            .await?;
+            let path = inference_model_path(&id)?;
+            mgmt::write_dedicated_config(&sess.state, principal, &path, def, expected_version)
+                .await?;
             return Ok(ActionResult::empty(server_rev(sess)));
         }
         ACTION_INFERENCE_GROUP_LIST => {
@@ -1152,13 +1081,8 @@ async fn dispatch_call(
         ACTION_INFERENCE_GROUP_READ => {
             let mut input = input_map(input_value(&call.input)?)?;
             let name = string_arg(&mut input, "name")?;
-            validate_path_segment(&name, "inference group name")?;
-            let value = mgmt::inspect(
-                &sess.state,
-                principal,
-                &format!("state://kernel/inference/groups/{name}"),
-            )
-            .await?;
+            let path = inference_group_path(&name)?;
+            let value = mgmt::inspect(&sess.state, principal, &path).await?;
             value.unwrap_or(Value::Null)
         }
         ACTION_INFERENCE_GROUP_WRITE_CAS => {
@@ -1167,15 +1091,9 @@ async fn dispatch_call(
             let def = value_arg(&mut input, "def")?;
             let expected_version = optional_u64_arg(&mut input, "expected_version")?;
             require_step_up(principal)?;
-            validate_path_segment(&name, "inference group name")?;
-            mgmt::write_dedicated_config(
-                &sess.state,
-                principal,
-                &format!("state://kernel/inference/groups/{name}"),
-                def,
-                expected_version,
-            )
-            .await?;
+            let path = inference_group_path(&name)?;
+            mgmt::write_dedicated_config(&sess.state, principal, &path, def, expected_version)
+                .await?;
             return Ok(ActionResult::empty(server_rev(sess)));
         }
         ACTION_INFERENCE_ROUTING_READ => {
@@ -1351,7 +1269,8 @@ async fn subscribe(
             let process = optional_u64_arg(&mut input, "process")?;
             authorize_fact_read(principal, process)?;
             let target = process
-                .map(|pid| format!("state://fact/{pid}"))
+                .map(|pid| fact_path(pid).map(|path| path.to_string()))
+                .transpose()?
                 .unwrap_or_else(|| "state://fact".into());
             record_visibility_audit(
                 &sess.state,
@@ -1552,14 +1471,7 @@ async fn run_state_op(
     input: Value,
 ) -> Result<Value, ConsoleError> {
     let target = ResourceName::new(path.clone());
-    let identity_path = Path::parse(&principal.identity_path)
-        .map_err(|e| ConsoleError::Operation(format!("invalid principal identity path: {e}")))?;
-    if identity_path.segments().is_empty() {
-        return Err(ConsoleError::Operation(
-            "invalid principal identity path: identity path must include at least one segment"
-                .into(),
-        ));
-    }
+    let identity_path = principal_identity_path(principal)?;
     let identity = nexus_kernel::intern_identity(&identity_path);
     let verb = capability_verb_for_state_method(method);
     let cap = format!("{verb}://{}", capability_target(&path));
@@ -1783,7 +1695,7 @@ async fn lineage_fact_read(
         .into_iter()
         .find(|fact| fact.id == op_id)
         .ok_or_else(|| ConsoleError::BadRequest(format!("unknown operation id: {op_id}")))?;
-    Ok(fact_detail_value(fact))
+    fact_detail_value(fact)
 }
 
 async fn health_summary(
@@ -1866,32 +1778,33 @@ async fn health_summary(
     ]))
 }
 
-fn authority_principal_effective(principal: &ConsolePrincipal) -> Value {
+fn authority_principal_effective(principal: &ConsolePrincipal) -> Result<Value, ConsoleError> {
     let grants = principal
         .grants
         .iter()
         .map(|cap| Value::Str(cap.to_string()))
         .collect::<Vec<_>>();
-    map_value([
+    let root_data_authority = serde_value(protocol::protocol_metadata(0, 0).root_data_authority)?;
+    Ok(map_value([
         ("username", Value::Str(principal.username.clone())),
         ("identity_path", Value::Str(principal.identity_path.clone())),
         ("mfa_level", Value::Int(i64::from(principal.mfa_level))),
         ("grant_count", Value::Int(grants.len() as i64)),
         ("grants", Value::List(grants)),
-        (
-            "root_data_authority",
-            serde_value(protocol::protocol_metadata(0, 0).root_data_authority),
-        ),
-    ])
+        ("root_data_authority", root_data_authority),
+    ]))
 }
 
-fn authority_action_matrix(principal: &ConsolePrincipal, domain: Option<&str>) -> Value {
+fn authority_action_matrix(
+    principal: &ConsolePrincipal,
+    domain: Option<&str>,
+) -> Result<Value, ConsoleError> {
     let rows = protocol::action_descriptors()
         .into_iter()
         .filter(|descriptor| domain.is_none_or(|d| descriptor.domain == d))
         .map(|descriptor| authority_action_row(principal, &descriptor))
-        .collect();
-    Value::List(rows)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Value::List(rows))
 }
 
 fn authority_why_denied(
@@ -1904,10 +1817,13 @@ fn authority_why_denied(
         .ok_or_else(|| {
             ConsoleError::BadRequest(format!("unknown action descriptor: {action_id}"))
         })?;
-    Ok(authority_action_row(principal, &descriptor))
+    authority_action_row(principal, &descriptor)
 }
 
-fn authority_action_row(principal: &ConsolePrincipal, descriptor: &ActionDescriptor) -> Value {
+fn authority_action_row(
+    principal: &ConsolePrincipal,
+    descriptor: &ActionDescriptor,
+) -> Result<Value, ConsoleError> {
     let checks = descriptor
         .required_authority
         .iter()
@@ -1939,13 +1855,16 @@ fn authority_action_row(principal: &ConsolePrincipal, descriptor: &ActionDescrip
         "available"
     };
     let why = authority_why(status, descriptor, authority_ok, conditional_authority);
-    map_value([
+    let risk = serde_value(&descriptor.risk)?;
+    let visibility = serde_value(&descriptor.visibility)?;
+    let implementation_status = serde_value(&descriptor.status)?;
+    Ok(map_value([
         ("action", Value::Str(descriptor.id.clone())),
         ("domain", Value::Str(descriptor.domain.clone())),
         ("status", Value::Str(status.into())),
-        ("risk", serde_value(&descriptor.risk)),
-        ("visibility", serde_value(&descriptor.visibility)),
-        ("implementation_status", serde_value(&descriptor.status)),
+        ("risk", risk),
+        ("visibility", visibility),
+        ("implementation_status", implementation_status),
         ("authority_ok", Value::Bool(authority_ok)),
         ("requires_step_up", Value::Bool(descriptor.requires_step_up)),
         ("mfa_level", Value::Int(i64::from(principal.mfa_level))),
@@ -1955,7 +1874,7 @@ fn authority_action_row(principal: &ConsolePrincipal, descriptor: &ActionDescrip
             "why",
             Value::List(why.into_iter().map(Value::Str).collect()),
         ),
-    ])
+    ]))
 }
 
 fn authority_required_check(principal: &ConsolePrincipal, required: &RequiredAuthority) -> Value {
@@ -2102,8 +2021,7 @@ async fn read_external_installation(
     principal: &ConsolePrincipal,
     id: &str,
 ) -> Result<ExternalInstallationDef, ConsoleError> {
-    validate_path_segment(id, "external installation id")?;
-    let installation_path = format!("state://kernel/external-installations/{id}");
+    let installation_path = external_installation_path(id)?;
     let value = mgmt::inspect(&sess.state, principal, &installation_path)
         .await?
         .ok_or_else(|| ConsoleError::BadRequest("external installation is not installed".into()))?;
@@ -2151,14 +2069,7 @@ async fn invoke_effect(
 ) -> Result<Value, ConsoleError> {
     let path = Path::parse(effect)?;
     auth::authorize_path(&sess.state.state, principal, "perform", &path, Some(&input)).await?;
-    let identity_path = Path::parse(&principal.identity_path)
-        .map_err(|e| ConsoleError::Operation(format!("invalid principal identity path: {e}")))?;
-    if identity_path.segments().is_empty() {
-        return Err(ConsoleError::Operation(
-            "invalid principal identity path: identity path must include at least one segment"
-                .into(),
-        ));
-    }
+    let identity_path = principal_identity_path(principal)?;
     let identity = nexus_kernel::intern_identity(&identity_path);
     let cap = format!("perform://{}", capability_target(&path));
     let target = ResourceName::new(path);
@@ -2640,15 +2551,15 @@ fn fact_value(f: nexus_types::Fact) -> Value {
     Value::Map(m)
 }
 
-fn fact_detail_value(f: nexus_types::Fact) -> Value {
+fn fact_detail_value(f: nexus_types::Fact) -> Result<Value, ConsoleError> {
     let mut m = match fact_value(f.clone()) {
         Value::Map(m) => m,
         _ => BTreeMap::new(),
     };
     m.insert("schema_version".into(), Value::Int(f.schema_version as i64));
     m.insert("handle".into(), Value::Str(f.handle.to_string()));
-    m.insert("input_ref".into(), serde_value(&f.input_ref));
-    m.insert("outcome_ref".into(), serde_value(&f.outcome_ref));
+    m.insert("input_ref".into(), serde_value(&f.input_ref)?);
+    m.insert("outcome_ref".into(), serde_value(&f.outcome_ref)?);
     m.insert("partial".into(), Value::Bool(true));
     m.insert(
         "partial_reason".into(),
@@ -2657,7 +2568,7 @@ fn fact_detail_value(f: nexus_types::Fact) -> Value {
                 .into(),
         ),
     );
-    Value::Map(m)
+    Ok(Value::Map(m))
 }
 
 fn registry_counts_value(counts: nexus_kernel::registry::RegistryCounts) -> Value {
@@ -2996,7 +2907,7 @@ fn authorize_fact_read(
     process: Option<u64>,
 ) -> Result<(), ConsoleError> {
     let path = match process {
-        Some(process) => Path::parse(&format!("state://fact/{process}"))?,
+        Some(process) => fact_path(process)?,
         None => Path::parse("state://fact")?,
     };
     if principal.grants.contains("read", &path) {
@@ -3080,15 +2991,23 @@ fn require_visibility_gate(
 }
 
 fn validate_principal_identity(principal: &ConsolePrincipal) -> Result<(), ConsoleError> {
+    principal_identity_path(principal).map(|_| ())
+}
+
+fn principal_identity_path(principal: &ConsolePrincipal) -> Result<Path, ConsoleError> {
     let identity_path = Path::parse(&principal.identity_path)
         .map_err(|e| ConsoleError::Operation(format!("invalid principal identity path: {e}")))?;
-    if identity_path.segments().is_empty() {
+    if identity_path.cluster().is_some()
+        || identity_path.scheme() != "identity"
+        || identity_path.segments().is_empty()
+        || !identity_path.is_concrete()
+    {
         return Err(ConsoleError::Operation(
-            "invalid principal identity path: identity path must include at least one segment"
+            "invalid principal identity path: identity path must be a concrete local identity path"
                 .into(),
         ));
     }
-    Ok(())
+    Ok(identity_path)
 }
 
 fn require_config_write_safety(
@@ -3118,6 +3037,68 @@ fn validate_path_segment(raw: &str, label: &str) -> Result<(), ConsoleError> {
         return Err(ConsoleError::BadRequest(format!("invalid {label}")));
     }
     Ok(())
+}
+
+fn state_path_string(segments: &[&str]) -> Result<String, ConsoleError> {
+    let mut path = Path::try_new("state")?;
+    for segment in segments {
+        path = path.try_push_literal(segment)?;
+    }
+    Ok(path.to_string())
+}
+
+fn kernel_state_path_string(segments: &[&str]) -> Result<String, ConsoleError> {
+    let mut all_segments = Vec::with_capacity(segments.len().saturating_add(1));
+    all_segments.push("kernel");
+    all_segments.extend_from_slice(segments);
+    state_path_string(&all_segments)
+}
+
+fn console_user_path(username: &str) -> Result<String, ConsoleError> {
+    auth::validate_username(username)?;
+    kernel_state_path_string(&["console", "users", username])
+}
+
+fn console_role_path(role: &str) -> Result<String, ConsoleError> {
+    auth::validate_username(role)?;
+    kernel_state_path_string(&["console", "roles", role])
+}
+
+fn external_installation_path(id: &str) -> Result<String, ConsoleError> {
+    validate_path_segment(id, "external installation id")?;
+    kernel_state_path_string(&["external-installations", id])
+}
+
+fn external_manifest_path(platform: &str) -> Result<String, ConsoleError> {
+    validate_path_segment(platform, "external manifest platform")?;
+    kernel_state_path_string(&["manifests", platform])
+}
+
+fn projection_status_path(id: &str) -> Result<String, ConsoleError> {
+    validate_path_segment(id, "in-process projection id")?;
+    kernel_state_path_string(&["projection-status", "in-process", id])
+}
+
+fn inference_backend_path(id: &str) -> Result<String, ConsoleError> {
+    validate_path_segment(id, "inference backend id")?;
+    kernel_state_path_string(&["inference", "backends", id])
+}
+
+fn inference_model_path(id: &str) -> Result<String, ConsoleError> {
+    validate_path_segment(id, "inference model id")?;
+    kernel_state_path_string(&["inference", "models", id])
+}
+
+fn inference_group_path(name: &str) -> Result<String, ConsoleError> {
+    validate_path_segment(name, "inference group name")?;
+    kernel_state_path_string(&["inference", "groups", name])
+}
+
+fn fact_path(process: u64) -> Result<Path, ConsoleError> {
+    let path = Path::try_new("state")?
+        .try_push_literal("fact")?
+        .try_push_literal(process.to_string())?;
+    Ok(path)
 }
 
 fn reject_secret_fields(input: &Value) -> Result<(), ConsoleError> {
@@ -3155,21 +3136,17 @@ fn map_value(items: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
     )
 }
 
-fn serde_value<T: Serialize>(value: T) -> Value {
-    let json = match serde_json::to_value(value) {
-        Ok(json) => json,
-        Err(error) => {
-            tracing::error!(?error, "console value projection serialization failed");
-            return Value::Null;
-        }
-    };
-    match serde_json::from_value(json) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::error!(?error, "console value projection conversion failed");
-            Value::Null
-        }
-    }
+fn serde_value<T: Serialize>(value: T) -> Result<Value, ConsoleError> {
+    let json = serde_json::to_value(value).map_err(|error| {
+        ConsoleError::Operation(format!(
+            "console value projection serialization failed: {error}"
+        ))
+    })?;
+    serde_json::from_value(json).map_err(|error| {
+        ConsoleError::Operation(format!(
+            "console value projection conversion failed: {error}"
+        ))
+    })
 }
 
 fn map_bool(value: &Value, key: &str) -> Option<bool> {
@@ -3669,6 +3646,10 @@ mod tests {
     }
 
     fn extension_installation(id: &str, version: u64) -> anyhow::Result<Value> {
+        let provider_namespace = Path::try_new("effect")?
+            .try_push("external-provider")?
+            .try_push_literal(id)?;
+        let search_effect = provider_namespace.clone().try_push("search")?.to_string();
         let def = ExternalInstallationDef {
             id: id.into(),
             platform: id.into(),
@@ -3682,11 +3663,8 @@ mod tests {
             projections: vec![ExternalProjectionDef {
                 id: "provider".into(),
                 role: Role::Provider,
-                namespace: Some(Path::parse(&format!("effect://external-provider/{id}"))?),
-                provides: vec![EffectCapability::new(
-                    format!("effect://external-provider/{id}/search"),
-                    Purity::Idempotent,
-                )],
+                namespace: Some(provider_namespace),
+                provides: vec![EffectCapability::new(search_effect, Purity::Idempotent)],
                 emits: None,
                 version: 1,
             }],
@@ -5140,6 +5118,32 @@ mod tests {
         ensure!(
             st.boot.kernel.processes.all_ids().len() == before,
             "malformed console principals must not fall back to root or spawn a process"
+        );
+
+        let mut wildcard_principal = root_principal()?;
+        wildcard_principal.identity_path = "identity://console/**".into();
+        let mut sess = test_session(st.clone(), wildcard_principal.clone());
+        let err = match dispatch_call(
+            &mut sess,
+            &wildcard_principal,
+            visibility_call(
+                ACTION_VISIBILITY_STATE_READ,
+                map_value([("path", Value::Str("state://chat/source/messages/1".into()))]),
+            )?,
+        )
+        .await
+        {
+            Ok(_) => bail!("visibility read unexpectedly accepted wildcard principal"),
+            Err(err) => err,
+        };
+
+        ensure!(
+            matches!(err, ConsoleError::Operation(ref message) if message.contains("invalid principal identity path")),
+            "unexpected wildcard principal error: {err:?}"
+        );
+        ensure!(
+            st.boot.kernel.processes.all_ids().len() == before,
+            "wildcard console principals must not spawn a process"
         );
         Ok(())
     }

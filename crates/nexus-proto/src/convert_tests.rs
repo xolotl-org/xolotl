@@ -3,10 +3,10 @@
 
 use crate::convert::*;
 use anyhow::{Context, anyhow, bail, ensure};
-use nexus_graph::{DoNode, OperationTemplate};
+use nexus_graph::{DoNode, OperationTemplate, StepRef};
 use nexus_types::{
     BlobRef, Capability, DType, Failure, FloatBits, FrameKind, Outcome, OutputMode, Path,
-    Predicate, ResourceName, StreamMarker, TensorRef, Value,
+    Predicate, ProcessId, ResourceName, StreamMarker, TensorRef, Value,
 };
 use std::collections::BTreeMap;
 
@@ -152,6 +152,44 @@ fn malformed_multimodal_refs_do_not_synthesize_empty_blob() {
     };
     assert_eq!(value_from_pb(&tensor), Value::Null);
     assert_eq!(value_from_pb(&frame), Value::Null);
+}
+
+#[test]
+fn malformed_multimodal_enums_do_not_default_to_valid_variants() {
+    use crate::nexus::v1 as pb;
+    let tensor = pb::Value {
+        kind: Some(pb::value::Kind::TensorVal(pb::TensorRef {
+            blob: Some(pb_blob()),
+            dtype: "complex64".into(),
+            shape: vec![1],
+        })),
+    };
+    let frame = pb::Value {
+        kind: Some(pb::value::Kind::FrameVal(pb::FrameRef {
+            blob: Some(pb_blob()),
+            ts_nanos: 1,
+            kind: "depth".into(),
+        })),
+    };
+    assert_eq!(value_from_pb(&tensor), Value::Null);
+    assert_eq!(value_from_pb(&frame), Value::Null);
+}
+
+#[test]
+fn malformed_stream_markers_do_not_default_to_done() {
+    use crate::nexus::v1 as pb;
+    let missing_kind = pb::Value {
+        kind: Some(pb::value::Kind::StreamEndVal(pb::StreamMarker {
+            kind: None,
+        })),
+    };
+    let false_done = pb::Value {
+        kind: Some(pb::value::Kind::StreamEndVal(pb::StreamMarker {
+            kind: Some(pb::stream_marker::Kind::Done(false)),
+        })),
+    };
+    assert_eq!(value_from_pb(&missing_kind), Value::Null);
+    assert_eq!(value_from_pb(&false_done), Value::Null);
 }
 
 #[test]
@@ -513,7 +551,7 @@ fn program_explicit_unspecified_output_mode_fails_closed() -> anyhow::Result<()>
 }
 
 #[test]
-fn program_missing_output_mode_defaults_to_unary() -> anyhow::Result<()> {
+fn program_missing_output_mode_fails_closed() -> anyhow::Result<()> {
     let mut program = program_to_pb(&DoNode::Op(op_template(
         "effect://x/post",
         OutputMode::Unary,
@@ -527,14 +565,92 @@ fn program_missing_output_mode_defaults_to_unary() -> anyhow::Result<()> {
     };
     op.output = None;
 
-    let back = program_from_pb(&program)?;
-    let DoNode::Op(op) = back else {
+    ensure!(
+        program_from_pb(&program).is_err(),
+        "missing output mode should fail closed"
+    );
+    Ok(())
+}
+
+#[test]
+fn program_blank_operation_method_fails_closed() -> anyhow::Result<()> {
+    let mut program = program_to_pb(&DoNode::Op(op_template(
+        "effect://x/post",
+        OutputMode::Unary,
+        None,
+    )?));
+    let root = program.root.as_mut().context("missing program root")?;
+    let crate::nexus::v1::do_node::Kind::Op(op) =
+        root.kind.as_mut().context("missing root kind")?
+    else {
         bail!("expected op node");
     };
+    op.method = "  ".into();
+
     ensure!(
-        op.output == OutputMode::Unary,
-        "unexpected output mode: {:?}",
-        op.output
+        program_from_pb(&program).is_err(),
+        "blank operation method should fail closed"
+    );
+
+    let mut padded = program_to_pb(&DoNode::Op(op_template(
+        "effect://x/post",
+        OutputMode::Unary,
+        None,
+    )?));
+    let root = padded.root.as_mut().context("missing program root")?;
+    let crate::nexus::v1::do_node::Kind::Op(op) =
+        root.kind.as_mut().context("missing root kind")?
+    else {
+        bail!("expected op node");
+    };
+    op.method = " invoke ".into();
+    ensure!(
+        program_from_pb(&padded).is_err(),
+        "padded operation method should fail closed"
+    );
+    Ok(())
+}
+
+#[test]
+fn program_blank_step_and_binding_names_fail_closed() -> anyhow::Result<()> {
+    let blank_step = DoNode::pure(Value::Null).and_then(StepRef::new(ProcessId::new(1), " "));
+    ensure!(
+        program_from_pb(&program_to_pb(&blank_step)).is_err(),
+        "blank step name should fail closed"
+    );
+
+    let blank_let = DoNode::Let {
+        name: String::new(),
+        value: Box::new(DoNode::pure(Value::Int(1))),
+        body: Box::new(DoNode::Use("x".into())),
+    };
+    ensure!(
+        program_from_pb(&program_to_pb(&blank_let)).is_err(),
+        "blank let binding name should fail closed"
+    );
+
+    let blank_use = DoNode::Use("  ".into());
+    ensure!(
+        program_from_pb(&program_to_pb(&blank_use)).is_err(),
+        "blank use name should fail closed"
+    );
+    Ok(())
+}
+
+#[test]
+fn program_blank_failure_kind_fails_closed() -> anyhow::Result<()> {
+    let mut program = program_to_pb(&DoNode::Fail(Failure::Timeout));
+    let root = program.root.as_mut().context("missing program root")?;
+    let crate::nexus::v1::do_node::Kind::Fail(failure) =
+        root.kind.as_mut().context("missing root kind")?
+    else {
+        bail!("expected fail node");
+    };
+    failure.kind = String::new();
+
+    ensure!(
+        program_from_pb(&program).is_err(),
+        "blank failure kind should fail closed"
     );
     Ok(())
 }
@@ -855,8 +971,9 @@ fn invoke_frame_types_roundtrip_through_pb() -> anyhow::Result<()> {
 #[test]
 fn malformed_wire_paths_and_capabilities_fail_closed() -> anyhow::Result<()> {
     use crate::convert::{
-        capability_from_pb, control_frame_from_pb, event_ack_from_pb, invoke_from_pb, path_from_pb,
-        role_ready_from_pb, session_context_from_pb,
+        capability_from_pb, control_frame_from_pb, event_ack_from_pb, inbound_event_from_pb,
+        invoke_from_pb, outbound_command_from_pb, path_from_pb, role_ready_from_pb,
+        role_session_client_hello_from_pb, session_context_from_pb,
     };
     use crate::nexus::v1 as pb;
     use crate::nexus::v1::external as ext;
@@ -867,6 +984,24 @@ fn malformed_wire_paths_and_capabilities_fail_closed() -> anyhow::Result<()> {
         cluster: None,
     };
     ensure!(path_from_pb(&bad_path).is_err(), "bad path should fail");
+    let injected_path_segment = pb::Path {
+        scheme: "effect".into(),
+        segments: vec!["x/post".into()],
+        cluster: None,
+    };
+    ensure!(
+        path_from_pb(&injected_path_segment).is_err(),
+        "path segment containing delimiter should fail"
+    );
+    let injected_path_cluster = pb::Path {
+        scheme: "effect".into(),
+        segments: vec!["post".into()],
+        cluster: Some("bad/cluster".into()),
+    };
+    ensure!(
+        path_from_pb(&injected_path_cluster).is_err(),
+        "path cluster containing delimiter should fail"
+    );
 
     let bad_capability = pb::Capability {
         verb: "effect".into(),
@@ -877,6 +1012,26 @@ fn malformed_wire_paths_and_capabilities_fail_closed() -> anyhow::Result<()> {
     ensure!(
         capability_from_pb(&bad_capability).is_err(),
         "bad capability should fail"
+    );
+    let injected_capability_segment = pb::Capability {
+        verb: "perform".into(),
+        scheme: "effect".into(),
+        segments: vec!["x/post".into()],
+        predicate: None,
+    };
+    ensure!(
+        capability_from_pb(&injected_capability_segment).is_err(),
+        "capability segment containing delimiter should fail"
+    );
+    let injected_capability_scheme = pb::Capability {
+        verb: "perform".into(),
+        scheme: "effect/post".into(),
+        segments: vec!["x".into()],
+        predicate: None,
+    };
+    ensure!(
+        capability_from_pb(&injected_capability_scheme).is_err(),
+        "capability scheme containing delimiter should fail"
     );
 
     let missing_effect_path = ext::Invoke {
@@ -922,6 +1077,42 @@ fn malformed_wire_paths_and_capabilities_fail_closed() -> anyhow::Result<()> {
         "missing context should fail"
     );
 
+    let missing_hello_observed = ext::RoleSessionClientHello {
+        role: ext::ExternalRole::Source as i32,
+        installation_id: "install-1".into(),
+        projection_id: "source".into(),
+        registry_hash: "registry-abc".into(),
+        observed: None,
+        config_schema: None,
+    };
+    ensure!(
+        role_session_client_hello_from_pb(&missing_hello_observed).is_err(),
+        "missing hello observed generations should fail"
+    );
+
+    let missing_event_observed = ext::InboundEvent {
+        id: "event-1".into(),
+        payload: Some(crate::convert::value_to_pb(&Value::Null)),
+        timestamp_ms: 1,
+        observed: None,
+        stream_id: None,
+        seq: None,
+    };
+    ensure!(
+        inbound_event_from_pb(&missing_event_observed).is_err(),
+        "missing event observed generations should fail"
+    );
+
+    let missing_command_observed = ext::OutboundCommand {
+        id: "cmd-1".into(),
+        action: Some(crate::convert::value_to_pb(&Value::Null)),
+        observed: None,
+    };
+    ensure!(
+        outbound_command_from_pb(&missing_command_observed).is_err(),
+        "missing command observed generations should fail"
+    );
+
     let bad_ack = ext::EventAck {
         id: "event-1".into(),
         status: ext::AckStatus::Unspecified as i32,
@@ -961,6 +1152,7 @@ fn malformed_wire_paths_and_capabilities_fail_closed() -> anyhow::Result<()> {
 #[test]
 fn invoke_result_ok_and_err_roundtrip() -> anyhow::Result<()> {
     use crate::convert::{invoke_result_from_pb, invoke_result_to_pb};
+    use crate::nexus::v1::external as ext;
     use nexus_types::Value;
     use nexus_types::external::{ErrorInfo, InvokeResult};
     let ok = InvokeResult {
@@ -994,6 +1186,30 @@ fn invoke_result_ok_and_err_roundtrip() -> anyhow::Result<()> {
         }
         Ok(value) => bail!("expected error outcome, got {value:?}"),
     }
+    let missing_code = ext::InvokeResult {
+        invocation_id: "r3".into(),
+        outcome: Some(ext::invoke_result::Outcome::Error(ext::ErrorInfo {
+            code: "  ".into(),
+            message: "missing stable class".into(),
+            details: Default::default(),
+        })),
+    };
+    ensure!(
+        invoke_result_from_pb(&missing_code).is_err(),
+        "invoke error without code should fail"
+    );
+    let padded_code = ext::InvokeResult {
+        invocation_id: "r4".into(),
+        outcome: Some(ext::invoke_result::Outcome::Error(ext::ErrorInfo {
+            code: " remote ".into(),
+            message: "padded stable class".into(),
+            details: Default::default(),
+        })),
+    };
+    ensure!(
+        invoke_result_from_pb(&padded_code).is_err(),
+        "invoke error with padded code should fail"
+    );
     Ok(())
 }
 
@@ -1003,6 +1219,7 @@ fn source_command_frames_roundtrip() -> anyhow::Result<()> {
         command_result_from_pb, command_result_to_pb, outbound_command_from_pb,
         outbound_command_to_pb,
     };
+    use crate::nexus::v1::external as ext;
     use nexus_types::Value;
     use nexus_types::external::{CommandResult, ErrorInfo, ObservedGenerations, OutboundCommand};
 
@@ -1033,5 +1250,29 @@ fn source_command_frames_roundtrip() -> anyhow::Result<()> {
     };
     let back = command_result_from_pb(&command_result_to_pb(&err))?;
     ensure!(back == err, "error result changed: {back:?}");
+    let missing_code = ext::CommandResult {
+        id: "cmd-3".into(),
+        outcome: Some(ext::command_result::Outcome::Error(ext::ErrorInfo {
+            code: String::new(),
+            message: "missing stable class".into(),
+            details: Default::default(),
+        })),
+    };
+    ensure!(
+        command_result_from_pb(&missing_code).is_err(),
+        "command error without code should fail"
+    );
+    let padded_code = ext::CommandResult {
+        id: "cmd-4".into(),
+        outcome: Some(ext::command_result::Outcome::Error(ext::ErrorInfo {
+            code: " remote ".into(),
+            message: "padded stable class".into(),
+            details: Default::default(),
+        })),
+    };
+    ensure!(
+        command_result_from_pb(&padded_code).is_err(),
+        "command error with padded code should fail"
+    );
     Ok(())
 }

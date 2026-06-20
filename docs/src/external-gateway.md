@@ -32,65 +32,21 @@ Provider/Source admission state.
 
 ## Configuration
 
-`[external_gateway.grpc]` and `[external_gateway.websocket]` share the same
-Provider/Source limit keys:
+Listener addresses, transport security, WebSocket transport caps, and
+Provider/Source numeric limits are owned by [Configuration](configuration.md).
+This page does not repeat the key list or default TOML block.
 
-```toml
-[external_gateway.grpc]
-source_dedupe_window_ms = 86400000
-provider_max_in_flight_invocations = 1024
-provider_max_in_flight_per_identity = 256
-provider_max_in_flight_per_effect = 256
-source_max_in_flight_commands = 1024
-source_command_rate_limit_window_ms = 60000
-source_command_rate_limit_max = 600
-
-[external_gateway.websocket]
-source_dedupe_window_ms = 86400000
-provider_max_in_flight_invocations = 1024
-provider_max_in_flight_per_identity = 256
-provider_max_in_flight_per_effect = 256
-source_max_in_flight_commands = 1024
-source_command_rate_limit_window_ms = 60000
-source_command_rate_limit_max = 600
-```
-
-`source_dedupe_window_ms` bounds Source event id dedupe retention and Source
-outbound command idempotency retention after result, deadline, or session drain.
-
-Provider in-flight caps apply per ready Provider session, per acting identity
-inside that session, and per effect path inside that session.
-
-Source command caps apply per ready Source session. The command rate limit
-applies per Source projection.
-
-Source event payload-size limits, stream capacity, overflow behavior, and
-event-ingress rate limits are declared on each Source projection.
-
-## WebSocket Transport Limits
-
-External WebSocket has transport-level limits:
-
-```toml
-[external_gateway.websocket.transport]
-max_frame_bytes = 1048576
-first_frame_timeout_ms = 10000
-idle_timeout_ms = 300000
-max_connections = 256
-```
-
-These values are clamped by `nexus-gateway-websocket` before the listener
-starts.
+After a session is admitted, those settings bound Provider dispatch, Provider
+result resolution, Source command dispatch, Source command result resolution,
+Source event ingress, and Source event or command idempotency retention. Source
+event payload-size limits, stream capacity, overflow behavior, and event-ingress
+rate limits are declared on each Source projection.
 
 ## Transport Security
 
-External gRPC supports `production_tls`, `mtls`, `trusted_reverse_proxy`,
-`local_trusted`, `unsafe_plaintext`, and `disabled_for_test`.
-
-External WebSocket is a plain listener. Use `trusted_reverse_proxy` for external
-TLS termination, `local_trusted` for loopback-only deployments, or
-`unsafe_plaintext` only when the deployment explicitly accepts plaintext.
-`production_tls` and `mtls` fail closed for the WebSocket listener.
+Transport-security modes and their required certificate or proxy fields are
+documented in [Configuration](configuration.md). A listener that rejects its
+transport-security mode fails before accepting external sessions.
 
 ## Session State
 

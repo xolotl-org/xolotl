@@ -45,6 +45,69 @@ fn secure_external_frame_types_are_canonical() -> anyhow::Result<()> {
 }
 
 #[test]
+fn gateway_state_paths_are_structural() -> anyhow::Result<()> {
+    let hash = "a".repeat(64);
+    ensure!(
+        blob_path(&hash)?.to_string() == format!("state://blob/{hash}"),
+        "unexpected blob path"
+    );
+    ensure!(
+        idempotency_path(&hash)?.to_string() == format!("state://gateway/idempotency/{hash}"),
+        "unexpected idempotency path"
+    );
+    ensure!(
+        upload_ticket_path("ticket/1").is_err(),
+        "ticket id with path delimiter was accepted"
+    );
+    ensure!(
+        blob_path(&format!("{hash}/tail")).is_err(),
+        "blob hash with path delimiter was accepted"
+    );
+    Ok(())
+}
+
+#[test]
+fn upload_ticket_records_require_security_state_fields() -> anyhow::Result<()> {
+    let ticket = GatewayObjectUploadTicket {
+        ticket_id: "ticket_regression".into(),
+        principal_id: "alice".into(),
+        surface_id: "echo".into(),
+        submission_token: None,
+        modality: GatewayModality::Bytes,
+        expected_size: None,
+        expected_digest: None,
+        allowed_media_types: Vec::new(),
+        expires_at_ms: now_millis().saturating_add(60_000),
+        single_use: true,
+        committed: false,
+        used: false,
+    };
+
+    for field in ["single_use", "committed", "used"] {
+        let mut value = ticket.to_value();
+        let Value::Map(map) = &mut value else {
+            bail!("ticket did not serialize to a map");
+        };
+        map.remove(field);
+        ensure!(
+            matches!(GatewayObjectUploadTicket::from_value(&value), Err(GatewayError::Rejected(message)) if message.contains(field)),
+            "ticket missing {field} should be rejected"
+        );
+    }
+
+    let mut value = ticket.to_value();
+    let Value::Map(map) = &mut value else {
+        bail!("ticket did not serialize to a map");
+    };
+    map.insert("used".into(), Value::Str("false".into()));
+    ensure!(
+        matches!(GatewayObjectUploadTicket::from_value(&value), Err(GatewayError::Rejected(message)) if message.contains("used")),
+        "ticket with malformed used field should be rejected"
+    );
+    Ok(())
+}
+
+#[test]
 fn secure_external_envelope_context_must_match_session() -> anyhow::Result<()> {
     let context = ExternalSessionContext {
         installation_id: "install".into(),
@@ -2463,10 +2526,7 @@ async fn direct_input_upload_ticket_is_bound_and_single_use() -> anyhow::Result<
     let hash = blake3::hash(&bytes).to_hex().to_string();
     boot.kernel
         .state
-        .write_set(
-            &Path::parse(&format!("state://blob/{hash}"))?,
-            Value::Bytes(bytes.clone()),
-        )
+        .write_set(&blob_path(&hash)?, Value::Bytes(bytes.clone()))
         .await?;
     let ticket_id = "ticket_1";
     let ticket = GatewayObjectUploadTicket {
@@ -2535,10 +2595,7 @@ async fn direct_input_upload_ticket_rejects_expired_or_wrong_surface() -> anyhow
     let hash = blake3::hash(&bytes).to_hex().to_string();
     boot.kernel
         .state
-        .write_set(
-            &Path::parse(&format!("state://blob/{hash}"))?,
-            Value::Bytes(bytes.clone()),
-        )
+        .write_set(&blob_path(&hash)?, Value::Bytes(bytes.clone()))
         .await?;
     let mut ticket = GatewayObjectUploadTicket {
         ticket_id: "ticket_expired".into(),

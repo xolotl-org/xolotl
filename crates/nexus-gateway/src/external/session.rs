@@ -8,6 +8,7 @@
 use super::secure_envelope::SecureEnvelope;
 use nexus_kernel::{CheckCtx, PolicyDecision, PolicySnapshot};
 use nexus_state::{Backend, StateError};
+use nexus_types::ErrorInfo;
 use nexus_types::external::{
     AckStatus, CommandResult, ControlFrame, EventAck, ExternalProjectionDef, InboundEvent, Invoke,
     InvokeResult, JsonSchema, ObservedGenerations, OutboundCommand, OverflowPolicy, Role,
@@ -181,10 +182,10 @@ pub enum SourceIngestError {
     #[error("Source projection has no emits declaration")]
     MissingEmits,
     /// Event id could not be represented as a durable path segment.
-    #[error("source event id is empty after path normalization")]
+    #[error("source event id is not a valid path segment")]
     InvalidEventId,
     /// Stream id could not be represented as a durable path segment.
-    #[error("source stream id is empty after path normalization")]
+    #[error("source stream id is not a valid path segment")]
     InvalidStreamId,
     /// Event supplied only one of `stream_id` or `seq`.
     #[error("source event stream_id and seq must be supplied together")]
@@ -437,9 +438,8 @@ impl ProviderInvocationRegistry {
                 && deadline <= req.now_millis
             {
                 Some(ProviderInvocationError::DeadlineExceeded)
-            } else if let (Ok(value), Some(limit)) =
-                (&req.result.outcome, entry.max_inline_result_bytes)
-                && value_inline_bytes(value) > limit
+            } else if let Some(limit) = entry.max_inline_result_bytes
+                && result_inline_bytes(&req.result.outcome) > limit
             {
                 Some(ProviderInvocationError::ResultTooLarge)
             } else if let (Ok(value), Some(schema)) =
@@ -606,6 +606,13 @@ fn value_inline_bytes(value: &Value) -> usize {
         }
     }
     total
+}
+
+fn result_inline_bytes(outcome: &Result<Value, ErrorInfo>) -> usize {
+    match outcome {
+        Ok(value) => value_inline_bytes(value),
+        Err(error) => error.kind.len().saturating_add(error.message.len()),
+    }
 }
 
 /// Why a Source outbound command frame was rejected.
@@ -852,9 +859,8 @@ impl SourceCommandRegistry {
                 && deadline <= req.now_millis
             {
                 Some(SourceCommandError::DeadlineExceeded)
-            } else if let (Ok(value), Some(limit)) =
-                (&req.result.outcome, entry.max_inline_result_bytes)
-                && value_inline_bytes(value) > limit
+            } else if let Some(limit) = entry.max_inline_result_bytes
+                && result_inline_bytes(&req.result.outcome) > limit
             {
                 Some(SourceCommandError::ResultTooLarge)
             } else if let (Ok(value), Some(schema)) =
@@ -1743,6 +1749,8 @@ fn is_forbidden_source_payload_field(key: &str) -> bool {
             | "refresh_token"
             | "session_token"
             | "bearer_token"
+            | "authority"
+            | "authorities"
             | "api_key"
             | "apikey"
             | "x_api_key"
@@ -1755,6 +1763,35 @@ fn is_forbidden_source_payload_field(key: &str) -> bool {
             | "_taint"
             | "provenance"
             | "_provenance"
+            | "identity"
+            | "identity_ref"
+            | "acting"
+            | "acting_identity"
+            | "principal"
+            | "principal_id"
+            | "sink"
+            | "event_sink"
+            | "source_sink"
+            | "capability"
+            | "capabilities"
+            | "raw_capability"
+            | "grant"
+            | "credential"
+            | "credentials"
+            | "credential_id"
+            | "credential_ref"
+            | "handle"
+            | "binding"
+            | "binding_generation"
+            | "credential_generation"
+            | "installation_config_version"
+            | "projection_version"
+            | "presentation_config_generation"
+            | "alias_catalog_generation"
+            | "registry_hash"
+            | "policy"
+            | "policy_result"
+            | "policy_decision"
     )
 }
 
@@ -1784,33 +1821,26 @@ fn source_event_dedup_path(
     projection_id: &str,
     event_id: &str,
 ) -> Result<Path, SourceIngestError> {
-    let installation_id = path_segment(installation_id);
-    let projection_id = path_segment(projection_id);
-    let event_id = path_segment(event_id);
-    if installation_id.is_empty() || projection_id.is_empty() || event_id.is_empty() {
-        return Err(SourceIngestError::InvalidEventId);
-    }
-    Path::parse(&format!(
-        "state://kernel/source-events/{}/{}/{}",
-        installation_id, projection_id, event_id
-    ))
-    .map_err(|e| SourceIngestError::State(format!("invalid dedup path: {e}")))
+    source_state_path(
+        "source-events",
+        installation_id,
+        projection_id,
+        Some(event_id),
+        SourcePathError::EventId,
+    )
 }
 
 fn source_event_dedup_prefix(
     installation_id: &str,
     projection_id: &str,
 ) -> Result<Path, SourceIngestError> {
-    let installation_id = path_segment(installation_id);
-    let projection_id = path_segment(projection_id);
-    if installation_id.is_empty() || projection_id.is_empty() {
-        return Err(SourceIngestError::InvalidEventId);
-    }
-    Path::parse(&format!(
-        "state://kernel/source-events/{}/{}",
-        installation_id, projection_id
-    ))
-    .map_err(|e| SourceIngestError::State(format!("invalid dedup prefix: {e}")))
+    source_state_path(
+        "source-events",
+        installation_id,
+        projection_id,
+        None,
+        SourcePathError::EventId,
+    )
 }
 
 fn source_stream_last_seq_path(
@@ -1818,51 +1848,77 @@ fn source_stream_last_seq_path(
     projection_id: &str,
     stream_id: &str,
 ) -> Result<Path, SourceIngestError> {
-    let installation_id = path_segment(installation_id);
-    let projection_id = path_segment(projection_id);
-    let stream_id = path_segment(stream_id);
-    if installation_id.is_empty() || projection_id.is_empty() || stream_id.is_empty() {
-        return Err(SourceIngestError::InvalidStreamId);
-    }
-    Path::parse(&format!(
-        "state://kernel/source-streams/{}/{}/{}",
-        installation_id, projection_id, stream_id
-    ))
-    .map_err(|e| SourceIngestError::State(format!("invalid source stream path: {e}")))
+    source_state_path(
+        "source-streams",
+        installation_id,
+        projection_id,
+        Some(stream_id),
+        SourcePathError::StreamId,
+    )
 }
 
 fn source_event_rate_path(
     installation_id: &str,
     projection_id: &str,
 ) -> Result<Path, SourceIngestError> {
-    let installation_id = path_segment(installation_id);
-    let projection_id = path_segment(projection_id);
-    if installation_id.is_empty() || projection_id.is_empty() {
-        return Err(SourceIngestError::State(
-            "source event rate path has empty segment".into(),
-        ));
-    }
-    Path::parse(&format!(
-        "state://kernel/source-rates/{}/{}",
-        installation_id, projection_id
-    ))
-    .map_err(|e| SourceIngestError::State(format!("invalid source event rate path: {e}")))
+    source_state_path(
+        "source-rates",
+        installation_id,
+        projection_id,
+        None,
+        SourcePathError::Rate,
+    )
 }
 
 fn source_projection_key(installation_id: &str, projection_id: &str) -> String {
     format!("{installation_id}/{projection_id}")
 }
 
-fn path_segment(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':') {
-                c
-            } else {
-                '_'
+#[derive(Clone, Copy)]
+enum SourcePathError {
+    EventId,
+    StreamId,
+    Rate,
+}
+
+impl SourcePathError {
+    fn into_error(self) -> SourceIngestError {
+        match self {
+            SourcePathError::EventId => SourceIngestError::InvalidEventId,
+            SourcePathError::StreamId => SourceIngestError::InvalidStreamId,
+            SourcePathError::Rate => {
+                SourceIngestError::State("source event rate path has invalid segment".into())
             }
-        })
-        .collect()
+        }
+    }
+}
+
+fn source_state_path(
+    table: &str,
+    installation_id: &str,
+    projection_id: &str,
+    leaf: Option<&str>,
+    error: SourcePathError,
+) -> Result<Path, SourceIngestError> {
+    let mut path = Path::try_new("state")
+        .and_then(|path| path.try_push("kernel"))
+        .and_then(|path| path.try_push_literal(table))
+        .map_err(|e| SourceIngestError::State(format!("invalid source state path base: {e}")))?;
+    path = push_source_state_segment(path, installation_id, error)?;
+    path = push_source_state_segment(path, projection_id, error)?;
+    if let Some(leaf) = leaf {
+        path = push_source_state_segment(path, leaf, error)?;
+    }
+    Ok(path)
+}
+
+fn push_source_state_segment(
+    path: Path,
+    segment: &str,
+    error: SourcePathError,
+) -> Result<Path, SourceIngestError> {
+    path.try_push_literal(segment)
+        .map_err(|_| error.into_error())
 }
 
 /// Validate a Nexus value against the external schema subset.
@@ -2235,6 +2291,16 @@ mod tests {
         }
     }
 
+    fn invoke_error_result(invocation_id: &str, kind: &str, message: &str) -> InvokeResult {
+        InvokeResult {
+            invocation_id: invocation_id.into(),
+            outcome: Err(ErrorInfo {
+                kind: kind.into(),
+                message: message.into(),
+            }),
+        }
+    }
+
     fn outbound_command(id: &str, action: Value) -> OutboundCommand {
         OutboundCommand {
             id: id.into(),
@@ -2250,6 +2316,16 @@ mod tests {
         CommandResult {
             id: id.into(),
             outcome: Ok(value),
+        }
+    }
+
+    fn command_error_result(id: &str, kind: &str, message: &str) -> CommandResult {
+        CommandResult {
+            id: id.into(),
+            outcome: Err(ErrorInfo {
+                kind: kind.into(),
+                message: message.into(),
+            }),
         }
     }
 
@@ -2840,6 +2916,23 @@ mod tests {
             "oversized result should close invocation"
         );
 
+        let inv = invoke("large-error")?;
+        let mut small_limit = provider_register(&s, &inv);
+        small_limit.max_inline_result_bytes = Some(4);
+        registry.register(small_limit)?;
+        let result = invoke_error_result("large-error", "remote", "too large");
+        ensure!(
+            registry.resolve(provider_resolve(&s, &result))
+                == Err(ProviderInvocationError::ResultTooLarge),
+            "large error result should be rejected"
+        );
+        ensure!(registry.is_empty(), "registry should be empty");
+        ensure!(
+            registry.resolve(provider_resolve(&s, &result))
+                == Err(ProviderInvocationError::InvocationNotFound),
+            "oversized error result should close invocation"
+        );
+
         let inv = invoke("timeout")?;
         registry.register(provider_register(&s, &inv))?;
         let result = invoke_result("timeout", Value::Null);
@@ -3226,6 +3319,28 @@ mod tests {
             "oversized result should close command"
         );
 
+        let command = outbound_command("large-error", message_payload("send"));
+        let mut small_limit = source_command_register(&s, &command);
+        small_limit.max_inline_result_bytes = Some(4);
+        registry.register(small_limit)?;
+        let result = command_error_result("large-error", "remote", "too large");
+        ensure!(
+            registry.resolve(source_command_resolve(&s, &result))
+                == Err(SourceCommandError::ResultTooLarge),
+            "large error result should be rejected"
+        );
+        ensure!(registry.is_empty(), "registry should be empty");
+        ensure!(
+            registry.resolve(source_command_resolve(&s, &result))
+                == Err(SourceCommandError::CommandNotFound),
+            "oversized error result should close command"
+        );
+        ensure!(
+            registry.register(source_command_register(&s, &command))
+                == Err(SourceCommandError::DuplicateCommandId),
+            "oversized error result should retain command id"
+        );
+
         let command = outbound_command("timeout", message_payload("send"));
         registry.register(source_command_register(&s, &command))?;
         let result = command_result("timeout", Value::Null);
@@ -3351,6 +3466,72 @@ mod tests {
             }),
             "missing inbound taint source: {:?}",
             tv.taint
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_ingest_rejects_invalid_event_id_without_state_write() -> anyhow::Result<()> {
+        let s = complete_handshake()?;
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let def = source_projection(None)?;
+        let policy = PolicySnapshot::empty();
+
+        for invalid_id in ["evt/1", "*"] {
+            let err = expect_source_ingest_error(
+                source_req(state.clone(), &s, &def, &policy),
+                event(invalid_id, message_payload("hello")),
+            )
+            .await?;
+            ensure!(
+                err == SourceIngestError::InvalidEventId,
+                "unexpected event id error for {invalid_id:?}: {err:?}"
+            );
+        }
+
+        let sink = source_event_sink()?;
+        let sink_value = state.read(&sink).await?;
+        ensure!(
+            sink_value.is_none(),
+            "unexpected source event value: {sink_value:?}"
+        );
+        let dedup_prefix = source_event_dedup_prefix("inst-1", "source")?;
+        let dedup_rows = state.read_prefix(&dedup_prefix).await?;
+        ensure!(
+            dedup_rows.is_empty(),
+            "unexpected dedup rows: {dedup_rows:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_ingest_rejects_invalid_stream_id_and_rolls_back_dedup() -> anyhow::Result<()> {
+        let s = complete_handshake()?;
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let def = source_projection(None)?;
+        let policy = PolicySnapshot::empty();
+
+        let err = expect_source_ingest_error(
+            source_req(state.clone(), &s, &def, &policy),
+            sequenced_event("chat/room", 1, "evt-stream", message_payload("hello")),
+        )
+        .await?;
+        ensure!(
+            err == SourceIngestError::InvalidStreamId,
+            "unexpected stream id error: {err:?}"
+        );
+
+        let sink = source_event_sink()?;
+        let sink_value = state.read(&sink).await?;
+        ensure!(
+            sink_value.is_none(),
+            "unexpected source event value: {sink_value:?}"
+        );
+        let dedup_prefix = source_event_dedup_prefix("inst-1", "source")?;
+        let dedup_rows = state.read_prefix(&dedup_prefix).await?;
+        ensure!(
+            dedup_rows.is_empty(),
+            "dedup reservation was not rolled back: {dedup_rows:?}"
         );
         Ok(())
     }
@@ -3671,6 +3852,45 @@ mod tests {
             field: "taint".into(),
         };
         ensure!(err == expected, "unexpected taint field error: {err:?}");
+        let sink = source_event_sink()?;
+        let value = state.read(&sink).await?;
+        ensure!(value.is_none(), "unexpected source event value: {value:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_ingest_rejects_authority_override_fields() -> anyhow::Result<()> {
+        let s = complete_handshake()?;
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let def = source_projection(None)?;
+        let policy = PolicySnapshot::empty();
+
+        for (event_id, field) in [
+            ("evt-authority", "authority"),
+            ("evt-identity", "acting-identity"),
+            ("evt-sink", "sink"),
+            ("evt-capability", "raw.capability"),
+            ("evt-credential", "credential_ref"),
+            ("evt-binding", "binding_generation"),
+            ("evt-policy", "policy_result"),
+        ] {
+            let mut nested = BTreeMap::new();
+            nested.insert(field.into(), Value::Str("override".into()));
+            let payload = Value::Map(BTreeMap::from([("metadata".into(), Value::Map(nested))]));
+            let err = expect_source_ingest_error(
+                source_req(state.clone(), &s, &def, &policy),
+                event(event_id, payload),
+            )
+            .await?;
+            let expected = SourceIngestError::ForbiddenPayloadField {
+                field: field.into(),
+            };
+            ensure!(
+                err == expected,
+                "unexpected authority field error for {field}: {err:?}"
+            );
+        }
+
         let sink = source_event_sink()?;
         let value = state.read(&sink).await?;
         ensure!(value.is_none(), "unexpected source event value: {value:?}");

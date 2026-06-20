@@ -4955,10 +4955,7 @@ async fn verify_blob_ref_in_state(
     blob: &BlobRef,
     state: &nexus_state::Backend,
 ) -> Result<(), GatewayError> {
-    validate_content_hash(&blob.hash)?;
-    let path = Path::parse(&format!("state://blob/{}", blob.hash)).map_err(|e| {
-        GatewayError::Rejected(format!("large object reference has invalid blob path: {e}"))
-    })?;
+    let path = blob_path(&blob.hash)?;
     let value = state
         .read(&path)
         .await
@@ -5042,9 +5039,9 @@ impl GatewayObjectUploadTicket {
             expected_digest: optional_str(map, "expected_digest").map(str::to_string),
             allowed_media_types: optional_string_list(map, "allowed_media_types")?,
             expires_at_ms: required_i64(map, "expires_at_ms")?,
-            single_use: optional_bool(map, "single_use").unwrap_or(true),
-            committed: optional_bool(map, "committed").unwrap_or(false),
-            used: optional_bool(map, "used").unwrap_or(false),
+            single_use: required_bool(map, "single_use")?,
+            committed: required_bool(map, "committed")?,
+            used: required_bool(map, "used")?,
         };
         validate_ticket_id(&ticket.ticket_id)?;
         if let Some(digest) = &ticket.expected_digest {
@@ -5307,20 +5304,28 @@ fn media_type_matches(allowed: &str, actual: &str) -> bool {
 
 fn upload_ticket_path(ticket_id: &str) -> Result<Path, GatewayError> {
     validate_ticket_id(ticket_id)?;
-    Path::parse(&format!("state://gateway/upload-ticket/{ticket_id}"))
+    state_path(&["gateway", "upload-ticket", ticket_id])
         .map_err(|e| GatewayError::Rejected(format!("invalid upload ticket path: {e}")))
 }
 
 fn idempotency_path(effective_key_hash: &str) -> Result<Path, GatewayError> {
     validate_content_hash(effective_key_hash)?;
-    Path::parse(&format!("state://gateway/idempotency/{effective_key_hash}"))
+    state_path(&["gateway", "idempotency", effective_key_hash])
         .map_err(|e| GatewayError::Rejected(format!("invalid idempotency path: {e}")))
 }
 
 fn blob_path(hash: &str) -> Result<Path, GatewayError> {
     validate_content_hash(hash)?;
-    Path::parse(&format!("state://blob/{hash}"))
+    state_path(&["blob", hash])
         .map_err(|e| GatewayError::Rejected(format!("invalid blob path: {e}")))
+}
+
+fn state_path(segments: &[&str]) -> Result<Path, nexus_types::PathError> {
+    let mut path = Path::try_new("state")?;
+    for segment in segments {
+        path = path.try_push_literal(segment)?;
+    }
+    Ok(path)
 }
 
 fn validate_ticket_id(ticket_id: &str) -> Result<(), GatewayError> {
@@ -5407,8 +5412,16 @@ fn optional_u64(
     }
 }
 
-fn optional_bool(map: &BTreeMap<String, Value>, key: &'static str) -> Option<bool> {
-    map.get(key).and_then(Value::as_bool)
+fn required_bool(map: &BTreeMap<String, Value>, key: &'static str) -> Result<bool, GatewayError> {
+    match map.get(key) {
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(GatewayError::Rejected(format!(
+            "upload ticket {key} must be a bool"
+        ))),
+        None => Err(GatewayError::Rejected(format!(
+            "upload ticket missing {key}"
+        ))),
+    }
 }
 
 fn optional_string_list(

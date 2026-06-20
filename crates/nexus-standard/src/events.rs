@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};
 use nexus_state::{Backend, StateEvent};
 use nexus_types::{MethodId, Outcome, OutputMode, Path, Purity, Value};
+use std::collections::BTreeMap;
 
 /// Internal method names in registration order. `install_standard` exposes each
 /// one as a separate `effect://events/<method>` Resource with public method
@@ -42,9 +43,10 @@ impl EventBusDriver {
     }
 
     fn topic_path(topic: &str) -> Result<Path, DriverError> {
-        // Topics live under state://events/<topic> as Sequence Resources.
-        Path::parse(&format!("state://events/{topic}"))
-            .map_err(|e| DriverError::Other(e.to_string()))
+        Path::try_new("state")
+            .and_then(|path| path.try_push("events"))
+            .and_then(|path| path.try_push_literal(topic))
+            .map_err(|e| DriverError::Other(format!("invalid event topic {topic:?}: {e}")))
     }
 
     /// Stream appended events on `topic` to the operation's sink. Returns the
@@ -99,17 +101,15 @@ impl Driver for EventBusDriver {
         output: OutputMode,
         ctx: &DriverContext,
     ) -> Result<Outcome, DriverError> {
-        let m = crate::input::map(input, "events")?;
-        let topic = m
-            .get("topic")
-            .and_then(|v| v.as_str())
-            .unwrap_or("default")
-            .to_string();
+        let mut m = crate::input::map(input, "events")?;
+        let topic = optional_topic(&m)?;
         let path = Self::topic_path(&topic)?;
         match method.get() {
             // publish: append the event payload to the topic Sequence.
             0 => {
-                let event = m.get("event").cloned().unwrap_or(Value::Null);
+                let event = m.remove("event").ok_or_else(|| {
+                    DriverError::InvalidInput("events.publish requires event".into())
+                })?;
                 self.state
                     .write_append(&path, event)
                     .await
@@ -121,11 +121,7 @@ impl Driver for EventBusDriver {
             // addressable (the Unary acknowledgement, unchanged).
             1 => {
                 if output == OutputMode::Stream {
-                    let limit = m
-                        .get("max_events")
-                        .and_then(|v| v.as_int())
-                        .map(|n| n.max(0) as usize)
-                        .unwrap_or(DEFAULT_STREAM_LIMIT);
+                    let limit = optional_stream_limit(&m)?;
                     self.stream_topic(&path, limit, ctx).await
                 } else {
                     Ok(Outcome::Done(Value::Str(path.to_string())))
@@ -133,6 +129,34 @@ impl Driver for EventBusDriver {
             }
             _ => Err(DriverError::NoSuchMethod(method)),
         }
+    }
+}
+
+fn optional_topic(m: &BTreeMap<String, Value>) -> Result<String, DriverError> {
+    match m.get("topic") {
+        None => Ok("default".into()),
+        Some(Value::Str(topic)) if !topic.is_empty() => Ok(topic.clone()),
+        Some(Value::Str(_)) => Err(DriverError::InvalidInput(
+            "events topic must not be empty".into(),
+        )),
+        Some(_) => Err(DriverError::InvalidInput(
+            "events topic must be a string".into(),
+        )),
+    }
+}
+
+fn optional_stream_limit(m: &BTreeMap<String, Value>) -> Result<usize, DriverError> {
+    match m.get("max_events") {
+        None => Ok(DEFAULT_STREAM_LIMIT),
+        Some(Value::Int(limit)) if *limit >= 0 => usize::try_from(*limit).map_err(|_| {
+            DriverError::InvalidInput("events max_events is too large for this platform".into())
+        }),
+        Some(Value::Int(_)) => Err(DriverError::InvalidInput(
+            "events max_events must be non-negative".into(),
+        )),
+        Some(_) => Err(DriverError::InvalidInput(
+            "events max_events must be an integer".into(),
+        )),
     }
 }
 
@@ -172,6 +196,49 @@ mod tests {
         let stored = state.read(&topic_path).await.context("read topic events")?;
         let expected = Some(Value::List(vec![Value::Str("fire".into())]));
         ensure!(stored == expected, "stored events: {stored:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_requires_explicit_event() -> Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = EventBusDriver::new(state);
+        let mut m = BTreeMap::new();
+        m.insert("topic".into(), Value::Str("alerts".into()));
+        let out = d
+            .call(MethodId::new(0), Value::Map(m), OutputMode::Unary, &ctx())
+            .await;
+        ensure!(out.is_err(), "publish accepted a missing event");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn topic_rejects_path_delimiters() -> Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = EventBusDriver::new(state);
+        let out = d
+            .call(
+                MethodId::new(0),
+                publish_input("alerts/ops", "fire"),
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await;
+        ensure!(out.is_err(), "topic with path delimiter was accepted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscribe_rejects_invalid_max_events() -> Result<()> {
+        let state: Backend = Arc::new(InMemoryBackend::new());
+        let d = EventBusDriver::new(state);
+        let mut m = BTreeMap::new();
+        m.insert("topic".into(), Value::Str("alerts".into()));
+        m.insert("max_events".into(), Value::Int(-1));
+        let out = d
+            .call(MethodId::new(1), Value::Map(m), OutputMode::Stream, &ctx())
+            .await;
+        ensure!(out.is_err(), "negative max_events was accepted");
         Ok(())
     }
 

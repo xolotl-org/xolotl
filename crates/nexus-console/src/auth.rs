@@ -23,10 +23,8 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 
 const USERS_PREFIX: &str = "state://kernel/console/users";
-const ROLES_PREFIX: &str = "state://kernel/console/roles";
 const SESSIONS_PREFIX: &str = "state://kernel/console/sessions";
 const CHALLENGES_PREFIX: &str = "state://kernel/console/challenges";
-const VAULT_PREFIX: &str = "state://vault/console";
 const ROOT_USERNAME: &str = "root";
 /// Default absolute session lifetime, in milliseconds.
 pub const DEFAULT_SESSION_TTL_MS: i64 = 24 * 60 * 60 * 1000;
@@ -740,7 +738,7 @@ impl ConsoleAuth {
     ) -> Result<ConsolePrincipal, AuthError> {
         validate_session_id(sid)?;
         let state = &boot.kernel.state;
-        let session_path = session_path(sid);
+        let session_path = session_path(sid)?;
         let Some(mut session) = read_session(state, &session_path).await? else {
             return Err(AuthError::InvalidSession);
         };
@@ -777,7 +775,7 @@ impl ConsoleAuth {
     ) -> Result<ConsolePrincipal, AuthError> {
         let (sid, token) = bearer.split_once('.').ok_or(AuthError::InvalidSession)?;
         validate_session_id(sid)?;
-        let session_path = session_path(sid);
+        let session_path = session_path(sid)?;
         let Some(mut session) = read_session(state, &session_path).await? else {
             return Err(AuthError::InvalidSession);
         };
@@ -787,7 +785,7 @@ impl ConsoleAuth {
             return Err(AuthError::InvalidSession);
         }
         let token_hash = token_hash(token);
-        let expected_hash = read_string(state, &session_token_path(sid))
+        let expected_hash = read_string(state, &session_token_path(sid)?)
             .await?
             .ok_or(AuthError::InvalidSession)?;
         if expected_hash
@@ -827,7 +825,7 @@ impl ConsoleAuth {
         source_addr: Option<&str>,
     ) -> Result<(), AuthError> {
         validate_session_id(sid)?;
-        let session = read_session(&boot.kernel.state, &session_path(sid)).await?;
+        let session = read_session(&boot.kernel.state, &session_path(sid)?).await?;
         let username = session.as_ref().map(|s| s.username.as_str());
         let mfa_level = session.as_ref().map(|s| s.mfa_level);
         let result = revoke_session(&boot.kernel.state, sid).await;
@@ -891,7 +889,7 @@ impl ConsoleAuth {
         source_addr: Option<&str>,
     ) -> Result<(), AuthError> {
         validate_session_id(sid)?;
-        let path = Path::parse(&session_path(sid))?;
+        let path = Path::parse(&session_path(sid)?)?;
         authorize_path(&boot.kernel.state, principal, "write", &path, None).await?;
         let result = revoke_session(&boot.kernel.state, sid).await;
         match &result {
@@ -924,7 +922,7 @@ impl ConsoleAuth {
         source_addr: Option<&str>,
     ) -> Result<usize, AuthError> {
         validate_username(username)?;
-        let user_path = Path::parse(&format!("{USERS_PREFIX}/{username}"))?;
+        let user_path = Path::parse(&user_path(username)?)?;
         authorize_path(&boot.kernel.state, principal, "write", &user_path, None).await?;
         let sessions = boot
             .kernel
@@ -984,8 +982,8 @@ impl ConsoleAuth {
             last_seen: now,
             source_addr,
         };
-        write_session(state, &session_path(&sid), &session).await?;
-        write_string(state, &session_token_path(&sid), token_hash(&token_secret)).await?;
+        write_session(state, &session_path(&sid)?, &session).await?;
+        write_string(state, &session_token_path(&sid)?, token_hash(&token_secret)).await?;
 
         Ok(LoginResponse {
             sid,
@@ -1107,7 +1105,7 @@ async fn bootstrap_root_account_inner(
     let now = now_millis();
     let root_grants = root_grants();
     let (password_hash_ref, outcome) = if let Some(phc) = provisioning.password_hash {
-        let hash_ref = password_hash_path(ROOT_USERNAME);
+        let hash_ref = password_hash_path(ROOT_USERNAME)?;
         write_string(state, &hash_ref, phc).await?;
         (
             Some(hash_ref),
@@ -1118,7 +1116,7 @@ async fn bootstrap_root_account_inner(
     } else if provisioning.pubkeys.is_empty() {
         let password = random_token(36)?;
         let phc = hash_password(&password)?;
-        let hash_ref = password_hash_path(ROOT_USERNAME);
+        let hash_ref = password_hash_path(ROOT_USERNAME)?;
         write_string(state, &hash_ref, phc).await?;
         (
             Some(hash_ref),
@@ -1261,7 +1259,7 @@ async fn authorize_role_target(
     };
     validate_username(&role)?;
 
-    let role_path = format!("{ROLES_PREFIX}/{role}");
+    let role_path = role_path(&role)?;
     if let Some(existing) = state.read(&Path::parse(&role_path)?).await? {
         let existing_grants = capset_from_strings(&role_grants(&existing)?)?;
         if !capset_covers(&principal.grants, &existing_grants) {
@@ -1306,7 +1304,7 @@ fn capset_covers(parent: &CapSet, child: &CapSet) -> bool {
 async fn effective_grants(state: &Backend, user: &UserRecord) -> Result<CapSet, AuthError> {
     let mut grants = user.grants.clone();
     for role in &user.roles {
-        let role_path = format!("{ROLES_PREFIX}/{role}");
+        let role_path = role_path(role)?;
         if let Some(v) = state.read(&Path::parse(&role_path)?).await? {
             grants.extend(role_grants(&v)?);
         }
@@ -1363,42 +1361,37 @@ impl UserRecord {
 
     fn from_value(username: &str, value: &Value) -> Result<Self, AuthError> {
         let m = value.as_map().ok_or(AuthError::InvalidCredentials)?;
-        let authn = m.get("authn").and_then(Value::as_map);
-        let password = authn
-            .and_then(|a| a.get("password"))
-            .and_then(Value::as_map);
-        let totp = authn.and_then(|a| a.get("totp")).and_then(Value::as_map);
-        let pubkeys = match authn.and_then(|a| a.get("pubkeys")) {
-            Some(value) => string_list(value, "console user.authn.pubkeys")?,
-            None => Vec::new(),
-        };
+        let identity_path = required_str_field(m, "identity_path", "console user")?;
+        validate_console_identity_path(&identity_path)?;
+        let status = required_str_field(m, "status", "console user")?;
+        if !matches!(status.as_str(), "active" | "disabled" | "locked") {
+            return Err(AuthError::State("console user.status is invalid".into()));
+        }
+        let authn = required_map_field(m, "authn", "console user")?;
+        let password = required_map_field(authn, "password", "console user.authn")?;
+        let totp = required_map_field(authn, "totp", "console user.authn")?;
+        let created_at = required_nonnegative_int_field(m, "created_at", "console user")?;
+        let password_changed_at =
+            required_nonnegative_int_field(m, "password_changed_at", "console user")?;
         Ok(Self {
             username: username.to_string(),
-            identity_path: str_field(m, "identity_path")
-                .unwrap_or_else(|| format!("identity://console/{username}")),
-            status: str_field(m, "status").unwrap_or_else(|| "active".into()),
-            password_hash_ref: password
-                .and_then(|p| p.get("hash_ref"))
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            totp_enabled: totp
-                .and_then(|t| t.get("enabled"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            totp_seed_ref: totp
-                .and_then(|t| t.get("seed_ref"))
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            totp_last_step: totp
-                .and_then(|t| t.get("last_step"))
-                .and_then(Value::as_int),
-            pubkeys,
-            roles: optional_string_list_field(m, "roles", "console user")?,
-            grants: optional_string_list_field(m, "grants", "console user")?,
-            authority_ceiling: optional_string_list_field(m, "authority_ceiling", "console user")?,
-            created_by: str_field(m, "created_by").unwrap_or_else(|| "unknown".into()),
-            created_at: int_field(m, "created_at").unwrap_or(0),
-            password_changed_at: int_field(m, "password_changed_at").unwrap_or(0),
+            identity_path,
+            status,
+            password_hash_ref: optional_string_field(
+                password,
+                "hash_ref",
+                "console user.password",
+            )?,
+            totp_enabled: optional_bool_field(totp, "enabled", "console user.totp")?,
+            totp_seed_ref: optional_string_field(totp, "seed_ref", "console user.totp")?,
+            totp_last_step: optional_nonnegative_int_field(totp, "last_step", "console user.totp")?,
+            pubkeys: required_string_list_field(authn, "pubkeys", "console user.authn")?,
+            roles: required_string_list_field(m, "roles", "console user")?,
+            grants: required_string_list_field(m, "grants", "console user")?,
+            authority_ceiling: required_string_list_field(m, "authority_ceiling", "console user")?,
+            created_by: required_str_field(m, "created_by", "console user")?,
+            created_at,
+            password_changed_at,
         })
     }
 
@@ -1462,10 +1455,14 @@ impl SessionRecord {
         let mfa_level = optional_int_field(m, "mfa_level", "console session", 1)?;
         let mfa_level = u8::try_from(mfa_level)
             .map_err(|_| AuthError::State("console session.mfa_level is out of range".into()))?;
+        let username = str_field(m, "username").ok_or(AuthError::InvalidSession)?;
+        validate_username(&username)?;
+        let identity_path = str_field(m, "identity_path").ok_or(AuthError::InvalidSession)?;
+        validate_console_identity_path(&identity_path)?;
         Ok(Self {
             sid: sid.to_string(),
-            username: str_field(m, "username").ok_or(AuthError::InvalidSession)?,
-            identity_path: str_field(m, "identity_path").ok_or(AuthError::InvalidSession)?,
+            username,
+            identity_path,
             issued_at: int_field(m, "issued_at").ok_or(AuthError::InvalidSession)?,
             expires_at: int_field(m, "expires_at").ok_or(AuthError::InvalidSession)?,
             idle_expires_at: int_field(m, "idle_expires_at").ok_or(AuthError::InvalidSession)?,
@@ -1543,8 +1540,7 @@ impl KeyChallengeRecord {
 }
 
 async fn read_user(state: &Backend, username: &str) -> Result<Option<UserRecord>, AuthError> {
-    validate_username(username)?;
-    let path = Path::parse(&format!("{USERS_PREFIX}/{username}"))?;
+    let path = Path::parse(&user_path(username)?)?;
     state
         .read(&path)
         .await?
@@ -1553,8 +1549,7 @@ async fn read_user(state: &Backend, username: &str) -> Result<Option<UserRecord>
 }
 
 async fn write_user(state: &Backend, user: &UserRecord) -> Result<(), AuthError> {
-    validate_username(&user.username)?;
-    let path = Path::parse(&format!("{USERS_PREFIX}/{}", user.username))?;
+    let path = Path::parse(&user_path(&user.username)?)?;
     state.write_set(&path, user.to_value()).await?;
     Ok(())
 }
@@ -1584,7 +1579,7 @@ async fn read_key_challenge(
     challenge_id: &str,
 ) -> Result<Option<KeyChallengeRecord>, AuthError> {
     validate_session_id(challenge_id).map_err(|_| AuthError::InvalidChallenge)?;
-    let path = key_challenge_path(challenge_id);
+    let path = key_challenge_path(challenge_id)?;
     state
         .read(&Path::parse(&path)?)
         .await?
@@ -1598,7 +1593,7 @@ async fn write_key_challenge(
 ) -> Result<(), AuthError> {
     state
         .write_set(
-            &Path::parse(&key_challenge_path(&challenge.challenge_id))?,
+            &Path::parse(&key_challenge_path(&challenge.challenge_id)?)?,
             challenge.to_value(),
         )
         .await?;
@@ -1607,7 +1602,7 @@ async fn write_key_challenge(
 
 async fn revoke_key_challenge(state: &Backend, challenge_id: &str) -> Result<(), AuthError> {
     state
-        .write_delete(&Path::parse(&key_challenge_path(challenge_id))?)
+        .write_delete(&Path::parse(&key_challenge_path(challenge_id)?)?)
         .await?;
     Ok(())
 }
@@ -1626,10 +1621,10 @@ async fn sweep_expired_key_challenges(state: &Backend, now: i64) -> Result<(), A
 
 async fn revoke_session(state: &Backend, sid: &str) -> Result<(), AuthError> {
     state
-        .write_delete(&Path::parse(&session_path(sid))?)
+        .write_delete(&Path::parse(&session_path(sid)?)?)
         .await?;
     state
-        .write_delete(&Path::parse(&session_token_path(sid))?)
+        .write_delete(&Path::parse(&session_token_path(sid)?)?)
         .await?;
     Ok(())
 }
@@ -1715,20 +1710,42 @@ fn root_grants() -> Vec<String> {
     ]
 }
 
-fn password_hash_path(username: &str) -> String {
-    format!("{VAULT_PREFIX}/{username}/password")
+fn state_path_string(segments: &[&str]) -> Result<String, AuthError> {
+    let mut path = Path::try_new("state")?;
+    for segment in segments {
+        path = path.try_push_literal(segment)?;
+    }
+    Ok(path.to_string())
 }
 
-fn session_path(sid: &str) -> String {
-    format!("{SESSIONS_PREFIX}/{sid}")
+fn user_path(username: &str) -> Result<String, AuthError> {
+    validate_username(username)?;
+    state_path_string(&["kernel", "console", "users", username])
 }
 
-fn session_token_path(sid: &str) -> String {
-    format!("{VAULT_PREFIX}/sessions/{sid}")
+fn role_path(role: &str) -> Result<String, AuthError> {
+    validate_username(role)?;
+    state_path_string(&["kernel", "console", "roles", role])
 }
 
-fn key_challenge_path(challenge_id: &str) -> String {
-    format!("{CHALLENGES_PREFIX}/{challenge_id}")
+fn password_hash_path(username: &str) -> Result<String, AuthError> {
+    validate_username(username)?;
+    state_path_string(&["vault", "console", username, "password"])
+}
+
+fn session_path(sid: &str) -> Result<String, AuthError> {
+    validate_session_id(sid)?;
+    state_path_string(&["kernel", "console", "sessions", sid])
+}
+
+fn session_token_path(sid: &str) -> Result<String, AuthError> {
+    validate_session_id(sid)?;
+    state_path_string(&["vault", "console", "sessions", sid])
+}
+
+fn key_challenge_path(challenge_id: &str) -> Result<String, AuthError> {
+    validate_session_id(challenge_id).map_err(|_| AuthError::InvalidChallenge)?;
+    state_path_string(&["kernel", "console", "challenges", challenge_id])
 }
 
 fn path_leaf(path: &Path, label: &str) -> Result<String, AuthError> {
@@ -1944,6 +1961,103 @@ fn str_field(m: &BTreeMap<String, Value>, key: &str) -> Option<String> {
 
 fn int_field(m: &BTreeMap<String, Value>, key: &str) -> Option<i64> {
     m.get(key).and_then(Value::as_int)
+}
+
+fn required_str_field(
+    m: &BTreeMap<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<String, AuthError> {
+    match m.get(key) {
+        Some(Value::Str(value)) if !value.is_empty() => Ok(value.clone()),
+        Some(Value::Str(_)) => Err(AuthError::State(format!("{label}.{key} must not be empty"))),
+        Some(_) => Err(AuthError::State(format!("{label}.{key} must be a string"))),
+        None => Err(AuthError::State(format!("{label}.{key} is required"))),
+    }
+}
+
+fn required_map_field<'a>(
+    m: &'a BTreeMap<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<&'a BTreeMap<String, Value>, AuthError> {
+    match m.get(key) {
+        Some(Value::Map(value)) => Ok(value),
+        Some(_) => Err(AuthError::State(format!("{label}.{key} must be an object"))),
+        None => Err(AuthError::State(format!("{label}.{key} is required"))),
+    }
+}
+
+fn required_nonnegative_int_field(
+    m: &BTreeMap<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<i64, AuthError> {
+    match m.get(key) {
+        Some(Value::Int(value)) if *value >= 0 => Ok(*value),
+        Some(Value::Int(_)) => Err(AuthError::State(format!(
+            "{label}.{key} must be non-negative"
+        ))),
+        Some(_) => Err(AuthError::State(format!(
+            "{label}.{key} must be an integer"
+        ))),
+        None => Err(AuthError::State(format!("{label}.{key} is required"))),
+    }
+}
+
+fn required_string_list_field(
+    m: &BTreeMap<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<Vec<String>, AuthError> {
+    match m.get(key) {
+        Some(value) => string_list(value, &format!("{label}.{key}")),
+        None => Err(AuthError::State(format!("{label}.{key} is required"))),
+    }
+}
+
+fn optional_string_field(
+    m: &BTreeMap<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<Option<String>, AuthError> {
+    match m.get(key) {
+        Some(Value::Str(value)) if !value.is_empty() => Ok(Some(value.clone())),
+        Some(Value::Str(_)) => Err(AuthError::State(format!("{label}.{key} must not be empty"))),
+        Some(_) => Err(AuthError::State(format!("{label}.{key} must be a string"))),
+        None => Ok(None),
+    }
+}
+
+fn optional_nonnegative_int_field(
+    m: &BTreeMap<String, Value>,
+    key: &str,
+    label: &str,
+) -> Result<Option<i64>, AuthError> {
+    match m.get(key) {
+        Some(Value::Int(value)) if *value >= 0 => Ok(Some(*value)),
+        Some(Value::Int(_)) => Err(AuthError::State(format!(
+            "{label}.{key} must be non-negative"
+        ))),
+        Some(_) => Err(AuthError::State(format!(
+            "{label}.{key} must be an integer"
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn validate_console_identity_path(identity_path: &str) -> Result<(), AuthError> {
+    let path = Path::parse(identity_path)?;
+    if path.cluster().is_some()
+        || path.scheme() != "identity"
+        || path.segments().is_empty()
+        || !path.is_concrete()
+    {
+        return Err(AuthError::State(
+            "console user.identity_path must be a concrete identity path".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn optional_str_field(
@@ -2258,7 +2372,7 @@ mod tests {
         for _ in 0..128 {
             let token = random_token(18)?;
             validate_session_id(&token)?;
-            Path::parse(&format!("state://kernel/console/sessions/{token}"))?;
+            Path::parse(&session_path(&token)?)?;
         }
         ensure!(
             validate_session_id("-bad").is_err(),
@@ -2277,6 +2391,100 @@ mod tests {
         assert!(validate_username("bad/name").is_err());
         assert!(validate_username(".bad").is_err());
         assert!(validate_username("\u{542b}").is_err());
+    }
+
+    #[test]
+    fn malformed_user_records_do_not_default_to_active() -> anyhow::Result<()> {
+        let user = UserRecord {
+            username: "alice".into(),
+            identity_path: "identity://console/alice".into(),
+            status: "active".into(),
+            password_hash_ref: None,
+            totp_enabled: false,
+            totp_seed_ref: None,
+            totp_last_step: None,
+            pubkeys: Vec::new(),
+            roles: Vec::new(),
+            grants: Vec::new(),
+            authority_ceiling: Vec::new(),
+            created_by: "test".into(),
+            created_at: 1,
+            password_changed_at: 1,
+        };
+
+        let mut missing_status = user.to_value();
+        let Value::Map(map) = &mut missing_status else {
+            bail!("user record must be a map");
+        };
+        map.remove("status");
+        ensure!(
+            UserRecord::from_value("alice", &missing_status).is_err(),
+            "missing status defaulted to active"
+        );
+
+        let mut missing_identity = user.to_value();
+        let Value::Map(map) = &mut missing_identity else {
+            bail!("user record must be a map");
+        };
+        map.remove("identity_path");
+        ensure!(
+            UserRecord::from_value("alice", &missing_identity).is_err(),
+            "missing identity_path was synthesized"
+        );
+
+        let mut bad_hash = user.to_value();
+        let Value::Map(map) = &mut bad_hash else {
+            bail!("user record must be a map");
+        };
+        let Some(Value::Map(authn)) = map.get_mut("authn") else {
+            bail!("authn must be a map");
+        };
+        let Some(Value::Map(password)) = authn.get_mut("password") else {
+            bail!("password authn must be a map");
+        };
+        password.insert("hash_ref".into(), Value::Int(7));
+        ensure!(
+            UserRecord::from_value("alice", &bad_hash).is_err(),
+            "malformed password hash ref was ignored"
+        );
+
+        let mut wildcard_identity = user.to_value();
+        let Value::Map(map) = &mut wildcard_identity else {
+            bail!("user record must be a map");
+        };
+        map.insert(
+            "identity_path".into(),
+            Value::Str("identity://console/**".into()),
+        );
+        ensure!(
+            UserRecord::from_value("alice", &wildcard_identity).is_err(),
+            "wildcard identity_path was accepted"
+        );
+
+        let mut clustered_identity = user.to_value();
+        let Value::Map(map) = &mut clustered_identity else {
+            bail!("user record must be a map");
+        };
+        map.insert(
+            "identity_path".into(),
+            Value::Str("path://remote/identity/console/alice".into()),
+        );
+        ensure!(
+            UserRecord::from_value("alice", &clustered_identity).is_err(),
+            "clustered identity_path was accepted"
+        );
+
+        let mut locked = user.to_value();
+        let Value::Map(map) = &mut locked else {
+            bail!("user record must be a map");
+        };
+        map.insert("status".into(), Value::Str("locked".into()));
+        let locked = UserRecord::from_value("alice", &locked)?;
+        ensure!(
+            locked.status == "locked",
+            "locked status did not round-trip"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -2466,7 +2674,7 @@ mod tests {
         boot.kernel
             .state
             .write_set(
-                &Path::parse(&format!("{SESSIONS_PREFIX}/malformed"))?,
+                &Path::parse(&session_path("malformed")?)?,
                 Value::Map(BTreeMap::new()),
             )
             .await?;
@@ -2477,6 +2685,23 @@ mod tests {
                 Err(AuthError::InvalidSession)
             ),
             "malformed session state was accepted"
+        );
+
+        let malformed_identity = SessionRecord {
+            sid: "malformed-identity".into(),
+            username: "root".into(),
+            identity_path: "identity://console/**".into(),
+            issued_at: 1,
+            expires_at: i64::MAX,
+            idle_expires_at: i64::MAX,
+            mfa_level: 1,
+            last_seen: 1,
+            source_addr: "test".into(),
+        }
+        .to_value();
+        ensure!(
+            SessionRecord::from_value("malformed-identity", &malformed_identity).is_err(),
+            "wildcard session identity was accepted"
         );
         Ok(())
     }
@@ -2655,6 +2880,18 @@ mod tests {
 
         let mut root = read_user(state, "root")
             .await?
+            .context("root user missing after disabled self-lock check")?;
+        root.status = "locked".into();
+        ensure!(
+            matches!(
+                authorize_path(state, &principal, "write", &path, Some(&root.to_value())).await,
+                Err(AuthError::PermissionDenied)
+            ),
+            "root was allowed to self-lock with locked status"
+        );
+
+        let mut root = read_user(state, "root")
+            .await?
             .context("root user missing after self-lock check")?;
         root.grants = vec!["read://state/kernel/**".into()];
         root.authority_ceiling = root.grants.clone();
@@ -2677,6 +2914,37 @@ mod tests {
                 Err(AuthError::PermissionDenied)
             ),
             "root was allowed to remove all login methods"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn locked_user_cannot_login() -> anyhow::Result<()> {
+        let boot = auth_boot();
+        let state = &boot.kernel.state;
+        let password = bootstrap_root_password(&boot).await?;
+        let mut root = read_user(state, "root")
+            .await?
+            .context("root user missing after bootstrap")?;
+        root.status = "locked".into();
+        write_user(state, &root).await?;
+
+        let auth = test_auth()?;
+        ensure!(
+            matches!(
+                auth.login(
+                    &boot,
+                    LoginRequest {
+                        username: "root".into(),
+                        password,
+                        totp_code: None,
+                    },
+                    "test".into(),
+                )
+                .await,
+                Err(AuthError::AccountUnavailable)
+            ),
+            "locked user was able to login"
         );
         Ok(())
     }

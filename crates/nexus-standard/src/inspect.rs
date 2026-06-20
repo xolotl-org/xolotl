@@ -50,10 +50,15 @@ impl Driver for KernelInspectDriver {
             }
             None => None,
         };
-        let include_facts = input
-            .get("include_recent_facts")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let include_facts = match input.get("include_recent_facts") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(DriverError::InvalidInput(
+                    "inspect.include_recent_facts must be a boolean".into(),
+                ));
+            }
+        };
         let limit = match input.get("limit") {
             Some(value) => {
                 let raw = value.as_int().ok_or_else(|| {
@@ -181,6 +186,27 @@ mod tests {
         };
         let id = OperationId::new(boot.root, NodeId::new(1), 0);
         ensure!(id.process == boot.root, "operation id process mismatch");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inspect_rejects_malformed_include_recent_facts() -> Result<()> {
+        let boot = Bootstrap::in_memory();
+        let d = KernelInspectDriver::new(boot.kernel.processes.clone(), boot.kernel.facts.clone());
+        let mut input = BTreeMap::new();
+        input.insert("include_recent_facts".into(), Value::Str("yes".into()));
+        let out = d
+            .call(
+                MethodId::new(0),
+                Value::Map(input),
+                OutputMode::Unary,
+                &DriverContext::new(IdentityRef::ROOT, boot.root),
+            )
+            .await;
+        ensure!(
+            matches!(out, Err(DriverError::InvalidInput(ref message)) if message.contains("include_recent_facts")),
+            "inspect accepted malformed include_recent_facts: {out:?}"
+        );
         Ok(())
     }
 }

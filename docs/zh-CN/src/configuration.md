@@ -16,27 +16,18 @@ cargo run -p nexus-daemon -- up
 
 ## 主要配置段
 
-`[storage]` 选择 redb 持久存储或内存存储。
+| 配置段 | 用途 |
+| --- | --- |
+| `[storage]` | 选择 redb 持久存储或内存存储。 |
+| `[server]` | 通过 `console_addr`、`external_grpc_addr` 和 `external_websocket_addr` 绑定监听器。 |
+| `[external_gateway.grpc]` | 设置 external gRPC 监听器的 Provider/Source session 限制。 |
+| `[external_gateway.websocket]` | 设置 external WebSocket 监听器的同一组 Provider/Source session 限制。 |
+| `[external_gateway.websocket.transport]` | 设置 WebSocket frame 大小、first-frame 超时、idle 超时和总连接数。 |
+| `[console.root]` | 预置 root 凭据。 |
+| `[console.auth]` | 设置会话 TTL、会话数量和 Argon2 校验并发限制。 |
+| `[console.ws]` | 设置控制台 WebSocket 的 frame、连接数、idle、速率、订阅数、结果大小和事件背压限制。 |
 
-`[server]` 设置监听绑定地址：
-
-- `console_addr`
-- `external_grpc_addr`
-- `external_websocket_addr`
-
-对应配置字段缺失时，`nexusd` 还会读取 `NEXUS_CONSOLE_ADDR`、`NEXUS_EXTERNAL_GRPC_ADDR` 和 `NEXUS_EXTERNAL_WEBSOCKET_ADDR`。配置字段和环境变量都缺失时，该监听保持关闭。
-
-`[external_gateway.grpc]` 配置 external gRPC 监听器的 Provider/Source session 限制。
-
-`[external_gateway.websocket]` 配置 external WebSocket 监听器的同一组 Provider/Source session 限制。
-
-`[external_gateway.websocket.transport]` 配置 WebSocket frame 大小、first-frame 超时、idle 超时和总连接数。
-
-`[console.root]` 可预置 root 凭据。
-
-`[console.auth]` 设置会话 TTL、会话数量和 Argon2 校验并发限制。
-
-`[console.ws]` 设置控制台 WebSocket 的 frame、连接数、idle、速率、订阅数、结果大小和事件背压限制。
+对应 `[server]` 字段缺失时，`nexusd` 还会读取 `NEXUS_CONSOLE_ADDR`、`NEXUS_EXTERNAL_GRPC_ADDR` 和 `NEXUS_EXTERNAL_WEBSOCKET_ADDR`。配置字段和环境变量都缺失时，该监听保持关闭。
 
 ## External Gateway
 
@@ -52,7 +43,9 @@ source_dedupe_window_ms = 86400000
 provider_max_in_flight_invocations = 1024
 provider_max_in_flight_per_identity = 256
 provider_max_in_flight_per_effect = 256
+provider_max_inline_result_bytes = 65536
 source_max_in_flight_commands = 1024
+source_command_max_inline_result_bytes = 65536
 source_command_rate_limit_window_ms = 60000
 source_command_rate_limit_max = 600
 
@@ -61,7 +54,9 @@ source_dedupe_window_ms = 86400000
 provider_max_in_flight_invocations = 1024
 provider_max_in_flight_per_identity = 256
 provider_max_in_flight_per_effect = 256
+provider_max_inline_result_bytes = 65536
 source_max_in_flight_commands = 1024
+source_command_max_inline_result_bytes = 65536
 source_command_rate_limit_window_ms = 60000
 source_command_rate_limit_max = 600
 
@@ -75,8 +70,10 @@ max_connections = 256
 `source_dedupe_window_ms` 限制 Source event id 去重保留窗口，也限制 Source outbound command 在 result、deadline 或 session drain 后的 command idempotency 保留窗口。
 
 `provider_max_in_flight_invocations`、`provider_max_in_flight_per_identity` 和 `provider_max_in_flight_per_effect` 限制每个 ready Provider session 的 pending invoke。
+`provider_max_inline_result_bytes` 限制 Provider 成功和错误结果的 inline 大小。
 
 `source_max_in_flight_commands`、`source_command_rate_limit_window_ms` 和 `source_command_rate_limit_max` 限制每个 ready Source session 和每个 Source projection 的 outbound command 分发。
+`source_command_max_inline_result_bytes` 限制 Source command 成功和错误结果的 inline 大小。
 
 Source event 的 payload 大小限制、stream 容量、溢出行为和 event-ingress 速率限制在每个 Source projection 上声明。
 

@@ -137,7 +137,7 @@ impl Driver for TerminalDriver {
             .and_then(|v| v.as_str())
             .ok_or_else(|| DriverError::Other("terminal.run requires `command`".into()))?
             .to_string();
-        let approved = m.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
+        let approved = optional_bool(&m, "approved", "terminal.run")?;
         // Three-layer gate (denylist → allowlist → high-risk Approval) runs
         // before any spawn.
         self.gate(&cmd, approved)?;
@@ -181,6 +181,20 @@ impl Driver for TerminalDriver {
             Value::Str(String::from_utf8_lossy(&output.stderr).into_owned()),
         );
         Ok(Outcome::Done(Value::Map(result)))
+    }
+}
+
+fn optional_bool(
+    m: &BTreeMap<String, Value>,
+    field: &'static str,
+    op: &'static str,
+) -> Result<bool, DriverError> {
+    match m.get(field) {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(DriverError::InvalidInput(format!(
+            "{op} `{field}` must be a boolean"
+        ))),
     }
 }
 
@@ -276,6 +290,23 @@ mod tests {
             Err(DriverError::Other(msg)) if msg.contains("approval") => Ok(()),
             other => bail!("high-risk command must require approval, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_approval_flag_is_rejected() -> Result<()> {
+        let d = TerminalDriver::new(vec!["echo".into()]);
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+        let mut input = BTreeMap::new();
+        input.insert("command".into(), Value::Str("echo".into()));
+        input.insert("approved".into(), Value::Str("true".into()));
+        let out = d
+            .call(MethodId::new(0), Value::Map(input), OutputMode::Unary, &ctx)
+            .await;
+        ensure!(
+            matches!(out, Err(DriverError::InvalidInput(ref message)) if message.contains("approved")),
+            "terminal accepted malformed approved flag: {out:?}"
+        );
+        Ok(())
     }
 
     #[test]

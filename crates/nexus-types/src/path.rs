@@ -91,9 +91,15 @@ pub enum PathError {
     /// Segment contained an invalid character.
     #[error("invalid character in segment '{0}': only [a-zA-Z0-9][a-zA-Z0-9_.:-]* allowed")]
     BadSegmentChar(String),
+    /// A concrete path segment used wildcard syntax.
+    #[error("wildcard segment '{0}' is only valid in path patterns")]
+    WildcardSegment(String),
     /// Cluster contained an invalid character.
     #[error("invalid character in cluster '{0}': only [a-zA-Z0-9_-]+ allowed")]
     BadClusterChar(String),
+    /// Cluster name collides with a standard local scheme.
+    #[error("cluster '{0}' is reserved as a local scheme")]
+    ReservedCluster(String),
     /// Path contained non-ASCII characters.
     #[error("non-ASCII characters are not allowed in paths")]
     NonAscii,
@@ -156,9 +162,7 @@ impl Path {
         let (cluster, rest) = match has_path_prefix {
             true => match split_canonical_cluster(stripped) {
                 Some((c, r)) => {
-                    if !is_cluster_ident(c) {
-                        return Err(PathError::BadClusterChar(c.into()));
-                    }
+                    validate_cluster_ident(c)?;
                     (Some(SmolStr::from(c)), r)
                 }
                 None => (None, stripped),
@@ -236,6 +240,25 @@ impl Path {
         Ok(self)
     }
 
+    /// Append one validated concrete path segment. Unlike [`Self::try_push`],
+    /// this rejects `*` and `**`, so it is appropriate for persisted keys,
+    /// resource names, and other non-pattern paths built from caller data.
+    pub fn try_push_literal(self, seg: impl AsRef<str>) -> Result<Self, PathError> {
+        let seg = seg.as_ref();
+        if is_wildcard_segment(seg) {
+            return Err(PathError::WildcardSegment(seg.into()));
+        }
+        self.try_push(seg)
+    }
+
+    /// Attach a validated cluster. Use this for external input.
+    pub fn try_with_cluster(mut self, c: impl AsRef<str>) -> Result<Self, PathError> {
+        let c = c.as_ref();
+        validate_cluster_ident(c)?;
+        self.cluster = Some(SmolStr::from(c));
+        Ok(self)
+    }
+
     /// Attach a cluster without validation.
     pub fn with_cluster(mut self, c: impl Into<SmolStr>) -> Self {
         self.cluster = Some(c.into());
@@ -272,6 +295,13 @@ impl Path {
             .all(|(a, b)| a == b)
     }
 
+    /// True when no segment uses path-pattern wildcard syntax.
+    pub fn is_concrete(&self) -> bool {
+        self.segments
+            .iter()
+            .all(|segment| !is_wildcard_segment(segment.as_str()))
+    }
+
     /// Clone this path for use as a path pattern.
     pub fn as_pattern(&self) -> Path {
         self.clone()
@@ -295,10 +325,23 @@ fn is_cluster_ident(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+fn validate_cluster_ident(s: &str) -> Result<(), PathError> {
+    if !s.is_ascii() {
+        return Err(PathError::NonAscii);
+    }
+    if !is_cluster_ident(s) {
+        return Err(PathError::BadClusterChar(s.into()));
+    }
+    if is_standard_scheme(s) {
+        return Err(PathError::ReservedCluster(s.into()));
+    }
+    Ok(())
+}
+
 fn is_segment_ident(s: &str) -> bool {
     // Wildcard patterns are valid segments (for pattern-matching, not for
     // real target paths — PathValidators enforce the distinction).
-    if s == "*" || s == "**" {
+    if is_wildcard_segment(s) {
         return true;
     }
     let mut chars = s.chars();
@@ -307,6 +350,10 @@ fn is_segment_ident(s: &str) -> bool {
         _ => return false,
     }
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == ':')
+}
+
+fn is_wildcard_segment(s: &str) -> bool {
+    matches!(s, "*" | "**")
 }
 
 fn is_ident(s: &str) -> bool {
@@ -446,6 +493,53 @@ mod tests {
         ensure!(
             err == PathError::BadSegmentChar("bad/slash".into()),
             "unexpected bad segment error: {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn literal_builder_rejects_pattern_wildcards() -> anyhow::Result<()> {
+        let pattern = Path::try_new("state")?.try_push("**")?;
+        ensure!(
+            !pattern.is_concrete(),
+            "wildcard path was treated as concrete"
+        );
+        let err = match Path::try_new("state")?.try_push_literal("**") {
+            Ok(path) => bail!("wildcard literal segment was accepted: {path}"),
+            Err(error) => error,
+        };
+        ensure!(
+            err == PathError::WildcardSegment("**".into()),
+            "unexpected wildcard literal error: {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checked_builder_validates_cluster() -> anyhow::Result<()> {
+        let path = Path::try_new("effect")?
+            .try_with_cluster("pc-home")?
+            .try_push("memory")?;
+        ensure!(
+            path.cluster() == Some("pc-home"),
+            "unexpected cluster: {:?}",
+            path.cluster()
+        );
+        let bad_cluster = match Path::try_new("effect")?.try_with_cluster("bad/slash") {
+            Ok(path) => bail!("bad cluster was accepted: {path}"),
+            Err(error) => error,
+        };
+        ensure!(
+            bad_cluster == PathError::BadClusterChar("bad/slash".into()),
+            "unexpected bad cluster error: {bad_cluster:?}"
+        );
+        let reserved_cluster = match Path::try_new("effect")?.try_with_cluster("state") {
+            Ok(path) => bail!("reserved cluster was accepted: {path}"),
+            Err(error) => error,
+        };
+        ensure!(
+            reserved_cluster == PathError::ReservedCluster("state".into()),
+            "unexpected reserved cluster error: {reserved_cluster:?}"
         );
         Ok(())
     }

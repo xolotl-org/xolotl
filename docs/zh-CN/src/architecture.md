@@ -10,9 +10,9 @@ Nexus 让执行热路径保持很小：
 产出结果和事实记录。
 ```
 
-这些中文术语分别对应代码中的 `Process`、`Handle`、`Resource.method`、`Operation`、`DriverPlan`、`PolicySnapshot`、`Outcome` 和 `Fact`。
-
 运行时分成四类代码路径。
+
+后续章节按这条主线展开：概念章节解释进程、资源、能力、操作、事实记录和重放；网关章节解释外部客户端如何进入运行时；配置章节解释宿主如何开放监听器、feature 和运行时声明。
 
 ## 控制路径
 
@@ -71,26 +71,11 @@ Executor 运行 body。body 如果使用进程本地 `StepRef`，宿主通过
 ## 标准包 feature 选择
 
 `nexus-standard` 包含标准进程内 Provider 和 Source 实现。某个二进制不需要全部实现时，可以
-用 Cargo feature 减少编译进来的模块。
-
-默认 `standard` 编译核心标准进程内实现。`standard-core` 编译同一
-核心集合和 pairing 管理 effect。`fetch`、`fs` 和 `terminal` 各自需要单独 feature。
-External Provider/Source session 处理和 `SecureEnvelope` 代码位于 `nexus-gateway`。
-
-HTTP inference provider feature 是可选的。`http-inference` 会启用全部 HTTP inference
-dialect。单独的 dialect feature 是 `openai-responses`、`openai-chat`、
-`anthropic-messages` 和 `gemini-generate-content`。`nexus-daemon` 会把这些
-feature 转发给 `nexus-standard`。
+用 Cargo feature 减少编译进来的模块。代码编译进二进制和资源被安装到运行时是两件事。
 
 `fetch`、`fs` 和 `terminal` 这类高风险进程内实现必须留在独立的 `nexus-standard`
 feature 后面。daemon 或嵌入式宿主只能通过 kernel state 声明和固定 Console action
 暴露它们。运行时进程内 projection 声明存储在 Nexus state 中。
-
-编译进二进制和实际安装是两件事。`StandardConfig` 默认安装全部 standard-core 模块；
-宿主可以使用 `StandardModules::none`、`StandardModules::state_only` 或自定义
-`StandardModules` 选择公开哪些模块。标准模型类 effect 可以使用内置 baseline、启用
-HTTP dialect feature 后的运行时 Provider state，或通过
-`StandardConfig::with_inference_backend` 接入宿主自己的 backend。
 
 可选进程内 projection 声明属于运行时状态，路径为
 `state://kernel/projections/in-process/<id>`。它们通过泛用 `config.*`
@@ -98,3 +83,7 @@ Console action、共享 kernel state 准入和宿主侧 reconcile 转换为普�
 Resource、Interface、Driver 和 Binding 注册项。reconcile 结果写在
 `state://kernel/projection-status/in-process/<id>`，通过
 `projection.in_process.status.*` 读取。
+
+部署时的 feature 选择和运行时声明路径见[配置](configuration.md)。HTTP 模型
+Provider 的 dialect 见 [HTTP 推理 Provider](http-inference-providers.md)。嵌入式 API
+入口见 [API 参考](api-reference.md)。

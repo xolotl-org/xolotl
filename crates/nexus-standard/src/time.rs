@@ -39,13 +39,7 @@ impl Driver for TimeDriver {
         match method.get() {
             // sleep
             1 => {
-                let ms = input
-                    .as_map()
-                    .and_then(|m| m.get("millis"))
-                    .and_then(|v| v.as_int())
-                    .or_else(|| input.as_int())
-                    .unwrap_or(0)
-                    .max(0) as u64;
+                let ms = sleep_millis(input)?;
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 Ok(Outcome::Done(Value::Null))
             }
@@ -58,7 +52,7 @@ impl Driver for TimeDriver {
             2 => {
                 let m = crate::input::map(input, "time.cron")?;
                 let now = now_millis();
-                let interval_ms = cron_interval_ms(&m).ok_or_else(|| {
+                let interval_ms = cron_interval_ms(&m)?.ok_or_else(|| {
                     DriverError::Other("cron requires `interval_ms` or `every`/`unit`".into())
                 })?;
                 let mut out = std::collections::BTreeMap::new();
@@ -73,24 +67,81 @@ impl Driver for TimeDriver {
     }
 }
 
+fn sleep_millis(input: Value) -> Result<u64, DriverError> {
+    let millis = match input {
+        Value::Int(value) => value,
+        Value::Map(map) => match map.get("millis") {
+            Some(Value::Int(value)) => *value,
+            Some(_) => {
+                return Err(DriverError::InvalidInput(
+                    "time.sleep millis must be an integer".into(),
+                ));
+            }
+            None => {
+                return Err(DriverError::InvalidInput(
+                    "time.sleep requires `millis`".into(),
+                ));
+            }
+        },
+        _ => {
+            return Err(DriverError::InvalidInput(
+                "time.sleep requires integer input or `{millis}`".into(),
+            ));
+        }
+    };
+    if millis < 0 {
+        return Err(DriverError::InvalidInput(
+            "time.sleep millis must be nonnegative".into(),
+        ));
+    }
+    Ok(millis as u64)
+}
+
 /// Resolve a recurring interval (millis) from a cron input map. Accepts either
 /// `{interval_ms: N}` or `{every: N, unit: "s"|"m"|"h"|"d"}`.
-fn cron_interval_ms(m: &std::collections::BTreeMap<String, Value>) -> Option<i64> {
-    if let Some(ms) = m.get("interval_ms").and_then(|v| v.as_int()) {
-        return (ms > 0).then_some(ms);
+fn cron_interval_ms(
+    m: &std::collections::BTreeMap<String, Value>,
+) -> Result<Option<i64>, DriverError> {
+    if let Some(value) = m.get("interval_ms") {
+        return match value {
+            Value::Int(ms) => Ok((*ms > 0).then_some(*ms)),
+            _ => Err(DriverError::InvalidInput(
+                "time.cron interval_ms must be an integer".into(),
+            )),
+        };
     }
-    let every = m.get("every").and_then(|v| v.as_int())?;
+    let every = match m.get("every") {
+        Some(Value::Int(value)) => *value,
+        Some(_) => {
+            return Err(DriverError::InvalidInput(
+                "time.cron every must be an integer".into(),
+            ));
+        }
+        None => return Ok(None),
+    };
     if every <= 0 {
-        return None;
+        return Ok(None);
     }
-    let unit_ms = match m.get("unit").and_then(|v| v.as_str()).unwrap_or("s") {
+    let unit = match m.get("unit") {
+        Some(Value::Str(unit)) => unit.as_str(),
+        Some(_) => {
+            return Err(DriverError::InvalidInput(
+                "time.cron unit must be a string".into(),
+            ));
+        }
+        None => "s",
+    };
+    let unit_ms = match unit {
         "s" | "sec" | "second" | "seconds" => 1000,
         "m" | "min" | "minute" | "minutes" => 60_000,
         "h" | "hour" | "hours" => 3_600_000,
         "d" | "day" | "days" => 86_400_000,
-        _ => return None,
+        _ => return Ok(None),
     };
-    Some(every * unit_ms)
+    every
+        .checked_mul(unit_ms)
+        .map(Some)
+        .ok_or_else(|| DriverError::InvalidInput("time.cron interval overflowed i64".into()))
 }
 
 /// Current wall clock in millis since epoch.
@@ -139,6 +190,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sleep_rejects_missing_or_malformed_duration() -> Result<()> {
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+        for input in [
+            Value::Null,
+            Value::Map(BTreeMap::new()),
+            Value::Map(BTreeMap::from([("millis".into(), Value::Str("0".into()))])),
+            Value::Int(-1),
+        ] {
+            let out = TimeDriver
+                .call(MethodId::new(1), input, OutputMode::Unary, &ctx)
+                .await;
+            ensure!(out.is_err(), "malformed sleep input should fail closed");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cron_computes_next_fire_from_every_unit() -> Result<()> {
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
         let mut m = BTreeMap::new();
@@ -164,6 +232,19 @@ mod tests {
             }
             other => bail!("expected cron map, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn cron_rejects_malformed_unit() -> Result<()> {
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+        let mut m = BTreeMap::new();
+        m.insert("every".into(), Value::Int(5));
+        m.insert("unit".into(), Value::Int(1));
+        let out = TimeDriver
+            .call(MethodId::new(2), Value::Map(m), OutputMode::Unary, &ctx)
+            .await;
+        ensure!(out.is_err(), "malformed cron unit should fail closed");
+        Ok(())
     }
 
     #[tokio::test]

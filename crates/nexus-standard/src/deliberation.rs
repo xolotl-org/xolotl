@@ -48,11 +48,18 @@ impl DeliberationDriver {
         Self { backend }
     }
 
-    fn mode_of(input: &BTreeMap<String, Value>) -> Mode {
-        match input.get("mode").and_then(|v| v.as_str()) {
-            Some("synthesize") => Mode::Synthesize,
-            Some("debate") => Mode::Debate,
-            _ => Mode::Vote,
+    fn mode_of(input: &BTreeMap<String, Value>) -> Result<Mode, DriverError> {
+        match input.get("mode") {
+            None => Ok(Mode::Vote),
+            Some(Value::Str(mode)) if mode == "vote" => Ok(Mode::Vote),
+            Some(Value::Str(mode)) if mode == "synthesize" => Ok(Mode::Synthesize),
+            Some(Value::Str(mode)) if mode == "debate" => Ok(Mode::Debate),
+            Some(Value::Str(_)) => Err(DriverError::InvalidInput(
+                "deliberation `mode` must be vote, synthesize, or debate".into(),
+            )),
+            Some(_) => Err(DriverError::InvalidInput(
+                "deliberation `mode` must be a string".into(),
+            )),
         }
     }
 }
@@ -69,23 +76,15 @@ impl Driver for DeliberationDriver {
         if method.get() != 0 {
             return Err(DriverError::NoSuchMethod(method));
         }
-        let m = crate::input::map(input, "deliberation")?;
-        let question = m
-            .get("question")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let panelists = m
-            .get("panelists")
-            .and_then(|v| v.as_int())
-            .unwrap_or(2)
-            .clamp(1, 8) as usize;
-        let max_rounds = m
-            .get("max_rounds")
-            .and_then(|v| v.as_int())
-            .unwrap_or(1)
-            .clamp(1, 8) as usize;
-        let mode = Self::mode_of(&m);
+        let Value::Map(m) = input else {
+            return Err(DriverError::InvalidInput(
+                "deliberation input must be a map".into(),
+            ));
+        };
+        let question = required_non_empty_string(&m, "question", "deliberation")?.to_string();
+        let panelists = optional_bounded_usize(&m, "panelists", 2, 1, 8, "deliberation")?;
+        let max_rounds = optional_bounded_usize(&m, "max_rounds", 1, 1, 8, "deliberation")?;
+        let mode = Self::mode_of(&m)?;
 
         let mut transcript: Vec<String> = Vec::new();
         let mut round = 0;
@@ -113,6 +112,53 @@ impl Driver for DeliberationDriver {
                 return Ok(Outcome::Done(verdict(mode, &transcript, round)));
             }
         }
+    }
+}
+
+fn required_non_empty_string<'a>(
+    m: &'a BTreeMap<String, Value>,
+    field: &'static str,
+    op: &'static str,
+) -> Result<&'a str, DriverError> {
+    match m.get(field) {
+        Some(Value::Str(value)) if !value.is_empty() => Ok(value),
+        Some(Value::Str(_)) => Err(DriverError::InvalidInput(format!(
+            "{op} `{field}` must not be empty"
+        ))),
+        Some(_) => Err(DriverError::InvalidInput(format!(
+            "{op} `{field}` must be a string"
+        ))),
+        None => Err(DriverError::InvalidInput(format!(
+            "{op} requires `{field}`"
+        ))),
+    }
+}
+
+fn optional_bounded_usize(
+    m: &BTreeMap<String, Value>,
+    field: &'static str,
+    default: usize,
+    min: usize,
+    max: usize,
+    op: &'static str,
+) -> Result<usize, DriverError> {
+    match m.get(field) {
+        None => Ok(default),
+        Some(Value::Int(value)) => {
+            let value = usize::try_from(*value).map_err(|_| {
+                DriverError::InvalidInput(format!("{op} `{field}` must be between {min} and {max}"))
+            })?;
+            if (min..=max).contains(&value) {
+                Ok(value)
+            } else {
+                Err(DriverError::InvalidInput(format!(
+                    "{op} `{field}` must be between {min} and {max}"
+                )))
+            }
+        }
+        Some(_) => Err(DriverError::InvalidInput(format!(
+            "{op} `{field}` must be an integer"
+        ))),
     }
 }
 
@@ -290,6 +336,49 @@ mod tests {
             }
             other => bail!("expected verdict, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_input() -> Result<()> {
+        let d = DeliberationDriver::new(Arc::new(EchoBackend));
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+
+        let out = d
+            .call(
+                MethodId::new(0),
+                Value::Map(BTreeMap::new()),
+                OutputMode::Unary,
+                &ctx,
+            )
+            .await;
+        ensure!(out.is_err(), "deliberation accepted missing question");
+
+        let mut bad_panel = BTreeMap::new();
+        bad_panel.insert("question".into(), Value::Str("best approach?".into()));
+        bad_panel.insert("panelists".into(), Value::Int(0));
+        let out = d
+            .call(
+                MethodId::new(0),
+                Value::Map(bad_panel),
+                OutputMode::Unary,
+                &ctx,
+            )
+            .await;
+        ensure!(out.is_err(), "deliberation accepted out-of-range panelists");
+
+        let mut bad_mode = BTreeMap::new();
+        bad_mode.insert("question".into(), Value::Str("best approach?".into()));
+        bad_mode.insert("mode".into(), Value::Str("maybe".into()));
+        let out = d
+            .call(
+                MethodId::new(0),
+                Value::Map(bad_mode),
+                OutputMode::Unary,
+                &ctx,
+            )
+            .await;
+        ensure!(out.is_err(), "deliberation accepted unknown mode");
+        Ok(())
     }
 
     #[test]

@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use nexus_kernel::{Driver, DriverContext, DriverError, MethodSpec};
 use nexus_state::Backend;
 use nexus_types::{MethodId, Outcome, OutputMode, Purity, Value};
+use std::collections::BTreeMap;
 use std::path::{Component, Path as FsPath, PathBuf};
 
 /// Internal method names in registration order. `install_standard` exposes each
@@ -98,23 +99,10 @@ impl Driver for FsDriver {
         _output: OutputMode,
         _ctx: &DriverContext,
     ) -> Result<Outcome, DriverError> {
-        let m = match &input {
-            Value::Null | Value::Str(_) => None,
-            Value::Map(m) => Some(m),
-            _ => {
-                return Err(DriverError::InvalidInput(
-                    "fs input must be a map, string path, or null".into(),
-                ));
-            }
-        };
-        let path = m
-            .and_then(|m| m.get("path"))
-            .and_then(|v| v.as_str())
-            .or_else(|| input.as_str())
-            .unwrap_or("");
         match method.get() {
             // read
             0 => {
+                let path = string_input_or_field(&input, "path", "fs.read")?;
                 let p = self.resolve(path)?;
                 // Stat first; a file larger than INLINE_MAX is
                 // content-addressed with blake3 and returned as a BlobRef so
@@ -140,8 +128,10 @@ impl Driver for FsDriver {
             }
             // write
             1 => {
+                let m = input_map(&input, "fs.write")?;
+                let path = required_string_field(m, "path", "fs.write")?;
                 let p = self.resolve(path)?;
-                let content = m.and_then(|m| m.get("content")).unwrap_or(&Value::Null);
+                let content = required_field(m, "content", "fs.write")?;
                 let bytes = match content {
                     Value::Str(s) => s.as_bytes().to_vec(),
                     Value::Bytes(b) => b.clone(),
@@ -161,6 +151,7 @@ impl Driver for FsDriver {
             }
             // list
             2 => {
+                let path = string_input_or_field(&input, "path", "fs.list")?;
                 let p = self.resolve(path)?;
                 let mut entries = Vec::new();
                 let mut rd = tokio::fs::read_dir(&p)
@@ -178,6 +169,7 @@ impl Driver for FsDriver {
             }
             // delete
             3 => {
+                let path = string_input_or_field(&input, "path", "fs.delete")?;
                 let p = self.resolve(path)?;
                 match tokio::fs::remove_file(&p).await {
                     Ok(()) => {}
@@ -191,11 +183,7 @@ impl Driver for FsDriver {
             // is re-checked against the sandbox root so a symlinked match cannot
             // escape.
             4 => {
-                let pattern = m
-                    .and_then(|m| m.get("pattern"))
-                    .and_then(|v| v.as_str())
-                    .or_else(|| input.as_str())
-                    .unwrap_or("");
+                let pattern = string_input_or_field(&input, "pattern", "fs.glob")?;
                 let abs_pattern = self.root.join(pattern.trim_start_matches('/'));
                 let abs_pattern = abs_pattern.to_string_lossy();
                 let paths = glob::glob(&abs_pattern)
@@ -220,6 +208,57 @@ impl Driver for FsDriver {
             _ => Err(DriverError::NoSuchMethod(method)),
         }
     }
+}
+
+fn input_map<'a>(
+    input: &'a Value,
+    op: &'static str,
+) -> Result<&'a BTreeMap<String, Value>, DriverError> {
+    match input {
+        Value::Map(m) => Ok(m),
+        _ => Err(DriverError::InvalidInput(format!(
+            "{op} input must be a map"
+        ))),
+    }
+}
+
+fn string_input_or_field<'a>(
+    input: &'a Value,
+    field: &'static str,
+    op: &'static str,
+) -> Result<&'a str, DriverError> {
+    match input {
+        Value::Str(value) => Ok(value),
+        Value::Map(m) => required_string_field(m, field, op),
+        _ => Err(DriverError::InvalidInput(format!(
+            "{op} input must be a map or string {field}"
+        ))),
+    }
+}
+
+fn required_string_field<'a>(
+    m: &'a BTreeMap<String, Value>,
+    field: &'static str,
+    op: &'static str,
+) -> Result<&'a str, DriverError> {
+    match m.get(field) {
+        Some(Value::Str(value)) => Ok(value),
+        Some(_) => Err(DriverError::InvalidInput(format!(
+            "{op} `{field}` must be a string"
+        ))),
+        None => Err(DriverError::InvalidInput(format!(
+            "{op} requires `{field}`"
+        ))),
+    }
+}
+
+fn required_field<'a>(
+    m: &'a BTreeMap<String, Value>,
+    field: &'static str,
+    op: &'static str,
+) -> Result<&'a Value, DriverError> {
+    m.get(field)
+        .ok_or_else(|| DriverError::InvalidInput(format!("{op} requires `{field}`")))
 }
 
 /// Best-effort MIME guess from the filename suffix, for the offload `BlobRef`'s
@@ -313,6 +352,65 @@ mod tests {
             )
             .await;
         ensure!(out.is_err(), "symlink/.. escape must be rejected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_or_malformed_paths() -> Result<()> {
+        let dir = tempfile::tempdir().context("create temp dir")?;
+        let d = FsDriver::new(dir.path(), state()).context("create fs driver")?;
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+
+        let out = d
+            .call(
+                MethodId::new(0),
+                Value::Map(BTreeMap::new()),
+                OutputMode::Unary,
+                &ctx,
+            )
+            .await;
+        ensure!(out.is_err(), "read accepted missing path");
+
+        let mut bad_path = BTreeMap::new();
+        bad_path.insert("path".into(), Value::Int(1));
+        let out = d
+            .call(
+                MethodId::new(2),
+                Value::Map(bad_path),
+                OutputMode::Unary,
+                &ctx,
+            )
+            .await;
+        ensure!(out.is_err(), "list accepted non-string path");
+
+        let out = d
+            .call(
+                MethodId::new(4),
+                Value::Map(BTreeMap::new()),
+                OutputMode::Unary,
+                &ctx,
+            )
+            .await;
+        ensure!(out.is_err(), "glob accepted missing pattern");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_requires_content() -> Result<()> {
+        let dir = tempfile::tempdir().context("create temp dir")?;
+        let d = FsDriver::new(dir.path(), state()).context("create fs driver")?;
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+        let mut m = BTreeMap::new();
+        m.insert("path".into(), Value::Str("note.txt".into()));
+
+        let out = d
+            .call(MethodId::new(1), Value::Map(m), OutputMode::Unary, &ctx)
+            .await;
+        ensure!(out.is_err(), "write accepted missing content");
+        ensure!(
+            !dir.path().join("note.txt").exists(),
+            "write created a file without content"
+        );
         Ok(())
     }
 

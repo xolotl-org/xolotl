@@ -32,7 +32,10 @@ impl LockDriver {
     /// illegal path segment is a caller error (returned as `DriverError`), never
     /// a panic.
     fn lock_path(name: &str) -> Result<Path, DriverError> {
-        Path::parse(&format!("state://kernel/locks/{name}"))
+        Path::try_new("state")
+            .and_then(|path| path.try_push("kernel"))
+            .and_then(|path| path.try_push("locks"))
+            .and_then(|path| path.try_push_literal(name))
             .map_err(|e| DriverError::Other(format!("invalid lock name {name:?}: {e}")))
     }
 }
@@ -149,7 +152,7 @@ mod tests {
         let r = d
             .call(
                 MethodId::new(0),
-                Value::Str("bad name/with spaces".into()),
+                Value::Str("bad/name".into()),
                 OutputMode::Unary,
                 &ctx,
             )

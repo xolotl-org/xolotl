@@ -18,35 +18,21 @@ cargo run -p nexus-daemon -- up
 
 ## Main Sections
 
-`[storage]` selects redb persistent storage or in-memory storage.
+| Section | Purpose |
+| --- | --- |
+| `[storage]` | Select redb persistent storage or in-memory storage. |
+| `[server]` | Bind listeners with `console_addr`, `external_grpc_addr`, and `external_websocket_addr`. |
+| `[external_gateway.grpc]` | Set Provider/Source session limits for the external gRPC listener. |
+| `[external_gateway.websocket]` | Set the same Provider/Source session limits for the external WebSocket listener. |
+| `[external_gateway.websocket.transport]` | Set WebSocket frame size, first-frame timeout, idle timeout, and connection count. |
+| `[console.root]` | Preseed root credentials. |
+| `[console.auth]` | Set session TTL, session count, and Argon2 verification concurrency. |
+| `[console.ws]` | Set Console WebSocket frame, connection, idle, rate, subscription, result-size, and event backpressure limits. |
 
-`[server]` sets listener bind addresses:
-
-- `console_addr`
-- `external_grpc_addr`
-- `external_websocket_addr`
-
-`nexusd` also reads `NEXUS_CONSOLE_ADDR`, `NEXUS_EXTERNAL_GRPC_ADDR`,
-and `NEXUS_EXTERNAL_WEBSOCKET_ADDR` when the matching config field is absent. A
+`nexusd` also reads `NEXUS_CONSOLE_ADDR`, `NEXUS_EXTERNAL_GRPC_ADDR`, and
+`NEXUS_EXTERNAL_WEBSOCKET_ADDR` when the matching `[server]` field is absent. A
 listener stays disabled when both the config field and environment variable are
 absent.
-
-`[external_gateway.grpc]` configures Provider/Source session limits for the
-external gRPC listener.
-
-`[external_gateway.websocket]` configures the same Provider/Source session
-limits for the external WebSocket listener.
-
-`[external_gateway.websocket.transport]` configures WebSocket frame size,
-first-frame timeout, idle timeout, and total connection count.
-
-`[console.root]` can preseed root credentials.
-
-`[console.auth]` sets session TTL, session count, and Argon2 verification
-concurrency limits.
-
-`[console.ws]` sets Console WebSocket frame, connection, idle, rate,
-subscription, result-size, and event backpressure limits.
 
 ## External Gateway
 
@@ -63,7 +49,9 @@ source_dedupe_window_ms = 86400000
 provider_max_in_flight_invocations = 1024
 provider_max_in_flight_per_identity = 256
 provider_max_in_flight_per_effect = 256
+provider_max_inline_result_bytes = 65536
 source_max_in_flight_commands = 1024
+source_command_max_inline_result_bytes = 65536
 source_command_rate_limit_window_ms = 60000
 source_command_rate_limit_max = 600
 
@@ -72,7 +60,9 @@ source_dedupe_window_ms = 86400000
 provider_max_in_flight_invocations = 1024
 provider_max_in_flight_per_identity = 256
 provider_max_in_flight_per_effect = 256
+provider_max_inline_result_bytes = 65536
 source_max_in_flight_commands = 1024
+source_command_max_inline_result_bytes = 65536
 source_command_rate_limit_window_ms = 60000
 source_command_rate_limit_max = 600
 
@@ -91,11 +81,15 @@ drain.
 `provider_max_in_flight_per_identity`, and
 `provider_max_in_flight_per_effect` bound pending Provider invokes per ready
 Provider session.
+`provider_max_inline_result_bytes` bounds inline Provider success and error
+results.
 
 `source_max_in_flight_commands`,
 `source_command_rate_limit_window_ms`, and
 `source_command_rate_limit_max` bound outbound command dispatch per ready
 Source session and per Source projection.
+`source_command_max_inline_result_bytes` bounds inline Source command success
+and error results.
 
 Source event payload-size limits, stream capacity, overflow behavior, and
 event-ingress rate limits are declared on each Source projection.
