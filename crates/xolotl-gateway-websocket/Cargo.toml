@@ -1,0 +1,26 @@
+[package]
+name = "xolotl-gateway-websocket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "WebSocket protocol adapter for Xolotl"
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = { workspace = true, default-features = false, features = ["http1", "tokio", "ws"] }
+futures-util = { workspace = true, default-features = false, features = ["sink", "std"] }
+xolotl-gateway.workspace = true
+xolotl-proto.workspace = true
+xolotl-types.workspace = true
+prost = { workspace = true, default-features = false, features = ["derive", "std"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "sync", "time", "macros"] }
+tonic = { workspace = true, default-features = false, features = ["codegen"] }
+tracing = { workspace = true, default-features = false, features = ["std"] }
+
+[dev-dependencies]
+anyhow = { workspace = true, default-features = false, features = ["std"] }

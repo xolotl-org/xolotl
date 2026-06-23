@@ -1,6 +1,6 @@
 # Console Protocol
 
-`andrias-console` hosts the management protocol used by console clients.
+`xolotl-console` hosts the management protocol used by console clients.
 It exposes HTTP routes for health and authentication, then uses Console
 WebSocket for logged-in management actions and streams.
 
@@ -11,16 +11,16 @@ effects do so as capability-scoped Operations.
 ## Listener
 
 Console HTTP and Console WebSocket share `[server].console_addr`, with
-`ANDRIAS_CONSOLE_ADDR` as the environment fallback.
+`XOLOTL_CONSOLE_ADDR` as the environment fallback.
 
 | Channel | Route | Encoding |
 | --- | --- | --- |
 | HTTP | `/health`, `/api/auth/*` | HTTP JSON |
-| WebSocket | `/ws` | Binary MessagePack, `msgpack+andrias-console-v1` |
+| WebSocket | `/ws` | Binary MessagePack, `msgpack+xolotl-console-v1` |
 
 ## HTTP Routes
 
-Console HTTP routes are provided by `andrias-console::router`:
+Console HTTP routes are provided by `xolotl-console::router`:
 
 | Path | Method | Purpose |
 | --- | --- | --- |
@@ -103,12 +103,12 @@ the backend.
 
 ## Encoding
 
-The wire encoding name is `msgpack+andrias-console-v1`, and the protocol version
+The wire encoding name is `msgpack+xolotl-console-v1`, and the protocol version
 is `1`.
 
 Frames are serde-compatible MessagePack values. Server frames are encoded with
 named fields. `ActionCall.input`, `ActionResult.output`, stream inputs, and
-events wrap Andrias `Value` payloads in `JsonBytes`, a JSON string inside the
+events wrap Xolotl `Value` payloads in `JsonBytes`, a JSON string inside the
 outer MessagePack frame.
 
 ## Session Sequence
@@ -118,7 +118,7 @@ Required client sequence:
 1. Log in through HTTP and keep `LoginResponse.token`.
 2. Open the console WebSocket at `/ws`.
 3. Send `ClientFrame::Hello { hello }` with `protocol_version = 1` and
-   `accepted_encodings` containing `msgpack+andrias-console-v1`.
+   `accepted_encodings` containing `msgpack+xolotl-console-v1`.
 4. Receive `ServerFrame::HelloAccepted { metadata }`.
 5. Send `ClientFrame::Auth { token }`.
 6. Receive `ServerFrame::Authenticated { principal, metadata }`.
@@ -153,7 +153,7 @@ later request revalidates the session id before dispatch.
 | Field | Meaning |
 | --- | --- |
 | `action` | Action id, such as `config.read` or `state.snapshot`. |
-| `input` | JSON string for a Andrias `Value`, wrapped in `JsonBytes`. |
+| `input` | JSON string for a Xolotl `Value`, wrapped in `JsonBytes`. |
 | `scope` | Optional visibility or high-risk access scope. |
 | `justification` | Optional operator justification. |
 | `ttl_ms` | Optional temporary authority duration. |

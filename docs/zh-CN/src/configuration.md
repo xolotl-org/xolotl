@@ -1,17 +1,17 @@
 # 配置
 
-`andrias.toml` 是引导配置。它控制存储、监听地址、root 引导凭据、external gateway 限制、控制台资源限制和传输安全设置。
+`xolotl.toml` 是引导配置。它控制存储、监听地址、root 引导凭据、external gateway 限制、控制台资源限制和传输安全设置。
 
 创建本地配置：
 
 ```sh
-cp andrias.toml.example andrias.toml
+cp xolotl.toml.example xolotl.toml
 ```
 
 启动守护进程：
 
 ```sh
-cargo run -p andrias-daemon -- up
+cargo run -p xolotl-daemon -- up
 ```
 
 ## 主要配置段
@@ -27,7 +27,7 @@ cargo run -p andrias-daemon -- up
 | `[console.auth]` | 设置会话 TTL、会话数量和 Argon2 校验并发限制。 |
 | `[console.ws]` | 设置控制台 WebSocket 的 frame、连接数、idle、速率、订阅数、结果大小和事件背压限制。 |
 
-对应 `[server]` 字段缺失时，`andriasd` 还会读取 `ANDRIAS_CONSOLE_ADDR`、`ANDRIAS_EXTERNAL_GRPC_ADDR` 和 `ANDRIAS_EXTERNAL_WEBSOCKET_ADDR`。配置字段和环境变量都缺失时，该监听保持关闭。
+对应 `[server]` 字段缺失时，`xolotld` 还会读取 `XOLOTL_CONSOLE_ADDR`、`XOLOTL_EXTERNAL_GRPC_ADDR` 和 `XOLOTL_EXTERNAL_WEBSOCKET_ADDR`。配置字段和环境变量都缺失时，该监听保持关闭。
 
 ## External Gateway
 
@@ -88,9 +88,9 @@ mode = "local_trusted"
 # honor_x_forwarded_proto = true
 # honor_x_forwarded_host = true
 # honor_x_forwarded_for = true
-# certificate_chain_path = "/etc/andrias/external-grpc-cert.pem"
-# private_key_path = "/etc/andrias/external-grpc-key.pem"
-# client_trust_roots = ["/etc/andrias/external-client-ca.pem"]
+# certificate_chain_path = "/etc/xolotl/external-grpc-cert.pem"
+# private_key_path = "/etc/xolotl/external-grpc-key.pem"
+# client_trust_roots = ["/etc/xolotl/external-client-ca.pem"]
 # unsafe_relaxations = ["ignore_origin_port"]
 ```
 
@@ -124,16 +124,16 @@ daemon 的控制台监听器当前是明文监听器。`local_trusted` 只用于
 
 ## 运行时配置
 
-运行时 Provider 设置、模型路由、组、绑定、进程内 Provider/Source projection 声明、外部 Provider/Source installation 声明和策略管理状态都属于 Andrias state，并通过 Console WebSocket action 管理。External projection 是 installation 声明的一部分。External 声明使用 `external.*`，inference 声明使用 `inference.*`，进程内 projection 声明通过 `config.*` 写入 `state://kernel/projections/in-process/<id>`。泛用 `config.*` action 会拒绝已经有专用动作族的运行时配置路径。
+运行时 Provider 设置、模型路由、组、绑定、进程内 Provider/Source projection 声明、外部 Provider/Source installation 声明和策略管理状态都属于 Xolotl state，并通过 Console WebSocket action 管理。External projection 是 installation 声明的一部分。External 声明使用 `external.*`，inference 声明使用 `inference.*`，进程内 projection 声明通过 `config.*` 写入 `state://kernel/projections/in-process/<id>`。泛用 `config.*` action 会拒绝已经有专用动作族的运行时配置路径。
 
-`andrias-standard` Cargo feature 决定哪些进程内实现被编译进宿主二进制。可选进程内 projection 声明位于
+`xolotl-standard` Cargo feature 决定哪些进程内实现被编译进宿主二进制。可选进程内 projection 声明位于
 `state://kernel/projections/in-process/<id>`。reconcile 状态写在
 `state://kernel/projection-status/in-process/<id>`，通过
 `projection.in_process.status.*` 读取；状态会区分期望声明版本和当前 active registry 版本。
 嵌入式宿主还可以用 `StandardConfig::with_modules` 选择实际安装哪些已编译的
 standard-core 模块；代码编译进二进制并不等于已经公开为 Resource。
 
-HTTP inference provider 只有在宿主二进制启用对应 `andrias-standard` feature 时才会编译。
+HTTP inference provider 只有在宿主二进制启用对应 `xolotl-standard` feature 时才会编译。
 运行时声明放在 `state://kernel/inference/*` 和 `state://kernel/routing/inference`；
 backend 记录只保存 `state://vault/inference/<backend>/api_key` 这类 secret 引用，
 不保存原始 API key。

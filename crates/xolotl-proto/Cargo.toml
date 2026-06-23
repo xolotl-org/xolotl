@@ -1,0 +1,28 @@
+[package]
+name = "xolotl-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+xolotl-graph.workspace = true
+xolotl-types.workspace = true
+prost = { workspace = true, default-features = false, features = ["derive", "std"] }
+thiserror = { workspace = true, default-features = false, features = ["std"] }
+tonic = { workspace = true, default-features = false, features = ["codegen", "router", "transport"] }
+tonic-prost = { workspace = true, default-features = false }
+
+[dev-dependencies]
+anyhow = { workspace = true, default-features = false, features = ["std"] }
+criterion = { workspace = true, default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "wire_conversion"
+harness = false

@@ -1,6 +1,6 @@
 # Security And Boundaries
 
-Andrias security is enforced by runtime paths. This chapter describes the public
+Xolotl security is enforced by runtime paths. This page describes the public
 behavior of those paths.
 
 ## Authority

@@ -1,0 +1,57 @@
+[package]
+name = "xolotl-standard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Standard in-process implementations for Xolotl"
+
+[lints]
+workspace = true
+
+[features]
+default = ["standard"]
+standard = ["standard-core"]
+standard-core = ["proc", "dep:blake3", "dep:getrandom", "tokio/time"]
+fetch = ["standard-core", "dep:reqwest", "dep:url"]
+fs = ["standard-core", "dep:glob", "tokio/fs"]
+http-inference = [
+    "openai-responses",
+    "openai-chat",
+    "anthropic-messages",
+    "gemini-generate-content",
+]
+openai-responses = ["standard-core", "dep:reqwest"]
+openai-chat = ["standard-core", "dep:reqwest"]
+anthropic-messages = ["standard-core", "dep:reqwest"]
+gemini-generate-content = ["standard-core", "dep:reqwest"]
+proc = ["tokio/io-util", "tokio/process"]
+terminal = ["standard-core", "tokio/io-util", "tokio/process"]
+
+[dependencies]
+async-trait = { workspace = true, default-features = false }
+blake3 = { workspace = true, default-features = false, features = ["std"], optional = true }
+getrandom = { workspace = true, default-features = false, optional = true }
+glob = { workspace = true, default-features = false, optional = true }
+xolotl-graph.workspace = true
+xolotl-kernel.workspace = true
+xolotl-state.workspace = true
+xolotl-types.workspace = true
+parking_lot = { workspace = true, default-features = false }
+reqwest = { workspace = true, default-features = false, features = ["rustls"], optional = true }
+serde = { workspace = true, default-features = false, features = ["derive", "std"] }
+serde_json = { workspace = true, default-features = false, features = ["std"] }
+thiserror = { workspace = true, default-features = false, features = ["std"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros"] }
+url = { workspace = true, default-features = false, features = ["std"], optional = true }
+
+[dev-dependencies]
+anyhow = { workspace = true, default-features = false, features = ["std"] }
+criterion = { workspace = true, default-features = false, features = ["cargo_bench_support"] }
+tempfile = { workspace = true, default-features = false, features = ["getrandom"] }
+
+[[bench]]
+name = "standard_drivers"
+harness = false

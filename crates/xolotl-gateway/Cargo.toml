@@ -1,0 +1,35 @@
+[package]
+name = "xolotl-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true, default-features = false }
+blake3 = { workspace = true, default-features = false, features = ["std"] }
+chacha20poly1305 = { workspace = true, default-features = false, features = ["alloc"] }
+getrandom = { workspace = true, default-features = false }
+hkdf = { workspace = true, default-features = false }
+xolotl-graph.workspace = true
+xolotl-kernel.workspace = true
+xolotl-proto.workspace = true
+xolotl-state.workspace = true
+xolotl-types.workspace = true
+parking_lot = { workspace = true, default-features = false }
+serde = { workspace = true, default-features = false, features = ["derive", "std"] }
+serde_json = { workspace = true, default-features = false, features = ["std"] }
+sha2 = { workspace = true, default-features = false }
+subtle = { workspace = true, default-features = false }
+thiserror = { workspace = true, default-features = false, features = ["std"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros"] }
+tracing = { workspace = true, default-features = false, features = ["std"] }
+
+[dev-dependencies]
+anyhow = { workspace = true, default-features = false, features = ["std"] }

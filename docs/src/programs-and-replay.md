@@ -1,6 +1,6 @@
 # Programs And Replay
 
-Andrias represents durable work as a graph.
+Xolotl represents durable work as a graph.
 
 ## Program Front Ends
 
@@ -8,8 +8,8 @@ The main Rust front end is `DoNode`. It supports pure values, operations, named
 Steps, branches, joins, identity switches, waits, failures, and structured
 composition.
 
-Plan documents are parsed by `andrias-plan` and lowered to the same `DoNode`
-shape. The structured protobuf `Program` type in `andrias-proto` is a wire-safe
+Plan documents are parsed by `xolotl-plan` and lowered to the same `DoNode`
+shape. The structured protobuf `Program` type in `xolotl-proto` is a wire-safe
 representation of the same executable shape and converts losslessly to `DoNode`.
 
 ## ExecutionGraph
@@ -44,6 +44,6 @@ non-idempotent effects.
 
 ## Simulation
 
-`andrias-sim` provides deterministic testing helpers: virtual time, crash-after-N
+`xolotl-sim` provides deterministic testing helpers: virtual time, crash-after-N
 drivers, `why_not` projections, and process replay helpers. Use it to check that
 programs and drivers behave predictably across crash and replay boundaries.

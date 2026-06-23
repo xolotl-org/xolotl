@@ -1,6 +1,6 @@
 # Architecture
 
-Andrias keeps the execution hot path small:
+Xolotl keeps the execution hot path small:
 
 ```text
 Process
@@ -13,9 +13,9 @@ Process
 
 The runtime is split into four code paths.
 
-The rest of the manual follows this split. Concept chapters explain Process,
-Resource, Capability, Operation, Fact, and replay. Gateway chapters explain how
-outside clients enter the runtime. Configuration chapters explain which
+The rest of the manual follows this split. Concept pages explain Process,
+Resource, Capability, Operation, Fact, and replay. Gateway pages explain how
+outside clients enter the runtime. Configuration pages explain which
 listeners, features, and runtime declarations expose those pieces in a host.
 
 ## Control Path
@@ -56,26 +56,26 @@ during recovery.
 
 | Crate | Role |
 | --- | --- |
-| `andrias-types` | Core ids, paths, values, capabilities, operations, audit, trace, external access, and process data. |
-| `andrias-graph` | `DoNode`, `ExecutionGraph`, graph compiler, cursor, and `ActorSpec` linting. |
-| `andrias-state` | State backend trait and in-memory implementation. |
-| `andrias-kernel` | Registry, policy, handle table, execution path, executor, process table, recovery, and bootstrap. |
-| `andrias-storage-redb` | redb-backed state and fact storage. |
-| `andrias-standard` | Standard in-process Provider and Source implementations. |
-| `andrias-gateway` | Shared session admission, flow-control, taint, and audit code for external protocol adapters. |
-| `andrias-gateway-grpc` | External Provider/Source gRPC adapter. |
-| `andrias-gateway-websocket` | External Provider/Source WebSocket adapter. |
-| `andrias-gateway-mcp` | MCP server-side adapter for selected Gateway publication kinds. |
-| `andrias-proto` | Protobuf schema and vendored Rust bindings. |
-| `andrias-console` | Gateway for Web Console management actions. |
-| `andrias-daemon` | `andriasd`, the long-running host process. |
-| `andrias-sdk` | Minimal embedded facade for in-process kernel use. |
-| `andrias-plan` | Plan document parsing and lowering. |
-| `andrias-sim` | Deterministic simulation and replay helpers. |
+| `xolotl-types` | Core ids, paths, values, capabilities, operations, audit, trace, external access, and process data. |
+| `xolotl-graph` | `DoNode`, `ExecutionGraph`, graph compiler, cursor, and `ActorSpec` linting. |
+| `xolotl-state` | State backend trait and in-memory implementation. |
+| `xolotl-kernel` | Registry, policy, handle table, execution path, executor, process table, recovery, and bootstrap. |
+| `xolotl-storage-redb` | redb-backed state and fact storage. |
+| `xolotl-standard` | Standard in-process Provider and Source implementations. |
+| `xolotl-gateway` | Shared session admission, flow-control, taint, and audit code for external protocol adapters. |
+| `xolotl-gateway-grpc` | External Provider/Source gRPC adapter. |
+| `xolotl-gateway-websocket` | External Provider/Source WebSocket adapter. |
+| `xolotl-gateway-mcp` | MCP server-side adapter for selected Gateway publication kinds. |
+| `xolotl-proto` | Protobuf schema and vendored Rust bindings. |
+| `xolotl-console` | Gateway for Web Console management actions. |
+| `xolotl-daemon` | `xolotld`, the long-running host process. |
+| `xolotl-sdk` | Minimal embedded facade for in-process kernel use. |
+| `xolotl-plan` | Plan document parsing and lowering. |
+| `xolotl-sim` | Deterministic simulation and replay helpers. |
 
 ## Embedded Hosts
 
-`andrias-sdk` builds a minimal in-memory kernel by default. `AndriasBuilder` lets
+`xolotl-sdk` builds a minimal in-memory kernel by default. `XolotlBuilder` lets
 embedded hosts provide their own state backend and fact sink before the
 `Bootstrap` is seeded. The SDK `standard` feature exposes the standard package
 installation API for hosts that include the standard in-process providers.
@@ -94,12 +94,12 @@ starts.
 
 ## Standard Package Features
 
-`andrias-standard` contains the standard in-process Provider and Source
+`xolotl-standard` contains the standard in-process Provider and Source
 implementations. A binary can compile only the modules it needs, and compiled
 code is separate from installed Resources.
 
 High-risk in-process implementations such as `fetch`, `fs`, and `terminal`
-must stay behind separate `andrias-standard` features. A daemon or embedded host may
+must stay behind separate `xolotl-standard` features. A daemon or embedded host may
 expose them only through kernel-state declarations admitted by `config.*`.
 
 Optional in-process projection declarations are runtime state under

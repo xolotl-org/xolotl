@@ -1,19 +1,19 @@
 # Configuration
 
-`andrias.toml` is bootstrap configuration. It controls storage, listener
+`xolotl.toml` is bootstrap configuration. It controls storage, listener
 addresses, root bootstrap credentials, external gateway limits, console
 resource limits, and transport-security settings.
 
 Create a local config:
 
 ```sh
-cp andrias.toml.example andrias.toml
+cp xolotl.toml.example xolotl.toml
 ```
 
 Start the daemon:
 
 ```sh
-cargo run -p andrias-daemon -- up
+cargo run -p xolotl-daemon -- up
 ```
 
 ## Main Sections
@@ -29,8 +29,8 @@ cargo run -p andrias-daemon -- up
 | `[console.auth]` | Set session TTL, session count, and Argon2 verification concurrency. |
 | `[console.ws]` | Set Console WebSocket frame, connection, idle, rate, subscription, result-size, and event backpressure limits. |
 
-`andriasd` also reads `ANDRIAS_CONSOLE_ADDR`, `ANDRIAS_EXTERNAL_GRPC_ADDR`, and
-`ANDRIAS_EXTERNAL_WEBSOCKET_ADDR` when the matching `[server]` field is absent. A
+`xolotld` also reads `XOLOTL_CONSOLE_ADDR`, `XOLOTL_EXTERNAL_GRPC_ADDR`, and
+`XOLOTL_EXTERNAL_WEBSOCKET_ADDR` when the matching `[server]` field is absent. A
 listener stays disabled when both the config field and environment variable are
 absent.
 
@@ -105,9 +105,9 @@ mode = "local_trusted"
 # honor_x_forwarded_proto = true
 # honor_x_forwarded_host = true
 # honor_x_forwarded_for = true
-# certificate_chain_path = "/etc/andrias/external-grpc-cert.pem"
-# private_key_path = "/etc/andrias/external-grpc-key.pem"
-# client_trust_roots = ["/etc/andrias/external-client-ca.pem"]
+# certificate_chain_path = "/etc/xolotl/external-grpc-cert.pem"
+# private_key_path = "/etc/xolotl/external-grpc-key.pem"
+# client_trust_roots = ["/etc/xolotl/external-client-ca.pem"]
 # unsafe_relaxations = ["ignore_origin_port"]
 ```
 
@@ -152,7 +152,7 @@ daemon-owned console TLS material is configured.
 
 Runtime provider setup, model routing, groups, bindings, in-process Provider or
 Source projection declarations, external Provider/Source installation declarations, and
-policy-managed state belong in Andrias state and are managed through Console
+policy-managed state belong in Xolotl state and are managed through Console
 WebSocket actions.
 External projections are part of each installation declaration. External
 declarations use `external.*`; inference declarations use `inference.*`;
@@ -160,7 +160,7 @@ in-process projection declarations use `config.*` under
 `state://kernel/projections/in-process/<id>`. Generic `config.*` actions reject
 runtime config paths that have a dedicated action family.
 
-`andrias-standard` Cargo features decide which in-process implementations are
+`xolotl-standard` Cargo features decide which in-process implementations are
 compiled into the host binary. Optional in-process projection declarations live under
 `state://kernel/projections/in-process/<id>`. Reconcile status is written under
 `state://kernel/projection-status/in-process/<id>` and is read through
@@ -171,7 +171,7 @@ installed with `StandardConfig::with_modules`; compiled code is not exposed as a
 Resource until the host installs it.
 
 HTTP inference providers are compiled only when the host binary enables the
-matching `andrias-standard` feature. Runtime declarations live under
+matching `xolotl-standard` feature. Runtime declarations live under
 `state://kernel/inference/*` and `state://kernel/routing/inference`; backend
 records store secret references such as
 `state://vault/inference/<backend>/api_key`, not raw API keys.

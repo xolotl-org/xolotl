@@ -1,0 +1,23 @@
+[package]
+name = "xolotl-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true, default-features = false }
+xolotl-graph.workspace = true
+xolotl-kernel.workspace = true
+xolotl-types.workspace = true
+parking_lot = { workspace = true, default-features = false }
+
+[dev-dependencies]
+anyhow = { workspace = true, default-features = false, features = ["std"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros", "time"] }

@@ -1,10 +1,10 @@
 [book]
-title = "Andrias 手册"
+title = "Xolotl 手册"
 authors = ["noctiro"]
 language = "zh-CN"
 src = "src"
 
 [output.html]
 additional-css = ["theme/cjk.css"]
-git-repository-url = "https://github.com/andrias-dev/andrias"
-edit-url-template = "https://github.com/andrias-dev/andrias/edit/main/docs/zh-CN/{path}"
+git-repository-url = "https://github.com/xolotl-org/xolotl"
+edit-url-template = "https://github.com/xolotl-org/xolotl/edit/main/docs/zh-CN/{path}"

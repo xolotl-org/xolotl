@@ -1,12 +1,12 @@
 # 程序与重放
 
-Andrias 用图表示可持久执行的工作。
+Xolotl 用图表示可持久执行的工作。
 
 ## 程序入口形态
 
 主要 Rust 入口形态是 `DoNode`。它支持纯值、操作、命名步骤、分支、汇合、身份切换、等待、失败和结构化组合。
 
-计划文档由 `andrias-plan` 解析，并转换为同样的 `DoNode` 形态。`andrias-proto` 中的结构化 protobuf `Program` 类型是同一可执行形态的线缆表示，并可无损转换为 `DoNode`。
+计划文档由 `xolotl-plan` 解析，并转换为同样的 `DoNode` 形态。`xolotl-proto` 中的结构化 protobuf `Program` 类型是同一可执行形态的线缆表示，并可无损转换为 `DoNode`。
 
 ## 执行图
 
@@ -33,4 +33,4 @@ I/O 和其它效果通过操作节点发生，而不是通过步骤函数发生�
 
 ## 仿真
 
-`andrias-sim` 提供确定性测试辅助工具：`ScriptedDriver`、`FixedClock`、`SimClock`、`CrashAfter`、`why_not` 和 `replay_report`。用它断言程序和驱动在崩溃/重放边界上的行为可预测。
+`xolotl-sim` 提供确定性测试辅助工具：`ScriptedDriver`、`FixedClock`、`SimClock`、`CrashAfter`、`why_not` 和 `replay_report`。用它断言程序和驱动在崩溃/重放边界上的行为可预测。

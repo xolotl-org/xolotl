@@ -1,6 +1,6 @@
-# Andrias 手册
+# Xolotl 手册
 
-Andrias 是面向模型应用的能力运行时。它把模型推理、工具调用、记忆、状态和外部系统映射为 `effect://` 与 `state://` 资源。程序通过 `open()` 编译出的能力句柄访问这些资源。Andrias 的范围是模型调用、工具执行、长期状态和外部协议之间的执行边界；模型训练、应用界面和业务逻辑由调用方或外部组件承担。
+Xolotl 是面向模型应用的能力运行时。它把模型推理、工具调用、记忆、状态和外部系统映射为 `effect://` 与 `state://` 资源。程序通过 `open()` 编译出的能力句柄访问这些资源。Xolotl 的范围是模型调用、工具执行、长期状态和外部协议之间的执行边界；模型训练、应用界面和业务逻辑由调用方或外部组件承担。
 
 这份手册是当前已实现运行时的中文公开叙述文档。它和 Rust API 参考分工不同：
 
@@ -13,7 +13,7 @@ Andrias 是面向模型应用的能力运行时。它把模型推理、工具调
 
 ## 如何阅读本手册
 
-先读[架构](architecture.md)，建立控制路径、数据路径、外部适配和工作区结构的整体图景。再读[运行时模型](runtime-model.md)和[能力模型](capability-model.md)，这些页面定义后续章节使用的核心概念。
+先读[架构](architecture.md)，建立控制路径、数据路径、外部适配和工作区结构的整体图景。再读[运行时模型](runtime-model.md)和[能力模型](capability-model.md)，这些页面定义后续页面使用的核心概念。
 
 遇到具体问题时按下面入口阅读：
 
@@ -24,7 +24,7 @@ Andrias 是面向模型应用的能力运行时。它把模型推理、工具调
 | 选择监听地址或协议 | [网关](gateways.md) |
 | 接入 Provider 或 Source 程序 | [External Gateway](external-gateway.md) |
 | 构建控制台客户端 | [控制台协议](console-protocol.md) |
-| 配置 `andriasd` | [配置](configuration.md) |
+| 配置 `xolotld` | [配置](configuration.md) |
 | 配置 HTTP 模型 Provider | [HTTP 推理 Provider](http-inference-providers.md) |
 | 查 Rust API 契约 | [API 参考](api-reference.md) |
 
@@ -70,4 +70,4 @@ mdbook build docs
 
 ## 翻译约定
 
-中文手册优先使用中文术语；Rust 类型名、Rust 包名、配置键、协议字段、命令和路径保持原文，方便回到代码中查找。[术语表](glossary.md)只作为中英文译名对照，不替代概念章节。
+中文手册优先使用中文术语；Rust 类型名、Rust 包名、配置键、协议字段、命令和路径保持原文，方便回到代码中查找。[术语表](glossary.md)只作为中英文译名对照，不替代概念页面。

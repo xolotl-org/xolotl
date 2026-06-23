@@ -1,6 +1,6 @@
 # External Gateway
 
-The external gateway connects out-of-process programs to Andrias as Provider or
+The external gateway connects out-of-process programs to Xolotl as Provider or
 Source projections. gRPC and WebSocket are transport implementations for the
 same session protocol.
 
@@ -20,11 +20,11 @@ Provider and Source are the only external projection roles.
 ## Transports
 
 External gRPC listens on `[server].external_grpc_addr` or
-`ANDRIAS_EXTERNAL_GRPC_ADDR` and serves
-`andrias.v1.external.ExternalService.Session`.
+`XOLOTL_EXTERNAL_GRPC_ADDR` and serves
+`xolotl.v1.external.ExternalService.Session`.
 
 External WebSocket listens on `[server].external_websocket_addr` or
-`ANDRIAS_EXTERNAL_WEBSOCKET_ADDR` and serves the same logical session frames over
+`XOLOTL_EXTERNAL_WEBSOCKET_ADDR` and serves the same logical session frames over
 `/ws`.
 
 Both transports use the same daemon-side session handler and the same

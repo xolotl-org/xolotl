@@ -1,0 +1,264 @@
+syntax = "proto3";
+package xolotl.v1.external;
+
+import "xolotl/v1/common.proto";
+
+// External gRPC service for Provider and Source sessions.
+// Clients connect to the daemon with one bidirectional stream of ExternalFrame messages.
+service ExternalService {
+  rpc Session(stream ExternalFrame) returns (stream ExternalFrame);
+}
+
+// Top-level frame envelope.
+message ExternalFrame {
+  oneof frame {
+    RoleSessionClientHello role_session_client_hello = 1;
+    SessionContext session_context = 2;
+    RoleReady role_ready = 3;
+    InboundEvent inbound_event = 4;
+    OutboundCommand outbound_command = 5;
+    CommandResult command_result = 6;
+    EventAck event_ack = 7;
+    Invoke invoke = 8;
+    InvokeResult invoke_result = 9;
+    ControlFrame control = 11;
+    SecureEnvelope secure_envelope = 12;
+  }
+}
+
+// AEAD-protected business/control frame envelope. Handshake frames remain
+// plaintext until the daemon has selected the authoritative session context.
+message SecureEnvelope {
+  string installation_id = 1;
+  uint64 generation = 2;
+  EnvelopeAad aad = 3;
+  bytes nonce_prefix = 4;
+  bytes ciphertext = 5;
+}
+
+message EnvelopeAad {
+  uint32 version = 1;
+  string projection_id = 2;
+  string role = 3;
+  string session_id = 4;
+  uint64 seq = 5;
+  // Authenticated frame discriminator. Control frames use control.<kind>,
+  // for example control.config_ack.
+  string frame_type = 6;
+  uint64 binding_generation = 7;
+  uint64 credential_generation = 8;
+  bytes transcript_hash = 9;
+  uint64 key_epoch = 10;
+}
+
+// Session handshake frames.
+
+// Role client hello with identity plus locally observed generations/hash.
+message RoleSessionClientHello {
+  ExternalRole role = 1;
+  string installation_id = 2;
+  string projection_id = 3;
+  string registry_hash = 4;
+  ObservedGenerations observed = 5;
+  optional xolotl.v1.Value config_schema = 6;
+}
+
+// Daemon-adjudicated registry hash and generations.
+message SessionContext {
+  string installation_id = 1;
+  string projection_id = 2;
+  ExternalRole role = 3;
+  string registry_hash = 4;
+  uint64 credential_generation = 5;
+  uint64 binding_generation = 6;
+  uint64 installation_config_version = 7;
+  uint64 projection_version = 8;
+  uint64 presentation_config_generation = 9;
+  uint64 alias_catalog_generation = 10;
+  string session_id = 11;
+}
+
+// Role client acknowledgement of the daemon-selected context.
+message RoleReady {
+  SessionContext accepted_context = 1;
+}
+
+// External projection role, orthogonal to transport and trust.
+enum ExternalRole {
+  EXTERNAL_ROLE_UNSPECIFIED = 0;
+  // Source: provides a state:// inbound event stream.
+  EXTERNAL_ROLE_SOURCE = 1;
+  // Provider: serves effect:// capabilities declared by its projection.
+  EXTERNAL_ROLE_PROVIDER = 2;
+}
+
+// Source role frames.
+
+// Source client to daemon: source event occurred.
+message InboundEvent {
+  string id = 1;
+  xolotl.v1.Value payload = 2;
+  int64 timestamp_ms = 3;
+  // Lightweight presentation/alias generation tags.
+  ObservedGenerations observed = 4;
+  optional string stream_id = 5;
+  optional uint64 seq = 6;
+}
+
+// Daemon to Source client: execute this action through the connector.
+message OutboundCommand {
+  string id = 1;
+  xolotl.v1.Value action = 2;
+  ObservedGenerations observed = 3;
+}
+
+// The two lightweight generation axes carried on each Source frame.
+// Session-level generations live in SessionContext instead.
+message ObservedGenerations {
+  uint64 presentation_config_generation = 1;
+  uint64 alias_catalog_generation = 2;
+}
+
+// Source client to daemon: command execution result.
+message CommandResult {
+  string id = 1;
+  oneof outcome {
+    xolotl.v1.Value success = 2;
+    ErrorInfo error = 3;
+  }
+}
+
+// Daemon to Source client: event acknowledgment.
+message EventAck {
+  string id = 1;
+  AckStatus status = 2;
+  optional string reject_reason = 3;
+}
+
+enum AckStatus {
+  ACK_STATUS_UNSPECIFIED = 0;
+  ACK_STATUS_ACCEPTED = 1;
+  ACK_STATUS_DUPLICATE = 2;
+  ACK_STATUS_REJECTED = 3;
+}
+
+// Provider role frames.
+
+// Daemon to Provider client: invoke an effect.
+message Invoke {
+  string invocation_id = 1;
+  xolotl.v1.Path effect_path = 2;
+  xolotl.v1.Value input = 3;
+  optional int64 deadline_ms = 4;
+  optional string output_stream_to = 5;
+  optional uint64 method_id = 6;
+}
+
+// Provider client to daemon: invocation result.
+message InvokeResult {
+  string invocation_id = 1;
+  oneof outcome {
+    xolotl.v1.Value success = 2;
+    ErrorInfo error = 3;
+  }
+}
+
+// Control frames. Direction is variant-specific.
+
+message ControlFrame {
+  oneof kind {
+    Heartbeat heartbeat = 1;
+    Shutdown shutdown = 2;
+    FlowControl flow_control = 3;
+    PresentationProfileUpdate presentation_profile_update = 4;
+    InstallationConfigUpdate installation_config_update = 5;
+    PresentationConfigUpdate presentation_config_update = 6;
+    ConfigAck config_ack = 7;
+    ProviderCancel provider_cancel = 8;
+  }
+}
+
+// Role client to daemon: report what this end can render. The profile
+// body is opaque here; connector docs such as Web/Mobile define its schema.
+message PresentationProfileUpdate {
+  uint64 profile_generation = 1;
+  string profile_hash = 2;
+  xolotl.v1.Value profile = 3;
+}
+
+// Daemon to role client: authority config update, via CAS;
+// advances the external installation version and may bump the Binding generation.
+message InstallationConfigUpdate {
+  uint64 config_version = 1;
+  xolotl.v1.Value config = 2;
+}
+
+// Daemon to role client: presentation-only config. Never grants
+// capability; bounded by profile_hash and local overrides.
+message PresentationConfigUpdate {
+  uint64 generation = 1;
+  string profile_hash = 2;
+  xolotl.v1.Value config = 3;
+}
+
+// Role client to daemon: how a config/presentation update was applied.
+message ConfigAck {
+  ConfigAxis axis = 1;
+  uint64 version = 2;
+  ApplyStatus status = 3;
+  optional RejectReason reject_reason = 4;  // set only when status == REJECTED
+}
+
+enum ConfigAxis {
+  CONFIG_AXIS_UNSPECIFIED = 0;
+  CONFIG_AXIS_INSTALLATION_CONFIG = 1;
+  CONFIG_AXIS_PRESENTATION_CONFIG = 2;
+}
+
+enum ApplyStatus {
+  APPLY_STATUS_UNSPECIFIED = 0;
+  APPLY_STATUS_APPLIED = 1;
+  APPLY_STATUS_REJECTED = 2;
+}
+
+enum RejectReason {
+  REJECT_REASON_UNSPECIFIED = 0;
+  REJECT_REASON_PROFILE_MISMATCH = 1;
+  REJECT_REASON_SCHEMA_INVALID = 2;
+  REJECT_REASON_GENERATION_STALE = 3;
+  REJECT_REASON_UNSUPPORTED = 4;
+}
+
+message Heartbeat {
+  int64 timestamp_ms = 1;
+}
+
+message Shutdown {
+  bool graceful = 1;
+  uint64 timeout_ms = 2;
+}
+
+// Daemon to role client: flow-control signal.
+message FlowControl {
+  FlowSignal signal = 1;
+}
+
+// Daemon to Provider client: cancel a pending invocation.
+message ProviderCancel {
+  string invocation_id = 1;
+  string reason = 2;
+}
+
+enum FlowSignal {
+  FLOW_SIGNAL_UNSPECIFIED = 0;
+  FLOW_SIGNAL_PAUSE = 1;
+  FLOW_SIGNAL_RESUME = 2;
+}
+
+// Shared messages.
+
+message ErrorInfo {
+  string code = 1;
+  string message = 2;
+  map<string, string> details = 3;
+}

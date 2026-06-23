@@ -1,9 +1,9 @@
 [book]
-title = "Andrias Manual"
+title = "Xolotl Manual"
 authors = ["noctiro"]
 language = "en"
 src = "src"
 
 [output.html]
-git-repository-url = "https://github.com/andrias-dev/andrias"
-edit-url-template = "https://github.com/andrias-dev/andrias/edit/main/docs/{path}"
+git-repository-url = "https://github.com/xolotl-org/xolotl"
+edit-url-template = "https://github.com/xolotl-org/xolotl/edit/main/docs/{path}"

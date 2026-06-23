@@ -1,6 +1,6 @@
 # External Gateway
 
-External gateway 把进程外程序以 Provider 或 Source projection 接入 Andrias。gRPC 和 WebSocket 是同一个 session 协议的两种传输实现。
+External gateway 把进程外程序以 Provider 或 Source projection 接入 Xolotl。gRPC 和 WebSocket 是同一个 session 协议的两种传输实现。
 
 ## 角色
 
@@ -12,9 +12,9 @@ Provider 和 Source 是唯一的外部 projection role。
 
 ## 传输
 
-External gRPC 监听 `[server].external_grpc_addr` 或 `ANDRIAS_EXTERNAL_GRPC_ADDR`，并提供 `andrias.v1.external.ExternalService.Session`。
+External gRPC 监听 `[server].external_grpc_addr` 或 `XOLOTL_EXTERNAL_GRPC_ADDR`，并提供 `xolotl.v1.external.ExternalService.Session`。
 
-External WebSocket 监听 `[server].external_websocket_addr` 或 `ANDRIAS_EXTERNAL_WEBSOCKET_ADDR`，在 `/ws` 上提供同一套逻辑 session frame。
+External WebSocket 监听 `[server].external_websocket_addr` 或 `XOLOTL_EXTERNAL_WEBSOCKET_ADDR`，在 `/ws` 上提供同一套逻辑 session frame。
 
 两种传输使用同一个 daemon 侧 session handler 和同一套 Provider/Source 准入 state。
 

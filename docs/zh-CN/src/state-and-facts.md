@@ -1,6 +1,6 @@
 # 状态与事实记录
 
-Andrias 把可变状态和事实流分开。
+Xolotl 把可变状态和事实流分开。
 
 ## 状态路径
 
@@ -22,6 +22,6 @@ Andrias 把可变状态和事实流分开。
 
 ## 存储后端
 
-`andrias-state` 提供后端 trait（特征）和内存实现。`andrias-storage-redb` 提供基于 redb 的持久状态和 `FactStore` 适配器。
+`xolotl-state` 提供后端 trait（特征）和内存实现。`xolotl-storage-redb` 提供基于 redb 的持久状态和 `FactStore` 适配器。
 
-`andrias.toml` 在引导时选择存储。控制台管理的运行时状态存在 Andrias 状态中，不存在守护进程命令行中。
+`xolotl.toml` 在引导时选择存储。控制台管理的运行时状态存在 Xolotl 状态中，不存在守护进程命令行中。

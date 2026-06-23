@@ -1,6 +1,6 @@
 # 架构
 
-Andrias 让执行热路径保持很小：
+Xolotl 让执行热路径保持很小：
 
 ```text
 进程持有句柄，
@@ -12,7 +12,7 @@ Andrias 让执行热路径保持很小：
 
 运行时分成四类代码路径。
 
-后续章节按这条主线展开：概念章节解释进程、资源、能力、操作、事实记录和重放；网关章节解释外部客户端如何进入运行时；配置章节解释宿主如何开放监听器、feature 和运行时声明。
+后续页面按这条主线展开：概念页面解释进程、资源、能力、操作、事实记录和重放；网关页面解释外部客户端如何进入运行时；配置页面解释宿主如何开放监听器、feature 和运行时声明。
 
 ## 控制路径
 
@@ -38,26 +38,26 @@ Andrias 让执行热路径保持很小：
 
 | Rust 包 | 职责 |
 | --- | --- |
-| `andrias-types` | 核心 ID、路径、值、能力、操作、审计、跟踪、外接和进程数据。 |
-| `andrias-graph` | `DoNode`、`ExecutionGraph`、图编译器、游标和行为体检查。 |
-| `andrias-state` | 状态后端 trait（特征）和内存实现。 |
-| `andrias-kernel` | 注册表、策略、句柄表、执行路径、执行器、进程表、恢复和引导。 |
-| `andrias-storage-redb` | 基于 redb 的状态和事实记录存储。 |
-| `andrias-standard` | 标准进程内 Provider 和 Source 实现。 |
-| `andrias-gateway` | external 协议适配器共享的 session 准入、流控、taint 和 audit 代码。 |
-| `andrias-gateway-grpc` | External Provider/Source gRPC 适配器。 |
-| `andrias-gateway-websocket` | External Provider/Source WebSocket 适配器。 |
-| `andrias-gateway-mcp` | 把选定 Gateway publication kind 暴露为 MCP 对象的服务端适配器。 |
-| `andrias-proto` | Protobuf 模式定义和随仓库提供的 Rust 绑定。 |
-| `andrias-console` | Web 控制台管理动作的 gateway。 |
-| `andrias-daemon` | 长期运行的宿主进程 `andriasd`。 |
-| `andrias-sdk` | 最小进程内嵌入式内核门面。 |
-| `andrias-plan` | 计划文档解析和转换。 |
-| `andrias-sim` | 确定性仿真和重放辅助工具。 |
+| `xolotl-types` | 核心 ID、路径、值、能力、操作、审计、跟踪、外接和进程数据。 |
+| `xolotl-graph` | `DoNode`、`ExecutionGraph`、图编译器、游标和行为体检查。 |
+| `xolotl-state` | 状态后端 trait（特征）和内存实现。 |
+| `xolotl-kernel` | 注册表、策略、句柄表、执行路径、执行器、进程表、恢复和引导。 |
+| `xolotl-storage-redb` | 基于 redb 的状态和事实记录存储。 |
+| `xolotl-standard` | 标准进程内 Provider 和 Source 实现。 |
+| `xolotl-gateway` | external 协议适配器共享的 session 准入、流控、taint 和 audit 代码。 |
+| `xolotl-gateway-grpc` | External Provider/Source gRPC 适配器。 |
+| `xolotl-gateway-websocket` | External Provider/Source WebSocket 适配器。 |
+| `xolotl-gateway-mcp` | 把选定 Gateway publication kind 暴露为 MCP 对象的服务端适配器。 |
+| `xolotl-proto` | Protobuf 模式定义和随仓库提供的 Rust 绑定。 |
+| `xolotl-console` | Web 控制台管理动作的 gateway。 |
+| `xolotl-daemon` | 长期运行的宿主进程 `xolotld`。 |
+| `xolotl-sdk` | 最小进程内嵌入式内核门面。 |
+| `xolotl-plan` | 计划文档解析和转换。 |
+| `xolotl-sim` | 确定性仿真和重放辅助工具。 |
 
 ## 嵌入式宿主
 
-`andrias-sdk` 默认构建最小内存内核。`AndriasBuilder` 允许嵌入式宿主在构建 `Bootstrap`
+`xolotl-sdk` 默认构建最小内存内核。`XolotlBuilder` 允许嵌入式宿主在构建 `Bootstrap`
 前提供自己的状态后端和事实记录接收端。SDK 的 `standard` feature 提供标准包安装 API，
 供包含标准进程内 Provider 的宿主使用。嵌入方仍可替换策略来源、driver 和宿主装配。
 
@@ -70,12 +70,12 @@ Executor 运行 body。body 如果使用进程本地 `StepRef`，宿主通过
 
 ## 标准包 feature 选择
 
-`andrias-standard` 包含标准进程内 Provider 和 Source 实现。某个二进制不需要全部实现时，可以
+`xolotl-standard` 包含标准进程内 Provider 和 Source 实现。某个二进制不需要全部实现时，可以
 用 Cargo feature 减少编译进来的模块。代码编译进二进制和资源被安装到运行时是两件事。
 
-`fetch`、`fs` 和 `terminal` 这类高风险进程内实现必须留在独立的 `andrias-standard`
+`fetch`、`fs` 和 `terminal` 这类高风险进程内实现必须留在独立的 `xolotl-standard`
 feature 后面。daemon 或嵌入式宿主只能通过 kernel state 声明和固定 Console action
-暴露它们。运行时进程内 projection 声明存储在 Andrias state 中。
+暴露它们。运行时进程内 projection 声明存储在 Xolotl state 中。
 
 可选进程内 projection 声明属于运行时状态，路径为
 `state://kernel/projections/in-process/<id>`。它们通过泛用 `config.*`

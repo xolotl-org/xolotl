@@ -1,0 +1,57 @@
+[package]
+name = "xolotl-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "xolotld — the long-running Xolotl host process"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "xolotld"
+path = "src/main.rs"
+
+[features]
+default = ["external-grpc", "external-websocket"]
+external-gateway = ["dep:tonic"]
+external-grpc = ["external-gateway", "dep:xolotl-gateway-grpc", "tonic/server", "tonic/tls-ring"]
+external-websocket = ["external-gateway", "dep:xolotl-gateway-websocket"]
+fetch = ["xolotl-standard/fetch"]
+fs = ["xolotl-standard/fs"]
+http-inference = ["xolotl-standard/http-inference"]
+openai-responses = ["xolotl-standard/openai-responses"]
+openai-chat = ["xolotl-standard/openai-chat"]
+anthropic-messages = ["xolotl-standard/anthropic-messages"]
+gemini-generate-content = ["xolotl-standard/gemini-generate-content"]
+terminal = ["xolotl-standard/terminal"]
+
+[dependencies]
+anyhow = { workspace = true, default-features = false, features = ["std"] }
+async-trait = { workspace = true, default-features = false }
+blake3 = { workspace = true, default-features = false, features = ["std"] }
+dotenvy = { workspace = true, default-features = false }
+getrandom = { workspace = true, default-features = false }
+xolotl-standard = { workspace = true, default-features = false, features = ["standard"] }
+xolotl-console.workspace = true
+xolotl-gateway.workspace = true
+xolotl-gateway-grpc = { workspace = true, optional = true }
+xolotl-gateway-websocket = { workspace = true, optional = true }
+xolotl-kernel.workspace = true
+xolotl-sdk.workspace = true
+xolotl-state.workspace = true
+xolotl-storage-redb.workspace = true
+xolotl-types.workspace = true
+serde = { workspace = true, default-features = false, features = ["derive", "std"] }
+serde_json = { workspace = true, default-features = false, features = ["std"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros", "rt-multi-thread", "signal", "time"] }
+toml = { workspace = true, default-features = false, features = ["parse", "serde", "std"] }
+tonic = { workspace = true, default-features = false, optional = true }
+tracing = { workspace = true, default-features = false, features = ["std"] }
+tracing-subscriber = { workspace = true, default-features = false, features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+xolotl-proto.workspace = true

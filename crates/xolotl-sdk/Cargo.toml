@@ -1,0 +1,29 @@
+[package]
+name = "xolotl-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+standard = ["dep:xolotl-standard", "xolotl-standard/standard"]
+
+[dependencies]
+xolotl-standard = { workspace = true, default-features = false, optional = true }
+xolotl-graph.workspace = true
+xolotl-kernel.workspace = true
+xolotl-plan.workspace = true
+xolotl-state.workspace = true
+xolotl-types.workspace = true
+
+[dev-dependencies]
+anyhow = { workspace = true, default-features = false, features = ["std"] }
+serde_json = { workspace = true, default-features = false, features = ["std"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros"] }

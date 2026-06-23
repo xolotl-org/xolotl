@@ -1,12 +1,12 @@
-# Andrias
+# Xolotl
 
-Andrias is a capability runtime for model-backed applications. It maps model
+Xolotl is a capability runtime for model-backed applications. It maps model
 inference, tool calls, memory, state, and outside systems into `effect://` and
 `state://` resources so programs access them through handles compiled by
 `open()`. Model backends, tool processes, state stores, and external programs
 remain behind resource bindings, drivers, or Provider/Source projections.
 
-Andrias supplies the execution boundary between model calls, tool execution,
+Xolotl supplies the execution boundary between model calls, tool execution,
 long-lived state, and external protocols. Model training, application UI, and
 business logic stay outside this runtime. Every access goes through the same
 `Resource / Interface / Driver`, `open()` handle, and capability-check path.
@@ -33,7 +33,7 @@ Chinese documentation: [README.zh-CN.md](README.zh-CN.md)
 ## Status
 
 The core runtime and the external Provider/Source gateway are implemented.
-Andrias has not shipped a first release, and the current gateway/config/protobuf
+Xolotl has not shipped a first release, and the current gateway/config/protobuf
 contract is defined by the external Provider/Source model.
 
 External access has one role model:
@@ -84,7 +84,7 @@ Process
   producing Outcome and Fact
 ```
 
-Andrias separates the runtime into four code paths:
+Xolotl separates the runtime into four code paths:
 
 - Control path: registry, naming, admission, policy compilation, binding
   resolution, and `open()` handle compilation.
@@ -97,23 +97,23 @@ Andrias separates the runtime into four code paths:
 
 | Crate | Purpose |
 | --- | --- |
-| `andrias-types` | Core IDs, paths, values, capabilities, operations, audit types, and external Provider/Source data. |
-| `andrias-graph` | Durable `Do<A>` program IR and execution graph compiler. |
-| `andrias-state` | State backend traits and in-memory implementation. |
-| `andrias-kernel` | Process, handle, registry, policy, executor, recovery, facts. |
-| `andrias-storage-redb` | Persistent redb-backed state and FactStore. |
-| `andrias-standard` | Standard in-process Provider and Source implementations. |
-| `andrias-gateway` | Shared session admission, flow-control, taint, and audit code for external protocol adapters. |
-| `andrias-gateway-grpc` | External Provider/Source gRPC adapter using `andrias-proto`. |
-| `andrias-gateway-websocket` | External Provider/Source WebSocket adapter. |
-| `andrias-gateway-mcp` | MCP server-side adapter for selected Gateway publications. |
-| `andrias-proto` | Protobuf schema and hand-vendored prost/tonic bindings. |
-| `andrias-console` | Gateway for Web Console management actions. |
-| `andrias-daemon` | `andriasd`, the long-running host process. |
-| `andrias-sdk` | Minimal embedded runtime facade and convenience exports. |
-| `andrias-plan`, `andrias-sim` | Planning and simulation crates. |
+| `xolotl-types` | Core IDs, paths, values, capabilities, operations, audit types, and external Provider/Source data. |
+| `xolotl-graph` | Durable `Do<A>` program IR and execution graph compiler. |
+| `xolotl-state` | State backend traits and in-memory implementation. |
+| `xolotl-kernel` | Process, handle, registry, policy, executor, recovery, facts. |
+| `xolotl-storage-redb` | Persistent redb-backed state and FactStore. |
+| `xolotl-standard` | Standard in-process Provider and Source implementations. |
+| `xolotl-gateway` | Shared session admission, flow-control, taint, and audit code for external protocol adapters. |
+| `xolotl-gateway-grpc` | External Provider/Source gRPC adapter using `xolotl-proto`. |
+| `xolotl-gateway-websocket` | External Provider/Source WebSocket adapter. |
+| `xolotl-gateway-mcp` | MCP server-side adapter for selected Gateway publications. |
+| `xolotl-proto` | Protobuf schema and hand-vendored prost/tonic bindings. |
+| `xolotl-console` | Gateway for Web Console management actions. |
+| `xolotl-daemon` | `xolotld`, the long-running host process. |
+| `xolotl-sdk` | Minimal embedded runtime facade and convenience exports. |
+| `xolotl-plan`, `xolotl-sim` | Planning and simulation crates. |
 
-`andrias-standard` uses Cargo features to choose which modules are built. The
+`xolotl-standard` uses Cargo features to choose which modules are built. The
 default `standard` feature builds the standard in-process implementations.
 Embedded hosts can choose a smaller installed module set with
 `StandardConfig::with_modules` and can provide their own model backend for
@@ -121,15 +121,15 @@ standard model-backed effects with `StandardConfig::with_inference_backend`.
 Gateway crates use only `external-session`, which contains session
 handling for external Provider and Source endpoints.
 
-`andrias-sdk` defaults to a minimal in-memory kernel. Embedded hosts use
-`AndriasBuilder` to provide their own state backend and fact sink. Standard
+`xolotl-sdk` defaults to a minimal in-memory kernel. Embedded hosts use
+`XolotlBuilder` to provide their own state backend and fact sink. Standard
 providers are installed explicitly by enabling the SDK `standard` feature or by
-calling `andrias-standard` directly.
-`ActorSpec` is available through `andrias-graph` and `andrias-sdk`; the kernel can
+calling `xolotl-standard` directly.
+`ActorSpec` is available through `xolotl-graph` and `xolotl-sdk`; the kernel can
 spawn it as a named long-lived Process through `Bootstrap::spawn_actor_under` or
-`Andrias::spawn_actor`. If the body or finalizers reference process-local
+`Xolotl::spawn_actor`. If the body or finalizers reference process-local
 `StepRef`s, pass their host functions at spawn time with
-`Bootstrap::spawn_actor_under_with_steps` or `Andrias::spawn_actor_with_steps`.
+`Bootstrap::spawn_actor_under_with_steps` or `Xolotl::spawn_actor_with_steps`.
 Actor declarations may use `state://process/self/...`; spawn binds it to the
 concrete Process id before linting and execution.
 
@@ -137,7 +137,7 @@ concrete Process id before linting and execution.
 
 - Rust 1.95 or newer.
 - Cargo from the matching stable toolchain.
-- No local `protoc` installation is required. `andrias-proto` includes vendored
+- No local `protoc` installation is required. `xolotl-proto` includes vendored
   prost/tonic Rust bindings.
 
 ## Build And Test
@@ -151,42 +151,42 @@ cargo test --workspace
 Build the daemon:
 
 ```sh
-cargo build -p andrias-daemon
+cargo build -p xolotl-daemon
 ```
 
-## Run `andriasd`
+## Run `xolotld`
 
 Create a local config:
 
 ```sh
-cp andrias.toml.example andrias.toml
+cp xolotl.toml.example xolotl.toml
 ```
 
 Start the daemon:
 
 ```sh
-cargo run -p andrias-daemon -- up
+cargo run -p xolotl-daemon -- up
 ```
 
-`andriasd` launches the host process. Runtime management goes through Console
+`xolotld` launches the host process. Runtime management goes through Console
 WebSocket.
 
-Default addresses from `andrias.toml.example`:
+Default addresses from `xolotl.toml.example`:
 
 - Console listener: `127.0.0.1:9000`
 - External gRPC gateway: `127.0.0.1:9444`
 - External WebSocket gateway: `127.0.0.1:9200`
 
-`andrias-daemon` enables `external-grpc` and `external-websocket` by default.
+`xolotl-daemon` enables `external-grpc` and `external-websocket` by default.
 Each transport can be built on its own with `--no-default-features --features
 external-grpc` or `--no-default-features --features external-websocket`.
 
 On first boot, if no console root account exists and no bootstrap credentials
-are configured, `andriasd` prints a one-time root password to stderr.
+are configured, `xolotld` prints a one-time root password to stderr.
 
 ## Configuration
 
-`andrias.toml` is bootstrap configuration. It controls storage, listener bind
+`xolotl.toml` is bootstrap configuration. It controls storage, listener bind
 addresses, root bootstrap credentials, external gateway limits, gateway
 transport-security settings, and Console resource limits.
 
@@ -205,7 +205,7 @@ transport-security settings, and Console resource limits.
 
 Runtime configuration, provider setup, model routing, groups, bindings, external
 program installations, Provider projections, Source projections, and
-policy-managed state belong in Andrias state and are managed through Console
+policy-managed state belong in Xolotl state and are managed through Console
 WebSocket.
 
 ## External Interfaces
@@ -215,7 +215,7 @@ Gateway](docs/src/external-gateway.md), and [Console Protocol](docs/src/console-
 
 ### Console
 
-`andrias-console` is the gateway for Web Console management actions. HTTP covers
+`xolotl-console` is the gateway for Web Console management actions. HTTP covers
 health and authentication. Console WebSocket handles snapshots, config
 read/write/CAS, runtime inspect, subscriptions, trace/fact streams, external
 program lifecycle actions, pairing actions, logout, and console
@@ -228,10 +228,10 @@ session admission, generation checks, flow control, dedupe, command
 idempotency, and inbound taint stamping.
 
 External gRPC serves the Provider/Source session stream on
-`[server].external_grpc_addr` or `ANDRIAS_EXTERNAL_GRPC_ADDR`.
+`[server].external_grpc_addr` or `XOLOTL_EXTERNAL_GRPC_ADDR`.
 
 External WebSocket serves the same Provider/Source session frames on
-`[server].external_websocket_addr` or `ANDRIAS_EXTERNAL_WEBSOCKET_ADDR`.
+`[server].external_websocket_addr` or `XOLOTL_EXTERNAL_WEBSOCKET_ADDR`.
 
 Control state uses these prefixes:
 
@@ -247,7 +247,7 @@ declaration.
 
 ### MCP
 
-`andrias-gateway-mcp` exposes selected Gateway publications as MCP tools,
+`xolotl-gateway-mcp` exposes selected Gateway publications as MCP tools,
 resources, resource templates, and prompts. Each publication references a
 Gateway surface; the surface must have an explicit publish capability, and MCP
 calls, reads, and prompt requests are translated into standard

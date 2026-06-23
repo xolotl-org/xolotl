@@ -31,292 +31,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "andrias-console"
-version = "0.1.0"
-dependencies = [
- "andrias-graph",
- "andrias-kernel",
- "andrias-standard",
- "andrias-state",
- "andrias-types",
- "anyhow",
- "argon2",
- "axum",
- "base64",
- "criterion",
- "ed25519-dalek",
- "futures-util",
- "getrandom 0.4.2",
- "hmac",
- "rmp-serde",
- "serde",
- "serde_json",
- "sha1 0.11.0",
- "sha2 0.11.0",
- "subtle",
- "thiserror",
- "tokio",
- "tower-http",
- "tracing",
-]
-
-[[package]]
-name = "andrias-daemon"
-version = "0.1.0"
-dependencies = [
- "andrias-console",
- "andrias-gateway",
- "andrias-gateway-grpc",
- "andrias-gateway-websocket",
- "andrias-kernel",
- "andrias-proto",
- "andrias-sdk",
- "andrias-standard",
- "andrias-state",
- "andrias-storage-redb",
- "andrias-types",
- "anyhow",
- "async-trait",
- "blake3",
- "dotenvy",
- "getrandom 0.4.2",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "andrias-gateway"
-version = "0.1.0"
-dependencies = [
- "andrias-graph",
- "andrias-kernel",
- "andrias-proto",
- "andrias-state",
- "andrias-types",
- "anyhow",
- "async-trait",
- "blake3",
- "chacha20poly1305",
- "getrandom 0.4.2",
- "hkdf",
- "parking_lot",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "subtle",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "andrias-gateway-grpc"
-version = "0.1.0"
-dependencies = [
- "andrias-gateway",
- "andrias-proto",
- "andrias-types",
- "anyhow",
- "prost",
- "tokio",
- "tonic",
- "tracing",
-]
-
-[[package]]
-name = "andrias-gateway-mcp"
-version = "0.1.0"
-dependencies = [
- "andrias-gateway",
- "andrias-kernel",
- "andrias-types",
- "anyhow",
- "base64",
- "serde",
- "serde_json",
- "std-uritemplate",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "andrias-gateway-websocket"
-version = "0.1.0"
-dependencies = [
- "andrias-gateway",
- "andrias-proto",
- "andrias-types",
- "anyhow",
- "axum",
- "futures-util",
- "prost",
- "tokio",
- "tonic",
- "tracing",
-]
-
-[[package]]
-name = "andrias-graph"
-version = "0.1.0"
-dependencies = [
- "andrias-types",
- "anyhow",
- "blake3",
- "criterion",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "andrias-kernel"
-version = "0.1.0"
-dependencies = [
- "andrias-graph",
- "andrias-state",
- "andrias-types",
- "anyhow",
- "async-trait",
- "blake3",
- "criterion",
- "futures-util",
- "parking_lot",
- "serde",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "andrias-plan"
-version = "0.1.0"
-dependencies = [
- "andrias-graph",
- "andrias-types",
- "anyhow",
- "serde",
- "serde_json",
- "thiserror",
- "yaml_serde",
-]
-
-[[package]]
-name = "andrias-proto"
-version = "0.1.0"
-dependencies = [
- "andrias-graph",
- "andrias-types",
- "anyhow",
- "criterion",
- "prost",
- "thiserror",
- "tonic",
- "tonic-prost",
-]
-
-[[package]]
-name = "andrias-sdk"
-version = "0.1.0"
-dependencies = [
- "andrias-graph",
- "andrias-kernel",
- "andrias-plan",
- "andrias-standard",
- "andrias-state",
- "andrias-types",
- "anyhow",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "andrias-sim"
-version = "0.1.0"
-dependencies = [
- "andrias-graph",
- "andrias-kernel",
- "andrias-types",
- "anyhow",
- "async-trait",
- "parking_lot",
- "tokio",
-]
-
-[[package]]
-name = "andrias-standard"
-version = "0.1.0"
-dependencies = [
- "andrias-graph",
- "andrias-kernel",
- "andrias-state",
- "andrias-types",
- "anyhow",
- "async-trait",
- "blake3",
- "criterion",
- "getrandom 0.4.2",
- "glob",
- "parking_lot",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "url",
-]
-
-[[package]]
-name = "andrias-state"
-version = "0.1.0"
-dependencies = [
- "andrias-types",
- "anyhow",
- "async-trait",
- "criterion",
- "dashmap",
- "parking_lot",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "andrias-storage-redb"
-version = "0.1.0"
-dependencies = [
- "andrias-kernel",
- "andrias-state",
- "andrias-types",
- "anyhow",
- "async-trait",
- "criterion",
- "parking_lot",
- "redb",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "andrias-types"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bitflags",
- "serde",
- "serde_json",
- "smol_str",
- "thiserror",
-]
-
-[[package]]
 name = "anes"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3315,6 +3029,292 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "xolotl-console"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "axum",
+ "base64",
+ "criterion",
+ "ed25519-dalek",
+ "futures-util",
+ "getrandom 0.4.2",
+ "hmac",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "xolotl-graph",
+ "xolotl-kernel",
+ "xolotl-standard",
+ "xolotl-state",
+ "xolotl-types",
+]
+
+[[package]]
+name = "xolotl-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "dotenvy",
+ "getrandom 0.4.2",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "xolotl-console",
+ "xolotl-gateway",
+ "xolotl-gateway-grpc",
+ "xolotl-gateway-websocket",
+ "xolotl-kernel",
+ "xolotl-proto",
+ "xolotl-sdk",
+ "xolotl-standard",
+ "xolotl-state",
+ "xolotl-storage-redb",
+ "xolotl-types",
+]
+
+[[package]]
+name = "xolotl-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "chacha20poly1305",
+ "getrandom 0.4.2",
+ "hkdf",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "xolotl-graph",
+ "xolotl-kernel",
+ "xolotl-proto",
+ "xolotl-state",
+ "xolotl-types",
+]
+
+[[package]]
+name = "xolotl-gateway-grpc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "prost",
+ "tokio",
+ "tonic",
+ "tracing",
+ "xolotl-gateway",
+ "xolotl-proto",
+ "xolotl-types",
+]
+
+[[package]]
+name = "xolotl-gateway-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "serde",
+ "serde_json",
+ "std-uritemplate",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "xolotl-gateway",
+ "xolotl-kernel",
+ "xolotl-types",
+]
+
+[[package]]
+name = "xolotl-gateway-websocket"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures-util",
+ "prost",
+ "tokio",
+ "tonic",
+ "tracing",
+ "xolotl-gateway",
+ "xolotl-proto",
+ "xolotl-types",
+]
+
+[[package]]
+name = "xolotl-graph"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "criterion",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "xolotl-types",
+]
+
+[[package]]
+name = "xolotl-kernel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "criterion",
+ "futures-util",
+ "parking_lot",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "xolotl-graph",
+ "xolotl-state",
+ "xolotl-types",
+]
+
+[[package]]
+name = "xolotl-plan"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "xolotl-graph",
+ "xolotl-types",
+ "yaml_serde",
+]
+
+[[package]]
+name = "xolotl-proto"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "criterion",
+ "prost",
+ "thiserror",
+ "tonic",
+ "tonic-prost",
+ "xolotl-graph",
+ "xolotl-types",
+]
+
+[[package]]
+name = "xolotl-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tokio",
+ "xolotl-graph",
+ "xolotl-kernel",
+ "xolotl-plan",
+ "xolotl-standard",
+ "xolotl-state",
+ "xolotl-types",
+]
+
+[[package]]
+name = "xolotl-sim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "parking_lot",
+ "tokio",
+ "xolotl-graph",
+ "xolotl-kernel",
+ "xolotl-types",
+]
+
+[[package]]
+name = "xolotl-standard"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "criterion",
+ "getrandom 0.4.2",
+ "glob",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "url",
+ "xolotl-graph",
+ "xolotl-kernel",
+ "xolotl-state",
+ "xolotl-types",
+]
+
+[[package]]
+name = "xolotl-state"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "criterion",
+ "dashmap",
+ "parking_lot",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "xolotl-types",
+]
+
+[[package]]
+name = "xolotl-storage-redb"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "criterion",
+ "parking_lot",
+ "redb",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "xolotl-kernel",
+ "xolotl-state",
+ "xolotl-types",
+]
+
+[[package]]
+name = "xolotl-types"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitflags",
+ "serde",
+ "serde_json",
+ "smol_str",
+ "thiserror",
+]
 
 [[package]]
 name = "yaml_serde"

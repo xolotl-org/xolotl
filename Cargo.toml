@@ -1,26 +1,22 @@
 [workspace]
 resolver = "2"
-# All crates build without `protoc`: `andrias-proto` ships hand-vendored prost/
-# tonic bindings (crates/andrias-proto/src/{common,external,program}.rs), so the
-# whole workspace — proto and the gRPC gateway included — is one default build
-# set. No `default-members` carve-out is needed.
 members = [
-    "crates/andrias-types",
-    "crates/andrias-graph",
-    "crates/andrias-state",
-    "crates/andrias-kernel",
-    "crates/andrias-storage-redb",
-    "crates/andrias-plan",
-    "crates/andrias-standard",
-    "crates/andrias-gateway",
-    "crates/andrias-proto",
-    "crates/andrias-gateway-grpc",
-    "crates/andrias-gateway-mcp",
-    "crates/andrias-sim",
-    "crates/andrias-sdk",
-    "crates/andrias-daemon",
-    "crates/andrias-console",
-    "crates/andrias-gateway-websocket",
+    "crates/xolotl-types",
+    "crates/xolotl-graph",
+    "crates/xolotl-state",
+    "crates/xolotl-kernel",
+    "crates/xolotl-storage-redb",
+    "crates/xolotl-plan",
+    "crates/xolotl-standard",
+    "crates/xolotl-gateway",
+    "crates/xolotl-proto",
+    "crates/xolotl-gateway-grpc",
+    "crates/xolotl-gateway-mcp",
+    "crates/xolotl-sim",
+    "crates/xolotl-sdk",
+    "crates/xolotl-daemon",
+    "crates/xolotl-console",
+    "crates/xolotl-gateway-websocket",
 ]
 
 [workspace.package]
@@ -29,12 +25,13 @@ edition      = "2024"
 rust-version = "1.95"
 license      = "MIT"
 authors      = ["noctiro"]
-repository   = "https://github.com/andrias-dev/andrias"
+repository   = "https://github.com/xolotl-org/xolotl"
 description  = "Capability runtime for model calls, tool access, memory, state, and extensions"
 
 [workspace.lints.rust]
 bare_trait_objects = "deny"
 future_incompatible = { level = "deny", priority = -1 }
+let_underscore_drop = "deny"
 non_ascii_idents = "deny"
 unsafe_code = "forbid"
 unsafe_op_in_unsafe_fn = "deny"
@@ -48,33 +45,41 @@ allow_attributes_without_reason = "deny"
 dbg_macro = "deny"
 expect_used = "deny"
 exit = "deny"
+let_underscore_future = "deny"
+let_underscore_lock = "deny"
+let_underscore_must_use = "deny"
+let_underscore_untyped = "deny"
+let_unit_value = "deny"
+map_err_ignore = "deny"
 mem_forget = "deny"
 panic = "deny"
 panic_in_result_fn = "deny"
 print_stderr = "deny"
 print_stdout = "deny"
+redundant_clone = "deny"
 todo = "deny"
 undocumented_unsafe_blocks = "deny"
 unimplemented = "deny"
 unreachable = "deny"
+unused_result_ok = "deny"
 unwrap_in_result = "deny"
 unwrap_used = "deny"
 
 [workspace.dependencies]
-andrias-standard = { version = "0.1.0", path = "crates/andrias-standard", default-features = false }
-andrias-console = { version = "0.1.0", path = "crates/andrias-console" }
-andrias-gateway = { version = "0.1.0", path = "crates/andrias-gateway" }
-andrias-gateway-grpc = { version = "0.1.0", path = "crates/andrias-gateway-grpc" }
-andrias-gateway-mcp = { version = "0.1.0", path = "crates/andrias-gateway-mcp" }
-andrias-gateway-websocket = { version = "0.1.0", path = "crates/andrias-gateway-websocket" }
-andrias-graph = { version = "0.1.0", path = "crates/andrias-graph" }
-andrias-kernel = { version = "0.1.0", path = "crates/andrias-kernel" }
-andrias-plan = { version = "0.1.0", path = "crates/andrias-plan" }
-andrias-proto = { version = "0.1.0", path = "crates/andrias-proto" }
-andrias-sdk = { version = "0.1.0", path = "crates/andrias-sdk" }
-andrias-state = { version = "0.1.0", path = "crates/andrias-state" }
-andrias-storage-redb = { version = "0.1.0", path = "crates/andrias-storage-redb" }
-andrias-types = { version = "0.1.0", path = "crates/andrias-types" }
+xolotl-standard = { version = "0.1.0", path = "crates/xolotl-standard", default-features = false }
+xolotl-console = { version = "0.1.0", path = "crates/xolotl-console" }
+xolotl-gateway = { version = "0.1.0", path = "crates/xolotl-gateway" }
+xolotl-gateway-grpc = { version = "0.1.0", path = "crates/xolotl-gateway-grpc" }
+xolotl-gateway-mcp = { version = "0.1.0", path = "crates/xolotl-gateway-mcp" }
+xolotl-gateway-websocket = { version = "0.1.0", path = "crates/xolotl-gateway-websocket" }
+xolotl-graph = { version = "0.1.0", path = "crates/xolotl-graph" }
+xolotl-kernel = { version = "0.1.0", path = "crates/xolotl-kernel" }
+xolotl-plan = { version = "0.1.0", path = "crates/xolotl-plan" }
+xolotl-proto = { version = "0.1.0", path = "crates/xolotl-proto" }
+xolotl-sdk = { version = "0.1.0", path = "crates/xolotl-sdk" }
+xolotl-state = { version = "0.1.0", path = "crates/xolotl-state" }
+xolotl-storage-redb = { version = "0.1.0", path = "crates/xolotl-storage-redb" }
+xolotl-types = { version = "0.1.0", path = "crates/xolotl-types" }
 
 anyhow = { version = "1.0.102", default-features = false }
 argon2 = { version = "0.5.3", default-features = false }
@@ -103,7 +108,7 @@ serde_json = { version = "1.0.150", default-features = false }
 sha1 = { version = "0.11.0", default-features = false }
 sha2 = { version = "0.11.0", default-features = false }
 smol_str = { version = "0.3.6", default-features = false }
-std-uritemplate = { version = "2.0.10", default-features = false }
+stduritemplate = { package = "std-uritemplate", version = "2.0.10", default-features = false }
 subtle = { version = "2.6.1", default-features = false }
 tempfile = { version = "3.27.0", default-features = false }
 thiserror = { version = "2.0.18", default-features = false }

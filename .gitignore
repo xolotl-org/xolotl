@@ -8,7 +8,7 @@
 .env.*
 
 # Configuration
-andrias.toml
+xolotl.toml
 
 # Runtime state / local databases
 *.db

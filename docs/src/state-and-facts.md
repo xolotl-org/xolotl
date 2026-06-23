@@ -1,6 +1,6 @@
 # State And Facts
 
-Andrias separates mutable state from the Fact stream.
+Xolotl separates mutable state from the Fact stream.
 
 ## State Path
 
@@ -33,9 +33,9 @@ content is represented with blob, tensor, or frame references.
 
 ## Storage Backends
 
-`andrias-state` provides the backend trait and in-memory implementation.
-`andrias-storage-redb` provides persistent redb-backed state and FactStore
+`xolotl-state` provides the backend trait and in-memory implementation.
+`xolotl-storage-redb` provides persistent redb-backed state and FactStore
 adapters.
 
-`andrias.toml` chooses storage at bootstrap time. Runtime state managed by the
-console is stored in Andrias state.
+`xolotl.toml` chooses storage at bootstrap time. Runtime state managed by the
+console is stored in Xolotl state.

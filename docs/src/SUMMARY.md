@@ -1,6 +1,6 @@
 # Summary
 
-- [Andrias Manual](README.md)
+- [Xolotl Manual](README.md)
 - [Architecture](architecture.md)
 - [Runtime Model](runtime-model.md)
 - [Capability Model](capability-model.md)
