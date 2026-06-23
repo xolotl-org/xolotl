@@ -1,6 +1,6 @@
 # Architecture
 
-Nexus keeps the execution hot path small:
+Andrias keeps the execution hot path small:
 
 ```text
 Process
@@ -56,26 +56,26 @@ during recovery.
 
 | Crate | Role |
 | --- | --- |
-| `nexus-types` | Core ids, paths, values, capabilities, operations, audit, trace, external access, and process data. |
-| `nexus-graph` | `DoNode`, `ExecutionGraph`, graph compiler, cursor, and `ActorSpec` linting. |
-| `nexus-state` | State backend trait and in-memory implementation. |
-| `nexus-kernel` | Registry, policy, handle table, execution path, executor, process table, recovery, and bootstrap. |
-| `nexus-storage-redb` | redb-backed state and fact storage. |
-| `nexus-standard` | Standard in-process Provider and Source implementations. |
-| `nexus-gateway` | Shared session admission, flow-control, taint, and audit code for external protocol adapters. |
-| `nexus-gateway-grpc` | External Provider/Source gRPC adapter. |
-| `nexus-gateway-websocket` | External Provider/Source WebSocket adapter. |
-| `nexus-gateway-mcp` | MCP server-side adapter for selected Gateway publication kinds. |
-| `nexus-proto` | Protobuf schema and vendored Rust bindings. |
-| `nexus-console` | Gateway for Web Console management actions. |
-| `nexus-daemon` | `nexusd`, the long-running host process. |
-| `nexus-sdk` | Minimal embedded facade for in-process kernel use. |
-| `nexus-plan` | Plan document parsing and lowering. |
-| `nexus-sim` | Deterministic simulation and replay helpers. |
+| `andrias-types` | Core ids, paths, values, capabilities, operations, audit, trace, external access, and process data. |
+| `andrias-graph` | `DoNode`, `ExecutionGraph`, graph compiler, cursor, and `ActorSpec` linting. |
+| `andrias-state` | State backend trait and in-memory implementation. |
+| `andrias-kernel` | Registry, policy, handle table, execution path, executor, process table, recovery, and bootstrap. |
+| `andrias-storage-redb` | redb-backed state and fact storage. |
+| `andrias-standard` | Standard in-process Provider and Source implementations. |
+| `andrias-gateway` | Shared session admission, flow-control, taint, and audit code for external protocol adapters. |
+| `andrias-gateway-grpc` | External Provider/Source gRPC adapter. |
+| `andrias-gateway-websocket` | External Provider/Source WebSocket adapter. |
+| `andrias-gateway-mcp` | MCP server-side adapter for selected Gateway publication kinds. |
+| `andrias-proto` | Protobuf schema and vendored Rust bindings. |
+| `andrias-console` | Gateway for Web Console management actions. |
+| `andrias-daemon` | `andriasd`, the long-running host process. |
+| `andrias-sdk` | Minimal embedded facade for in-process kernel use. |
+| `andrias-plan` | Plan document parsing and lowering. |
+| `andrias-sim` | Deterministic simulation and replay helpers. |
 
 ## Embedded Hosts
 
-`nexus-sdk` builds a minimal in-memory kernel by default. `NexusBuilder` lets
+`andrias-sdk` builds a minimal in-memory kernel by default. `AndriasBuilder` lets
 embedded hosts provide their own state backend and fact sink before the
 `Bootstrap` is seeded. The SDK `standard` feature exposes the standard package
 installation API for hosts that include the standard in-process providers.
@@ -94,12 +94,12 @@ starts.
 
 ## Standard Package Features
 
-`nexus-standard` contains the standard in-process Provider and Source
+`andrias-standard` contains the standard in-process Provider and Source
 implementations. A binary can compile only the modules it needs, and compiled
 code is separate from installed Resources.
 
 High-risk in-process implementations such as `fetch`, `fs`, and `terminal`
-must stay behind separate `nexus-standard` features. A daemon or embedded host may
+must stay behind separate `andrias-standard` features. A daemon or embedded host may
 expose them only through kernel-state declarations admitted by `config.*`.
 
 Optional in-process projection declarations are runtime state under

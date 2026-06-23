@@ -1,6 +1,6 @@
 # Gateways
 
-This page maps `nexusd` listener addresses to client protocols.
+This page maps `andriasd` listener addresses to client protocols.
 
 External programs have one role model: they connect as Provider or Source
 projections. gRPC and WebSocket are transport implementations for the same
@@ -9,17 +9,17 @@ external gateway.
 ## Entry Points
 
 A listener starts when its `[server]` config field is set, or when the matching
-environment variable is set. `nexus-daemon` enables `external-grpc` and
+environment variable is set. `andrias-daemon` enables `external-grpc` and
 `external-websocket` by default; either transport can be built alone with
 `--no-default-features --features external-grpc` or `--no-default-features
 --features external-websocket`.
 
 | Entry point | Config field | Environment variable | Route or service | Encoding |
 | --- | --- | --- | --- | --- |
-| Console HTTP | `console_addr` | `NEXUS_CONSOLE_ADDR` | `/health`, `/api/auth/*` | HTTP JSON |
-| Console WebSocket | `console_addr` | `NEXUS_CONSOLE_ADDR` | `/ws` | MessagePack, `msgpack+nexus-console-v1` |
-| External gRPC | `external_grpc_addr` | `NEXUS_EXTERNAL_GRPC_ADDR` | `nexus.v1.external.ExternalService.Session` | Protobuf |
-| External WebSocket | `external_websocket_addr` | `NEXUS_EXTERNAL_WEBSOCKET_ADDR` | `/ws` | Binary protobuf frames |
+| Console HTTP | `console_addr` | `ANDRIAS_CONSOLE_ADDR` | `/health`, `/api/auth/*` | HTTP JSON |
+| Console WebSocket | `console_addr` | `ANDRIAS_CONSOLE_ADDR` | `/ws` | MessagePack, `msgpack+andrias-console-v1` |
+| External gRPC | `external_grpc_addr` | `ANDRIAS_EXTERNAL_GRPC_ADDR` | `andrias.v1.external.ExternalService.Session` | Protobuf |
+| External WebSocket | `external_websocket_addr` | `ANDRIAS_EXTERNAL_WEBSOCKET_ADDR` | `/ws` | Binary protobuf frames |
 
 Console WebSocket and external WebSocket both mount `/ws`. They are selected by
 listener address and frame encoding:
@@ -43,7 +43,7 @@ listener address and frame encoding:
 External gateway sessions are described in [External Gateway](external-gateway.md).
 Provider and Source are the only external projection roles.
 
-Use this entry point when a program runs outside the Nexus process but should be
+Use this entry point when a program runs outside the Andrias process but should be
 projected into the runtime as declared effects or declared event streams. The
 daemon owns session admission, generation checks, binding selection, and
 runtime limits; external programs do not self-declare authority.

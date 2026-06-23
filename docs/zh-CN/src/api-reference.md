@@ -23,44 +23,44 @@ target/doc/<crate_name>/index.html
 Cargo 会把 Rust 包名里的连字符转换为下划线。例如：
 
 ```text
-nexus-sdk      -> target/doc/nexus_sdk/index.html
-nexus-kernel   -> target/doc/nexus_kernel/index.html
-nexus-standard   -> target/doc/nexus_standard/index.html
+andrias-sdk      -> target/doc/andrias_sdk/index.html
+andrias-kernel   -> target/doc/andrias_kernel/index.html
+andrias-standard   -> target/doc/andrias_standard/index.html
 ```
 
 ## 阅读顺序
 
 嵌入运行时：
 
-- `nexus-sdk`
-- `nexus-graph`
-- `nexus-types`
-- `nexus-kernel`
+- `andrias-sdk`
+- `andrias-graph`
+- `andrias-types`
+- `andrias-kernel`
 
-`nexus-sdk` 默认保持最小化。用 `NexusBuilder` 接入宿主持有的状态和事实记录后端。
+`andrias-sdk` 默认保持最小化。用 `AndriasBuilder` 接入宿主持有的状态和事实记录后端。
 SDK 的 `standard` feature 提供标准进程内 Provider 安装 API。
-使用 `ActorSpec` 和 `Nexus::spawn_actor` 声明并启动命名长寿 Process。
-Actor body 或终结器引用进程本地 `StepRef` 时，使用 `Nexus::spawn_actor_with_steps`。
+使用 `ActorSpec` 和 `Andrias::spawn_actor` 声明并启动命名长寿 Process。
+Actor body 或终结器引用进程本地 `StepRef` 时，使用 `Andrias::spawn_actor_with_steps`。
 使用 `StandardConfig::with_modules` 选择实际安装的 standard 模块，使用
 `StandardConfig::with_inference_backend` 接入标准模型类 effect 使用的宿主模型 backend。
 
 协议适配器：
 
-- `nexus-gateway`
-- `nexus-proto`
-- `nexus-gateway-grpc`
-- `nexus-gateway-websocket`
-- `nexus-gateway-mcp`
+- `andrias-gateway`
+- `andrias-proto`
+- `andrias-gateway-grpc`
+- `andrias-gateway-websocket`
+- `andrias-gateway-mcp`
 
 External Provider/Source session 准入和 secure envelope helper 位于
-`nexus_gateway::external`。`nexus-gateway` 根 API 用于 gateway profile、
+`andrias_gateway::external`。`andrias-gateway` 根 API 用于 gateway profile、
 session、submission、limit 和运行时状态。
 
 标准提供方：
 
-- `nexus-standard`
-- `nexus-state`
-- `nexus-storage-redb`
+- `andrias-standard`
+- `andrias-state`
+- `andrias-storage-redb`
 
 ## 文档质量检查
 

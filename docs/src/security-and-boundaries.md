@@ -1,6 +1,6 @@
 # Security And Boundaries
 
-Nexus security is enforced by runtime paths. This chapter describes the public
+Andrias security is enforced by runtime paths. This chapter describes the public
 behavior of those paths.
 
 ## Authority

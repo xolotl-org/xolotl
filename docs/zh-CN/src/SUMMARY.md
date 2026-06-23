@@ -1,6 +1,6 @@
 # 目录
 
-- [Nexus 手册](README.md)
+- [Andrias 手册](README.md)
 - [架构](architecture.md)
 - [运行时模型](runtime-model.md)
 - [能力模型](capability-model.md)

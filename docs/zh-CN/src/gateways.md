@@ -1,19 +1,19 @@
 # 网关
 
-本页说明 `nexusd` 的监听地址和客户端协议。
+本页说明 `andriasd` 的监听地址和客户端协议。
 
 外部程序只有一套角色模型：以 Provider 或 Source projection 接入。gRPC 和 WebSocket 是同一个 external gateway 的两种传输实现。
 
 ## 接入口
 
-当 `[server]` 中的配置字段存在，或对应环境变量存在时，`nexusd` 会启动该通道。`nexus-daemon` 默认启用 `external-grpc` 和 `external-websocket`；可以用 `--no-default-features --features external-grpc` 或 `--no-default-features --features external-websocket` 只构建其中一种 transport。
+当 `[server]` 中的配置字段存在，或对应环境变量存在时，`andriasd` 会启动该通道。`andrias-daemon` 默认启用 `external-grpc` 和 `external-websocket`；可以用 `--no-default-features --features external-grpc` 或 `--no-default-features --features external-websocket` 只构建其中一种 transport。
 
 | 接口 | 配置字段 | 环境变量 | 路径或服务 | 编码 |
 | --- | --- | --- | --- | --- |
-| 控制台 HTTP | `console_addr` | `NEXUS_CONSOLE_ADDR` | `/health`、`/api/auth/*` | HTTP JSON |
-| 控制台 WebSocket | `console_addr` | `NEXUS_CONSOLE_ADDR` | `/ws` | MessagePack，`msgpack+nexus-console-v1` |
-| External gRPC | `external_grpc_addr` | `NEXUS_EXTERNAL_GRPC_ADDR` | `nexus.v1.external.ExternalService.Session` | Protobuf |
-| External WebSocket | `external_websocket_addr` | `NEXUS_EXTERNAL_WEBSOCKET_ADDR` | `/ws` | 二进制 protobuf frame |
+| 控制台 HTTP | `console_addr` | `ANDRIAS_CONSOLE_ADDR` | `/health`、`/api/auth/*` | HTTP JSON |
+| 控制台 WebSocket | `console_addr` | `ANDRIAS_CONSOLE_ADDR` | `/ws` | MessagePack，`msgpack+andrias-console-v1` |
+| External gRPC | `external_grpc_addr` | `ANDRIAS_EXTERNAL_GRPC_ADDR` | `andrias.v1.external.ExternalService.Session` | Protobuf |
+| External WebSocket | `external_websocket_addr` | `ANDRIAS_EXTERNAL_WEBSOCKET_ADDR` | `/ws` | 二进制 protobuf frame |
 
 控制台 WebSocket 和 external WebSocket 都挂在 `/ws`，通过监听地址和帧编码区分：
 
@@ -33,7 +33,7 @@
 
 External gateway session 见 [External Gateway](external-gateway.md)。Provider 和 Source 是唯一的外部 projection role。
 
-外部程序运行在 Nexus 进程之外，但需要作为声明过的 effect 或事件流投影进运行时，就使用这个入口。daemon 持有 session 准入、generation 检查、binding 选择和运行时限制；外部程序不能自声明授权范围。
+外部程序运行在 Andrias 进程之外，但需要作为声明过的 effect 或事件流投影进运行时，就使用这个入口。daemon 持有 session 准入、generation 检查、binding 选择和运行时限制；外部程序不能自声明授权范围。
 
 ## MCP
 

@@ -1,6 +1,6 @@
 # Runtime Model
 
-Nexus has one active entity: `Process`.
+Andrias has one active entity: `Process`.
 
 A Process owns compiled Handles, issues Operations against Resources, receives
 Outcomes, and records Facts. Files, terminal commands, inference, memory, state,

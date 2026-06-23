@@ -21,7 +21,7 @@ OpenAI 兼容服务可以使用 OpenAI Chat Completions dialect，并配置自�
 `base_url` 和 `provider_model`。
 
 嵌入式宿主不必使用 HTTP 推理。宿主可以用
-`StandardConfig::with_inference_backend` 安装 `nexus-standard`，并提供实现
+`StandardConfig::with_inference_backend` 安装 `andrias-standard`，并提供实现
 `InferenceBackend` 的进程内 backend。这个 backend 仍服务同一组
 `effect://inference/*` 资源和标准模型类 effect，并继续经过 handle、policy、budget 和 Fact。
 
@@ -32,8 +32,8 @@ HTTP 推理 Provider 代码需要显式启用。
 启用全部 HTTP 推理 dialect：
 
 ```toml
-nexus-standard = {
-  path = "crates/nexus-standard",
+andrias-standard = {
+  path = "crates/andrias-standard",
   default-features = false,
   features = ["standard", "http-inference"],
 }
@@ -42,17 +42,17 @@ nexus-standard = {
 也可以只启用需要的 dialect：
 
 ```toml
-nexus-standard = {
-  path = "crates/nexus-standard",
+andrias-standard = {
+  path = "crates/andrias-standard",
   default-features = false,
   features = ["standard", "openai-chat"],
 }
 ```
 
-`nexus-daemon` 转发同名 feature：
+`andrias-daemon` 转发同名 feature：
 
 ```text
-cargo run -p nexus-daemon --features openai-chat
+cargo run -p andrias-daemon --features openai-chat
 ```
 
 可用 feature：
@@ -139,7 +139,7 @@ backend。
 当前 HTTP 推理 Provider 发送纯文本请求。`Blob`、`Tensor`、`Frame` 和 inline bytes
 会在 HTTP 请求前被拒绝。
 
-请求中的 provider tool 字段会被拒绝。工具调用必须通过 Nexus effect 和策略执行。
+请求中的 provider tool 字段会被拒绝。工具调用必须通过 Andrias effect 和策略执行。
 
 `request_overrides` 只能添加非敏感的 provider 字段。它不能替换 model id、消息
 payload、streaming 标志、认证字段、tool 字段、system 字段、previous response id、

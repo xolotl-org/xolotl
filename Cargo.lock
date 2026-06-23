@@ -31,6 +31,292 @@ dependencies = [
 ]
 
 [[package]]
+name = "andrias-console"
+version = "0.1.0"
+dependencies = [
+ "andrias-graph",
+ "andrias-kernel",
+ "andrias-standard",
+ "andrias-state",
+ "andrias-types",
+ "anyhow",
+ "argon2",
+ "axum",
+ "base64",
+ "criterion",
+ "ed25519-dalek",
+ "futures-util",
+ "getrandom 0.4.2",
+ "hmac",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tower-http",
+ "tracing",
+]
+
+[[package]]
+name = "andrias-daemon"
+version = "0.1.0"
+dependencies = [
+ "andrias-console",
+ "andrias-gateway",
+ "andrias-gateway-grpc",
+ "andrias-gateway-websocket",
+ "andrias-kernel",
+ "andrias-proto",
+ "andrias-sdk",
+ "andrias-standard",
+ "andrias-state",
+ "andrias-storage-redb",
+ "andrias-types",
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "dotenvy",
+ "getrandom 0.4.2",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "andrias-gateway"
+version = "0.1.0"
+dependencies = [
+ "andrias-graph",
+ "andrias-kernel",
+ "andrias-proto",
+ "andrias-state",
+ "andrias-types",
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "chacha20poly1305",
+ "getrandom 0.4.2",
+ "hkdf",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "andrias-gateway-grpc"
+version = "0.1.0"
+dependencies = [
+ "andrias-gateway",
+ "andrias-proto",
+ "andrias-types",
+ "anyhow",
+ "prost",
+ "tokio",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
+name = "andrias-gateway-mcp"
+version = "0.1.0"
+dependencies = [
+ "andrias-gateway",
+ "andrias-kernel",
+ "andrias-types",
+ "anyhow",
+ "base64",
+ "serde",
+ "serde_json",
+ "std-uritemplate",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "andrias-gateway-websocket"
+version = "0.1.0"
+dependencies = [
+ "andrias-gateway",
+ "andrias-proto",
+ "andrias-types",
+ "anyhow",
+ "axum",
+ "futures-util",
+ "prost",
+ "tokio",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
+name = "andrias-graph"
+version = "0.1.0"
+dependencies = [
+ "andrias-types",
+ "anyhow",
+ "blake3",
+ "criterion",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "andrias-kernel"
+version = "0.1.0"
+dependencies = [
+ "andrias-graph",
+ "andrias-state",
+ "andrias-types",
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "criterion",
+ "futures-util",
+ "parking_lot",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "andrias-plan"
+version = "0.1.0"
+dependencies = [
+ "andrias-graph",
+ "andrias-types",
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "yaml_serde",
+]
+
+[[package]]
+name = "andrias-proto"
+version = "0.1.0"
+dependencies = [
+ "andrias-graph",
+ "andrias-types",
+ "anyhow",
+ "criterion",
+ "prost",
+ "thiserror",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
+name = "andrias-sdk"
+version = "0.1.0"
+dependencies = [
+ "andrias-graph",
+ "andrias-kernel",
+ "andrias-plan",
+ "andrias-standard",
+ "andrias-state",
+ "andrias-types",
+ "anyhow",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "andrias-sim"
+version = "0.1.0"
+dependencies = [
+ "andrias-graph",
+ "andrias-kernel",
+ "andrias-types",
+ "anyhow",
+ "async-trait",
+ "parking_lot",
+ "tokio",
+]
+
+[[package]]
+name = "andrias-standard"
+version = "0.1.0"
+dependencies = [
+ "andrias-graph",
+ "andrias-kernel",
+ "andrias-state",
+ "andrias-types",
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "criterion",
+ "getrandom 0.4.2",
+ "glob",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "andrias-state"
+version = "0.1.0"
+dependencies = [
+ "andrias-types",
+ "anyhow",
+ "async-trait",
+ "criterion",
+ "dashmap",
+ "parking_lot",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "andrias-storage-redb"
+version = "0.1.0"
+dependencies = [
+ "andrias-kernel",
+ "andrias-state",
+ "andrias-types",
+ "anyhow",
+ "async-trait",
+ "criterion",
+ "parking_lot",
+ "redb",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "andrias-types"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitflags",
+ "serde",
+ "serde_json",
+ "smol_str",
+ "thiserror",
+]
+
+[[package]]
 name = "anes"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1324,292 +1610,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "nexus-console"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "argon2",
- "axum",
- "base64",
- "criterion",
- "ed25519-dalek",
- "futures-util",
- "getrandom 0.4.2",
- "hmac",
- "nexus-graph",
- "nexus-kernel",
- "nexus-standard",
- "nexus-state",
- "nexus-types",
- "rmp-serde",
- "serde",
- "serde_json",
- "sha1 0.11.0",
- "sha2 0.11.0",
- "subtle",
- "thiserror",
- "tokio",
- "tower-http",
- "tracing",
-]
-
-[[package]]
-name = "nexus-daemon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "blake3",
- "dotenvy",
- "getrandom 0.4.2",
- "nexus-console",
- "nexus-gateway",
- "nexus-gateway-grpc",
- "nexus-gateway-websocket",
- "nexus-kernel",
- "nexus-proto",
- "nexus-sdk",
- "nexus-standard",
- "nexus-state",
- "nexus-storage-redb",
- "nexus-types",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "nexus-gateway"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "blake3",
- "chacha20poly1305",
- "getrandom 0.4.2",
- "hkdf",
- "nexus-graph",
- "nexus-kernel",
- "nexus-proto",
- "nexus-state",
- "nexus-types",
- "parking_lot",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "subtle",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "nexus-gateway-grpc"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "nexus-gateway",
- "nexus-proto",
- "nexus-types",
- "prost",
- "tokio",
- "tonic",
- "tracing",
-]
-
-[[package]]
-name = "nexus-gateway-mcp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "nexus-gateway",
- "nexus-kernel",
- "nexus-types",
- "serde",
- "serde_json",
- "std-uritemplate",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "nexus-gateway-websocket"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "futures-util",
- "nexus-gateway",
- "nexus-proto",
- "nexus-types",
- "prost",
- "tokio",
- "tonic",
- "tracing",
-]
-
-[[package]]
-name = "nexus-graph"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "criterion",
- "nexus-types",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "nexus-kernel"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "blake3",
- "criterion",
- "futures-util",
- "nexus-graph",
- "nexus-state",
- "nexus-types",
- "parking_lot",
- "serde",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "nexus-plan"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "nexus-graph",
- "nexus-types",
- "serde",
- "serde_json",
- "thiserror",
- "yaml_serde",
-]
-
-[[package]]
-name = "nexus-proto"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "criterion",
- "nexus-graph",
- "nexus-types",
- "prost",
- "thiserror",
- "tonic",
- "tonic-prost",
-]
-
-[[package]]
-name = "nexus-sdk"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "nexus-graph",
- "nexus-kernel",
- "nexus-plan",
- "nexus-standard",
- "nexus-state",
- "nexus-types",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "nexus-sim"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "nexus-graph",
- "nexus-kernel",
- "nexus-types",
- "parking_lot",
- "tokio",
-]
-
-[[package]]
-name = "nexus-standard"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "blake3",
- "criterion",
- "getrandom 0.4.2",
- "glob",
- "nexus-graph",
- "nexus-kernel",
- "nexus-state",
- "nexus-types",
- "parking_lot",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "url",
-]
-
-[[package]]
-name = "nexus-state"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "criterion",
- "dashmap",
- "nexus-types",
- "parking_lot",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "nexus-storage-redb"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "criterion",
- "nexus-kernel",
- "nexus-state",
- "nexus-types",
- "parking_lot",
- "redb",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "nexus-types"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bitflags",
- "serde",
- "serde_json",
- "smol_str",
- "thiserror",
 ]
 
 [[package]]

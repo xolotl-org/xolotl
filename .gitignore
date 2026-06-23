@@ -8,7 +8,7 @@
 .env.*
 
 # Configuration
-nexus.toml
+andrias.toml
 
 # Runtime state / local databases
 *.db

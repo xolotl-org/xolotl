@@ -1,0 +1,27 @@
+[package]
+name = "andrias-gateway-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "MCP protocol adapter for Andrias"
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = { workspace = true, default-features = false, features = ["alloc"] }
+andrias-gateway.workspace = true
+andrias-kernel.workspace = true
+andrias-types.workspace = true
+serde = { workspace = true, default-features = false, features = ["derive", "std"] }
+serde_json = { workspace = true, default-features = false, features = ["std"] }
+std-uritemplate = { workspace = true, default-features = false }
+thiserror = { workspace = true, default-features = false, features = ["std"] }
+tracing = { workspace = true, default-features = false, features = ["std"] }
+
+[dev-dependencies]
+anyhow = { workspace = true, default-features = false, features = ["std"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "macros"] }

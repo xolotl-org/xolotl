@@ -1,6 +1,6 @@
 # State And Facts
 
-Nexus separates mutable state from the Fact stream.
+Andrias separates mutable state from the Fact stream.
 
 ## State Path
 
@@ -33,9 +33,9 @@ content is represented with blob, tensor, or frame references.
 
 ## Storage Backends
 
-`nexus-state` provides the backend trait and in-memory implementation.
-`nexus-storage-redb` provides persistent redb-backed state and FactStore
+`andrias-state` provides the backend trait and in-memory implementation.
+`andrias-storage-redb` provides persistent redb-backed state and FactStore
 adapters.
 
-`nexus.toml` chooses storage at bootstrap time. Runtime state managed by the
-console is stored in Nexus state.
+`andrias.toml` chooses storage at bootstrap time. Runtime state managed by the
+console is stored in Andrias state.

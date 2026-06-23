@@ -23,7 +23,7 @@ DeepSeek, OpenRouter, vLLM, and Ollama-compatible deployments can use the
 OpenAI Chat Completions dialect with their own base URL and model id.
 
 Embedded hosts do not have to use HTTP inference. They can install
-`nexus-standard` with `StandardConfig::with_inference_backend` and supply an
+`andrias-standard` with `StandardConfig::with_inference_backend` and supply an
 in-process backend implementing `InferenceBackend`. That backend serves the same
 `effect://inference/*` resources and the standard model-backed effects while
 still being invoked through handles, policy, budget, and Facts.
@@ -36,17 +36,17 @@ Use `http-inference` to enable all HTTP inference dialects, or enable only the
 dialects a binary needs:
 
 ```toml
-nexus-standard = {
-  path = "crates/nexus-standard",
+andrias-standard = {
+  path = "crates/andrias-standard",
   default-features = false,
   features = ["standard", "openai-chat"],
 }
 ```
 
-`nexus-daemon` forwards the same feature names:
+`andrias-daemon` forwards the same feature names:
 
 ```text
-cargo run -p nexus-daemon --features openai-chat
+cargo run -p andrias-daemon --features openai-chat
 ```
 
 Available feature flags:
@@ -138,8 +138,8 @@ inference provider features use the offline baseline backend.
 HTTP inference providers send plain text requests today. `Blob`, `Tensor`, `Frame`,
 and inline bytes are rejected before HTTP.
 
-Provider-native tool fields are rejected. Nexus tool execution must go through
-Nexus effects and policy.
+Provider-native tool fields are rejected. Andrias tool execution must go through
+Andrias effects and policy.
 
 Request overrides can add non-secret provider fields. They cannot replace the
 model id, message payload, streaming flag, auth fields, tool fields, system

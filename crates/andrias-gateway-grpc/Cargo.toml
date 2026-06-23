@@ -1,0 +1,24 @@
+[package]
+name = "andrias-gateway-grpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "gRPC protocol adapter for Andrias"
+
+[lints]
+workspace = true
+
+[dependencies]
+andrias-gateway.workspace = true
+andrias-proto.workspace = true
+andrias-types.workspace = true
+prost = { workspace = true, default-features = false, features = ["derive", "std"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "sync"] }
+tonic = { workspace = true, default-features = false, features = ["codegen", "transport", "tls-ring"] }
+tracing = { workspace = true, default-features = false, features = ["std"] }
+
+[dev-dependencies]
+anyhow = { workspace = true, default-features = false, features = ["std"] }

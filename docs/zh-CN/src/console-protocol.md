@@ -1,22 +1,22 @@
 # 控制台协议
 
-`nexus-console` 承载控制台客户端使用的管理协议。它提供健康检查和认证用的 HTTP 路由；登录后的管理动作和流订阅通过控制台 WebSocket 运行。
+`andrias-console` 承载控制台客户端使用的管理协议。它提供健康检查和认证用的 HTTP 路由；登录后的管理动作和流订阅通过控制台 WebSocket 运行。
 
 管理动作使用有描述符名称的调用。它们使用运行时的状态、授权、CAS、可见性和审计接口；当管理动作调用运行时效果时，该效果作为受能力约束的 `Operation` 执行。
 
 ## 监听地址
 
 控制台 HTTP 和控制台 WebSocket 共用 `[server].console_addr`，环境变量回退为
-`NEXUS_CONSOLE_ADDR`。
+`ANDRIAS_CONSOLE_ADDR`。
 
 | 通道 | 路径 | 编码 |
 | --- | --- | --- |
 | HTTP | `/health`、`/api/auth/*` | HTTP JSON |
-| WebSocket | `/ws` | 二进制 MessagePack，`msgpack+nexus-console-v1` |
+| WebSocket | `/ws` | 二进制 MessagePack，`msgpack+andrias-console-v1` |
 
 ## HTTP 路由
 
-控制台 HTTP 路由由 `nexus-console::router` 提供：
+控制台 HTTP 路由由 `andrias-console::router` 提供：
 
 | 路径 | 方法 | 用途 |
 | --- | --- | --- |
@@ -95,10 +95,10 @@ HTTP 认证错误映射：
 
 ## 编码
 
-线缆编码名是 `msgpack+nexus-console-v1`，协议版本是 `1`。
+线缆编码名是 `msgpack+andrias-console-v1`，协议版本是 `1`。
 
 帧是与 serde 兼容的 MessagePack 值。服务端用具名字段编码帧。
-`ActionCall.input`、`ActionResult.output`、流输入和事件里的 Nexus `Value`
+`ActionCall.input`、`ActionResult.output`、流输入和事件里的 Andrias `Value`
 载荷会封装在 `JsonBytes` 中；`JsonBytes` 是外层 MessagePack 帧里的 JSON 字符串。
 
 ## 会话顺序
@@ -108,7 +108,7 @@ HTTP 认证错误映射：
 1. 通过 HTTP 登录，保存 `LoginResponse.token`。
 2. 打开控制台 `/ws`。
 3. 发送 `ClientFrame::Hello { hello }`，其中 `protocol_version = 1`，
-   `accepted_encodings` 包含 `msgpack+nexus-console-v1`。
+   `accepted_encodings` 包含 `msgpack+andrias-console-v1`。
 4. 接收 `ServerFrame::HelloAccepted { metadata }`。
 5. 发送 `ClientFrame::Auth { token }`。
 6. 接收 `ServerFrame::Authenticated { principal, metadata }`。
@@ -142,7 +142,7 @@ HTTP 认证错误映射：
 | 字段 | 含义 |
 | --- | --- |
 | `action` | 动作 ID，例如 `config.read` 或 `state.snapshot`。 |
-| `input` | Nexus `Value` 的 JSON 字符串，封装在 `JsonBytes` 中。 |
+| `input` | Andrias `Value` 的 JSON 字符串，封装在 `JsonBytes` 中。 |
 | `scope` | 可选可见性或高风险访问范围。 |
 | `justification` | 可选操作理由。 |
 | `ttl_ms` | 可选临时授权持续时间。 |

@@ -1,26 +1,26 @@
 [workspace]
 resolver = "2"
-# All crates build without `protoc`: `nexus-proto` ships hand-vendored prost/
-# tonic bindings (crates/nexus-proto/src/{common,gateway,extension}.rs), so the
+# All crates build without `protoc`: `andrias-proto` ships hand-vendored prost/
+# tonic bindings (crates/andrias-proto/src/{common,external,program}.rs), so the
 # whole workspace — proto and the gRPC gateway included — is one default build
 # set. No `default-members` carve-out is needed.
 members = [
-    "crates/nexus-types",
-    "crates/nexus-graph",
-    "crates/nexus-state",
-    "crates/nexus-kernel",
-    "crates/nexus-storage-redb",
-    "crates/nexus-plan",
-    "crates/nexus-standard",
-    "crates/nexus-gateway",
-    "crates/nexus-proto",
-    "crates/nexus-gateway-grpc",
-    "crates/nexus-gateway-mcp",
-    "crates/nexus-sim",
-    "crates/nexus-sdk",
-    "crates/nexus-daemon",
-    "crates/nexus-console",
-    "crates/nexus-gateway-websocket",
+    "crates/andrias-types",
+    "crates/andrias-graph",
+    "crates/andrias-state",
+    "crates/andrias-kernel",
+    "crates/andrias-storage-redb",
+    "crates/andrias-plan",
+    "crates/andrias-standard",
+    "crates/andrias-gateway",
+    "crates/andrias-proto",
+    "crates/andrias-gateway-grpc",
+    "crates/andrias-gateway-mcp",
+    "crates/andrias-sim",
+    "crates/andrias-sdk",
+    "crates/andrias-daemon",
+    "crates/andrias-console",
+    "crates/andrias-gateway-websocket",
 ]
 
 [workspace.package]
@@ -29,7 +29,7 @@ edition      = "2024"
 rust-version = "1.95"
 license      = "MIT"
 authors      = ["noctiro"]
-repository   = "https://github.com/noctiro/nexus"
+repository   = "https://github.com/andrias-dev/andrias"
 description  = "Capability runtime for model calls, tool access, memory, state, and extensions"
 
 [workspace.lints.rust]
@@ -61,20 +61,20 @@ unwrap_in_result = "deny"
 unwrap_used = "deny"
 
 [workspace.dependencies]
-nexus-standard = { version = "0.1.0", path = "crates/nexus-standard", default-features = false }
-nexus-console = { version = "0.1.0", path = "crates/nexus-console" }
-nexus-gateway = { version = "0.1.0", path = "crates/nexus-gateway" }
-nexus-gateway-grpc = { version = "0.1.0", path = "crates/nexus-gateway-grpc" }
-nexus-gateway-mcp = { version = "0.1.0", path = "crates/nexus-gateway-mcp" }
-nexus-gateway-websocket = { version = "0.1.0", path = "crates/nexus-gateway-websocket" }
-nexus-graph = { version = "0.1.0", path = "crates/nexus-graph" }
-nexus-kernel = { version = "0.1.0", path = "crates/nexus-kernel" }
-nexus-plan = { version = "0.1.0", path = "crates/nexus-plan" }
-nexus-proto = { version = "0.1.0", path = "crates/nexus-proto" }
-nexus-sdk = { version = "0.1.0", path = "crates/nexus-sdk" }
-nexus-state = { version = "0.1.0", path = "crates/nexus-state" }
-nexus-storage-redb = { version = "0.1.0", path = "crates/nexus-storage-redb" }
-nexus-types = { version = "0.1.0", path = "crates/nexus-types" }
+andrias-standard = { version = "0.1.0", path = "crates/andrias-standard", default-features = false }
+andrias-console = { version = "0.1.0", path = "crates/andrias-console" }
+andrias-gateway = { version = "0.1.0", path = "crates/andrias-gateway" }
+andrias-gateway-grpc = { version = "0.1.0", path = "crates/andrias-gateway-grpc" }
+andrias-gateway-mcp = { version = "0.1.0", path = "crates/andrias-gateway-mcp" }
+andrias-gateway-websocket = { version = "0.1.0", path = "crates/andrias-gateway-websocket" }
+andrias-graph = { version = "0.1.0", path = "crates/andrias-graph" }
+andrias-kernel = { version = "0.1.0", path = "crates/andrias-kernel" }
+andrias-plan = { version = "0.1.0", path = "crates/andrias-plan" }
+andrias-proto = { version = "0.1.0", path = "crates/andrias-proto" }
+andrias-sdk = { version = "0.1.0", path = "crates/andrias-sdk" }
+andrias-state = { version = "0.1.0", path = "crates/andrias-state" }
+andrias-storage-redb = { version = "0.1.0", path = "crates/andrias-storage-redb" }
+andrias-types = { version = "0.1.0", path = "crates/andrias-types" }
 
 anyhow = { version = "1.0.102", default-features = false }
 argon2 = { version = "0.5.3", default-features = false }

@@ -1,9 +1,9 @@
-# Nexus Manual
+# Andrias Manual
 
-Nexus is a capability runtime for model-backed applications. It maps model
+Andrias is a capability runtime for model-backed applications. It maps model
 inference, tool calls, memory, state, and outside systems into `effect://` and
 `state://` resources so programs access them through handles compiled by
-`open()`. Nexus supplies the execution boundary between model calls, tool
+`open()`. Andrias supplies the execution boundary between model calls, tool
 execution, long-lived state, and external protocols. Model training,
 application UI, and business logic stay outside this runtime.
 
@@ -34,7 +34,7 @@ Use the operational pages when you need a boundary or deployment answer:
 | Choose a listener or protocol | [Gateways](gateways.md) |
 | Connect Provider or Source programs | [External Gateway](external-gateway.md) |
 | Build a console client | [Console Protocol](console-protocol.md) |
-| Configure `nexusd` | [Configuration](configuration.md) |
+| Configure `andriasd` | [Configuration](configuration.md) |
 | Configure HTTP model providers | [HTTP Inference Providers](http-inference-providers.md) |
 | Find Rust API contracts | [API Reference](api-reference.md) |
 

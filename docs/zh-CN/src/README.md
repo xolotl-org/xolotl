@@ -1,6 +1,6 @@
-# Nexus 手册
+# Andrias 手册
 
-Nexus 是面向模型应用的能力运行时。它把模型推理、工具调用、记忆、状态和外部系统映射为 `effect://` 与 `state://` 资源。程序通过 `open()` 编译出的能力句柄访问这些资源。Nexus 的范围是模型调用、工具执行、长期状态和外部协议之间的执行边界；模型训练、应用界面和业务逻辑由调用方或外部组件承担。
+Andrias 是面向模型应用的能力运行时。它把模型推理、工具调用、记忆、状态和外部系统映射为 `effect://` 与 `state://` 资源。程序通过 `open()` 编译出的能力句柄访问这些资源。Andrias 的范围是模型调用、工具执行、长期状态和外部协议之间的执行边界；模型训练、应用界面和业务逻辑由调用方或外部组件承担。
 
 这份手册是当前已实现运行时的中文公开叙述文档。它和 Rust API 参考分工不同：
 
@@ -24,7 +24,7 @@ Nexus 是面向模型应用的能力运行时。它把模型推理、工具调�
 | 选择监听地址或协议 | [网关](gateways.md) |
 | 接入 Provider 或 Source 程序 | [External Gateway](external-gateway.md) |
 | 构建控制台客户端 | [控制台协议](console-protocol.md) |
-| 配置 `nexusd` | [配置](configuration.md) |
+| 配置 `andriasd` | [配置](configuration.md) |
 | 配置 HTTP 模型 Provider | [HTTP 推理 Provider](http-inference-providers.md) |
 | 查 Rust API 契约 | [API 参考](api-reference.md) |
 
