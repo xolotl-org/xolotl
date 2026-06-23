@@ -4,9 +4,9 @@ Xolotl 是面向模型应用的能力运行时。它把模型推理、工具调�
 
 这份手册是当前已实现运行时的中文公开叙述文档。它和 Rust API 参考分工不同：
 
-- 用这份手册理解运行时模型、操作边界和工作区结构。
-- 用 Rustdoc 查看 Rust 包、模块、类型、trait（特征）、方法和错误的公开契约。
-- 随着示例增加，用 `examples/` 和 Rust 包测试作为可执行文档。
+- 用这份手册理解运行时模型、操作边界和工作区结构
+- 用 Rustdoc 查看 Rust 包、模块、类型、trait（特征）、方法和错误的公开契约
+- 随着示例增加，用 `examples/` 和 Rust 包测试作为可执行文档
 
 英文手册的 HTML 版本在运行 `mdbook build docs` 后位于：
 [`docs/book/index.html`](../../book/index.html)。
@@ -32,9 +32,9 @@ Xolotl 是面向模型应用的能力运行时。它把模型推理、工具调�
 
 | 层次 | 位置 | 用途 |
 | --- | --- | --- |
-| 概览 | `README.md` / `README.zh-CN.md` | 项目概要、构建命令、运行命令和文档入口。 |
-| 手册 | `docs/src/*.md` / `docs/zh-CN/src/*.md` | 运行时概念、操作行为和组件关系。 |
-| API 参考 | `target/doc/` | `cargo doc` 生成的 Rust 包和条目契约。 |
+| 概览 | `README.md` / `README.zh-CN.md` | 项目概要、构建命令、运行命令和文档入口 |
+| 手册 | `docs/src/*.md` / `docs/zh-CN/src/*.md` | 运行时概念、操作行为和组件关系 |
+| API 参考 | `target/doc/` | `cargo doc` 生成的 Rust 包和条目契约 |
 
 需要安装 mdBook 时运行：
 

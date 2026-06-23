@@ -24,10 +24,10 @@ I/O 和其它效果通过操作节点发生，而不是通过步骤函数发生�
 
 | 纯度 | 重放行为 |
 | --- | --- |
-| `Pure` / `Deterministic` | 安全时可重新计算或重新读取。 |
-| `Observation` | 在被消费时记录观察到的外部值或持久值。 |
-| `IdempotentEffect` | 可通过有效幂等键去重。 |
-| `NonIdempotentEffect` | 发出效果前必须先写入预备记录。 |
+| `Pure` / `Deterministic` | 安全时可重新计算或重新读取 |
+| `Observation` | 在被消费时记录观察到的外部值或持久值 |
+| `IdempotentEffect` | 可通过有效幂等键去重 |
+| `NonIdempotentEffect` | 发出效果前必须先写入预备记录 |
 
 事实流是重放使用的记录。恢复会分类这些记录，为已完成结果构建重放映射，并隔离不安全的待处理非幂等效果。
 

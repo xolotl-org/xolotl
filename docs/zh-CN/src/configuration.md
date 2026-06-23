@@ -18,14 +18,14 @@ cargo run -p xolotl-daemon -- up
 
 | 配置段 | 用途 |
 | --- | --- |
-| `[storage]` | 选择 redb 持久存储或内存存储。 |
-| `[server]` | 通过 `console_addr`、`external_grpc_addr` 和 `external_websocket_addr` 绑定监听器。 |
-| `[external_gateway.grpc]` | 设置 external gRPC 监听器的 Provider/Source session 限制。 |
-| `[external_gateway.websocket]` | 设置 external WebSocket 监听器的同一组 Provider/Source session 限制。 |
-| `[external_gateway.websocket.transport]` | 设置 WebSocket frame 大小、first-frame 超时、idle 超时和总连接数。 |
-| `[console.root]` | 预置 root 凭据。 |
-| `[console.auth]` | 设置会话 TTL、会话数量和 Argon2 校验并发限制。 |
-| `[console.ws]` | 设置控制台 WebSocket 的 frame、连接数、idle、速率、订阅数、结果大小和事件背压限制。 |
+| `[storage]` | 选择 redb 持久存储或内存存储 |
+| `[server]` | 通过 `console_addr`、`external_grpc_addr` 和 `external_websocket_addr` 绑定监听器 |
+| `[external_gateway.grpc]` | 设置 external gRPC 监听器的 Provider/Source session 限制 |
+| `[external_gateway.websocket]` | 设置 external WebSocket 监听器的同一组 Provider/Source session 限制 |
+| `[external_gateway.websocket.transport]` | 设置 WebSocket frame 大小、first-frame 超时、idle 超时和总连接数 |
+| `[console.root]` | 预置 root 凭据 |
+| `[console.auth]` | 设置会话 TTL、会话数量和 Argon2 校验并发限制 |
+| `[console.ws]` | 设置控制台 WebSocket 的 frame、连接数、idle、速率、订阅数、结果大小和事件背压限制 |
 
 对应 `[server]` 字段缺失时，`xolotld` 还会读取 `XOLOTL_CONSOLE_ADDR`、`XOLOTL_EXTERNAL_GRPC_ADDR` 和 `XOLOTL_EXTERNAL_WEBSOCKET_ADDR`。配置字段和环境变量都缺失时，该监听保持关闭。
 

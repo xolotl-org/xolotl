@@ -6,7 +6,7 @@
 
 ## 接入口
 
-当 `[server]` 中的配置字段存在，或对应环境变量存在时，`xolotld` 会启动该通道。`xolotl-daemon` 默认启用 `external-grpc` 和 `external-websocket`；可以用 `--no-default-features --features external-grpc` 或 `--no-default-features --features external-websocket` 只构建其中一种 transport。
+当 `[server]` 中的配置字段存在，或对应环境变量存在时，`xolotld` 会启动该通道。`xolotl-daemon` 默认启用 `external-grpc` 和 `external-websocket`；可以用 `--no-default-features --features external-grpc` 或 `--no-default-features --features external-websocket` 只构建其中一种 transport
 
 | 接口 | 配置字段 | 环境变量 | 路径或服务 | 编码 |
 | --- | --- | --- | --- | --- |
@@ -17,8 +17,8 @@
 
 控制台 WebSocket 和 external WebSocket 都挂在 `/ws`，通过监听地址和帧编码区分：
 
-- 控制台 WebSocket 使用 `[server].console_addr` 和 MessagePack 控制台帧。
-- External WebSocket 使用 `[server].external_websocket_addr` 和二进制 Provider/Source session frame。
+- 控制台 WebSocket 使用 `[server].console_addr` 和 MessagePack 控制台帧
+- External WebSocket 使用 `[server].external_websocket_addr` 和二进制 Provider/Source session frame
 
 ## 如何选择接口
 

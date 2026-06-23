@@ -1,51 +1,40 @@
 # Xolotl
 
-Xolotl is a capability runtime for model-backed applications. It maps model
-inference, tool calls, memory, state, and outside systems into `effect://` and
-`state://` resources so programs access them through handles compiled by
-`open()`. Model backends, tool processes, state stores, and external programs
-remain behind resource bindings, drivers, or Provider/Source projections.
+> [!WARNING]
+> Xolotl is pre-v1. Runtime behavior, configuration paths, protobuf schemas,
+> and gateway protocols may change without compatibility guarantees.
 
-Xolotl supplies the execution boundary between model calls, tool execution,
-long-lived state, and external protocols. Model training, application UI, and
-business logic stay outside this runtime. Every access goes through the same
-`Resource / Interface / Driver`, `open()` handle, and capability-check path.
+Xolotl is a Rust runtime for programs that need to call models, tools, state,
+and external connectors without handing every caller raw access.
+
+A caller runs as a `Process`. It opens a `Resource` such as
+`effect://inference/infer` or `state://memory/alice/thread` and receives a
+process-owned `Handle`. The kernel checks grants and policy, dispatches through
+a `Driver` or an external Provider/Source session, and records `Fact`s for
+audit, replay, and recovery.
+
+Use `xolotld` when you want a daemon with Console, external gRPC, and external
+WebSocket listeners. Use `xolotl-sdk` when another Rust program should embed the
+kernel. In both cases, the application layer keeps model selection policy,
+user-facing UI, and business logic outside the runtime and calls Xolotl through
+resources and operations.
 
 Chinese documentation: [README.zh-CN.md](README.zh-CN.md)
 
-## Implemented Features
+## Features
 
-- Model execution: `effect://inference/*` supports infer, embed, rerank, and
-  plan. Model routing selects backends by capability, modality, group policy,
-  retry, and fallback.
-- Tool access: MCP tools, files, terminal commands, fetch, time, events, locks,
-  blobs, tensors, approvals, and compression are registered as effect resources.
-- Memory and context: the memory driver combines the state backend, vector
-  index, and ranker; context assembly and compression are separate effects.
-- External programs: external programs connect as Provider or Source
-  projections through the external gateway.
-- Capability boundary: `open()` compiles resource paths, grants, policies, and
-  bindings into process-owned handles; spawned processes receive attenuated
-  rights.
-- Program execution: Rust `DoNode`, Plan documents, and the protobuf `Program`
-  AST lower to one execution graph and one executor.
-
-## Status
-
-The core runtime and the external Provider/Source gateway are implemented.
-Xolotl has not shipped a first release, and the current gateway/config/protobuf
-contract is defined by the external Provider/Source model.
-
-External access has one role model:
-
-- Provider projections expose remote effect handlers.
-- Source projections emit inbound events and can receive outbound commands.
-- gRPC and WebSocket are transport implementations for the same external
-  Provider/Source gateway.
-
-MCP publishes selected Gateway publications as tools, resources, resource
-templates, and prompts. MCP requests are submitted through the same Gateway
-surfaces as other protocol adapters.
+- Resources and process-owned Handles are the access boundary for model calls,
+  tools, memory, state, and external systems.
+- `open()` compiles grants, policy, bindings, and driver plans before
+  execution; operations run on ids and rights bitmaps.
+- Child Processes receive attenuated grants. Named long-running work uses
+  `ActorSpec` while remaining a Process.
+- External programs enter as Provider or Source projections over gRPC or
+  WebSocket, with one gateway session model for both transports.
+- `xolotld` and `xolotl-sdk` use the same kernel. Hosts can replace state,
+  facts, drivers, policy sources, and model backends.
+- Durable programs compile to `ExecutionGraph` with shared operation boundaries
+  for replay, recovery, audit, and simulation.
 
 ## Documentation
 
@@ -73,7 +62,7 @@ Rustdoc output is written to `target/doc/index.html`.
 
 ## Architecture
 
-The hot path is deliberately small:
+An operation follows this path:
 
 ```text
 Process
@@ -84,7 +73,7 @@ Process
   producing Outcome and Fact
 ```
 
-Xolotl separates the runtime into four code paths:
+The runtime has four code paths:
 
 - Control path: registry, naming, admission, policy compilation, binding
   resolution, and `open()` handle compilation.
@@ -114,17 +103,16 @@ Xolotl separates the runtime into four code paths:
 | `xolotl-plan`, `xolotl-sim` | Planning and simulation crates. |
 
 `xolotl-standard` uses Cargo features to choose which modules are built. The
-default `standard` feature builds the standard in-process implementations.
-Embedded hosts can choose a smaller installed module set with
-`StandardConfig::with_modules` and can provide their own model backend for
-standard model-backed effects with `StandardConfig::with_inference_backend`.
-Gateway crates use only `external-session`, which contains session
-handling for external Provider and Source endpoints.
+default `standard` feature enables the standard in-process implementations.
+Embedded hosts can install a smaller module set with
+`StandardConfig::with_modules` and can provide a model backend with
+`StandardConfig::with_inference_backend`. Gateway crates use only
+`external-session`, the shared session code for external Provider and Source
+endpoints.
 
-`xolotl-sdk` defaults to a minimal in-memory kernel. Embedded hosts use
-`XolotlBuilder` to provide their own state backend and fact sink. Standard
-providers are installed explicitly by enabling the SDK `standard` feature or by
-calling `xolotl-standard` directly.
+`xolotl-sdk` starts with a minimal in-memory kernel. Embedded hosts provide
+state and facts through `XolotlBuilder`. Standard providers are opt-in through
+the SDK `standard` feature or direct `xolotl-standard` installation.
 `ActorSpec` is available through `xolotl-graph` and `xolotl-sdk`; the kernel can
 spawn it as a named long-lived Process through `Bootstrap::spawn_actor_under` or
 `Xolotl::spawn_actor`. If the body or finalizers reference process-local
@@ -132,13 +120,6 @@ spawn it as a named long-lived Process through `Bootstrap::spawn_actor_under` or
 `Bootstrap::spawn_actor_under_with_steps` or `Xolotl::spawn_actor_with_steps`.
 Actor declarations may use `state://process/self/...`; spawn binds it to the
 concrete Process id before linting and execution.
-
-## Requirements
-
-- Rust 1.95 or newer.
-- Cargo from the matching stable toolchain.
-- No local `protoc` installation is required. `xolotl-proto` includes vendored
-  prost/tonic Rust bindings.
 
 ## Build And Test
 
@@ -282,17 +263,6 @@ write://state/kernel/config
 
 Path parameters are rejected. Put options in structured values, explicit
 resource segments, or policy/config state.
-
-## Development Notes
-
-- Keep parsing, discovery, policy source handling, and schema work in the
-  control path.
-- Keep the data path limited to compiled IDs, handles, driver plans, policy
-  snapshots, operations, outcomes, and facts.
-- External protocol crates stay thin adapters over the gateway, console, or
-  kernel runtime APIs.
-- Protocol changes update proto, vendored bindings, conversions, tests,
-  examples, and public docs together.
 
 ## License
 

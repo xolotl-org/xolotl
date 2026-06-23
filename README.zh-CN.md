@@ -1,33 +1,29 @@
 # Xolotl
 
-Xolotl 是面向模型应用的能力运行时。它把模型推理、工具调用、记忆、状态和外部系统映射为
-`effect://` 与 `state://` 资源。程序通过 `open()` 编译出的句柄访问这些资源。模型后端、工具进程、状态存储和外部程序分别位于资源绑定、driver 或
-Provider/Source projection 后面。
+> [!WARNING]
+> Xolotl 还处于 v1 前阶段。运行时行为、配置路径、protobuf schema 和 gateway
+> 协议都可能变化，暂不提供兼容性保证。
 
-Xolotl 负责模型调用、工具执行、长期状态和外部协议之间的执行边界。模型训练、应用界面和业务逻辑在运行时外部。所有访问都经过同一套 `Resource / Interface / Driver`、`open()` 句柄和能力检查路径。
+Xolotl 是一个 Rust 运行时，用于让程序调用模型、工具、状态和外部连接器，同时避免把原始访问权直接交给每个调用方。
+
+调用方以 `Process` 运行。它打开 `effect://inference/infer` 或
+`state://memory/alice/thread` 这样的 `Resource`，拿到属于该进程的
+`Handle`。内核检查授权和策略，通过 `Driver` 或外部 Provider/Source session 分派请求，并记录
+`Fact`，用于审计、重放和恢复。
+
+需要 daemon 时使用 `xolotld`，它提供 Console、external gRPC 和 external WebSocket
+监听器。需要嵌入另一个 Rust 程序时使用 `xolotl-sdk`。两种形态下，应用层仍然持有模型选择策略、用户界面和业务逻辑，并通过资源和操作调用 Xolotl。
 
 英文默认文档：[README.md](README.md)
 
-## 已实现功能
+## 特性
 
-- 模型执行：`effect://inference/*` 支持推理、嵌入、重排和计划；模型路由按能力、模态、组策略、重试和回退选择后端。
-- 工具接入：MCP 工具、文件、终端、网络抓取、时间、事件、锁、blob、tensor、审批和压缩都注册为 effect 资源。
-- 记忆与上下文：记忆驱动结合状态后端、向量索引和重排器；上下文组装和压缩是独立 effect。
-- 外部程序：外部程序通过 external gateway 以 Provider 或 Source projection 接入。
-- 能力边界：`open()` 把资源路径、授权、策略和绑定编译为进程持有的句柄；派生进程只能获得衰减权限。
-- 程序执行：Rust `DoNode`、Plan 文档和 protobuf `Program` AST 都会落到同一个执行图，由同一个执行器推进。
-
-## 当前状态
-
-核心运行时和 external Provider/Source gateway 已经实现。Xolotl 还没有发布第一版，当前 gateway/config/protobuf 契约由 external Provider/Source 模型定义。
-
-外部接入只有一套角色模型：
-
-- Provider projection 暴露远端 effect handler。
-- Source projection 发送入站事件，也可以接收 outbound command。
-- gRPC 和 WebSocket 是同一个 external Provider/Source gateway 的两种传输实现。
-
-MCP 把选定 Gateway publication 发布为 tool、resource、resource template 和 prompt。MCP 请求通过与其他协议适配器相同的 Gateway surface 提交。
+- Resource 和进程持有的 Handle 是模型调用、工具、记忆、状态和外部系统的访问边界
+- `open()` 在执行前编译授权、策略、绑定和驱动计划；操作热路径只处理 ID 和权限位图
+- 子 Process 只获得衰减后的授权。命名长寿任务使用 `ActorSpec`，但仍然是 Process
+- 外部程序通过 gRPC 或 WebSocket 以 Provider/Source projection 接入，并共用 gateway session 模型
+- `xolotld` 和 `xolotl-sdk` 共用一个内核；宿主可以替换状态、事实记录、驱动、策略来源和模型后端
+- 持久程序会编译为 `ExecutionGraph`，重放、恢复、审计和仿真共用操作边界
 
 ## 文档
 
@@ -55,7 +51,7 @@ Rustdoc 输出在 `target/doc/index.html`。
 
 ## 架构
 
-热路径保持很小：
+一次操作的路径如下：
 
 ```text
 Process
@@ -66,55 +62,41 @@ Process
   producing Outcome and Fact
 ```
 
-这些行对应代码中的 `Process`、`Handle`、`Resource.method`、`Operation`、`DriverPlan`、`PolicySnapshot`、`Outcome` 和 `Fact`。
-
 运行时分成四类代码路径：
 
-- 控制路径：注册表、命名、准入、策略编译、绑定解析和 `open()` 句柄编译。
-- 数据路径：围绕 `Process`、`Handle`、`Operation` 和 `Fact` 做固定成本执行。
-- 外部适配：Provider、Source、driver 和协议适配器。
-- 程序执行：可恢复的 `Do<A>` 程序和执行图。
+- 控制路径：注册表、命名、准入、策略编译、绑定解析和 `open()` 句柄编译
+- 数据路径：围绕 `Process`、`Handle`、`Operation` 和 `Fact` 做固定成本执行
+- 外部适配：Provider、Source、driver 和协议适配器
+- 程序执行：可恢复的 `Do<A>` 程序和执行图
 
 ## 工作区
 
 | Rust 包 | 职责 |
 | --- | --- |
-| `xolotl-types` | 核心 ID、路径、值、能力、操作、审计类型和 external Provider/Source 数据。 |
-| `xolotl-graph` | 可恢复 `Do<A>` 程序中间表示和执行图编译器。 |
-| `xolotl-state` | 状态后端 trait 与内存实现。 |
-| `xolotl-kernel` | 进程、句柄、注册表、策略、执行器、恢复、事实记录。 |
-| `xolotl-storage-redb` | 基于 redb 的持久状态和 `FactStore`。 |
-| `xolotl-standard` | 标准进程内 Provider 和 Source 实现。 |
-| `xolotl-gateway` | external 协议适配器共享的 session 准入、流控、taint 和 audit 代码。 |
-| `xolotl-gateway-grpc` | 使用 `xolotl-proto` 的 external Provider/Source gRPC 适配器。 |
-| `xolotl-gateway-websocket` | external Provider/Source WebSocket 适配器。 |
-| `xolotl-gateway-mcp` | 把选定 Gateway publication 暴露为 MCP tool、resource、resource template 和 prompt 的服务端适配器。 |
-| `xolotl-proto` | Protobuf schema 和随仓库提供的 prost/tonic 绑定。 |
-| `xolotl-console` | Web 控制台管理动作的 gateway。 |
-| `xolotl-daemon` | 长期运行的宿主进程 `xolotld`。 |
-| `xolotl-sdk` | 最小嵌入式运行时门面和便捷导出。 |
-| `xolotl-plan`, `xolotl-sim` | 规划与仿真 crate。 |
+| `xolotl-types` | 核心 ID、路径、值、能力、操作、审计类型和 external Provider/Source 数据 |
+| `xolotl-graph` | 可恢复 `Do<A>` 程序中间表示和执行图编译器 |
+| `xolotl-state` | 状态后端 trait 与内存实现 |
+| `xolotl-kernel` | 进程、句柄、注册表、策略、执行器、恢复、事实记录 |
+| `xolotl-storage-redb` | 基于 redb 的持久状态和 `FactStore` |
+| `xolotl-standard` | 标准进程内 Provider 和 Source 实现 |
+| `xolotl-gateway` | external 协议适配器共享的 session 准入、流控、taint 和 audit 代码 |
+| `xolotl-gateway-grpc` | 使用 `xolotl-proto` 的 external Provider/Source gRPC 适配器 |
+| `xolotl-gateway-websocket` | external Provider/Source WebSocket 适配器 |
+| `xolotl-gateway-mcp` | 把选定 Gateway publication 暴露为 MCP tool、resource、resource template 和 prompt 的服务端适配器 |
+| `xolotl-proto` | Protobuf schema 和随仓库提供的 prost/tonic 绑定 |
+| `xolotl-console` | Web 控制台管理动作的 gateway |
+| `xolotl-daemon` | 长期运行的宿主进程 `xolotld` |
+| `xolotl-sdk` | 最小嵌入式运行时门面和便捷导出 |
+| `xolotl-plan`, `xolotl-sim` | 规划与仿真 crate |
 
-`xolotl-standard` 使用 Cargo feature 选择要编译的模块。默认 `standard` 会编译标准进程内
-实现。嵌入式宿主可以用 `StandardConfig::with_modules` 选择更小的安装模块集合，
-也可以用 `StandardConfig::with_inference_backend` 为标准模型类 effect 提供自己的模型 backend。
-gateway 相关 crate 只启用 `external-session`，其中包含
-external Provider 和 Source endpoint 的 session 处理代码。
+`xolotl-standard` 使用 Cargo feature 选择要编译的模块。默认 `standard` feature 启用标准进程内实现。嵌入式宿主可以用 `StandardConfig::with_modules` 安装更小的模块集合，也可以用 `StandardConfig::with_inference_backend` 提供模型 backend。gateway 相关 crate 只启用 `external-session`，也就是 external Provider 和 Source endpoint 共用的 session 代码。
 
-`xolotl-sdk` 默认只构建最小内存内核。嵌入式宿主通过 `XolotlBuilder` 提供自己的状态后端
-和事实记录接收端。标准 Provider 通过 SDK 的 `standard` feature 或 `xolotl-standard`
-安装入口接入。
+`xolotl-sdk` 默认启动最小内存内核。嵌入式宿主通过 `XolotlBuilder` 提供状态后端和事实记录接收端。标准 Provider 通过 SDK 的 `standard` feature 或 `xolotl-standard` 安装入口接入。
 `ActorSpec` 可通过 `xolotl-graph` 和 `xolotl-sdk` 使用；内核可以通过
 `Bootstrap::spawn_actor_under` 把它启动为命名长寿 Process，SDK 也提供
 `Xolotl::spawn_actor` 便捷入口。body 或终结器如果引用进程本地 `StepRef`，宿主应在启动时
 通过 `Bootstrap::spawn_actor_under_with_steps` 或 `Xolotl::spawn_actor_with_steps`
 传入对应函数。Actor 声明可以使用 `state://process/self/...`；启动时会在 lint 和执行前绑定为具体 Process id。
-
-## 环境要求
-
-- Rust 1.95 或更新版本。
-- 与稳定版工具链匹配的 Cargo。
-- 不需要本地安装 `protoc`。`xolotl-proto` 已包含随仓库提供的 prost/tonic Rust 绑定。
 
 ## 构建与测试
 
@@ -163,13 +145,13 @@ transport。
 
 `xolotl.toml` 是引导配置。它控制存储、监听绑定地址、root 引导凭据、external gateway 限制、gateway 传输安全设置和控制台资源上限。
 
-- `[server]`：控制台、external gRPC 和 external WebSocket 绑定地址。
-- `[external_gateway.grpc]`：external gRPC 的 Provider/Source session 限制。
-- `[external_gateway.grpc.transport_security]`：external gRPC 传输边界。
-- `[external_gateway.websocket]`：external WebSocket 的 Provider/Source session 限制。
-- `[external_gateway.websocket.transport]`：WebSocket frame、idle、first-frame 和连接数限制。
-- `[external_gateway.websocket.transport_security]`：external WebSocket 明文监听器的传输边界。
-- `[console.*]`：控制台 root 凭据、认证/会话限制、WebSocket 限制和传输安全。
+- `[server]`：控制台、external gRPC 和 external WebSocket 绑定地址
+- `[external_gateway.grpc]`：external gRPC 的 Provider/Source session 限制
+- `[external_gateway.grpc.transport_security]`：external gRPC 传输边界
+- `[external_gateway.websocket]`：external WebSocket 的 Provider/Source session 限制
+- `[external_gateway.websocket.transport]`：WebSocket frame、idle、first-frame 和连接数限制
+- `[external_gateway.websocket.transport_security]`：external WebSocket 明文监听器的传输边界
+- `[console.*]`：控制台 root 凭据、认证/会话限制、WebSocket 限制和传输安全
 
 运行时配置、Provider 设置、模型路由、组、绑定、外部程序安装、Provider projection、Source projection 和策略管理状态都属于 Xolotl state，并通过 Console WebSocket 管理。
 
@@ -229,13 +211,6 @@ write://state/kernel/config
 ```
 
 路径参数会被拒绝。选项放进结构化值、显式资源段或策略/配置 state。
-
-## 开发说明
-
-- 解析、发现、策略源处理和 schema 工作保持在控制路径。
-- 数据路径只处理已编译 ID、句柄、driver plan、policy snapshot、operation、outcome 和 fact。
-- 外部协议 crate 保持为 gateway、console 或 kernel runtime API 的薄适配器。
-- 协议变更同时更新 proto、随仓库绑定、转换、测试、示例和公开文档。
 
 ## 许可证
 

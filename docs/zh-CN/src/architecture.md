@@ -38,22 +38,22 @@ Xolotl 让执行热路径保持很小：
 
 | Rust 包 | 职责 |
 | --- | --- |
-| `xolotl-types` | 核心 ID、路径、值、能力、操作、审计、跟踪、外接和进程数据。 |
-| `xolotl-graph` | `DoNode`、`ExecutionGraph`、图编译器、游标和行为体检查。 |
-| `xolotl-state` | 状态后端 trait（特征）和内存实现。 |
-| `xolotl-kernel` | 注册表、策略、句柄表、执行路径、执行器、进程表、恢复和引导。 |
-| `xolotl-storage-redb` | 基于 redb 的状态和事实记录存储。 |
-| `xolotl-standard` | 标准进程内 Provider 和 Source 实现。 |
-| `xolotl-gateway` | external 协议适配器共享的 session 准入、流控、taint 和 audit 代码。 |
-| `xolotl-gateway-grpc` | External Provider/Source gRPC 适配器。 |
-| `xolotl-gateway-websocket` | External Provider/Source WebSocket 适配器。 |
-| `xolotl-gateway-mcp` | 把选定 Gateway publication kind 暴露为 MCP 对象的服务端适配器。 |
-| `xolotl-proto` | Protobuf 模式定义和随仓库提供的 Rust 绑定。 |
-| `xolotl-console` | Web 控制台管理动作的 gateway。 |
-| `xolotl-daemon` | 长期运行的宿主进程 `xolotld`。 |
-| `xolotl-sdk` | 最小进程内嵌入式内核门面。 |
-| `xolotl-plan` | 计划文档解析和转换。 |
-| `xolotl-sim` | 确定性仿真和重放辅助工具。 |
+| `xolotl-types` | 核心 ID、路径、值、能力、操作、审计、跟踪、外接和进程数据 |
+| `xolotl-graph` | `DoNode`、`ExecutionGraph`、图编译器、游标和行为体检查 |
+| `xolotl-state` | 状态后端 trait（特征）和内存实现 |
+| `xolotl-kernel` | 注册表、策略、句柄表、执行路径、执行器、进程表、恢复和引导 |
+| `xolotl-storage-redb` | 基于 redb 的状态和事实记录存储 |
+| `xolotl-standard` | 标准进程内 Provider 和 Source 实现 |
+| `xolotl-gateway` | external 协议适配器共享的 session 准入、流控、taint 和 audit 代码 |
+| `xolotl-gateway-grpc` | External Provider/Source gRPC 适配器 |
+| `xolotl-gateway-websocket` | External Provider/Source WebSocket 适配器 |
+| `xolotl-gateway-mcp` | 把选定 Gateway publication kind 暴露为 MCP 对象的服务端适配器 |
+| `xolotl-proto` | Protobuf 模式定义和随仓库提供的 Rust 绑定 |
+| `xolotl-console` | Web 控制台管理动作的 gateway |
+| `xolotl-daemon` | 长期运行的宿主进程 `xolotld` |
+| `xolotl-sdk` | 最小进程内嵌入式内核门面 |
+| `xolotl-plan` | 计划文档解析和转换 |
+| `xolotl-sim` | 确定性仿真和重放辅助工具 |
 
 ## 嵌入式宿主
 
