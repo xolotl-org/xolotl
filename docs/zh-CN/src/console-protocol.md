@@ -12,7 +12,7 @@
 | 通道 | 路径 | 编码 |
 | --- | --- | --- |
 | HTTP | `/health`、`/api/auth/*` | HTTP JSON |
-| WebSocket | `/ws` | 二进制 MessagePack，`msgpack+xolotl-console-v1` |
+| WebSocket | `/ws` | 二进制 protobuf `ConsoleFrame`，`protobuf+xolotl-console-v1` |
 
 ## HTTP 路由
 
@@ -24,11 +24,17 @@
 | `/api/auth/login` | `POST` | 用户名、密码和可选 TOTP 登录 |
 | `/api/auth/key/challenge` | `POST` | 创建公钥登录挑战 |
 | `/api/auth/key/login` | `POST` | 提交公钥签名并完成登录 |
+| `/api/auth/passkey/register/begin` | `POST` | 为已提权 bearer session 开始注册 passkey |
+| `/api/auth/passkey/register/finish` | `POST` | 完成 passkey 注册并保存凭据 |
+| `/api/auth/passkey/login/begin` | `POST` | 为指定用户名开始 passkey 登录 |
+| `/api/auth/passkey/login/finish` | `POST` | 校验 passkey assertion 并签发 session |
 | `/api/auth/step-up` | `POST` | 使用现有 bearer session 提升 MFA 等级 |
+| `/api/auth/refresh` | `POST` | 轮换现有 session 的 bearer token |
 
 认证路由要求 `Origin` 和 `Host` 请求头。origin 的 host、port 以及可信 forwarded
 scheme 必须匹配控制台监听器对外可见的 host。公钥登录还要求 JSON 里的 `origin`
-字段与请求 `Origin` 头完全一致；该值会绑定进签名 transcript。
+字段与请求 `Origin` 头完全一致；该值会绑定进签名 transcript。Passkey 路由使用
+配置中的 WebAuthn relying-party id 和 origin，不规定任何前端布局或 UI 框架。
 
 密码登录请求：
 
@@ -47,6 +53,27 @@ scheme 必须匹配控制台监听器对外可见的 host。公钥登录还要�
 ```json
 {"username":"root","challenge_id":"...","signature":"...","origin":"https://console.example","key":null}
 ```
+
+Passkey 注册 begin 请求：
+
+```json
+{"display_name":"Root Operator"}
+```
+
+Passkey 注册 begin 和 finish 要求：
+
+```text
+Authorization: Bearer <token>
+```
+
+Passkey 登录 begin 请求：
+
+```json
+{"username":"root"}
+```
+
+Passkey finish 请求携带浏览器从 `navigator.credentials.create` 或
+`navigator.credentials.get` 返回的 credential response。
 
 Step-up 请求体：
 
@@ -88,17 +115,21 @@ HTTP 认证错误映射：
 - `Host` 请求头存在；
 - origin host 和 port 与对外可见 host 匹配；
 - 存在 `:path` 时，其值为 `/ws`；
-- 来源级连接限制仍有容量
-端点接收二进制 MessagePack 帧。文本帧会返回 `ConsoleErrorCode::BadFrame`。
+- 来源级连接限制仍有容量。
+
+端点在 `xolotl-console-v1` WebSocket 子协议下接收二进制 protobuf
+`ConsoleFrame` 帧。文本帧会返回 `ConsoleErrorCode::BadFrame`。
 配置帧大小受后端 4 MiB 硬上限约束。
 
 ## 编码
 
-线缆编码名是 `msgpack+xolotl-console-v1`，协议版本是 `1`。
+线缆编码名是 `protobuf+xolotl-console-v1`，WebSocket 子协议是
+`xolotl-console-v1`，协议版本是 `1`。
 
-帧是与 serde 兼容的 MessagePack 值。服务端用具名字段编码帧。
-`ActionCall.input`、`ActionResult.output`、流输入和事件里的 Xolotl `Value`
-载荷会封装在 `JsonBytes` 中；`JsonBytes` 是外层 MessagePack 帧里的 JSON 字符串。
+帧是 protobuf `xolotl.v1.console.ConsoleFrame` 消息。`ActionCall.input`、
+`ActionResult.output`、流输入和事件里的 Xolotl `Value` 都使用原生
+`xolotl.v1.Value` 消息，因此控制台客户端与 external gateway 共享同一套
+`Value` 和 `Path` protobuf 形状。
 
 ## 会话顺序
 
@@ -107,7 +138,7 @@ HTTP 认证错误映射：
 1. 通过 HTTP 登录，保存 `LoginResponse.token`
 2. 打开控制台 `/ws`
 3. 发送 `ClientFrame::Hello { hello }`，其中 `protocol_version = 1`，
-   `accepted_encodings` 包含 `msgpack+xolotl-console-v1`。
+   `accepted_encodings` 包含 `protobuf+xolotl-console-v1`。
 4. 接收 `ServerFrame::HelloAccepted { metadata }`
 5. 发送 `ClientFrame::Auth { token }`
 6. 接收 `ServerFrame::Authenticated { principal, metadata }`
@@ -134,14 +165,14 @@ HTTP 认证错误映射：
 | --- | --- |
 | `protocol_version` | 客户端支持的主要线缆版本 |
 | `client_name` | 可选客户端应用名称，用于审计和诊断 |
-| `accepted_encodings` | 客户端接受的编码，按偏好排序 |
+| `accepted_encodings` | 客户端接受的编码；当前必须包含 `protobuf+xolotl-console-v1` |
 
 `ActionCall`：
 
 | 字段 | 含义 |
 | --- | --- |
 | `action` | 动作 ID，例如 `config.read` 或 `state.snapshot` |
-| `input` | Xolotl `Value` 的 JSON 字符串，封装在 `JsonBytes` 中 |
+| `input` | 原生 `xolotl.v1.Value` protobuf 消息 |
 | `scope` | 可选可见性或高风险访问范围 |
 | `justification` | 可选操作理由 |
 | `ttl_ms` | 可选临时授权持续时间 |
@@ -151,9 +182,9 @@ HTTP 认证错误映射：
 | 字段 | 含义 |
 | --- | --- |
 | `stream` | 流 ID，例如 `state.watch` 或 `audit.facts.stream` |
-| `input` | 流过滤条件的 JSON 字符串 |
+| `input` | 原生 `xolotl.v1.Value` 流过滤条件 |
 | `scope`、`justification`、`ttl_ms` | 受保护流需要的可见性元数据 |
-| `since_rev` | 预留游标；当前控制台流是 live-only，传入该字段会被拒绝 |
+| `since_rev` | 预留字段；客户端必须省略。当前流是 live-only，传入会被拒绝 |
 
 ## 服务端帧
 
@@ -166,8 +197,8 @@ HTTP 认证错误映射：
 | `Pong` | `nonce` | 保活响应 |
 | `Error` | 可选 `id`、`ConsoleErrorCode`、消息 | 协议、认证、校验、授权、速率限制或内部错误 |
 
-`ConsoleErrorCode` 的取值为 `BadFrame`、`NotAuthenticated`、`Unauthorized`、
-`Forbidden`、`Conflict`、`BadRequest`、`RateLimited` 和 `Internal`。
+`ConsoleErrorCode` 通过 protobuf `ConsoleError` 帧传输。服务端会把协议、
+认证、授权、校验、冲突、速率限制和内部错误映射到规范的控制台错误枚举。
 
 ## 动作和流
 

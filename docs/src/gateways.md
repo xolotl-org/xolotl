@@ -17,15 +17,15 @@ environment variable is set. `xolotl-daemon` enables `external-grpc` and
 | Entry point | Config field | Environment variable | Route or service | Encoding |
 | --- | --- | --- | --- | --- |
 | Console HTTP | `console_addr` | `XOLOTL_CONSOLE_ADDR` | `/health`, `/api/auth/*` | HTTP JSON |
-| Console WebSocket | `console_addr` | `XOLOTL_CONSOLE_ADDR` | `/ws` | MessagePack, `msgpack+xolotl-console-v1` |
+| Console WebSocket | `console_addr` | `XOLOTL_CONSOLE_ADDR` | `/ws` | Binary protobuf `ConsoleFrame`, `protobuf+xolotl-console-v1` |
 | External gRPC | `external_grpc_addr` | `XOLOTL_EXTERNAL_GRPC_ADDR` | `xolotl.v1.external.ExternalService.Session` | Protobuf |
 | External WebSocket | `external_websocket_addr` | `XOLOTL_EXTERNAL_WEBSOCKET_ADDR` | `/ws` | Binary protobuf frames |
 
 Console WebSocket and external WebSocket both mount `/ws`. They are selected by
 listener address and frame encoding:
 
-- Console WebSocket uses `[server].console_addr` and MessagePack console
-  frames.
+- Console WebSocket uses `[server].console_addr` and binary protobuf console
+  frames under the `xolotl-console-v1` subprotocol.
 - External WebSocket uses `[server].external_websocket_addr` and binary
   Provider/Source session frames.
 

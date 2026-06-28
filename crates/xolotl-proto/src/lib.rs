@@ -3,8 +3,8 @@
 //! gRPC types for Xolotl external clients.
 //!
 //! The `.proto` files under `proto/` are the schema spec. The Rust bindings are
-//! hand-vendored in `src/{common,program,external}.rs` so the crate builds without
-//! `protoc`.
+//! hand-vendored in `src/{common,program,external,console}.rs` so the crate
+//! builds without `protoc`.
 //! If you change a `.proto`, mirror the change in the matching `.rs` module.
 
 pub mod xolotl {
@@ -14,6 +14,10 @@ pub mod xolotl {
 
         pub mod external {
             include!("external.rs");
+        }
+
+        pub mod console {
+            include!("console.rs");
         }
     }
 }

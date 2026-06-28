@@ -17,19 +17,26 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 mod auth;
+mod credentials;
 mod mgmt;
 pub mod protocol;
+mod recipes;
+mod registry;
 mod state;
+mod wire;
 mod ws;
 
 pub use auth::{
-    AuthError, BootstrapOutcome, ConsoleAuthConfig, DEFAULT_GLOBAL_SESSION_LIMIT,
-    DEFAULT_IDLE_TTL_MS, DEFAULT_MAX_SESSIONS_PER_USER, DEFAULT_SESSION_TTL_MS,
-    HARD_ARGON2_CONCURRENCY, HARD_GLOBAL_SESSION_LIMIT, HARD_MAX_SESSIONS_PER_USER,
-    KeyChallengeRequest, KeyChallengeResponse, KeyLoginRequest, LoginRequest, LoginResponse,
-    MAX_IDLE_TTL_MS, MAX_SESSION_TTL_MS, MIN_ARGON2_CONCURRENCY, MIN_GLOBAL_SESSION_LIMIT,
-    MIN_IDLE_TTL_MS, MIN_MAX_SESSIONS_PER_USER, MIN_SESSION_TTL_MS, RootProvisioning,
-    StepUpRequest, bootstrap_root_account, default_argon2_concurrency, root_random_password_needed,
+    AuthError, BootstrapOutcome, ConsoleAuthConfig, ConsoleWebAuthnConfig,
+    DEFAULT_GLOBAL_SESSION_LIMIT, DEFAULT_IDLE_TTL_MS, DEFAULT_MAX_SESSIONS_PER_USER,
+    DEFAULT_SESSION_TTL_MS, HARD_ARGON2_CONCURRENCY, HARD_GLOBAL_SESSION_LIMIT,
+    HARD_MAX_SESSIONS_PER_USER, KeyChallengeRequest, KeyChallengeResponse, KeyLoginRequest,
+    LoginRequest, LoginResponse, MAX_IDLE_TTL_MS, MAX_SESSION_TTL_MS, MIN_ARGON2_CONCURRENCY,
+    MIN_GLOBAL_SESSION_LIMIT, MIN_IDLE_TTL_MS, MIN_MAX_SESSIONS_PER_USER, MIN_SESSION_TTL_MS,
+    PasskeyLoginBeginRequest, PasskeyLoginBeginResponse, PasskeyLoginFinishRequest,
+    PasskeyRegisterBeginRequest, PasskeyRegisterBeginResponse, PasskeyRegisterFinishRequest,
+    PasskeyRegisterFinishResponse, RootProvisioning, StepUpRequest, bootstrap_root_account,
+    default_argon2_concurrency, root_random_password_needed,
 };
 pub use protocol::{
     ActionCall, ActionResult, ClientFrame, ClientHello, ConsoleErrorCode, ConsoleEvent,
@@ -61,7 +68,24 @@ pub fn router(state: Arc<ConsoleState>) -> Router {
         .route("/api/auth/login", post(api_login))
         .route("/api/auth/key/challenge", post(api_key_challenge))
         .route("/api/auth/key/login", post(api_key_login))
+        .route(
+            "/api/auth/passkey/register/begin",
+            post(api_passkey_register_begin),
+        )
+        .route(
+            "/api/auth/passkey/register/finish",
+            post(api_passkey_register_finish),
+        )
+        .route(
+            "/api/auth/passkey/login/begin",
+            post(api_passkey_login_begin),
+        )
+        .route(
+            "/api/auth/passkey/login/finish",
+            post(api_passkey_login_finish),
+        )
         .route("/api/auth/step-up", post(api_step_up))
+        .route("/api/auth/refresh", post(api_refresh))
         .route("/ws", get(ws::upgrade))
         .with_state(state)
         .layer(
@@ -140,6 +164,72 @@ async fn api_key_login(
     Ok(Json(response))
 }
 
+async fn api_passkey_register_begin(
+    State(st): State<Arc<ConsoleState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<PasskeyRegisterBeginRequest>,
+) -> Result<Json<PasskeyRegisterBeginResponse>, (StatusCode, String)> {
+    let source = verified_source_addr(&headers, Some(peer), &st.transport_security);
+    validate_http_auth_origin(&st, &headers, Some(peer), &source)?;
+    let bearer = bearer_or_audit(&st, &headers, &source)?;
+    let response = st
+        .auth
+        .begin_passkey_registration(&st.boot, bearer, body, source)
+        .await
+        .map_err(auth_error)?;
+    Ok(Json(response))
+}
+
+async fn api_passkey_register_finish(
+    State(st): State<Arc<ConsoleState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<PasskeyRegisterFinishRequest>,
+) -> Result<Json<PasskeyRegisterFinishResponse>, (StatusCode, String)> {
+    let source = verified_source_addr(&headers, Some(peer), &st.transport_security);
+    validate_http_auth_origin(&st, &headers, Some(peer), &source)?;
+    let bearer = bearer_or_audit(&st, &headers, &source)?;
+    let response = st
+        .auth
+        .finish_passkey_registration(&st.boot, bearer, body, source)
+        .await
+        .map_err(auth_error)?;
+    Ok(Json(response))
+}
+
+async fn api_passkey_login_begin(
+    State(st): State<Arc<ConsoleState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<PasskeyLoginBeginRequest>,
+) -> Result<Json<PasskeyLoginBeginResponse>, (StatusCode, String)> {
+    let source = verified_source_addr(&headers, Some(peer), &st.transport_security);
+    validate_http_auth_origin(&st, &headers, Some(peer), &source)?;
+    let response = st
+        .auth
+        .begin_passkey_login(&st.boot, body, source)
+        .await
+        .map_err(auth_error)?;
+    Ok(Json(response))
+}
+
+async fn api_passkey_login_finish(
+    State(st): State<Arc<ConsoleState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<PasskeyLoginFinishRequest>,
+) -> Result<Json<LoginResponse>, (StatusCode, String)> {
+    let source = verified_source_addr(&headers, Some(peer), &st.transport_security);
+    validate_http_auth_origin(&st, &headers, Some(peer), &source)?;
+    let response = st
+        .auth
+        .finish_passkey_login(&st.boot, body, source)
+        .await
+        .map_err(auth_error)?;
+    Ok(Json(response))
+}
+
 async fn api_step_up(
     State(st): State<Arc<ConsoleState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -160,6 +250,30 @@ async fn api_step_up(
         .step_up(&st.boot, bearer, body, source)
         .await
         .map_err(auth_error)?;
+    Ok(Json(response))
+}
+
+async fn api_refresh(
+    State(st): State<Arc<ConsoleState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<LoginResponse>, (StatusCode, String)> {
+    let source = verified_source_addr(&headers, Some(peer), &st.transport_security);
+    validate_http_auth_origin(&st, &headers, Some(peer), &source)?;
+    let bearer = match auth::bearer_from_headers(&headers) {
+        Ok(bearer) => bearer,
+        Err(e) => {
+            record_http_auth_audit(&st, "console_credential", Some(&source), "missing_bearer")?;
+            return Err(auth_error(e));
+        }
+    };
+    let response = match st.auth.refresh_session(&st.boot, bearer).await {
+        Ok(response) => {
+            record_http_auth_audit(&st, "console_credential", Some(&source), "token_refresh")?;
+            response
+        }
+        Err(e) => return Err(auth_error(e)),
+    };
     Ok(Json(response))
 }
 
@@ -201,7 +315,21 @@ fn forwarded_client_addr(headers: &HeaderMap) -> Option<String> {
 
 #[cfg(test)]
 pub(crate) fn source_addr(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
-    verified_source_addr(headers, peer, &ConsoleTransportSecurityConfig::default())
+    verified_source_addr(headers, peer, &state::console_transport_default())
+}
+
+fn bearer_or_audit<'a>(
+    st: &Arc<ConsoleState>,
+    headers: &'a HeaderMap,
+    source: &str,
+) -> Result<&'a str, (StatusCode, String)> {
+    match auth::bearer_from_headers(headers) {
+        Ok(bearer) => Ok(bearer),
+        Err(e) => {
+            record_http_auth_audit(st, "console_credential", Some(source), "missing_bearer")?;
+            Err(auth_error(e))
+        }
+    }
 }
 
 fn record_http_auth_audit(

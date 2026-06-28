@@ -1,8 +1,4 @@
 //! Console Protocol DTOs and static registry descriptors.
-//!
-//! `xolotl-console` is the control-plane protocol host. Web UI and third-party
-//! panels consume this registry, then issue descriptor-named actions. The
-//! descriptor registry is the public protocol surface.
 
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::OnceLock};
@@ -12,8 +8,10 @@ use xolotl_types::Value;
 pub const PROTOCOL_VERSION: u16 = 1;
 /// Canonical server name returned in protocol metadata.
 pub const SERVER_NAME: &str = "xolotl-console";
-/// Default compact frame encoding advertised by the server.
-pub const WIRE_ENCODING: &str = "msgpack+xolotl-console-v1";
+/// Default frame encoding advertised by the server.
+pub const WIRE_ENCODING: &str = "protobuf+xolotl-console-v1";
+/// WebSocket subprotocol token for the protobuf console wire.
+pub const SUBPROTOCOL: &str = "xolotl-console-v1";
 
 /// Describe protocol metadata and descriptors.
 pub const ACTION_PROTOCOL_DESCRIBE: &str = "protocol.describe";
@@ -162,15 +160,13 @@ pub const STREAM_STATE_WATCH: &str = "state.watch";
 pub const STREAM_AUDIT_FACTS: &str = "audit.facts.stream";
 
 /// Initial client hello used to negotiate protocol version and encoding.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientHello {
     /// Client-supported protocol version.
     pub protocol_version: u16,
     /// Optional client application name for audit and diagnostics.
-    #[serde(default)]
     pub client_name: Option<String>,
-    /// Encodings the client accepts, in preference order.
-    #[serde(default)]
+    /// Encodings the client accepts; must include [`WIRE_ENCODING`].
     pub accepted_encodings: Vec<String>,
 }
 
@@ -185,44 +181,43 @@ impl Default for ClientHello {
 }
 
 /// One descriptor-named action invocation from a console client.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ActionCall {
     /// Action id, usually one of the `ACTION_*` constants.
     pub action: String,
-    /// JSON-encoded Xolotl value passed as action input.
-    #[serde(default)]
-    pub input: JsonBytes,
+    /// Optional compact action code fast-path.
+    pub action_code: Option<u32>,
+    /// Xolotl value passed as action input.
+    pub input: Value,
     /// Optional target scope for break-glass or visibility-gated actions.
-    #[serde(default)]
     pub scope: Option<String>,
     /// Operator justification for high-risk actions.
-    #[serde(default)]
     pub justification: Option<String>,
     /// Optional temporary authority duration for scoped access.
-    #[serde(default)]
     pub ttl_ms: Option<u64>,
+    /// Client's last-known descriptor registry revision.
+    pub registry_rev: Option<u64>,
+    /// Client-supplied idempotency key.
+    pub idempotency_key: Option<String>,
 }
 
 /// One stream subscription request from a console client.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StreamCall {
     /// Stream id, usually one of the `STREAM_*` constants.
     pub stream: String,
-    /// JSON-encoded stream input/filter value.
-    #[serde(default)]
-    pub input: JsonBytes,
+    /// Stream input/filter value.
+    pub input: Value,
     /// Optional target scope for visibility-gated streams.
-    #[serde(default)]
     pub scope: Option<String>,
     /// Operator justification for sensitive streams.
-    #[serde(default)]
     pub justification: Option<String>,
     /// Optional temporary authority duration for scoped streaming.
-    #[serde(default)]
     pub ttl_ms: Option<u64>,
-    /// Reserved revision cursor; current console streams are live-only.
-    #[serde(default)]
+    /// Reserved; current streams are live-only.
     pub since_rev: Option<u64>,
+    /// Maximum events per server flush.
+    pub max_batch: Option<u32>,
 }
 
 /// Compact identity summary returned after authentication.
@@ -237,7 +232,7 @@ pub struct PrincipalSummary {
 }
 
 /// Frames sent by the console client over the management WebSocket.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientFrame {
     /// Protocol negotiation frame.
     Hello {
@@ -275,40 +270,11 @@ pub enum ClientFrame {
     },
 }
 
-/// JSON-encoded [`Value`] string. The outer frame is MessagePack; this inner
-/// value envelope keeps Xolotl's untagged `Value` representation explicit for
-/// clients in any language.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct JsonBytes(
-    /// JSON string encoding a Xolotl [`Value`].
-    pub String,
-);
-
-impl Eq for JsonBytes {}
-
-impl Default for JsonBytes {
-    fn default() -> Self {
-        Self("null".into())
-    }
-}
-
-impl JsonBytes {
-    /// Serialize a Xolotl value into the inner JSON string.
-    pub fn try_from_value(v: &Value) -> Result<Self, serde_json::Error> {
-        serde_json::to_string(v).map(Self)
-    }
-
-    /// Decode the inner JSON string into a Xolotl value.
-    pub fn try_to_value(&self) -> Result<Value, serde_json::Error> {
-        serde_json::from_str(&self.0)
-    }
-}
-
 /// Result of one action invocation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionResult {
-    /// Optional JSON-encoded Xolotl value output.
-    pub output: Option<JsonBytes>,
+    /// Optional Xolotl value output.
+    pub output: Option<Value>,
     /// Server revision after the action.
     pub server_rev: u64,
 }
@@ -323,16 +289,16 @@ impl ActionResult {
     }
 
     /// Construct an action result carrying one Xolotl value.
-    pub fn value(value: Value, server_rev: u64) -> Result<Self, serde_json::Error> {
-        Ok(Self {
-            output: Some(JsonBytes::try_from_value(&value)?),
+    pub fn value(value: Value, server_rev: u64) -> Self {
+        Self {
+            output: Some(value),
             server_rev,
-        })
+        }
     }
 }
 
 /// Frames sent by the console server over the management WebSocket.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServerFrame {
     /// Protocol negotiation succeeded.
     HelloAccepted {
@@ -377,21 +343,21 @@ pub enum ServerFrame {
 }
 
 /// Event delivered on a subscribed console stream.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ConsoleEvent {
     /// A state value was set.
     StateSet {
         /// State path that changed.
         path: String,
-        /// New JSON-encoded value.
-        value: JsonBytes,
+        /// New value.
+        value: Value,
     },
     /// An item was appended to a state sequence.
     StateAppend {
         /// State sequence path that changed.
         path: String,
-        /// Appended JSON-encoded item.
-        item: JsonBytes,
+        /// Appended item.
+        item: Value,
     },
     /// A state value was deleted.
     StateDelete {
@@ -400,8 +366,8 @@ pub enum ConsoleEvent {
     },
     /// An audit Fact event was observed.
     Audit {
-        /// JSON-encoded Fact projection.
-        fact: JsonBytes,
+        /// Fact projection value.
+        fact: Value,
     },
     /// Server closed the subscription.
     SubscriptionClosed {
@@ -413,7 +379,7 @@ pub enum ConsoleEvent {
 impl Eq for ConsoleEvent {}
 
 /// Stable error codes returned by the Console Protocol.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConsoleErrorCode {
     /// Frame was malformed or out of sequence.
     BadFrame,
@@ -766,11 +732,9 @@ pub(crate) fn coverage_report_value(server_rev: u64, registry_rev: u64) -> Value
 }
 
 /// Return one action descriptor encoded as a Xolotl value.
-pub(crate) fn descriptor_value(action_id: &str) -> Option<Value> {
-    action_descriptor_registry()
-        .iter()
-        .find(|d| d.id == action_id)
-        .map(to_value)
+/// Serialize one action descriptor for wire output.
+pub(crate) fn action_descriptor_to_value(descriptor: &ActionDescriptor) -> Value {
+    to_value(descriptor.clone())
 }
 
 /// Return one action descriptor status.
@@ -1449,6 +1413,16 @@ pub(crate) fn visibility_authority_value() -> Value {
     root.insert(
         "secret_prefix_rule".into(),
         Value::Str("use secret.* custody actions; generic visibility reads reject vault".into()),
+    );
+    root.insert(
+        "password_policy".into(),
+        crate::credentials::password_policy_to_value(
+            &crate::credentials::PasswordPolicy::default().bounded(),
+        ),
+    );
+    root.insert(
+        "lockout_policy".into(),
+        crate::credentials::lockout_policy_to_value(5, 1000, 60_000),
     );
     Value::Map(root)
 }

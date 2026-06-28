@@ -8,7 +8,8 @@ use crate::{
 use parking_lot::Mutex;
 use redb::{Database, ReadableDatabase, ReadableTable};
 use std::sync::Arc;
-use xolotl_kernel::{FactError, FactStore};
+use tokio::sync::broadcast;
+use xolotl_kernel::{FACT_BROADCAST_CAPACITY, FactError, FactStore, FactStream};
 use xolotl_types::{Fact, OperationId, ProcessId};
 
 const NEXT_CURSOR_KEY: &str = "next_cursor";
@@ -24,6 +25,7 @@ fn fact_err(e: impl ToString) -> FactError {
 pub struct RedbFactStore {
     db: Arc<Database>,
     cursor: Mutex<u64>,
+    tx: broadcast::Sender<Arc<Fact>>,
 }
 
 impl RedbFactStore {
@@ -37,9 +39,11 @@ impl RedbFactStore {
                 .map(|v| v.value())
                 .unwrap_or(0)
         };
+        let (tx, _rx) = broadcast::channel(FACT_BROADCAST_CAPACITY);
         Ok(Self {
             db,
             cursor: Mutex::new(cursor),
+            tx,
         })
     }
 
@@ -112,11 +116,22 @@ impl RedbFactStore {
             .map(|slot| slot.value()))
     }
 
+    fn broadcast_fact(&self, fact: Fact) {
+        match self.tx.send(Arc::new(fact)) {
+            Ok(_receivers) => {}
+            Err(_error) => {
+                // No active receiver kept the fact; the transaction already committed.
+            }
+        }
+    }
+
     fn update_existing_slot(&self, slot: u64, fact: &Fact) -> Result<(), FactError> {
         let txn = self.db.begin_write().map_err(fact_err)?;
         let old_caller = self.caller_at_slot(&txn, slot)?;
         self.store_fact(&txn, slot, fact, old_caller)?;
-        txn.commit().map_err(fact_err)
+        txn.commit().map_err(fact_err)?;
+        self.broadcast_fact(fact.clone());
+        Ok(())
     }
 }
 
@@ -138,6 +153,7 @@ impl FactStore for RedbFactStore {
         // Advance only after a durable commit, so a failed write leaves the slot
         // reusable rather than punching a gap in the append log.
         *cursor = next;
+        self.broadcast_fact(fact);
         Ok(slot)
     }
 
@@ -167,6 +183,7 @@ impl FactStore for RedbFactStore {
                 }
                 txn.commit().map_err(fact_err)?;
                 *cursor = next;
+                self.broadcast_fact(fact);
             }
         }
         Ok(())
@@ -218,6 +235,10 @@ impl FactStore for RedbFactStore {
 
     fn cursor(&self) -> u64 {
         *self.cursor.lock()
+    }
+
+    fn subscribe_facts(&self) -> FactStream {
+        self.tx.subscribe()
     }
 }
 

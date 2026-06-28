@@ -16,7 +16,7 @@ Console HTTP and Console WebSocket share `[server].console_addr`, with
 | Channel | Route | Encoding |
 | --- | --- | --- |
 | HTTP | `/health`, `/api/auth/*` | HTTP JSON |
-| WebSocket | `/ws` | Binary MessagePack, `msgpack+xolotl-console-v1` |
+| WebSocket | `/ws` | Binary protobuf `ConsoleFrame`, `protobuf+xolotl-console-v1` |
 
 ## HTTP Routes
 
@@ -28,13 +28,19 @@ Console HTTP routes are provided by `xolotl-console::router`:
 | `/api/auth/login` | `POST` | Username/password login with optional TOTP. |
 | `/api/auth/key/challenge` | `POST` | Create a public-key login challenge. |
 | `/api/auth/key/login` | `POST` | Submit the public-key signature and finish login. |
+| `/api/auth/passkey/register/begin` | `POST` | Begin passkey registration for an elevated bearer session. |
+| `/api/auth/passkey/register/finish` | `POST` | Finish passkey registration and store the credential. |
+| `/api/auth/passkey/login/begin` | `POST` | Begin passkey login for a username. |
+| `/api/auth/passkey/login/finish` | `POST` | Verify the passkey assertion and issue a session. |
 | `/api/auth/step-up` | `POST` | Raise MFA level for an existing bearer session. |
+| `/api/auth/refresh` | `POST` | Rotate the bearer token for an existing session. |
 
 Authentication routes require `Origin` and `Host` headers. The origin host,
 port, and trusted forwarded scheme must match the externally visible host for
 the console listener. Public-key login additionally requires the JSON `origin`
 field to exactly match the request `Origin` header; that value is bound into the
-signed transcript.
+signed transcript. Passkey routes use the configured WebAuthn relying-party id
+and origin, and do not prescribe any frontend layout or UI framework.
 
 Password login request:
 
@@ -53,6 +59,27 @@ Public-key login request:
 ```json
 {"username":"root","challenge_id":"...","signature":"...","origin":"https://console.example","key":null}
 ```
+
+Passkey registration begin request:
+
+```json
+{"display_name":"Root Operator"}
+```
+
+Passkey registration begin and finish require:
+
+```text
+Authorization: Bearer <token>
+```
+
+Passkey login begin request:
+
+```json
+{"username":"root"}
+```
+
+Passkey finish requests carry the browser credential response returned by
+`navigator.credentials.create` or `navigator.credentials.get`.
 
 Step-up request body:
 
@@ -97,19 +124,20 @@ checks:
 - `:path`, when present, is `/ws`;
 - source-level connection limits have capacity.
 
-The endpoint accepts binary MessagePack frames. Text frames return
+The endpoint accepts binary protobuf `ConsoleFrame` frames under the
+`xolotl-console-v1` WebSocket subprotocol. Text frames return
 `ConsoleErrorCode::BadFrame`. The configured frame limit is capped at 4 MiB by
 the backend.
 
 ## Encoding
 
-The wire encoding name is `msgpack+xolotl-console-v1`, and the protocol version
-is `1`.
+The wire encoding name is `protobuf+xolotl-console-v1`, the WebSocket
+subprotocol is `xolotl-console-v1`, and the protocol version is `1`.
 
-Frames are serde-compatible MessagePack values. Server frames are encoded with
-named fields. `ActionCall.input`, `ActionResult.output`, stream inputs, and
-events wrap Xolotl `Value` payloads in `JsonBytes`, a JSON string inside the
-outer MessagePack frame.
+Frames are protobuf `xolotl.v1.console.ConsoleFrame` messages. `ActionCall.input`,
+`ActionResult.output`, stream inputs, and events carry native `xolotl.v1.Value`
+messages, so console clients share the same `Value` and `Path` protobuf shapes as
+the external gateway.
 
 ## Session Sequence
 
@@ -118,7 +146,7 @@ Required client sequence:
 1. Log in through HTTP and keep `LoginResponse.token`.
 2. Open the console WebSocket at `/ws`.
 3. Send `ClientFrame::Hello { hello }` with `protocol_version = 1` and
-   `accepted_encodings` containing `msgpack+xolotl-console-v1`.
+   `accepted_encodings` containing `protobuf+xolotl-console-v1`.
 4. Receive `ServerFrame::HelloAccepted { metadata }`.
 5. Send `ClientFrame::Auth { token }`.
 6. Receive `ServerFrame::Authenticated { principal, metadata }`.
@@ -146,14 +174,14 @@ later request revalidates the session id before dispatch.
 | --- | --- |
 | `protocol_version` | Client-supported major wire version. |
 | `client_name` | Optional client application name for audit and diagnostics. |
-| `accepted_encodings` | Encodings accepted by the client, in preference order. |
+| `accepted_encodings` | Encodings accepted by the client; currently must include `protobuf+xolotl-console-v1`. |
 
 `ActionCall`:
 
 | Field | Meaning |
 | --- | --- |
 | `action` | Action id, such as `config.read` or `state.snapshot`. |
-| `input` | JSON string for a Xolotl `Value`, wrapped in `JsonBytes`. |
+| `input` | Native `xolotl.v1.Value` protobuf message. |
 | `scope` | Optional visibility or high-risk access scope. |
 | `justification` | Optional operator justification. |
 | `ttl_ms` | Optional temporary authority duration. |
@@ -163,9 +191,9 @@ later request revalidates the session id before dispatch.
 | Field | Meaning |
 | --- | --- |
 | `stream` | Stream id, such as `state.watch` or `audit.facts.stream`. |
-| `input` | JSON string for stream filters. |
+| `input` | Native `xolotl.v1.Value` stream filter. |
 | `scope`, `justification`, `ttl_ms` | Visibility metadata required by protected streams. |
-| `since_rev` | Reserved cursor; current console streams are live-only and reject it. |
+| `since_rev` | Reserved; clients must omit it. Current streams are live-only and reject it. |
 
 ## Server Frames
 
@@ -178,8 +206,9 @@ later request revalidates the session id before dispatch.
 | `Pong` | `nonce` | Keepalive response. |
 | `Error` | optional `id`, `ConsoleErrorCode`, message | Protocol, auth, validation, authorization, rate-limit, or internal error. |
 
-`ConsoleErrorCode` values are `BadFrame`, `NotAuthenticated`, `Unauthorized`,
-`Forbidden`, `Conflict`, `BadRequest`, `RateLimited`, and `Internal`.
+`ConsoleErrorCode` values are carried on the protobuf `ConsoleError` frame. The
+server maps protocol, authentication, authorization, validation, conflict,
+rate-limit, and internal failures to the canonical console error enum.
 
 ## Actions And Streams
 

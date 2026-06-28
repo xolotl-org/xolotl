@@ -1,0 +1,354 @@
+syntax = "proto3";
+package xolotl.v1.console;
+
+import "xolotl/v1/common.proto";
+
+// Control-plane gateway service for management consoles.
+service ConsoleService {
+  rpc Session(stream ConsoleFrame) returns (stream ConsoleFrame);
+}
+
+// Top-level frame envelope. Client frames use tags 1-6; server frames use 11-16.
+message ConsoleFrame {
+  oneof frame {
+    ClientHello   hello          = 1;   // client -> server
+    bytes         auth_token     = 2;   // client -> server (opaque bearer session token)
+    ActionCall    call           = 3;   // client -> server
+    StreamCall    subscribe      = 4;   // client -> server
+    uint64        unsubscribe    = 5;   // subscription id
+    uint64        ping           = 6;   // nonce
+    HelloAccepted hello_accepted = 11;  // server -> client
+    Authenticated authenticated  = 12;  // server -> client
+    Reply         reply          = 13;  // server -> client
+    Event         event          = 14;  // server -> client
+    uint64        pong           = 15;  // echoes ping
+    ConsoleError  error          = 16;  // server -> client
+  }
+}
+
+message ClientHello {
+  uint32 protocol_version = 1;            // must equal CONSOLE_PROTOCOL_VERSION
+  string client_name = 2;                 // optional human-readable client id
+  repeated string accepted_encodings = 3; // accepted wire encodings
+  optional uint64 registry_rev = 4;       // client's last-known descriptor rev
+}
+
+message HelloAccepted {
+  ProtocolMetadata metadata = 1;
+}
+
+message Authenticated {
+  PrincipalSummary principal = 1;
+  ProtocolMetadata metadata = 2;
+}
+
+message ProtocolMetadata {
+  uint32 protocol_version = 1;
+  string server_name = 2;                 // "xolotl-console"
+  string wire_encoding = 3;               // "protobuf+xolotl-console-v1"
+  uint64 server_rev = 4;                  // fact cursor (advances on every Fact)
+  uint64 registry_rev = 5;                // descriptor registry revision
+  uint64 server_time_ms = 6;              // wall clock for client skew detection
+  repeated string capabilities = 7;       // optional feature flags
+}
+
+message PrincipalSummary {
+  string username = 1;
+  string identity_path = 2;               // identity://console/<user>
+  uint32 mfa_level = 3;                   // 1 = single-factor, 2 = verified
+  repeated string grants = 4;             // effective kernel capability selectors (redacted summary)
+}
+
+
+message ActionCall {
+  uint64 id = 1;                          // client correlation id
+  string action = 2;                      // action id, e.g. "config.write_cas"
+  optional uint32 action_code = 3;        // compact code fast-path; if set, `action` may be empty
+  xolotl.v1.Value input = 4;             // action input
+  optional string scope = 5;              // visibility scope
+  optional string justification = 6;      // visibility justification
+  optional uint64 ttl_ms = 7;             // visibility TTL
+  optional uint64 registry_rev = 8;       // client's descriptor rev (RegistryChanged detection)
+  optional string idempotency_key = 9;    // client-supplied idempotency key
+}
+
+message StreamCall {
+  uint64 id = 1;                          // subscription id
+  string stream = 2;                      // stream id, e.g. "state.diff"
+  xolotl.v1.Value input = 3;             // stream input / filter
+  optional string scope = 4;
+  optional string justification = 5;
+  optional uint64 ttl_ms = 6;
+  optional uint64 since_rev = 7;          // resume cursor (state_rev or fact_cursor)
+  optional uint32 max_batch = 8;          // max events per server flush
+}
+
+message Reply {
+  uint64 id = 1;                          // echoes ActionCall.id
+  ActionResult result = 2;
+}
+
+message ActionResult {
+  optional xolotl.v1.Value output = 1;    // action output
+  uint64 server_rev = 2;                  // fact cursor after this action
+  optional uint64 registry_rev = 3;       // descriptor registry revision
+}
+
+message Event {
+  uint64 stream = 1;                      // subscription id
+  ConsoleEvent event = 2;
+}
+
+message ConsoleEvent {
+  oneof kind {
+    StateSet    state_set    = 1;
+    StateAppend state_append = 2;
+    StateDelete state_delete = 3;
+    FactEvent   fact         = 4;
+    Summary     summary      = 5;         // VolatileSummary coalesced
+    SubscriptionClosed closed = 6;
+  }
+  uint64 state_rev = 10;                  // per-subscription monotonic cursor
+  uint64 fact_cursor = 11;                // ReliableLog resume cursor
+  bool coalesced = 12;                    // true if events were merged under backpressure
+}
+
+message StateSet {
+  xolotl.v1.Path path = 1;
+  xolotl.v1.Value value = 2;
+}
+
+message StateAppend {
+  xolotl.v1.Path path = 1;
+  xolotl.v1.Value item = 2;
+}
+
+message StateDelete {
+  xolotl.v1.Path path = 1;
+}
+
+message FactEvent {
+  xolotl.v1.Value fact = 1;               // projected Fact (redacted per visibility tier)
+}
+
+message Summary {
+  xolotl.v1.Value payload = 1;            // coalesced volatile summary value
+}
+
+message SubscriptionClosed {
+  string reason = 1;
+  optional uint64 last_rev = 2;           // last cursor delivered (for replay)
+}
+
+
+message ConsoleError {
+  ConsoleErrorCode code = 1;
+  string message = 2;                     // redacted; never contains secrets/tokens/raw policy
+  optional uint64 request_id = 3;         // correlation id when known
+  optional uint64 retry_after_ms = 4;     // RATE_LIMITED / BACKPRESSURE
+  optional uint32 required_mfa_level = 5; // STEP_UP_REQUIRED
+  optional uint64 current_version = 6;    // VERSION_CONFLICT
+  optional uint64 current_registry_rev = 7; // REGISTRY_CHANGED
+  optional string correlation_id = 8;     // approval / policy id
+}
+
+enum ConsoleErrorCode {
+  CONSOLE_ERROR_CODE_UNSPECIFIED = 0;
+  UNAUTHENTICATED = 1;
+  FORBIDDEN = 2;
+  STEP_UP_REQUIRED = 3;
+  RATE_LIMITED = 4;
+  VALIDATION_FAILED = 5;
+  ADMISSION_REJECTED = 6;
+  VERSION_CONFLICT = 7;
+  NOT_FOUND = 8;
+  REGISTRY_CHANGED = 9;
+  REPLAY_REQUIRED = 10;
+  VISIBILITY_REQUIRED = 11;
+  INDEX_UNAVAILABLE = 12;
+  PAYLOAD_TOO_LARGE = 13;
+  BACKPRESSURE = 14;
+  UNSUPPORTED_VERSION = 15;
+  INTERNAL = 16;
+}
+
+
+message ActionDescriptor {
+  string id = 1;                          // "config.write_cas"
+  optional uint32 code = 2;               // compact fast-path code
+  string domain = 3;                      // "config"
+  uint32 version = 4;                     // descriptor schema version
+  Stability stability = 5;
+  SchemaDescriptor input = 6;
+  SchemaDescriptor output = 7;
+  repeated string required_grants = 8;    // kernel capability selectors
+  uint32 required_mfa_level = 9;
+  RiskLevel risk = 10;
+  IdempotencyClass idempotency = 11;
+  ConsistencyClass consistency = 12;
+  optional string audit_tag = 13;
+  RedactionProfile redaction = 14;
+  optional DisplayEdgeKind display_edge = 15;
+  RecipeKind recipe_kind = 16;
+  optional PaginationSpec pagination = 17;
+  repeated string stream_emits = 18;      // stream ids this action can emit on
+  ImplementationStatus status = 19;
+  VisibilityTier visibility = 20;
+  optional SecretClass secret_class = 21;
+  bool requires_step_up = 22;
+}
+
+message StreamDescriptor {
+  string id = 1;                          // "state.diff"
+  string domain = 2;
+  ImplementationStatus status = 3;
+  VisibilityTier visibility = 4;
+  bool requires_step_up = 5;
+  repeated string required_grants = 6;    // kernel capability selectors
+  SchemaDescriptor input = 7;
+  SchemaDescriptor event = 8;
+  StreamClass class = 9;                  // ReliableLog / StateDiff / VolatileSummary
+  ResumeMode resume = 10;                 // resume semantics
+  OrderingMode ordering = 11;             // monotonicity guarantee
+  optional uint32 default_max_batch = 12;
+}
+
+message SchemaDescriptor {
+  string schema_id = 1;
+  string value_kind = 2;                  // "map" / "list" / "string" / ...
+  repeated FieldDescriptor fields = 3;
+  repeated string notes = 4;
+}
+
+message FieldDescriptor {
+  string name = 1;
+  string kind = 2;
+  bool required = 3;
+  optional string stable_id = 4;
+  optional string semantic_kind = 5;
+  optional string ref_target_type = 6;
+  Sensitivity sensitivity = 7;
+  bool read_only = 8;
+  bool computed = 9;
+  bool deprecated = 10;
+}
+
+message PaginationSpec {
+  string cursor_kind = 1;                 // "offset" / "rev" / "cursor"
+  uint32 default_limit = 2;
+  uint32 max_limit = 3;
+}
+
+
+enum RecipeKind {
+  RECIPE_KIND_UNSPECIFIED = 0;
+  RECIPE_STATE_READ = 1;
+  RECIPE_STATE_LIST = 2;
+  RECIPE_STATE_WRITE_CAS = 3;
+  RECIPE_STATE_APPEND = 4;
+  RECIPE_STATE_DELETE = 5;
+  RECIPE_EFFECT_INVOKE = 6;
+  RECIPE_FACT_READ = 7;
+  RECIPE_FACT_TAIL = 8;
+  RECIPE_SUBSCRIBE = 9;
+  RECIPE_INSPECT = 10;
+  RECIPE_COMPOSITE = 11;
+  RECIPE_DISPLAY_EDGE = 12;
+}
+
+enum Stability {
+  STABILITY_UNSPECIFIED = 0;
+  STABILITY_EXPERIMENTAL = 1;
+  STABILITY_BETA = 2;
+  STABILITY_STABLE = 3;
+  STABILITY_DEPRECATED = 4;
+}
+
+enum RiskLevel {
+  RISK_LEVEL_UNSPECIFIED = 0;
+  RISK_LEVEL_LOW = 1;
+  RISK_LEVEL_MEDIUM = 2;
+  RISK_LEVEL_HIGH = 3;
+  RISK_LEVEL_BREAK_GLASS = 4;
+}
+
+enum IdempotencyClass {
+  IDEMPOTENCY_CLASS_UNSPECIFIED = 0;
+  IDEMPOTENCY_NONE = 1;
+  IDEMPOTENCY_CLIENT_KEY = 2;
+  IDEMPOTENCY_SERVER_DERIVED = 3;
+  IDEMPOTENCY_CAS_ONLY = 4;
+}
+
+enum ConsistencyClass {
+  CONSISTENCY_CLASS_UNSPECIFIED = 0;
+  CONSISTENCY_STRONG_CAS = 1;
+  CONSISTENCY_READ_YOUR_WRITE = 2;
+  CONSISTENCY_EVENTUAL = 3;
+}
+
+enum ImplementationStatus {
+  IMPLEMENTATION_STATUS_UNSPECIFIED = 0;
+  IMPLEMENTED = 1;
+  PLANNED = 2;
+  BLOCKED_BY_CUSTODY = 3;
+  NOT_CONSOLE_MANAGED = 4;
+}
+
+enum VisibilityTier {
+  VISIBILITY_TIER_UNSPECIFIED = 0;
+  VISIBILITY_METADATA = 1;
+  VISIBILITY_REDACTED_SUMMARY = 2;
+  VISIBILITY_PAYLOAD = 3;
+  VISIBILITY_PROTECTED_PAYLOAD = 4;
+  VISIBILITY_SECRET = 5;
+}
+
+enum SecretClass {
+  SECRET_CLASS_UNSPECIFIED = 0;
+  SECRET_CLASS_NONE = 1;
+  SECRET_CLASS_REVEALABLE = 2;
+  SECRET_CLASS_NON_RECOVERABLE = 3;
+  SECRET_CLASS_ONE_TIME = 4;
+}
+
+enum Sensitivity {
+  SENSITIVITY_UNSPECIFIED = 0;
+  SENSITIVITY_PUBLIC = 1;
+  SENSITIVITY_INTERNAL = 2;
+  SENSITIVITY_RESTRICTED = 3;
+  SENSITIVITY_SECRET = 4;
+}
+
+enum DisplayEdgeKind {
+  DISPLAY_EDGE_KIND_UNSPECIFIED = 0;
+  DISPLAY_EDGE_NONE = 1;
+  DISPLAY_EDGE_ONE_TIME = 2;              // pairing secret / secret.reveal
+}
+
+enum RedactionProfile {
+  REDACTION_PROFILE_UNSPECIFIED = 0;
+  REDACTION_NONE = 1;
+  REDACTION_SUMMARY = 2;                  // truncate / aggregate
+  REDACTION_METADATA_ONLY = 3;            // drop payload, keep metadata
+  REDACTION_SECRET = 4;                   // never in Fact/outcome, DisplayEdge only
+}
+
+enum StreamClass {
+  STREAM_CLASS_UNSPECIFIED = 0;
+  STREAM_RELIABLE_LOG = 1;                // Fact tail / audit log (resumable by cursor)
+  STREAM_STATE_DIFF = 2;                  // state subscribe (coalesceable)
+  STREAM_VOLATILE_SUMMARY = 3;            // health / counters (drop-old)
+}
+
+enum ResumeMode {
+  RESUME_MODE_UNSPECIFIED = 0;
+  RESUME_NONE = 1;
+  RESUME_CURSOR = 2;
+  RESUME_SNAPSHOT_THEN_CURSOR = 3;
+}
+
+enum OrderingMode {
+  ORDERING_MODE_UNSPECIFIED = 0;
+  ORDERING_MONOTONIC_PER_SUBSCRIPTION = 1; // no global order, per-subscription monotonic
+}

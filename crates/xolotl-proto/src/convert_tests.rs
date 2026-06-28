@@ -1276,3 +1276,94 @@ fn source_command_frames_roundtrip() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn console_frame_carries_action_call_with_kernel_value() -> anyhow::Result<()> {
+    use crate::xolotl::v1::console as con;
+    use prost::Message;
+
+    let input = composite_value();
+    let frame = con::ConsoleFrame {
+        frame: Some(con::console_frame::Frame::Call(con::ActionCall {
+            id: 42,
+            action: "config.write_cas".into(),
+            action_code: Some(7),
+            input: Some(value_to_pb(&input)),
+            scope: Some("state://kernel/config".into()),
+            justification: Some("rotating key".into()),
+            ttl_ms: Some(5_000),
+            registry_rev: Some(3),
+            idempotency_key: Some("k-1".into()),
+        })),
+    };
+    let bytes = frame.encode_to_vec();
+    let decoded = con::ConsoleFrame::decode(&bytes[..])?;
+    ensure!(
+        frame == decoded,
+        "console frame changed on the wire: {decoded:?}"
+    );
+
+    let call = match decoded.frame {
+        Some(con::console_frame::Frame::Call(call)) => call,
+        other => bail!("expected Call frame, got {other:?}"),
+    };
+    ensure!(call.id == 42, "correlation id lost");
+    ensure!(call.action_code == Some(7), "action code lost");
+    let round = value_from_pb_checked(
+        call.input
+            .as_ref()
+            .ok_or_else(|| anyhow!("input value missing"))?,
+    )?;
+    ensure!(round == input, "action input value changed: {round:?}");
+    Ok(())
+}
+
+#[test]
+fn console_error_codes_round_trip_every_variant() -> anyhow::Result<()> {
+    use crate::xolotl::v1::console as con;
+    use prost::Message;
+
+    let codes = [
+        con::ConsoleErrorCode::Unauthenticated,
+        con::ConsoleErrorCode::Forbidden,
+        con::ConsoleErrorCode::StepUpRequired,
+        con::ConsoleErrorCode::RateLimited,
+        con::ConsoleErrorCode::ValidationFailed,
+        con::ConsoleErrorCode::AdmissionRejected,
+        con::ConsoleErrorCode::VersionConflict,
+        con::ConsoleErrorCode::NotFound,
+        con::ConsoleErrorCode::RegistryChanged,
+        con::ConsoleErrorCode::ReplayRequired,
+        con::ConsoleErrorCode::VisibilityRequired,
+        con::ConsoleErrorCode::IndexUnavailable,
+        con::ConsoleErrorCode::PayloadTooLarge,
+        con::ConsoleErrorCode::Backpressure,
+        con::ConsoleErrorCode::UnsupportedVersion,
+        con::ConsoleErrorCode::Internal,
+    ];
+    for code in codes {
+        let wire = con::ConsoleErrorCode::from_str_name(code.as_str_name());
+        ensure!(
+            wire == Some(code),
+            "code {} did not round-trip its str name",
+            code.as_str_name()
+        );
+        let err = con::ConsoleError {
+            code: code as i32,
+            message: "redacted".into(),
+            request_id: Some(99),
+            retry_after_ms: Some(250),
+            required_mfa_level: Some(2),
+            current_version: Some(13),
+            current_registry_rev: Some(5),
+            correlation_id: Some("appr-1".into()),
+        };
+        let bytes = err.encode_to_vec();
+        let decoded = con::ConsoleError::decode(&bytes[..])?;
+        ensure!(
+            err == decoded,
+            "console error changed on the wire: {decoded:?}"
+        );
+    }
+    Ok(())
+}

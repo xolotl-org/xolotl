@@ -51,7 +51,10 @@ pub use driver::{
     EchoDriver, FnDriver,
 };
 pub use executor::{ExecError, Executor, intern_identity, now_millis};
-pub use fact::{FactError, FactSink, FactStore, InMemoryFactStore, SharedFactStore};
+pub use fact::{
+    FACT_BROADCAST_CAPACITY, FactError, FactSink, FactStore, FactStream, InMemoryFactStore,
+    SharedFactStore,
+};
 pub use handle::{FastPath, Handle, HandleState, HandleTable};
 pub use kernel::Kernel;
 pub use open::{OpenError, OpenRequest, derive_handle, open_resource};

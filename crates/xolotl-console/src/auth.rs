@@ -1,8 +1,7 @@
 //! Console authentication and authorization.
 //!
-//! Credentials stay outside Operation input and Facts. Account records live
-//! under `state://kernel/console/*`; password/session/TOTP secrets live under
-//! `state://vault/console/*`.
+//! Account records live under `state://kernel/console/*`; credential verifiers,
+//! sessions, lockouts, and passkey challenges live under `state://vault/console/*`.
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -14,12 +13,20 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::sync::Semaphore;
-use xolotl_kernel::{Bootstrap, GatewayAudit};
+use webauthn_rs::prelude::{
+    CreationChallengeResponse, Passkey, PasskeyAuthentication, PasskeyRegistration,
+    PublicKeyCredential, RegisterPublicKeyCredential, RequestChallengeResponse, Url, Uuid,
+    Webauthn, WebauthnBuilder,
+};
+use xolotl_kernel::{Bootstrap, CompiledRequestGrantTemplate, GatewayAudit};
 use xolotl_state::{Backend, StateError};
-use xolotl_types::{CapSet, Capability, Path, Value};
+use xolotl_types::{CapSet, Capability, Path, ResourceName, ResourceSelector, Value};
+
+use crate::credentials::{LockoutState, lockout_until_ms};
 
 const USERS_PREFIX: &str = "state://kernel/console/users";
 const SESSIONS_PREFIX: &str = "state://kernel/console/sessions";
@@ -71,8 +78,51 @@ type HmacSha1 = Hmac<Sha1>;
 pub struct RootProvisioning {
     /// Optional precomputed Argon2 PHC string for the root password.
     pub password_hash: Option<String>,
+    /// Optional plaintext root password consumed only during bootstrap.
+    /// Mutually exclusive with `password_hash`.
+    pub password: Option<String>,
     /// Optional public-key descriptors for key login.
     pub pubkeys: Vec<String>,
+}
+
+/// WebAuthn relying-party configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConsoleWebAuthnConfig {
+    /// Whether passkey endpoints are enabled.
+    pub enabled: bool,
+    /// Stable relying-party id, usually the console hostname.
+    pub rp_id: String,
+    /// Externally visible relying-party origin.
+    pub rp_origin: String,
+    /// Human-readable relying-party name shown by authenticators.
+    pub rp_name: String,
+    /// Ceremony lifetime in milliseconds.
+    pub challenge_ttl_ms: i64,
+}
+
+impl Default for ConsoleWebAuthnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rp_id: "localhost".into(),
+            rp_origin: "https://localhost".into(),
+            rp_name: "Xolotl Console".into(),
+            challenge_ttl_ms: KEY_CHALLENGE_TTL_MS,
+        }
+    }
+}
+
+impl ConsoleWebAuthnConfig {
+    /// Clamp timing values and preserve caller-supplied relying-party identity.
+    pub fn bounded(self) -> Self {
+        Self {
+            enabled: self.enabled,
+            rp_id: self.rp_id,
+            rp_origin: self.rp_origin,
+            rp_name: self.rp_name,
+            challenge_ttl_ms: self.challenge_ttl_ms.clamp(10_000, 300_000),
+        }
+    }
 }
 
 /// Console authentication tuning.
@@ -88,6 +138,8 @@ pub struct ConsoleAuthConfig {
     pub global_session_limit: usize,
     /// Maximum concurrent Argon2 verifications.
     pub argon2_concurrency: usize,
+    /// Passkey/WebAuthn relying-party settings.
+    pub webauthn: ConsoleWebAuthnConfig,
 }
 
 impl Default for ConsoleAuthConfig {
@@ -98,6 +150,7 @@ impl Default for ConsoleAuthConfig {
             max_sessions_per_user: DEFAULT_MAX_SESSIONS_PER_USER,
             global_session_limit: DEFAULT_GLOBAL_SESSION_LIMIT,
             argon2_concurrency: default_argon2_concurrency(),
+            webauthn: ConsoleWebAuthnConfig::default(),
         }
     }
 }
@@ -124,6 +177,7 @@ impl ConsoleAuthConfig {
             argon2_concurrency: self
                 .argon2_concurrency
                 .clamp(MIN_ARGON2_CONCURRENCY, HARD_ARGON2_CONCURRENCY),
+            webauthn: self.webauthn.bounded(),
         }
     }
 }
@@ -140,6 +194,11 @@ pub enum BootstrapOutcome {
         /// One-time generated password.
         password: String,
     },
+    /// Root was created from a provisioned plaintext password (validated and hashed).
+    CreatedFromProvisionedPassword {
+        /// Created username.
+        username: String,
+    },
     /// Root was created from preseeded password or key material.
     CreatedPreseeded {
         /// Created username.
@@ -152,7 +211,10 @@ pub async fn root_random_password_needed(
     boot: &Bootstrap,
     provisioning: &RootProvisioning,
 ) -> Result<bool, AuthError> {
-    if provisioning.password_hash.is_some() || !provisioning.pubkeys.is_empty() {
+    if provisioning.password_hash.is_some()
+        || provisioning.password.is_some()
+        || !provisioning.pubkeys.is_empty()
+    {
         return Ok(false);
     }
     let users = boot
@@ -239,6 +301,66 @@ pub struct KeyLoginRequest {
     /// Optional public-key descriptor selecting a registered key.
     #[serde(default)]
     pub key: Option<String>,
+}
+
+/// Request to begin passkey registration for the bearer principal.
+#[derive(Debug, Deserialize)]
+pub struct PasskeyRegisterBeginRequest {
+    /// Optional display name sent to the authenticator.
+    #[serde(default)]
+    pub display_name: Option<String>,
+}
+
+/// Passkey registration options and server-side ceremony id.
+#[derive(Debug, Serialize)]
+pub struct PasskeyRegisterBeginResponse {
+    /// Single-use server-side ceremony id.
+    pub challenge_id: String,
+    /// Browser `navigator.credentials.create` options.
+    pub public_key: CreationChallengeResponse,
+}
+
+/// Request to finish passkey registration.
+#[derive(Debug, Deserialize)]
+pub struct PasskeyRegisterFinishRequest {
+    /// Ceremony id returned by registration begin.
+    pub challenge_id: String,
+    /// Browser credential response.
+    pub credential: RegisterPublicKeyCredential,
+}
+
+/// Passkey registration result.
+#[derive(Debug, Serialize)]
+pub struct PasskeyRegisterFinishResponse {
+    /// Stored credential id, base64url encoded by the WebAuthn library.
+    pub credential_id: String,
+}
+
+/// Request to begin passkey login.
+#[derive(Debug, Deserialize)]
+pub struct PasskeyLoginBeginRequest {
+    /// Console username.
+    pub username: String,
+}
+
+/// Passkey authentication options and server-side ceremony id.
+#[derive(Debug, Serialize)]
+pub struct PasskeyLoginBeginResponse {
+    /// Single-use server-side ceremony id.
+    pub challenge_id: String,
+    /// Browser `navigator.credentials.get` options.
+    pub public_key: RequestChallengeResponse,
+}
+
+/// Request to finish passkey login.
+#[derive(Debug, Deserialize)]
+pub struct PasskeyLoginFinishRequest {
+    /// Console username.
+    pub username: String,
+    /// Ceremony id returned by login begin.
+    pub challenge_id: String,
+    /// Browser assertion response.
+    pub credential: PublicKeyCredential,
 }
 
 /// Authenticated console principal used by management actions.
@@ -405,6 +527,13 @@ impl ConsoleAuth {
         let username = req.username.trim().to_string();
         validate_username(&username)?;
         self.check_rate_limits(&username, &source_addr, now_millis())?;
+        let now = now_millis();
+        let lockout = read_lockout(state, &username).await?;
+        if lockout.is_locked(now) {
+            return Err(AuthError::RateLimited {
+                retry_after_ms: lockout.remaining_ms(now),
+            });
+        }
 
         let user = read_user(state, &username).await?;
         let password_ref = user.as_ref().and_then(|u| u.password_hash_ref());
@@ -415,31 +544,35 @@ impl ConsoleAuth {
             None => self.decoy_phc.clone(),
         };
 
-        let _permit = self
+        let permit = self
             .argon2_slots
             .acquire()
             .await
             .map_err(|_error| AuthError::Crypto("argon2 semaphore closed".into()))?;
         let password_ok = verify_password(&phc, &req.password);
-        drop(_permit);
+        drop(permit);
 
         let Some(mut user) = user else {
-            self.record_login_failure(&username, &source_addr, now_millis());
+            self.record_login_failure(&username, &source_addr, now);
+            record_account_lockout_failure(state, &username, now).await?;
             return Err(AuthError::InvalidCredentials);
         };
         if !matches!(user.status.as_str(), "active") {
-            self.record_login_failure(&username, &source_addr, now_millis());
+            self.record_login_failure(&username, &source_addr, now);
+            record_account_lockout_failure(state, &username, now).await?;
             return Err(AuthError::AccountUnavailable);
         }
         if !password_ok {
-            self.record_login_failure(&username, &source_addr, now_millis());
+            self.record_login_failure(&username, &source_addr, now);
+            record_account_lockout_failure(state, &username, now).await?;
             return Err(AuthError::InvalidCredentials);
         }
 
         let mut mfa_level = 1u8;
         if user.totp_enabled {
             let Some(code) = req.totp_code.as_deref() else {
-                self.record_login_failure(&username, &source_addr, now_millis());
+                self.record_login_failure(&username, &source_addr, now);
+                record_account_lockout_failure(state, &username, now).await?;
                 return Err(AuthError::InvalidCredentials);
             };
             let seed_ref = user
@@ -456,7 +589,8 @@ impl ConsoleAuth {
             mfa_level = 2;
         }
 
-        self.clear_login_failures(&username, &source_addr, now_millis());
+        self.clear_login_failures(&username, &source_addr, now);
+        clear_lockout(state, &username).await?;
         self.issue_session(state, &user, source_addr, mfa_level)
             .await
     }
@@ -611,6 +745,272 @@ impl ConsoleAuth {
         self.issue_session(state, &user, source_addr, 1).await
     }
 
+    fn webauthn(&self) -> Result<Webauthn, AuthError> {
+        if !self.config.webauthn.enabled {
+            return Err(AuthError::AccountUnavailable);
+        }
+        let origin = Url::parse(&self.config.webauthn.rp_origin)
+            .map_err(|error| AuthError::Crypto(format!("invalid WebAuthn origin: {error}")))?;
+        WebauthnBuilder::new(&self.config.webauthn.rp_id, &origin)
+            .map_err(|error| AuthError::Crypto(error.to_string()))?
+            .rp_name(&self.config.webauthn.rp_name)
+            .timeout(Duration::from_millis(
+                self.config.webauthn.challenge_ttl_ms as u64,
+            ))
+            .build()
+            .map_err(|error| AuthError::Crypto(error.to_string()))
+    }
+
+    /// Begin passkey registration for the authenticated bearer principal.
+    pub(crate) async fn begin_passkey_registration(
+        &self,
+        boot: &Bootstrap,
+        bearer: &str,
+        req: PasskeyRegisterBeginRequest,
+        source_addr: String,
+    ) -> Result<PasskeyRegisterBeginResponse, AuthError> {
+        let principal = self.authenticate_token(boot, bearer).await?;
+        if principal.mfa_level < 2 {
+            return Err(AuthError::PermissionDenied);
+        }
+        let state = &boot.kernel.state;
+        let user = read_user(state, &principal.username)
+            .await?
+            .ok_or(AuthError::InvalidSession)?;
+        if !matches!(user.status.as_str(), "active") {
+            return Err(AuthError::AccountUnavailable);
+        }
+        let webauthn = self.webauthn()?;
+        let passkeys = read_passkey_records(state, &user.username).await?;
+        let exclude = passkeys
+            .iter()
+            .map(|record| record.credential.cred_id().clone())
+            .collect::<Vec<_>>();
+        let display_name = req.display_name.as_deref().unwrap_or(&user.username);
+        let (public_key, registration) = webauthn
+            .start_passkey_registration(
+                stable_user_uuid(&user.username),
+                &user.username,
+                display_name,
+                Some(exclude),
+            )
+            .map_err(|error| AuthError::Crypto(error.to_string()))?;
+        let challenge_id = random_token(18)?;
+        let expires_at = now_millis().saturating_add(self.config.webauthn.challenge_ttl_ms);
+        write_passkey_challenge(
+            state,
+            &challenge_id,
+            &PasskeyChallengeRecord::Registration {
+                username: user.username.clone(),
+                expires_at,
+                state: registration,
+            },
+        )
+        .await?;
+        record_auth_audit(
+            boot,
+            "console_credential",
+            Some(&user.username),
+            Some(&source_addr),
+            "passkey_register_begin",
+            Some(principal.mfa_level),
+        )?;
+        Ok(PasskeyRegisterBeginResponse {
+            challenge_id,
+            public_key,
+        })
+    }
+
+    /// Finish passkey registration and persist the credential.
+    pub(crate) async fn finish_passkey_registration(
+        &self,
+        boot: &Bootstrap,
+        bearer: &str,
+        req: PasskeyRegisterFinishRequest,
+        source_addr: String,
+    ) -> Result<PasskeyRegisterFinishResponse, AuthError> {
+        let principal = self.authenticate_token(boot, bearer).await?;
+        if principal.mfa_level < 2 {
+            return Err(AuthError::PermissionDenied);
+        }
+        let state = &boot.kernel.state;
+        let challenge = take_passkey_challenge(state, &req.challenge_id).await?;
+        let PasskeyChallengeRecord::Registration {
+            username,
+            expires_at,
+            state: registration,
+        } = challenge
+        else {
+            return Err(AuthError::InvalidChallenge);
+        };
+        if expires_at <= now_millis() || username != principal.username {
+            return Err(AuthError::InvalidChallenge);
+        }
+        let webauthn = self.webauthn()?;
+        let credential = webauthn
+            .finish_passkey_registration(&req.credential, &registration)
+            .map_err(|error| AuthError::Crypto(error.to_string()))?;
+        let credential_id = passkey_credential_id(&credential);
+        let now = now_millis();
+        write_passkey_record(
+            state,
+            &PasskeyCredentialRecord {
+                username: username.clone(),
+                credential,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await?;
+        record_auth_audit(
+            boot,
+            "console_credential",
+            Some(&username),
+            Some(&source_addr),
+            "passkey_register_finish",
+            Some(principal.mfa_level),
+        )?;
+        Ok(PasskeyRegisterFinishResponse { credential_id })
+    }
+
+    /// Begin passkey login for an active user.
+    pub(crate) async fn begin_passkey_login(
+        &self,
+        boot: &Bootstrap,
+        req: PasskeyLoginBeginRequest,
+        source_addr: String,
+    ) -> Result<PasskeyLoginBeginResponse, AuthError> {
+        let state = &boot.kernel.state;
+        let username = req.username.trim().to_string();
+        validate_username(&username)?;
+        self.check_rate_limits(&username, &source_addr, now_millis())?;
+        let user = read_user(state, &username)
+            .await?
+            .ok_or(AuthError::InvalidCredentials)?;
+        if !matches!(user.status.as_str(), "active") {
+            return Err(AuthError::AccountUnavailable);
+        }
+        let records = read_passkey_records(state, &username).await?;
+        if records.is_empty() {
+            return Err(AuthError::InvalidCredentials);
+        }
+        let credentials = records
+            .iter()
+            .map(|record| record.credential.clone())
+            .collect::<Vec<_>>();
+        let webauthn = self.webauthn()?;
+        let (public_key, authentication) = webauthn
+            .start_passkey_authentication(&credentials)
+            .map_err(|error| AuthError::Crypto(error.to_string()))?;
+        let challenge_id = random_token(18)?;
+        let expires_at = now_millis().saturating_add(self.config.webauthn.challenge_ttl_ms);
+        write_passkey_challenge(
+            state,
+            &challenge_id,
+            &PasskeyChallengeRecord::Authentication {
+                username,
+                expires_at,
+                state: authentication,
+            },
+        )
+        .await?;
+        record_auth_audit(
+            boot,
+            "console_credential",
+            Some(&user.username),
+            Some(&source_addr),
+            "passkey_login_begin",
+            None,
+        )?;
+        Ok(PasskeyLoginBeginResponse {
+            challenge_id,
+            public_key,
+        })
+    }
+
+    /// Finish passkey login and issue an MFA-level session.
+    pub(crate) async fn finish_passkey_login(
+        &self,
+        boot: &Bootstrap,
+        req: PasskeyLoginFinishRequest,
+        source_addr: String,
+    ) -> Result<LoginResponse, AuthError> {
+        let username = req.username.trim().to_string();
+        validate_username(&username)?;
+        let result = self
+            .finish_passkey_login_inner(&boot.kernel.state, req, source_addr.clone())
+            .await;
+        match &result {
+            Ok(response) => record_auth_audit(
+                boot,
+                "console_login",
+                Some(&username),
+                Some(&source_addr),
+                "passkey_ok",
+                Some(response.mfa_level),
+            )?,
+            Err(err) => record_auth_audit(
+                boot,
+                "console_login_failed",
+                Some(&username),
+                Some(&source_addr),
+                audit_outcome(err),
+                None,
+            )?,
+        }
+        result
+    }
+
+    async fn finish_passkey_login_inner(
+        &self,
+        state: &Backend,
+        req: PasskeyLoginFinishRequest,
+        source_addr: String,
+    ) -> Result<LoginResponse, AuthError> {
+        let username = req.username.trim().to_string();
+        let challenge = take_passkey_challenge(state, &req.challenge_id).await?;
+        let PasskeyChallengeRecord::Authentication {
+            username: challenge_username,
+            expires_at,
+            state: authentication,
+        } = challenge
+        else {
+            return Err(AuthError::InvalidChallenge);
+        };
+        if expires_at <= now_millis() || challenge_username != username {
+            return Err(AuthError::InvalidChallenge);
+        }
+        let mut user = read_user(state, &username)
+            .await?
+            .ok_or(AuthError::InvalidCredentials)?;
+        if !matches!(user.status.as_str(), "active") {
+            return Err(AuthError::AccountUnavailable);
+        }
+        let records = read_passkey_records(state, &username).await?;
+        let webauthn = self.webauthn()?;
+        let auth_result = webauthn
+            .finish_passkey_authentication(&req.credential, &authentication)
+            .map_err(|error| AuthError::Crypto(error.to_string()))?;
+        if !auth_result.user_verified() {
+            return Err(AuthError::InvalidCredentials);
+        }
+        let mut matched = None;
+        for mut record in records {
+            if record.credential.update_credential(&auth_result).is_some() {
+                record.updated_at = now_millis();
+                write_passkey_record(state, &record).await?;
+                matched = Some(());
+                break;
+            }
+        }
+        if matched.is_none() {
+            return Err(AuthError::InvalidCredentials);
+        }
+        clear_lockout(state, &username).await?;
+        user.password_changed_at = user.password_changed_at.max(0);
+        self.issue_session(state, &user, source_addr, 2).await
+    }
+
     /// Upgrade an existing bearer session to MFA level 2.
     ///
     /// Uses TOTP when enabled for the user, otherwise rechecks the password.
@@ -699,13 +1099,13 @@ impl ConsoleAuth {
                     .unwrap_or_else(|| self.decoy_phc.clone()),
                 None => self.decoy_phc.clone(),
             };
-            let _permit = self
+            let permit = self
                 .argon2_slots
                 .acquire()
                 .await
                 .map_err(|_error| AuthError::Crypto("argon2 semaphore closed".into()))?;
             let ok = verify_password(&phc, password);
-            drop(_permit);
+            drop(permit);
             if !ok {
                 self.record_login_failure(&user.username, &source_addr, now_millis());
                 return Err(AuthError::InvalidCredentials);
@@ -812,6 +1212,54 @@ impl ConsoleAuth {
             username: user.username,
             identity_path: user.identity_path,
             grants,
+            mfa_level: session.mfa_level,
+        })
+    }
+
+    /// Rotate a session's bearer token: validate the presented token, issue a
+    /// fresh secret (invalidating the old hash), and extend the idle window.
+    /// The session id is preserved; only the secret changes.
+    pub(crate) async fn refresh_session(
+        &self,
+        boot: &Bootstrap,
+        bearer: &str,
+    ) -> Result<LoginResponse, AuthError> {
+        let state = &boot.kernel.state;
+        let (sid, token) = bearer.split_once('.').ok_or(AuthError::InvalidSession)?;
+        validate_session_id(sid)?;
+        let session_path = session_path(sid)?;
+        let Some(mut session) = read_session(state, &session_path).await? else {
+            return Err(AuthError::InvalidSession);
+        };
+        let now = now_millis();
+        if session.expires_at <= now || session.idle_expires_at <= now {
+            revoke_session(state, sid).await?;
+            return Err(AuthError::InvalidSession);
+        }
+        let expected_hash = read_string(state, &session_token_path(sid)?)
+            .await?
+            .ok_or(AuthError::InvalidSession)?;
+        if expected_hash
+            .as_bytes()
+            .ct_eq(token_hash(token).as_bytes())
+            .unwrap_u8()
+            != 1
+        {
+            return Err(AuthError::InvalidSession);
+        }
+
+        let new_secret = random_token(32)?;
+        let new_token = format!("{sid}.{new_secret}");
+        session.last_seen = now;
+        session.idle_expires_at = now.saturating_add(self.config.idle_ttl_ms);
+        write_session(state, &session_path, &session).await?;
+        write_string(state, &session_token_path(sid)?, token_hash(&new_secret)).await?;
+
+        Ok(LoginResponse {
+            sid: sid.to_string(),
+            token: new_token,
+            expires_at: session.expires_at,
+            idle_expires_at: session.idle_expires_at,
             mfa_level: session.mfa_level,
         })
     }
@@ -1085,6 +1533,11 @@ async fn bootstrap_root_account_inner(
     state: &Backend,
     provisioning: RootProvisioning,
 ) -> Result<BootstrapOutcome, AuthError> {
+    if provisioning.password_hash.is_some() && provisioning.password.is_some() {
+        return Err(AuthError::Crypto(
+            "root password and password_hash are mutually exclusive".into(),
+        ));
+    }
     if let Some(phc) = &provisioning.password_hash {
         PasswordHash::new(phc)
             .map_err(|_error| AuthError::Crypto("invalid root password PHC string".into()))?;
@@ -1109,6 +1562,22 @@ async fn bootstrap_root_account_inner(
         (
             Some(hash_ref),
             BootstrapOutcome::CreatedPreseeded {
+                username: ROOT_USERNAME.into(),
+            },
+        )
+    } else if let Some(password) = provisioning.password {
+        crate::credentials::enforce_password_strength(
+            &crate::credentials::PasswordPolicy::default().bounded(),
+            ROOT_USERNAME,
+            &password,
+        )
+        .map_err(|error| AuthError::Crypto(format!("root password rejected by policy: {error}")))?;
+        let phc = hash_password(&password)?;
+        let hash_ref = password_hash_path(ROOT_USERNAME)?;
+        write_string(state, &hash_ref, phc).await?;
+        (
+            Some(hash_ref),
+            BootstrapOutcome::CreatedFromProvisionedPassword {
                 username: ROOT_USERNAME.into(),
             },
         )
@@ -1177,6 +1646,23 @@ pub(crate) fn validate_username(username: &str) -> Result<(), AuthError> {
     } else {
         Err(AuthError::InvalidUsername)
     }
+}
+
+/// Compile one request grant after checking that `principal` covers it.
+pub(crate) fn compile_principal_request_grant(
+    boot: &Bootstrap,
+    principal: &ConsolePrincipal,
+    target: &ResourceName,
+    verb: &str,
+    selector: ResourceSelector,
+) -> Result<CompiledRequestGrantTemplate, AuthError> {
+    if !principal.grants.contains(verb, target.path()) {
+        return Err(AuthError::PermissionDenied);
+    }
+    let methods = boot
+        .request_method_bitmap(target, verb)
+        .map_err(|error| AuthError::State(error.to_string()))?;
+    Ok(CompiledRequestGrantTemplate { selector, methods })
 }
 
 /// Authorize a principal for a state path and optional replacement value.
@@ -1333,6 +1819,29 @@ fn role_frozen(value: &Value) -> Result<bool, AuthError> {
         .as_map()
         .ok_or_else(|| AuthError::State("console role must be a map".into()))?;
     optional_bool_field(map, "frozen", "console role")
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PasskeyCredentialRecord {
+    username: String,
+    credential: Passkey,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PasskeyChallengeRecord {
+    Registration {
+        username: String,
+        expires_at: i64,
+        state: PasskeyRegistration,
+    },
+    Authentication {
+        username: String,
+        expires_at: i64,
+        state: PasskeyAuthentication,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1710,6 +2219,96 @@ fn root_grants() -> Vec<String> {
     ]
 }
 
+fn passkey_challenge_path(challenge_id: &str) -> Result<String, AuthError> {
+    validate_session_id(challenge_id).map_err(|_error| AuthError::InvalidChallenge)?;
+    state_path_string(&["vault", "console", "passkey_challenges", challenge_id])
+}
+
+fn passkey_credential_id(credential: &Passkey) -> String {
+    URL_SAFE_NO_PAD.encode(credential.cred_id().as_ref())
+}
+
+fn passkey_credential_key(credential: &Passkey) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(credential.cred_id().as_ref()))
+}
+
+fn passkey_user_prefix(username: &str) -> Result<String, AuthError> {
+    validate_username(username)?;
+    state_path_string(&["kernel", "console", "credentials", "passkeys", username])
+}
+
+fn passkey_credential_path(username: &str, credential: &Passkey) -> Result<String, AuthError> {
+    let prefix = passkey_user_prefix(username)?;
+    Ok(format!("{prefix}/{}", passkey_credential_key(credential)))
+}
+
+fn stable_user_uuid(username: &str) -> Uuid {
+    let digest = Sha256::digest(username.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+async fn write_passkey_challenge(
+    state: &Backend,
+    challenge_id: &str,
+    record: &PasskeyChallengeRecord,
+) -> Result<(), AuthError> {
+    let encoded =
+        serde_json::to_string(record).map_err(|error| AuthError::Crypto(error.to_string()))?;
+    write_string(state, &passkey_challenge_path(challenge_id)?, encoded).await
+}
+
+async fn take_passkey_challenge(
+    state: &Backend,
+    challenge_id: &str,
+) -> Result<PasskeyChallengeRecord, AuthError> {
+    let path = passkey_challenge_path(challenge_id)?;
+    let encoded = read_string(state, &path)
+        .await?
+        .ok_or(AuthError::InvalidChallenge)?;
+    state.write_delete(&Path::parse(&path)?).await?;
+    serde_json::from_str(&encoded).map_err(|_error| AuthError::InvalidChallenge)
+}
+
+async fn write_passkey_record(
+    state: &Backend,
+    record: &PasskeyCredentialRecord,
+) -> Result<(), AuthError> {
+    let encoded =
+        serde_json::to_string(record).map_err(|error| AuthError::Crypto(error.to_string()))?;
+    write_string(
+        state,
+        &passkey_credential_path(&record.username, &record.credential)?,
+        encoded,
+    )
+    .await
+}
+
+async fn read_passkey_records(
+    state: &Backend,
+    username: &str,
+) -> Result<Vec<PasskeyCredentialRecord>, AuthError> {
+    let prefix = Path::parse(&passkey_user_prefix(username)?)?;
+    let entries = state.read_prefix(&prefix).await?;
+    let mut records = Vec::with_capacity(entries.len());
+    for (_path, value) in entries {
+        let Some(encoded) = value.as_str() else {
+            return Err(AuthError::State(
+                "passkey credential record must be a string".into(),
+            ));
+        };
+        records.push(
+            serde_json::from_str(encoded).map_err(|error| {
+                AuthError::State(format!("invalid passkey credential: {error}"))
+            })?,
+        );
+    }
+    Ok(records)
+}
+
 fn state_path_string(segments: &[&str]) -> Result<String, AuthError> {
     let mut path = Path::try_new("state")?;
     for segment in segments {
@@ -1741,6 +2340,80 @@ fn session_path(sid: &str) -> Result<String, AuthError> {
 fn session_token_path(sid: &str) -> Result<String, AuthError> {
     validate_session_id(sid)?;
     state_path_string(&["vault", "console", "sessions", sid])
+}
+
+fn lockout_path(username: &str) -> Result<String, AuthError> {
+    validate_username(username)?;
+    state_path_string(&["vault", "console", "lockouts", username])
+}
+
+const LOCKOUT_THRESHOLD: u32 = 5;
+const LOCKOUT_BASE_MS: i64 = 1_000;
+const LOCKOUT_MAX_MS: i64 = 60_000;
+
+async fn read_lockout(state: &Backend, username: &str) -> Result<LockoutState, AuthError> {
+    let path = Path::parse(&lockout_path(username)?)?;
+    let Some(value) = state.read(&path).await? else {
+        return Ok(LockoutState::default());
+    };
+    let Value::Map(map) = value else {
+        return Ok(LockoutState::default());
+    };
+    let consecutive_failures = map
+        .get("consecutive_failures")
+        .and_then(Value::as_int)
+        .map(|i| i.max(0) as u32)
+        .unwrap_or(0);
+    let locked_until_ms = map
+        .get("locked_until_ms")
+        .and_then(Value::as_int)
+        .unwrap_or(0);
+    Ok(LockoutState {
+        consecutive_failures,
+        locked_until_ms,
+    })
+}
+
+async fn write_lockout(
+    state: &Backend,
+    username: &str,
+    lockout: &LockoutState,
+) -> Result<(), AuthError> {
+    let path = Path::parse(&lockout_path(username)?)?;
+    let mut map = BTreeMap::new();
+    map.insert(
+        "consecutive_failures".into(),
+        Value::Int(lockout.consecutive_failures as i64),
+    );
+    map.insert(
+        "locked_until_ms".into(),
+        Value::Int(lockout.locked_until_ms),
+    );
+    state.write_set(&path, Value::Map(map)).await?;
+    Ok(())
+}
+
+async fn clear_lockout(state: &Backend, username: &str) -> Result<(), AuthError> {
+    let path = Path::parse(&lockout_path(username)?)?;
+    state.write_delete(&path).await?;
+    Ok(())
+}
+
+async fn record_account_lockout_failure(
+    state: &Backend,
+    username: &str,
+    now: i64,
+) -> Result<(), AuthError> {
+    let mut lockout = read_lockout(state, username).await?;
+    lockout.consecutive_failures = lockout.consecutive_failures.saturating_add(1);
+    lockout.locked_until_ms = lockout_until_ms(
+        lockout.consecutive_failures,
+        LOCKOUT_THRESHOLD,
+        LOCKOUT_BASE_MS,
+        LOCKOUT_MAX_MS,
+        now,
+    );
+    write_lockout(state, username, &lockout).await
 }
 
 fn key_challenge_path(challenge_id: &str) -> Result<String, AuthError> {
@@ -2238,6 +2911,7 @@ mod tests {
             max_sessions_per_user: 0,
             global_session_limit: usize::MAX,
             argon2_concurrency: 0,
+            webauthn: ConsoleWebAuthnConfig::default(),
         }
         .bounded();
         assert_eq!(cfg.session_ttl_ms, MAX_SESSION_TTL_MS);
@@ -2252,6 +2926,7 @@ mod tests {
             max_sessions_per_user: 10,
             global_session_limit: 100,
             argon2_concurrency: 2,
+            webauthn: ConsoleWebAuthnConfig::default(),
         }
         .bounded();
         assert_eq!(cfg.session_ttl_ms, MIN_SESSION_TTL_MS);
@@ -2298,6 +2973,7 @@ mod tests {
                 &boot,
                 &RootProvisioning {
                     password_hash: None,
+                    password: None,
                     pubkeys: vec!["ssh-ed25519 unsupported".into()],
                 },
             )
@@ -2480,6 +3156,45 @@ mod tests {
         ensure!(
             locked.status == "locked",
             "locked status did not round-trip"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_rotates_token_and_invalidates_old_secret() -> anyhow::Result<()> {
+        let boot = auth_boot();
+        let password = bootstrap_root_password(&boot).await?;
+        let auth = test_auth()?;
+        let login = auth
+            .login(
+                &boot,
+                LoginRequest {
+                    username: "root".into(),
+                    password,
+                    totp_code: None,
+                },
+                "test".into(),
+            )
+            .await?;
+        let rotated = auth.refresh_session(&boot, &login.token).await?;
+        ensure!(
+            rotated.sid == login.sid,
+            "refresh must preserve the session id"
+        );
+        ensure!(
+            rotated.token != login.token,
+            "refresh must mint a new token"
+        );
+
+        // The new token authenticates.
+        auth.authenticate_token(&boot, &rotated.token).await?;
+        // The old token no longer authenticates.
+        ensure!(
+            matches!(
+                auth.authenticate_token(&boot, &login.token).await,
+                Err(AuthError::InvalidSession)
+            ),
+            "old token still authenticated after rotation"
         );
         Ok(())
     }
@@ -2753,6 +3468,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_password_and_hash_are_mutually_exclusive() -> anyhow::Result<()> {
+        let boot = auth_boot();
+        let phc = hash_password_with_salt("strong-root-password-9qL", &[1u8; 16])?;
+        let err = match bootstrap_root_account(
+            &boot,
+            RootProvisioning {
+                password_hash: Some(phc),
+                password: Some("another-strong-root-password-8pK".into()),
+                pubkeys: Vec::new(),
+            },
+        )
+        .await
+        {
+            Ok(outcome) => bail!("unexpected bootstrap success: {outcome:?}"),
+            Err(error) => error,
+        };
+        ensure!(
+            matches!(err, AuthError::Crypto(ref message) if message.contains("mutually exclusive")),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn pubkey_only_root_can_use_single_use_challenge_login() -> anyhow::Result<()> {
         let boot = auth_boot();
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
@@ -2764,6 +3503,7 @@ mod tests {
             &boot,
             RootProvisioning {
                 password_hash: None,
+                password: None,
                 pubkeys: vec![descriptor.clone()],
             },
         )

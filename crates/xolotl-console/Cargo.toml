@@ -21,10 +21,13 @@ futures-util = { workspace = true, default-features = false, features = ["sink",
 getrandom = { workspace = true, default-features = false }
 hmac = { workspace = true, default-features = false }
 xolotl-graph.workspace = true
+xolotl-gateway.workspace = true
 xolotl-kernel.workspace = true
 xolotl-state.workspace = true
 xolotl-types.workspace = true
-rmp-serde = { workspace = true, default-features = false }
+xolotl-proto.workspace = true
+xolotl-console-protocol.workspace = true
+prost = { workspace = true, default-features = false, features = ["derive", "std"] }
 serde = { workspace = true, default-features = false, features = ["derive", "std"] }
 serde_json = { workspace = true, default-features = false, features = ["std"] }
 sha1 = { workspace = true, default-features = false }
@@ -34,6 +37,7 @@ thiserror = { workspace = true, default-features = false, features = ["std"] }
 tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros", "rt-multi-thread", "signal", "time"] }
 tower-http = { workspace = true, default-features = false, features = ["trace", "cors"] }
 tracing = { workspace = true, default-features = false, features = ["std"] }
+webauthn-rs = { workspace = true, default-features = false }
 
 [dev-dependencies]
 criterion = { workspace = true, default-features = false, features = ["cargo_bench_support"] }

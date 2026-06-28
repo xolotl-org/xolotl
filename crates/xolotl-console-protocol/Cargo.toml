@@ -1,0 +1,18 @@
+[package]
+name = "xolotl-console-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+xolotl-proto.workspace = true
+
+[dev-dependencies]
+anyhow = { workspace = true, default-features = false, features = ["std"] }

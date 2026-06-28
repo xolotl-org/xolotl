@@ -260,13 +260,14 @@ async fn serve() -> Result<()> {
 
     let root_provisioning = RootProvisioning {
         password_hash: cfg.console.root.password_hash.clone(),
+        password: cfg.console.root.password.clone(),
         pubkeys: cfg.console.root.pubkeys.clone(),
     };
     if xolotl_console::root_random_password_needed(&boot, &root_provisioning).await?
         && !std::io::stderr().is_terminal()
     {
         anyhow::bail!(
-            "refusing to bootstrap root with a random password because stderr is not a TTY; set console.root.password_hash or console.root.pubkeys in xolotl.toml"
+            "refusing to bootstrap root with a random password because stderr is not a TTY; set console.root.password_hash, console.root.password, or console.root.pubkeys in xolotl.toml"
         );
     }
     let root_bootstrap = xolotl_console::bootstrap_root_account(&boot, root_provisioning).await?;
@@ -274,6 +275,9 @@ async fn serve() -> Result<()> {
         BootstrapOutcome::AlreadyPresent => {}
         BootstrapOutcome::CreatedPreseeded { username } => {
             tracing::info!(%username, "console root account bootstrapped from config");
+        }
+        BootstrapOutcome::CreatedFromProvisionedPassword { username } => {
+            tracing::info!(%username, "console root account bootstrapped from provisioned password");
         }
         BootstrapOutcome::CreatedRandomPassword { username, password } => {
             write_bootstrap_credentials(&username, &password)?;

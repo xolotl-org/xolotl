@@ -1,9 +1,4 @@
 //! Console WebSocket protocol endpoint.
-//!
-//! This is the post-login control path. Frames carry descriptor-named protocol
-//! actions (`ActionCall`) and streams (`StreamCall`). Dispatch goes through
-//! kernel/auth management surfaces and audited runtime helpers, not through a
-//! raw `{target, method, input}` shell.
 
 use crate::auth::{self, ConsolePrincipal, SessionSummary};
 use crate::mgmt::{self, MgmtError};
@@ -32,9 +27,10 @@ use crate::protocol::{
     ACTION_RUNTIME_PROCESS_INSPECT, ACTION_SECRET_CATALOG, ACTION_SECRET_REVEAL,
     ACTION_STATE_SNAPSHOT, ACTION_VISIBILITY_AUTHORITY_DESCRIBE, ACTION_VISIBILITY_STATE_LIST,
     ACTION_VISIBILITY_STATE_READ, ActionCall, ActionDescriptor, ActionResult, ClientFrame,
-    ConsoleErrorCode, ConsoleEvent, JsonBytes, PrincipalSummary, RequiredAuthority,
-    STREAM_AUDIT_FACTS, STREAM_STATE_WATCH, ServerFrame, StreamCall,
+    ConsoleErrorCode, ConsoleEvent, PrincipalSummary, RequiredAuthority, STREAM_AUDIT_FACTS,
+    STREAM_STATE_WATCH, ServerFrame, StreamCall,
 };
+use crate::recipes::{self, StateMethod as RecipeStateMethod};
 use crate::state::{
     ConsoleState, ConsoleWsLimit, HARD_MAX_WS_FACT_LIMIT, HARD_MAX_WS_FRAME_BYTES,
     HARD_MAX_WS_STATE_LIST_LIMIT, HARD_MAX_WS_SUBSCRIPTIONS, HARD_MAX_WS_TRACE_LIMIT,
@@ -51,12 +47,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use xolotl_graph::{DoNode, OperationTemplate};
-use xolotl_kernel::RequestGrantTemplate;
 use xolotl_state::StateEvent;
 use xolotl_types::{
-    Capability, ExternalInstallationDef, NodeId, OperationId, Outcome, OutputMode, Path, ProcSpec,
-    ProcessId, ProcessStatus, ResourceName, RestartPolicy, TaintSet, Transport, Value,
+    Capability, ExternalInstallationDef, NodeId, OperationId, Path, ProcSpec, ProcessId,
+    RestartPolicy, Transport, Value,
 };
 
 const MAX_VISIBILITY_TTL_MS: u64 = 10 * 60 * 1000;
@@ -73,13 +67,33 @@ pub(crate) async fn upgrade(
     if let Err(message) = validate_upgrade_headers_audited(&st, &headers, Some(peer)) {
         return (StatusCode::FORBIDDEN, message).into_response();
     }
+    // Downgrade protection: if the client offers any subprotocol, exactly the
+    // protobuf console subprotocol must be among them. A client offering only a
+    // legacy/unknown subprotocol is rejected rather than silently downgraded.
+    if let Some(offered) = headers.get("sec-websocket-protocol")
+        && !offered
+            .to_str()
+            .map(|raw| raw.split(',').any(|p| p.trim() == protocol::SUBPROTOCOL))
+            .unwrap_or(false)
+    {
+        record_ws_audit(&st, None, Some(&source_addr), "unsupported_subprotocol");
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "console websocket requires the {} subprotocol",
+                protocol::SUBPROTOCOL
+            ),
+        )
+            .into_response();
+    }
     if let Err(limit) = st.ws.try_acquire_source(&source_addr) {
         let message = ws_limit_message(limit);
         record_ws_audit(&st, None, Some(&source_addr), "rate_limited");
         return (StatusCode::TOO_MANY_REQUESTS, message).into_response();
     }
     let max_frame_bytes = st.ws.config().max_frame_bytes.min(HARD_MAX_WS_FRAME_BYTES);
-    ws.max_message_size(max_frame_bytes)
+    ws.protocols([protocol::SUBPROTOCOL])
+        .max_message_size(max_frame_bytes)
         .max_frame_size(max_frame_bytes)
         .on_upgrade(move |socket| session(socket, st, source_addr))
 }
@@ -94,8 +108,8 @@ impl From<&ConsolePrincipal> for PrincipalSummary {
     }
 }
 
-struct WsSession {
-    state: Arc<ConsoleState>,
+pub(crate) struct WsSession {
+    pub(crate) state: Arc<ConsoleState>,
     principal: Option<ConsolePrincipal>,
     sid: Option<String>,
     hello_accepted: bool,
@@ -304,7 +318,7 @@ async fn receive_client_message(sess: &mut WsSession, msg: Message) -> Option<Se
             return Some(ServerFrame::Error {
                 id: None,
                 code: ConsoleErrorCode::BadFrame,
-                message: "console websocket only accepts binary MessagePack frames".into(),
+                message: "console websocket only accepts binary protobuf frames".into(),
             });
         }
     };
@@ -595,9 +609,13 @@ async fn dispatch_call(
         ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET => {
             let mut input = input_map(input_value(&call.input)?)?;
             let action_id = string_arg(&mut input, "action")?;
-            protocol::descriptor_value(&action_id).ok_or_else(|| {
-                ConsoleError::BadRequest(format!("unknown action descriptor: {action_id}"))
-            })?
+            sess.state
+                .registry
+                .action_by_id(&action_id)
+                .map(protocol::action_descriptor_to_value)
+                .ok_or_else(|| {
+                    ConsoleError::BadRequest(format!("unknown action descriptor: {action_id}"))
+                })?
         }
         ACTION_REGISTRY_COVERAGE_REPORT => {
             protocol::coverage_report_value(server_rev(sess), registry_rev(sess))
@@ -1217,7 +1235,7 @@ async fn dispatch_call(
             )));
         }
     };
-    ActionResult::value(out, server_rev(sess)).map_err(value_envelope_error)
+    Ok(ActionResult::value(out, server_rev(sess)))
 }
 
 async fn subscribe(
@@ -1268,18 +1286,7 @@ async fn subscribe(
                         _ = &mut shutdown_rx => break,
                         ev = rx.recv() => {
                             let Ok(ev) = ev else { break };
-                            let event = match state_event(ev) {
-                                Ok(event) => event,
-                                Err(e) => {
-                                    send_subscription_closed(
-                                        &event_tx,
-                                        id,
-                                        format!("state event serialization failed: {e}"),
-                                    )
-                                    .await;
-                                    break;
-                                }
-                            };
+                            let event = state_event(ev);
                             if event_tx.send(SubscriptionMessage { stream: id, event }).await.is_err() {
                                 break;
                             }
@@ -1335,18 +1342,7 @@ async fn subscribe(
                             for fact in facts.iter().skip(seen).filter(|fact| {
                                 process.is_none_or(|pid| fact.caller.get() == pid)
                             }) {
-                                let fact = match JsonBytes::try_from_value(&fact_value(fact.clone())) {
-                                    Ok(fact) => fact,
-                                    Err(e) => {
-                                        send_subscription_closed(
-                                            &event_tx,
-                                            id,
-                                            format!("audit fact serialization failed: {e}"),
-                                        )
-                                        .await;
-                                        return;
-                                    }
-                                };
+                                let fact = fact_value(fact.clone());
                                 if event_tx
                                     .send(SubscriptionMessage {
                                         stream: id,
@@ -1504,73 +1500,21 @@ async fn run_state_op(
     method: &str,
     input: Value,
 ) -> Result<Value, ConsoleError> {
-    let target = ResourceName::new(path.clone());
-    let identity_path = principal_identity_path(principal)?;
-    let identity = xolotl_kernel::intern_identity(&identity_path);
-    let verb = capability_verb_for_state_method(method);
-    let cap = format!("{verb}://{}", capability_target(&path));
-    let methods = sess
-        .state
-        .boot
-        .request_method_bitmap(&target, verb)
-        .map_err(|e| ConsoleError::Operation(e.to_string()))?;
-    let process = sess
-        .state
-        .boot
-        .spawn_request_process_under_with_request_grants(
-            sess.state.boot.root,
-            identity,
-            &[RequestGrantTemplate {
-                literal: &cap,
-                methods,
-            }],
-        )
-        .map_err(|e| ConsoleError::Operation(e.to_string()))?;
-    let handle = match sess.state.boot.open_for(process, &target, verb) {
-        Ok(handle) => handle,
-        Err(error) => {
-            return finish_console_request_as_failed(
-                &sess.state.boot,
-                process,
-                ConsoleError::Operation(error.to_string()),
-            )
-            .await;
+    let state_method = match method {
+        "read" => RecipeStateMethod::Read,
+        "list" => RecipeStateMethod::List,
+        "write" => RecipeStateMethod::Write,
+        "append" => RecipeStateMethod::Append,
+        "delete" => RecipeStateMethod::Delete,
+        other => {
+            return Err(ConsoleError::Operation(format!(
+                "unsupported state method: {other}"
+            )));
         }
     };
-    let ex = sess.state.boot.kernel.executor_for(process);
-    ex.bind_handle(target.clone(), handle);
-    let op = DoNode::Op(OperationTemplate {
-        target,
-        method: method.into(),
-        method_id: None,
-        output: OutputMode::Unary,
-        literal_input: Some(input),
-    });
-    let outcome = ex.eval_tainted(&op, TaintSet::author()).await;
-    let result = match &outcome {
-        Outcome::Done(v) | Outcome::Short(v) => Ok(v.clone()),
-        Outcome::Fail(f) => Err(ConsoleError::Operation(f.to_string())),
-    };
-    sess.state
-        .boot
-        .finish_request_process(process, &outcome)
-        .await
+    let compiled = recipes::CompiledRecipe::state(path, state_method, input)
         .map_err(|e| ConsoleError::Operation(e.to_string()))?;
-    result
-}
-
-async fn finish_console_request_as_failed<T>(
-    boot: &xolotl_kernel::Bootstrap,
-    process: ProcessId,
-    error: ConsoleError,
-) -> Result<T, ConsoleError> {
-    let original = error.to_string();
-    match boot.finish_process_as(process, ProcessStatus::Failed).await {
-        Ok(()) => Err(error),
-        Err(cleanup_error) => Err(ConsoleError::Operation(format!(
-            "{original}; request cleanup failed: {cleanup_error}"
-        ))),
-    }
+    recipes::execute(sess, principal, compiled).await
 }
 
 async fn process_inspect(
@@ -2103,58 +2047,9 @@ async fn invoke_effect(
 ) -> Result<Value, ConsoleError> {
     let path = Path::parse(effect)?;
     auth::authorize_path(&sess.state.state, principal, "perform", &path, Some(&input)).await?;
-    let identity_path = principal_identity_path(principal)?;
-    let identity = xolotl_kernel::intern_identity(&identity_path);
-    let cap = format!("perform://{}", capability_target(&path));
-    let target = ResourceName::new(path);
-    let methods = sess
-        .state
-        .boot
-        .request_method_bitmap(&target, "perform")
+    let compiled = recipes::CompiledRecipe::effect(path, input)
         .map_err(|e| ConsoleError::Operation(e.to_string()))?;
-    let process = sess
-        .state
-        .boot
-        .spawn_request_process_under_with_request_grants(
-            sess.state.boot.root,
-            identity,
-            &[RequestGrantTemplate {
-                literal: &cap,
-                methods,
-            }],
-        )
-        .map_err(|e| ConsoleError::Operation(e.to_string()))?;
-    let handle = match sess.state.boot.open_for(process, &target, "perform") {
-        Ok(handle) => handle,
-        Err(error) => {
-            return finish_console_request_as_failed(
-                &sess.state.boot,
-                process,
-                ConsoleError::Operation(error.to_string()),
-            )
-            .await;
-        }
-    };
-    let ex = sess.state.boot.kernel.executor_for(process);
-    ex.bind_handle(target.clone(), handle);
-    let op = DoNode::Op(OperationTemplate {
-        target,
-        method: "invoke".into(),
-        method_id: None,
-        output: OutputMode::Unary,
-        literal_input: Some(input),
-    });
-    let outcome = ex.eval_tainted(&op, TaintSet::author()).await;
-    let result = match &outcome {
-        Outcome::Done(v) | Outcome::Short(v) => Ok(v.clone()),
-        Outcome::Fail(f) => Err(ConsoleError::Operation(f.to_string())),
-    };
-    sess.state
-        .boot
-        .finish_request_process(process, &outcome)
-        .await
-        .map_err(|e| ConsoleError::Operation(e.to_string()))?;
-    result
+    recipes::execute(sess, principal, compiled).await
 }
 
 fn decode_frame(bytes: &[u8], configured_max_frame_bytes: usize) -> Result<ClientFrame, String> {
@@ -2162,7 +2057,7 @@ fn decode_frame(bytes: &[u8], configured_max_frame_bytes: usize) -> Result<Clien
     if bytes.len() > max_frame_bytes {
         return Err("frame exceeds console websocket limit".into());
     }
-    rmp_serde::from_slice(bytes).map_err(|e| format!("bad MessagePack frame: {e}"))
+    crate::wire::decode_client_frame(bytes)
 }
 
 fn bounded_limit(requested: usize, configured: usize, hard: usize) -> usize {
@@ -2179,7 +2074,6 @@ fn u64_to_i64_saturating(value: u64) -> i64 {
 
 #[derive(Debug)]
 enum WsSendError {
-    Encode(rmp_serde::encode::Error),
     Transport(String),
     Timeout,
 }
@@ -2187,7 +2081,6 @@ enum WsSendError {
 impl fmt::Display for WsSendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Encode(error) => write!(f, "frame encoding failed: {error}"),
             Self::Transport(error) => write!(f, "transport send failed: {error}"),
             Self::Timeout => f.write_str("transport send timed out"),
         }
@@ -2205,7 +2098,7 @@ fn record_ws_send_error(sess: &WsSession, error: &WsSendError) {
                 "console WebSocket transport send failed"
             );
         }
-        WsSendError::Encode(_) | WsSendError::Timeout => {
+        WsSendError::Timeout => {
             tracing::warn!(
                 error = %error,
                 username = username.unwrap_or("<anonymous>"),
@@ -2221,7 +2114,7 @@ where
     S: Sink<Message> + Unpin,
     S::Error: fmt::Display,
 {
-    let bytes = encode_frame(&frame).map_err(WsSendError::Encode)?;
+    let bytes = crate::wire::encode_server_frame(&frame);
     tx.send(Message::Binary(bytes.into()))
         .await
         .map_err(|e| WsSendError::Transport(e.to_string()))
@@ -2251,12 +2144,8 @@ fn message_len(msg: &Message) -> usize {
     }
 }
 
-fn encode_frame<T: Serialize>(frame: &T) -> Result<Vec<u8>, rmp_serde::encode::Error> {
-    rmp_serde::to_vec_named(frame)
-}
-
 #[derive(Debug)]
-enum ConsoleError {
+pub(crate) enum ConsoleError {
     Auth(auth::AuthError),
     Mgmt(MgmtError),
     NotAuthenticated,
@@ -2630,19 +2519,19 @@ fn registry_counts_value(counts: xolotl_kernel::registry::RegistryCounts) -> Val
     ])
 }
 
-fn state_event(ev: StateEvent) -> Result<ConsoleEvent, serde_json::Error> {
+fn state_event(ev: StateEvent) -> ConsoleEvent {
     match ev {
-        StateEvent::Set { path, value, .. } => Ok(ConsoleEvent::StateSet {
+        StateEvent::Set { path, value, .. } => ConsoleEvent::StateSet {
             path: path.to_string(),
-            value: JsonBytes::try_from_value(&value)?,
-        }),
-        StateEvent::Append { path, item, .. } => Ok(ConsoleEvent::StateAppend {
+            value,
+        },
+        StateEvent::Append { path, item, .. } => ConsoleEvent::StateAppend {
             path: path.to_string(),
-            item: JsonBytes::try_from_value(&item)?,
-        }),
-        StateEvent::Delete { path } => Ok(ConsoleEvent::StateDelete {
+            item,
+        },
+        StateEvent::Delete { path } => ConsoleEvent::StateDelete {
             path: path.to_string(),
-        }),
+        },
     }
 }
 
@@ -2853,8 +2742,8 @@ fn server_rev(sess: &WsSession) -> u64 {
     sess.state.boot.kernel.facts.cursor()
 }
 
-fn registry_rev(_sess: &WsSession) -> u64 {
-    protocol::PROTOCOL_VERSION as u64
+fn registry_rev(sess: &WsSession) -> u64 {
+    sess.state.registry.current_rev()
 }
 
 fn protocol_metadata(sess: &WsSession) -> protocol::ProtocolMetadata {
@@ -3031,7 +2920,7 @@ fn validate_principal_identity(principal: &ConsolePrincipal) -> Result<(), Conso
     principal_identity_path(principal).map(|_| ())
 }
 
-fn principal_identity_path(principal: &ConsolePrincipal) -> Result<Path, ConsoleError> {
+pub(crate) fn principal_identity_path(principal: &ConsolePrincipal) -> Result<Path, ConsoleError> {
     let identity_path = Path::parse(&principal.identity_path)
         .map_err(|e| ConsoleError::Operation(format!("invalid principal identity path: {e}")))?;
     if identity_path.cluster().is_some()
@@ -3248,14 +3137,8 @@ fn validate_authority_verb(verb: &str) -> Result<(), ConsoleError> {
     }
 }
 
-fn input_value(input: &JsonBytes) -> Result<Value, ConsoleError> {
-    input
-        .try_to_value()
-        .map_err(|e| ConsoleError::BadRequest(format!("invalid JSON Value envelope: {e}")))
-}
-
-fn value_envelope_error(e: serde_json::Error) -> ConsoleError {
-    ConsoleError::Operation(format!("JSON Value envelope serialization failed: {e}"))
+fn input_value(input: &Value) -> Result<Value, ConsoleError> {
+    Ok(input.clone())
 }
 
 fn input_map(input: Value) -> Result<BTreeMap<String, Value>, ConsoleError> {
@@ -3418,11 +3301,11 @@ fn string_list_arg(
     }
 }
 
-fn capability_target(path: &Path) -> String {
+pub(crate) fn capability_target(path: &Path) -> String {
     path.to_string().replacen("://", "/", 1)
 }
 
-fn capability_verb_for_state_method(method: &str) -> &'static str {
+pub(crate) fn capability_verb_for_state_method(method: &str) -> &'static str {
     match method {
         "read" | "list" => "read",
         "write" | "append" | "delete" => "write",
@@ -3462,12 +3345,12 @@ mod tests {
         }
     }
 
-    fn json_bytes(value: &Value) -> anyhow::Result<JsonBytes> {
-        Ok(JsonBytes::try_from_value(value)?)
+    fn json_bytes(value: &Value) -> anyhow::Result<Value> {
+        Ok(value.clone())
     }
 
-    fn decode_json_bytes(json: JsonBytes) -> anyhow::Result<Value> {
-        Ok(json.try_to_value()?)
+    fn decode_json_bytes(value: Value) -> anyhow::Result<Value> {
+        Ok(value)
     }
 
     fn invalid_header_value() -> anyhow::Result<axum::http::HeaderValue> {
@@ -3736,6 +3619,7 @@ mod tests {
             scope: None,
             justification: None,
             ttl_ms: None,
+            ..Default::default()
         })
     }
 
@@ -3746,6 +3630,7 @@ mod tests {
             scope: Some("test".into()),
             justification: Some("test visibility inspection".into()),
             ttl_ms: Some(60_000),
+            ..Default::default()
         })
     }
 
@@ -3824,7 +3709,7 @@ mod tests {
     }
 
     #[test]
-    fn console_frame_roundtrips_with_msgpack() -> anyhow::Result<()> {
+    fn console_frame_roundtrips_on_protobuf_wire() -> anyhow::Result<()> {
         let frame = ClientFrame::Call {
             id: 7,
             call: call(
@@ -3847,10 +3732,23 @@ mod tests {
                 ]),
             )?,
         };
-        let bytes = encode_frame(&frame)?;
+        let bytes = crate::wire::encode_client_frame(&frame);
         let decoded = decode_frame(&bytes, HARD_MAX_WS_FRAME_BYTES)
             .map_err(|message| anyhow::anyhow!(message))?;
         ensure!(decoded == frame, "decoded frame did not match original");
+
+        // The server frame path also encodes to a decodable protobuf envelope.
+        let reply = ServerFrame::Reply {
+            id: 7,
+            result: ActionResult::value(Value::Str("ok".into()), 11),
+        };
+        let server_bytes = crate::wire::encode_server_frame(&reply);
+        let server_frame = crate::wire::decode_server_frame(&server_bytes)
+            .map_err(|message| anyhow::anyhow!(message))?;
+        ensure!(
+            server_frame.frame.is_some(),
+            "server frame did not encode a frame payload"
+        );
         Ok(())
     }
 
@@ -4138,7 +4036,7 @@ mod tests {
         );
 
         let frame = ClientFrame::Ping { nonce: 9 };
-        let bytes = encode_frame(&frame)?;
+        let bytes = crate::wire::encode_client_frame(&frame);
         ensure!(
             decode_frame(&bytes, bytes.len()).is_ok(),
             "frame did not decode within exact limit"
@@ -4151,7 +4049,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_action_calls_are_msgpack_frames() -> anyhow::Result<()> {
+    fn protocol_action_calls_are_protobuf_frames() -> anyhow::Result<()> {
         let actions = vec![
             call(ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE, Value::Null)?,
             call(ACTION_AUTHORITY_ACTION_MATRIX, Value::Null)?,
@@ -4193,7 +4091,7 @@ mod tests {
                 id: idx as u64,
                 call,
             };
-            let bytes = encode_frame(&frame)?;
+            let bytes = crate::wire::encode_client_frame(&frame);
             ensure!(
                 decode_frame(&bytes, HARD_MAX_WS_FRAME_BYTES)
                     .map_err(|message| anyhow::anyhow!(message))?
@@ -4205,17 +4103,15 @@ mod tests {
             id: 1,
             stream: StreamCall {
                 stream: STREAM_STATE_WATCH.into(),
-                input: json_bytes(&map_value([(
-                    "pattern",
-                    Value::Str("state://kernel/**".into()),
-                )]))?,
+                input: map_value([("pattern", Value::Str("state://kernel/**".into()))]),
                 scope: Some("test".into()),
                 justification: Some("test stream".into()),
                 ttl_ms: Some(60_000),
                 since_rev: None,
+                max_batch: None,
             },
         };
-        let bytes = encode_frame(&sub)?;
+        let bytes = crate::wire::encode_client_frame(&sub);
         ensure!(
             decode_frame(&bytes, HARD_MAX_WS_FRAME_BYTES)
                 .map_err(|message| anyhow::anyhow!(message))?
@@ -4298,11 +4194,7 @@ mod tests {
         )
         .await
         .map_err(|error| anyhow::anyhow!("metadata action failed: {error:?}"))?;
-        let output = result
-            .output
-            .context("metadata output is missing")?
-            .try_to_value()
-            .map_err(|error| anyhow::anyhow!("metadata output must decode: {error}"))?;
+        let output = result.output.context("metadata output is missing")?;
         let map = output.as_map().context("metadata output must be a map")?;
         ensure!(
             map.get("transport_security_mode").and_then(Value::as_str) == Some("unsafe_plaintext"),
@@ -5290,7 +5182,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_json_envelope_is_rejected() -> anyhow::Result<()> {
+    async fn malformed_action_input_is_rejected() -> anyhow::Result<()> {
         let st = console_state()?;
         let (_token, principal, _password) = root_login(&st).await?;
         let mut sess = test_session(st, principal.clone());
@@ -5299,23 +5191,18 @@ mod tests {
             &principal,
             ActionCall {
                 action: ACTION_CONFIG_READ.into(),
-                input: JsonBytes("{".into()),
-                scope: None,
-                justification: None,
-                ttl_ms: None,
+                input: Value::Str("not-a-map".into()),
+                ..Default::default()
             },
         )
         .await
         {
-            Ok(_) => bail!("invalid JSON envelope unexpectedly decoded"),
+            Ok(_) => bail!("non-map action input unexpectedly accepted"),
             Err(err) => err,
         };
         ensure!(
-            matches!(
-            err,
-            ConsoleError::BadRequest(ref message) if message.contains("invalid JSON Value envelope")
-            ),
-            "unexpected invalid envelope error: {err:?}"
+            matches!(err, ConsoleError::BadRequest(_)),
+            "unexpected malformed input error: {err:?}"
         );
         Ok(())
     }
@@ -5429,6 +5316,7 @@ mod tests {
                 justification: Some("test stream".into()),
                 ttl_ms: Some(60_000),
                 since_rev: Some(1),
+                max_batch: None,
             },
         )
         .await
@@ -5483,6 +5371,7 @@ mod tests {
                 justification: Some("test stream".into()),
                 ttl_ms: Some(60_000),
                 since_rev: None,
+                max_batch: None,
             },
         )
         .await
@@ -5506,6 +5395,7 @@ mod tests {
                 justification: Some("test stream".into()),
                 ttl_ms: Some(60_000),
                 since_rev: None,
+                max_batch: None,
             },
         )
         .await
@@ -5525,7 +5415,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, "console.local:9443".parse()?);
         headers.insert(header::ORIGIN, "https://console.local:9443".parse()?);
-        let cfg = ConsoleTransportSecurityConfig::default();
+        let cfg = crate::state::console_transport_default();
         validate_upgrade_headers(&headers, None, &cfg)
             .map_err(|message| anyhow::anyhow!(message))?;
         headers.insert(header::ORIGIN, "https://console.local:8080".parse()?);
@@ -5589,7 +5479,7 @@ mod tests {
 
     #[test]
     fn invalid_origin_headers_are_rejected() -> anyhow::Result<()> {
-        let cfg = ConsoleTransportSecurityConfig::default();
+        let cfg = crate::state::console_transport_default();
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -5700,18 +5590,181 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn origin_and_host_are_required() -> anyhow::Result<()> {
-        let mut headers = HeaderMap::new();
-        let cfg = ConsoleTransportSecurityConfig::default();
+    #[tokio::test]
+    async fn recipe_state_write_lands_a_fact_via_request_process() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let principal = ConsolePrincipal {
+            username: "root".into(),
+            identity_path: "identity://console/root".into(),
+            grants: xolotl_types::CapSet::from_strs(["*://**"])?,
+            mfa_level: 2,
+        };
+        let sess = test_session(st.clone(), principal.clone());
+
+        let before = st.boot.kernel.facts.cursor();
+        let path = Path::parse("state://chat/source/messages/recipe_probe")?;
+        let compiled = recipes::CompiledRecipe::state(
+            path,
+            RecipeStateMethod::Append,
+            Value::Str("probe-value".into()),
+        )
+        .map_err(|e| anyhow::anyhow!("compile recipe: {e}"))?;
+        recipes::execute(&sess, &principal, compiled)
+            .await
+            .context("recipe execute")?;
+
+        let after = st.boot.kernel.facts.cursor();
         ensure!(
-            validate_upgrade_headers(&headers, None, &cfg).is_err(),
-            "upgrade without origin and host was accepted"
+            after > before,
+            "fact cursor did not advance after recipe write"
         );
-        headers.insert(header::ORIGIN, "https://console.local".parse()?);
+        let facts = st.boot.kernel.facts.all_facts()?;
         ensure!(
-            validate_upgrade_headers(&headers, None, &cfg).is_err(),
-            "upgrade without host was accepted"
+            !facts.is_empty(),
+            "recipe write must record at least one Fact"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recipe_denies_principal_without_matching_grant() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let principal = ConsolePrincipal {
+            username: "limited".into(),
+            identity_path: "identity://console/limited".into(),
+            grants: xolotl_types::CapSet::from_strs(["read://state/other/**"])?,
+            mfa_level: 2,
+        };
+        let sess = test_session(st.clone(), principal.clone());
+        let before = st.boot.kernel.facts.cursor();
+
+        let path = Path::parse("state://chat/source/messages/bridge_probe")?;
+        let compiled = recipes::CompiledRecipe::state(path, RecipeStateMethod::Read, Value::Null)
+            .map_err(|e| anyhow::anyhow!("compile recipe: {e}"))?;
+        let err = match recipes::execute(&sess, &principal, compiled).await {
+            Ok(value) => bail!("read without matching principal grant succeeded: {value:?}"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::Auth(auth::AuthError::PermissionDenied)),
+            "missing grant should fail at the principal bridge, got {err:?}"
+        );
+        ensure!(
+            st.boot.kernel.facts.cursor() == before,
+            "principal-bridge denial should not spawn or finalize a request process"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recipe_read_grant_cannot_write() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let principal = ConsolePrincipal {
+            username: "reader".into(),
+            identity_path: "identity://console/reader".into(),
+            grants: xolotl_types::CapSet::from_strs(["read://state/chat/source/messages/**"])?,
+            mfa_level: 2,
+        };
+        let sess = test_session(st.clone(), principal.clone());
+        let before = st.boot.kernel.facts.cursor();
+
+        let path = Path::parse("state://chat/source/messages/bridge_write_probe")?;
+        let compiled = recipes::CompiledRecipe::state(
+            path,
+            RecipeStateMethod::Append,
+            Value::Str("should-not-write".into()),
+        )
+        .map_err(|e| anyhow::anyhow!("compile recipe: {e}"))?;
+        let err = match recipes::execute(&sess, &principal, compiled).await {
+            Ok(value) => bail!("write with only read grant succeeded: {value:?}"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::Auth(auth::AuthError::PermissionDenied)),
+            "write with read grant should fail at the principal bridge, got {err:?}"
+        );
+        ensure!(
+            st.boot.kernel.facts.cursor() == before,
+            "principal-bridge denial should not spawn or finalize a request process"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recipe_principal_grant_allows_state_read() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let path = Path::parse("state://chat/source/messages/bridge_read_probe")?;
+        st.boot
+            .kernel
+            .state
+            .write_set(&path, Value::Str("readable".into()))
+            .await?;
+        let principal = ConsolePrincipal {
+            username: "reader".into(),
+            identity_path: "identity://console/reader".into(),
+            grants: xolotl_types::CapSet::from_strs(["read://state/chat/source/messages/**"])?,
+            mfa_level: 2,
+        };
+        let sess = test_session(st, principal.clone());
+        let compiled = recipes::CompiledRecipe::state(path, RecipeStateMethod::Read, Value::Null)
+            .map_err(|e| anyhow::anyhow!("compile recipe: {e}"))?;
+        let value = recipes::execute(&sess, &principal, compiled)
+            .await
+            .context("read recipe with matching principal grant")?;
+        ensure!(
+            value == Value::Str("readable".into()),
+            "unexpected read recipe output: {value:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recipe_effect_requires_perform_grant() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let principal = ConsolePrincipal {
+            username: "reader".into(),
+            identity_path: "identity://console/reader".into(),
+            grants: xolotl_types::CapSet::from_strs(["read://state/**"])?,
+            mfa_level: 2,
+        };
+        let sess = test_session(st.clone(), principal.clone());
+        let before = st.boot.kernel.facts.cursor();
+
+        let path = Path::parse("effect://kernel/process/inspect")?;
+        let compiled = recipes::CompiledRecipe::effect(path, Value::Null)
+            .map_err(|e| anyhow::anyhow!("compile recipe: {e}"))?;
+        let err = match recipes::execute(&sess, &principal, compiled).await {
+            Ok(value) => bail!("effect invoke without perform grant succeeded: {value:?}"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::Auth(auth::AuthError::PermissionDenied)),
+            "effect without perform grant should fail at the principal bridge, got {err:?}"
+        );
+        ensure!(
+            st.boot.kernel.facts.cursor() == before,
+            "principal-bridge denial should not spawn or finalize a request process"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recipe_open_for_denial_returns_operation_error() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (_token, principal, _password) = root_login(&st).await?;
+        let sess = test_session(st.clone(), principal.clone());
+
+        // A path the root request grant does not cover: a reserved vault path.
+        let path = Path::parse("state://vault/unreachable/recipe_probe")?;
+        let compiled = recipes::CompiledRecipe::state(path, RecipeStateMethod::Read, Value::Null)
+            .map_err(|e| anyhow::anyhow!("compile recipe: {e}"))?;
+        let err = match recipes::execute(&sess, &principal, compiled).await {
+            Ok(value) => bail!("vault read should be denied by open_for, got {value:?}"),
+            Err(err) => err,
+        };
+        ensure!(
+            matches!(err, ConsoleError::Operation(ref m) if !m.is_empty()),
+            "denied recipe should surface an operation error, got {err:?}"
         );
         Ok(())
     }

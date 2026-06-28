@@ -1,17 +1,10 @@
-//! `FactSink` — write-ahead Fact recording with ReplayClass-graded persistence
-//! barriers.
-//!
-//! The hot path writes a fixed-size record (refs + tags). Only
-//! `NonIdempotentEffect` operations take a write-ahead fsync barrier before the
-//! effect is issued; everything else is an in-memory append flushed by group
-//! commit. The sink maintains a monotonic append cursor used **only** for
-//! snapshot cut-points and archival — it is not a Fact field and plays no part
-//! in identity or idempotency.
+//! `FactSink` records operation Facts with ReplayClass-graded persistence barriers.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::broadcast;
 use xolotl_types::{Fact, OperationId};
 
 /// A durable-write failure from the fact store (disk full, corruption, txn
@@ -22,6 +15,12 @@ use xolotl_types::{Fact, OperationId};
 #[derive(Debug, Error)]
 #[error("fact store write failed: {0}")]
 pub struct FactError(pub String);
+
+/// Push subscription to facts appended after subscription creation.
+pub type FactStream = broadcast::Receiver<Arc<Fact>>;
+
+/// Capacity of the in-memory fact broadcast channel.
+pub const FACT_BROADCAST_CAPACITY: usize = 256;
 
 /// Pluggable durable sink. The in-memory impl is the default; redb provides a
 /// persistent one. The kernel speaks only this trait. Read failures are
@@ -41,13 +40,27 @@ pub trait FactStore: Send + Sync + 'static {
     fn all_facts(&self) -> Result<Vec<Fact>, FactError>;
     /// The current monotonic append cursor.
     fn cursor(&self) -> u64;
+    /// Subscribe to facts appended after this call. The receiver is bounded;
+    /// slow consumers miss older entries and must catch up via `all_facts()`.
+    /// The default returns an inert receiver (never delivers), so test stores
+    /// that do not exercise subscription need no override.
+    fn subscribe_facts(&self) -> FactStream {
+        let (_tx, rx) = broadcast::channel::<Arc<Fact>>(1);
+        rx
+    }
 }
 
 /// In-memory fact store. Tracks append order and a fsync counter so tests can
 /// assert "only NonIdempotentEffect takes a barrier".
-#[derive(Default)]
 pub struct InMemoryFactStore {
     inner: Mutex<FactStoreInner>,
+    tx: broadcast::Sender<Arc<Fact>>,
+}
+
+impl Default for InMemoryFactStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Default)]
@@ -62,7 +75,16 @@ struct FactStoreInner {
 impl InMemoryFactStore {
     /// Create an empty in-memory fact store.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_capacity(FACT_BROADCAST_CAPACITY)
+    }
+
+    /// Create an empty in-memory fact store with a custom broadcast capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let (tx, _rx) = broadcast::channel(capacity.max(1));
+        Self {
+            inner: Mutex::new(FactStoreInner::default()),
+            tx,
+        }
     }
 
     /// Number of fsyncs issued so far — used to verify the barrier discipline.
@@ -81,29 +103,51 @@ impl InMemoryFactStore {
     }
 }
 
+fn broadcast_fact(tx: &broadcast::Sender<Arc<Fact>>, fact: Arc<Fact>) {
+    match tx.send(fact) {
+        Ok(_receivers) => {}
+        Err(_error) => {
+            // No active receiver kept the fact; storage has already accepted it.
+        }
+    }
+}
+
 impl FactStore for InMemoryFactStore {
     fn append(&self, fact: Fact) -> Result<u64, FactError> {
-        let mut inner = self.inner.lock();
-        let pos = inner.cursor;
-        inner.cursor = inner
-            .cursor
-            .checked_add(1)
-            .ok_or_else(|| FactError("fact cursor overflow".into()))?;
-        let idx = inner.facts.len();
-        inner.index.insert(fact.id, idx);
-        inner.facts.push(fact);
+        let shared = Arc::new(fact);
+        let pos = {
+            let mut inner = self.inner.lock();
+            let pos = inner.cursor;
+            inner.cursor = inner
+                .cursor
+                .checked_add(1)
+                .ok_or_else(|| FactError("fact cursor overflow".into()))?;
+            let idx = inner.facts.len();
+            inner.index.insert(shared.id, idx);
+            inner.facts.push((*shared).clone());
+            pos
+        };
+        broadcast_fact(&self.tx, shared);
         Ok(pos)
     }
 
     fn complete(&self, fact: Fact) -> Result<(), FactError> {
-        let mut inner = self.inner.lock();
-        if let Some(&idx) = inner.index.get(&fact.id) {
-            inner.facts[idx] = fact;
-        } else {
-            let idx = inner.facts.len();
-            inner.index.insert(fact.id, idx);
-            inner.facts.push(fact);
+        let shared = Arc::new(fact);
+        {
+            let mut inner = self.inner.lock();
+            if let Some(&idx) = inner.index.get(&shared.id) {
+                inner.facts[idx] = (*shared).clone();
+            } else {
+                inner.cursor = inner
+                    .cursor
+                    .checked_add(1)
+                    .ok_or_else(|| FactError("fact cursor overflow".into()))?;
+                let idx = inner.facts.len();
+                inner.index.insert(shared.id, idx);
+                inner.facts.push((*shared).clone());
+            }
         }
+        broadcast_fact(&self.tx, shared);
         Ok(())
     }
 
@@ -129,6 +173,10 @@ impl FactStore for InMemoryFactStore {
 
     fn cursor(&self) -> u64 {
         self.inner.lock().cursor
+    }
+
+    fn subscribe_facts(&self) -> FactStream {
+        self.tx.subscribe()
     }
 }
 
@@ -298,6 +346,47 @@ mod tests {
             err.0.contains("unsupported Fact schema_version"),
             "unexpected FactSink error: {err}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subscribe_facts_delivers_appended_facts() -> anyhow::Result<()> {
+        let store = Arc::new(InMemoryFactStore::new());
+        let mut rx = store.subscribe_facts();
+        store.append(fact(1, 0, ReplayClass::Deterministic))?;
+        store.append(fact(1, 1, ReplayClass::Observation))?;
+        let first = rx
+            .recv()
+            .await
+            .map_err(|e| anyhow::anyhow!("recv1: {e:?}"))?;
+        let second = rx
+            .recv()
+            .await
+            .map_err(|e| anyhow::anyhow!("recv2: {e:?}"))?;
+        ensure!(
+            first.id == fact(1, 0, ReplayClass::Deterministic).id,
+            "first fact mismatch"
+        );
+        ensure!(
+            second.id == fact(1, 1, ReplayClass::Observation).id,
+            "second fact mismatch"
+        );
+        ensure!(store.cursor() == 2, "cursor should have advanced twice");
+        Ok(())
+    }
+
+    #[test]
+    fn dropped_fact_subscription_does_not_fail_writes() -> anyhow::Result<()> {
+        let store = InMemoryFactStore::new();
+        let rx = store.subscribe_facts();
+        drop(rx);
+        store.append(fact(1, 0, ReplayClass::Deterministic))?;
+        store.complete(fact(1, 1, ReplayClass::Observation))?;
+        ensure!(
+            store.cursor() == 2,
+            "fresh complete should advance the cursor"
+        );
+        ensure!(store.len() == 2, "facts should still be retained");
         Ok(())
     }
 }

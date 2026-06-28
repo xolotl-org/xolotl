@@ -7,10 +7,10 @@ use std::path::Path;
 use std::time::Duration;
 use xolotl_console::{
     ConsoleAuthConfig, ConsoleTransportSecurityConfig, ConsoleTransportSecurityMode,
-    ConsoleTrustedProxyConfig, ConsoleUnsafeTransportRelaxation, ConsoleWsConfig,
-    DEFAULT_GLOBAL_SESSION_LIMIT, DEFAULT_IDLE_TTL_MS, DEFAULT_MAX_SESSIONS_PER_USER,
-    DEFAULT_SESSION_TTL_MS, DEFAULT_WS_EVENT_SEND_TIMEOUT, DEFAULT_WS_IDLE_TIMEOUT,
-    DEFAULT_WS_MAX_BYTES_PER_SECOND, DEFAULT_WS_MAX_CONNECTIONS_GLOBAL,
+    ConsoleTrustedProxyConfig, ConsoleUnsafeTransportRelaxation, ConsoleWebAuthnConfig,
+    ConsoleWsConfig, DEFAULT_GLOBAL_SESSION_LIMIT, DEFAULT_IDLE_TTL_MS,
+    DEFAULT_MAX_SESSIONS_PER_USER, DEFAULT_SESSION_TTL_MS, DEFAULT_WS_EVENT_SEND_TIMEOUT,
+    DEFAULT_WS_IDLE_TIMEOUT, DEFAULT_WS_MAX_BYTES_PER_SECOND, DEFAULT_WS_MAX_CONNECTIONS_GLOBAL,
     DEFAULT_WS_MAX_CONNECTIONS_PER_SOURCE, DEFAULT_WS_MAX_CONNECTIONS_PER_USER,
     DEFAULT_WS_MAX_FACT_LIMIT, DEFAULT_WS_MAX_FRAME_BYTES, DEFAULT_WS_MAX_FRAMES_PER_SECOND,
     DEFAULT_WS_MAX_STATE_LIST_LIMIT, DEFAULT_WS_MAX_SUBSCRIPTIONS, DEFAULT_WS_MAX_TRACE_LIMIT,
@@ -915,7 +915,8 @@ impl ConsoleTransportSecurityTuning {
         })?;
         let config = self.to_console_transport_security_config_inner(allow_disabled_for_test)?;
         match config.mode {
-            ConsoleTransportSecurityMode::ProductionTls => {
+            ConsoleTransportSecurityMode::ProductionTls
+            | ConsoleTransportSecurityMode::MutualTls => {
                 anyhow::bail!(
                     "{label} production_tls requires a TLS listener; configure trusted_reverse_proxy, local_trusted, or unsafe_plaintext for the current plain listener"
                 );
@@ -958,6 +959,7 @@ impl ConsoleTransportSecurityTuning {
     ) -> Result<ConsoleTransportSecurityConfig> {
         let mode = match self.mode.as_str() {
             "production_tls" => ConsoleTransportSecurityMode::ProductionTls,
+            "mtls" => ConsoleTransportSecurityMode::MutualTls,
             "trusted_reverse_proxy" => ConsoleTransportSecurityMode::TrustedReverseProxy,
             "local_trusted" => ConsoleTransportSecurityMode::LocalTrusted,
             "unsafe_plaintext" => ConsoleTransportSecurityMode::UnsafePlaintext,
@@ -1018,6 +1020,9 @@ fn default_true() -> bool {
 pub struct ConsoleRootConfig {
     /// Optional pre-seeded Argon2id PHC string for the root Console account.
     pub password_hash: Option<String>,
+    /// Optional plaintext root password, mutually exclusive with `password_hash`.
+    /// The console validates and hashes it at bootstrap.
+    pub password: Option<String>,
     /// Optional Ed25519/WebAuthn key descriptors for deployments that disable
     /// root password bootstrap and provision key login externally.
     #[serde(default)]
@@ -1037,6 +1042,48 @@ pub struct ConsoleAuthTuning {
     pub global_session_limit: usize,
     #[serde(default = "default_argon2_concurrency")]
     pub argon2_concurrency: usize,
+    #[serde(default)]
+    pub webauthn: ConsoleWebAuthnTuning,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsoleWebAuthnTuning {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_webauthn_rp_id")]
+    pub rp_id: String,
+    #[serde(default = "default_webauthn_rp_origin")]
+    pub rp_origin: String,
+    #[serde(default = "default_webauthn_rp_name")]
+    pub rp_name: String,
+    #[serde(default = "default_webauthn_challenge_ttl_ms")]
+    pub challenge_ttl_ms: i64,
+}
+
+impl Default for ConsoleWebAuthnTuning {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rp_id: default_webauthn_rp_id(),
+            rp_origin: default_webauthn_rp_origin(),
+            rp_name: default_webauthn_rp_name(),
+            challenge_ttl_ms: default_webauthn_challenge_ttl_ms(),
+        }
+    }
+}
+
+impl From<ConsoleWebAuthnTuning> for ConsoleWebAuthnConfig {
+    fn from(value: ConsoleWebAuthnTuning) -> Self {
+        Self {
+            enabled: value.enabled,
+            rp_id: value.rp_id,
+            rp_origin: value.rp_origin,
+            rp_name: value.rp_name,
+            challenge_ttl_ms: value.challenge_ttl_ms,
+        }
+        .bounded()
+    }
 }
 
 impl Default for ConsoleAuthTuning {
@@ -1047,6 +1094,7 @@ impl Default for ConsoleAuthTuning {
             max_sessions_per_user: default_max_sessions_per_user(),
             global_session_limit: default_global_session_limit(),
             argon2_concurrency: default_argon2_concurrency(),
+            webauthn: ConsoleWebAuthnTuning::default(),
         }
     }
 }
@@ -1059,6 +1107,7 @@ impl From<ConsoleAuthTuning> for ConsoleAuthConfig {
             max_sessions_per_user: value.max_sessions_per_user,
             global_session_limit: value.global_session_limit,
             argon2_concurrency: value.argon2_concurrency,
+            webauthn: value.webauthn.into(),
         }
         .bounded()
     }
@@ -1146,6 +1195,22 @@ fn default_max_sessions_per_user() -> usize {
 
 fn default_global_session_limit() -> usize {
     DEFAULT_GLOBAL_SESSION_LIMIT
+}
+
+fn default_webauthn_rp_id() -> String {
+    "localhost".into()
+}
+
+fn default_webauthn_rp_origin() -> String {
+    "https://localhost".into()
+}
+
+fn default_webauthn_rp_name() -> String {
+    "Xolotl Console".into()
+}
+
+fn default_webauthn_challenge_ttl_ms() -> i64 {
+    60_000
 }
 
 fn default_ws_max_frame_bytes() -> usize {
@@ -1322,6 +1387,7 @@ mod tests {
             max_sessions_per_user: 0,
             global_session_limit: usize::MAX,
             argon2_concurrency: 0,
+            webauthn: ConsoleWebAuthnTuning::default(),
         }
         .into();
         assert_eq!(auth.session_ttl_ms, MIN_SESSION_TTL_MS);

@@ -11,13 +11,13 @@
 | 接口 | 配置字段 | 环境变量 | 路径或服务 | 编码 |
 | --- | --- | --- | --- | --- |
 | 控制台 HTTP | `console_addr` | `XOLOTL_CONSOLE_ADDR` | `/health`、`/api/auth/*` | HTTP JSON |
-| 控制台 WebSocket | `console_addr` | `XOLOTL_CONSOLE_ADDR` | `/ws` | MessagePack，`msgpack+xolotl-console-v1` |
+| 控制台 WebSocket | `console_addr` | `XOLOTL_CONSOLE_ADDR` | `/ws` | 二进制 protobuf `ConsoleFrame`，`protobuf+xolotl-console-v1` |
 | External gRPC | `external_grpc_addr` | `XOLOTL_EXTERNAL_GRPC_ADDR` | `xolotl.v1.external.ExternalService.Session` | Protobuf |
 | External WebSocket | `external_websocket_addr` | `XOLOTL_EXTERNAL_WEBSOCKET_ADDR` | `/ws` | 二进制 protobuf frame |
 
 控制台 WebSocket 和 external WebSocket 都挂在 `/ws`，通过监听地址和帧编码区分：
 
-- 控制台 WebSocket 使用 `[server].console_addr` 和 MessagePack 控制台帧
+- 控制台 WebSocket 使用 `[server].console_addr`，并在 `xolotl-console-v1` 子协议下发送二进制 protobuf 控制台帧
 - External WebSocket 使用 `[server].external_websocket_addr` 和二进制 Provider/Source session frame
 
 ## 如何选择接口
