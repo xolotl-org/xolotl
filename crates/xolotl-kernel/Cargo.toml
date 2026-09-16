@@ -11,23 +11,33 @@ description.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+host = ["dep:async-trait", "dep:blake3", "dep:futures-util", "dep:xolotl-graph", "dep:xolotl-state", "dep:parking_lot", "dep:serde", "dep:serde_json", "dep:thiserror", "dep:tokio", "dep:tracing"]
+multi-thread = ["host", "tokio/rt-multi-thread"]
+durable = ["host", "xolotl-core/serde", "serde/rc"]
+
 [dependencies]
-async-trait = { workspace = true, default-features = false }
-blake3 = { workspace = true, default-features = false, features = ["std"] }
-futures-util = { workspace = true, default-features = false, features = ["std"] }
-xolotl-graph.workspace = true
-xolotl-state.workspace = true
+xolotl-core.workspace = true
+async-trait = { workspace = true, default-features = false, optional = true }
+blake3 = { workspace = true, default-features = false, features = ["std"], optional = true }
+futures-util = { workspace = true, default-features = false, features = ["std"], optional = true }
+xolotl-graph = { workspace = true, optional = true }
+xolotl-state = { workspace = true, features = ["memory"], optional = true }
 xolotl-types.workspace = true
-parking_lot = { workspace = true, default-features = false }
-serde = { workspace = true, default-features = false, features = ["derive", "std"] }
-thiserror = { workspace = true, default-features = false, features = ["std"] }
-tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros", "time", "rt-multi-thread"] }
-tracing = { workspace = true, default-features = false, features = ["std"] }
+parking_lot = { workspace = true, default-features = false, optional = true }
+serde = { workspace = true, default-features = false, features = ["derive", "std"], optional = true }
+serde_json = { workspace = true, default-features = false, features = ["std"], optional = true }
+thiserror = { workspace = true, default-features = false, features = ["std"], optional = true }
+tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros", "time"], optional = true }
+tracing = { workspace = true, default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 anyhow = { workspace = true, default-features = false, features = ["std"] }
 criterion = { workspace = true, default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "kernel_hot_paths"
 harness = false
+required-features = ["host"]

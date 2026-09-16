@@ -12,11 +12,12 @@ description = "Xolotl single execution IR (ExecutionGraph) + Do<A> front-end + D
 workspace = true
 
 [dependencies]
+xolotl-core.workspace = true
 xolotl-types.workspace = true
-serde = { workspace = true, default-features = false, features = ["derive", "std"] }
-serde_json = { workspace = true, default-features = false, features = ["std"] }
-blake3 = { workspace = true, default-features = false, features = ["std"] }
-thiserror = { workspace = true, default-features = false, features = ["std"] }
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
+serde_json = { workspace = true, default-features = false, features = ["alloc"] }
+blake3 = { workspace = true, default-features = false }
+thiserror = { workspace = true, default-features = false }
 
 [dev-dependencies]
 anyhow = { workspace = true, default-features = false, features = ["std"] }

@@ -1,0 +1,21 @@
+[package]
+name = "xolotl-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Allocation-free, host-driven Xolotl execution machine"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { workspace = true, optional = true, features = ["derive"] }
+
+[dev-dependencies]
+anyhow = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["std"] }

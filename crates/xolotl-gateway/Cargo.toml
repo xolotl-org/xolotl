@@ -11,17 +11,25 @@ description.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+structured-output = ["dep:xolotl-value-codec", "dep:xolotl-value-object"]
+
 [dependencies]
 async-trait = { workspace = true, default-features = false }
 blake3 = { workspace = true, default-features = false, features = ["std"] }
-chacha20poly1305 = { workspace = true, default-features = false, features = ["alloc"] }
+chacha20poly1305 = { workspace = true, default-features = false, features = ["alloc", "zeroize"] }
+# ChaCha20 0.10 no longer forwards zeroize to its keystream buffer.
+cipher = { workspace = true, features = ["zeroize"] }
 getrandom = { workspace = true, default-features = false }
 hkdf = { workspace = true, default-features = false }
 xolotl-graph.workspace = true
-xolotl-kernel.workspace = true
+xolotl-kernel = { workspace = true, features = ["host"] }
 xolotl-proto.workspace = true
 xolotl-state.workspace = true
 xolotl-types.workspace = true
+xolotl-value-codec = { workspace = true, features = ["cbor"], optional = true }
+xolotl-value-object = { workspace = true, features = ["cbor"], optional = true }
 parking_lot = { workspace = true, default-features = false }
 serde = { workspace = true, default-features = false, features = ["derive", "std"] }
 serde_json = { workspace = true, default-features = false, features = ["std"] }
@@ -33,3 +41,9 @@ tracing = { workspace = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
 anyhow = { workspace = true, default-features = false, features = ["std"] }
+tempfile = { workspace = true, default-features = false, features = ["getrandom"] }
+xolotl-standard = { workspace = true, features = ["standard-core"] }
+xolotl-storage-fs = { workspace = true, features = ["value-workspace"] }
+xolotl-storage-redb.workspace = true
+xolotl-value-codec = { workspace = true, features = ["cbor"] }
+xolotl-value-object = { workspace = true, features = ["cbor"] }

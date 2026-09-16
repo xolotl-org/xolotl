@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod stream;
+
 #[derive(Clone, Copy)]
 enum RouteMethod {
     Infer,
@@ -267,6 +269,14 @@ pub(crate) struct Routed {
 }
 
 impl Router {
+    /// A static group must satisfy the input requirements of every candidate,
+    /// including retry and fallback candidates selected after a failure.
+    pub(crate) fn requires_unprotected_input(&self) -> bool {
+        self.models
+            .iter()
+            .any(|model| model.backend.requires_unprotected_input())
+    }
+
     /// A router with one group `default` over the given models in priority order.
     pub(crate) fn new(models: Vec<ModelEntry>) -> Self {
         let member_idx: Vec<usize> = (0..models.len()).collect();
@@ -676,11 +686,11 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match &self.fail_with {
                 Some(e) => Err(e.clone()),
-                None => Ok(Value::Str(self.label.into())),
+                None => Ok(Value::string(self.label.into())),
             }
         }
         async fn embed(&self, _input: &Value) -> Result<Value, String> {
-            Ok(Value::Str(self.label.into()))
+            Ok(Value::string(self.label.into()))
         }
 
         fn capabilities(&self) -> ModelCapabilities {
@@ -731,7 +741,7 @@ mod tests {
             model("p/b", "b", c1.clone(), None),
         ]);
         let out = r
-            .infer(&Value::Null, &RequestRequirements::default(), None)
+            .infer(&Value::null(), &RequestRequirements::default(), None)
             .await
             .map_err(|error| anyhow::anyhow!("route inference: {error}"))?;
         ensure!(out.model_id == "p/a", "model id: {}", out.model_id);
@@ -752,7 +762,7 @@ mod tests {
             model("p/b", "b", c1.clone(), None),
         ]);
         let out = r
-            .infer(&Value::Null, &RequestRequirements::default(), None)
+            .infer(&Value::null(), &RequestRequirements::default(), None)
             .await
             .map_err(|error| anyhow::anyhow!("route inference with retry: {error}"))?;
         ensure!(out.model_id == "p/b", "falls through to the healthy model");
@@ -772,7 +782,7 @@ mod tests {
             model("p/b", "b", c1.clone(), None),
         ]);
         let routed = r
-            .infer(&Value::Null, &RequestRequirements::default(), None)
+            .infer(&Value::null(), &RequestRequirements::default(), None)
             .await
             .map_err(|error| anyhow::anyhow!("route inference with permanent error: {error}"))?;
         ensure!(routed.model_id == "p/b", "permanent error falls through");
@@ -797,7 +807,7 @@ mod tests {
         r.add_group(ModelGroup::new("backup", GroupPolicy::Priority, vec![1]));
         r.set_default_group("primary");
         let out = r
-            .infer(&Value::Null, &RequestRequirements::default(), None)
+            .infer(&Value::null(), &RequestRequirements::default(), None)
             .await
             .map_err(|error| anyhow::anyhow!("route inference through fallback group: {error}"))?;
         ensure!(
@@ -817,7 +827,7 @@ mod tests {
             ..Default::default()
         };
         ensure!(
-            r.infer(&Value::Null, &req, None).await.is_err(),
+            r.infer(&Value::null(), &req, None).await.is_err(),
             "vision request should exclude text-only model"
         );
         Ok(())
@@ -837,7 +847,7 @@ mod tests {
         };
         let r = Router::new(vec![model_with_caps("p/chat", "chat", calls, caps)]);
         ensure!(
-            r.embed(&Value::Null, &RequestRequirements::default())
+            r.embed(&Value::null(), &RequestRequirements::default())
                 .await
                 .is_err(),
             "embed request should exclude chat-only model"

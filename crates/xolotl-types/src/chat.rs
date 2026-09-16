@@ -7,6 +7,7 @@
 //! The schema is stored as `Value::Map` on `state://chat/*/messages/*`.
 
 use crate::BlobRef;
+use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
 /// Who authored this message.
@@ -101,11 +102,12 @@ impl ChatMessage {
         platform: impl Into<String>,
         conversation_id: impl Into<String>,
         text: impl Into<String>,
+        timestamp: i64,
     ) -> Self {
         Self {
             role: MessageRole::User,
             content: vec![ContentPart::Text { text: text.into() }],
-            timestamp: now_secs(),
+            timestamp,
             metadata: Some(ChatMetadata {
                 platform: platform.into(),
                 conversation_id: Some(conversation_id.into()),
@@ -115,22 +117,22 @@ impl ChatMessage {
         }
     }
 
-    /// Create an assistant text response.
-    pub fn assistant(text: impl Into<String>) -> Self {
+    /// Create an assistant text response with a host-supplied Unix timestamp.
+    pub fn assistant(text: impl Into<String>, timestamp: i64) -> Self {
         Self {
             role: MessageRole::Assistant,
             content: vec![ContentPart::Text { text: text.into() }],
-            timestamp: now_secs(),
+            timestamp,
             metadata: None,
         }
     }
 
-    /// Create a system message (persona / safety preamble).
-    pub fn system(text: impl Into<String>) -> Self {
+    /// Create a system message with a host-supplied Unix timestamp.
+    pub fn system(text: impl Into<String>, timestamp: i64) -> Self {
         Self {
             role: MessageRole::System,
             content: vec![ContentPart::Text { text: text.into() }],
-            timestamp: now_secs(),
+            timestamp,
             metadata: None,
         }
     }
@@ -166,27 +168,6 @@ pub fn estimate_tokens(messages: &[ChatMessage]) -> usize {
     chars / 4
 }
 
-fn now_secs() -> i64 {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
-            Err(error) => {
-                let before_epoch = i64::try_from(error.duration().as_secs()).unwrap_or(i64::MAX);
-                before_epoch.saturating_neg()
-            }
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        // On wasm32 (the Leptos web client) there is no `SystemTime`. Client-side
-        // timestamps are provisional anyway: the daemon stamps the authoritative
-        // ingest time when the event is written to the state stream, so
-        // returning 0 here is a deliberate "unset, daemon will fill" sentinel.
-        0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,7 +175,7 @@ mod tests {
 
     #[test]
     fn chat_message_roundtrip() -> anyhow::Result<()> {
-        let msg = ChatMessage::user("chat_platform", "C42", "hello world");
+        let msg = ChatMessage::user("chat_platform", "C42", "hello world", 42);
         let json = serde_json::to_string(&msg)?;
         let back: ChatMessage = serde_json::from_str(&json)?;
         ensure!(
@@ -223,7 +204,7 @@ mod tests {
 
     #[test]
     fn assistant_message_has_no_metadata() {
-        let msg = ChatMessage::assistant("ok");
+        let msg = ChatMessage::assistant("ok", 42);
         assert!(msg.metadata.is_none());
     }
 
@@ -244,8 +225,8 @@ mod tests {
     #[test]
     fn estimate_tokens_approximate() {
         let msgs = vec![
-            ChatMessage::user("chat_platform", "c1", "hello world"), // 11 chars
-            ChatMessage::assistant("hi there"),                      // 8 chars
+            ChatMessage::user("chat_platform", "c1", "hello world", 42), // 11 chars
+            ChatMessage::assistant("hi there", 42),                      // 8 chars
         ];
         let tokens = estimate_tokens(&msgs);
         // 19 chars / 4 ≈ 4
@@ -257,11 +238,11 @@ mod tests {
         let part = ContentPart::ToolCall {
             id: "call_1".into(),
             name: "fetch".into(),
-            arguments: crate::Value::Map({
-                let mut m = std::collections::BTreeMap::new();
+            arguments: crate::Value::map({
+                let mut m = alloc::collections::BTreeMap::new();
                 m.insert(
                     "url".into(),
-                    crate::Value::Str("https://example.invalid".into()),
+                    crate::Value::string("https://example.invalid".into()),
                 );
                 m
             }),
@@ -278,8 +259,8 @@ mod tests {
     }
 
     #[test]
-    fn system_message_timestamp_is_set() {
-        let msg = ChatMessage::system("be helpful");
-        assert!(msg.timestamp > 0 || cfg!(target_arch = "wasm32"));
+    fn system_message_preserves_host_timestamp() {
+        let msg = ChatMessage::system("be helpful", -42);
+        assert_eq!(msg.timestamp, -42);
     }
 }

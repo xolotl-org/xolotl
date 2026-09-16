@@ -9,7 +9,71 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use xolotl_proto::xolotl::v1::external as external_pb;
 use xolotl_types::external::{Role as ExternalRole, SessionContext as ExternalSessionContext};
 
-const TEST_TOKEN: &str = "test-token-for-alice-0001";
+mod authority;
+mod output;
+mod surfaces;
+
+pub(super) const TEST_TOKEN: &str = "test-token-for-alice-0001";
+
+#[test]
+fn submission_hash_preserves_value_types_and_float_bits() -> anyhow::Result<()> {
+    let blob = xolotl_types::BlobRef {
+        hash: "0123456789abcdef".repeat(4),
+        size: 64,
+        mime: None,
+    };
+    let mut values = vec![
+        Value::null(),
+        Value::integer(0),
+        Value::bytes(vec![1, 2]),
+        Value::list(vec![Value::integer(1), Value::integer(2)]),
+        Value::map(BTreeMap::from([
+            ("hash".into(), Value::string(blob.hash.clone())),
+            ("size".into(), Value::integer(64)),
+            ("mime".into(), Value::null()),
+        ])),
+        Value::blob(blob),
+        Value::stream_end(xolotl_types::StreamMarker::Done),
+        Value::map(BTreeMap::from([(
+            "__stream_marker".into(),
+            Value::string("Done".into()),
+        )])),
+    ];
+    values.extend(
+        [
+            0,
+            0x8000_0000_0000_0000,
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            0x7ff8_1234_5678_9abc,
+            0x7ff8_1234_5678_9abd,
+            0xfff8_1234_5678_9abc,
+        ]
+        .into_iter()
+        .map(|bits| Value::float(xolotl_types::FloatBits(f64::from_bits(bits)))),
+    );
+
+    let mut hashes = BTreeSet::new();
+    for value in values {
+        for payload in [
+            value.clone(),
+            Value::map(BTreeMap::from([(
+                "nested".into(),
+                Value::list(vec![value]),
+            )])),
+        ] {
+            let submission = GatewaySubmission::direct_input("echo", payload.clone());
+            let replay = GatewaySubmission::direct_input("echo", payload);
+            let hash = submission_hash(&submission)?;
+            ensure!(hash == submission_hash(&replay)?, "hash changed on replay");
+            ensure!(
+                hashes.insert(hash),
+                "distinct typed submission collided: {submission:?}"
+            );
+        }
+    }
+    Ok(())
+}
 
 #[test]
 fn secure_external_frame_types_are_canonical() -> anyhow::Result<()> {
@@ -48,61 +112,12 @@ fn secure_external_frame_types_are_canonical() -> anyhow::Result<()> {
 fn gateway_state_paths_are_structural() -> anyhow::Result<()> {
     let hash = "a".repeat(64);
     ensure!(
-        blob_path(&hash)?.to_string() == format!("state://blob/{hash}"),
-        "unexpected blob path"
-    );
-    ensure!(
         idempotency_path(&hash)?.to_string() == format!("state://gateway/idempotency/{hash}"),
         "unexpected idempotency path"
     );
     ensure!(
-        upload_ticket_path("ticket/1").is_err(),
-        "ticket id with path delimiter was accepted"
-    );
-    ensure!(
-        blob_path(&format!("{hash}/tail")).is_err(),
-        "blob hash with path delimiter was accepted"
-    );
-    Ok(())
-}
-
-#[test]
-fn upload_ticket_records_require_security_state_fields() -> anyhow::Result<()> {
-    let ticket = GatewayObjectUploadTicket {
-        ticket_id: "ticket_regression".into(),
-        principal_id: "alice".into(),
-        surface_id: "echo".into(),
-        submission_token: None,
-        modality: GatewayModality::Bytes,
-        expected_size: None,
-        expected_digest: None,
-        allowed_media_types: Vec::new(),
-        expires_at_ms: now_millis().saturating_add(60_000),
-        single_use: true,
-        committed: false,
-        used: false,
-    };
-
-    for field in ["single_use", "committed", "used"] {
-        let mut value = ticket.to_value();
-        let Value::Map(map) = &mut value else {
-            bail!("ticket did not serialize to a map");
-        };
-        map.remove(field);
-        ensure!(
-            matches!(GatewayObjectUploadTicket::from_value(&value), Err(GatewayError::Rejected(message)) if message.contains(field)),
-            "ticket missing {field} should be rejected"
-        );
-    }
-
-    let mut value = ticket.to_value();
-    let Value::Map(map) = &mut value else {
-        bail!("ticket did not serialize to a map");
-    };
-    map.insert("used".into(), Value::Str("false".into()));
-    ensure!(
-        matches!(GatewayObjectUploadTicket::from_value(&value), Err(GatewayError::Rejected(message)) if message.contains("used")),
-        "ticket with malformed used field should be rejected"
+        idempotency_path(&format!("{hash}/tail")).is_err(),
+        "idempotency hash with path delimiter was accepted"
     );
     Ok(())
 }
@@ -183,12 +198,12 @@ impl xolotl_kernel::Driver for BlockingCountingDriver {
         input: Value,
         _output: OutputMode,
         _ctx: &xolotl_kernel::DriverContext,
-    ) -> Result<Outcome, xolotl_kernel::DriverError> {
+    ) -> Result<xolotl_kernel::DriverOutput, xolotl_kernel::DriverError> {
         self.count.fetch_add(1, Ordering::AcqRel);
         while !self.released.load(Ordering::Acquire) {
             self.release.notified().await;
         }
-        Ok(Outcome::Done(input))
+        Ok(xolotl_kernel::DriverOutput::new(Outcome::Done(input)))
     }
 }
 
@@ -202,10 +217,12 @@ impl xolotl_kernel::Driver for FailingDriver {
         _input: Value,
         _output: OutputMode,
         _ctx: &xolotl_kernel::DriverContext,
-    ) -> Result<Outcome, xolotl_kernel::DriverError> {
-        Ok(Outcome::Fail(Failure::InvalidInput {
-            reason: "bad input".into(),
-        }))
+    ) -> Result<xolotl_kernel::DriverOutput, xolotl_kernel::DriverError> {
+        Ok(xolotl_kernel::DriverOutput::new(Outcome::Fail(
+            Failure::InvalidInput {
+                reason: "bad input".into(),
+            },
+        )))
     }
 }
 
@@ -328,28 +345,28 @@ fn profile_rejects_duplicate_registered_hosts() -> anyhow::Result<()> {
 }
 
 fn schema_type(kind: &str) -> Value {
-    Value::Map(BTreeMap::from([("type".into(), Value::from(kind))]))
+    Value::map(BTreeMap::from([("type".into(), Value::from(kind))]))
 }
 
 fn array_schema(item: Value) -> Value {
-    Value::Map(BTreeMap::from([
+    Value::map(BTreeMap::from([
         ("type".into(), Value::from("array")),
         ("items".into(), item),
     ]))
 }
 
 fn text_object_schema() -> Value {
-    Value::Map(BTreeMap::from([
+    Value::map(BTreeMap::from([
         ("type".into(), Value::from("object")),
-        ("required".into(), Value::List(vec![Value::from("text")])),
+        ("required".into(), Value::list(vec![Value::from("text")])),
         (
             "properties".into(),
-            Value::Map(BTreeMap::from([("text".into(), schema_type("string"))])),
+            Value::map(BTreeMap::from([("text".into(), schema_type("string"))])),
         ),
     ]))
 }
 
-fn direct_input_with_provenance(
+pub(super) fn direct_input_with_provenance(
     surface_id: &str,
     payload: Value,
     provenance: GatewayPayloadProvenance,
@@ -357,7 +374,7 @@ fn direct_input_with_provenance(
     GatewaySubmission::direct_input(surface_id, payload).with_provenance(provenance)
 }
 
-fn direct_input_with_ticket(
+pub(super) fn direct_input_with_ticket(
     surface_id: &str,
     payload: Value,
     ticket_id: &str,
@@ -388,7 +405,7 @@ fn input_stream_submission(surface_id: &str) -> GatewaySubmission {
     GatewaySubmission::input_stream(surface_id, input_stream_open_request())
 }
 
-fn echo_profile(name: ResourceName) -> anyhow::Result<GatewayProfile> {
+pub(super) fn echo_profile(name: ResourceName) -> anyhow::Result<GatewayProfile> {
     Ok(identity_profile()?
         .with_surface(GatewaySurface::effect_invoke("echo", name))
         .with_principal_surface_binding(GatewayPrincipalSurfaceBinding::allow(
@@ -602,11 +619,11 @@ async fn submit_runs_direct_input_surface() -> anyhow::Result<()> {
     let out = gw
         .submit(
             &session,
-            GatewaySubmission::direct_input("echo", Value::Int(7)),
+            GatewaySubmission::direct_input("echo", Value::integer(7)),
         )
         .await?;
     ensure!(
-        out == Outcome::Done(Value::Int(7)),
+        out.output.outcome == Outcome::Done(Value::integer(7)),
         "unexpected gateway output: {out:?}"
     );
     ensure!(
@@ -664,7 +681,7 @@ async fn cancel_requires_owner_and_trace_root() -> anyhow::Result<()> {
         tokio::spawn(async move {
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("slow", Value::Str("work".into())).with_options(
+                GatewaySubmission::direct_input("slow", Value::string("work".into())).with_options(
                     SubmitOptions {
                         idempotency_key: Some("slow-cancel".into()),
                         ..SubmitOptions::default()
@@ -741,7 +758,7 @@ async fn cancel_requires_owner_and_trace_root() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn cancel_releases_admission_and_budget_before_driver_returns() -> anyhow::Result<()> {
+async fn cancel_retains_admission_and_budget_until_request_owner_drops() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
     let count = Arc::new(AtomicUsize::new(0));
     let released = Arc::new(AtomicBool::new(false));
@@ -798,7 +815,7 @@ async fn cancel_releases_admission_and_budget_before_driver_returns() -> anyhow:
         tokio::spawn(async move {
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("slow", Value::Str("work".into())).with_options(
+                GatewaySubmission::direct_input("slow", Value::string("work".into())).with_options(
                     SubmitOptions {
                         idempotency_key: Some("cancel-slow-once".into()),
                         ..SubmitOptions::default()
@@ -825,7 +842,7 @@ async fn cancel_releases_admission_and_budget_before_driver_returns() -> anyhow:
         matches!(
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("fast", Value::Str("before".into()))
+                GatewaySubmission::direct_input("fast", Value::string("before".into()))
             )
             .await,
             Err(GatewayError::LimitExceeded(_))
@@ -841,25 +858,32 @@ async fn cancel_releases_admission_and_budget_before_driver_returns() -> anyhow:
         },
     )?;
     ensure!(cancelled, "running request should cancel");
+    {
+        let requests = gw.requests.inner.lock();
+        ensure!(
+            requests.global_running == 1,
+            "cancel released a resident request"
+        );
+        ensure!(requests.budget_running.inflight_ops == 1);
+    }
+    running.abort();
+    ensure!(
+        running.await.is_err(),
+        "aborted submission unexpectedly completed"
+    );
 
     let out = gw
         .submit(
             &session,
-            GatewaySubmission::direct_input("fast", Value::Str("after".into())),
+            GatewaySubmission::direct_input("fast", Value::string("after".into())),
         )
         .await?;
     ensure!(
-        out.outcome == Outcome::Done(Value::Str("after".into())),
+        out.output.outcome == Outcome::Done(Value::string("after".into())),
         "unexpected output after cancellation: {:?}",
-        out.outcome
+        out.output.outcome
     );
 
-    released.store(true, Ordering::Release);
-    release.notify_waiters();
-    let completed = running
-        .await
-        .context("running submission task join failed")??;
-    drop(completed);
     Ok(())
 }
 
@@ -874,9 +898,12 @@ async fn request_runs_as_attenuated_child_not_root() -> anyhow::Result<()> {
     let profile = gw.profile_snapshot();
     let p1 = gw.spawn_gateway_request_process(&profile, &session, &BTreeSet::new())?;
     let p2 = gw.spawn_gateway_request_process(&profile, &session, &BTreeSet::new())?;
-    ensure!(p1 != root, "request process should not be root");
-    ensure!(p2 != root, "request process should not be root");
-    ensure!(p1 != p2, "each request gets its own attenuated process");
+    ensure!(p1.id() != root, "request process should not be root");
+    ensure!(p2.id() != root, "request process should not be root");
+    ensure!(
+        p1.id() != p2.id(),
+        "each request gets its own attenuated process"
+    );
     Ok(())
 }
 
@@ -1066,7 +1093,11 @@ fn malformed_profile_rejects_invalid_surface_schemas() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn submit_uses_restricted_authority_anchor_when_configured() -> anyhow::Result<()> {
+    use std::task::Poll;
     let boot = Arc::new(Bootstrap::in_memory());
+    let count = Arc::new(AtomicUsize::new(0));
+    let released = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Notify::new());
     let name = boot.register_effect(
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
@@ -1074,7 +1105,11 @@ async fn submit_uses_restricted_authority_anchor_when_configured() -> anyhow::Re
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
-        Arc::new(xolotl_kernel::EchoDriver),
+        Arc::new(BlockingCountingDriver {
+            count: count.clone(),
+            released: released.clone(),
+            release: release.clone(),
+        }),
     )?;
     let anchor = restricted_anchor(&boot, "perform://effect/echo/**")?;
     let profile = echo_profile(name.clone())?.with_authority_anchor(anchor);
@@ -1082,16 +1117,16 @@ async fn submit_uses_restricted_authority_anchor_when_configured() -> anyhow::Re
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
-    let result = gw
-        .submit(
-            &session,
-            GatewaySubmission::direct_input("echo", Value::Str("ok".into())),
-        )
-        .await?;
+    let mut running = Box::pin(gw.submit(
+        &session,
+        GatewaySubmission::direct_input("echo", Value::string("ok".into())),
+    ));
     ensure!(
-        result == Outcome::Done(Value::Str("ok".into())),
-        "unexpected restricted authority output: {result:?}"
+        std::future::poll_fn(|cx| Poll::Ready(running.as_mut().poll(cx)))
+            .await
+            .is_pending()
     );
+    ensure!(count.load(Ordering::Acquire) == 1);
 
     let children = boot.kernel.processes.children_of(anchor);
     ensure!(
@@ -1103,9 +1138,28 @@ async fn submit_uses_restricted_authority_anchor_when_configured() -> anyhow::Re
         boot.kernel.registry.grants_of(children[0]).is_empty(),
         "child should not retain root grants"
     );
+    let grants = boot.kernel.processes.attached_grants(children[0]);
     ensure!(
-        boot.kernel.processes.attached_grants(children[0]).len() == 1,
-        "child should have one attached grant"
+        grants.len() == 1,
+        "running child should have one attached grant"
+    );
+    ensure!(grants[0].holder == children[0]);
+    ensure!(
+        grants[0].selector == xolotl_types::ResourceSelector::parse("perform://effect/echo/say")?
+    );
+    released.store(true, Ordering::Release);
+    release.notify_waiters();
+    let result = running.await?;
+    ensure!(
+        result.output.outcome == Outcome::Done(Value::string("ok".into())),
+        "unexpected restricted authority output: {result:?}"
+    );
+    ensure!(
+        boot.kernel
+            .processes
+            .attached_grants(children[0])
+            .is_empty(),
+        "finished child should release attached grants"
     );
     Ok(())
 }
@@ -1151,7 +1205,7 @@ async fn profile_replace_rejects_old_session_and_keeps_bad_reload_closed() -> an
         matches!(
             gw.submit(
                 &old_session,
-                GatewaySubmission::direct_input("echo", Value::Int(1))
+                GatewaySubmission::direct_input("echo", Value::integer(1))
             )
             .await,
             Err(GatewayError::Rejected(_))
@@ -1395,7 +1449,7 @@ async fn generation_bump_invalidates_existing_session() -> anyhow::Result<()> {
         matches!(
             gw.submit(
                 &old_session,
-                GatewaySubmission::direct_input("echo", Value::Int(1))
+                GatewaySubmission::direct_input("echo", Value::integer(1))
             )
             .await,
             Err(GatewayError::Rejected(_))
@@ -1418,7 +1472,7 @@ async fn generation_bump_invalidates_existing_session() -> anyhow::Result<()> {
     ensure!(
         gw.submit(
             &new_session,
-            GatewaySubmission::direct_input("echo", Value::Int(2))
+            GatewaySubmission::direct_input("echo", Value::integer(2))
         )
         .await
         .is_ok(),
@@ -1450,12 +1504,12 @@ async fn direct_input_lowers_through_surface_not_client_target() -> anyhow::Resu
     let out = gw
         .submit(
             &session,
-            GatewaySubmission::direct_input("echo", Value::Str("direct text".into())),
+            GatewaySubmission::direct_input("echo", Value::string("direct text".into())),
         )
         .await?;
 
     ensure!(
-        out == Outcome::Done(Value::Str("direct text".into())),
+        out.output.outcome == Outcome::Done(Value::string("direct text".into())),
         "unexpected direct input output: {out:?}"
     );
     Ok(())
@@ -1480,9 +1534,9 @@ async fn surface_input_schema_validates_direct_input() -> anyhow::Result<()> {
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
-    let valid = Value::Map(BTreeMap::from([(
+    let valid = Value::map(BTreeMap::from([(
         "text".into(),
-        Value::Str("schema-ok".into()),
+        Value::string("schema-ok".into()),
     )]));
 
     let out = gw
@@ -1492,7 +1546,7 @@ async fn surface_input_schema_validates_direct_input() -> anyhow::Result<()> {
         )
         .await?;
     ensure!(
-        out == Outcome::Done(valid),
+        out.output.outcome == Outcome::Done(valid),
         "unexpected valid schema output: {out:?}"
     );
 
@@ -1500,7 +1554,7 @@ async fn surface_input_schema_validates_direct_input() -> anyhow::Result<()> {
         matches!(
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("echo", Value::Map(BTreeMap::new()))
+                GatewaySubmission::direct_input("echo", Value::map(BTreeMap::new()))
             )
             .await,
             Err(GatewayError::Rejected(_))
@@ -1544,7 +1598,7 @@ async fn surface_output_schema_rejects_success_payload_and_replays_failure() -> 
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
     let submission =
-        GatewaySubmission::direct_input("charge", Value::Int(42)).with_options(SubmitOptions {
+        GatewaySubmission::direct_input("charge", Value::integer(42)).with_options(SubmitOptions {
             idempotency_key: Some("charge-output-schema".into()),
             ..SubmitOptions::default()
         });
@@ -1552,22 +1606,22 @@ async fn surface_output_schema_rejects_success_payload_and_replays_failure() -> 
     let first = gw.submit(&session, submission.clone()).await?;
     ensure!(
         matches!(
-        first.outcome,
+        first.output.outcome,
         Outcome::Fail(Failure::Custom { ref kind, .. }) if kind == "gateway_output_schema"
         ),
         "first outcome should be output schema failure: {:?}",
-        first.outcome
+        first.output.outcome
     );
     ensure!(count.load(Ordering::Acquire) == 1, "driver should run once");
 
     let replay = gw.submit(&session, submission).await?;
     ensure!(
         matches!(
-        replay.outcome,
+        replay.output.outcome,
         Outcome::Fail(Failure::Custom { ref kind, .. }) if kind == "gateway_output_schema"
         ),
         "replay outcome should be output schema failure: {:?}",
-        replay.outcome
+        replay.output.outcome
     );
     ensure!(
         count.load(Ordering::Acquire) == 1,
@@ -1598,12 +1652,12 @@ async fn surface_output_schema_does_not_validate_sink_only_delivery() -> anyhow:
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
-    let submission = GatewaySubmission::direct_input("echo", Value::Int(42))
+    let submission = GatewaySubmission::direct_input("echo", Value::integer(42))
         .with_requested_output(OutputMode::SinkOnly);
 
     let out = gw.submit(&session, submission).await?;
     ensure!(
-        out == Outcome::Done(Value::Null),
+        out.output.outcome == Outcome::Done(Value::null()),
         "unexpected sink-only output: {out:?}"
     );
     Ok(())
@@ -1665,7 +1719,7 @@ async fn input_stream_open_registers_request_before_chunks() -> anyhow::Result<(
 }
 
 #[tokio::test]
-async fn deadline_sweep_releases_stream_admission_once() -> anyhow::Result<()> {
+async fn deadline_sweep_retains_admission_until_stream_owner_drops() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
     let count = Arc::new(AtomicUsize::new(0));
     let released = Arc::new(AtomicBool::new(false));
@@ -1733,7 +1787,7 @@ async fn deadline_sweep_releases_stream_admission_once() -> anyhow::Result<()> {
         matches!(
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("fast", Value::Str("before".into()))
+                GatewaySubmission::direct_input("fast", Value::string("before".into()))
             )
             .await,
             Err(GatewayError::LimitExceeded(_))
@@ -1750,6 +1804,18 @@ async fn deadline_sweep_releases_stream_admission_once() -> anyhow::Result<()> {
         boot.kernel.processes.status(stream_process) == Some(ProcessStatus::Cancelled),
         "stream process should be cancelled"
     );
+    ensure!(
+        matches!(
+            gw.submit(
+                &session,
+                GatewaySubmission::direct_input("fast", Value::string("expired-but-owned".into()))
+            )
+            .await,
+            Err(GatewayError::LimitExceeded(_))
+        ),
+        "an expired stream still owns its admission until dropped"
+    );
+    drop(stream);
 
     let running = {
         let gw = gw.clone();
@@ -1757,7 +1823,7 @@ async fn deadline_sweep_releases_stream_admission_once() -> anyhow::Result<()> {
         tokio::spawn(async move {
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("slow", Value::Str("running".into())),
+                GatewaySubmission::direct_input("slow", Value::string("running".into())),
             )
             .await
         })
@@ -1765,12 +1831,11 @@ async fn deadline_sweep_releases_stream_admission_once() -> anyhow::Result<()> {
     while count.load(Ordering::Acquire) == 0 {
         tokio::task::yield_now().await;
     }
-    drop(stream);
     ensure!(
         matches!(
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("fast", Value::Str("still-limited".into()))
+                GatewaySubmission::direct_input("fast", Value::string("still-limited".into()))
             )
             .await,
             Err(GatewayError::LimitExceeded(_))
@@ -1784,9 +1849,9 @@ async fn deadline_sweep_releases_stream_admission_once() -> anyhow::Result<()> {
         .await
         .context("running submission task join failed")??;
     ensure!(
-        out.outcome == Outcome::Done(Value::Str("running".into())),
+        out.output.outcome == Outcome::Done(Value::string("running".into())),
         "unexpected running output: {:?}",
-        out.outcome
+        out.output.outcome
     );
     Ok(())
 }
@@ -1903,13 +1968,13 @@ async fn input_stream_chunks_use_profile_item_schema() -> anyhow::Result<()> {
 
     ensure!(
         stream
-            .validate_chunk_item(&Value::Str("chunk".into()))
+            .validate_chunk_item(&Value::string("chunk".into()))
             .is_ok(),
         "valid stream chunk should pass"
     );
     ensure!(
         matches!(
-            stream.validate_chunk_item(&Value::Int(1)),
+            stream.validate_chunk_item(&Value::integer(1)),
             Err(GatewayError::Rejected(_))
         ),
         "invalid stream chunk should be rejected"
@@ -1942,7 +2007,7 @@ async fn input_stream_completion_reuses_accepted_request() -> anyhow::Result<()>
     )?;
     let accepted = stream.accepted().clone();
     let result = gw
-        .complete_input_stream_submission(*stream, Value::Str("stream text".into()), None)
+        .complete_input_stream_submission(*stream, Value::string("stream text".into()), None)
         .await?;
 
     ensure!(
@@ -1950,9 +2015,9 @@ async fn input_stream_completion_reuses_accepted_request() -> anyhow::Result<()>
         "accepted metadata should be reused"
     );
     ensure!(
-        result.outcome == Outcome::Done(Value::Str("stream text".into())),
+        result.output.outcome == Outcome::Done(Value::string("stream text".into())),
         "unexpected stream completion outcome: {:?}",
-        result.outcome
+        result.output.outcome
     );
     Ok(())
 }
@@ -1984,7 +2049,7 @@ async fn surface_without_principal_binding_is_not_callable() -> anyhow::Result<(
         matches!(
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("echo", Value::Str("denied".into()))
+                GatewaySubmission::direct_input("echo", Value::string("denied".into()))
             )
             .await,
             Err(GatewayError::Rejected(_))
@@ -2025,7 +2090,7 @@ async fn submit_deadline_is_clamped_by_server_profile() -> anyhow::Result<()> {
         matches!(
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("echo", Value::Int(1)).with_options(options)
+                GatewaySubmission::direct_input("echo", Value::integer(1)).with_options(options)
             )
             .await,
             Err(GatewayError::Rejected(_))
@@ -2055,10 +2120,12 @@ async fn submit_deadline_out_of_range_is_rejected_before_admission() -> anyhow::
     let result = gw
         .submit(
             &session,
-            GatewaySubmission::direct_input("echo", Value::Int(1)).with_options(SubmitOptions {
-                deadline_ms: Some(u64::MAX),
-                ..SubmitOptions::default()
-            }),
+            GatewaySubmission::direct_input("echo", Value::integer(1)).with_options(
+                SubmitOptions {
+                    deadline_ms: Some(u64::MAX),
+                    ..SubmitOptions::default()
+                },
+            ),
         )
         .await;
 
@@ -2104,7 +2171,7 @@ async fn submit_deadline_timeout_is_recorded_for_idempotency_replay() -> anyhow:
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
-    let submission = GatewaySubmission::direct_input("charge", Value::Str("42".into()))
+    let submission = GatewaySubmission::direct_input("charge", Value::string("42".into()))
         .with_options(SubmitOptions {
             idempotency_key: Some("charge-deadline-timeout".into()),
             deadline_ms: Some(u64::try_from(now_millis().saturating_add(100))?),
@@ -2113,9 +2180,9 @@ async fn submit_deadline_timeout_is_recorded_for_idempotency_replay() -> anyhow:
 
     let first = gw.submit(&session, submission.clone()).await?;
     ensure!(
-        matches!(first.outcome, Outcome::Fail(Failure::Timeout)),
+        matches!(first.output.outcome, Outcome::Fail(Failure::Timeout)),
         "first outcome should be timeout: {:?}",
-        first.outcome
+        first.output.outcome
     );
     let entry = gw
         .requests
@@ -2133,7 +2200,7 @@ async fn submit_deadline_timeout_is_recorded_for_idempotency_replay() -> anyhow:
 
     let replay = gw.submit(&session, submission).await?;
     ensure!(
-        replay.outcome == first.outcome,
+        replay.output.outcome == first.output.outcome,
         "replay should return retained outcome"
     );
     ensure!(
@@ -2171,7 +2238,7 @@ async fn non_idempotent_effect_requires_submission_idempotency() -> anyhow::Resu
         matches!(
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("charge", Value::Str("42".into()))
+                GatewaySubmission::direct_input("charge", Value::string("42".into()))
             )
             .await,
             Err(GatewayError::Rejected(_))
@@ -2182,7 +2249,7 @@ async fn non_idempotent_effect_requires_submission_idempotency() -> anyhow::Resu
     let out = gw
         .submit(
             &session,
-            GatewaySubmission::direct_input("charge", Value::Str("42".into())).with_options(
+            GatewaySubmission::direct_input("charge", Value::string("42".into())).with_options(
                 SubmitOptions {
                     idempotency_key: Some("charge-42".into()),
                     ..SubmitOptions::default()
@@ -2191,7 +2258,7 @@ async fn non_idempotent_effect_requires_submission_idempotency() -> anyhow::Resu
         )
         .await?;
     ensure!(
-        out == Outcome::Done(Value::Str("42".into())),
+        out.output.outcome == Outcome::Done(Value::string("42".into())),
         "unexpected idempotent output: {out:?}"
     );
     Ok(())
@@ -2227,7 +2294,7 @@ async fn idempotency_key_replays_without_reexecuting_non_idempotent_effect() -> 
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
-    let submission = GatewaySubmission::direct_input("charge", Value::Str("42".into()))
+    let submission = GatewaySubmission::direct_input("charge", Value::string("42".into()))
         .with_options(SubmitOptions {
             idempotency_key: Some("charge-42-once".into()),
             ..SubmitOptions::default()
@@ -2256,7 +2323,7 @@ async fn idempotency_key_replays_without_reexecuting_non_idempotent_effect() -> 
     release.notify_waiters();
     let first = first.await.context("first submission task join failed")??;
     ensure!(
-        first == Outcome::Done(Value::Str("42".into())),
+        first.output.outcome == Outcome::Done(Value::string("42".into())),
         "unexpected first output: {first:?}"
     );
     ensure!(
@@ -2266,7 +2333,7 @@ async fn idempotency_key_replays_without_reexecuting_non_idempotent_effect() -> 
 
     let replay = gw.submit(&session, submission).await?;
     ensure!(
-        replay == Outcome::Done(Value::Str("42".into())),
+        replay.output.outcome == Outcome::Done(Value::string("42".into())),
         "unexpected replay output: {replay:?}"
     );
     ensure!(
@@ -2300,7 +2367,7 @@ async fn idempotency_key_replays_fail_outcome_variant() -> anyhow::Result<()> {
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
     let submission =
-        GatewaySubmission::direct_input("fail", Value::Null).with_options(SubmitOptions {
+        GatewaySubmission::direct_input("fail", Value::null()).with_options(SubmitOptions {
             idempotency_key: Some("fail-once".into()),
             ..SubmitOptions::default()
         });
@@ -2308,14 +2375,23 @@ async fn idempotency_key_replays_fail_outcome_variant() -> anyhow::Result<()> {
     let first = gw.submit(&session, submission.clone()).await?;
     let replay = gw.submit(&session, submission).await?;
 
-    ensure!(first == replay, "replay should equal first result");
+    ensure!(
+        first.accepted == replay.accepted,
+        "replay changed acceptance"
+    );
+    ensure!(
+        first.output == replay.output,
+        "replay changed execution output"
+    );
+    ensure!(first.origin == CompletionOrigin::CurrentAttempt);
+    ensure!(replay.origin == CompletionOrigin::CachedOutcome);
     ensure!(
         matches!(
-        replay.outcome,
+        replay.output.outcome,
         Outcome::Fail(Failure::InvalidInput { ref reason }) if reason == "bad input"
         ),
         "unexpected replay failure outcome: {:?}",
-        replay.outcome
+        replay.output.outcome
     );
     Ok(())
 }
@@ -2345,7 +2421,7 @@ async fn idempotency_reservation_is_released_after_admission_rejection() -> anyh
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
-    let submission = GatewaySubmission::direct_input("echo", Value::Str("too-large".into()))
+    let submission = GatewaySubmission::direct_input("echo", Value::string("too-large".into()))
         .with_options(SubmitOptions {
             idempotency_key: Some("reject-and-release".into()),
             ..SubmitOptions::default()
@@ -2353,32 +2429,38 @@ async fn idempotency_reservation_is_released_after_admission_rejection() -> anyh
     let prefix = Path::parse("state://gateway/idempotency")?;
     let before = boot.kernel.processes.all_ids().len();
 
+    let rejected = expect_error(gw.submit(&session, submission.clone()).await)?;
     ensure!(
-        matches!(
-            gw.submit(&session, submission.clone()).await,
-            Err(GatewayError::Rejected(_))
-        ),
+        matches!(&rejected, GatewayError::Rejected(_)),
         "oversized submission should be rejected"
     );
+    let released = boot
+        .kernel
+        .state
+        .query(&xolotl_state::StateScan::new(prefix.clone()))
+        .await?;
     ensure!(
-        boot.kernel.state.read_prefix(&prefix).await?.is_empty(),
-        "admission rejection must release the idempotency reservation"
+        released.entries.is_empty(),
+        "admission rejection must remove its idempotency reservation"
     );
     ensure!(
         boot.kernel.processes.all_ids().len() == before,
         "process count should not change"
     );
 
+    let retried = expect_error(gw.submit(&session, submission).await)?;
     ensure!(
-        matches!(
-            gw.submit(&session, submission).await,
-            Err(GatewayError::Rejected(_))
-        ),
-        "retry of oversized submission should be rejected"
+        rejected.to_string() == retried.to_string(),
+        "retry must reach the same admission check"
     );
+    let retried = boot
+        .kernel
+        .state
+        .query(&xolotl_state::StateScan::new(prefix))
+        .await?;
     ensure!(
-        boot.kernel.state.read_prefix(&prefix).await?.is_empty(),
-        "retry rejection must release idempotency reservation"
+        retried.entries.is_empty(),
+        "retry rejection must remove its idempotency reservation"
     );
     Ok(())
 }
@@ -2402,7 +2484,7 @@ async fn direct_input_large_ref_requires_provenance() -> anyhow::Result<()> {
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
-    let blob = Value::Blob(xolotl_types::BlobRef {
+    let blob = Value::blob(xolotl_types::BlobRef {
         hash: "abc".into(),
         size: 3,
         mime: Some("text/plain".into()),
@@ -2422,316 +2504,12 @@ async fn direct_input_large_ref_requires_provenance() -> anyhow::Result<()> {
         matches!(
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("echo", Value::Map(nested))
+                GatewaySubmission::direct_input("echo", Value::map(nested))
             )
             .await,
             Err(GatewayError::Rejected(_))
         ),
         "nested large blob ref without provenance should be rejected"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn direct_input_large_ref_requires_blob_store_match() -> anyhow::Result<()> {
-    let boot = Arc::new(Bootstrap::in_memory());
-    let name = boot.register_effect(
-        "effect://echo/say",
-        &[xolotl_kernel::MethodSpec::new(
-            "invoke",
-            xolotl_types::Purity::Pure,
-            xolotl_kernel::MethodSpec::UNARY_ASYNC,
-        )],
-        Arc::new(xolotl_kernel::EchoDriver),
-    )?;
-    let bytes = b"stored image bytes".to_vec();
-    let hash = blake3::hash(&bytes).to_hex().to_string();
-    let profile = echo_profile(name)?;
-    let gw = GatewayRuntime::new(boot, profile)?;
-    let session = gw
-        .authenticate(PresentedCredential::bearer(TEST_TOKEN))
-        .await?;
-    let ticket = gw
-        .issue_object_upload_ticket(
-            &session,
-            IssueObjectUploadTicketRequest {
-                surface_id: "echo".into(),
-                submission_token: None,
-                modality: GatewayModality::Bytes,
-                expected_size: Some(bytes.len() as u64),
-                expected_digest: Some(hash.clone()),
-                allowed_media_types: vec!["image/png".into()],
-                expires_in_ms: Some(60_000),
-                single_use: false,
-            },
-        )
-        .await?;
-    let committed = gw
-        .commit_object_upload(
-            &session,
-            CommitObjectUploadRequest {
-                ticket_id: ticket.ticket_id,
-                bytes,
-                media_type: Some("image/png".into()),
-                item: None,
-                submission_token: None,
-            },
-        )
-        .await?;
-    let blob = committed.item.clone();
-
-    let out = gw
-        .submit(
-            &session,
-            direct_input_with_provenance("echo", blob.clone(), committed.provenance.clone()),
-        )
-        .await?;
-    ensure!(
-        out == Outcome::Done(blob),
-        "unexpected blob output: {out:?}"
-    );
-
-    let wrong_size = Value::Blob(BlobRef {
-        hash,
-        size: 999,
-        mime: None,
-    });
-    ensure!(
-        matches!(
-            gw.submit(
-                &session,
-                direct_input_with_provenance("echo", wrong_size, committed.provenance)
-            )
-            .await,
-            Err(GatewayError::Rejected(_))
-        ),
-        "mismatched blob store proof should be rejected"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn direct_input_upload_ticket_is_bound_and_single_use() -> anyhow::Result<()> {
-    let boot = Arc::new(Bootstrap::in_memory());
-    let name = boot.register_effect(
-        "effect://echo/say",
-        &[xolotl_kernel::MethodSpec::new(
-            "invoke",
-            xolotl_types::Purity::Pure,
-            xolotl_kernel::MethodSpec::UNARY_ASYNC,
-        )],
-        Arc::new(xolotl_kernel::EchoDriver),
-    )?;
-    let bytes = b"ticketed bytes".to_vec();
-    let hash = blake3::hash(&bytes).to_hex().to_string();
-    boot.kernel
-        .state
-        .write_set(&blob_path(&hash)?, Value::Bytes(bytes.clone()))
-        .await?;
-    let ticket_id = "ticket_1";
-    let ticket = GatewayObjectUploadTicket {
-        ticket_id: ticket_id.into(),
-        principal_id: "alice".into(),
-        surface_id: "echo".into(),
-        submission_token: None,
-        modality: GatewayModality::Bytes,
-        expected_size: Some(bytes.len() as u64),
-        expected_digest: Some(hash.clone()),
-        allowed_media_types: vec!["image/*".into()],
-        expires_at_ms: now_millis().saturating_add(60_000),
-        single_use: true,
-        committed: false,
-        used: false,
-    };
-    boot.kernel
-        .state
-        .write_set(&upload_ticket_path(ticket_id)?, ticket.to_value())
-        .await?;
-    let blob = Value::Blob(BlobRef {
-        hash,
-        size: bytes.len() as u64,
-        mime: Some("image/png".into()),
-    });
-    let profile = echo_profile(name)?;
-    let gw = GatewayRuntime::new(boot, profile)?;
-    let session = gw
-        .authenticate(PresentedCredential::bearer(TEST_TOKEN))
-        .await?;
-
-    let out = gw
-        .submit(
-            &session,
-            direct_input_with_ticket("echo", blob.clone(), ticket_id),
-        )
-        .await?;
-    ensure!(
-        out == Outcome::Done(blob.clone()),
-        "unexpected ticketed blob output: {out:?}"
-    );
-    ensure!(
-        matches!(
-            gw.submit(&session, direct_input_with_ticket("echo", blob, ticket_id))
-                .await,
-            Err(GatewayError::Rejected(_))
-        ),
-        "single-use ticket should reject reuse"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn direct_input_upload_ticket_rejects_expired_or_wrong_surface() -> anyhow::Result<()> {
-    let boot = Arc::new(Bootstrap::in_memory());
-    let name = boot.register_effect(
-        "effect://echo/say",
-        &[xolotl_kernel::MethodSpec::new(
-            "invoke",
-            xolotl_types::Purity::Pure,
-            xolotl_kernel::MethodSpec::UNARY_ASYNC,
-        )],
-        Arc::new(xolotl_kernel::EchoDriver),
-    )?;
-    let bytes = b"rejected ticket bytes".to_vec();
-    let hash = blake3::hash(&bytes).to_hex().to_string();
-    boot.kernel
-        .state
-        .write_set(&blob_path(&hash)?, Value::Bytes(bytes.clone()))
-        .await?;
-    let mut ticket = GatewayObjectUploadTicket {
-        ticket_id: "ticket_expired".into(),
-        principal_id: "alice".into(),
-        surface_id: "echo".into(),
-        submission_token: None,
-        modality: GatewayModality::Bytes,
-        expected_size: Some(bytes.len() as u64),
-        expected_digest: Some(hash.clone()),
-        allowed_media_types: Vec::new(),
-        expires_at_ms: now_millis().saturating_sub(1),
-        single_use: true,
-        committed: false,
-        used: false,
-    };
-    boot.kernel
-        .state
-        .write_set(&upload_ticket_path(&ticket.ticket_id)?, ticket.to_value())
-        .await?;
-    ticket.ticket_id = "ticket_surface".into();
-    ticket.expires_at_ms = now_millis().saturating_add(60_000);
-    ticket.surface_id = "other".into();
-    boot.kernel
-        .state
-        .write_set(&upload_ticket_path(&ticket.ticket_id)?, ticket.to_value())
-        .await?;
-    let blob = Value::Blob(BlobRef {
-        hash,
-        size: bytes.len() as u64,
-        mime: None,
-    });
-    let profile = echo_profile(name)?;
-    let gw = GatewayRuntime::new(boot, profile)?;
-    let session = gw
-        .authenticate(PresentedCredential::bearer(TEST_TOKEN))
-        .await?;
-
-    ensure!(
-        matches!(
-            gw.submit(
-                &session,
-                direct_input_with_ticket("echo", blob.clone(), "ticket_expired")
-            )
-            .await,
-            Err(GatewayError::Rejected(_))
-        ),
-        "expired ticket should be rejected"
-    );
-    ensure!(
-        matches!(
-            gw.submit(
-                &session,
-                direct_input_with_ticket("echo", blob, "ticket_surface")
-            )
-            .await,
-            Err(GatewayError::Rejected(_))
-        ),
-        "wrong-surface ticket should be rejected"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn object_upload_issue_commit_returns_bound_single_use_store_proof() -> anyhow::Result<()> {
-    let boot = Arc::new(Bootstrap::in_memory());
-    let name = boot.register_effect(
-        "effect://echo/say",
-        &[xolotl_kernel::MethodSpec::new(
-            "invoke",
-            xolotl_types::Purity::Pure,
-            xolotl_kernel::MethodSpec::UNARY_ASYNC,
-        )],
-        Arc::new(xolotl_kernel::EchoDriver),
-    )?;
-    let profile = echo_profile(name)?;
-    let gw = GatewayRuntime::new(boot, profile)?;
-    let session = gw
-        .authenticate(PresentedCredential::bearer(TEST_TOKEN))
-        .await?;
-    let bytes = b"committed image bytes".to_vec();
-    let digest = blake3::hash(&bytes).to_hex().to_string();
-    let ticket = gw
-        .issue_object_upload_ticket(
-            &session,
-            IssueObjectUploadTicketRequest {
-                surface_id: "echo".into(),
-                submission_token: None,
-                modality: GatewayModality::Bytes,
-                expected_size: Some(bytes.len() as u64),
-                expected_digest: Some(digest.clone()),
-                allowed_media_types: vec!["image/*".into()],
-                expires_in_ms: Some(60_000),
-                single_use: true,
-            },
-        )
-        .await?;
-
-    let committed = gw
-        .commit_object_upload(
-            &session,
-            CommitObjectUploadRequest {
-                ticket_id: ticket.ticket_id,
-                bytes,
-                media_type: Some("image/png".into()),
-                item: None,
-                submission_token: None,
-            },
-        )
-        .await?;
-    ensure!(
-        committed.digest == digest,
-        "unexpected committed digest: {}",
-        committed.digest
-    );
-    let out = gw
-        .submit(
-            &session,
-            GatewaySubmission::direct_input("echo", committed.item.clone())
-                .with_provenance(committed.provenance.clone()),
-        )
-        .await?;
-    ensure!(
-        out == Outcome::Done(committed.item.clone()),
-        "unexpected committed object output: {out:?}"
-    );
-    ensure!(
-        matches!(
-            gw.submit(
-                &session,
-                GatewaySubmission::direct_input("echo", committed.item)
-                    .with_provenance(committed.provenance),
-            )
-            .await,
-            Err(GatewayError::Rejected(_))
-        ),
-        "single-use store proof should reject reuse"
     );
     Ok(())
 }
@@ -2822,7 +2600,7 @@ async fn operation_not_exposed_by_profile_is_rejected() -> anyhow::Result<()> {
         matches!(
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("echo", Value::Null)
+                GatewaySubmission::direct_input("echo", Value::null())
             )
             .await,
             Err(GatewayError::Rejected(_))
@@ -2861,27 +2639,35 @@ async fn direct_input_large_literal_is_rejected_before_process_spawn() -> anyhow
     let prefix = Path::parse("state://gateway/idempotency")?;
     let submission = GatewaySubmission::direct_input(
         "echo",
-        Value::Str("this direct input is too large".into()),
+        Value::string("this direct input is too large".into()),
     )
     .with_options(SubmitOptions {
         idempotency_key: Some("direct-input-too-large".into()),
         ..SubmitOptions::default()
     });
 
+    let rejected = expect_error(gw.submit(&session, submission.clone()).await)?;
     ensure!(
-        matches!(
-            gw.submit(&session, submission).await,
-            Err(GatewayError::Rejected(_))
-        ),
+        matches!(&rejected, GatewayError::Rejected(_)),
         "large literal should be rejected"
+    );
+    let retried = expect_error(gw.submit(&session, submission).await)?;
+    ensure!(
+        rejected.to_string() == retried.to_string(),
+        "retry must reach the same literal limit"
     );
     ensure!(
         boot.kernel.processes.all_ids().len() == before,
         "process count should not change"
     );
+    let released = boot
+        .kernel
+        .state
+        .query(&xolotl_state::StateScan::new(prefix))
+        .await?;
     ensure!(
-        boot.kernel.state.read_prefix(&prefix).await?.is_empty(),
-        "direct input admission rejection must release the idempotency reservation"
+        released.entries.is_empty(),
+        "direct input admission rejection must remove its idempotency reservation"
     );
     Ok(())
 }
@@ -2931,7 +2717,7 @@ async fn gateway_budget_rejects_inflight_ops_and_releases() -> anyhow::Result<()
         tokio::spawn(async move {
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("budget", Value::Str("one".into())),
+                GatewaySubmission::direct_input("budget", Value::string("one".into())),
             )
             .await
         })
@@ -2940,7 +2726,7 @@ async fn gateway_budget_rejects_inflight_ops_and_releases() -> anyhow::Result<()
         tokio::task::yield_now().await;
     }
 
-    let retry = GatewaySubmission::direct_input("budget", Value::Str("two".into()));
+    let retry = GatewaySubmission::direct_input("budget", Value::string("two".into()));
     ensure!(
         matches!(
         gw.submit(&session, retry.clone()).await,
@@ -2959,9 +2745,9 @@ async fn gateway_budget_rejects_inflight_ops_and_releases() -> anyhow::Result<()
 
     let out = gw.submit(&session, retry).await?;
     ensure!(
-        out.outcome == Outcome::Done(Value::Str("two".into())),
+        out.output.outcome == Outcome::Done(Value::string("two".into())),
         "unexpected retry output: {:?}",
-        out.outcome
+        out.output.outcome
     );
     Ok(())
 }
@@ -3012,7 +2798,7 @@ async fn gateway_budget_rejects_estimated_cost_before_dispatch() -> anyhow::Resu
         matches!(
         gw.submit(
             &session,
-            GatewaySubmission::direct_input("budget", Value::Str("costed".into()))
+            GatewaySubmission::direct_input("budget", Value::string("costed".into()))
         )
         .await,
         Err(GatewayError::LimitExceeded(message))
@@ -3068,7 +2854,7 @@ async fn profile_replace_keeps_global_in_flight_limit() -> anyhow::Result<()> {
         tokio::spawn(async move {
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("slow", Value::Str("running".into())),
+                GatewaySubmission::direct_input("slow", Value::string("running".into())),
             )
             .await
         })
@@ -3102,7 +2888,7 @@ async fn profile_replace_keeps_global_in_flight_limit() -> anyhow::Result<()> {
         matches!(
             gw.submit(
                 &new_session,
-                GatewaySubmission::direct_input("slow", Value::Int(1))
+                GatewaySubmission::direct_input("slow", Value::integer(1))
             )
             .await,
             Err(GatewayError::LimitExceeded(_))
@@ -3122,7 +2908,7 @@ async fn profile_replace_keeps_global_in_flight_limit() -> anyhow::Result<()> {
     ensure!(
         gw.submit(
             &new_session,
-            GatewaySubmission::direct_input("slow", Value::Int(2))
+            GatewaySubmission::direct_input("slow", Value::integer(2))
         )
         .await
         .is_ok(),
@@ -3186,7 +2972,7 @@ async fn fair_admission_enforces_principal_limit() -> anyhow::Result<()> {
         tokio::spawn(async move {
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("slow-a", Value::Str("one".into())),
+                GatewaySubmission::direct_input("slow-a", Value::string("one".into())),
             )
             .await
         })
@@ -3198,7 +2984,7 @@ async fn fair_admission_enforces_principal_limit() -> anyhow::Result<()> {
     let err = expect_gateway_error(
         gw.submit(
             &session,
-            GatewaySubmission::direct_input("slow-b", Value::Str("two".into())),
+            GatewaySubmission::direct_input("slow-b", Value::string("two".into())),
         )
         .await,
     )?;
@@ -3216,7 +3002,7 @@ async fn fair_admission_enforces_principal_limit() -> anyhow::Result<()> {
     ensure!(
         gw.submit(
             &session,
-            GatewaySubmission::direct_input("slow-b", Value::Str("after".into())),
+            GatewaySubmission::direct_input("slow-b", Value::string("after".into())),
         )
         .await
         .is_ok(),
@@ -3279,7 +3065,7 @@ async fn fair_admission_enforces_surface_and_risk_limits() -> anyhow::Result<()>
         tokio::spawn(async move {
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("fair-a", Value::Str("one".into())),
+                GatewaySubmission::direct_input("fair-a", Value::string("one".into())),
             )
             .await
         })
@@ -3291,7 +3077,7 @@ async fn fair_admission_enforces_surface_and_risk_limits() -> anyhow::Result<()>
         surface_gw
             .submit(
                 &surface_session,
-                GatewaySubmission::direct_input("fair-a", Value::Str("two".into())),
+                GatewaySubmission::direct_input("fair-a", Value::string("two".into())),
             )
             .await,
     )?;
@@ -3334,7 +3120,7 @@ async fn fair_admission_enforces_surface_and_risk_limits() -> anyhow::Result<()>
         tokio::spawn(async move {
             gw.submit(
                 &session,
-                GatewaySubmission::direct_input("fair-a", Value::Str("one".into())),
+                GatewaySubmission::direct_input("fair-a", Value::string("one".into())),
             )
             .await
         })
@@ -3346,7 +3132,7 @@ async fn fair_admission_enforces_surface_and_risk_limits() -> anyhow::Result<()>
         risk_gw
             .submit(
                 &risk_session,
-                GatewaySubmission::direct_input("fair-b", Value::Str("two".into())),
+                GatewaySubmission::direct_input("fair-b", Value::string("two".into())),
             )
             .await,
     )?;
@@ -3364,7 +3150,7 @@ async fn fair_admission_enforces_surface_and_risk_limits() -> anyhow::Result<()>
         risk_gw
             .submit(
                 &risk_session,
-                GatewaySubmission::direct_input("fair-b", Value::Str("after".into())),
+                GatewaySubmission::direct_input("fair-b", Value::string("after".into())),
             )
             .await
             .is_ok(),

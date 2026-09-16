@@ -1,0 +1,25 @@
+[package]
+name = "xolotl-value-object"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Owned incremental value publication through portable object ports"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+cbor = ["dep:xolotl-value-codec", "xolotl-value-codec/cbor", "dep:xolotl-state"]
+
+[dependencies]
+xolotl-types.workspace = true
+xolotl-value-codec = { workspace = true, optional = true }
+xolotl-state = { workspace = true, optional = true }
+
+[dev-dependencies]
+anyhow = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["alloc"] }

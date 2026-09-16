@@ -1,34 +1,41 @@
+#![no_std]
 #![forbid(unsafe_code)]
 
-//! `xolotl-graph` — the single execution IR and its front-ends.
+//! Program front ends and interchange graphs for the common execution core.
 //!
-//! Every Program format (`Do<A>`, model plan, native) compiles to one
-//! [`ExecutionGraph`]. The Executor (in `xolotl-kernel`) advances a graph cursor
-//! over that IR. Front-ends share the same executor and recovery model.
+//! [`DoNode`] and native continuations compile to [`ExecutionGraph`], which the
+//! hosted executor lowers to `xolotl-core` instructions. [`portable`] programs
+//! compile directly to core images with explicit portable imports. Both paths
+//! use the same core control flow; durable checkpoints require portable imports.
 //!
 //! This crate sits **below** the kernel and **above** `xolotl-types`,
 //! and is wasm-safe: the Do→Graph compiler can run in the browser.
 //!
-//! - [`graph`]   — `ExecutionGraph` / `Node` / `NodeKind`, the IR.
-//! - `r#do`      — `Do<A>` (`DoNode`): the preferred serializable front-end.
+//! - [`graph`]   — `ExecutionGraph` / `Node` / `NodeKind`, the graph interchange form.
+//! - `r#do`      — `Do<A>` (`DoNode`): the native graph front end.
 //! - [`compile`] — Do→Graph compiler; assigns stable `NodeId == CausalPosition`.
-//! - [`cursor`]  — `GraphCursor`: where execution / recovery is positioned.
 //! - [`actor_spec`] — `ActorSpec` + `lint`: declared vs. used effects.
+//! - [`portable`] — portable expressions, compilation and import contracts.
+
+#[macro_use]
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 pub mod actor_spec;
 pub mod compile;
-pub mod cursor;
 #[path = "do_.rs"]
 pub mod r#do;
+mod fingerprint;
 pub mod graph;
+pub mod portable;
 
 pub use actor_spec::{
     ActorBindError, ActorSpec, CapabilityQueryError, LintFinding, LintSeverity, capability_covers,
     lint, lint_actor, operation_capability_verb,
 };
 pub use compile::{CompileError, compile_do, compile_do_at};
-pub use cursor::{Frame, GraphCursor};
-pub use r#do::DoNode;
+pub use r#do::{DoNode, bind_process_self_capability};
 pub use graph::{
     BranchKind, Edge, EdgeKind, ExecutionGraph, JoinKind, Node, NodeKind, OperationTemplate,
     StepRef, WaitSpec,

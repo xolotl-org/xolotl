@@ -11,8 +11,15 @@
 //! whether protected lineage participated in producing a value.
 
 use crate::path::Path;
+use alloc::{collections::TryReserveError, sync::Arc, vec::Vec};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
+
+mod failure;
+mod sources;
+mod value;
+pub use failure::TaintedFailure;
+pub use value::TaintedValue;
 
 /// Where a value's data originated. The lineage label that propagates with the
 /// value through every Operation.
@@ -66,23 +73,53 @@ impl TaintSource {
 /// The set of sources a value's lineage has touched. Empty = pristine
 /// (equivalent to a pure author constant with nothing mixed in). The set is the
 /// union of every input's taint that flowed into producing this value.
+/// Clones share the ordered source storage. Adding a new source copies that
+/// flat storage only when a snapshot still owns it; empty sets allocate nothing.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TaintSet {
-    sources: Vec<TaintSource>,
+    #[serde(with = "sources")]
+    sources: Option<Arc<Vec<TaintSource>>>,
 }
 
 impl TaintSet {
     /// A pristine (empty) taint set.
-    pub fn pristine() -> Self {
+    pub const fn pristine() -> Self {
+        Self { sources: None }
+    }
+
+    /// Retain an owned source sequence without copying, sorting, or coalescing
+    /// repeated claims. This preserves a document's source order and also lets
+    /// a consumer transfer a sequence it has already deduplicated incrementally.
+    /// [`Self::add`] and [`Self::union`] still coalesce newly added sources.
+    /// Recording labels does not establish their authority or grant access.
+    pub fn from_recorded_sources(sources: Vec<TaintSource>) -> Self {
         Self {
-            sources: Vec::new(),
+            sources: (!sources.is_empty()).then(|| Arc::new(sources)),
         }
+    }
+
+    /// Extend a document's recorded sequence without coalescing repeated claims.
+    pub(crate) fn push_recorded_source(
+        &mut self,
+        source: TaintSource,
+    ) -> Result<(), TryReserveError> {
+        if let Some(sources) = &mut self.sources {
+            let sources = Arc::make_mut(sources);
+            sources.try_reserve(1)?;
+            sources.push(source);
+        } else {
+            let mut sources = Vec::new();
+            sources.try_reserve(1)?;
+            sources.push(source);
+            self.sources = Some(Arc::new(sources));
+        }
+        Ok(())
     }
 
     /// A taint set with a single source.
     pub fn of(source: TaintSource) -> Self {
         Self {
-            sources: vec![source],
+            sources: Some(Arc::new(vec![source])),
         }
     }
 
@@ -93,15 +130,24 @@ impl TaintSet {
 
     /// Add a source (idempotent — duplicates are coalesced).
     pub fn add(&mut self, source: TaintSource) {
-        if !self.sources.contains(&source) {
-            self.sources.push(source);
+        if !self.sources().contains(&source) {
+            let sources = self.sources.get_or_insert_with(|| Arc::new(Vec::new()));
+            Arc::make_mut(sources).push(source);
         }
     }
 
     /// Union another set into this one. Output taint is the union of all input
     /// taints.
     pub fn union(&mut self, other: &TaintSet) {
-        for s in &other.sources {
+        if self
+            .sources
+            .as_ref()
+            .zip(other.sources.as_ref())
+            .is_some_and(|(left, right)| Arc::ptr_eq(left, right))
+        {
+            return;
+        }
+        for s in other.sources() {
             self.add(s.clone());
         }
     }
@@ -112,24 +158,46 @@ impl TaintSet {
         self
     }
 
+    /// Whether every required source is recorded in this set.
+    ///
+    /// Coverage ignores source order and repeated labels. It neither allocates
+    /// nor changes the original recorded sequences. Covering labels does not
+    /// establish their authority or grant access to the associated content.
+    pub fn contains_all(&self, required: &TaintSet) -> bool {
+        if self
+            .sources
+            .as_ref()
+            .zip(required.sources.as_ref())
+            .is_some_and(|(left, right)| Arc::ptr_eq(left, right))
+        {
+            return true;
+        }
+        required
+            .sources()
+            .iter()
+            .all(|source| self.sources().contains(source))
+    }
+
     /// Whether the lineage touched any protected source.
     pub fn has_protected(&self) -> bool {
-        self.sources.iter().any(TaintSource::is_protected)
+        self.sources().iter().any(TaintSource::is_protected)
     }
 
     /// Whether the lineage touched untrusted content (memory-poison gate).
     pub fn has_untrusted_content(&self) -> bool {
-        self.sources.iter().any(TaintSource::is_untrusted_content)
+        self.sources().iter().any(TaintSource::is_untrusted_content)
     }
 
     /// Whether the set is pristine (no recorded sources).
     pub fn is_pristine(&self) -> bool {
-        self.sources.is_empty()
+        self.sources.is_none()
     }
 
     /// The recorded sources.
     pub fn sources(&self) -> &[TaintSource] {
-        &self.sources
+        self.sources
+            .as_ref()
+            .map_or(&[], |sources| sources.as_slice())
     }
 }
 
@@ -139,12 +207,66 @@ mod tests {
     use anyhow::ensure;
 
     #[test]
+    fn cloned_lineage_shares_until_a_new_source_is_added() {
+        let original = TaintSet::author();
+        let mut cloned = original.clone();
+        assert_eq!(original.sources().as_ptr(), cloned.sources().as_ptr());
+        cloned.union(&original);
+        assert_eq!(original.sources().as_ptr(), cloned.sources().as_ptr());
+        cloned.add(TaintSource::ModelOutput);
+        assert_ne!(original.sources().as_ptr(), cloned.sources().as_ptr());
+        assert_eq!(original.sources(), &[TaintSource::AuthorConstant]);
+        assert_eq!(
+            cloned.sources(),
+            &[TaintSource::AuthorConstant, TaintSource::ModelOutput]
+        );
+    }
+
+    #[test]
+    fn serialized_sources_preserve_order_and_duplicate_claims() -> anyhow::Result<()> {
+        let source = r#"{"sources":["model_output","author_constant","model_output"]}"#;
+        let taint: TaintSet = serde_json::from_str(source)?;
+        ensure!(serde_json::to_string(&taint)? == source);
+        let mut cloned = taint.clone();
+        cloned.add(TaintSource::ModelOutput);
+        ensure!(cloned.sources().as_ptr() == taint.sources().as_ptr());
+        let empty: TaintSet = serde_json::from_str(r#"{"sources":[]}"#)?;
+        ensure!(empty.sources.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn union_is_idempotent() {
         let mut a = TaintSet::of(TaintSource::ModelOutput);
         a.add(TaintSource::ModelOutput);
         assert_eq!(a.sources().len(), 1);
         a.union(&TaintSet::of(TaintSource::ModelOutput));
         assert_eq!(a.sources().len(), 1);
+    }
+
+    #[test]
+    fn coverage_ignores_order_and_repetitions_without_rewriting_sources() {
+        let recorded = TaintSet::from_recorded_sources(vec![
+            TaintSource::ModelOutput,
+            TaintSource::AuthorConstant,
+            TaintSource::ModelOutput,
+        ]);
+        let reordered = TaintSet::from_recorded_sources(vec![
+            TaintSource::AuthorConstant,
+            TaintSource::ModelOutput,
+        ]);
+        let original = recorded.sources().as_ptr();
+        assert_ne!(recorded, reordered);
+        assert!(recorded.contains_all(&reordered));
+        assert!(reordered.contains_all(&recorded));
+        assert!(recorded.contains_all(&recorded));
+        assert!(recorded.contains_all(&TaintSet::pristine()));
+        assert!(!TaintSet::pristine().contains_all(&recorded));
+        assert!(!recorded.contains_all(&TaintSet::of(TaintSource::Fetched {
+            host: "new-source".into(),
+        })));
+        assert_eq!(recorded.sources().as_ptr(), original);
+        assert_eq!(recorded.sources().len(), 3);
     }
 
     #[test]

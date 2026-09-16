@@ -17,8 +17,9 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Child;
-use xolotl_kernel::{Driver, DriverContext, DriverError, MethodSpec};
+use xolotl_kernel::{Driver, DriverContext, DriverError, DriverOutput, MethodSpec};
 use xolotl_types::{MethodId, Outcome, OutputMode, Purity, Value};
+use xolotl_types::{ValueMap, ValueView};
 
 const DEFAULT_TERMINAL_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const HARD_TERMINAL_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -136,7 +137,7 @@ impl Driver for TerminalDriver {
         input: Value,
         _output: OutputMode,
         _ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
+    ) -> Result<DriverOutput, DriverError> {
         if method.get() != 0 {
             return Err(DriverError::NoSuchMethod(method));
         }
@@ -162,8 +163,8 @@ impl Driver for TerminalDriver {
             HARD_TERMINAL_TIMEOUT_MS,
             "terminal.run",
         )?;
-        let args: Vec<String> = match m.get("args") {
-            Some(Value::List(xs)) => {
+        let args: Vec<String> = match m.get("args").map(Value::view) {
+            Some(ValueView::List(xs)) => {
                 let mut args = Vec::with_capacity(xs.len());
                 for value in xs {
                     let arg = value.as_str().ok_or_else(|| {
@@ -185,25 +186,25 @@ impl Driver for TerminalDriver {
         let mut result = BTreeMap::new();
         result.insert(
             "status".into(),
-            Value::Int(output.status.code().unwrap_or(-1) as i64),
+            Value::integer(output.status.code().unwrap_or(-1) as i64),
         );
         result.insert(
             "stdout".into(),
-            Value::Str(String::from_utf8_lossy(&output.stdout).into_owned()),
+            Value::string(String::from_utf8_lossy(&output.stdout).into_owned()),
         );
         result.insert(
             "stderr".into(),
-            Value::Str(String::from_utf8_lossy(&output.stderr).into_owned()),
+            Value::string(String::from_utf8_lossy(&output.stderr).into_owned()),
         );
         result.insert(
             "stdout_truncated".into(),
-            Value::Bool(output.stdout_truncated),
+            Value::boolean(output.stdout_truncated),
         );
         result.insert(
             "stderr_truncated".into(),
-            Value::Bool(output.stderr_truncated),
+            Value::boolean(output.stderr_truncated),
         );
-        Ok(Outcome::Done(Value::Map(result)))
+        Ok(DriverOutput::new(Outcome::Done(Value::map(result))))
     }
 }
 
@@ -326,14 +327,10 @@ async fn join_limited_output(
     }
 }
 
-fn optional_bool(
-    m: &BTreeMap<String, Value>,
-    field: &'static str,
-    op: &'static str,
-) -> Result<bool, DriverError> {
-    match m.get(field) {
+fn optional_bool(m: &ValueMap, field: &'static str, op: &'static str) -> Result<bool, DriverError> {
+    match m.get(field).map(Value::view) {
         None => Ok(false),
-        Some(Value::Bool(value)) => Ok(*value),
+        Some(ValueView::Bool(value)) => Ok(value),
         Some(_) => Err(DriverError::InvalidInput(format!(
             "{op} `{field}` must be a boolean"
         ))),
@@ -341,7 +338,7 @@ fn optional_bool(
 }
 
 fn optional_bounded_usize(
-    m: &BTreeMap<String, Value>,
+    m: &ValueMap,
     field: &'static str,
     default: usize,
     hard_limit: usize,
@@ -350,17 +347,17 @@ fn optional_bounded_usize(
     let Some(value) = m.get(field) else {
         return Ok(default);
     };
-    let Value::Int(raw) = value else {
+    let Some(raw) = value.as_int() else {
         return Err(DriverError::InvalidInput(format!(
             "{op} `{field}` must be an integer"
         )));
     };
-    if *raw < 0 {
+    if raw < 0 {
         return Err(DriverError::InvalidInput(format!(
             "{op} `{field}` must be nonnegative"
         )));
     }
-    let parsed = usize::try_from(*raw)
+    let parsed = usize::try_from(raw)
         .map_err(|_error| DriverError::InvalidInput(format!("{op} `{field}` is out of range")))?;
     if parsed > hard_limit {
         return Err(DriverError::InvalidInput(format!(
@@ -371,7 +368,7 @@ fn optional_bounded_usize(
 }
 
 fn optional_bounded_u64(
-    m: &BTreeMap<String, Value>,
+    m: &ValueMap,
     field: &'static str,
     default: u64,
     hard_limit: u64,
@@ -380,17 +377,17 @@ fn optional_bounded_u64(
     let Some(value) = m.get(field) else {
         return Ok(default);
     };
-    let Value::Int(raw) = value else {
+    let Some(raw) = value.as_int() else {
         return Err(DriverError::InvalidInput(format!(
             "{op} `{field}` must be an integer"
         )));
     };
-    if *raw <= 0 {
+    if raw <= 0 {
         return Err(DriverError::InvalidInput(format!(
             "{op} `{field}` must be positive"
         )));
     }
-    let parsed = u64::try_from(*raw)
+    let parsed = u64::try_from(raw)
         .map_err(|_error| DriverError::InvalidInput(format!("{op} `{field}` is out of range")))?;
     if parsed > hard_limit {
         return Err(DriverError::InvalidInput(format!(
@@ -408,12 +405,12 @@ mod tests {
 
     fn run_input(command: &str, args: &[&str]) -> Value {
         let mut m = BTreeMap::new();
-        m.insert("command".into(), Value::Str(command.into()));
+        m.insert("command".into(), Value::string(command.into()));
         m.insert(
             "args".into(),
-            Value::List(args.iter().map(|a| Value::Str((*a).into())).collect()),
+            Value::list(args.iter().map(|a| Value::string((*a).into())).collect()),
         );
-        Value::Map(m)
+        Value::map(m)
     }
 
     #[tokio::test]
@@ -445,8 +442,9 @@ mod tests {
             )
             .await
             .context("run echo command")?;
-        match out {
-            Outcome::Done(Value::Map(m)) => {
+        match out.outcome {
+            Outcome::Done(m_value) => {
+                let m = m_value.as_map().context("expected map")?;
                 let stdout = m.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
                 ensure!(
                     stdout.contains("$HOME"),
@@ -462,21 +460,26 @@ mod tests {
     async fn output_is_bounded_and_marked_when_truncated() -> Result<()> {
         let d = TerminalDriver::new(vec!["echo".into()]);
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
-        let mut input = match run_input("echo", &["abcdef"]) {
-            Value::Map(map) => map,
-            other => bail!("expected map input, got {other:?}"),
-        };
-        input.insert("max_output_bytes".into(), Value::Int(4));
+        let mut input = run_input("echo", &["abcdef"])
+            .into_map()
+            .context("expected map input")?;
+        input.insert("max_output_bytes".into(), Value::integer(4))?;
         let out = d
-            .call(MethodId::new(0), Value::Map(input), OutputMode::Unary, &ctx)
+            .call(
+                MethodId::new(0),
+                Value::from(input),
+                OutputMode::Unary,
+                &ctx,
+            )
             .await
             .context("run bounded echo command")?;
-        match out {
-            Outcome::Done(Value::Map(m)) => {
+        match out.outcome {
+            Outcome::Done(m_value) => {
+                let m = m_value.as_map().context("expected map")?;
                 let stdout = m.get("stdout").and_then(|v| v.as_str());
                 ensure!(stdout == Some("abcd"), "unexpected stdout: {stdout:?}");
                 ensure!(
-                    m.get("stdout_truncated") == Some(&Value::Bool(true)),
+                    m.get("stdout_truncated") == Some(&Value::boolean(true)),
                     "stdout truncation flag missing: {m:?}"
                 );
                 Ok(())
@@ -490,17 +493,21 @@ mod tests {
         let d = TerminalDriver::new(vec!["echo".into()]);
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
         for (field, value) in [
-            ("max_output_bytes", Value::Int(-1)),
-            ("timeout_ms", Value::Int(0)),
-            ("timeout_ms", Value::Str("1".into())),
+            ("max_output_bytes", Value::integer(-1)),
+            ("timeout_ms", Value::integer(0)),
+            ("timeout_ms", Value::string("1".into())),
         ] {
-            let mut input = match run_input("echo", &["hello"]) {
-                Value::Map(map) => map,
-                other => bail!("expected map input, got {other:?}"),
-            };
-            input.insert(field.into(), value);
+            let mut input = run_input("echo", &["hello"])
+                .into_map()
+                .context("expected map input")?;
+            input.insert(field.into(), value)?;
             let out = d
-                .call(MethodId::new(0), Value::Map(input), OutputMode::Unary, &ctx)
+                .call(
+                    MethodId::new(0),
+                    Value::from(input),
+                    OutputMode::Unary,
+                    &ctx,
+                )
                 .await;
             ensure!(out.is_err(), "malformed {field} was accepted");
         }
@@ -548,10 +555,10 @@ mod tests {
         let d = TerminalDriver::new(vec!["echo".into()]);
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
         let mut input = BTreeMap::new();
-        input.insert("command".into(), Value::Str("echo".into()));
-        input.insert("approved".into(), Value::Str("true".into()));
+        input.insert("command".into(), Value::string("echo".into()));
+        input.insert("approved".into(), Value::string("true".into()));
         let out = d
-            .call(MethodId::new(0), Value::Map(input), OutputMode::Unary, &ctx)
+            .call(MethodId::new(0), Value::map(input), OutputMode::Unary, &ctx)
             .await;
         ensure!(
             matches!(out, Err(DriverError::InvalidInput(ref message)) if message.contains("approved")),

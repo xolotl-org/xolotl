@@ -1,15 +1,17 @@
 //! Protobuf `ConsoleFrame` conversion helpers.
 
-use prost::Message as _;
-use xolotl_console_protocol::{SERVER_NAME, WIRE_ENCODING, pb};
-use xolotl_proto::xolotl::v1 as pbv;
-use xolotl_proto::{path_to_pb, value_from_pb_checked, value_to_pb};
-use xolotl_types::Path;
+mod encode;
 
-use crate::protocol::{
-    ActionCall, ClientFrame, ClientHello, ConsoleErrorCode, ConsoleEvent, PrincipalSummary,
-    ProtocolMetadata, ServerFrame, StreamCall,
-};
+pub(crate) use encode::{FrameEncodeError, encode_server_frame};
+
+use prost::Message as _;
+use xolotl_console_protocol::pb;
+use xolotl_proto::value_from_pb_checked;
+#[cfg(test)]
+use xolotl_proto::value_to_pb;
+use xolotl_proto::xolotl::v1 as pbv;
+
+use crate::protocol::{ActionCall, ClientFrame, ClientHello, StreamCall};
 
 /// Decode a binary protobuf `ConsoleFrame` into a server-side client frame.
 pub(crate) fn decode_client_frame(bytes: &[u8]) -> Result<ClientFrame, String> {
@@ -44,11 +46,6 @@ pub(crate) fn decode_client_frame(bytes: &[u8]) -> Result<ClientFrame, String> {
     }
 }
 
-/// Encode a server-side frame into binary protobuf wire bytes.
-pub(crate) fn encode_server_frame(frame: &ServerFrame) -> Vec<u8> {
-    server_frame_to_pb(frame).encode_to_vec()
-}
-
 fn action_call_from_pb(call: pb::ActionCall) -> Result<ActionCall, String> {
     Ok(ActionCall {
         action: call.action,
@@ -79,132 +76,7 @@ fn input_value(value: Option<pbv::Value>) -> Result<xolotl_types::Value, String>
         Some(value) => {
             value_from_pb_checked(&value).map_err(|e| format!("invalid input value: {e}"))
         }
-        None => Ok(xolotl_types::Value::Null),
-    }
-}
-
-fn server_frame_to_pb(frame: &ServerFrame) -> pb::ConsoleFrame {
-    let inner = match frame {
-        ServerFrame::HelloAccepted { metadata } => {
-            pb::console_frame::Frame::HelloAccepted(pb::HelloAccepted {
-                metadata: Some(metadata_to_pb(metadata)),
-            })
-        }
-        ServerFrame::Authenticated {
-            principal,
-            metadata,
-        } => pb::console_frame::Frame::Authenticated(pb::Authenticated {
-            principal: Some(principal_to_pb(principal)),
-            metadata: Some(metadata_to_pb(metadata)),
-        }),
-        ServerFrame::Reply { id, result } => pb::console_frame::Frame::Reply(pb::Reply {
-            id: *id,
-            result: Some(pb::ActionResult {
-                output: result.output.as_ref().map(value_to_pb),
-                server_rev: result.server_rev,
-                registry_rev: None,
-            }),
-        }),
-        ServerFrame::Event { stream, event } => pb::console_frame::Frame::Event(pb::Event {
-            stream: *stream,
-            event: Some(console_event_to_pb(event)),
-        }),
-        ServerFrame::Pong { nonce } => pb::console_frame::Frame::Pong(*nonce),
-        ServerFrame::Error { id, code, message } => {
-            pb::console_frame::Frame::Error(pb::ConsoleError {
-                code: error_code_to_pb(*code) as i32,
-                message: message.clone(),
-                request_id: *id,
-                retry_after_ms: None,
-                required_mfa_level: None,
-                current_version: None,
-                current_registry_rev: None,
-                correlation_id: None,
-            })
-        }
-    };
-    pb::ConsoleFrame { frame: Some(inner) }
-}
-
-fn metadata_to_pb(metadata: &ProtocolMetadata) -> pb::ProtocolMetadata {
-    pb::ProtocolMetadata {
-        protocol_version: u32::from(metadata.protocol_version),
-        server_name: SERVER_NAME.into(),
-        wire_encoding: WIRE_ENCODING.into(),
-        server_rev: metadata.server_rev,
-        registry_rev: metadata.registry_rev,
-        server_time_ms: u64::try_from(xolotl_kernel::now_millis()).unwrap_or(0),
-        capabilities: Vec::new(),
-    }
-}
-
-fn principal_to_pb(principal: &PrincipalSummary) -> pb::PrincipalSummary {
-    pb::PrincipalSummary {
-        username: principal.username.clone(),
-        identity_path: principal.identity_path.clone(),
-        mfa_level: u32::from(principal.mfa_level),
-        grants: Vec::new(),
-    }
-}
-
-fn console_event_to_pb(event: &ConsoleEvent) -> pb::ConsoleEvent {
-    let kind = match event {
-        ConsoleEvent::StateSet { path, value } => pb::console_event::Kind::StateSet(pb::StateSet {
-            path: Some(path_to_pb_lossy(path)),
-            value: Some(value_to_pb(value)),
-        }),
-        ConsoleEvent::StateAppend { path, item } => {
-            pb::console_event::Kind::StateAppend(pb::StateAppend {
-                path: Some(path_to_pb_lossy(path)),
-                item: Some(value_to_pb(item)),
-            })
-        }
-        ConsoleEvent::StateDelete { path } => {
-            pb::console_event::Kind::StateDelete(pb::StateDelete {
-                path: Some(path_to_pb_lossy(path)),
-            })
-        }
-        ConsoleEvent::Audit { fact } => pb::console_event::Kind::Fact(pb::FactEvent {
-            fact: Some(value_to_pb(fact)),
-        }),
-        ConsoleEvent::SubscriptionClosed { reason } => {
-            pb::console_event::Kind::Closed(pb::SubscriptionClosed {
-                reason: reason.clone(),
-                last_rev: None,
-            })
-        }
-    };
-    pb::ConsoleEvent {
-        kind: Some(kind),
-        state_rev: 0,
-        fact_cursor: 0,
-        coalesced: false,
-    }
-}
-
-fn path_to_pb_lossy(raw: &str) -> pbv::Path {
-    match Path::parse(raw) {
-        Ok(path) => path_to_pb(&path),
-        Err(_) => pbv::Path {
-            cluster: None,
-            scheme: "state".into(),
-            segments: vec![raw.to_string()],
-        },
-    }
-}
-
-fn error_code_to_pb(code: ConsoleErrorCode) -> pb::ConsoleErrorCode {
-    match code {
-        ConsoleErrorCode::BadFrame | ConsoleErrorCode::BadRequest => {
-            pb::ConsoleErrorCode::ValidationFailed
-        }
-        ConsoleErrorCode::NotAuthenticated => pb::ConsoleErrorCode::Unauthenticated,
-        ConsoleErrorCode::Unauthorized | ConsoleErrorCode::Forbidden => {
-            pb::ConsoleErrorCode::Forbidden
-        }
-        ConsoleErrorCode::Conflict => pb::ConsoleErrorCode::VersionConflict,
-        ConsoleErrorCode::RateLimited => pb::ConsoleErrorCode::RateLimited,
-        ConsoleErrorCode::Internal => pb::ConsoleErrorCode::Internal,
+        None => Ok(xolotl_types::Value::null()),
     }
 }
 

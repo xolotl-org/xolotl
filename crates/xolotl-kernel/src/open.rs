@@ -15,6 +15,9 @@ use xolotl_types::{ConstraintSet, Grant, HandleId, IdentityRef, ProcessId, Resou
 /// Errors returned while compiling an open request into a handle.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum OpenError {
+    /// The handle table cannot admit a new slot or its parent was revoked.
+    #[error("handle admission failed: {0}")]
+    HandleAdmission(#[from] xolotl_core::AuthorityError),
     /// The caller tried to open a resource for a process not present in the
     /// process table.
     #[error("process {0} not found")]
@@ -163,7 +166,12 @@ pub fn open_resource_with_attached(
         req.now_millis,
     );
     if let Some(plan) = registry.cached_open_plan(&cache_key) {
-        return Ok(handles.insert(handle_from_plan(req.process, Some(resource_name), plan)));
+        return Ok(handles.insert(handle_from_plan(
+            req.process,
+            req.acting,
+            Some(resource_name),
+            plan,
+        ))?);
     }
 
     // Compile policy into a snapshot with partial evaluation. The residual is
@@ -226,10 +234,14 @@ pub fn open_resource_with_attached(
             (None, _, None) => return Err(OpenError::NoSuchDriver(binding.driver.id)),
         };
     let mut plan = DriverPlan::new(binding.driver.id, binding.endpoint, binding.generation);
+    let cleanup_owner = state_cleanup_owner(&resource_name);
     for iface_id in &resource.interfaces.interfaces {
         if let Some(iface) = registry.interface(*iface_id) {
-            for method in &iface.methods {
-                plan.insert(method.id, dispatch_driver.clone());
+            for (index, method) in iface.methods.iter().enumerate() {
+                let index = u32::try_from(index).map_err(|_error| OpenError::RightsNotSubset)?;
+                let mut contract = xolotl_types::MethodContract::from_method(index, method);
+                contract.cleanup_owner = cleanup_owner;
+                plan.insert(method.id, contract, dispatch_driver.clone());
             }
         }
     }
@@ -249,17 +261,39 @@ pub fn open_resource_with_attached(
     registry.store_open_plan(cache_key, compiled.clone());
 
     // Allocate and install the handle slot.
-    Ok(handles.insert(handle_from_plan(req.process, Some(resource_name), compiled)))
+    Ok(handles.insert(handle_from_plan(
+        req.process,
+        req.acting,
+        Some(resource_name),
+        compiled,
+    ))?)
+}
+
+fn state_cleanup_owner(path: &xolotl_types::Path) -> Option<ProcessId> {
+    if path.scheme() != "state"
+        || path.cluster().is_some()
+        || path.segments().first()?.as_str() != "process"
+    {
+        return None;
+    }
+    path.segments()
+        .get(1)?
+        .as_str()
+        .parse()
+        .ok()
+        .map(ProcessId::new)
 }
 
 fn handle_from_plan(
     process: ProcessId,
+    acting: IdentityRef,
     bound_path: Option<xolotl_types::Path>,
     plan: CompiledOpenPlan,
 ) -> Handle {
     Handle {
         id: HandleId::new(0, 0), // patched by insert()
         process,
+        acting,
         resource: plan.resource,
         rights: plan.rights,
         driver_plan: plan.driver_plan,
@@ -315,6 +349,7 @@ pub fn derive_handle(
     let child = Handle {
         id: HandleId::new(0, 0),
         process: new_owner,
+        acting: parent.acting,
         resource: parent.resource,
         rights: new_rights,
         driver_plan: parent.driver_plan.clone(),
@@ -322,7 +357,7 @@ pub fn derive_handle(
         state: HandleState::Active,
         bound_path: parent.bound_path.clone(),
     };
-    Ok(handles.insert(child))
+    Ok(handles.insert_derived(child, parent_id)?)
 }
 
 #[cfg(test)]
@@ -359,6 +394,7 @@ mod tests {
                 cost: Default::default(),
                 batchable: false,
                 finalize_allowed: false,
+                requires_unprotected_input: false,
             }],
             laws: Vec::new(),
         });
@@ -421,6 +457,7 @@ mod tests {
                 cost: Default::default(),
                 batchable: false,
                 finalize_allowed: false,
+                requires_unprotected_input: false,
             }],
             laws: Vec::new(),
         });
@@ -484,6 +521,7 @@ mod tests {
                 cost: Default::default(),
                 batchable: false,
                 finalize_allowed: false,
+                requires_unprotected_input: false,
             }],
             laws: Vec::new(),
         });
@@ -539,7 +577,7 @@ mod tests {
             self.seen.lock().push(invoke.clone());
             Ok(InvokeResult {
                 invocation_id: invoke.invocation_id,
-                outcome: Ok(xolotl_types::Value::Str("remote".into())),
+                outcome: Ok(xolotl_types::Value::string("remote".into())),
             })
         }
     }
@@ -624,7 +662,7 @@ mod tests {
 
         let deny = snapshot
             .check(&crate::policy::CheckCtx {
-                input: &Value::Null,
+                input: &Value::null(),
                 acting: IdentityRef::ROOT,
                 now_millis: 0,
                 target: rid,
@@ -635,8 +673,8 @@ mod tests {
             "missing predicate input should be denied: {deny:?}"
         );
 
-        let input = Value::Map(
-            [("tenant".into(), Value::Str("acme".into()))]
+        let input = Value::map(
+            [("tenant".into(), Value::string("acme".into()))]
                 .into_iter()
                 .collect(),
         );
@@ -766,22 +804,27 @@ mod tests {
             "driver plan should support method 0"
         );
 
-        let ctx =
-            crate::DriverContext::new(IdentityRef::ROOT, ProcessId::new(1)).with_operation_id(
-                xolotl_types::OperationId::new(ProcessId::new(1), xolotl_types::NodeId::new(4), 0),
-            );
+        let ctx = crate::DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
+            .with_operation_id(xolotl_types::OperationId::new(
+                ProcessId::new(1),
+                xolotl_types::ExecutionId::FIRST,
+                xolotl_types::InvocationId::new(5),
+                xolotl_types::NodeId::new(4),
+                0,
+            ));
         let out = h
             .driver_plan
             .call(
                 xolotl_types::MethodId::new(0),
-                xolotl_types::Value::Str("q".into()),
+                xolotl_types::Value::string("q".into()),
                 xolotl_types::OutputMode::Unary,
                 &ctx,
             )
             .await
             .context("remote driver call failed")?;
         ensure!(
-            out == xolotl_types::Outcome::Done(xolotl_types::Value::Str("remote".into())),
+            out.outcome
+                == xolotl_types::Outcome::Done(xolotl_types::Value::string("remote".into())),
             "unexpected remote outcome: {out:?}"
         );
         let seen = seen.lock();
@@ -791,10 +834,99 @@ mod tests {
             seen.len()
         );
         let invoke = seen.first().context("missing remote invoke")?;
-        ensure!(invoke.invocation_id == "1/4/0", "invocation id mismatch");
+        ensure!(
+            invoke.invocation_id == "1/1/5/4/0",
+            "invocation id mismatch"
+        );
         ensure!(
             invoke.effect_path.to_string() == "effect://external-provider/acme/search",
             "remote effect path mismatch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn open_freezes_cleanup_ownership_in_cached_and_delegated_plans() -> anyhow::Result<()> {
+        let reg = Registry::new();
+        let resource = setup_state_subtree_resource(&reg)?;
+        let owner = ProcessId::new(7);
+        let other = ProcessId::new(9);
+        let rights = Rights::new(MethodBitmap::method(0), RightFlags::DELEGATE);
+        for holder in [owner, other] {
+            reg.register_grant(Grant {
+                id: reg.next_grant_id(),
+                holder,
+                selector: ResourceSelector::parse("read://state/**")?,
+                rights,
+                constraints: ConstraintSet::empty(),
+                expires: Expiry::Never,
+            });
+        }
+        let requested_path = Path::parse("state://process/7/result")?;
+        let request = |process| OpenRequest {
+            process,
+            resource,
+            verb: "read".into(),
+            rights,
+            acting: IdentityRef::ROOT,
+            requested_path: Some(requested_path.clone()),
+            now_millis: 1,
+        };
+        let mut handles = HandleTable::new();
+        let first = open_resource(&reg, &mut handles, request(owner))?;
+        let cached = open_resource(&reg, &mut handles, request(owner))?;
+        ensure!(reg.open_cache_stats() == (1, 1, 1));
+        let foreign = open_resource(&reg, &mut handles, request(other))?;
+        let delegated = derive_handle(
+            &mut handles,
+            first,
+            rights,
+            xolotl_types::DeriveKind::Delegate,
+            other,
+        )?;
+        for handle in [first, cached, foreign, delegated] {
+            let opened = handles.get(handle).context("missing opened handle")?;
+            let contract = opened
+                .driver_plan
+                .contract(xolotl_types::MethodId::new(0))
+                .context("missing contract")?;
+            ensure!(!contract.finalize_allowed && contract.cleanup_owner == Some(owner));
+            ensure!(contract.permits_cleanup(owner));
+            ensure!(!contract.permits_cleanup(other));
+            ensure!(contract.permits_cleanup(opened.process) == (opened.process == owner));
+        }
+        ensure!(handles.release(first));
+        let derived = handles
+            .get(delegated)
+            .context("derived handle lost released parent")?;
+        ensure!(
+            !derived
+                .driver_plan
+                .contract(xolotl_types::MethodId::new(0))
+                .context("missing derived contract")?
+                .permits_cleanup(other)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn only_local_numeric_process_state_compiles_implicit_cleanup_ownership() -> anyhow::Result<()>
+    {
+        for path in [
+            "state://",
+            "state://process",
+            "state://process/self/result",
+            "state://process/not-an-id/result",
+            "state://process/18446744073709551616/result",
+            "state://other/7/result",
+            "effect://process/7/result",
+            "path://remote/state/process/7/result",
+        ] {
+            ensure!(state_cleanup_owner(&Path::parse(path)?).is_none(), "{path}");
+        }
+        ensure!(
+            state_cleanup_owner(&Path::parse("state://process/18446744073709551615/result")?)
+                == Some(ProcessId::new(u64::MAX))
         );
         Ok(())
     }

@@ -6,8 +6,12 @@
 //! literals.
 
 use crate::r#do::{DoNode, bind_process_self_capability_literal};
+use alloc::{
+    collections::BTreeSet,
+    string::{String, ToString},
+    vec::Vec,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use xolotl_types::{BudgetSpec, Capability, PathError, Value};
 
 /// Declaration for a named long-lived `Do<()>` body.
@@ -75,11 +79,11 @@ impl ActorSpec {
         &self,
         process: xolotl_types::ProcessId,
     ) -> Result<Self, ActorBindError> {
-        let body = self.body.bind_process_local_refs(process)?;
+        let body = self.body.clone().bind_process_local_refs(process)?;
         let finalizers = self
             .finalizers
             .iter()
-            .map(|finalizer| finalizer.bind_process_local_refs(process))
+            .map(|finalizer| finalizer.clone().bind_process_local_refs(process))
             .collect::<Result<Vec<_>, _>>()?;
         let declared_capabilities = self
             .declared_capabilities
@@ -116,7 +120,7 @@ impl Default for ActorSpec {
 }
 
 fn default_body() -> DoNode {
-    DoNode::pure(Value::Null)
+    DoNode::pure(Value::null())
 }
 
 /// Error returned by capability coverage queries on an [`ActorSpec`].
@@ -235,7 +239,7 @@ fn lint_program(
     findings: &mut Vec<LintFinding>,
     finalizer_index: Option<usize>,
 ) {
-    let mut seen = HashSet::new();
+    let mut seen = BTreeSet::new();
     for op in program.ops() {
         let target_path = op.target.path();
         let target = target_path.to_string();
@@ -296,11 +300,12 @@ fn capability_target(target: &str) -> String {
 mod tests {
     use super::*;
     use crate::graph::{OperationTemplate, StepRef, WaitSpec};
+    use alloc::boxed::Box;
     use anyhow::{Context, anyhow, bail, ensure};
     use xolotl_types::{OutputMode, Path, ProcessId, ResourceName, Value};
 
     fn s(name: &str) -> StepRef {
-        StepRef::new(ProcessId::new(1), name)
+        StepRef::new(name)
     }
 
     fn op(path: &str) -> anyhow::Result<OperationTemplate> {
@@ -400,7 +405,7 @@ mod tests {
     #[test]
     fn malformed_declared_capability_is_flagged() -> anyhow::Result<()> {
         let spec = ActorSpec::with_capabilities("a", ["effect://x/post"]);
-        let findings = lint(&spec, &DoNode::pure(Value::Null));
+        let findings = lint(&spec, &DoNode::pure(Value::null()));
 
         ensure!(findings.len() == 1, "unexpected findings: {findings:?}");
         let finding = findings.first().context("missing finding")?;
@@ -457,7 +462,7 @@ mod tests {
     #[test]
     fn pure_program_with_no_ops_is_clean() -> anyhow::Result<()> {
         let spec = ActorSpec::default();
-        let program = DoNode::pure(Value::Int(1)).and_then(s("noop"));
+        let program = DoNode::pure(Value::integer(1)).and_then(s("noop"));
         let findings = lint(&spec, &program);
         ensure!(findings.is_empty(), "unexpected findings: {findings:?}");
         Ok(())
@@ -467,7 +472,7 @@ mod tests {
     fn spec_serde_roundtrip() -> anyhow::Result<()> {
         let spec = ActorSpec {
             name: "n".into(),
-            body: DoNode::pure(Value::Null),
+            body: DoNode::pure(Value::null()),
             declared_capabilities: vec!["perform://effect/fs/**".into()],
             budget: BudgetSpec::default(),
             finalizers: Vec::new(),
@@ -508,7 +513,7 @@ mod tests {
     #[test]
     fn malformed_declared_capability_is_reported_once_for_actor() -> anyhow::Result<()> {
         let mut spec = ActorSpec::with_capabilities("a", ["effect://x/post"]);
-        spec.finalizers.push(DoNode::pure(Value::Null));
+        spec.finalizers.push(DoNode::pure(Value::null()));
         let findings = lint_actor(&spec);
         ensure!(findings.len() == 1, "unexpected findings: {findings:?}");
         Ok(())

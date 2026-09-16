@@ -9,13 +9,12 @@
 use crate::auth::{self, ConsolePrincipal};
 use crate::state::ConsoleState;
 use serde::de::DeserializeOwned;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
-use xolotl_types::{
-    AuditRules, Capability, KernelConfigAdmission, Path, Value,
-    admit_kernel_config as admit_shared_kernel_config,
-};
+use xolotl_types::{AuditRules, Capability, Path, Value, ValueMap, ValueView};
+
+mod config;
+use config::{KernelConfigAdmission, admit_kernel_config as admit_declared_config};
 
 /// Errors raised by console management state helpers.
 #[derive(Debug, Error)]
@@ -99,15 +98,20 @@ pub(crate) async fn inspect_prefix(
     let p = Path::parse(prefix)?;
     ensure_manageable(&p)?;
     auth::authorize_path(&state.state, principal, "read", &p, None).await?;
-    let entries = state
-        .state
-        .read_prefix(&p)
+    let mut pages = state.state.pages(xolotl_state::StateScan::new(p));
+    let mut entries = Vec::new();
+    while let Some(page) = pages
+        .next()
         .await
-        .map_err(|error| MgmtError::Operation(error.to_string()))?;
-    Ok(entries
-        .into_iter()
-        .map(|(path, value)| (path.to_string(), value))
-        .collect())
+        .map_err(|error| MgmtError::Operation(error.to_string()))?
+    {
+        entries.extend(
+            page.entries
+                .into_iter()
+                .map(|(path, value)| (path.to_string(), value.value)),
+        );
+    }
+    Ok(entries)
 }
 
 /// List config values through the generic config action family.
@@ -192,7 +196,10 @@ async fn write_config_inner(
 
     match state.state.write_cas(&p, current, value).await {
         Ok(_) => {}
-        Err(xolotl_state::StateError::CasFailed { .. }) => {
+        Err(xolotl_state::StateFailure {
+            error: xolotl_state::StateError::CasFailed { .. },
+            ..
+        }) => {
             return Err(MgmtError::Conflict {
                 expected: expected_version,
             });
@@ -270,10 +277,12 @@ fn value_version(v: &Value) -> Result<Option<u64>, MgmtError> {
 }
 
 fn set_version(v: &mut Value, version: u64) -> Result<(), MgmtError> {
-    if let Value::Map(m) = v {
+    if let Some(mut m) = v.as_map().cloned() {
         let version = i64::try_from(version)
             .map_err(|_error| MgmtError::Admission("config version exceeds i64".into()))?;
-        m.insert("version".into(), Value::Int(version));
+        m.insert("version".into(), Value::integer(version))
+            .map_err(|error| MgmtError::Admission(error.to_string()))?;
+        *v = Value::from(m);
     }
     Ok(())
 }
@@ -291,7 +300,7 @@ async fn admit_kernel_config(
         return Err(MgmtError::NotManageable(path.to_string()));
     }
 
-    match admit_shared_kernel_config(path, value) {
+    match admit_declared_config(path, value) {
         Ok(KernelConfigAdmission::Admitted) => return Ok(()),
         Ok(KernelConfigAdmission::Unhandled) => {}
         Err(error) => return Err(MgmtError::Admission(error.to_string())),
@@ -344,10 +353,7 @@ fn required_tail<'a, S: AsRef<str>>(segs: &'a [S], label: &str) -> Result<&'a st
         .ok_or_else(|| MgmtError::Admission(format!("missing {label}")))
 }
 
-fn require_map_ref<'a>(
-    value: &'a Value,
-    label: &str,
-) -> Result<&'a BTreeMap<String, Value>, MgmtError> {
+fn require_map_ref<'a>(value: &'a Value, label: &str) -> Result<&'a ValueMap, MgmtError> {
     value
         .as_map()
         .ok_or_else(|| MgmtError::Admission(format!("{label} must be an object")))
@@ -431,13 +437,9 @@ fn admit_console_role(value: &Value) -> Result<(), MgmtError> {
     Ok(())
 }
 
-fn validate_known_fields(
-    map: &BTreeMap<String, Value>,
-    allowed: &[&str],
-    label: &str,
-) -> Result<(), MgmtError> {
+fn validate_known_fields(map: &ValueMap, allowed: &[&str], label: &str) -> Result<(), MgmtError> {
     for key in map.keys() {
-        if !allowed.iter().any(|allowed_key| allowed_key == key) {
+        if !allowed.contains(&key) {
             return Err(MgmtError::Admission(format!(
                 "{label} has unknown field '{key}'"
             )));
@@ -447,12 +449,12 @@ fn validate_known_fields(
 }
 
 fn optional_string<'a>(
-    map: &'a BTreeMap<String, Value>,
+    map: &'a ValueMap,
     name: &str,
     label: &str,
 ) -> Result<Option<&'a str>, MgmtError> {
-    match map.get(name) {
-        Some(Value::Str(value)) => Ok(Some(value)),
+    match map.get(name).map(Value::view) {
+        Some(ValueView::Str(value)) => Ok(Some(value)),
         Some(_) => Err(MgmtError::Admission(format!(
             "{label}.{name} must be a string"
         ))),
@@ -460,23 +462,15 @@ fn optional_string<'a>(
     }
 }
 
-fn required_value<'a>(
-    map: &'a BTreeMap<String, Value>,
-    name: &str,
-    label: &str,
-) -> Result<&'a Value, MgmtError> {
+fn required_value<'a>(map: &'a ValueMap, name: &str, label: &str) -> Result<&'a Value, MgmtError> {
     map.get(name)
         .ok_or_else(|| MgmtError::Admission(format!("{label}.{name} is required")))
 }
 
-fn required_string<'a>(
-    map: &'a BTreeMap<String, Value>,
-    name: &str,
-    label: &str,
-) -> Result<&'a str, MgmtError> {
-    match map.get(name) {
-        Some(Value::Str(value)) if !value.is_empty() => Ok(value),
-        Some(Value::Str(_)) => Err(MgmtError::Admission(format!(
+fn required_string<'a>(map: &'a ValueMap, name: &str, label: &str) -> Result<&'a str, MgmtError> {
+    match map.get(name).map(Value::view) {
+        Some(ValueView::Str(value)) if !value.is_empty() => Ok(value),
+        Some(ValueView::Str(_)) => Err(MgmtError::Admission(format!(
             "{label}.{name} must not be empty"
         ))),
         Some(_) => Err(MgmtError::Admission(format!(
@@ -486,13 +480,9 @@ fn required_string<'a>(
     }
 }
 
-fn required_map<'a>(
-    map: &'a BTreeMap<String, Value>,
-    name: &str,
-    label: &str,
-) -> Result<&'a BTreeMap<String, Value>, MgmtError> {
-    match map.get(name) {
-        Some(Value::Map(value)) => Ok(value),
+fn required_map<'a>(map: &'a ValueMap, name: &str, label: &str) -> Result<&'a ValueMap, MgmtError> {
+    match map.get(name).map(Value::view) {
+        Some(ValueView::Map(value)) => Ok(value),
         Some(_) => Err(MgmtError::Admission(format!(
             "{label}.{name} must be an object"
         ))),
@@ -500,13 +490,9 @@ fn required_map<'a>(
     }
 }
 
-fn optional_bool(
-    map: &BTreeMap<String, Value>,
-    name: &str,
-    label: &str,
-) -> Result<Option<bool>, MgmtError> {
-    match map.get(name) {
-        Some(Value::Bool(value)) => Ok(Some(*value)),
+fn optional_bool(map: &ValueMap, name: &str, label: &str) -> Result<Option<bool>, MgmtError> {
+    match map.get(name).map(Value::view) {
+        Some(ValueView::Bool(value)) => Ok(Some(value)),
         Some(_) => Err(MgmtError::Admission(format!(
             "{label}.{name} must be a bool"
         ))),
@@ -515,13 +501,13 @@ fn optional_bool(
 }
 
 fn optional_nonnegative_int(
-    map: &BTreeMap<String, Value>,
+    map: &ValueMap,
     name: &str,
     label: &str,
 ) -> Result<Option<i64>, MgmtError> {
-    match map.get(name) {
-        Some(Value::Int(value)) if *value >= 0 => Ok(Some(*value)),
-        Some(Value::Int(_)) => Err(MgmtError::Admission(format!(
+    match map.get(name).map(Value::view) {
+        Some(ValueView::Int(value)) if value >= 0 => Ok(Some(value)),
+        Some(ValueView::Int(_)) => Err(MgmtError::Admission(format!(
             "{label}.{name} must be non-negative"
         ))),
         Some(_) => Err(MgmtError::Admission(format!(
@@ -531,14 +517,10 @@ fn optional_nonnegative_int(
     }
 }
 
-fn required_nonnegative_int(
-    map: &BTreeMap<String, Value>,
-    name: &str,
-    label: &str,
-) -> Result<i64, MgmtError> {
-    match map.get(name) {
-        Some(Value::Int(value)) if *value >= 0 => Ok(*value),
-        Some(Value::Int(_)) => Err(MgmtError::Admission(format!(
+fn required_nonnegative_int(map: &ValueMap, name: &str, label: &str) -> Result<i64, MgmtError> {
+    match map.get(name).map(Value::view) {
+        Some(ValueView::Int(value)) if value >= 0 => Ok(value),
+        Some(ValueView::Int(_)) => Err(MgmtError::Admission(format!(
             "{label}.{name} must be non-negative"
         ))),
         Some(_) => Err(MgmtError::Admission(format!(
@@ -549,15 +531,15 @@ fn required_nonnegative_int(
 }
 
 fn optional_string_list<'a>(
-    map: &'a BTreeMap<String, Value>,
+    map: &'a ValueMap,
     name: &str,
     label: &str,
 ) -> Result<Vec<&'a str>, MgmtError> {
-    match map.get(name) {
-        Some(Value::List(items)) => {
+    match map.get(name).map(Value::view) {
+        Some(ValueView::List(items)) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                let Value::Str(value) = item else {
+                let Some(value) = item.as_str() else {
                     return Err(MgmtError::Admission(format!(
                         "{label}.{name} must be a list of strings"
                     )));
@@ -567,7 +549,7 @@ fn optional_string_list<'a>(
                         "{label}.{name} entries must be non-empty"
                     )));
                 }
-                out.push(value.as_str());
+                out.push(value);
             }
             Ok(out)
         }
@@ -579,7 +561,7 @@ fn optional_string_list<'a>(
 }
 
 fn required_string_list<'a>(
-    map: &'a BTreeMap<String, Value>,
+    map: &'a ValueMap,
     name: &str,
     label: &str,
 ) -> Result<Vec<&'a str>, MgmtError> {
@@ -589,11 +571,7 @@ fn required_string_list<'a>(
     optional_string_list(map, name, label)
 }
 
-fn validate_capability_list(
-    map: &BTreeMap<String, Value>,
-    name: &str,
-    label: &str,
-) -> Result<(), MgmtError> {
+fn validate_capability_list(map: &ValueMap, name: &str, label: &str) -> Result<(), MgmtError> {
     for capability in optional_string_list(map, name, label)? {
         Capability::parse(capability)
             .map_err(|e| MgmtError::Admission(format!("{label}.{name}: {e}")))?;
@@ -602,7 +580,7 @@ fn validate_capability_list(
 }
 
 fn validate_required_capability_list(
-    map: &BTreeMap<String, Value>,
+    map: &ValueMap,
     name: &str,
     label: &str,
 ) -> Result<(), MgmtError> {
@@ -642,11 +620,11 @@ mod tests {
 
     fn obj(version: Option<u64>) -> Value {
         let mut m = BTreeMap::new();
-        m.insert("transport".into(), Value::Str("stdio".into()));
+        m.insert("transport".into(), Value::string("stdio".into()));
         if let Some(v) = version {
-            m.insert("version".into(), Value::Int(v as i64));
+            m.insert("version".into(), Value::integer(v as i64));
         }
-        Value::Map(m)
+        Value::map(m)
     }
 
     fn complete_console_user(username: &str) -> anyhow::Result<Value> {
@@ -657,28 +635,28 @@ mod tests {
             .and_then(|path| path.try_push("password"))
             .map(|path| path.to_string())?;
         let mut password = BTreeMap::new();
-        password.insert("hash_ref".into(), Value::Str(password_ref));
+        password.insert("hash_ref".into(), Value::string(password_ref));
         let mut totp = BTreeMap::new();
-        totp.insert("enabled".into(), Value::Bool(false));
+        totp.insert("enabled".into(), Value::boolean(false));
         let mut authn = BTreeMap::new();
-        authn.insert("password".into(), Value::Map(password));
-        authn.insert("totp".into(), Value::Map(totp));
-        authn.insert("pubkeys".into(), Value::List(Vec::new()));
+        authn.insert("password".into(), Value::map(password));
+        authn.insert("totp".into(), Value::map(totp));
+        authn.insert("pubkeys".into(), Value::list(Vec::new()));
 
         let mut user = BTreeMap::new();
         user.insert(
             "identity_path".into(),
-            Value::Str(format!("identity://console/{username}")),
+            Value::string(format!("identity://console/{username}")),
         );
-        user.insert("status".into(), Value::Str("active".into()));
-        user.insert("authn".into(), Value::Map(authn));
-        user.insert("roles".into(), Value::List(Vec::new()));
-        user.insert("grants".into(), Value::List(Vec::new()));
-        user.insert("authority_ceiling".into(), Value::List(Vec::new()));
-        user.insert("created_by".into(), Value::Str("test".into()));
-        user.insert("created_at".into(), Value::Int(1));
-        user.insert("password_changed_at".into(), Value::Int(1));
-        Ok(Value::Map(user))
+        user.insert("status".into(), Value::string("active".into()));
+        user.insert("authn".into(), Value::map(authn));
+        user.insert("roles".into(), Value::list(Vec::new()));
+        user.insert("grants".into(), Value::list(Vec::new()));
+        user.insert("authority_ceiling".into(), Value::list(Vec::new()));
+        user.insert("created_by".into(), Value::string("test".into()));
+        user.insert("created_at".into(), Value::integer(1));
+        user.insert("password_changed_at".into(), Value::integer(1));
+        Ok(Value::map(user))
     }
 
     fn extension_installation(id: &str, version: u64) -> anyhow::Result<Value> {
@@ -694,8 +672,8 @@ mod tests {
                 args: vec![],
             },
             trust: TrustLevel::Sandboxed,
-            config_schema: Value::Null,
-            config: Value::Null,
+            config_schema: Value::null(),
+            config: Value::null(),
             projections: vec![ExternalProjectionDef {
                 id: "provider".into(),
                 role: Role::Provider,
@@ -724,6 +702,8 @@ mod tests {
             default_headers: BTreeMap::new(),
             request_overrides: BTreeMap::new(),
             api_version: None,
+            io_window_bytes: None,
+            response_limits: Default::default(),
             version: 0,
         })
     }
@@ -738,7 +718,7 @@ mod tests {
                 Purity::Idempotent,
             )],
             emits: None,
-            config: Value::Null,
+            config: Value::null(),
             version,
         })
     }
@@ -749,8 +729,8 @@ mod tests {
             platform: "instant_messaging_platform".into(),
             transport: Transport::Grpc { endpoint: None },
             trust: TrustLevel::Sandboxed,
-            config_schema: Value::Null,
-            config: Value::Null,
+            config_schema: Value::null(),
+            config: Value::null(),
             projections: vec![
                 xolotl_types::ExternalProjectionDef {
                     id: "source".into(),
@@ -874,9 +854,9 @@ mod tests {
     #[test]
     fn console_user_admission_rejects_unknown_fields() -> anyhow::Result<()> {
         let mut user = BTreeMap::new();
-        user.insert("unknown".into(), Value::Bool(true));
+        user.insert("unknown".into(), Value::boolean(true));
 
-        let err = match admit_console_user("ops", &Value::Map(user)) {
+        let err = match admit_console_user("ops", &Value::map(user)) {
             Ok(()) => bail!("console user with unknown field was admitted"),
             Err(err) => err,
         };
@@ -892,11 +872,11 @@ mod tests {
         let complete = complete_console_user("ops")?;
         admit_console_user("ops", &complete).context("complete console user was rejected")?;
 
-        let mut missing_status = complete_console_user("ops")?;
-        let Value::Map(map) = &mut missing_status else {
-            bail!("console user fixture must be a map");
-        };
+        let mut map = (complete_console_user("ops")?)
+            .into_map()
+            .context("expected map")?;
         map.remove("status");
+        let missing_status = Value::from(map);
         let err = match admit_console_user("ops", &missing_status) {
             Ok(()) => bail!("console user missing status was admitted"),
             Err(err) => err,
@@ -906,11 +886,11 @@ mod tests {
             "unexpected missing status admission error: {err:?}"
         );
 
-        let mut missing_authn = complete_console_user("ops")?;
-        let Value::Map(map) = &mut missing_authn else {
-            bail!("console user fixture must be a map");
-        };
+        let mut map = (complete_console_user("ops")?)
+            .into_map()
+            .context("expected map")?;
         map.remove("authn");
+        let missing_authn = Value::from(map);
         let err = match admit_console_user("ops", &missing_authn) {
             Ok(()) => bail!("console user missing authn was admitted"),
             Err(err) => err,
@@ -920,37 +900,37 @@ mod tests {
             "unexpected missing authn admission error: {err:?}"
         );
 
-        let mut wildcard_identity = complete_console_user("ops")?;
-        let Value::Map(map) = &mut wildcard_identity else {
-            bail!("console user fixture must be a map");
-        };
+        let mut map = (complete_console_user("ops")?)
+            .into_map()
+            .context("expected map")?;
         map.insert(
             "identity_path".into(),
-            Value::Str("identity://console/**".into()),
-        );
+            Value::string("identity://console/**".into()),
+        )?;
+        let wildcard_identity = Value::from(map);
         ensure!(
             admit_console_user("ops", &wildcard_identity).is_err(),
             "wildcard console identity path was admitted"
         );
 
-        let mut clustered_identity = complete_console_user("ops")?;
-        let Value::Map(map) = &mut clustered_identity else {
-            bail!("console user fixture must be a map");
-        };
+        let mut map = (complete_console_user("ops")?)
+            .into_map()
+            .context("expected map")?;
         map.insert(
             "identity_path".into(),
-            Value::Str("path://remote/identity/console/ops".into()),
-        );
+            Value::string("path://remote/identity/console/ops".into()),
+        )?;
+        let clustered_identity = Value::from(map);
         ensure!(
             admit_console_user("ops", &clustered_identity).is_err(),
             "clustered console identity path was admitted"
         );
 
-        let mut locked = complete_console_user("ops")?;
-        let Value::Map(map) = &mut locked else {
-            bail!("console user fixture must be a map");
-        };
-        map.insert("status".into(), Value::Str("locked".into()));
+        let mut map = (complete_console_user("ops")?)
+            .into_map()
+            .context("expected map")?;
+        map.insert("status".into(), Value::string("locked".into()))?;
+        let locked = Value::from(map);
         admit_console_user("ops", &locked).context("locked console user status was rejected")?;
         Ok(())
     }
@@ -960,10 +940,10 @@ mod tests {
         let mut role = BTreeMap::new();
         role.insert(
             "grants".into(),
-            Value::List(vec![Value::Str("not-a-capability".into())]),
+            Value::list(vec![Value::string("not-a-capability".into())]),
         );
 
-        let err = match admit_console_role(&Value::Map(role)) {
+        let err = match admit_console_role(&Value::map(role)) {
             Ok(()) => bail!("console role with malformed grant was admitted"),
             Err(err) => err,
         };
@@ -1110,11 +1090,11 @@ mod tests {
         let st = console_state()?;
         let root = root_principal(&st).await?;
         let path = Path::parse("state://kernel/external-installations/acme")?;
-        let mut existing = extension_installation("acme", 0)?;
-        let Value::Map(ref mut map) = existing else {
-            bail!("expected object");
-        };
-        map.insert("version".into(), Value::Int(-1));
+        let mut map = (extension_installation("acme", 0)?)
+            .into_map()
+            .context("expected map")?;
+        map.insert("version".into(), Value::integer(-1))?;
+        let existing = Value::from(map);
         st.state.write_cas(&path, None, existing).await?;
         let path = path.to_string();
 
@@ -1154,27 +1134,28 @@ mod tests {
             "multi-projection install did not advance version"
         );
 
-        let mut bad = instant_messaging_platform_installation(0)?;
-        let Value::Map(ref mut m) = bad else {
-            bail!("expected object");
-        };
-        let Value::List(projections) = m.get_mut("projections").context("expected projections")?
-        else {
-            bail!("expected projections");
-        };
-        let Value::Map(provider) = projections
-            .get_mut(1)
-            .context("expected provider projection")?
-        else {
-            bail!("expected provider projection");
-        };
+        let mut map = instant_messaging_platform_installation(0)?
+            .into_map()
+            .context("installation map")?;
+        let mut projections = map
+            .remove("projections")
+            .and_then(Value::into_list)
+            .context("projections")?;
+        let mut provider = projections
+            .get(1)
+            .and_then(Value::as_map)
+            .cloned()
+            .context("provider projection")?;
         provider.insert(
             "provides".into(),
-            Value::List(vec![serde_json::from_value(serde_json::json!({
+            Value::list(vec![serde_json::from_value(serde_json::json!({
                 "effect_path": "effect://external-provider/other/send_text",
                 "purity": "effectful"
             }))?]),
-        );
+        )?;
+        projections.set(1, Value::from(provider))?;
+        map.insert("projections".into(), Value::from(projections))?;
+        let bad = Value::from(map);
         expect_admission(write_dedicated_config(&st, &root, path, bad, Some(1)).await)?;
         Ok(())
     }
@@ -1204,17 +1185,17 @@ mod tests {
             .await,
         )?;
 
-        let mut bad = inference_backend("bad")?;
-        let Value::Map(ref mut map) = bad else {
-            bail!("expected backend object");
-        };
+        let mut map = inference_backend("bad")?
+            .into_map()
+            .context("backend map")?;
         map.insert(
             "auth".into(),
             serde_json::from_value(serde_json::json!({
                 "kind": "bearer_token",
                 "token_ref": "state://kernel/inference/bad/api_key"
             }))?,
-        );
+        )?;
+        let bad = Value::from(map);
         expect_admission(
             write_dedicated_config(
                 &st,

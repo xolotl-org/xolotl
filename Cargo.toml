@@ -1,11 +1,16 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
+    "benchmarks/runtime",
+    "crates/xolotl-core",
     "crates/xolotl-types",
+    "crates/xolotl-value-codec",
+    "crates/xolotl-value-object",
     "crates/xolotl-graph",
     "crates/xolotl-state",
     "crates/xolotl-kernel",
     "crates/xolotl-storage-redb",
+    "crates/xolotl-storage-fs",
     "crates/xolotl-plan",
     "crates/xolotl-standard",
     "crates/xolotl-gateway",
@@ -23,7 +28,7 @@ members = [
 [workspace.package]
 version      = "0.1.0"
 edition      = "2024"
-rust-version = "1.95"
+rust-version = "1.98.1"
 license      = "MIT"
 authors      = ["noctiro"]
 repository   = "https://github.com/xolotl-org/xolotl"
@@ -67,6 +72,7 @@ unwrap_in_result = "deny"
 unwrap_used = "deny"
 
 [workspace.dependencies]
+xolotl-core = { version = "0.1.0", path = "crates/xolotl-core" }
 xolotl-standard = { version = "0.1.0", path = "crates/xolotl-standard", default-features = false }
 xolotl-console = { version = "0.1.0", path = "crates/xolotl-console" }
 xolotl-console-protocol = { version = "0.1.0", path = "crates/xolotl-console-protocol" }
@@ -79,50 +85,60 @@ xolotl-kernel = { version = "0.1.0", path = "crates/xolotl-kernel" }
 xolotl-plan = { version = "0.1.0", path = "crates/xolotl-plan" }
 xolotl-proto = { version = "0.1.0", path = "crates/xolotl-proto" }
 xolotl-sdk = { version = "0.1.0", path = "crates/xolotl-sdk" }
-xolotl-state = { version = "0.1.0", path = "crates/xolotl-state" }
+xolotl-state = { version = "0.1.0", path = "crates/xolotl-state", default-features = false }
 xolotl-storage-redb = { version = "0.1.0", path = "crates/xolotl-storage-redb" }
+xolotl-storage-fs = { version = "0.1.0", path = "crates/xolotl-storage-fs" }
 xolotl-types = { version = "0.1.0", path = "crates/xolotl-types" }
+xolotl-value-codec = { version = "0.1.0", path = "crates/xolotl-value-codec", default-features = false }
+xolotl-value-object = { version = "0.1.0", path = "crates/xolotl-value-object", default-features = false }
 
-anyhow = { version = "1.0.102", default-features = false }
-argon2 = { version = "0.5.3", default-features = false }
-async-trait = { version = "0.1.89", default-features = false }
+anyhow = { version = "1.0.104", default-features = false }
+argon2 = { version = "0.6.0", default-features = false }
+async-trait = { version = "0.1.92", default-features = false }
 axum = { version = "0.8.9", default-features = false }
-base64 = { version = "0.22.1", default-features = false }
-bitflags = { version = "2.13.0", default-features = false }
-blake3 = { version = "1.8.5", default-features = false }
-chacha20poly1305 = { version = "0.10.1", default-features = false }
+base64 = { version = "0.23.1", default-features = false }
+bitflags = { version = "2.13.2", default-features = false }
+blake3 = { version = "1.8.7", default-features = false }
+bytes = { version = "1.12.1", default-features = false }
+chacha20poly1305 = { version = "0.11.0", default-features = false }
+cipher = { version = "0.5.2", default-features = false }
+ciborium-ll = { version = "0.2.2", default-features = false }
 criterion = { version = "0.8.2", default-features = false }
-dashmap = { version = "6.2.1", default-features = false }
+dhat = { version = "0.3.3", default-features = false }
 dotenvy = { version = "0.15.7", default-features = false }
-ed25519-dalek = { version = "2.2.0", default-features = false }
-futures-util = { version = "0.3.32", default-features = false }
-getrandom = { version = "0.4.2", default-features = false }
-glob = { version = "0.3.3", default-features = false }
+ed25519-dalek = { version = "3.0.0", default-features = false }
+futures-util = { version = "0.3.34", default-features = false }
+getrandom = { version = "0.4.3", default-features = false }
+glob = { version = "0.3.4", default-features = false }
+h2 = { version = "0.4.19", default-features = false }
+half = { version = "2.7.1", default-features = false }
 hkdf = { version = "0.13.0", default-features = false }
 hmac = { version = "0.13.0", default-features = false }
+http-body = { version = "1.1.0", default-features = false }
 parking_lot = { version = "0.12.5", default-features = false }
 prost = { version = "0.14.4", default-features = false }
-redb = { version = "4.1.0", default-features = false }
-reqwest = { version = "0.13.4", default-features = false }
-serde = { version = "1.0.228", default-features = false }
-serde_json = { version = "1.0.150", default-features = false }
+redb = { version = "4.3.0", default-features = false }
+reqwest = { version = "0.13.5", default-features = false }
+serde = { version = "1.0.229", default-features = false }
+serde_json = { version = "1.0.151", default-features = false }
 sha1 = { version = "0.11.0", default-features = false }
 sha2 = { version = "0.11.0", default-features = false }
 smol_str = { version = "0.3.6", default-features = false }
-stduritemplate = { package = "std-uritemplate", version = "2.0.10", default-features = false }
+stduritemplate = { package = "std-uritemplate", version = "2.0.12", default-features = false }
 subtle = { version = "2.6.1", default-features = false }
 tempfile = { version = "3.27.0", default-features = false }
-thiserror = { version = "2.0.18", default-features = false }
-tokio = { version = "1.52.3", default-features = false }
-toml = { version = "1.1.2", default-features = false }
+thiserror = { version = "2.0.20", default-features = false }
+tokio = { version = "1.53.1", default-features = false }
+tokio-stream = { version = "0.1.19", default-features = false }
+toml = { version = "1.1.6", default-features = false }
 tonic = { version = "0.14.6", default-features = false }
 tonic-prost = { version = "0.14.6", default-features = false }
-tower-http = { version = "0.6.11", default-features = false }
+tower-http = { version = "0.7.1", default-features = false }
 tracing = { version = "0.1.44", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false }
 url = { version = "2.5.8", default-features = false }
 webauthn-rs = { version = "0.5.5", default-features = false, features = ["danger-allow-state-serialisation"] }
-yaml_serde = { version = "0.10.4", default-features = false }
+yaml_serde = { version = "0.10.7", default-features = false }
 
 [profile.release]
 opt-level     = 3

@@ -21,7 +21,9 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use xolotl_kernel::{Bootstrap, Driver, DriverContext, DriverError, DynDriver, FactSink};
+use xolotl_kernel::{
+    Bootstrap, Driver, DriverContext, DriverError, DriverOutput, DynDriver, FactSink,
+};
 use xolotl_types::{MethodId, Outcome, OutputMode, ProcessId, Value};
 
 /// A driver whose responses are queued in advance. Each call dequeues the next
@@ -68,13 +70,11 @@ impl Driver for ScriptedDriver {
         input: Value,
         _output: OutputMode,
         _ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
+    ) -> Result<DriverOutput, DriverError> {
         self.calls.lock().push(input);
-        Ok(self
-            .queue
-            .lock()
-            .pop_front()
-            .unwrap_or(Outcome::Fail(xolotl_types::Failure::Cancelled)))
+        Ok(DriverOutput::new(self.queue.lock().pop_front().unwrap_or(
+            Outcome::Fail(xolotl_types::Failure::Cancelled),
+        )))
     }
 }
 
@@ -92,20 +92,22 @@ impl Driver for FixedClock {
         input: Value,
         _output: OutputMode,
         _ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
+    ) -> Result<DriverOutput, DriverError> {
         match method.get() {
-            0 => Ok(Outcome::Done(Value::Int(self.t_millis))),
+            0 => Ok(DriverOutput::new(Outcome::Done(Value::integer(
+                self.t_millis,
+            )))),
             1 => {
                 sim_sleep_millis(input)?;
-                Ok(Outcome::Done(Value::Null))
+                Ok(DriverOutput::new(Outcome::Done(Value::null())))
             }
             2 => {
-                let Value::Map(map) = input else {
+                let Some(map) = input.as_map() else {
                     return Err(DriverError::InvalidInput(
                         "time.cron requires object input".into(),
                     ));
                 };
-                let interval_ms = sim_cron_interval_ms(&map)?.ok_or_else(|| {
+                let interval_ms = sim_cron_interval_ms(map)?.ok_or_else(|| {
                     DriverError::InvalidInput(
                         "cron requires `interval_ms` or `every`/`unit`".into(),
                     )
@@ -113,10 +115,10 @@ impl Driver for FixedClock {
                 let mut out = BTreeMap::new();
                 out.insert(
                     "next_millis".into(),
-                    Value::Int(self.t_millis.saturating_add(interval_ms)),
+                    Value::integer(self.t_millis.saturating_add(interval_ms)),
                 );
-                out.insert("interval_ms".into(), Value::Int(interval_ms));
-                Ok(Outcome::Done(Value::Map(out)))
+                out.insert("interval_ms".into(), Value::integer(interval_ms));
+                Ok(DriverOutput::new(Outcome::Done(Value::map(out))))
             }
             _ => Err(DriverError::NoSuchMethod(method)),
         }
@@ -153,9 +155,15 @@ impl SimClock {
     /// Advance virtual time by `delta_millis` (saturating at `i64::MAX`).
     /// Returns the new `now`.
     pub fn advance(&self, delta_millis: i64) -> i64 {
-        // `fetch_add` returns the previous value; report the post-add time.
-        let prev = self.millis.fetch_add(delta_millis.max(0), Ordering::SeqCst);
-        prev.saturating_add(delta_millis.max(0))
+        let delta = delta_millis.max(0);
+        match self
+            .millis
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |time| {
+                Some(time.saturating_add(delta))
+            }) {
+            Ok(previous) => previous.saturating_add(delta),
+            Err(current) => current,
+        }
     }
 
     /// Pin virtual time to an absolute `millis`.
@@ -178,21 +186,21 @@ impl Driver for SimClock {
         input: Value,
         _output: OutputMode,
         _ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
+    ) -> Result<DriverOutput, DriverError> {
         match method.get() {
-            0 => Ok(Outcome::Done(Value::Int(self.now()))),
+            0 => Ok(DriverOutput::new(Outcome::Done(Value::integer(self.now())))),
             1 => {
                 let ms = sim_sleep_millis(input)?;
                 self.advance(ms);
-                Ok(Outcome::Done(Value::Null))
+                Ok(DriverOutput::new(Outcome::Done(Value::null())))
             }
             2 => {
-                let Value::Map(map) = input else {
+                let Some(map) = input.as_map() else {
                     return Err(DriverError::InvalidInput(
                         "time.cron requires object input".into(),
                     ));
                 };
-                let interval_ms = sim_cron_interval_ms(&map)?.ok_or_else(|| {
+                let interval_ms = sim_cron_interval_ms(map)?.ok_or_else(|| {
                     DriverError::InvalidInput(
                         "cron requires `interval_ms` or `every`/`unit`".into(),
                     )
@@ -200,10 +208,10 @@ impl Driver for SimClock {
                 let mut out = BTreeMap::new();
                 out.insert(
                     "next_millis".into(),
-                    Value::Int(self.now().saturating_add(interval_ms)),
+                    Value::integer(self.now().saturating_add(interval_ms)),
                 );
-                out.insert("interval_ms".into(), Value::Int(interval_ms));
-                Ok(Outcome::Done(Value::Map(out)))
+                out.insert("interval_ms".into(), Value::integer(interval_ms));
+                Ok(DriverOutput::new(Outcome::Done(Value::map(out))))
             }
             _ => Err(DriverError::NoSuchMethod(method)),
         }
@@ -211,15 +219,12 @@ impl Driver for SimClock {
 }
 
 fn sim_sleep_millis(input: Value) -> Result<i64, DriverError> {
-    let millis = match input {
-        Value::Int(value) => value,
-        Value::Map(map) => match map.get("millis") {
-            Some(Value::Int(value)) => *value,
-            Some(_) => {
-                return Err(DriverError::InvalidInput(
-                    "time.sleep millis must be an integer".into(),
-                ));
-            }
+    let millis = match input.view() {
+        xolotl_types::ValueView::Int(value) => value,
+        xolotl_types::ValueView::Map(map) => match map.get("millis") {
+            Some(value) => value.as_int().ok_or_else(|| {
+                DriverError::InvalidInput("time.sleep millis must be an integer".into())
+            })?,
             None => {
                 return Err(DriverError::InvalidInput(
                     "time.sleep requires `millis`".into(),
@@ -240,34 +245,28 @@ fn sim_sleep_millis(input: Value) -> Result<i64, DriverError> {
     Ok(millis)
 }
 
-fn sim_cron_interval_ms(m: &BTreeMap<String, Value>) -> Result<Option<i64>, DriverError> {
+fn sim_cron_interval_ms(m: &xolotl_types::ValueMap) -> Result<Option<i64>, DriverError> {
     if let Some(value) = m.get("interval_ms") {
-        return match value {
-            Value::Int(ms) => Ok((*ms > 0).then_some(*ms)),
+        return match value.as_int() {
+            Some(ms) => Ok((ms > 0).then_some(ms)),
             _ => Err(DriverError::InvalidInput(
                 "time.cron interval_ms must be an integer".into(),
             )),
         };
     }
     let every = match m.get("every") {
-        Some(Value::Int(value)) => *value,
-        Some(_) => {
-            return Err(DriverError::InvalidInput(
-                "time.cron every must be an integer".into(),
-            ));
-        }
+        Some(value) => value.as_int().ok_or_else(|| {
+            DriverError::InvalidInput("time.cron every must be an integer".into())
+        })?,
         None => return Ok(None),
     };
     if every <= 0 {
         return Ok(None);
     }
     let unit = match m.get("unit") {
-        Some(Value::Str(unit)) => unit.as_str(),
-        Some(_) => {
-            return Err(DriverError::InvalidInput(
-                "time.cron unit must be a string".into(),
-            ));
-        }
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| DriverError::InvalidInput("time.cron unit must be a string".into()))?,
         None => "s",
     };
     let unit_ms = match unit {
@@ -329,7 +328,7 @@ impl Driver for CrashAfter {
         input: Value,
         output: OutputMode,
         ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
+    ) -> Result<DriverOutput, DriverError> {
         // `fetch_add` returns the prior count; this call is the (prior+1)-th.
         let nth = self.seen.fetch_add(1, Ordering::SeqCst) + 1;
         if nth > self.n {
@@ -388,7 +387,7 @@ pub fn replay_report(
     facts: &FactSink,
     process: ProcessId,
 ) -> Result<xolotl_kernel::RecoveryReport, xolotl_kernel::FactError> {
-    xolotl_kernel::recover_process(facts, process).map(|(report, _, _)| report)
+    xolotl_kernel::recover_process(facts, process).map(|(report, _)| report)
 }
 
 /// The "why-not" explanation for one Operation. A pure projection over the
@@ -419,8 +418,7 @@ impl WhyNot {
     }
 }
 
-/// Explain why Operation `op` ended the way it did, from a Process's recorded
-/// Facts.
+/// Explain the latest explicit attempt of `op`'s invocation from recorded Facts.
 ///
 /// Returns `None` if no Fact for `op` exists (the Operation never reached a
 /// decision — e.g. its graph cursor was never reached). Otherwise returns a
@@ -429,11 +427,17 @@ impl WhyNot {
 /// (`Fact.taint`, `Fact.decision`) the data plane recorded at decision time.
 pub fn why_not(facts: &[xolotl_types::Fact], op: xolotl_types::OperationId) -> Option<WhyNot> {
     use xolotl_types::DecisionTag;
-    // Latest attempt wins if several Facts share the position (retries).
+    // Retries share one invocation; repeated call sites and executions do not.
     let fact = facts
         .iter()
-        .filter(|f| f.id.process == op.process && f.id.position == op.position)
+        .filter(|f| {
+            f.id.process == op.process
+                && f.id.execution == op.execution
+                && f.id.invocation == op.invocation
+                && f.id.position == op.position
+        })
         .max_by_key(|f| f.id.attempt)?;
+    let op = fact.id;
 
     let tainted_protected = fact.taint.has_protected();
     let tainted_untrusted = fact.taint.has_untrusted_content();
@@ -480,11 +484,11 @@ mod tests {
     use super::*;
     use anyhow::{Context, bail, ensure};
     use xolotl_graph::{ActorSpec, DoNode, OperationTemplate, StepRef};
-    use xolotl_kernel::ProcessStepBinding;
+    use xolotl_kernel::{StepBinding, StepModule};
     use xolotl_types::OutputMode;
 
     fn run_prog(name: xolotl_types::ResourceName) -> DoNode {
-        run_prog_with(name, Value::Null)
+        run_prog_with(name, Value::null())
     }
 
     fn run_prog_with(name: xolotl_types::ResourceName, input: Value) -> DoNode {
@@ -518,25 +522,26 @@ mod tests {
     }
 
     fn is_process_finalized_fact(fact: &xolotl_types::Fact) -> bool {
-        matches!(
-            &fact.outcome_ref,
-            xolotl_types::OutcomeRef::Inline(Value::Map(map))
-                if map.get("event").and_then(Value::as_str) == Some("ProcessFinalized")
-        )
+        fact.outcome
+            .as_ref()
+            .and_then(Value::as_map)
+            .and_then(|map| map.get("event"))
+            .and_then(Value::as_str)
+            == Some("ProcessFinalized")
     }
 
     #[tokio::test]
     async fn scripted_driver_returns_queued_outcomes() -> anyhow::Result<()> {
         let sim = Sim::new();
         let driver = Arc::new(ScriptedDriver::new("model"));
-        driver.enqueue_done(Value::Str("first".into()));
+        driver.enqueue_done(Value::string("first".into()));
         let name = sim.scripted_effect("effect://model/x", driver.clone())?;
         let handle = sim.boot.open_for(sim.boot.root, &name, "perform")?;
         let ex = sim.boot.kernel.executor_for(sim.boot.root);
         ex.bind_handle(name.clone(), handle);
-        let out = ex.eval(&run_prog(name)).await;
+        let out = ex.eval(&run_prog(name)).await.outcome;
         ensure!(
-            out == Outcome::Done(Value::Str("first".into())),
+            out == Outcome::Done(Value::string("first".into())),
             "unexpected scripted outcome: {out:?}"
         );
         ensure!(driver.calls().len() == 1, "unexpected call count");
@@ -551,7 +556,7 @@ mod tests {
         let name = sim.scripted_effect("effect://primary/fallible", driver.clone())?;
         let spec = ActorSpec {
             name: "fallible-recovery".into(),
-            body: run_prog(name).or_else(StepRef::new(sim.boot.root, "fallback")),
+            body: run_prog(name).or_else(StepRef::new("fallback")),
             declared_capabilities: vec!["perform://effect/primary/fallible".into()],
             ..ActorSpec::default()
         };
@@ -562,17 +567,17 @@ mod tests {
                 xolotl_types::IdentityRef::ROOT,
                 "root",
                 &spec,
-                [ProcessStepBinding::new(
+                StepModule::new([StepBinding::new(
                     "fallback",
-                    Arc::new(|v, _| match v {
-                        Value::Str(reason) if reason.contains("cancelled") => {
-                            DoNode::pure(Value::Str("fallback".into()))
+                    Arc::new(|v, _| match v.view() {
+                        xolotl_types::ValueView::Str(reason) if reason.contains("cancelled") => {
+                            DoNode::pure(Value::string("fallback".into()))
                         }
-                        other => DoNode::pure(Value::Str(format!(
+                        other => DoNode::pure(Value::string(format!(
                             "unexpected recovery input: {other:?}"
                         ))),
                     }),
-                )],
+                )])?,
             )
             .await?;
         let value = wait_actor_status(&sim.boot, &actor.directory, "completed").await?;
@@ -611,7 +616,7 @@ mod tests {
     async fn replay_report_counts_recorded_facts() -> anyhow::Result<()> {
         let sim = Sim::new();
         let driver = Arc::new(ScriptedDriver::new("m"));
-        driver.enqueue_done(Value::Int(1));
+        driver.enqueue_done(Value::integer(1));
         let name = sim.scripted_effect("effect://m/x", driver)?;
         let handle = sim.boot.open_for(sim.boot.root, &name, "perform")?;
         let ex = sim.boot.kernel.executor_for(sim.boot.root);
@@ -629,7 +634,7 @@ mod tests {
     async fn budget_denial_records_fact_without_calling_scripted_driver() -> anyhow::Result<()> {
         let sim = Sim::new();
         let driver = Arc::new(ScriptedDriver::new("costly"));
-        driver.enqueue_done(Value::Int(99));
+        driver.enqueue_done(Value::integer(99));
         let name = sim.boot.register_effect_with_cost(
             "effect://costly/call",
             &[xolotl_kernel::MethodSpec::new(
@@ -658,8 +663,9 @@ mod tests {
         ex.bind_handle(name.clone(), handle);
 
         let out = ex
-            .eval(&run_prog_with(name, Value::Str("pay".into())))
-            .await;
+            .eval(&run_prog_with(name, Value::string("pay".into())))
+            .await
+            .outcome;
 
         match out {
             Outcome::Fail(xolotl_types::Failure::BudgetExhausted { dim }) => {
@@ -699,7 +705,7 @@ mod tests {
     {
         let sim = Sim::new();
         let driver = Arc::new(ScriptedDriver::new("idempotent"));
-        driver.enqueue_done(Value::Str("created".into()));
+        driver.enqueue_done(Value::string("created".into()));
         let name = sim.boot.register_effect(
             "effect://orders/create",
             &[xolotl_kernel::MethodSpec::new(
@@ -713,26 +719,30 @@ mod tests {
         let ex = sim.boot.kernel.executor_for(sim.boot.root);
         ex.bind_handle(name.clone(), handle);
         let mut input = std::collections::BTreeMap::new();
-        input.insert("_idem_key".into(), Value::Str("order-42".into()));
-        let prog = run_prog_with(name, Value::Map(input));
+        input.insert("_idem_key".into(), Value::string("order-42".into()));
+        let prog = run_prog_with(name, Value::map(input));
 
-        let first = ex.eval(&prog).await;
-        let second = ex.eval(&prog).await;
+        let first = ex.eval(&prog).await.outcome;
+        let second = ex.eval(&prog).await.outcome;
 
         ensure!(
-            first == Outcome::Done(Value::Str("created".into())),
+            first == Outcome::Done(Value::string("created".into())),
             "unexpected first outcome: {first:?}"
         );
         ensure!(
-            second == Outcome::Done(Value::Str("created".into())),
+            second == Outcome::Done(Value::string("created".into())),
             "unexpected second outcome: {second:?}"
         );
         ensure!(
             driver.calls().len() == 1,
-            "the replayed node must use the idempotency cache"
+            "the business key must use the idempotency cache"
         );
         let facts = sim.boot.kernel.facts.facts_of(sim.boot.root)?;
-        ensure!(facts.len() == 1, "same OperationId updates the same fact");
+        ensure!(
+            facts.len() == 2,
+            "independent executions retain distinct facts"
+        );
+        ensure!(facts[0].id.execution != facts[1].id.execution);
         ensure!(
             facts[0].decision == xolotl_types::DecisionTag::Ok,
             "unexpected decision: {:?}",
@@ -752,33 +762,42 @@ mod tests {
         let clock = FixedClock { t_millis: 10_000 };
 
         let now = clock
-            .call(MethodId::new(0), Value::Null, OutputMode::Unary, &ctx)
+            .call(MethodId::new(0), Value::null(), OutputMode::Unary, &ctx)
             .await?;
         ensure!(
-            now == Outcome::Done(Value::Int(10_000)),
+            now.outcome == Outcome::Done(Value::integer(10_000)),
             "unexpected fixed now output: {now:?}"
         );
 
         let sleep = clock
-            .call(MethodId::new(1), Value::Int(250), OutputMode::Unary, &ctx)
+            .call(
+                MethodId::new(1),
+                Value::integer(250),
+                OutputMode::Unary,
+                &ctx,
+            )
             .await?;
         ensure!(
-            sleep == Outcome::Done(Value::Null),
+            sleep.outcome == Outcome::Done(Value::null()),
             "unexpected fixed sleep output: {sleep:?}"
         );
 
         let cron = clock
             .call(
                 MethodId::new(2),
-                Value::Map(BTreeMap::from([("interval_ms".into(), Value::Int(500))])),
+                Value::map(BTreeMap::from([(
+                    "interval_ms".into(),
+                    Value::integer(500),
+                )])),
                 OutputMode::Unary,
                 &ctx,
             )
             .await?;
-        match cron {
-            Outcome::Done(Value::Map(map)) => {
+        match cron.outcome {
+            Outcome::Done(value) => {
+                let map = value.as_map().context("expected object result")?;
                 ensure!(
-                    map.get("next_millis") == Some(&Value::Int(10_500)),
+                    map.get("next_millis") == Some(&Value::integer(10_500)),
                     "unexpected fixed cron output: {map:?}"
                 );
             }
@@ -788,7 +807,7 @@ mod tests {
         ensure!(
             matches!(
                 clock
-                    .call(MethodId::new(99), Value::Null, OutputMode::Unary, &ctx)
+                    .call(MethodId::new(99), Value::null(), OutputMode::Unary, &ctx)
                     .await,
                 Err(DriverError::NoSuchMethod(method)) if method == MethodId::new(99)
             ),
@@ -802,47 +821,48 @@ mod tests {
         let ctx = DriverContext::new(xolotl_types::IdentityRef::ROOT, ProcessId::new(1));
         let clock = SimClock::new(1_000);
         let out = clock
-            .call(MethodId::new(0), Value::Null, OutputMode::Unary, &ctx)
+            .call(MethodId::new(0), Value::null(), OutputMode::Unary, &ctx)
             .await?;
         ensure!(
-            out == Outcome::Done(Value::Int(1_000)),
+            out.outcome == Outcome::Done(Value::integer(1_000)),
             "unexpected initial clock output: {out:?}"
         );
 
         ensure!(clock.advance(500) == 1_500, "unexpected advanced time");
         let out = clock
-            .call(MethodId::new(0), Value::Null, OutputMode::Unary, &ctx)
+            .call(MethodId::new(0), Value::null(), OutputMode::Unary, &ctx)
             .await?;
         ensure!(
-            out == Outcome::Done(Value::Int(1_500)),
+            out.outcome == Outcome::Done(Value::integer(1_500)),
             "unexpected advanced clock output: {out:?}"
         );
 
         let mut m = BTreeMap::new();
-        m.insert("millis".into(), Value::Int(250));
+        m.insert("millis".into(), Value::integer(250));
         let out = clock
-            .call(MethodId::new(1), Value::Map(m), OutputMode::Unary, &ctx)
+            .call(MethodId::new(1), Value::map(m), OutputMode::Unary, &ctx)
             .await?;
         ensure!(
-            out == Outcome::Done(Value::Null),
+            out.outcome == Outcome::Done(Value::null()),
             "unexpected sleep output: {out:?}"
         );
         ensure!(clock.now() == 1_750, "unexpected time after sleep");
 
         let mut cron = BTreeMap::new();
-        cron.insert("every".into(), Value::Int(2));
-        cron.insert("unit".into(), Value::Str("s".into()));
+        cron.insert("every".into(), Value::integer(2));
+        cron.insert("unit".into(), Value::string("s".into()));
         let out = clock
-            .call(MethodId::new(2), Value::Map(cron), OutputMode::Unary, &ctx)
+            .call(MethodId::new(2), Value::map(cron), OutputMode::Unary, &ctx)
             .await?;
-        match out {
-            Outcome::Done(Value::Map(map)) => {
+        match out.outcome {
+            Outcome::Done(value) => {
+                let map = value.as_map().context("expected object result")?;
                 ensure!(
-                    map.get("interval_ms") == Some(&Value::Int(2_000)),
+                    map.get("interval_ms") == Some(&Value::integer(2_000)),
                     "unexpected cron interval: {map:?}"
                 );
                 ensure!(
-                    map.get("next_millis") == Some(&Value::Int(3_750)),
+                    map.get("next_millis") == Some(&Value::integer(3_750)),
                     "unexpected cron next time: {map:?}"
                 );
             }
@@ -854,16 +874,37 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn sim_clock_stores_saturated_time_without_wrapping() -> anyhow::Result<()> {
+        let clock = SimClock::new(i64::MAX - 1);
+        let shared = clock.clone();
+        for delta in [2, i64::MAX, 1, 0, -1, i64::MIN] {
+            ensure!(clock.advance(delta) == i64::MAX, "advance must saturate");
+            ensure!(shared.now() == i64::MAX, "stored time must not wrap");
+        }
+        clock.set(i64::MIN);
+        ensure!(
+            clock.advance(-1) == i64::MIN,
+            "negative deltas do not rewind"
+        );
+        ensure!(clock.advance(i64::MAX) == -1, "full-width addition");
+        ensure!(shared.now() == -1, "shared clock observes the same time");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn sim_clock_rejects_malformed_time_calls() -> anyhow::Result<()> {
         let ctx = DriverContext::new(xolotl_types::IdentityRef::ROOT, ProcessId::new(1));
         let clock = SimClock::new(0);
 
         for input in [
-            Value::Null,
-            Value::Map(BTreeMap::new()),
-            Value::Map(BTreeMap::from([("millis".into(), Value::Str("0".into()))])),
-            Value::Int(-1),
+            Value::null(),
+            Value::map(BTreeMap::new()),
+            Value::map(BTreeMap::from([(
+                "millis".into(),
+                Value::string("0".into()),
+            )])),
+            Value::integer(-1),
         ] {
             let out = clock
                 .call(MethodId::new(1), input, OutputMode::Unary, &ctx)
@@ -871,9 +912,9 @@ mod tests {
             ensure!(out.is_err(), "malformed sleep input should fail closed");
         }
 
-        let bad_unit = Value::Map(BTreeMap::from([
-            ("every".into(), Value::Int(1)),
-            ("unit".into(), Value::Str("fortnight".into())),
+        let bad_unit = Value::map(BTreeMap::from([
+            ("every".into(), Value::integer(1)),
+            ("unit".into(), Value::string("fortnight".into())),
         ]));
         ensure!(
             clock
@@ -885,7 +926,7 @@ mod tests {
         ensure!(
             matches!(
                 clock
-                    .call(MethodId::new(99), Value::Null, OutputMode::Unary, &ctx)
+                    .call(MethodId::new(99), Value::null(), OutputMode::Unary, &ctx)
                     .await,
                 Err(DriverError::NoSuchMethod(method)) if method == MethodId::new(99)
             ),
@@ -899,24 +940,24 @@ mod tests {
         let ctx = DriverContext::new(xolotl_types::IdentityRef::ROOT, ProcessId::new(1));
         let crasher = CrashAfter::arc(Arc::new(xolotl_kernel::EchoDriver), 2);
         let a = crasher
-            .call(MethodId::new(0), Value::Int(1), OutputMode::Unary, &ctx)
+            .call(MethodId::new(0), Value::integer(1), OutputMode::Unary, &ctx)
             .await;
         let b = crasher
-            .call(MethodId::new(0), Value::Int(2), OutputMode::Unary, &ctx)
+            .call(MethodId::new(0), Value::integer(2), OutputMode::Unary, &ctx)
             .await;
         ensure!(
-            a? == Outcome::Done(Value::Int(1)),
+            a?.outcome == Outcome::Done(Value::integer(1)),
             "unexpected first delegated output"
         );
         ensure!(
-            b? == Outcome::Done(Value::Int(2)),
+            b?.outcome == Outcome::Done(Value::integer(2)),
             "unexpected second delegated output"
         );
         ensure!(!crasher.has_crashed(), "driver should not have crashed yet");
         ensure!(crasher.calls_made() == 2, "unexpected call count");
 
         let c = crasher
-            .call(MethodId::new(0), Value::Int(3), OutputMode::Unary, &ctx)
+            .call(MethodId::new(0), Value::integer(3), OutputMode::Unary, &ctx)
             .await;
         ensure!(
             matches!(c, Err(DriverError::Transport(_))),
@@ -924,7 +965,7 @@ mod tests {
         );
         ensure!(crasher.has_crashed(), "driver should be crashed");
         let d = crasher
-            .call(MethodId::new(0), Value::Int(4), OutputMode::Unary, &ctx)
+            .call(MethodId::new(0), Value::integer(4), OutputMode::Unary, &ctx)
             .await;
         ensure!(d.is_err(), "stays crashed after the crash point");
         Ok(())
@@ -934,11 +975,18 @@ mod tests {
     fn why_not_explains_a_denied_fact() -> anyhow::Result<()> {
         use xolotl_types::ids::NodeId;
         use xolotl_types::{
-            DecisionTag, Fact, HandleId, IdentityRef, MethodId, OperationId, OutcomeRef, Path,
-            ProcessId, ReplayClass, ResourceId, TaintSet, TaintSource, Timestamp, ValueRef,
+            DecisionTag, ExecutionId, Fact, HandleId, IdentityRef, InvocationId, MethodId,
+            OperationId, Path, ProcessId, ReplayClass, ResourceId, TaintSet, TaintSource,
+            Timestamp,
         };
 
-        let op = OperationId::new(ProcessId::new(7), NodeId::new(3), 0);
+        let op = OperationId::new(
+            ProcessId::new(7),
+            ExecutionId::FIRST,
+            InvocationId::new(4),
+            NodeId::new(3),
+            0,
+        );
         // A residual policy rejected an outbound op whose input touched the vault.
         let mut taint = TaintSet::of(TaintSource::ModelOutput);
         taint.add(TaintSource::Protected {
@@ -952,16 +1000,30 @@ mod tests {
             handle: HandleId::new(0, 1),
             resource: ResourceId::new(1),
             method: MethodId::new(0),
-            input_ref: ValueRef::Inline(Value::Str("post this".into())),
+            input: Value::string("post this".into()),
             taint,
             decision: DecisionTag::RejectedByPolicy,
-            outcome_ref: OutcomeRef::None,
+            outcome: None,
             batch: None,
             replay: ReplayClass::NonIdempotentEffect,
             timestamp: Timestamp::millis(1),
         };
 
-        let why = why_not(&[fact], op).context("missing why-not explanation")?;
+        let mut retry = fact.clone();
+        retry.id = op.retry().context("retry remains representable")?;
+        let mut repeated = retry.clone();
+        repeated.id.invocation = InvocationId::new(5);
+        repeated.id.attempt = 2;
+        repeated.decision = DecisionTag::Ok;
+        let mut independent = repeated.clone();
+        independent.id.invocation = op.invocation;
+        independent.id.execution = ExecutionId::new(2).context("nonzero scope")?;
+        let facts = [fact, retry.clone(), repeated, independent];
+        let why = why_not(&facts, op).context("missing why-not explanation")?;
+        ensure!(
+            why.op == retry.id,
+            "diagnostic should identify the selected attempt"
+        );
         ensure!(
             why.decision == DecisionTag::RejectedByPolicy,
             "unexpected decision: {:?}",
@@ -977,9 +1039,12 @@ mod tests {
         );
 
         // No Fact for an unrelated op ⇒ no explanation (cursor never reached it).
-        let other = OperationId::new(ProcessId::new(7), NodeId::new(99), 0);
+        let other = OperationId {
+            position: NodeId::new(99),
+            ..op
+        };
         ensure!(
-            why_not(&[], other).is_none(),
+            why_not(&facts, other).is_none(),
             "unrelated op should have no explanation"
         );
         Ok(())

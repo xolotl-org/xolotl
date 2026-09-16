@@ -1,39 +1,70 @@
-use anyhow::{Result, anyhow};
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use anyhow::{Context, Result, anyhow, ensure};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
-use std::sync::Arc;
+use std::io::Write;
+use std::num::NonZeroUsize;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, Runtime};
-use xolotl_state::{InMemoryBackend, StateBackend};
+use xolotl_state::{
+    InMemoryBackend, InMemoryOptions, MemoryHistory, StateHistoryQuery, StateScan, prelude::*,
+};
 use xolotl_types::{Path, Value};
 
 const ITEMS: u32 = 1_024;
+const THREADS: usize = 8;
+const OPERATIONS_PER_THREAD: u32 = 1_024;
+
+fn configurations() -> [(&'static str, InMemoryOptions); 5] {
+    let compact = InMemoryOptions::default();
+    let sharded = InMemoryOptions {
+        read_shards: NonZeroUsize::MIN.saturating_add(31),
+        ..compact
+    };
+    [
+        ("compact", compact),
+        ("sharded_32", sharded),
+        (
+            "sharded_128",
+            InMemoryOptions {
+                read_shards: NonZeroUsize::MIN.saturating_add(127),
+                ..compact
+            },
+        ),
+        (
+            "compact_current_only",
+            InMemoryOptions {
+                history: MemoryHistory::Disabled,
+                ..compact
+            },
+        ),
+        (
+            "sharded_32_current_only",
+            InMemoryOptions {
+                history: MemoryHistory::Disabled,
+                ..sharded
+            },
+        ),
+    ]
+}
 
 fn runtime() -> Result<Runtime> {
     Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|error| anyhow!("tokio runtime build failed: {error}"))
+        .context("benchmark runtime build failed")
 }
 
 fn path(s: &str) -> Result<Path> {
     Path::parse(s).map_err(|error| anyhow!("benchmark path parse failed for {s}: {error}"))
 }
 
-fn bench_setup_failure(c: &mut Criterion, name: &'static str, error: anyhow::Error) {
-    let message = error.to_string();
-    c.bench_function(name, |b| b.iter(|| black_box(message.as_str())));
-}
-
-fn observe<T>(result: Result<T>) {
-    match result {
-        Ok(value) => drop(black_box(value)),
-        Err(error) => observe_error(error),
-    }
-}
-
-fn observe_error(error: anyhow::Error) {
-    let message = error.to_string();
-    drop(black_box(message));
+fn required<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> T {
+    result.unwrap_or_else(|error| {
+        let message = format!("state benchmark failed: {error}");
+        let _reported = writeln!(std::io::stderr().lock(), "{message}");
+        std::panic::resume_unwind(Box::new(message));
+    })
 }
 
 fn prepopulate_prefix(rt: &Runtime, backend: &InMemoryBackend, keys: u32) -> Result<()> {
@@ -41,11 +72,10 @@ fn prepopulate_prefix(rt: &Runtime, backend: &InMemoryBackend, keys: u32) -> Res
         for i in 0..keys {
             let path = path(&format!("state://bench/prefix/k{i}"))?;
             backend
-                .write_set(&path, Value::Int(i as i64))
-                .await
-                .map_err(|error| anyhow!("state set failed during prefix prepopulate: {error}"))?;
+                .write_set(&path, Value::integer(i64::from(i)))
+                .await?;
         }
-        Ok::<(), anyhow::Error>(())
+        Ok(())
     })
 }
 
@@ -58,106 +88,61 @@ fn prepopulate_sequence(
     rt.block_on(async {
         for i in 0..items {
             backend
-                .write_append(path, Value::Int(i as i64))
-                .await
-                .map_err(|error| {
-                    anyhow!("state append failed during sequence prepopulate: {error}")
-                })?;
+                .write_append(path, Value::integer(i64::from(i)))
+                .await?;
         }
-        Ok::<(), anyhow::Error>(())
+        Ok(())
     })
 }
 
 fn bench_current_values(c: &mut Criterion) {
-    let rt = match runtime() {
-        Ok(rt) => rt,
-        Err(error) => {
-            bench_setup_failure(c, "state/in_memory/runtime_setup_failed", error);
-            return;
-        }
-    };
-    let mut group = c.benchmark_group("state/in_memory/current");
+    for (name, options) in configurations() {
+        bench_current_values_for(c, name, options);
+    }
+}
+
+fn bench_current_values_for(c: &mut Criterion, name: &str, options: InMemoryOptions) {
+    let rt = required(runtime());
+    let create = || required(InMemoryBackend::with_options(options));
+    let value_path = required(path("state://bench/value"));
+    let cas_path = required(path("state://bench/cas"));
+    let mut group = c.benchmark_group(format!("state/in_memory/{name}/current"));
 
     group.bench_function("write_set", |b| {
-        b.iter_batched(
-            || path("state://bench/value").map(|path| (InMemoryBackend::new(), path)),
-            |setup| match setup {
-                Ok((backend, path)) => {
-                    let result: Result<()> = rt.block_on(async {
-                        backend
-                            .write_set(black_box(&path), black_box(Value::Int(1)))
-                            .await
-                            .map_err(|error| anyhow!("state set failed: {error}"))
-                    });
-                    observe(result);
-                }
-                Err(error) => {
-                    observe_error(error);
-                }
+        b.iter_batched_ref(
+            create,
+            |backend| {
+                required(rt.block_on(
+                    backend.write_set(black_box(&value_path), black_box(Value::integer(1))),
+                ));
             },
             BatchSize::SmallInput,
         );
     });
 
     group.bench_function("read_current_value", |b| {
-        let setup = path("state://bench/value").and_then(|p| {
-            let backend = InMemoryBackend::new();
-            rt.block_on(async {
-                backend
-                    .write_set(&p, Value::Int(1))
-                    .await
-                    .map_err(|error| anyhow!("state set failed: {error}"))?;
-                Ok::<(InMemoryBackend, Path), anyhow::Error>((backend, p))
-            })
+        let backend = create();
+        required(rt.block_on(backend.write_set(&value_path, Value::integer(1))));
+        b.iter(|| {
+            drop(black_box(required(
+                rt.block_on(backend.read(black_box(&value_path))),
+            )));
         });
-        match setup {
-            Ok((backend, p)) => {
-                b.iter(|| {
-                    let value: Result<Option<Value>> = rt.block_on(async {
-                        backend
-                            .read(black_box(&p))
-                            .await
-                            .map_err(|error| anyhow!("state read failed: {error}"))
-                    });
-                    observe(value);
-                });
-            }
-            Err(error) => {
-                b.iter(|| observe_error(anyhow!("{error}")));
-            }
-        }
     });
 
     group.bench_function("write_cas_success", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
-                let backend = InMemoryBackend::new();
-                let p = path("state://bench/cas")?;
-                rt.block_on(async {
-                    backend
-                        .write_set(&p, Value::Int(1))
-                        .await
-                        .map_err(|error| anyhow!("state set failed before CAS: {error}"))?;
-                    Ok::<(InMemoryBackend, Path), anyhow::Error>((backend, p))
-                })
+                let backend = create();
+                required(rt.block_on(backend.write_set(&cas_path, Value::integer(1))));
+                backend
             },
-            |setup| match setup {
-                Ok((backend, p)) => {
-                    let result: Result<()> = rt.block_on(async {
-                        backend
-                            .write_cas(
-                                black_box(&p),
-                                black_box(Some(Value::Int(1))),
-                                black_box(Value::Int(2)),
-                            )
-                            .await
-                            .map_err(|error| anyhow!("state CAS failed: {error}"))
-                    });
-                    observe(result);
-                }
-                Err(error) => {
-                    observe_error(error);
-                }
+            |backend| {
+                required(rt.block_on(backend.write_cas(
+                    black_box(&cas_path),
+                    black_box(Some(Value::integer(1))),
+                    black_box(Value::integer(2)),
+                )));
             },
             BatchSize::SmallInput,
         );
@@ -167,133 +152,231 @@ fn bench_current_values(c: &mut Criterion) {
 }
 
 fn bench_sequences_and_history(c: &mut Criterion) {
-    let rt = match runtime() {
-        Ok(rt) => rt,
-        Err(error) => {
-            bench_setup_failure(c, "state/in_memory/history_runtime_setup_failed", error);
-            return;
+    for (name, options) in configurations() {
+        if options.history == MemoryHistory::Full {
+            bench_sequences_and_history_for(c, name, options);
         }
-    };
-    let mut group = c.benchmark_group("state/in_memory/history");
+    }
+}
+
+fn bench_sequences_and_history_for(c: &mut Criterion, name: &str, options: InMemoryOptions) {
+    let rt = required(runtime());
+    let create = || required(InMemoryBackend::with_options(options));
+    let sequence_path = required(path("state://bench/log"));
+    let prefix = required(path("state://bench/prefix"));
+    let history_path = required(path("state://bench/history"));
+    let mut group = c.benchmark_group(format!("state/in_memory/{name}/history"));
     group.sample_size(10);
 
     group.bench_function("append_after_1024_items", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
-                let backend = InMemoryBackend::new();
-                let p = path("state://bench/log")?;
-                prepopulate_sequence(&rt, &backend, &p, ITEMS)?;
-                Ok::<(InMemoryBackend, Path), anyhow::Error>((backend, p))
+                let backend = create();
+                required(prepopulate_sequence(&rt, &backend, &sequence_path, ITEMS));
+                backend
             },
-            |setup| match setup {
-                Ok((backend, p)) => {
-                    let result: Result<()> = rt.block_on(async {
-                        backend
-                            .write_append(black_box(&p), black_box(Value::Int(ITEMS as i64)))
-                            .await
-                            .map_err(|error| anyhow!("state append failed: {error}"))
-                    });
-                    observe(result);
-                }
-                Err(error) => {
-                    observe_error(error);
-                }
-            },
-            BatchSize::SmallInput,
-        );
-    });
-
-    group.bench_function("read_prefix_1024_keys", |b| {
-        b.iter_batched(
-            || {
-                let backend = InMemoryBackend::new();
-                prepopulate_prefix(&rt, &backend, ITEMS)?;
-                let prefix = path("state://bench/prefix")?;
-                Ok::<(InMemoryBackend, Path), anyhow::Error>((backend, prefix))
-            },
-            |setup| match setup {
-                Ok((backend, prefix)) => {
-                    let rows: Result<Vec<(Path, Value)>> = rt.block_on(async {
-                        backend
-                            .read_prefix(black_box(&prefix))
-                            .await
-                            .map_err(|error| anyhow!("prefix read failed: {error}"))
-                    });
-                    observe(rows);
-                }
-                Err(error) => {
-                    observe_error(error);
-                }
+            |backend| {
+                required(rt.block_on(backend.write_append(
+                    black_box(&sequence_path),
+                    black_box(Value::integer(i64::from(ITEMS))),
+                )));
             },
             BatchSize::LargeInput,
         );
     });
 
-    group.bench_function("read_range_1024_history_entries", |b| {
-        b.iter_batched(
-            || {
-                let backend = InMemoryBackend::new();
-                let p = path("state://bench/history")?;
-                prepopulate_sequence(&rt, &backend, &p, ITEMS)?;
-                Ok::<(InMemoryBackend, Path), anyhow::Error>((backend, p))
-            },
-            |setup| match setup {
-                Ok((backend, p)) => {
-                    let rows = rt.block_on(async {
-                        backend
-                            .read_range(black_box(&p), 0, i64::MAX)
-                            .await
-                            .map_err(|error| anyhow!("range read failed: {error}"))
-                    });
-                    observe(rows);
+    group.bench_function("query_pages_1024_keys", |b| {
+        let backend = create();
+        required(prepopulate_prefix(&rt, &backend, ITEMS));
+        b.iter(|| {
+            let rows = required(rt.block_on(async {
+                let mut pages = backend.pages(StateScan::new(black_box(&prefix).clone()));
+                let mut count = 0;
+                while let Some(page) = pages.next().await? {
+                    count += page.entries.len();
+                    black_box(page);
                 }
-                Err(error) => {
-                    observe_error(error);
+                Ok::<_, xolotl_state::StateFailure>(count)
+            }));
+            required((|| {
+                ensure!(rows == ITEMS as usize, "incomplete prefix read");
+                Ok::<(), anyhow::Error>(())
+            })());
+            black_box(rows);
+        });
+    });
+
+    group.bench_function("history_pages_1024_entries", |b| {
+        let backend = create();
+        required(prepopulate_sequence(&rt, &backend, &history_path, ITEMS));
+        b.iter(|| {
+            let rows = required(rt.block_on(async {
+                let mut pages = backend.history_pages(StateHistoryQuery::new(
+                    black_box(&history_path).clone(),
+                    0,
+                    i64::MAX,
+                ));
+                let mut count = 0;
+                while let Some(page) = pages.next().await? {
+                    count += page.entries.len();
+                    black_box(page);
                 }
-            },
-            BatchSize::LargeInput,
-        );
+                Ok::<_, xolotl_state::StateFailure>(count)
+            }));
+            required((|| {
+                ensure!(rows == ITEMS as usize, "incomplete history read");
+                Ok::<(), anyhow::Error>(())
+            })());
+            black_box(rows);
+        });
     });
 
     group.finish();
 }
 
-fn bench_concurrency(c: &mut Criterion) {
-    let rt = match runtime() {
-        Ok(rt) => rt,
-        Err(error) => {
-            bench_setup_failure(c, "state/in_memory/concurrency_runtime_setup_failed", error);
-            return;
-        }
-    };
-    let mut group = c.benchmark_group("state/in_memory/concurrency");
+#[derive(Clone, Copy)]
+enum Workload {
+    Read,
+    Write,
+}
 
-    group.bench_function("concurrent_write_set_64", |b| {
-        b.iter(|| {
-            let backend = Arc::new(InMemoryBackend::new());
-            let result: Result<()> = rt.block_on(async {
-                let mut tasks = Vec::new();
-                for i in 0..64u32 {
-                    let backend = backend.clone();
-                    tasks.push(tokio::spawn(async move {
-                        let path = path(&format!("state://bench/concurrent/k{i}"))?;
-                        backend
-                            .write_set(&path, Value::Int(i as i64))
-                            .await
-                            .map_err(|error| anyhow!("state set failed in writer task: {error}"))
-                    }));
-                }
-                for task in tasks {
-                    let result = task
-                        .await
-                        .map_err(|error| anyhow!("state writer task join failed: {error}"))?;
-                    result?;
-                }
-                Ok::<(), anyhow::Error>(())
+async fn run_workload(backend: &InMemoryBackend, path: &Path, workload: Workload) -> Result<()> {
+    match workload {
+        Workload::Read => {
+            for _ in 0..OPERATIONS_PER_THREAD {
+                let value = backend.read(black_box(path)).await?;
+                ensure!(
+                    value == Some(Value::integer(0)),
+                    "unexpected concurrent read"
+                );
+                drop(black_box(value));
+            }
+        }
+        Workload::Write => {
+            for i in 0..OPERATIONS_PER_THREAD {
+                backend
+                    .write_set(black_box(path), black_box(Value::integer(i64::from(i))))
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn threaded_batch(
+    backend: &InMemoryBackend,
+    runtimes: &[Runtime],
+    paths: &[Path],
+    workload: Workload,
+) -> Result<Duration> {
+    ensure!(runtimes.len() == THREADS && paths.len() == THREADS);
+    std::thread::scope(|scope| {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let mut starters = Vec::with_capacity(THREADS);
+        let mut workers = Vec::with_capacity(THREADS);
+        for (index, (rt, path)) in runtimes.iter().zip(paths).enumerate() {
+            let ready_tx = ready_tx.clone();
+            let finished_tx = finished_tx.clone();
+            let (start_tx, start_rx) = mpsc::channel();
+            let worker = std::thread::Builder::new()
+                .name(format!("state-bench-{index}"))
+                .spawn_scoped(scope, move || -> Result<()> {
+                    ready_tx.send(()).context("worker readiness send failed")?;
+                    start_rx.recv().context("worker start receive failed")?;
+                    let result = rt.block_on(run_workload(backend, path, workload));
+                    finished_tx
+                        .send(())
+                        .context("worker completion send failed")?;
+                    result
+                })
+                .context("benchmark worker creation failed")?;
+            starters.push(start_tx);
+            workers.push(worker);
+        }
+        drop(ready_tx);
+        drop(finished_tx);
+        for _ in 0..THREADS {
+            ready_rx.recv().context("worker readiness receive failed")?;
+        }
+
+        // Only kickoff/completion messages and the operation batch are timed.
+        // Disconnectable start channels also release workers if setup fails.
+        let start = Instant::now();
+        for starter in starters {
+            starter.send(()).context("worker start send failed")?;
+        }
+        for _ in 0..THREADS {
+            finished_rx
+                .recv()
+                .context("worker completion receive failed")?;
+        }
+        let elapsed = start.elapsed();
+        for worker in workers {
+            match worker.join() {
+                Ok(result) => result?,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        Ok(elapsed)
+    })
+}
+
+fn bench_concurrency(c: &mut Criterion) {
+    for (name, options) in configurations() {
+        bench_concurrency_for(c, name, options);
+    }
+}
+
+fn bench_concurrency_for(c: &mut Criterion, name: &str, options: InMemoryOptions) {
+    let runtimes = required((0..THREADS).map(|_| runtime()).collect::<Result<Vec<_>>>());
+    let rt = required(runtimes.first().context("missing setup runtime"));
+    let mut group = c.benchmark_group(format!("state/in_memory/{name}/concurrency"));
+    group.sample_size(20);
+    group.throughput(Throughput::Elements(
+        THREADS as u64 * u64::from(OPERATIONS_PER_THREAD),
+    ));
+
+    for (name, workload, same_key) in [
+        ("read_same_key_8_threads", Workload::Read, true),
+        ("read_distinct_keys_8_threads", Workload::Read, false),
+        ("write_same_key_8_threads", Workload::Write, true),
+        ("write_distinct_keys_8_threads", Workload::Write, false),
+    ] {
+        let paths = required(
+            (0..THREADS)
+                .map(|index| {
+                    let key = if same_key { 0 } else { index };
+                    path(&format!("state://bench/concurrent/k{key}"))
+                })
+                .collect::<Result<Vec<_>>>(),
+        );
+        group.bench_function(name, |b| {
+            b.iter_custom(|iterations| {
+                required((|| {
+                    let mut elapsed = Duration::ZERO;
+                    for _ in 0..iterations {
+                        let backend = InMemoryBackend::with_options(options)?;
+                        for path in &paths {
+                            rt.block_on(backend.write_set(path, Value::integer(0)))?;
+                        }
+                        elapsed += threaded_batch(&backend, &runtimes, &paths, workload)?;
+                        let expected = match workload {
+                            Workload::Read => 0,
+                            Workload::Write => i64::from(OPERATIONS_PER_THREAD - 1),
+                        };
+                        for path in &paths {
+                            ensure!(
+                                rt.block_on(backend.read(path))? == Some(Value::integer(expected)),
+                                "unexpected value after worker batch"
+                            );
+                        }
+                    }
+                    Ok::<Duration, anyhow::Error>(elapsed)
+                })())
             });
-            observe(result);
         });
-    });
+    }
 
     group.finish();
 }

@@ -1,16 +1,14 @@
 use anyhow::{Result, anyhow};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
-use xolotl_graph::{
-    ActorSpec, DoNode, Frame, GraphCursor, OperationTemplate, StepRef, compile_do, lint,
-};
-use xolotl_types::{MethodId, NodeId, OutputMode, Path, ProcessId, ResourceName, Value};
+use xolotl_graph::{ActorSpec, DoNode, OperationTemplate, StepRef, compile_do, lint};
+use xolotl_types::{MethodId, OutputMode, Path, ResourceName, Value};
 
 const LINEAR_STEPS: usize = 512;
 const PARALLEL_LEAVES: usize = 1_024;
 
 fn step(name: impl Into<String>) -> StepRef {
-    StepRef::new(ProcessId::new(1), name)
+    StepRef::new(name)
 }
 
 fn op_template(id: usize) -> Result<OperationTemplate> {
@@ -22,7 +20,7 @@ fn op_template(id: usize) -> Result<OperationTemplate> {
         method: "invoke".into(),
         method_id: Some(MethodId::new(0)),
         output: OutputMode::Unary,
-        literal_input: Some(Value::Int(id as i64)),
+        literal_input: Some(Value::integer(id as i64)),
     })
 }
 
@@ -141,43 +139,6 @@ fn bench_graph_queries(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_cursor(c: &mut Criterion) {
-    let mut group = c.benchmark_group("graph/cursor");
-
-    group.bench_function("cursor_push_pop_4096_frames", |b| {
-        b.iter_batched(
-            || GraphCursor::at_root(NodeId::new(0)),
-            |mut cursor| {
-                for i in 1..=4_096u32 {
-                    cursor.push(Frame::new(NodeId::new(i), Value::Int(i as i64)));
-                }
-                while let Some(frame) = cursor.pop() {
-                    black_box(frame);
-                }
-            },
-            BatchSize::SmallInput,
-        );
-    });
-
-    group.bench_function("cursor_is_done_4096_done_nodes", |b| {
-        b.iter_batched(
-            || {
-                let mut cursor = GraphCursor::at_root(NodeId::new(0));
-                for i in 0..4_096u32 {
-                    cursor.mark_done(NodeId::new(i));
-                }
-                cursor
-            },
-            |cursor| {
-                black_box(cursor.is_done(NodeId::new(4_095)));
-            },
-            BatchSize::SmallInput,
-        );
-    });
-
-    group.finish();
-}
-
 fn bench_lint(c: &mut Criterion) {
     let mut group = c.benchmark_group("graph/lint");
     group.sample_size(10);
@@ -204,11 +165,5 @@ fn bench_lint(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_compile,
-    bench_graph_queries,
-    bench_cursor,
-    bench_lint
-);
+criterion_group!(benches, bench_compile, bench_graph_queries, bench_lint);
 criterion_main!(benches);

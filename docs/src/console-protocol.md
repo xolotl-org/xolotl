@@ -259,5 +259,129 @@ Streams:
 | `state.watch` | State backend watch events. |
 | `audit.facts.stream` | Audit Fact events. |
 
-Frame, connection, idle, rate, subscription, result-size, and event-send limits
+Frame, connection, idle, rate, subscription, result-size, queue, and send limits
 come from `[console.ws]`; values are clamped by backend hard bounds.
+
+## Outbound Limits
+
+`max_frame_bytes` applies to incoming and outgoing protobuf frames (default 1 MiB,
+range 16 KiB to 4 MiB). Before cloning wire payloads, conversion checks cumulative
+inline bytes, at most 16,384 Value nodes and 30 Value nesting levels, and at most
+256 path segments. The completed protobuf message must also fit the exact frame
+byte limit before its output buffer is allocated. Values are never truncated.
+
+`send_timeout_ms` applies to every outgoing frame, including replies and errors
+(default 5 seconds, range 100 ms to 60 seconds). It replaces
+`event_send_timeout_ms`. If a reply cannot be encoded within the limits, the server
+sends a small `Internal` error carrying the original request ID. The action may
+already have completed; this error does not indicate rollback or a safe retry.
+A transport error or send timeout closes the connection.
+
+Live subscriptions share a 256-entry queue per connection.
+`max_pending_event_bytes` bounds encoded subscription data bytes queued or being sent
+(default 1 MiB, range 16 KiB to 16 MiB). A worker prepares at most one bounded frame
+before attempting queue admission and never waits while retaining an unaccounted
+frame. Exhausting either queue limit closes that subscription. The queue budget
+excludes the independent control path: at most `max_subscriptions` pending closure
+reasons (1 KiB each) and one closure frame being sent. It also excludes
+source broadcast storage, native action outputs, temporary wire
+conversion structures, socket buffers, or total process memory.
+
+Both State and Fact workers have one session owner. Lag, source closure, a failed
+projection or encoding, and worker failure release the subscription slot and
+emit `SubscriptionClosed`. Closure invalidates any unsent tail for that
+subscription generation; old queued events and closures cannot affect a replacement
+using the same ID. Closing or cancelling the session aborts its workers. Shutdown
+uses one 250 ms deadline for all workers; failure to finish closes the session.
+This bounds asynchronous waits. Tokio cannot forcibly preempt synchronous adapter
+work or a blocking destructor; host adapters must cooperate with cancellation.
+
+Subscription visibility lasts for the requested `ttl_ms`, at most ten minutes.
+Expiry discards pending data and emits `SubscriptionClosed`. Successful `Auth`
+clears previous subscriptions before accepting the new session. Each event
+reauthenticates the SID; a changed identity, effective grant set or MFA level
+closes the connection and requires new authorization and subscriptions.
+Data sends use the earlier of the visibility deadline and send timeout, and check
+expiry after the socket becomes writable. Data already accepted by the socket
+cannot be retracted. Stale generations retain queue credits until dequeued and
+discarded, so an immediate replacement can still encounter queue pressure.
+
+## Fact Queries
+
+`audit.facts.recent` returns one reverse append-order page, defaulting to 64 records.
+`lineage.trace.read` requires `process` and returns one forward append-order page,
+defaulting to 128 records. Both accept `from`, `before`, `limit`, `max_bytes` and
+`max_examined`; recent also accepts an optional `process`. Cursor and process inputs
+accept nonnegative integers or decimal `u64` strings. Cursors and numeric identifier
+fields are projected as decimal strings, preserving the full range in clients;
+`op_id` retains its composite OperationId string format. `from` is a physical global append
+position, including for a process-filtered trace, rather than an offset into its
+matching rows. Order is fixed by the action.
+
+Page output has the following fields:
+
+| Field | Meaning |
+| --- | --- |
+| `items` | Projected Facts in append order; `completed` reflects the current outcome. |
+| `from`, `end` | Inclusive lower and exclusive upper append bounds for this page. |
+| `next` | Decimal continuation cursor, or `null` when the interval is exhausted. |
+| `order` | `forward` or `reverse`. |
+| `complete` | Whether this page exhausted its append interval. |
+| `examined` | Storage candidates visited, including filtered or byte-rejected candidates. |
+| `encoded_bytes` | Sum of returned Fact JSON encoding lengths before projection. |
+| `process` | Selected process, when supplied. |
+
+Continue recent with `before=next` and the same `from`; continue trace with
+`from=next` and `before=end`. Preserve filters and budgets. Empty pages may have
+continuations. Reverse pages shrink their upper bound. A fixed append interval
+excludes later appends but does not freeze in-place completion updates.
+Trace additionally returns `partial=true` and `partial_reason` for omitted
+materialized lineage indexes; these fields are independent of pagination
+completion. No all-history trace count is returned.
+
+The record limit is capped by the listener's Fact or trace limit. JSON bytes are
+capped at `min(max_frame_bytes / 8, 256 KiB)`, reserving room for projection and
+framing. Outbound conversion and exact frame limits are checked separately. Candidate examination
+defaults to `max(limit, 4096)` and is capped at 65,536. Zero budgets are invalid;
+larger requests are clamped. A first matching record that exceeds the byte budget
+fails the read. `lineage.fact.read` uses an indexed, byte-bounded lookup and also
+accepts `max_bytes` and an optional `process`, defaulting to `op_id.process`. It
+requires read authority for that process and only returns a record whose current
+caller matches it. A different caller is reported as unknown, without exposing
+the record. These limits do not measure decoded heap or total memory.
+
+`runtime.process.inspect` and the `runtime` section of `state.snapshot` default to
+metadata only. `include_recent_facts=true` requires an explicit `process`, Fact-read
+authority for `state://fact/<process>`, and the action's visibility metadata.
+`recent_facts` is one bounded reverse page; there is no full-history `fact_count`.
+A snapshot accepts at most one runtime section. Process rows and children remain
+independent, currently unpaged collections.
+
+`health.summary.fact_sample` contains `sampled_facts`, `decisions`, and the same
+page metadata. These counts describe only the recent sample; the old global
+`fact_count` and `fact_decisions` fields are removed. Top-level `fact_cursor` is a
+decimal append-head string, observed separately from the sample, and does not
+track completion updates. Process counts still enumerate the process table.
+
+## Live Audit
+
+`audit.facts.stream` starts with future notifications and does not replay history.
+Its optional `process` filters the current record before checking its byte budget;
+unrelated oversized records are ignored. Appends and outcome updates both trigger
+a bounded indexed reread; each event is an upsert keyed by `op_id`.
+Notifications may arrive out of commit order or yield repeated current values.
+Clients should replace their record for that identity rather than count every
+notification as a distinct Fact.
+
+Lag, a missing record or a bounded-read failure emits `SubscriptionClosed` and
+releases the subscription slot. The shared lifecycle and queue limits above also apply.
+After closure, resubscribe and reconcile retained Facts with explicit bounded
+pages, including old slots whose outcomes may have changed. Establish the live
+subscription before reading pages to reduce the gap, and restart reconciliation
+after any further lag; this is not an atomic snapshot or a durable update log.
+
+`StreamCall.since_rev` is reserved and rejected. Wire `ConsoleEvent.state_rev` and
+`fact_cursor` remain zero; `SubscriptionClosed.last_rev` is absent. Append cursors
+cannot resume outcome updates in old slots. The protobuf envelope is unchanged;
+the paged action outputs and exact identifier projections replace the previous
+Value payload shapes.

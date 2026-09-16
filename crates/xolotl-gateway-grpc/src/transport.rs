@@ -100,16 +100,11 @@ fn forwarded_client_addr(metadata: &MetadataMap) -> Result<Option<String>, Forwa
 }
 
 fn forwarded_header_for(value: &str) -> Option<String> {
-    forwarded_header_param(value, "for").and_then(|value| {
-        if value.eq_ignore_ascii_case("unknown") || value.starts_with('_') {
-            None
-        } else {
-            Some(value)
-        }
-    })
+    forwarded_header_param(value, "for")
+        .filter(|value| !(value.eq_ignore_ascii_case("unknown") || value.starts_with('_')))
 }
 
-fn forwarded_header_param(value: &str, expected_name: &str) -> Option<String> {
+pub(crate) fn forwarded_header_param(value: &str, expected_name: &str) -> Option<String> {
     let first = value.split(',').next()?.trim();
     for part in first.split(';') {
         let Some((name, raw_value)) = part.split_once('=') else {
@@ -127,7 +122,7 @@ fn forwarded_header_param(value: &str, expected_name: &str) -> Option<String> {
     None
 }
 
-fn first_forwarded_value(value: &str) -> Option<String> {
+pub(crate) fn first_forwarded_value(value: &str) -> Option<String> {
     value
         .split(',')
         .next()

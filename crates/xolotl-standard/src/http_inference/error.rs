@@ -75,6 +75,9 @@ pub(crate) enum HttpInferenceError {
     /// Response JSON could not be parsed.
     #[error("HTTP inference provider response JSON failed: {0}")]
     ResponseJson(#[source] serde_json::Error),
+    /// Incremental provider framing, completion, or output delivery failed.
+    #[error("HTTP inference stream failed: {0}")]
+    Stream(String),
     /// Provider returned a non-success status.
     #[error("HTTP inference provider returned HTTP {status}: {body}")]
     ProviderHttpStatus {
@@ -88,7 +91,7 @@ pub(crate) enum HttpInferenceError {
     MissingResponseField(&'static str),
     /// State read failed while loading HTTP inference provider declarations.
     #[error("HTTP inference provider state read failed: {0}")]
-    State(String),
+    State(#[from] xolotl_state::StateFailure),
     /// State value could not be decoded as an inference declaration.
     #[error("{label} is malformed: {source}")]
     StateDecode {

@@ -5,9 +5,10 @@
 //! held = present). Pairs with the `bracket` idiom so the lock is
 //! released on any exit path.
 
+use crate::error::ObservedFailure;
 use async_trait::async_trait;
-use xolotl_kernel::{Driver, DriverContext, DriverError, MethodSpec};
-use xolotl_state::{Backend, StateError};
+use xolotl_kernel::{Driver, DriverContext, DriverError, DriverOutput, MethodSpec};
+use xolotl_state::{Backend, StateError, StateFailure};
 use xolotl_types::{MethodId, Outcome, OutputMode, Path, Purity, Value};
 
 /// Internal method names in registration order. `install_standard` exposes each
@@ -48,7 +49,7 @@ impl Driver for LockDriver {
         input: Value,
         _output: OutputMode,
         ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
+    ) -> Result<DriverOutput, DriverError> {
         let name = input
             .as_str()
             .map(str::to_string)
@@ -64,21 +65,35 @@ impl Driver for LockDriver {
         match method.get() {
             // acquire: create-if-absent; fail if already held.
             0 => {
-                let holder = Value::Str(format!("p{}", ctx.caller.get()));
-                match self.state.write_cas(&path, None, holder).await {
-                    Ok(()) => Ok(Outcome::Done(Value::Bool(true))),
-                    Err(StateError::CasFailed { .. }) => Ok(Outcome::Done(Value::Bool(false))),
-                    Err(e) => Err(DriverError::Other(e.to_string())),
+                let holder = Value::string(format!("p{}", ctx.caller.get()));
+                match self
+                    .state
+                    .write_cas_tainted(&path, None, holder, ctx.taint.clone())
+                    .await
+                {
+                    Ok(commit) => Ok(DriverOutput::new(Outcome::Done(Value::boolean(true)))
+                        .with_taint(commit.taint)),
+                    Err(StateFailure {
+                        error: StateError::CasFailed { .. },
+                        taint,
+                    }) => {
+                        Ok(DriverOutput::new(Outcome::Done(Value::boolean(false)))
+                            .with_taint(taint))
+                    }
+                    Err(error) => ObservedFailure::from(error)
+                        .with_taint(&ctx.taint)
+                        .into_output("lock"),
                 }
             }
             // release: delete the lock.
-            1 => {
-                self.state
-                    .write_delete(&path)
-                    .await
-                    .map_err(|e| DriverError::Other(e.to_string()))?;
-                Ok(Outcome::Done(Value::Null))
-            }
+            1 => match self.state.write_delete(&path).await {
+                Ok(commit) => {
+                    Ok(DriverOutput::new(Outcome::Done(Value::null())).with_taint(commit.taint))
+                }
+                Err(error) => ObservedFailure::from(error)
+                    .with_taint(&ctx.taint)
+                    .into_output("lock"),
+            },
             _ => Err(DriverError::NoSuchMethod(method)),
         }
     }
@@ -88,44 +103,43 @@ impl Driver for LockDriver {
 mod tests {
     use super::*;
     use anyhow::{Context, Result, ensure};
-    use std::sync::Arc;
     use xolotl_state::InMemoryBackend;
     use xolotl_types::{IdentityRef, ProcessId};
 
     #[tokio::test]
     async fn acquire_is_exclusive_until_released() -> Result<()> {
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let d = LockDriver::new(state);
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
         let a = d
             .call(
                 MethodId::new(0),
-                Value::Str("job".into()),
+                Value::string("job".into()),
                 OutputMode::Unary,
                 &ctx,
             )
             .await
             .context("initial acquire")?;
         ensure!(
-            a == Outcome::Done(Value::Bool(true)),
+            a.outcome == Outcome::Done(Value::boolean(true)),
             "initial acquire: {a:?}"
         );
         let b = d
             .call(
                 MethodId::new(0),
-                Value::Str("job".into()),
+                Value::string("job".into()),
                 OutputMode::Unary,
                 &ctx,
             )
             .await
             .context("held acquire")?;
         ensure!(
-            b == Outcome::Done(Value::Bool(false)),
+            b.outcome == Outcome::Done(Value::boolean(false)),
             "held acquire: {b:?}"
         );
         d.call(
             MethodId::new(1),
-            Value::Str("job".into()),
+            Value::string("job".into()),
             OutputMode::Unary,
             &ctx,
         )
@@ -134,25 +148,28 @@ mod tests {
         let c = d
             .call(
                 MethodId::new(0),
-                Value::Str("job".into()),
+                Value::string("job".into()),
                 OutputMode::Unary,
                 &ctx,
             )
             .await
             .context("re-acquire")?;
-        ensure!(c == Outcome::Done(Value::Bool(true)), "re-acquire: {c:?}");
+        ensure!(
+            c.outcome == Outcome::Done(Value::boolean(true)),
+            "re-acquire: {c:?}"
+        );
         Ok(())
     }
 
     #[tokio::test]
     async fn illegal_lock_name_is_a_driver_error_not_a_panic() -> Result<()> {
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let d = LockDriver::new(state);
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
         let r = d
             .call(
                 MethodId::new(0),
-                Value::Str("bad/name".into()),
+                Value::string("bad/name".into()),
                 OutputMode::Unary,
                 &ctx,
             )

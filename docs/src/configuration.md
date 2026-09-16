@@ -21,18 +21,24 @@ cargo run -p xolotl-daemon -- up
 | Section | Purpose |
 | --- | --- |
 | `[storage]` | Select redb persistent storage or in-memory storage. |
-| `[server]` | Bind listeners with `console_addr`, `external_grpc_addr`, and `external_websocket_addr`. |
+| `[server]` | Bind listeners with `console_addr`, `application_grpc_addr`, `external_grpc_addr`, and `external_websocket_addr`. |
+| `[application_gateway]` | Select the State profile and application gRPC frame, upload/output concurrency, resident output and wait windows. |
 | `[external_gateway.grpc]` | Set Provider/Source session limits for the external gRPC listener. |
 | `[external_gateway.websocket]` | Set the same Provider/Source session limits for the external WebSocket listener. |
 | `[external_gateway.websocket.transport]` | Set WebSocket frame size, first-frame timeout, idle timeout, and connection count. |
 | `[console.root]` | Preseed root credentials. |
 | `[console.auth]` | Set session TTL, session count, and Argon2 verification concurrency. |
-| `[console.ws]` | Set Console WebSocket frame, connection, idle, rate, subscription, result-size, and event backpressure limits. |
+| `[console.ws]` | Set Console WebSocket frame, connection, idle, rate, subscription, result-size, encoded event queue, and all-frame send limits. |
 
 `xolotld` also reads `XOLOTL_CONSOLE_ADDR`, `XOLOTL_EXTERNAL_GRPC_ADDR`, and
-`XOLOTL_EXTERNAL_WEBSOCKET_ADDR` when the matching `[server]` field is absent. A
+`XOLOTL_EXTERNAL_WEBSOCKET_ADDR`, plus `XOLOTL_APPLICATION_GRPC_ADDR`, when the matching `[server]` field is absent. A
 listener stays disabled when both the config field and environment variable are
 absent.
+
+The application listener requires the optional `application-grpc` feature.
+Provision its profile through Console before enabling the address; see
+[Application Gateway](application-gateway.md) for the complete configuration and
+upload protocol.
 
 ## External Gateway
 
@@ -175,6 +181,51 @@ matching `xolotl-standard` feature. Runtime declarations live under
 `state://kernel/inference/*` and `state://kernel/routing/inference`; backend
 records store secret references such as
 `state://vault/inference/<backend>/api_key`, not raw API keys.
+
+`InferenceBackendDef.io_window_bytes` selects the encoded request and parsing
+work window; it defaults to 16,384 bytes and accepts any positive value. One-byte
+windows support split UTF-8 scalars and JSON escapes. This window does not limit
+request size, response size or SSE event size. Output channel windows remain a
+separate `StreamWindow` setting, and the HTTP library owns its transport buffers.
+After record validation, selected text is emitted in chunks up to this window,
+preserving complete UTF-8 scalars (up to four bytes even with a smaller window).
+The output channel charges the encoded chunk and its provenance metadata.
+
+`response_limits` makes result materialization policy explicit:
+
+- `max_materialized_bytes`: simultaneously retained selected text and numeric
+  token bytes in one unary response or atomic SSE record.
+- `max_materialized_nodes`: retained selected value nodes, including empty values.
+- `max_json_frames`: simultaneously open JSON containers, including skipped data.
+
+Every limit is optional; unset fields impose no corresponding quota. The byte
+and node counts are logical admission units, not an allocator or process RSS
+bound. Known control tags and schema keys add fixed storage outside the selected
+token-byte count. Unary output and each atomic selected SSE delta still need resident
+storage; applications can admit those results explicitly without imposing a
+cumulative task-size limit. Unused provider fields are validated incrementally
+and never collected into a complete JSON envelope. In particular, OpenAI
+Responses completion snapshots do not retain the repeated output text.
+
+SSE dispatch requires a complete record and valid JSON before any selected delta
+from that record is emitted. A late error or malformed suffix cannot publish an
+earlier prefix from the same record. The parser removes exactly one initial
+UTF-8 BOM and validates skipped data as well as selected data. The adapters keep
+their declared delta semantics; repeated text is not guessed to be a cumulative
+snapshot.
+HTTP error diagnostics use a fixed 8 KiB read prefix and at most 512 redacted
+display characters, independent of successful response admission. Reaching the
+prefix bound stops reading without waiting for the server to close its body.
+A server that stalls before that point still requires request cancellation or
+a client timeout; a byte bound does not impose a response-duration policy.
+
+Embedded hosts install object capabilities explicitly with
+`StandardConfig::with_object_store`. `ObjectStore` accepts independent read,
+write, and delete adapters; `xolotl-storage-fs::FileObjectStore::open(root)`
+provides a file-backed implementation. Large unary Fetch and filesystem outputs,
+Blob writes, and Tensor writes require an object writer. Blob reads and deletes
+require their corresponding ports. Streamed Fetch and filesystem reads can run
+without object storage.
 
 Console auth, WebSocket, and transport-security fields are deployment settings.
 Capability checks, step-up gates, path-specific admission, action registry

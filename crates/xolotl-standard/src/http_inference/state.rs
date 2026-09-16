@@ -3,7 +3,6 @@ use super::error::HttpInferenceError;
 use super::routing::{HttpInferenceGroup, HttpInferenceRoute, HttpInferenceRouterConfig};
 use crate::inference::{InferenceMethodSupport, ModelCapabilities};
 use crate::router::{GroupPolicy, Router};
-use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use xolotl_state::Backend;
@@ -107,19 +106,37 @@ async fn read_prefix_values(
     state: &Backend,
     prefix: &str,
 ) -> Result<Vec<(Path, Value)>, HttpInferenceError> {
-    let path = Path::parse(prefix).map_err(|e| HttpInferenceError::State(e.to_string()))?;
-    state
-        .read_prefix(&path)
+    let path = Path::parse(prefix).map_err(|_error| HttpInferenceError::StatePath {
+        label: "inference configuration prefix",
+        path: prefix.into(),
+    })?;
+    let mut pages = state.pages(xolotl_state::StateScan::new(path));
+    let mut values = Vec::new();
+    let mut observed = xolotl_types::TaintSet::pristine();
+    while let Some(page) = pages
+        .next()
         .await
-        .map_err(|e| HttpInferenceError::State(e.to_string()))
+        .map_err(|failure| HttpInferenceError::State(failure.with_taint(&observed)))?
+    {
+        observed.union(&page.taint);
+        for (_, value) in &page.entries {
+            observed.union(&value.taint);
+        }
+        values.extend(
+            page.entries
+                .into_iter()
+                .map(|(path, value)| (path, value.value)),
+        );
+    }
+    Ok(values)
 }
 
 async fn state_read(state: &Backend, path: &str) -> Result<Option<Value>, HttpInferenceError> {
-    let path = Path::parse(path).map_err(|e| HttpInferenceError::State(e.to_string()))?;
-    state
-        .read(&path)
-        .await
-        .map_err(|e| HttpInferenceError::State(e.to_string()))
+    let path = Path::parse(path).map_err(|_error| HttpInferenceError::StatePath {
+        label: "inference configuration",
+        path: path.into(),
+    })?;
+    state.read(&path).await.map_err(HttpInferenceError::State)
 }
 
 fn decode_state_value<T: serde::de::DeserializeOwned>(
@@ -159,11 +176,7 @@ async fn resolve_auth(
 }
 
 async fn read_secret_string(state: &Backend, path: &Path) -> Result<String, HttpInferenceError> {
-    let Some(value) = state
-        .read(path)
-        .await
-        .map_err(|e| HttpInferenceError::State(e.to_string()))?
-    else {
+    let Some(value) = state.read(path).await.map_err(HttpInferenceError::State)? else {
         return Err(HttpInferenceError::MissingSecret(path.to_string()));
     };
     value
@@ -191,24 +204,17 @@ fn runtime_config_from_defs(
     }
     config.capabilities = capabilities_from_def(model.capabilities);
     config.options.default_headers = backend.default_headers.clone();
-    config.options.request_overrides = value_overrides_to_json(&backend.request_overrides)?;
+    config.options.request_overrides = backend.request_overrides.clone().into();
     config.options.api_version = backend.api_version.clone();
+    if let Some(limit) = backend.io_window_bytes {
+        config.io_window_bytes = limit;
+    }
+    config.response_limits = backend.response_limits;
     Ok(config)
 }
 
 fn qualified_model_id(backend_id: &str, model_id: &str) -> String {
     format!("{backend_id}/{model_id}")
-}
-
-fn value_overrides_to_json(
-    overrides: &BTreeMap<String, Value>,
-) -> Result<BTreeMap<String, JsonValue>, HttpInferenceError> {
-    let mut out = BTreeMap::new();
-    for (key, value) in overrides {
-        let json = serde_json::to_value(value).map_err(HttpInferenceError::RequestJson)?;
-        out.insert(key.clone(), json);
-    }
-    Ok(out)
 }
 
 fn capabilities_from_def(caps: InferenceModelCapabilities) -> ModelCapabilities {
@@ -236,3 +242,6 @@ fn group_policy_from_def(policy: InferenceGroupPolicy) -> GroupPolicy {
         InferenceGroupPolicy::Weighted => GroupPolicy::Weighted,
     }
 }
+
+#[cfg(test)]
+mod tests;

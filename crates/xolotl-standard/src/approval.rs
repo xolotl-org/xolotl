@@ -18,11 +18,13 @@
 //! `now_millis` input field when supplied, else the
 //! wall clock.
 
+use crate::error::ObservedFailure;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
-use xolotl_kernel::{Driver, DriverContext, DriverError, MethodSpec};
+use xolotl_kernel::{Driver, DriverContext, DriverError, DriverOutput, MethodSpec};
 use xolotl_state::Backend;
 use xolotl_types::{MethodId, Outcome, OutputMode, Path, Purity, Value};
+use xolotl_types::{ValueMap, ValueView};
 
 /// Internal method names in registration order. `install_standard` exposes each
 /// one as a separate `effect://approval/<method>` Resource with public method
@@ -65,7 +67,7 @@ impl Fanout {
     }
 }
 
-/// The persisted approval record. Stored as a `Value::Map` so it lives in the
+/// The persisted approval record. Stored as a a `Value` map so it lives in the
 /// state plane and travels with taint like any other value.
 #[derive(Clone, Debug, PartialEq)]
 struct Record {
@@ -94,13 +96,16 @@ impl Record {
 
     fn to_value(&self) -> Value {
         let mut m = BTreeMap::new();
-        m.insert("status".into(), Value::Str(self.status.clone()));
-        m.insert("fanout".into(), Value::Str(self.fanout.as_str().into()));
-        m.insert("deadline_millis".into(), Value::Int(self.deadline_millis));
+        m.insert("status".into(), Value::string(self.status.clone()));
+        m.insert("fanout".into(), Value::string(self.fanout.as_str().into()));
+        m.insert(
+            "deadline_millis".into(),
+            Value::integer(self.deadline_millis),
+        );
         m.insert("approvers".into(), str_list(&self.approvers));
         m.insert("approvals".into(), str_list(&self.approvals));
         m.insert("denials".into(), str_list(&self.denials));
-        Value::Map(m)
+        Value::map(m)
     }
 
     fn from_value(v: &Value) -> Result<Self, DriverError> {
@@ -191,16 +196,13 @@ impl Record {
 }
 
 fn str_list(xs: &[String]) -> Value {
-    Value::List(xs.iter().map(|s| Value::Str(s.clone())).collect())
+    Value::list(xs.iter().map(|s| Value::string(s.clone())).collect())
 }
 
-fn required_record_str<'a>(
-    m: &'a BTreeMap<String, Value>,
-    field: &'static str,
-) -> Result<&'a str, DriverError> {
-    match m.get(field) {
-        Some(Value::Str(value)) if !value.is_empty() => Ok(value),
-        Some(Value::Str(_)) => Err(DriverError::Other(format!(
+fn required_record_str<'a>(m: &'a ValueMap, field: &'static str) -> Result<&'a str, DriverError> {
+    match m.get(field).map(Value::view) {
+        Some(ValueView::Str(value)) if !value.is_empty() => Ok(value),
+        Some(ValueView::Str(_)) => Err(DriverError::Other(format!(
             "malformed approval record: {field} must not be empty"
         ))),
         Some(_) => Err(DriverError::Other(format!(
@@ -212,12 +214,9 @@ fn required_record_str<'a>(
     }
 }
 
-fn required_record_int(
-    m: &BTreeMap<String, Value>,
-    field: &'static str,
-) -> Result<i64, DriverError> {
-    match m.get(field) {
-        Some(Value::Int(value)) => Ok(*value),
+fn required_record_int(m: &ValueMap, field: &'static str) -> Result<i64, DriverError> {
+    match m.get(field).map(Value::view) {
+        Some(ValueView::Int(value)) => Ok(value),
         Some(_) => Err(DriverError::Other(format!(
             "malformed approval record: {field} must be an integer"
         ))),
@@ -228,13 +227,13 @@ fn required_record_int(
 }
 
 fn parse_str_list(v: Option<&Value>, field: &'static str) -> Result<Vec<String>, DriverError> {
-    match v {
+    match v.map(Value::view) {
         None => Ok(Vec::new()),
-        Some(Value::List(items)) => items
+        Some(ValueView::List(items)) => items
             .iter()
-            .map(|item| match item {
-                Value::Str(value) if !value.is_empty() => Ok(value.clone()),
-                Value::Str(_) => Err(DriverError::InvalidInput(format!(
+            .map(|item| match item.view() {
+                ValueView::Str(value) if !value.is_empty() => Ok(value.to_owned()),
+                ValueView::Str(_) => Err(DriverError::InvalidInput(format!(
                     "{field} must not contain empty strings"
                 ))),
                 _ => Err(DriverError::InvalidInput(format!(
@@ -270,14 +269,23 @@ impl ApprovalDriver {
             .map_err(|e| DriverError::Other(format!("invalid approval key {key:?}: {e}")))
     }
 
-    async fn read_record(&self, path: &Path) -> Result<Option<Record>, DriverError> {
+    async fn read_record(
+        &self,
+        path: &Path,
+        observed: &mut xolotl_types::TaintSet,
+    ) -> Result<Option<Record>, ObservedFailure> {
         let v = self
             .state
-            .read(path)
+            .read_tainted(path)
             .await
-            .map_err(|e| DriverError::Other(e.to_string()))?;
+            .map_err(ObservedFailure::from)?;
         match v {
-            Some(value) => Record::from_value(&value).map(Some),
+            Some(value) => {
+                observed.union(&value.taint);
+                Record::from_value(&value.value)
+                    .map(Some)
+                    .map_err(ObservedFailure::from)
+            }
             None => Ok(None),
         }
     }
@@ -285,23 +293,20 @@ impl ApprovalDriver {
 
 /// Resolve `now` (millis since epoch) from a `now_millis` input field, falling
 /// back to the wall clock so live asks expire without an injected clock.
-fn now_from(m: &BTreeMap<String, Value>) -> Result<i64, DriverError> {
-    match m.get("now_millis") {
+fn now_from(m: &ValueMap) -> Result<i64, DriverError> {
+    match m.get("now_millis").map(Value::view) {
         None => Ok(crate::time::now_millis()),
-        Some(Value::Int(now)) => Ok(*now),
+        Some(ValueView::Int(now)) => Ok(now),
         Some(_) => Err(DriverError::InvalidInput(
             "approval now_millis must be an integer".into(),
         )),
     }
 }
 
-fn required_input_str<'a>(
-    m: &'a BTreeMap<String, Value>,
-    field: &'static str,
-) -> Result<&'a str, DriverError> {
-    match m.get(field) {
-        Some(Value::Str(value)) if !value.is_empty() => Ok(value),
-        Some(Value::Str(_)) => Err(DriverError::InvalidInput(format!(
+fn required_input_str<'a>(m: &'a ValueMap, field: &'static str) -> Result<&'a str, DriverError> {
+    match m.get(field).map(Value::view) {
+        Some(ValueView::Str(value)) if !value.is_empty() => Ok(value),
+        Some(ValueView::Str(_)) => Err(DriverError::InvalidInput(format!(
             "approval {field} must not be empty"
         ))),
         Some(_) => Err(DriverError::InvalidInput(format!(
@@ -313,10 +318,10 @@ fn required_input_str<'a>(
     }
 }
 
-fn optional_fanout(m: &BTreeMap<String, Value>) -> Result<Fanout, DriverError> {
-    match m.get("fanout") {
+fn optional_fanout(m: &ValueMap) -> Result<Fanout, DriverError> {
+    match m.get("fanout").map(Value::view) {
         None => Ok(Fanout::AnyOne),
-        Some(Value::Str(value)) => Fanout::parse(value),
+        Some(ValueView::Str(value)) => Fanout::parse(value),
         Some(_) => Err(DriverError::InvalidInput(
             "approval fanout must be a string".into(),
         )),
@@ -324,14 +329,14 @@ fn optional_fanout(m: &BTreeMap<String, Value>) -> Result<Fanout, DriverError> {
 }
 
 fn optional_non_negative_int(
-    m: &BTreeMap<String, Value>,
+    m: &ValueMap,
     field: &'static str,
     default: i64,
 ) -> Result<i64, DriverError> {
-    match m.get(field) {
+    match m.get(field).map(Value::view) {
         None => Ok(default),
-        Some(Value::Int(value)) if *value >= 0 => Ok(*value),
-        Some(Value::Int(_)) => Err(DriverError::InvalidInput(format!(
+        Some(ValueView::Int(value)) if value >= 0 => Ok(value),
+        Some(ValueView::Int(_)) => Err(DriverError::InvalidInput(format!(
             "approval {field} must be non-negative"
         ))),
         Some(_) => Err(DriverError::InvalidInput(format!(
@@ -340,9 +345,9 @@ fn optional_non_negative_int(
     }
 }
 
-fn decision_from(m: &BTreeMap<String, Value>) -> Result<bool, DriverError> {
-    match m.get("decision") {
-        Some(Value::Str(decision)) => match decision.as_str() {
+fn decision_from(m: &ValueMap) -> Result<bool, DriverError> {
+    match m.get("decision").map(Value::view) {
+        Some(ValueView::Str(decision)) => match decision {
             "approve" | "approved" | "yes" => return Ok(true),
             "deny" | "denied" | "no" => return Ok(false),
             other => {
@@ -358,8 +363,8 @@ fn decision_from(m: &BTreeMap<String, Value>) -> Result<bool, DriverError> {
         }
         None => {}
     }
-    match m.get("approve") {
-        Some(Value::Bool(value)) => Ok(*value),
+    match m.get("approve").map(Value::view) {
+        Some(ValueView::Bool(value)) => Ok(value),
         Some(_) => Err(DriverError::InvalidInput(
             "approval approve must be a bool".into(),
         )),
@@ -369,15 +374,15 @@ fn decision_from(m: &BTreeMap<String, Value>) -> Result<bool, DriverError> {
     }
 }
 
-#[async_trait]
-impl Driver for ApprovalDriver {
-    async fn call(
+impl ApprovalDriver {
+    async fn execute(
         &self,
         method: MethodId,
         input: Value,
         _output: OutputMode,
-        _ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
+        ctx: &DriverContext,
+        observed: &mut xolotl_types::TaintSet,
+    ) -> Result<DriverOutput, ObservedFailure> {
         let m = crate::input::map(input, "approval")?;
         let key = required_input_str(&m, "dedup_key")?.to_string();
         let path = Self::key_path(&key)?;
@@ -389,54 +394,93 @@ impl Driver for ApprovalDriver {
                 let approvers = parse_str_list(m.get("approvers"), "approvers")?;
                 let deadline = optional_non_negative_int(&m, "deadline_millis", 0)?;
                 let record = Record::pending(fanout, approvers, deadline);
-                match self.state.write_cas(&path, None, record.to_value()).await {
-                    Ok(()) | Err(xolotl_state::StateError::CasFailed { .. }) => {}
-                    Err(error) => return Err(DriverError::Other(error.to_string())),
+                match self
+                    .state
+                    .write_cas_tainted(&path, None, record.to_value(), ctx.taint.clone())
+                    .await
+                {
+                    Ok(commit) => observed.union(&commit.taint),
+                    Err(xolotl_state::StateFailure {
+                        error: xolotl_state::StateError::CasFailed { .. },
+                        taint,
+                    }) => observed.union(&taint),
+                    Err(error) => return Err(error.into()),
                 }
-                let current = self.read_record(&path).await?.ok_or_else(|| {
+                let current = self.read_record(&path, observed).await?.ok_or_else(|| {
                     DriverError::Other("approval record missing after ask".into())
                 })?;
-                Ok(Outcome::Done(current.to_value()))
+                Ok(DriverOutput::new(Outcome::Done(current.to_value())))
             }
             // check: pure read of the current decision, reported as a status
             // string. Reports `expired` once now > deadline while pending.
             1 => {
-                let status = match self.read_record(&path).await? {
+                let status = match self.read_record(&path, observed).await? {
                     Some(r) => r.effective_status(now_from(&m)?).to_string(),
-                    None => return Ok(Outcome::Done(Value::Null)),
+                    None => return Ok(DriverOutput::new(Outcome::Done(Value::null()))),
                 };
-                Ok(Outcome::Done(Value::Str(status)))
+                Ok(DriverOutput::new(Outcome::Done(Value::string(status))))
             }
             // respond: an approver records approve/deny; re-resolve under fanout.
             2 => {
                 let approver = required_input_str(&m, "approver")?.to_string();
                 let approve = decision_from(&m)?;
                 let mut record = self
-                    .read_record(&path)
+                    .read_record(&path, observed)
                     .await?
                     .ok_or_else(|| DriverError::Other(format!("no approval for key {key:?}")))?;
                 // A lapsed deadline freezes the record at `expired`; late
                 // responses do not revive it.
                 if record.effective_status(now_from(&m)?) == STATUS_EXPIRED {
                     record.status = STATUS_EXPIRED.into();
-                    self.state
-                        .write_set(&path, record.to_value())
+                    let commit = self
+                        .state
+                        .write_set_tainted(&path, record.to_value(), observed.clone())
                         .await
-                        .map_err(|e| DriverError::Other(e.to_string()))?;
-                    return Ok(Outcome::Done(Value::Str(STATUS_EXPIRED.into())));
+                        .map_err(ObservedFailure::from)?;
+                    observed.union(&commit.taint);
+                    return Ok(DriverOutput::new(Outcome::Done(Value::string(
+                        STATUS_EXPIRED.into(),
+                    ))));
                 }
                 // Once decided (AnyOne first-responder), further responses
                 // return the stable verdict without rewriting state.
                 if !record.is_decided() {
                     record.apply(&approver, approve);
-                    self.state
-                        .write_set(&path, record.to_value())
+                    let commit = self
+                        .state
+                        .write_set_tainted(&path, record.to_value(), observed.clone())
                         .await
-                        .map_err(|e| DriverError::Other(e.to_string()))?;
+                        .map_err(ObservedFailure::from)?;
+                    observed.union(&commit.taint);
                 }
-                Ok(Outcome::Done(Value::Str(record.status.clone())))
+                Ok(DriverOutput::new(Outcome::Done(Value::string(
+                    record.status.clone(),
+                ))))
             }
-            _ => Err(DriverError::NoSuchMethod(method)),
+            _ => Err(DriverError::NoSuchMethod(method).into()),
+        }
+    }
+}
+
+#[async_trait]
+impl Driver for ApprovalDriver {
+    async fn call(
+        &self,
+        method: MethodId,
+        input: Value,
+        output: OutputMode,
+        ctx: &DriverContext,
+    ) -> Result<DriverOutput, DriverError> {
+        let mut observed = ctx.taint.clone();
+        match self
+            .execute(method, input, output, ctx, &mut observed)
+            .await
+        {
+            Ok(mut output) => {
+                output.taint.union(&observed);
+                Ok(output)
+            }
+            Err(error) => error.with_taint(&observed).into_output("approval"),
         }
     }
 }
@@ -445,7 +489,6 @@ impl Driver for ApprovalDriver {
 mod tests {
     use super::*;
     use anyhow::{Context, Result, bail, ensure};
-    use std::sync::Arc;
     use xolotl_state::InMemoryBackend;
     use xolotl_types::{IdentityRef, ProcessId};
 
@@ -454,27 +497,31 @@ mod tests {
     }
 
     fn driver() -> ApprovalDriver {
-        ApprovalDriver::new(Arc::new(InMemoryBackend::new()))
+        ApprovalDriver::new(InMemoryBackend::new().into_backend())
     }
 
     fn ask(key: &str) -> Value {
         let mut m = BTreeMap::new();
-        m.insert("dedup_key".into(), Value::Str(key.into()));
-        Value::Map(m)
+        m.insert("dedup_key".into(), Value::string(key.into()));
+        Value::map(m)
     }
 
     async fn check(d: &ApprovalDriver, key: &str, now: Option<i64>) -> Result<String> {
         let mut m = BTreeMap::new();
-        m.insert("dedup_key".into(), Value::Str(key.into()));
+        m.insert("dedup_key".into(), Value::string(key.into()));
         if let Some(n) = now {
-            m.insert("now_millis".into(), Value::Int(n));
+            m.insert("now_millis".into(), Value::integer(n));
         }
         match d
-            .call(MethodId::new(1), Value::Map(m), OutputMode::Unary, &ctx())
+            .call(MethodId::new(1), Value::map(m), OutputMode::Unary, &ctx())
             .await
             .context("check approval status")?
+            .outcome
         {
-            Outcome::Done(Value::Str(s)) => Ok(s),
+            Outcome::Done(value) => value
+                .as_str()
+                .map(str::to_owned)
+                .context("expected status string"),
             other => bail!("expected status string, got {other:?}"),
         }
     }
@@ -486,15 +533,19 @@ mod tests {
         decision: &str,
     ) -> Result<String> {
         let mut m = BTreeMap::new();
-        m.insert("dedup_key".into(), Value::Str(key.into()));
-        m.insert("approver".into(), Value::Str(approver.into()));
-        m.insert("decision".into(), Value::Str(decision.into()));
+        m.insert("dedup_key".into(), Value::string(key.into()));
+        m.insert("approver".into(), Value::string(approver.into()));
+        m.insert("decision".into(), Value::string(decision.into()));
         match d
-            .call(MethodId::new(2), Value::Map(m), OutputMode::Unary, &ctx())
+            .call(MethodId::new(2), Value::map(m), OutputMode::Unary, &ctx())
             .await
             .context("respond to approval")?
+            .outcome
         {
-            Outcome::Done(Value::Str(s)) => Ok(s),
+            Outcome::Done(value) => value
+                .as_str()
+                .map(str::to_owned)
+                .context("expected status string"),
             other => bail!("expected status string, got {other:?}"),
         }
     }
@@ -533,12 +584,12 @@ mod tests {
     async fn ask_rejects_malformed_options() -> Result<()> {
         let d = driver();
         let mut bad_fanout = BTreeMap::new();
-        bad_fanout.insert("dedup_key".into(), Value::Str("bad-fanout".into()));
-        bad_fanout.insert("fanout".into(), Value::Str("sometimes".into()));
+        bad_fanout.insert("dedup_key".into(), Value::string("bad-fanout".into()));
+        bad_fanout.insert("fanout".into(), Value::string("sometimes".into()));
         let out = d
             .call(
                 MethodId::new(0),
-                Value::Map(bad_fanout),
+                Value::map(bad_fanout),
                 OutputMode::Unary,
                 &ctx(),
             )
@@ -546,12 +597,12 @@ mod tests {
         ensure!(out.is_err(), "invalid fanout was accepted");
 
         let mut bad_deadline = BTreeMap::new();
-        bad_deadline.insert("dedup_key".into(), Value::Str("bad-deadline".into()));
-        bad_deadline.insert("deadline_millis".into(), Value::Int(-1));
+        bad_deadline.insert("dedup_key".into(), Value::string("bad-deadline".into()));
+        bad_deadline.insert("deadline_millis".into(), Value::integer(-1));
         let out = d
             .call(
                 MethodId::new(0),
-                Value::Map(bad_deadline),
+                Value::map(bad_deadline),
                 OutputMode::Unary,
                 &ctx(),
             )
@@ -559,15 +610,15 @@ mod tests {
         ensure!(out.is_err(), "negative deadline was accepted");
 
         let mut bad_approver = BTreeMap::new();
-        bad_approver.insert("dedup_key".into(), Value::Str("bad-approver".into()));
+        bad_approver.insert("dedup_key".into(), Value::string("bad-approver".into()));
         bad_approver.insert(
             "approvers".into(),
-            Value::List(vec![Value::Str("alice".into()), Value::Int(1)]),
+            Value::list(vec![Value::string("alice".into()), Value::integer(1)]),
         );
         let out = d
             .call(
                 MethodId::new(0),
-                Value::Map(bad_approver),
+                Value::map(bad_approver),
                 OutputMode::Unary,
                 &ctx(),
             )
@@ -580,13 +631,13 @@ mod tests {
     async fn any_one_resolves_on_first_approve() -> Result<()> {
         let d = driver();
         let mut m = BTreeMap::new();
-        m.insert("dedup_key".into(), Value::Str("deploy".into()));
-        m.insert("fanout".into(), Value::Str("any_one".into()));
+        m.insert("dedup_key".into(), Value::string("deploy".into()));
+        m.insert("fanout".into(), Value::string("any_one".into()));
         m.insert(
             "approvers".into(),
             str_list(&["alice".into(), "bob".into()]),
         );
-        d.call(MethodId::new(0), Value::Map(m), OutputMode::Unary, &ctx())
+        d.call(MethodId::new(0), Value::map(m), OutputMode::Unary, &ctx())
             .await
             .context("ask approval")?;
         let pending = check(&d, "deploy", None).await?;
@@ -605,13 +656,13 @@ mod tests {
     async fn require_all_needs_every_approver() -> Result<()> {
         let d = driver();
         let mut m = BTreeMap::new();
-        m.insert("dedup_key".into(), Value::Str("wire".into()));
-        m.insert("fanout".into(), Value::Str("require_all".into()));
+        m.insert("dedup_key".into(), Value::string("wire".into()));
+        m.insert("fanout".into(), Value::string("require_all".into()));
         m.insert(
             "approvers".into(),
             str_list(&["alice".into(), "bob".into()]),
         );
-        d.call(MethodId::new(0), Value::Map(m), OutputMode::Unary, &ctx())
+        d.call(MethodId::new(0), Value::map(m), OutputMode::Unary, &ctx())
             .await
             .context("ask approval")?;
         let first = respond(&d, "wire", "alice", "approve").await?;
@@ -629,13 +680,13 @@ mod tests {
     async fn require_all_denied_by_single_veto() -> Result<()> {
         let d = driver();
         let mut m = BTreeMap::new();
-        m.insert("dedup_key".into(), Value::Str("merge".into()));
-        m.insert("fanout".into(), Value::Str("require_all".into()));
+        m.insert("dedup_key".into(), Value::string("merge".into()));
+        m.insert("fanout".into(), Value::string("require_all".into()));
         m.insert(
             "approvers".into(),
             str_list(&["alice".into(), "bob".into()]),
         );
-        d.call(MethodId::new(0), Value::Map(m), OutputMode::Unary, &ctx())
+        d.call(MethodId::new(0), Value::map(m), OutputMode::Unary, &ctx())
             .await
             .context("ask approval")?;
         let first = respond(&d, "merge", "alice", "approve").await?;
@@ -654,12 +705,12 @@ mod tests {
             .await
             .context("ask approval")?;
         let mut m = BTreeMap::new();
-        m.insert("dedup_key".into(), Value::Str("decision".into()));
-        m.insert("approver".into(), Value::Str("alice".into()));
-        m.insert("decision".into(), Value::Str("maybe".into()));
-        m.insert("approve".into(), Value::Bool(true));
+        m.insert("dedup_key".into(), Value::string("decision".into()));
+        m.insert("approver".into(), Value::string("alice".into()));
+        m.insert("decision".into(), Value::string("maybe".into()));
+        m.insert("approve".into(), Value::boolean(true));
         let out = d
-            .call(MethodId::new(2), Value::Map(m), OutputMode::Unary, &ctx())
+            .call(MethodId::new(2), Value::map(m), OutputMode::Unary, &ctx())
             .await;
         ensure!(out.is_err(), "invalid decision was accepted");
         Ok(())
@@ -669,9 +720,9 @@ mod tests {
     async fn check_reports_expired_past_deadline() -> Result<()> {
         let d = driver();
         let mut m = BTreeMap::new();
-        m.insert("dedup_key".into(), Value::Str("timed".into()));
-        m.insert("deadline_millis".into(), Value::Int(1_000));
-        d.call(MethodId::new(0), Value::Map(m), OutputMode::Unary, &ctx())
+        m.insert("dedup_key".into(), Value::string("timed".into()));
+        m.insert("deadline_millis".into(), Value::integer(1_000));
+        d.call(MethodId::new(0), Value::map(m), OutputMode::Unary, &ctx())
             .await
             .context("ask approval with deadline")?;
         let pending = check(&d, "timed", Some(500)).await?;
@@ -679,26 +730,26 @@ mod tests {
         let expired = check(&d, "timed", Some(2_000)).await?;
         ensure!(expired == "expired", "after deadline status: {expired:?}");
         let mut r = BTreeMap::new();
-        r.insert("dedup_key".into(), Value::Str("timed".into()));
-        r.insert("approver".into(), Value::Str("alice".into()));
-        r.insert("decision".into(), Value::Str("approve".into()));
-        r.insert("now_millis".into(), Value::Int(2_001));
+        r.insert("dedup_key".into(), Value::string("timed".into()));
+        r.insert("approver".into(), Value::string("alice".into()));
+        r.insert("decision".into(), Value::string("approve".into()));
+        r.insert("now_millis".into(), Value::integer(2_001));
         let out = d
-            .call(MethodId::new(2), Value::Map(r), OutputMode::Unary, &ctx())
+            .call(MethodId::new(2), Value::map(r), OutputMode::Unary, &ctx())
             .await
             .context("late approval response")?;
-        let expected = Outcome::Done(Value::Str("expired".into()));
-        ensure!(out == expected, "late response status: {out:?}");
+        let expected = Outcome::Done(Value::string("expired".into()));
+        ensure!(out.outcome == expected, "late response status: {out:?}");
         Ok(())
     }
 
     #[tokio::test]
     async fn malformed_stored_record_is_an_error() -> Result<()> {
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let d = ApprovalDriver::new(state.clone());
         let path = ApprovalDriver::key_path("corrupt").context("approval path")?;
         state
-            .write_set(&path, Value::Map(BTreeMap::new()))
+            .write_set(&path, Value::map(BTreeMap::new()))
             .await
             .context("write malformed approval record")?;
         let out = d

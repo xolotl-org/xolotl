@@ -6,11 +6,11 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::runtime::{Builder, Runtime};
 use xolotl_kernel::{FactSink, FactStore};
-use xolotl_state::StateBackend;
+use xolotl_state::{StateHistoryQuery, StateScan, prelude::*};
 use xolotl_storage_redb::RedbStore;
 use xolotl_types::{
-    DecisionTag, Fact, HandleId, IdentityRef, MethodId, NodeId, OperationId, OutcomeRef, Path,
-    ProcessId, ReplayClass, ResourceId, TaintSet, Timestamp, Value, ValueRef,
+    DecisionTag, ExecutionId, Fact, HandleId, IdentityRef, InvocationId, MethodId, NodeId,
+    OperationId, Path, ProcessId, ReplayClass, ResourceId, TaintSet, Timestamp, Value,
 };
 
 const FACTS_IN_SCAN_BENCH: u32 = 4_096;
@@ -18,7 +18,7 @@ const STATE_ITEMS_IN_SEQUENCE: u32 = 1_024;
 const STATE_KEYS_IN_PREFIX_SCAN: u32 = 1_024;
 const STATE_WRITES_IN_RANGE_SCAN: u32 = 1_024;
 const BENCH_FACTS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("facts");
-const BENCH_FACT_INDEX_TABLE: TableDefinition<&str, u64> = TableDefinition::new("fact_index");
+const BENCH_FACT_INDEX_TABLE: TableDefinition<&[u8], u64> = TableDefinition::new("fact_index_v2");
 const BENCH_FACT_PROCESS_INDEX_TABLE: TableDefinition<&str, u64> =
     TableDefinition::new("fact_process_index");
 const BENCH_FACT_META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("fact_meta");
@@ -60,20 +60,26 @@ fn observe_error(error: anyhow::Error) {
 
 fn fact(process: ProcessId, node: u32, complete: bool) -> Fact {
     Fact {
-        id: OperationId::new(process, NodeId::new(node), 0),
+        id: OperationId::new(
+            process,
+            ExecutionId::FIRST,
+            InvocationId::new(1),
+            NodeId::new(node),
+            0,
+        ),
         schema_version: Fact::SCHEMA_VERSION,
         caller: process,
         acting: IdentityRef::ROOT,
         handle: HandleId::new(0, 1),
         resource: ResourceId::new(1),
         method: MethodId::new(0),
-        input_ref: ValueRef::Inline(Value::Int(node as i64)),
+        input: Value::integer(node as i64),
         taint: TaintSet::pristine(),
         decision: DecisionTag::Ok,
-        outcome_ref: if complete {
-            OutcomeRef::Inline(Value::Int(node as i64))
+        outcome: if complete {
+            Some(Value::integer(node as i64))
         } else {
-            OutcomeRef::None
+            None
         },
         batch: None,
         replay: ReplayClass::NonIdempotentEffect,
@@ -90,7 +96,7 @@ fn prepopulate_state_sequence(
     rt.block_on(async {
         for i in 0..items {
             backend
-                .write_append(path, Value::Int(i as i64))
+                .write_append(path, Value::integer(i as i64))
                 .await
                 .map_err(|error| {
                     anyhow!("state append failed during sequence prepopulate: {error}")
@@ -109,7 +115,7 @@ fn prepopulate_state_prefix(
         for i in 0..keys {
             let path = bench_path(&format!("state://bench/prefix/k{i}"))?;
             backend
-                .write_set(&path, Value::Int(i as i64))
+                .write_set(&path, Value::integer(i as i64))
                 .await
                 .map_err(|error| anyhow!("state set failed during prefix prepopulate: {error}"))?;
         }
@@ -126,7 +132,7 @@ fn prepopulate_state_history(
     rt.block_on(async {
         for i in 0..writes {
             backend
-                .write_set(path, Value::Int(i as i64))
+                .write_set(path, Value::integer(i as i64))
                 .await
                 .map_err(|error| anyhow!("state set failed during history prepopulate: {error}"))?;
         }
@@ -157,7 +163,7 @@ fn bench_state(c: &mut Criterion) {
                 Ok((_dir, backend, path)) => {
                     let result = rt.block_on(async {
                         backend
-                            .write_append(black_box(&path), black_box(Value::Int(1)))
+                            .write_append(black_box(&path), black_box(Value::integer(1)))
                             .await
                             .map_err(|error| anyhow!("state append failed: {error}"))
                     });
@@ -181,7 +187,7 @@ fn bench_state(c: &mut Criterion) {
                 Ok((_dir, backend, path)) => {
                     let result = rt.block_on(async {
                         backend
-                            .write_set(black_box(&path), black_box(Value::Int(7)))
+                            .write_set(black_box(&path), black_box(Value::integer(7)))
                             .await
                             .map_err(|error| anyhow!("state set failed: {error}"))
                     });
@@ -201,7 +207,7 @@ fn bench_state(c: &mut Criterion) {
                 let path = bench_path("state://bench/cas")?;
                 rt.block_on(async {
                     backend
-                        .write_set(&path, Value::Int(1))
+                        .write_set(&path, Value::integer(1))
                         .await
                         .map_err(|error| anyhow!("state set failed before CAS: {error}"))?;
                     Ok::<(), anyhow::Error>(())
@@ -214,8 +220,8 @@ fn bench_state(c: &mut Criterion) {
                         backend
                             .write_cas(
                                 black_box(&path),
-                                black_box(Some(Value::Int(1))),
-                                black_box(Value::Int(2)),
+                                black_box(Some(Value::integer(1))),
+                                black_box(Value::integer(2)),
                             )
                             .await
                             .map_err(|error| anyhow!("state CAS failed: {error}"))
@@ -243,7 +249,7 @@ fn bench_state(c: &mut Criterion) {
                         backend
                             .write_append(
                                 black_box(&path),
-                                black_box(Value::Int(STATE_ITEMS_IN_SEQUENCE as i64)),
+                                black_box(Value::integer(STATE_ITEMS_IN_SEQUENCE as i64)),
                             )
                             .await
                             .map_err(|error| anyhow!("state append failed: {error}"))
@@ -282,7 +288,7 @@ fn bench_state(c: &mut Criterion) {
         );
     });
 
-    group.bench_function("read_prefix_1024_keys", |b| {
+    group.bench_function("query_pages_1024_keys", |b| {
         b.iter_batched(
             || {
                 let (dir, store) = redb_store()?;
@@ -293,10 +299,13 @@ fn bench_state(c: &mut Criterion) {
             |setup: Result<_>| match setup {
                 Ok((_dir, backend, prefix)) => {
                     let result = rt.block_on(async {
-                        backend
-                            .read_prefix(black_box(&prefix))
-                            .await
-                            .map_err(|error| anyhow!("state prefix read failed: {error}"))
+                        let mut pages = backend.pages(StateScan::new(black_box(&prefix).clone()));
+                        let mut count = 0;
+                        while let Some(page) = pages.next().await? {
+                            count += page.entries.len();
+                            black_box(page);
+                        }
+                        Ok::<_, anyhow::Error>(count)
                     });
                     observe(result);
                 }
@@ -306,7 +315,7 @@ fn bench_state(c: &mut Criterion) {
         );
     });
 
-    group.bench_function("read_range_1024_writes_same_path", |b| {
+    group.bench_function("history_pages_1024_writes_same_path", |b| {
         b.iter_batched(
             || {
                 let (dir, store) = redb_store()?;
@@ -318,10 +327,17 @@ fn bench_state(c: &mut Criterion) {
             |setup: Result<_>| match setup {
                 Ok((_dir, backend, path)) => {
                     let result = rt.block_on(async {
-                        backend
-                            .read_range(black_box(&path), 0, i64::MAX)
-                            .await
-                            .map_err(|error| anyhow!("state range read failed: {error}"))
+                        let mut pages = backend.history_pages(StateHistoryQuery::new(
+                            black_box(&path).clone(),
+                            0,
+                            i64::MAX,
+                        ));
+                        let mut count = 0;
+                        while let Some(page) = pages.next().await? {
+                            count += page.entries.len();
+                            black_box(page);
+                        }
+                        Ok::<_, anyhow::Error>(count)
                     });
                     observe(result);
                 }
@@ -338,10 +354,6 @@ fn fact_sink() -> Result<(TempDir, FactSink)> {
     let (dir, store) = redb_store()?;
     let fact_store = store.fact_store()?;
     Ok((dir, FactSink::new(Arc::new(fact_store))))
-}
-
-fn op_key(id: &OperationId) -> String {
-    format!("{}/{}/{}", id.process.get(), id.position.get(), id.attempt)
 }
 
 fn process_key(process: ProcessId, slot: u64) -> String {
@@ -361,7 +373,7 @@ fn prepopulated_fact_sink(count: u32) -> Result<(TempDir, FactSink)> {
             let slot = i as u64;
             let fact = fact(process, i, true);
             let bytes = serde_json::to_vec(&fact)?;
-            let op_key = op_key(&fact.id);
+            let op_key = fact.id.to_bytes();
             let process_key = process_key(fact.caller, slot);
             Ok((slot, bytes, op_key, process_key))
         })
@@ -379,7 +391,7 @@ fn prepopulated_fact_sink(count: u32) -> Result<(TempDir, FactSink)> {
         {
             let mut table = txn.open_table(BENCH_FACT_INDEX_TABLE)?;
             for (slot, _, key, _) in &rows {
-                table.insert(key.as_str(), *slot)?;
+                table.insert(key.as_slice(), *slot)?;
             }
         }
         {

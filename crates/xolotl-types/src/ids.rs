@@ -8,6 +8,7 @@
 //! allocation or hashing cost. `HandleId` is a generational `(index, gen)`
 //! pair so revoke/reopen cannot be confused (ABA-safe).
 
+use core::num::NonZeroU64;
 use serde::{Deserialize, Serialize};
 
 /// Macro for a `u64`-backed compact id newtype.
@@ -25,8 +26,8 @@ macro_rules! id_u64 {
             pub const fn get(self) -> u64 { self.0 }
         }
 
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        impl core::fmt::Display for $name {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                 write!(f, "{}#{}", stringify!($name), self.0)
             }
         }
@@ -53,6 +54,40 @@ id_u64!(/// Identifies a remote endpoint.
     EndpointId);
 id_u64!(/// Identifies a compiled `ExecutionGraph`.
     GraphId);
+id_u64!(/// Identifies one dynamic host request within an execution scope.
+    InvocationId);
+
+/// One host execution scope in a retained allocator namespace.
+///
+/// A fresh evaluation receives a fresh identifier; checkpoint restoration reuses
+/// the original identifier. Administrative lifecycle events have their own scope.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ExecutionId(NonZeroU64);
+
+impl ExecutionId {
+    /// Lowest representable scope. Constructing it does not reserve it from an allocator.
+    pub const FIRST: Self = Self(NonZeroU64::MIN);
+
+    /// Construct an execution identifier. Zero is not an execution scope.
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Return the identifier's nonzero integer value.
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl core::fmt::Display for ExecutionId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "ExecutionId#{}", self.get())
+    }
+}
 
 /// A resolved identity prefix. The data plane carries this, never the raw
 /// `Path` of the identity. `acting` on an operation is one of these.
@@ -75,15 +110,15 @@ impl IdentityRef {
     }
 }
 
-impl std::fmt::Display for IdentityRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for IdentityRef {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "identity#{}", self.0)
     }
 }
 
 /// Generational handle id: `(index, generation)` into the slotmap
-/// `HandleTable`. Lookup is `O(1)` array indexing; revoke bumps the
-/// slot generation so a stale `HandleId` (old generation) is rejected.
+/// `HandleTable`. Slot reuse advances the generation without wrapping;
+/// exhausted slots retire so an old identifier can never regain authority.
 #[derive(
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
@@ -91,18 +126,18 @@ pub struct HandleId {
     /// Slot index in the handle table.
     pub index: u32,
     /// Slot generation used to reject stale handles.
-    pub generation: u32,
+    pub generation: u64,
 }
 
 impl HandleId {
     /// Construct a handle id from slot index and generation.
-    pub const fn new(index: u32, generation: u32) -> Self {
+    pub const fn new(index: u32, generation: u64) -> Self {
         Self { index, generation }
     }
 }
 
-impl std::fmt::Display for HandleId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for HandleId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "handle#{}.{}", self.index, self.generation)
     }
 }
@@ -110,7 +145,8 @@ impl std::fmt::Display for HandleId {
 /// Stable position of a node within a compiled `ExecutionGraph`.
 /// **`NodeId` == `CausalPosition`**: it is assigned at compile time,
 /// is stable while the Program is unchanged, and never depends on wall clock
-/// or randomness. This is the anchor for idempotency dedup and replay.
+/// or randomness. Dynamic invocations and separate evaluations carry their own
+/// coordinates; a node position alone does not identify an operation.
 #[derive(
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
@@ -130,8 +166,8 @@ impl NodeId {
     }
 }
 
-impl std::fmt::Display for NodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for NodeId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "n{}", self.0)
     }
 }
@@ -175,6 +211,18 @@ mod tests {
     }
 
     #[test]
+    fn handle_generation_roundtrips_the_full_u64_range() -> anyhow::Result<()> {
+        let id = HandleId::new(u32::MAX, u64::MAX);
+        let encoded = serde_json::to_string(&id)?;
+        ensure!(serde_json::from_str::<HandleId>(&encoded)? == id);
+        ensure!(
+            serde_json::from_str::<HandleId>(r#"{"index":0,"generation":18446744073709551616}"#)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn id_serde_is_transparent() -> anyhow::Result<()> {
         let p = ProcessId::new(42);
         let json = serde_json::to_string(&p)?;
@@ -188,5 +236,16 @@ mod tests {
     fn node_id_is_causal_position() {
         let n: CausalPosition = NodeId::new(7);
         assert_eq!(n.get(), 7);
+    }
+
+    #[test]
+    fn execution_id_is_nonzero_and_compact() -> anyhow::Result<()> {
+        ensure!(ExecutionId::new(0).is_none());
+        ensure!(core::mem::size_of::<Option<ExecutionId>>() == 8);
+        ensure!(serde_json::from_str::<ExecutionId>("0").is_err());
+        let id = serde_json::from_str::<ExecutionId>("7")?;
+        ensure!(id.get() == 7);
+        ensure!(serde_json::to_string(&id)? == "7");
+        Ok(())
     }
 }

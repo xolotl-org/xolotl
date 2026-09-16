@@ -245,5 +245,104 @@ revision、关系、图节点类型、port、edge 和校验 hook。它们不指�
 | `state.watch` | 状态后端 watch 事件 |
 | `audit.facts.stream` | 审计事实记录事件 |
 
-帧大小、连接数、空闲时间、速率、订阅数、结果大小和事件发送限制来自
+帧大小、连接数、空闲时间、速率、订阅数、结果大小、队列和发送限制来自
 `[console.ws]`；后端会把配置值限制在硬上限内。
+
+## 出站限制
+
+`max_frame_bytes` 同时约束入站和出站 protobuf 帧，默认 1 MiB，范围为 16 KiB 至 4 MiB。
+转换前检查累计内联字节、最多 16,384 个 Value 节点、30 层 Value 嵌套和 256 个路径段，
+通过后才克隆线缆载荷。完整 protobuf 消息还必须通过精确帧字节检查，随后才能分配编码
+输出缓冲区。超限 Value 不会被截断。
+
+`send_timeout_ms` 约束所有出站帧，包括回复和错误，默认 5 秒，范围为 100 毫秒至 60 秒。
+它替代 `event_send_timeout_ms`。回复无法在预算内编码时，服务端返回携带原请求 ID 的
+小型 `Internal` 错误。此时动作可能已经完成，错误不表示回滚，也不表示可以安全重试。
+传输错误或发送超时会关闭连接。
+
+每个连接的实时订阅共用一个最多 256 条的队列。`max_pending_event_bytes` 约束排队及
+正在发送的订阅数据编码字节，默认 1 MiB，范围为 16 KiB 至 16 MiB。每个 worker 在尝试
+入队前最多准备一帧有界数据，不会持有未计费帧等待队列空间。条数或字节预算耗尽都会
+关闭产生该事件的订阅。独立控制路径最多保留 `max_subscriptions` 条各不超过 1 KiB
+的关闭原因和一条正在发送的关闭帧，不计入数据预算。此预算也不包含来源广播存储、原生动作输出、转换临时结构、
+socket 缓冲区或整个进程的内存。
+
+State 和 Fact worker 统一由会话管理。lag、来源关闭、投影或编码失败、worker 异常
+都会释放订阅名额并产生 `SubscriptionClosed`。关闭使该代订阅尚未发送的尾部失效；
+旧事件和旧关闭通知不能影响使用相同 ID 的新订阅。会话关闭或被取消时会中止所属任务。
+全部 worker 共用 250 毫秒的关闭期限，无法完成关闭则终止会话。
+该期限约束异步等待；Tokio 无法强行抢占同步适配器工作或阻塞的析构函数，宿主适配器
+仍需配合取消。
+
+订阅可见性按请求的 `ttl_ms` 到期，最长十分钟。过期丢弃待发送数据并产生
+`SubscriptionClosed`。成功 `Auth` 会在接纳新会话前清理旧订阅。每次事件发送都会
+重新认证 SID；身份、有效权限集合或 MFA 级别发生变化时关闭连接，重新建立授权和订阅。
+数据发送取可见性期限和发送超时的较早者，并在 socket 可写后再次检查是否过期。
+已经交给 socket 的数据无法撤回。旧代次排队数据在出队丢弃前仍占队列额度，因此立即
+替换的订阅仍可能遇到队列压力。
+
+## Fact 查询
+
+`audit.facts.recent` 返回一页反向追加顺序的记录，默认 64 条。
+`lineage.trace.read` 要求指定 `process`，返回一页正向追加顺序的记录，默认 128 条。
+两者均接受 `from`、`before`、`limit`、`max_bytes`、`max_examined`；recent 还接受
+可选 `process`。游标与进程编号输入接受非负整数或十进制 `u64` 字符串；游标及数值标识符
+投影输出为十进制字符串，避免客户端丢失精度。`op_id` 保留组合 OperationId 字符串格式。
+`from` 表示全局物理追加位置，即使按进程过滤也不表示
+匹配记录的行偏移。读取方向由动作固定。
+
+页面输出字段如下：
+
+| 字段 | 含义 |
+| --- | --- |
+| `items` | 按追加顺序排列的 Fact 投影；`completed` 反映当前完成状态 |
+| `from`、`end` | 本页追加区间的包含下界和排他上界 |
+| `next` | 十进制续页游标；区间结束时为 `null` |
+| `order` | `forward` 或 `reverse` |
+| `complete` | 本页是否已读完追加区间 |
+| `examined` | 已访问候选数，包括被过滤或因字节预算不足而拒绝的候选 |
+| `encoded_bytes` | 返回 Fact 在投影前的 JSON 编码长度之和 |
+| `process` | 传入时返回所选进程 |
+
+recent 用 `before=next` 和相同 `from` 续页；trace 用 `from=next`、`before=end` 续页，
+保留筛选条件和预算。空页仍可能有续页，反向分页逐步缩小上界。固定追加区间排除后续
+追加，但旧槽位的完成结果仍可能更新。trace 另返回 `partial=true` 和 `partial_reason`，
+说明没有包含物化的来源链索引；这与分页是否完成无关，不再返回全历史 trace 总数。
+
+条数受监听器的 Fact 或 trace 上限约束。JSON 字节上限为
+`min(max_frame_bytes / 8, 256 KiB)`，为投影和帧预留空间。出站转换和精确帧大小仍需
+通过各自独立的预算检查。
+候选检查数默认 `max(limit, 4096)`，最高 65,536。零预算无效，超出上限的请求按上限执行。
+第一个匹配记录超过字节预算时读取失败。`lineage.fact.read` 使用有字节限制的索引点查，
+同样接受 `max_bytes` 和可选 `process`，后者默认 `op_id.process`。动作要求所选进程的
+读取权限，并只返回当前调用进程与之匹配的记录；归属不同则返回未知记录，不暴露内容。
+这些限额不计量解码堆或总内存。
+
+`runtime.process.inspect` 和 `state.snapshot` 的 `runtime` section 默认只读元数据。
+`include_recent_facts=true` 要求显式 `process`、对应 `state://fact/<process>` 的读取权限，
+以及动作要求的可见性元数据。`recent_facts` 是一页有界反向结果，不再返回全历史
+`fact_count`。一次快照最多接受一个 runtime section。进程行及 children 是独立集合，
+目前仍未分页。
+
+`health.summary.fact_sample` 包含 `sampled_facts`、`decisions` 和相同的页面元数据，
+计数仅代表近期样本；原来的全局 `fact_count`、`fact_decisions` 字段已移除。
+顶层 `fact_cursor` 是单独观察的十进制追加上界，不跟踪完成更新，也不保证与样本同一视图。
+进程统计仍然枚举进程表。
+
+## 实时审计
+
+`audit.facts.stream` 只接收订阅后的通知，不回放历史。可选 `process` 在检查字节预算之前
+筛选当前记录，无关进程的超大记录会被忽略。新增和完成更新都会触发有界索引重读；
+事件以 `op_id` 为键表示 upsert。
+通知可能不按提交顺序到达，也可能重复返回当前值。客户端应替换对应身份的记录，
+不能把每个通知计为一个新 Fact。
+
+积压导致 lag、记录消失或有界读取失败时，发送 `SubscriptionClosed` 并释放订阅名额。
+上述共享生命周期和队列限制同样适用。关闭后应重新订阅，再通过显式有界分页核对保留记录，包括
+可能更新过完成结果的旧槽位。先建立实时订阅再分页可缩小间隙；再次 lag 时重做核对。
+这不提供原子快照或持久更新日志。
+
+`StreamCall.since_rev` 是预留字段，当前拒绝传入。线缆 `ConsoleEvent.state_rev` 和
+`fact_cursor` 保持零，`SubscriptionClosed.last_rev` 省略。追加游标无法恢复旧槽位的
+完成更新。protobuf 信封结构保持不变，分页动作输出及精确标识符投影替换了原来的
+Value 载荷形状。

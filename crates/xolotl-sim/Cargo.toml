@@ -14,7 +14,7 @@ workspace = true
 [dependencies]
 async-trait = { workspace = true, default-features = false }
 xolotl-graph.workspace = true
-xolotl-kernel.workspace = true
+xolotl-kernel = { workspace = true, features = ["host"] }
 xolotl-types.workspace = true
 parking_lot = { workspace = true, default-features = false }
 

@@ -11,11 +11,13 @@
 //! serializable and avoid cross-identity code injection.
 
 use crate::graph::{OperationTemplate, StepRef, WaitSpec};
-use serde::{Deserialize, Serialize};
-use xolotl_types::{
-    CapError, Capability, Failure, Path, PathError, PredOp, Predicate, ProcessId, ResourceName,
-    Value,
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
 };
+use serde::{Deserialize, Serialize};
+use xolotl_types::{CapError, Capability, Failure, Path, PathError, ProcessId, Value};
 
 /// The nine combinators plus an `Op` leaf and a `Wait` leaf. Erased
 /// over the `A` type parameter — the kernel validates the Outcome shape at the
@@ -24,7 +26,7 @@ use xolotl_types::{
 #[serde(rename_all = "snake_case")]
 pub enum DoNode {
     /// `Pure :: A -> Do<A>` — lift a value.
-    Pure(Value),
+    Pure(#[serde(with = "xolotl_types::tagged_value")] Value),
     /// `AndThen :: Do<A> -> (A -> Do<B>) -> Do<B>` — sequence into a step.
     AndThen {
         /// Program whose successful result feeds the continuation.
@@ -213,39 +215,36 @@ impl DoNode {
         out
     }
 
-    /// Return a copy with process-local references bound to `process`.
-    pub fn bind_process_local_refs(&self, process: ProcessId) -> Result<Self, PathError> {
+    /// Bind structured `state://process/self/...` operation and signal paths.
+    ///
+    /// Consumes the program and updates paths in place. Literal values, step
+    /// names and arguments are unchanged, and their payloads are not cloned.
+    pub fn bind_process_local_refs(mut self, process: ProcessId) -> Result<Self, PathError> {
+        self.bind_process_paths(process)?;
+        Ok(self)
+    }
+
+    fn bind_process_paths(&mut self, process: ProcessId) -> Result<(), PathError> {
         match self {
-            DoNode::Pure(value) => Ok(DoNode::Pure(value.clone())),
-            DoNode::AndThen { d, then } => Ok(DoNode::AndThen {
-                d: Box::new(d.bind_process_local_refs(process)?),
-                then: bind_step_ref(then, process),
-            }),
-            DoNode::OrElse { d, or } => Ok(DoNode::OrElse {
-                d: Box::new(d.bind_process_local_refs(process)?),
-                or: bind_step_ref(or, process),
-            }),
-            DoNode::Both(left, right) => Ok(DoNode::Both(
-                Box::new(left.bind_process_local_refs(process)?),
-                Box::new(right.bind_process_local_refs(process)?),
-            )),
-            DoNode::Race(left, right) => Ok(DoNode::Race(
-                Box::new(left.bind_process_local_refs(process)?),
-                Box::new(right.bind_process_local_refs(process)?),
-            )),
-            DoNode::Let { name, value, body } => Ok(DoNode::Let {
-                name: name.clone(),
-                value: Box::new(value.bind_process_local_refs(process)?),
-                body: Box::new(body.bind_process_local_refs(process)?),
-            }),
-            DoNode::Use(name) => Ok(DoNode::Use(name.clone())),
-            DoNode::Acting { identity, body } => Ok(DoNode::Acting {
-                identity: identity.clone(),
-                body: Box::new(body.bind_process_local_refs(process)?),
-            }),
-            DoNode::Fail(failure) => Ok(DoNode::Fail(failure.clone())),
-            DoNode::Wait(spec) => Ok(DoNode::Wait(bind_wait_spec(spec, process)?)),
-            DoNode::Op(template) => Ok(DoNode::Op(bind_operation_template(template, process)?)),
+            DoNode::AndThen { d, .. }
+            | DoNode::OrElse { d, .. }
+            | DoNode::Acting { body: d, .. } => d.bind_process_paths(process),
+            DoNode::Both(left, right) | DoNode::Race(left, right) => {
+                left.bind_process_paths(process)?;
+                right.bind_process_paths(process)
+            }
+            DoNode::Let { value, body, .. } => {
+                value.bind_process_paths(process)?;
+                body.bind_process_paths(process)
+            }
+            DoNode::Wait(WaitSpec::Signal(path)) => bind_process_self_path_in_place(path, process),
+            DoNode::Op(template) => {
+                bind_process_self_path_in_place(&mut template.target.0, process)
+            }
+            DoNode::Pure(_)
+            | DoNode::Use(_)
+            | DoNode::Fail(_)
+            | DoNode::Wait(WaitSpec::Deadline(_)) => Ok(()),
         }
     }
 
@@ -268,42 +267,14 @@ impl DoNode {
     }
 }
 
-fn bind_step_ref(step: &StepRef, process: ProcessId) -> StepRef {
-    StepRef {
-        process,
-        name: step.name.clone(),
-        arg: step.arg.clone(),
-    }
-}
-
-fn bind_wait_spec(spec: &WaitSpec, process: ProcessId) -> Result<WaitSpec, PathError> {
-    match spec {
-        WaitSpec::Signal(path) => Ok(WaitSpec::Signal(bind_process_self_path(path, process)?)),
-        WaitSpec::Deadline(at_millis) => Ok(WaitSpec::Deadline(*at_millis)),
-    }
-}
-
-fn bind_operation_template(
-    template: &OperationTemplate,
-    process: ProcessId,
-) -> Result<OperationTemplate, PathError> {
-    Ok(OperationTemplate {
-        target: ResourceName::new(bind_process_self_path(template.target.path(), process)?),
-        method: template.method.clone(),
-        method_id: template.method_id,
-        output: template.output,
-        literal_input: template.literal_input.clone(),
-    })
-}
-
-pub(crate) fn bind_process_self_path(path: &Path, process: ProcessId) -> Result<Path, PathError> {
+fn bind_process_self_path_in_place(path: &mut Path, process: ProcessId) -> Result<(), PathError> {
     let segments = path.segments();
     if path.scheme() != "state"
         || path.cluster().is_some()
         || segments.first().map(|segment| segment.as_str()) != Some("process")
         || segments.get(1).map(|segment| segment.as_str()) != Some("self")
     {
-        return Ok(path.clone());
+        return Ok(());
     }
     let mut bound = Path::try_new("state")?
         .try_push("process")?
@@ -311,14 +282,26 @@ pub(crate) fn bind_process_self_path(path: &Path, process: ProcessId) -> Result<
     for segment in &segments[2..] {
         bound = bound.try_push(segment.as_str())?;
     }
-    Ok(bound)
+    *path = bound;
+    Ok(())
 }
 
 pub(crate) fn bind_process_self_capability_literal(
     literal: &str,
     process: ProcessId,
 ) -> Result<String, CapError> {
-    let capability = Capability::parse(literal)?;
+    let mut capability = Capability::parse(literal)?;
+    if bind_process_self_capability(&mut capability, process) {
+        Ok(capability.to_string())
+    } else {
+        Ok(literal.to_string())
+    }
+}
+
+/// Bind a structured `state/process/self/...` capability to a concrete process.
+/// Returns whether a segment changed. Verbs, predicates and remaining segments
+/// are preserved; hosts must check the bound capability against the parent's grants.
+pub fn bind_process_self_capability(capability: &mut Capability, process: ProcessId) -> bool {
     let changed = capability.scheme == "state"
         && capability
             .segments
@@ -328,41 +311,10 @@ pub(crate) fn bind_process_self_capability_literal(
             .segments
             .get(1)
             .is_some_and(|segment| segment.as_str() == "self");
-    if !changed {
-        return Ok(literal.to_string());
+    if changed {
+        capability.segments[1] = process.get().to_string().into();
     }
-
-    let mut segments = Vec::with_capacity(capability.segments.len());
-    for (index, segment) in capability.segments.iter().enumerate() {
-        if index == 1 {
-            segments.push(process.get().to_string());
-        } else {
-            segments.push(segment.to_string());
-        }
-    }
-    let mut bound = format!(
-        "{}://{}/{}",
-        capability.verb,
-        capability.scheme,
-        segments.join("/")
-    );
-    if let Some(predicate) = &capability.predicate {
-        bound.push_str(&format_predicate(predicate));
-    }
-    Capability::parse(&bound)?;
-    Ok(bound)
-}
-
-fn format_predicate(predicate: &Predicate) -> String {
-    let op = match predicate.op {
-        PredOp::Eq => "=",
-        PredOp::Ne => "!=",
-        PredOp::Le => "<=",
-        PredOp::Lt => "<",
-        PredOp::Ge => ">=",
-        PredOp::Gt => ">",
-    };
-    format!("@{}{}{}", predicate.key, op, predicate.value)
+    changed
 }
 
 #[cfg(test)]
@@ -372,7 +324,7 @@ mod tests {
     use xolotl_types::{ProcessId, ResourceName};
 
     fn s(name: &str) -> StepRef {
-        StepRef::new(ProcessId::new(1), name)
+        StepRef::new(name)
     }
 
     fn op(path: &str) -> anyhow::Result<OperationTemplate> {
@@ -458,10 +410,35 @@ mod tests {
 
     #[test]
     fn serde_roundtrip() -> anyhow::Result<()> {
-        let d = DoNode::r#let("x", DoNode::pure(Value::Int(1)), DoNode::use_("x"));
+        let d = DoNode::r#let("x", DoNode::pure(Value::integer(1)), DoNode::use_("x"));
         let s = serde_json::to_string(&d)?;
         let back: DoNode = serde_json::from_str(&s)?;
         ensure!(d == back, "round trip changed node: {back:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn serialized_programs_preserve_literal_types_and_optional_nulls() -> anyhow::Result<()> {
+        let value = Value::list(vec![
+            Value::bytes(vec![0, 255]),
+            Value::float(xolotl_types::FloatBits(f64::from_bits(
+                0xfff8_0000_0000_0123,
+            ))),
+            Value::stream_end(xolotl_types::StreamMarker::Done),
+        ]);
+        for literal in [None, Some(Value::null()), Some(value.clone())] {
+            let mut operation = op("effect://codec/invoke")?;
+            operation.literal_input = literal.clone();
+            let mut step = s("codec/step");
+            step.arg = literal;
+            let program =
+                DoNode::both(DoNode::pure(value.clone()), DoNode::op(operation)).and_then(step);
+            let encoded = serde_json::to_vec(&program)?;
+            ensure!(serde_json::from_slice::<DoNode>(&encoded)? == program);
+            let graph = crate::compile_do(&program)?;
+            let encoded = serde_json::to_vec(&graph)?;
+            ensure!(serde_json::from_slice::<crate::ExecutionGraph>(&encoded)? == graph);
+        }
         Ok(())
     }
 
@@ -494,11 +471,45 @@ mod tests {
             other => bail!("unexpected bound node: {other:?}"),
         }
 
-        let value = DoNode::pure(Value::Str("state://process/self/not-a-path".into()));
+        let value = DoNode::pure(Value::string("state://process/self/not-a-path".into()));
         ensure!(
-            value.bind_process_local_refs(process)? == value,
+            value.clone().bind_process_local_refs(process)? == value,
             "plain string value should not be rebound"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn binding_process_paths_keeps_payload_and_ast_allocations() -> anyhow::Result<()> {
+        let literal = vec![0x5a; 65_536];
+        let argument = vec![0x7f; 65_536];
+        let literal_ptr = literal.as_ptr();
+        let argument_ptr = argument.as_ptr();
+        let mut operation = op("state://process/self/scratch")?;
+        operation.literal_input = Some(Value::bytes(literal));
+        let body = Box::new(DoNode::op(operation));
+        let body_ptr = std::ptr::from_ref(body.as_ref());
+        let node = DoNode::AndThen {
+            d: body,
+            then: StepRef::new("finish").with_arg(Value::bytes(argument)),
+        };
+        let DoNode::AndThen { d, then } = node.bind_process_local_refs(ProcessId::new(42))? else {
+            bail!("binding changed the program shape");
+        };
+        ensure!(std::ptr::from_ref(d.as_ref()) == body_ptr);
+        let DoNode::Op(operation) = *d else {
+            bail!("binding changed the operation");
+        };
+        ensure!(operation.target.path().to_string() == "state://process/42/scratch");
+        let Some(literal) = operation.literal_input.as_ref().and_then(Value::as_bytes) else {
+            bail!("binding changed the literal");
+        };
+        let Some(argument) = then.arg.as_ref().and_then(Value::as_bytes) else {
+            bail!("binding changed the argument");
+        };
+        ensure!(literal.as_ptr() == literal_ptr);
+        ensure!(argument.as_ptr() == argument_ptr);
+        ensure!(then.name == "finish");
         Ok(())
     }
 

@@ -1,17 +1,17 @@
 use anyhow::{Result, anyhow, bail};
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use prost::Message;
 use std::collections::BTreeMap;
 use std::hint::black_box;
 use xolotl_graph::{DoNode, OperationTemplate, StepRef};
 use xolotl_proto::xolotl::v1 as pb;
 use xolotl_proto::{
-    capability_from_pb, capability_to_pb, program_from_pb, program_to_pb, value_from_pb,
-    value_to_pb,
+    MAX_VALUE_ENCODE_DEPTH, ValueEncodeLimits, capability_from_pb, capability_to_pb,
+    program_from_pb, program_to_pb, value_from_pb, value_to_pb, value_to_pb_bounded,
 };
 use xolotl_types::{
-    BlobRef, Capability, DType, FloatBits, MethodId, OutputMode, Path, ProcessId, ResourceName,
-    TensorRef, Value,
+    BlobRef, Capability, DType, FloatBits, MethodId, OutputMode, Path, ResourceName, TensorRef,
+    Value,
 };
 
 const MAP_FIELDS: usize = 256;
@@ -22,16 +22,16 @@ fn complex_value(fields: usize) -> Value {
     for i in 0..fields {
         map.insert(
             format!("k{i}"),
-            Value::List(vec![
-                Value::Int(i as i64),
-                Value::Float(FloatBits(i as f64 / 10.0)),
-                Value::Str(format!("value-{i}")),
+            Value::list(vec![
+                Value::integer(i as i64),
+                Value::float(FloatBits(i as f64 / 10.0)),
+                Value::string(format!("value-{i}")),
             ]),
         );
     }
     map.insert(
         "tensor".into(),
-        Value::Tensor(TensorRef {
+        Value::from(TensorRef {
             blob: BlobRef {
                 hash: "ab".repeat(32),
                 size: 128,
@@ -41,7 +41,7 @@ fn complex_value(fields: usize) -> Value {
             shape: vec![8, 16],
         }),
     );
-    Value::Map(map)
+    Value::map(map)
 }
 
 fn op_template(id: usize) -> Result<OperationTemplate> {
@@ -53,7 +53,7 @@ fn op_template(id: usize) -> Result<OperationTemplate> {
         method: "invoke".into(),
         method_id: Some(MethodId::new(0)),
         output: OutputMode::Unary,
-        literal_input: Some(Value::Int(id as i64)),
+        literal_input: Some(Value::integer(id as i64)),
     })
 }
 
@@ -76,7 +76,7 @@ fn program(ops: usize) -> Result<DoNode> {
     if ops == 0 {
         bail!("benchmark program must contain at least one operation");
     }
-    Ok(balanced_ops(0, ops)?.and_then(StepRef::new(ProcessId::new(1), "finish")))
+    Ok(balanced_ops(0, ops)?.and_then(StepRef::new("finish")))
 }
 
 fn observe<T>(result: Result<T>) {
@@ -190,6 +190,35 @@ fn bench_programs(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_bounded_values(c: &mut Criterion) {
+    let mut group = c.benchmark_group("proto/bounded_value");
+    group.sample_size(10);
+    let limits = ValueEncodeLimits {
+        max_nodes: 16_384,
+        max_depth: MAX_VALUE_ENCODE_DEPTH,
+        max_inline_bytes: 1_048_576,
+    };
+    for (name, value) in [
+        ("map_256", complex_value(MAP_FIELDS)),
+        ("bytes_64k", Value::bytes(vec![42; 65_536])),
+        ("nulls_4096", Value::list(vec![Value::null(); 4096])),
+    ] {
+        group.bench_with_input(BenchmarkId::new("canonical", name), &value, |b, value| {
+            b.iter(|| black_box(value_to_pb(black_box(value)).encode_to_vec()));
+        });
+        group.bench_with_input(BenchmarkId::new("bounded", name), &value, |b, value| {
+            b.iter(|| {
+                observe(
+                    value_to_pb_bounded(black_box(value), limits)
+                        .map(|wire| wire.encode_to_vec())
+                        .map_err(|error| anyhow!("value admission failed: {error}")),
+                );
+            });
+        });
+    }
+    group.finish();
+}
+
 fn bench_capability(c: &mut Criterion) {
     let mut group = c.benchmark_group("proto/capability");
 
@@ -215,5 +244,11 @@ fn bench_capability(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_values, bench_programs, bench_capability);
+criterion_group!(
+    benches,
+    bench_values,
+    bench_bounded_values,
+    bench_programs,
+    bench_capability
+);
 criterion_main!(benches);

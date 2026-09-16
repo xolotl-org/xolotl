@@ -11,14 +11,27 @@ description = "gRPC protocol adapter for Xolotl"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Explicit host policy and incremental object delivery for output payloads.
+structured-output = ["xolotl-gateway/structured-output"]
+
 [dependencies]
 xolotl-gateway.workspace = true
 xolotl-proto.workspace = true
 xolotl-types.workspace = true
+http-body.workspace = true
 prost = { workspace = true, default-features = false, features = ["derive", "std"] }
-tokio = { workspace = true, default-features = false, features = ["rt", "sync"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros", "time"] }
 tonic = { workspace = true, default-features = false, features = ["codegen", "transport", "tls-ring"] }
 tracing = { workspace = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
 anyhow = { workspace = true, default-features = false, features = ["std"] }
+h2.workspace = true
+tempfile = { workspace = true, default-features = false, features = ["getrandom"] }
+tokio = { workspace = true, default-features = false, features = ["test-util"] }
+xolotl-kernel = { workspace = true, features = ["host"] }
+xolotl-state.workspace = true
+xolotl-storage-fs.workspace = true
+xolotl-value-codec = { workspace = true, features = ["cbor"] }

@@ -8,6 +8,10 @@
 
 use crate::path::Path;
 use crate::value::Value;
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use thiserror::Error;
@@ -120,21 +124,18 @@ impl Predicate {
             };
             return (now_millis as f64) <= bound;
         }
-        let field = match input {
-            Value::Map(m) => m.get(&self.key),
-            _ => None,
-        };
+        let field = input.as_map().and_then(|map| map.get(&self.key));
         let Some(field) = field else { return false };
-        match (&self.op, field) {
+        match (&self.op, field.view()) {
             // String equality / inequality.
-            (PredOp::Eq, Value::Str(s)) => s.as_str() == self.value,
-            (PredOp::Ne, Value::Str(s)) => s.as_str() != self.value,
+            (PredOp::Eq, crate::ValueView::Str(s)) => s == self.value,
+            (PredOp::Ne, crate::ValueView::Str(s)) => s != self.value,
             // Numeric comparisons against int/float fields.
-            (op, Value::Int(n)) => match self.value_num() {
-                Ok(rhs) => Self::cmp_num(*n as f64, *op, rhs),
+            (op, crate::ValueView::Int(n)) => match self.value_num() {
+                Ok(rhs) => Self::cmp_num(n as f64, *op, rhs),
                 Err(_) => false,
             },
-            (op, Value::Float(n)) => match self.value_num() {
+            (op, crate::ValueView::Float(n)) => match self.value_num() {
                 Ok(rhs) => Self::cmp_num(n.0, *op, rhs),
                 Err(_) => false,
             },
@@ -161,8 +162,8 @@ fn parse_predicate_number(value: &str) -> Result<f64, CapError> {
         .map_err(|error| CapError::Malformed(format!("invalid predicate number: {value}: {error}")))
 }
 
-impl std::fmt::Display for Predicate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Predicate {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let op = match self.op {
             PredOp::Eq => "=",
             PredOp::Ne => "!=",
@@ -485,7 +486,7 @@ impl CapSet {
     }
 
     /// Iterate over capabilities.
-    pub fn iter(&self) -> std::slice::Iter<'_, Capability> {
+    pub fn iter(&self) -> core::slice::Iter<'_, Capability> {
         self.0.iter()
     }
     /// Number of capabilities in the set.
@@ -498,8 +499,8 @@ impl CapSet {
     }
 }
 
-impl std::fmt::Display for Capability {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Capability {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}://{}", self.verb, self.scheme)?;
         for s in &self.segments {
             write!(f, "/{}", s)?;
@@ -650,21 +651,21 @@ mod tests {
     #[test]
     fn predicate_eq_enforced_against_input() -> anyhow::Result<()> {
         use crate::value::Value;
-        use std::collections::BTreeMap;
+        use alloc::collections::BTreeMap;
         let c = Capability::parse("perform://effect/x/post@account=alice")?;
         let mut m = BTreeMap::new();
-        m.insert("account".to_string(), Value::Str("alice".into()));
+        m.insert("account".to_string(), Value::string("alice".into()));
         ensure!(
-            c.covers_with("perform", &p("effect://x/post")?, &Value::Map(m.clone()), 0),
+            c.covers_with("perform", &p("effect://x/post")?, &Value::map(m.clone()), 0),
             "matching predicate was denied"
         );
-        m.insert("account".to_string(), Value::Str("bob".into()));
+        m.insert("account".to_string(), Value::string("bob".into()));
         ensure!(
-            !c.covers_with("perform", &p("effect://x/post")?, &Value::Map(m), 0),
+            !c.covers_with("perform", &p("effect://x/post")?, &Value::map(m), 0),
             "mismatched predicate was allowed"
         );
         ensure!(
-            !c.covers_with("perform", &p("effect://x/post")?, &Value::Null, 0),
+            !c.covers_with("perform", &p("effect://x/post")?, &Value::null(), 0),
             "missing predicate field was allowed"
         );
         Ok(())
@@ -673,28 +674,28 @@ mod tests {
     #[test]
     fn predicate_budget_le_enforced() -> anyhow::Result<()> {
         use crate::value::Value;
-        use std::collections::BTreeMap;
+        use alloc::collections::BTreeMap;
         let c = Capability::parse("spawn://process/alice/*@budget<=$0.10")?;
         let mut m = BTreeMap::new();
         m.insert(
             "budget".to_string(),
-            Value::Float(crate::value::FloatBits(0.05)),
+            Value::float(crate::value::FloatBits(0.05)),
         );
         ensure!(
             c.covers_with(
                 "spawn",
                 &p("process://alice/job")?,
-                &Value::Map(m.clone()),
+                &Value::map(m.clone()),
                 0
             ),
             "budget under limit was denied"
         );
         m.insert(
             "budget".to_string(),
-            Value::Float(crate::value::FloatBits(0.50)),
+            Value::float(crate::value::FloatBits(0.50)),
         );
         ensure!(
-            !c.covers_with("spawn", &p("process://alice/job")?, &Value::Map(m), 0),
+            !c.covers_with("spawn", &p("process://alice/job")?, &Value::map(m), 0),
             "budget over limit was allowed"
         );
         Ok(())
@@ -705,11 +706,11 @@ mod tests {
         use crate::value::Value;
         let c = Capability::parse("act-as://process/bob@until=1000")?;
         ensure!(
-            c.covers_with("act-as", &p("process://bob")?, &Value::Null, 500),
+            c.covers_with("act-as", &p("process://bob")?, &Value::null(), 500),
             "valid until predicate was denied"
         );
         ensure!(
-            !c.covers_with("act-as", &p("process://bob")?, &Value::Null, 2000),
+            !c.covers_with("act-as", &p("process://bob")?, &Value::null(), 2000),
             "expired until predicate was allowed"
         );
         Ok(())

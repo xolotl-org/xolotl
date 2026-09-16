@@ -6,21 +6,37 @@ use super::dialects::{
 };
 use super::error::HttpInferenceError;
 use super::request::reject_unsupported_input;
-use super::routing::{HttpInferenceGroup, HttpInferenceRoute, HttpInferenceRouterConfig};
-use super::state::router_from_state;
-use crate::router::GroupPolicy;
 use anyhow::{Context, bail, ensure};
-use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
-use xolotl_state::Backend;
-use xolotl_types::{
-    BlobRef, InferenceAuthRef, InferenceBackendDef, InferenceGroupDef, InferenceGroupPolicy,
-    InferenceModelCapabilities, InferenceModelDef, InferenceRoutingDef, Path, Value,
-};
+use xolotl_types::{BlobRef, Value};
+
+#[cfg(feature = "openai-chat")]
+mod chat;
+mod transport;
+
+#[test]
+fn input_admission_visits_shared_graphs_and_preserves_field_guards() -> anyhow::Result<()> {
+    let mut shared = Value::string("text".into());
+    for _ in 0..80 {
+        shared = Value::list(vec![shared.clone(), shared]);
+    }
+    reject_unsupported_input(&shared)?;
+    let with_tools = Value::list(vec![
+        shared,
+        Value::map(BTreeMap::from([("ToOl_ChOiCe".into(), Value::null())])),
+    ]);
+    ensure!(matches!(
+        reject_unsupported_input(&with_tools),
+        Err(HttpInferenceError::UnsupportedPayload(
+            "provider-native tools"
+        ))
+    ));
+    Ok(())
+}
 
 #[derive(Debug)]
 struct CapturedRequest {
@@ -34,21 +50,6 @@ struct HttpOnce {
     handle: JoinHandle<anyhow::Result<()>>,
 }
 
-fn state_value<T: serde::Serialize>(value: &T) -> anyhow::Result<Value> {
-    let json = serde_json::to_value(value).context("serialize state value")?;
-    serde_json::from_value(json).context("decode state value")
-}
-
-async fn write_state_value(state: &Backend, path: &str, value: Value) -> anyhow::Result<()> {
-    state
-        .write_set(
-            &Path::parse(path).with_context(|| format!("parse {path}"))?,
-            value,
-        )
-        .await
-        .with_context(|| format!("write {path}"))
-}
-
 fn bearer_config(dialect: HttpInferenceDialect) -> HttpInferenceConfig {
     HttpInferenceConfig::new(
         "test",
@@ -59,14 +60,31 @@ fn bearer_config(dialect: HttpInferenceDialect) -> HttpInferenceConfig {
     )
 }
 
-fn spawn_http_once(status: &'static str, response_body: &'static str) -> anyhow::Result<HttpOnce> {
+#[cfg(any(
+    feature = "openai-chat",
+    feature = "anthropic-messages",
+    feature = "gemini-generate-content"
+))]
+fn spawn_http_once(
+    status: &'static str,
+    response_body: impl Into<String>,
+) -> anyhow::Result<HttpOnce> {
+    spawn_http_once_with_type(status, response_body, "application/json")
+}
+
+fn spawn_http_once_with_type(
+    status: &'static str,
+    response_body: impl Into<String>,
+    content_type: &'static str,
+) -> anyhow::Result<HttpOnce> {
+    let response_body = response_body.into();
     let listener = TcpListener::bind("127.0.0.1:0").context("bind HTTP test listener")?;
     let addr = listener
         .local_addr()
         .context("read HTTP test listener address")?;
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
-        let result = handle_http_once(listener, status, response_body);
+        let result = handle_http_once(listener, status, &response_body, content_type);
         tx.send(result)
             .map_err(|_error| anyhow::anyhow!("HTTP test receiver dropped before request capture"))
     });
@@ -81,36 +99,27 @@ fn handle_http_once(
     listener: TcpListener,
     status: &str,
     response_body: &str,
+    content_type: &str,
 ) -> anyhow::Result<CapturedRequest> {
     let (mut stream, _) = listener.accept().context("accept HTTP test request")?;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
-    let mut needed_len = None;
-    loop {
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let body = loop {
         let n = stream.read(&mut tmp).context("read HTTP test request")?;
         if n == 0 {
-            break;
+            bail!("HTTP test request ended before its body");
         }
         buf.extend_from_slice(&tmp[..n]);
-        if needed_len.is_none()
-            && let Some(header_end) = header_end(&buf)
-        {
-            let head = String::from_utf8(buf[..header_end].to_vec())
-                .context("decode HTTP request head")?;
-            let content_len = content_length(&head)?;
-            needed_len = Some(header_end + content_len);
+        if let Some(decoded) = decode_request_body(&buf)? {
+            break decoded;
         }
-        if let Some(len) = needed_len
-            && buf.len() >= len
-        {
-            break;
-        }
-    }
+    };
     let header_end = header_end(&buf).context("request headers missing")?;
     let head = String::from_utf8(buf[..header_end].to_vec()).context("decode HTTP request head")?;
-    let body = String::from_utf8(buf[header_end..].to_vec()).context("decode HTTP request body")?;
+    let body = String::from_utf8(body).context("decode HTTP request body")?;
     let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
         response_body.len()
     );
     stream
@@ -118,6 +127,8 @@ fn handle_http_once(
         .context("write HTTP test response")?;
     Ok(CapturedRequest { head, body })
 }
+
+mod streaming;
 
 fn header_end(buf: &[u8]) -> Option<usize> {
     if buf.len() < 4 {
@@ -146,6 +157,44 @@ fn content_length(head: &str) -> anyhow::Result<usize> {
     Ok(0)
 }
 
+fn decode_request_body(bytes: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(end) = header_end(bytes) else {
+        return Ok(None);
+    };
+    let head = std::str::from_utf8(&bytes[..end])?;
+    let mut bytes = &bytes[end..];
+    if !head.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("transfer-encoding")
+                && value.trim().eq_ignore_ascii_case("chunked")
+        })
+    }) {
+        let length = content_length(head)?;
+        return Ok(bytes.get(..length).map(|body| body.to_vec()));
+    }
+    let mut output = Vec::new();
+    loop {
+        let Some(end) = bytes.windows(2).position(|bytes| bytes == b"\r\n") else {
+            return Ok(None);
+        };
+        let size = std::str::from_utf8(&bytes[..end])?
+            .split(';')
+            .next()
+            .context("missing chunk length")?;
+        let size = usize::from_str_radix(size, 16)?;
+        bytes = &bytes[end + 2..];
+        let Some(data) = bytes.get(..size.saturating_add(2)) else {
+            return Ok(None);
+        };
+        ensure!(&data[size..] == b"\r\n", "invalid request chunk terminator");
+        if size == 0 {
+            return Ok(Some(output));
+        }
+        output.extend_from_slice(&data[..size]);
+        bytes = &bytes[size + 2..];
+    }
+}
+
 fn recv_request(server: HttpOnce) -> anyhow::Result<CapturedRequest> {
     let request = server.rx.recv().context("receive captured HTTP request")?;
     let join_result = server
@@ -168,228 +217,9 @@ fn debug_redacts_auth_material() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "openai-chat")]
-#[tokio::test]
-async fn router_from_state_builds_openai_compatible_backend() -> anyhow::Result<()> {
-    let server = spawn_http_once(
-        "200 OK",
-        r#"{"choices":[{"message":{"content":"state route ok"}}]}"#,
-    )?;
-    let state: Backend = Arc::new(xolotl_state::InMemoryBackend::new());
-    write_state_value(
-        &state,
-        "state://vault/inference/deepseek/api_key",
-        Value::Str("secret-token".into()),
-    )
-    .await?;
-    write_state_value(
-        &state,
-        "state://kernel/inference/backends/deepseek",
-        state_value(&InferenceBackendDef {
-            id: "deepseek".into(),
-            dialect: HttpInferenceDialect::OpenAiChatCompletions,
-            base_url: server.base_url.clone(),
-            auth: InferenceAuthRef::BearerToken {
-                token_ref: Path::parse("state://vault/inference/deepseek/api_key")
-                    .map_err(anyhow::Error::msg)?,
-            },
-            default_headers: BTreeMap::new(),
-            request_overrides: BTreeMap::new(),
-            api_version: None,
-            version: 0,
-        })?,
-    )
-    .await?;
-    write_state_value(
-        &state,
-        "state://kernel/inference/models/deepseek-chat",
-        state_value(&InferenceModelDef {
-            id: "deepseek-chat".into(),
-            backend_id: "deepseek".into(),
-            provider_model: "deepseek-chat".into(),
-            embedding_model: None,
-            capabilities: InferenceModelCapabilities::default(),
-            weight: 1,
-            version: 0,
-        })?,
-    )
-    .await?;
-    write_state_value(
-        &state,
-        "state://kernel/inference/groups/default",
-        state_value(&InferenceGroupDef {
-            name: "default".into(),
-            policy: InferenceGroupPolicy::Priority,
-            models: vec!["deepseek-chat".into()],
-            fallback: None,
-            version: 0,
-        })?,
-    )
-    .await?;
-    write_state_value(
-        &state,
-        "state://kernel/routing/inference",
-        state_value(&InferenceRoutingDef {
-            default_group: "default".into(),
-            max_retries: Some(0),
-            version: 0,
-        })?,
-    )
-    .await?;
-
-    let router = router_from_state(&state)
-        .await
-        .map_err(anyhow::Error::msg)?
-        .context("expected router")?;
-    let routed = router
-        .infer(
-            &Value::Str("hello".into()),
-            &crate::inference::RequestRequirements::default(),
-            None,
-        )
-        .await
-        .map_err(anyhow::Error::msg)?;
-    ensure!(
-        routed.model_id == "deepseek/deepseek-chat",
-        "routed model id: {}",
-        routed.model_id
-    );
-    ensure!(
-        routed.output == Value::Str("state route ok".into()),
-        "routed output: {:?}",
-        routed.output
-    );
-
-    let req = recv_request(server)?;
-    ensure!(
-        req.head.starts_with("POST /v1/chat/completions "),
-        "request head: {}",
-        req.head
-    );
-    ensure!(
-        req.head.contains("authorization: Bearer secret-token"),
-        "request missing authorization header"
-    );
-    let body: JsonValue = serde_json::from_str(&req.body).map_err(anyhow::Error::msg)?;
-    ensure!(
-        body["model"] == JsonValue::String("deepseek-chat".into()),
-        "request model: {:?}",
-        body["model"]
-    );
-    Ok(())
-}
-
-#[cfg(feature = "openai-chat")]
-#[tokio::test]
-async fn router_from_state_rejects_path_id_mismatch() -> anyhow::Result<()> {
-    let state: Backend = Arc::new(xolotl_state::InMemoryBackend::new());
-    write_state_value(
-        &state,
-        "state://vault/inference/deepseek/api_key",
-        Value::Str("secret-token".into()),
-    )
-    .await?;
-    write_state_value(
-        &state,
-        "state://kernel/inference/backends/other",
-        state_value(&InferenceBackendDef {
-            id: "deepseek".into(),
-            dialect: HttpInferenceDialect::OpenAiChatCompletions,
-            base_url: "https://api.deepseek.com".into(),
-            auth: InferenceAuthRef::BearerToken {
-                token_ref: Path::parse("state://vault/inference/deepseek/api_key")
-                    .map_err(anyhow::Error::msg)?,
-            },
-            default_headers: BTreeMap::new(),
-            request_overrides: BTreeMap::new(),
-            api_version: None,
-            version: 0,
-        })?,
-    )
-    .await?;
-    write_state_value(
-        &state,
-        "state://kernel/inference/models/deepseek-chat",
-        state_value(&InferenceModelDef {
-            id: "deepseek-chat".into(),
-            backend_id: "deepseek".into(),
-            provider_model: "deepseek-chat".into(),
-            embedding_model: None,
-            capabilities: InferenceModelCapabilities::default(),
-            weight: 1,
-            version: 0,
-        })?,
-    )
-    .await?;
-
-    let result = router_from_state(&state).await;
-    ensure!(
-        matches!(result, Err(HttpInferenceError::StateAdmission { .. })),
-        "expected state admission error"
-    );
-    Ok(())
-}
-
-#[cfg(feature = "openai-chat")]
-#[test]
-fn config_rejects_reserved_headers_and_request_fields() -> anyhow::Result<()> {
-    let mut cfg = bearer_config(HttpInferenceDialect::OpenAiChatCompletions);
-    cfg.options
-        .default_headers
-        .insert("authorization".into(), "bad".into());
-    let result = HttpInferenceBackend::new(cfg);
-    ensure!(
-        matches!(result, Err(HttpInferenceError::BadHeader(_))),
-        "reserved header was accepted"
-    );
-
-    let mut cfg = bearer_config(HttpInferenceDialect::OpenAiChatCompletions);
-    cfg.options
-        .request_overrides
-        .insert("tools".into(), JsonValue::Array(vec![]));
-    let result = HttpInferenceBackend::new(cfg);
-    ensure!(
-        matches!(result, Err(HttpInferenceError::ReservedRequestField(_))),
-        "reserved request field was accepted"
-    );
-    Ok(())
-}
-
-#[cfg(feature = "openai-chat")]
-#[test]
-fn config_rejects_reserved_url_and_numeric_options() -> anyhow::Result<()> {
-    let mut cfg = bearer_config(HttpInferenceDialect::OpenAiChatCompletions);
-    cfg.base_url = "file:///tmp/model".into();
-    let result = HttpInferenceBackend::new(cfg);
-    ensure!(
-        matches!(result, Err(HttpInferenceError::BadBaseUrl)),
-        "file base url was accepted"
-    );
-
-    let mut cfg = bearer_config(HttpInferenceDialect::OpenAiChatCompletions);
-    cfg.base_url = "https://example.test/v1?key=secret".into();
-    let result = HttpInferenceBackend::new(cfg);
-    ensure!(
-        matches!(result, Err(HttpInferenceError::BadBaseUrl)),
-        "base url with query was accepted"
-    );
-
-    let mut cfg = bearer_config(HttpInferenceDialect::OpenAiChatCompletions);
-    cfg.options.max_output_tokens = Some(0);
-    let result = HttpInferenceBackend::new(cfg);
-    ensure!(
-        matches!(
-            result,
-            Err(HttpInferenceError::InvalidNumber("max_output_tokens"))
-        ),
-        "zero max_output_tokens was accepted"
-    );
-    Ok(())
-}
-
 #[test]
 fn non_text_payloads_are_rejected_before_http() -> anyhow::Result<()> {
-    let blob = Value::Blob(BlobRef {
+    let blob = Value::blob(BlobRef {
         hash: "abc".into(),
         size: 3,
         mime: Some("image/png".into()),
@@ -414,7 +244,7 @@ fn parses_response_dialects() -> anyhow::Result<()> {
     });
     ensure!(
         matches!(
-            parse_openai_responses_text(&openai_response),
+            parse_openai_responses_text(openai_response),
             Ok(ref text) if text == "hello"
         ),
         "OpenAI Responses text parse failed"
@@ -424,7 +254,7 @@ fn parses_response_dialects() -> anyhow::Result<()> {
         "choices": [{"message": {"content": "hi"}}]
     });
     ensure!(
-        matches!(parse_openai_chat_text(&chat), Ok(ref text) if text == "hi"),
+        matches!(parse_openai_chat_text(chat), Ok(ref text) if text == "hi"),
         "OpenAI chat text parse failed"
     );
 
@@ -432,7 +262,7 @@ fn parses_response_dialects() -> anyhow::Result<()> {
         "content": [{"type": "text", "text": "claude"}]
     });
     ensure!(
-        matches!(parse_anthropic_text(&anthropic), Ok(ref text) if text == "claude"),
+        matches!(parse_anthropic_text(anthropic), Ok(ref text) if text == "claude"),
         "Anthropic text parse failed"
     );
 
@@ -440,7 +270,7 @@ fn parses_response_dialects() -> anyhow::Result<()> {
         "candidates": [{"content": {"parts": [{"text": "gemini"}]}}]
     });
     ensure!(
-        matches!(parse_gemini_text(&gemini), Ok(ref text) if text == "gemini"),
+        matches!(parse_gemini_text(gemini), Ok(ref text) if text == "gemini"),
         "Gemini text parse failed"
     );
     Ok(())
@@ -451,7 +281,7 @@ fn embeddings_include_space_and_model() -> anyhow::Result<()> {
     let response = serde_json::json!({
         "data": [{"embedding": [0.25, -0.5, 1.0]}]
     });
-    let value = parse_openai_embedding(&response, "http-inference/test/embedder", "embedder")
+    let value = parse_openai_embedding(response, "http-inference/test/embedder", "embedder")
         .map_err(anyhow::Error::msg)?;
     let map = value.as_map().context("embedding output must be a map")?;
     ensure!(
@@ -480,83 +310,6 @@ fn embedding_capability_is_explicit() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "openai-chat")]
-#[test]
-fn routing_config_rejects_bad_groups() -> anyhow::Result<()> {
-    let cfg = bearer_config(HttpInferenceDialect::OpenAiChatCompletions);
-    let result = HttpInferenceRouterConfig::new()
-        .with_route(HttpInferenceRoute::new(cfg))
-        .with_group(HttpInferenceGroup::new(
-            "primary",
-            GroupPolicy::Priority,
-            ["missing-model"],
-        ))
-        .with_default_group("primary")
-        .build();
-    ensure!(
-        matches!(result, Err(HttpInferenceError::UnknownGroupModel { .. })),
-        "missing model group was accepted"
-    );
-
-    let cfg = bearer_config(HttpInferenceDialect::OpenAiChatCompletions);
-    let result = HttpInferenceRouterConfig::new()
-        .with_route(HttpInferenceRoute::new(cfg))
-        .with_group(
-            HttpInferenceGroup::new("primary", GroupPolicy::Priority, ["test"])
-                .with_fallback("missing"),
-        )
-        .with_default_group("primary")
-        .build();
-    ensure!(
-        matches!(result, Err(HttpInferenceError::UnknownFallbackGroup { .. })),
-        "missing fallback group was accepted"
-    );
-    Ok(())
-}
-
-#[cfg(feature = "openai-chat")]
-#[tokio::test]
-async fn openai_chat_posts_openai_compatible_request() -> anyhow::Result<()> {
-    let server = spawn_http_once("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#)?;
-    let cfg = HttpInferenceConfig::new(
-        "deepseek-chat",
-        HttpInferenceDialect::OpenAiChatCompletions,
-        server.base_url.clone(),
-        "deepseek-chat",
-        HttpInferenceAuth::BearerToken("secret-token".into()),
-    );
-    let backend = HttpInferenceBackend::new(cfg).map_err(anyhow::Error::msg)?;
-    let text = backend
-        .infer_inner(&Value::Str("hello".into()))
-        .await
-        .map_err(anyhow::Error::msg)?;
-    ensure!(text == "ok", "OpenAI chat text: {text}");
-    let request = recv_request(server)?;
-    ensure!(
-        request.head.starts_with("POST /v1/chat/completions "),
-        "request head: {}",
-        request.head
-    );
-    ensure!(
-        request
-            .head
-            .to_ascii_lowercase()
-            .contains("authorization: bearer secret-token"),
-        "request missing bearer authorization"
-    );
-    let body: JsonValue = serde_json::from_str(&request.body).map_err(anyhow::Error::msg)?;
-    ensure!(
-        body.get("model").and_then(JsonValue::as_str) == Some("deepseek-chat"),
-        "request model: {:?}",
-        body.get("model")
-    );
-    ensure!(
-        body.get("tools").is_none(),
-        "tools override leaked into request"
-    );
-    Ok(())
-}
-
 #[cfg(feature = "anthropic-messages")]
 #[tokio::test]
 async fn anthropic_uses_versioned_base_url_and_api_key_header() -> anyhow::Result<()> {
@@ -574,7 +327,7 @@ async fn anthropic_uses_versioned_base_url_and_api_key_header() -> anyhow::Resul
     cfg.options.api_version = Some("2023-06-01".into());
     let backend = HttpInferenceBackend::new(cfg).map_err(anyhow::Error::msg)?;
     let text = backend
-        .infer_inner(&Value::Str("hello".into()))
+        .infer_inner(&Value::string("hello".into()))
         .await
         .map_err(anyhow::Error::msg)?;
     ensure!(text == "claude", "Anthropic text: {text}");
@@ -615,7 +368,7 @@ async fn gemini_generate_content_posts_and_parses_text() -> anyhow::Result<()> {
     );
     let backend = HttpInferenceBackend::new(cfg).map_err(anyhow::Error::msg)?;
     let text = backend
-        .infer_inner(&Value::Str("hello".into()))
+        .infer_inner(&Value::string("hello".into()))
         .await
         .map_err(anyhow::Error::msg)?;
     ensure!(text == "gemini", "Gemini text: {text}");
@@ -633,39 +386,6 @@ async fn gemini_generate_content_posts_and_parses_text() -> anyhow::Result<()> {
             .to_ascii_lowercase()
             .contains("x-goog-api-key: gemini-secret"),
         "request missing Gemini api key header"
-    );
-    Ok(())
-}
-
-#[cfg(feature = "openai-chat")]
-#[tokio::test]
-async fn provider_status_redacts_configured_secret() -> anyhow::Result<()> {
-    let server = spawn_http_once("401 Unauthorized", r#"{"error":"secret-token rejected"}"#)?;
-    let cfg = HttpInferenceConfig::new(
-        "openai",
-        HttpInferenceDialect::OpenAiChatCompletions,
-        server.base_url.clone(),
-        "model-1",
-        HttpInferenceAuth::BearerToken("secret-token".into()),
-    );
-    let backend = HttpInferenceBackend::new(cfg).map_err(anyhow::Error::msg)?;
-    let err = backend
-        .infer_inner(&Value::Str("hello".into()))
-        .await
-        .map_err(anyhow::Error::msg);
-    let request = recv_request(server)?;
-    ensure!(
-        request.head.starts_with("POST /v1/chat/completions "),
-        "request head: {}",
-        request.head
-    );
-    let Err(error) = err else {
-        bail!("provider status unexpectedly succeeded");
-    };
-    let message = error.to_string();
-    ensure!(
-        message.contains("<redacted>") && !message.contains("secret-token"),
-        "provider status did not redact secret: {message}"
     );
     Ok(())
 }

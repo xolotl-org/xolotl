@@ -13,16 +13,16 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true, default-features = false, features = ["std"] }
-argon2 = { workspace = true, default-features = false, features = ["std"] }
+argon2 = { workspace = true, default-features = false, features = ["alloc", "password-hash"] }
 axum = { workspace = true, default-features = false, features = ["http1", "json", "tokio", "ws"] }
 base64 = { workspace = true, default-features = false, features = ["alloc"] }
-ed25519-dalek = { workspace = true, default-features = false, features = ["fast", "std", "zeroize"] }
+ed25519-dalek = { workspace = true, default-features = false, features = ["alloc", "fast", "zeroize"] }
 futures-util = { workspace = true, default-features = false, features = ["sink", "std"] }
 getrandom = { workspace = true, default-features = false }
 hmac = { workspace = true, default-features = false }
 xolotl-graph.workspace = true
 xolotl-gateway.workspace = true
-xolotl-kernel.workspace = true
+xolotl-kernel = { workspace = true, features = ["host"] }
 xolotl-state.workspace = true
 xolotl-types.workspace = true
 xolotl-proto.workspace = true

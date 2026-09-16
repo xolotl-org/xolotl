@@ -19,7 +19,7 @@ const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
 pub struct McpJsonRpcRequest {
     /// JSON-RPC protocol version. Must be `2.0`.
     pub jsonrpc: String,
-    /// Request id echoed in responses. Missing id means notification.
+    /// String or numeric request id echoed in responses. Missing id means notification.
     #[serde(default)]
     pub id: Option<serde_json::Value>,
     /// MCP method name.

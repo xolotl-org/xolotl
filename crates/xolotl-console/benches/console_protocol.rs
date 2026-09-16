@@ -12,9 +12,9 @@ const SNAPSHOT_FIELDS: usize = 256;
 fn snapshot_value(fields: usize) -> Value {
     let mut map = BTreeMap::new();
     for i in 0..fields {
-        map.insert(format!("state://bench/k{i}"), Value::Int(i as i64));
+        map.insert(format!("state://bench/k{i}"), Value::integer(i as i64));
     }
-    Value::Map(map)
+    Value::map(map)
 }
 
 fn consume<T>(value: T) {

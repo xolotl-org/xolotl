@@ -7,8 +7,9 @@
 use async_trait::async_trait;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use xolotl_kernel::{Driver, DriverContext, DriverError, MethodSpec};
+use xolotl_kernel::{Driver, DriverContext, DriverError, DriverOutput, MethodSpec};
 use xolotl_types::{MethodId, Outcome, OutputMode, Purity, Value};
+use xolotl_types::{ValueMap, ValueView};
 
 /// Method names for `effect://context/assemble`; the public method is `invoke`
 /// after standard installation. Pure: assembly is a deterministic function of
@@ -38,38 +39,57 @@ fn est_tokens(s: &str) -> usize {
 }
 
 /// Render one layer's value to its text contribution.
-fn layer_text<'a>(v: &'a Value, layer: &str) -> Result<Cow<'a, str>, DriverError> {
-    match v {
-        Value::Str(s) => Ok(Cow::Borrowed(s.as_str())),
-        Value::List(items) => {
-            let mut rendered = String::new();
-            for item in items {
-                let text = layer_text(item, layer)?;
-                if !rendered.is_empty() {
-                    rendered.push('\n');
-                }
-                rendered.push_str(text.as_ref());
-            }
-            Ok(Cow::Owned(rendered))
-        }
-        Value::Map(m) => {
-            let text = m.get("text").ok_or_else(|| {
-                DriverError::InvalidInput(format!("context layer {layer:?} missing text"))
-            })?;
-            layer_text(text, layer)
-        }
-        _ => Err(DriverError::InvalidInput(format!(
-            "context layer {layer:?} must be text, list, or map with text"
-        ))),
+fn layer_text<'a>(mut value: &'a Value, layer: &str) -> Result<Cow<'a, str>, DriverError> {
+    while let ValueView::Map(map) = value.view() {
+        value = map.get("text").ok_or_else(|| {
+            DriverError::InvalidInput(format!("context layer {layer:?} missing text"))
+        })?;
     }
+    if let ValueView::Str(text) = value.view() {
+        return Ok(Cow::Borrowed(text));
+    }
+    let mut rendered = String::new();
+    let mut frames = Vec::new();
+    let mut next = Some(value);
+    loop {
+        if let Some(value) = next.take() {
+            match value.view() {
+                ValueView::Str(text) => rendered.push_str(text),
+                ValueView::List(items) => frames.push((items.iter(), rendered.len())),
+                ValueView::Map(map) => {
+                    next = Some(map.get("text").ok_or_else(|| {
+                        DriverError::InvalidInput(format!("context layer {layer:?} missing text"))
+                    })?);
+                    continue;
+                }
+                _ => {
+                    return Err(DriverError::InvalidInput(format!(
+                        "context layer {layer:?} must be text, list, or map with text"
+                    )));
+                }
+            }
+        }
+        let Some((items, start)) = frames.last_mut() else {
+            break;
+        };
+        if let Some(child) = items.next() {
+            if rendered.len() > *start {
+                rendered.push('\n');
+            }
+            next = Some(child);
+        } else {
+            frames.pop();
+        }
+    }
+    Ok(Cow::Owned(rendered))
 }
 
 fn parse_budget(value: Option<&Value>) -> Result<usize, DriverError> {
-    match value {
-        Some(Value::Int(value)) if *value >= 0 => usize::try_from(*value).map_err(|_error| {
+    match value.map(Value::view) {
+        Some(ValueView::Int(value)) if value >= 0 => usize::try_from(value).map_err(|_error| {
             DriverError::InvalidInput("context token_budget is too large for this platform".into())
         }),
-        Some(Value::Int(_)) => Err(DriverError::InvalidInput(
+        Some(ValueView::Int(_)) => Err(DriverError::InvalidInput(
             "context token_budget must be nonnegative".into(),
         )),
         Some(_) => Err(DriverError::InvalidInput(
@@ -81,9 +101,9 @@ fn parse_budget(value: Option<&Value>) -> Result<usize, DriverError> {
     }
 }
 
-fn required_layers(m: &BTreeMap<String, Value>) -> Result<&BTreeMap<String, Value>, DriverError> {
-    match m.get("layers") {
-        Some(Value::Map(layers)) => Ok(layers),
+fn required_layers(m: &ValueMap) -> Result<&ValueMap, DriverError> {
+    match m.get("layers").map(Value::view) {
+        Some(ValueView::Map(layers)) => Ok(layers),
         Some(_) => Err(DriverError::InvalidInput(
             "context.assemble layers must be a map".into(),
         )),
@@ -112,7 +132,7 @@ impl Driver for ContextDriver {
         input: Value,
         _output: OutputMode,
         _ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
+    ) -> Result<DriverOutput, DriverError> {
         if method.get() != 0 {
             return Err(DriverError::NoSuchMethod(method));
         }
@@ -124,7 +144,7 @@ impl Driver for ContextDriver {
         let mut included: Vec<(&str, Cow<'_, str>, usize)> = Vec::new();
         let mut used = 0usize;
         for (i, layer) in LAYER_ORDER.iter().enumerate() {
-            let Some(v) = layers.get(*layer) else {
+            let Some(v) = layers.get(layer) else {
                 continue;
             };
             let text = layer_text(v, layer)?;
@@ -165,15 +185,15 @@ impl Driver for ContextDriver {
         }
         let layers_used: Vec<Value> = included
             .iter()
-            .map(|(name, _, _)| Value::Str((*name).to_string()))
+            .map(|(name, _, _)| Value::string((*name).to_string()))
             .collect();
 
         let mut out = BTreeMap::new();
-        out.insert("prompt".into(), Value::Str(prompt));
-        out.insert("token_count".into(), Value::Int(used as i64));
-        out.insert("budget".into(), Value::Int(budget as i64));
-        out.insert("layers_used".into(), Value::List(layers_used));
-        Ok(Outcome::Done(Value::Map(out)))
+        out.insert("prompt".into(), Value::string(prompt));
+        out.insert("token_count".into(), Value::integer(used as i64));
+        out.insert("budget".into(), Value::integer(budget as i64));
+        out.insert("layers_used".into(), Value::list(layers_used));
+        Ok(DriverOutput::new(Outcome::Done(Value::map(out))))
     }
 }
 
@@ -183,6 +203,21 @@ mod tests {
     use anyhow::{Context, Result, bail, ensure};
     use xolotl_types::{IdentityRef, ProcessId};
 
+    #[test]
+    fn nested_empty_layers_preserve_separator_behavior() -> Result<()> {
+        let value = Value::list(vec![
+            Value::string(String::new()),
+            Value::list(vec![
+                Value::string("a".into()),
+                Value::string(String::new()),
+            ]),
+            Value::list(vec![]),
+            Value::map(BTreeMap::from([("text".into(), Value::string("b".into()))])),
+        ]);
+        ensure!(layer_text(&value, "recall")? == "a\n\n\nb");
+        Ok(())
+    }
+
     fn ctx() -> DriverContext {
         DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
     }
@@ -190,17 +225,17 @@ mod tests {
     fn assemble_input(budget: i64, layers: Vec<(&str, &str)>) -> Value {
         let mut lm = BTreeMap::new();
         for (k, v) in layers {
-            lm.insert(k.to_string(), Value::Str(v.into()));
+            lm.insert(k.to_string(), Value::string(v.into()));
         }
         let mut m = BTreeMap::new();
-        m.insert("token_budget".into(), Value::Int(budget));
-        m.insert("layers".into(), Value::Map(lm));
-        Value::Map(m)
+        m.insert("token_budget".into(), Value::integer(budget));
+        m.insert("layers".into(), Value::map(lm));
+        Value::map(m)
     }
 
-    fn output_map(outcome: Outcome) -> Result<BTreeMap<String, Value>> {
-        match outcome {
-            Outcome::Done(Value::Map(map)) => Ok(map),
+    fn output_map(output: DriverOutput) -> Result<ValueMap> {
+        match output.outcome {
+            Outcome::Done(value) => value.into_map().context("expected assembled map"),
             other => bail!("expected assembled map, got {other:?}"),
         }
     }
@@ -289,8 +324,8 @@ mod tests {
             .await
             .context("assemble context")?;
         let map = output_map(out)?;
-        let layers: Vec<String> = match map.get("layers_used") {
-            Some(Value::List(l)) => l
+        let layers: Vec<String> = match map.get("layers_used").map(Value::view) {
+            Some(ValueView::List(l)) => l
                 .iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect(),
@@ -331,33 +366,33 @@ mod tests {
     async fn assemble_rejects_malformed_input() -> Result<()> {
         let d = ContextDriver::new();
         let mut missing_layers = BTreeMap::new();
-        missing_layers.insert("token_budget".into(), Value::Int(10));
+        missing_layers.insert("token_budget".into(), Value::integer(10));
 
         let mut missing_budget = BTreeMap::new();
-        missing_budget.insert("layers".into(), Value::Map(BTreeMap::new()));
+        missing_budget.insert("layers".into(), Value::map(BTreeMap::new()));
 
         let mut malformed_layer = BTreeMap::new();
-        malformed_layer.insert("persona".into(), Value::Map(BTreeMap::new()));
+        malformed_layer.insert("persona".into(), Value::map(BTreeMap::new()));
         let mut malformed_layer_input = BTreeMap::new();
-        malformed_layer_input.insert("token_budget".into(), Value::Int(10));
-        malformed_layer_input.insert("layers".into(), Value::Map(malformed_layer));
+        malformed_layer_input.insert("token_budget".into(), Value::integer(10));
+        malformed_layer_input.insert("layers".into(), Value::map(malformed_layer));
 
         for input in [
-            Value::Map(missing_layers),
-            Value::Map(missing_budget),
-            Value::Map(BTreeMap::from([
-                ("token_budget".into(), Value::Str("10".into())),
-                ("layers".into(), Value::Map(BTreeMap::new())),
+            Value::map(missing_layers),
+            Value::map(missing_budget),
+            Value::map(BTreeMap::from([
+                ("token_budget".into(), Value::string("10".into())),
+                ("layers".into(), Value::map(BTreeMap::new())),
             ])),
-            Value::Map(BTreeMap::from([
-                ("token_budget".into(), Value::Int(-1)),
-                ("layers".into(), Value::Map(BTreeMap::new())),
+            Value::map(BTreeMap::from([
+                ("token_budget".into(), Value::integer(-1)),
+                ("layers".into(), Value::map(BTreeMap::new())),
             ])),
-            Value::Map(BTreeMap::from([
-                ("token_budget".into(), Value::Int(10)),
-                ("layers".into(), Value::Str("bad".into())),
+            Value::map(BTreeMap::from([
+                ("token_budget".into(), Value::integer(10)),
+                ("layers".into(), Value::string("bad".into())),
             ])),
-            Value::Map(malformed_layer_input),
+            Value::map(malformed_layer_input),
         ] {
             let out = d
                 .call(MethodId::new(0), input, OutputMode::Unary, &ctx())

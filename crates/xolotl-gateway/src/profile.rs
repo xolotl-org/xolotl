@@ -11,6 +11,9 @@ use crate::{
 use std::collections::BTreeMap;
 use xolotl_types::{Path, ProcessId, ResourceName, Value};
 
+mod document;
+pub use document::GatewayProfileDocument;
+
 /// One resource surface exposed by a gateway profile.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GatewaySurface {
@@ -22,8 +25,10 @@ pub struct GatewaySurface {
     pub(crate) publish_capability: Option<String>,
     /// Input schema descriptor advertised for this surface.
     pub(crate) input_schema: Option<Value>,
-    /// Output schema descriptor advertised for this surface.
+    /// Final output schema descriptor advertised for this surface.
     pub(crate) output_schema: Option<Value>,
+    /// Schema for each emitted output stream item, independent of the final result.
+    pub(crate) output_stream_schema: Option<Value>,
 }
 
 /// A protocol-level publication of one Gateway surface.
@@ -128,6 +133,7 @@ impl GatewaySurface {
             publish_capability: None,
             input_schema: None,
             output_schema: None,
+            output_stream_schema: None,
         }
     }
 
@@ -145,6 +151,12 @@ impl GatewaySurface {
     ) -> Self {
         self.input_schema = input_schema;
         self.output_schema = output_schema;
+        self
+    }
+
+    /// Validate each emitted output stream item without changing the final schema.
+    pub fn with_output_stream_schema(mut self, schema: Value) -> Self {
+        self.output_stream_schema = Some(schema);
         self
     }
 }
@@ -204,7 +216,8 @@ impl GatewayPrincipalSurfaceBinding {
 }
 
 /// Request limits applied before a request Process runs.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct GatewayLimitProfile {
     /// Maximum inline literal bytes in one lowered submission.
     pub max_literal_bytes: usize,
@@ -249,7 +262,8 @@ impl Default for GatewayLimitProfile {
 }
 
 /// Aggregate request budget reserved during Gateway admission.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct GatewayBudgetProfile {
     /// Maximum outstanding operation leaves admitted across running requests.
     pub max_inflight_ops: Option<u64>,

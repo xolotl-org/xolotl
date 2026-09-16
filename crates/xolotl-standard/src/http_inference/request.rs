@@ -2,9 +2,11 @@ use super::config::{HttpInferenceAuth, HttpInferenceConfig, HttpInferenceDialect
 use super::error::HttpInferenceError;
 use crate::inference::{InferenceMethodSupport, ModelCapabilities};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
-use xolotl_types::Value;
+use xolotl_types::{Value, ValueView};
+
+mod encode;
+pub(super) use encode::{Body, encode_embedding, encode_generation};
 
 pub(super) fn default_capabilities(dialect: HttpInferenceDialect) -> ModelCapabilities {
     let mut caps = ModelCapabilities {
@@ -14,6 +16,7 @@ pub(super) fn default_capabilities(dialect: HttpInferenceDialect) -> ModelCapabi
             rerank: false,
             plan: true,
         },
+        streaming: true,
         ..Default::default()
     };
     match dialect {
@@ -150,7 +153,7 @@ fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), HttpInfere
 }
 
 pub(super) fn validate_overrides(
-    overrides: &BTreeMap<String, JsonValue>,
+    overrides: &xolotl_types::ValueMap,
 ) -> Result<(), HttpInferenceError> {
     for (key, value) in overrides {
         let lower = key.to_ascii_lowercase();
@@ -162,30 +165,23 @@ pub(super) fn validate_overrides(
     Ok(())
 }
 
-fn validate_sensitive_override_field(
-    key: &str,
-    value: &JsonValue,
-) -> Result<(), HttpInferenceError> {
+fn validate_sensitive_override_field(key: &str, value: &Value) -> Result<(), HttpInferenceError> {
     let lower = key.to_ascii_lowercase();
     if is_sensitive_request_field(&lower) || lower.contains("secret") || lower.contains("api_key") {
         return Err(HttpInferenceError::ReservedRequestField(key.to_string()));
     }
-    match value {
-        JsonValue::Object(map) => {
-            for (child, child_value) in map {
-                validate_sensitive_override_field(child, child_value)?;
-            }
-        }
-        JsonValue::Array(items) => {
-            for item in items {
-                if let JsonValue::Object(map) = item {
-                    for (child, child_value) in map {
-                        validate_sensitive_override_field(child, child_value)?;
-                    }
+    for value in crate::input::inspection_values(value) {
+        if let ValueView::Map(map) = value.view() {
+            for child in map.keys() {
+                let lower = child.to_ascii_lowercase();
+                if is_sensitive_request_field(&lower)
+                    || lower.contains("secret")
+                    || lower.contains("api_key")
+                {
+                    return Err(HttpInferenceError::ReservedRequestField(child.to_owned()));
                 }
             }
         }
-        _ => {}
     }
     Ok(())
 }
@@ -237,19 +233,21 @@ fn is_sensitive_request_field(field: &str) -> bool {
 }
 
 pub(super) fn reject_unsupported_input(input: &Value) -> Result<(), HttpInferenceError> {
-    fn scan(value: &Value) -> Result<(), HttpInferenceError> {
-        match value {
-            Value::Bytes(_) => Err(HttpInferenceError::UnsupportedPayload("inline bytes")),
-            Value::Blob(_) => Err(HttpInferenceError::UnsupportedPayload("blob reference")),
-            Value::Tensor(_) => Err(HttpInferenceError::UnsupportedPayload("tensor reference")),
-            Value::Frame(_) => Err(HttpInferenceError::UnsupportedPayload("frame reference")),
-            Value::List(items) => {
-                for item in items {
-                    scan(item)?;
-                }
-                Ok(())
+    for value in crate::input::inspection_values(input) {
+        match value.view() {
+            ValueView::Bytes(_) => {
+                return Err(HttpInferenceError::UnsupportedPayload("inline bytes"));
             }
-            Value::Map(map) => {
+            ValueView::Blob(_) => {
+                return Err(HttpInferenceError::UnsupportedPayload("blob reference"));
+            }
+            ValueView::Tensor(_) => {
+                return Err(HttpInferenceError::UnsupportedPayload("tensor reference"));
+            }
+            ValueView::Frame(_) => {
+                return Err(HttpInferenceError::UnsupportedPayload("frame reference"));
+            }
+            ValueView::Map(map) => {
                 for key in map.keys() {
                     let lower = key.to_ascii_lowercase();
                     if lower == "tools" || lower == "tool_choice" || lower == "functions" {
@@ -258,15 +256,11 @@ pub(super) fn reject_unsupported_input(input: &Value) -> Result<(), HttpInferenc
                         ));
                     }
                 }
-                for value in map.values() {
-                    scan(value)?;
-                }
-                Ok(())
             }
-            _ => Ok(()),
+            _ => {}
         }
     }
-    scan(input)
+    Ok(())
 }
 
 pub(super) fn headers_for(config: &HttpInferenceConfig) -> Result<HeaderMap, HttpInferenceError> {
@@ -322,22 +316,4 @@ pub(super) fn endpoint_url(base_url: &str, path: &str) -> Result<String, HttpInf
         url.set_path(&base_path);
     }
     Ok(url.to_string())
-}
-
-pub(super) fn redact_body(body: &str, config: &HttpInferenceConfig) -> String {
-    let mut redacted = body.to_string();
-    match &config.auth {
-        HttpInferenceAuth::None => {}
-        HttpInferenceAuth::BearerToken(token) => {
-            if !token.is_empty() {
-                redacted = redacted.replace(token, "<redacted>");
-            }
-        }
-        HttpInferenceAuth::ApiKeyHeader { value, .. } => {
-            if !value.is_empty() {
-                redacted = redacted.replace(value, "<redacted>");
-            }
-        }
-    }
-    redacted.chars().take(512).collect()
 }

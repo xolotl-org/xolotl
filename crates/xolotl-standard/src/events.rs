@@ -9,14 +9,26 @@
 //! `subscribe` is mode-aware. In `OutputMode::Stream` it taps the backend's
 //! subscription channel (`state.subscribe`, the same channel the executor's
 //! `Wait(Signal)` consumes) and forwards each appended event to the operation's
-//! stream sink via [`DriverContext::emit`], bounded so a quiet topic can't wedge
-//! the run. In `OutputMode::Unary` it confirms the topic is addressable.
+//! stream sink via [`DriverContext::emit_tainted`]. A matching topic deletion ends
+//! that subscription without emitting a data chunk. The terminal delivery count
+//! and later failures retain all sources observed on the topic, including
+//! deletion; each data chunk keeps its own event's sources. In `OutputMode::Unary`
+//! it confirms the topic is addressable.
+//!
+//! Streaming subscriptions have no implicit cumulative event limit. An optional
+//! nonnegative `max_events` sets an explicit stopping condition; zero returns
+//! immediately without opening a subscription. The successful terminal value is
+//! the complete decimal string of delivered data chunks, including `"0"`.
 
+use crate::error::ObservedFailure;
 use async_trait::async_trait;
-use std::collections::BTreeMap;
-use xolotl_kernel::{Driver, DriverContext, DriverError, MethodSpec};
-use xolotl_state::{Backend, StateEvent};
+use xolotl_kernel::{Driver, DriverContext, DriverError, DriverOutput, MethodSpec};
+use xolotl_state::{Backend, StateEvent, TaintedValue};
 use xolotl_types::{MethodId, Outcome, OutputMode, Path, Purity, Value};
+use xolotl_types::{ValueMap, ValueView};
+
+mod count;
+use count::DeliveryCount;
 
 /// Internal method names in registration order. `install_standard` exposes each
 /// one as a separate `effect://events/<method>` Resource with public method
@@ -25,11 +37,6 @@ pub(crate) const EVENTS_METHODS: &[MethodSpec] = &[
     MethodSpec::new("publish", Purity::Effectful, MethodSpec::UNARY_ASYNC).finalize_allowed(),
     MethodSpec::new("subscribe", Purity::Pure, MethodSpec::STREAM_ASYNC).observes_external(),
 ];
-
-/// Upper bound on events forwarded to one streaming subscriber before the
-/// driver returns, so a subscribe Operation always terminates. A caller
-/// may lower it via `max_events`; long-lived ingest uses a Source.
-const DEFAULT_STREAM_LIMIT: usize = 1024;
 
 /// Drives the event bus actions.
 pub(crate) struct EventBusDriver {
@@ -49,46 +56,79 @@ impl EventBusDriver {
             .map_err(|e| DriverError::Other(format!("invalid event topic {topic:?}: {e}")))
     }
 
-    /// Stream appended events on `topic` to the operation's sink. Returns the
-    /// count delivered once the channel closes or the bound is hit.
+    /// Stream appended items and whole-topic replacements to the operation's sink.
+    /// A matching deletion ends the subscription without emitting a data chunk.
+    /// Return the decimal count of chunks delivered on deletion, closure, or an
+    /// explicitly requested limit. No limit means continued subscription. Zero
+    /// returns immediately without observing State. Idle subscriptions wait for
+    /// the next event or closure and remain cancellable by their operation owner,
+    /// retaining every matched event's sources in that count or any later failure.
     async fn stream_topic(
         &self,
         path: &Path,
-        limit: usize,
+        limit: Option<u64>,
         ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
-        let mut rx = self
-            .state
-            .subscribe(path)
-            .await
-            .map_err(|e| DriverError::Other(format!("subscribe failed: {e}")))?;
-        let mut delivered = 0usize;
-        while delivered < limit {
-            match rx.recv().await {
-                // Topics are Sequence Resources, so a publish is an Append.
-                Ok(StateEvent::Append { path: p, item, .. }) if &p == path => {
-                    if !ctx.emit(item) {
-                        break; // receiver dropped (caller cancelled / disconnected)
-                    }
-                    delivered += 1;
-                }
-                // A whole-topic Set (e.g. reset) is forwarded as a single chunk.
-                Ok(StateEvent::Set { path: p, value, .. }) if &p == path => {
-                    if !ctx.emit(value) {
-                        break;
-                    }
-                    delivered += 1;
-                }
-                Ok(_) => continue, // unrelated path on a shared channel
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    return Err(DriverError::Other(format!(
-                        "event stream lagged and dropped {skipped} events"
-                    )));
-                }
-            }
+    ) -> Result<DriverOutput, DriverError> {
+        let mut delivered = DeliveryCount::new();
+        let mut observed = ctx.taint.clone();
+        if delivered.reached(limit) {
+            return Ok(
+                DriverOutput::new(Outcome::Done(Value::string(delivered.into_decimal())))
+                    .with_taint(observed),
+            );
         }
-        Ok(Outcome::Done(Value::Int(delivered as i64)))
+        let mut rx = match self.state.subscribe(path).await {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                return ObservedFailure::from(error)
+                    .with_taint(&ctx.taint)
+                    .into_output("events");
+            }
+        };
+        while !delivered.reached(limit) {
+            let event = match rx.recv().await {
+                Ok(event) => event,
+                Err(xolotl_state::StateWatchError::Closed) => break,
+                Err(xolotl_state::StateWatchError::Lagged(skipped)) => {
+                    return ObservedFailure::from(DriverError::Other(format!(
+                        "event stream lagged and dropped {skipped} events"
+                    )))
+                    .with_taint(&observed)
+                    .into_output("events");
+                }
+                Err(error) => {
+                    return ObservedFailure::from(DriverError::Other(format!(
+                        "event stream failed: {error}"
+                    )))
+                    .with_taint(&observed)
+                    .into_output("events");
+                }
+            };
+            if event.path() != path {
+                continue;
+            }
+            let (value, taint) = match event {
+                StateEvent::Append { item, taint, .. }
+                | StateEvent::Set {
+                    value: item, taint, ..
+                } => (item, taint),
+                StateEvent::Delete { taint, .. } => {
+                    observed.union(&taint);
+                    break;
+                }
+            };
+            observed.union(&taint);
+            if let Err(error) = ctx.emit_tainted(TaintedValue::new(value, taint)).await {
+                return ObservedFailure::from(DriverError::from(error))
+                    .with_taint(&observed)
+                    .into_output("events");
+            }
+            delivered.increment();
+        }
+        Ok(
+            DriverOutput::new(Outcome::Done(Value::string(delivered.into_decimal())))
+                .with_taint(observed),
+        )
     }
 }
 
@@ -100,21 +140,27 @@ impl Driver for EventBusDriver {
         input: Value,
         output: OutputMode,
         ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
-        let mut m = crate::input::map(input, "events")?;
+    ) -> Result<DriverOutput, DriverError> {
+        let m = crate::input::map(input, "events")?;
         let topic = optional_topic(&m)?;
         let path = Self::topic_path(&topic)?;
         match method.get() {
             // publish: append the event payload to the topic Sequence.
             0 => {
-                let event = m.remove("event").ok_or_else(|| {
+                let event = m.get("event").cloned().ok_or_else(|| {
                     DriverError::InvalidInput("events.publish requires event".into())
                 })?;
-                self.state
-                    .write_append(&path, event)
+                match self
+                    .state
+                    .write_append_tainted(&path, event, ctx.taint.clone())
                     .await
-                    .map_err(|e| DriverError::Other(e.to_string()))?;
-                Ok(Outcome::Done(Value::Bool(true)))
+                {
+                    Ok(commit) => Ok(DriverOutput::new(Outcome::Done(Value::boolean(true)))
+                        .with_taint(commit.taint)),
+                    Err(error) => ObservedFailure::from(error)
+                        .with_taint(&ctx.taint)
+                        .into_output("events"),
+                }
             }
             // subscribe: in Stream mode, forward appended events to the sink via
             // the backend subscription channel; otherwise confirm the topic is
@@ -124,7 +170,9 @@ impl Driver for EventBusDriver {
                     let limit = optional_stream_limit(&m)?;
                     self.stream_topic(&path, limit, ctx).await
                 } else {
-                    Ok(Outcome::Done(Value::Str(path.to_string())))
+                    Ok(DriverOutput::new(Outcome::Done(Value::string(
+                        path.to_string(),
+                    ))))
                 }
             }
             _ => Err(DriverError::NoSuchMethod(method)),
@@ -132,11 +180,11 @@ impl Driver for EventBusDriver {
     }
 }
 
-fn optional_topic(m: &BTreeMap<String, Value>) -> Result<String, DriverError> {
-    match m.get("topic") {
+fn optional_topic(m: &ValueMap) -> Result<String, DriverError> {
+    match m.get("topic").map(Value::view) {
         None => Ok("default".into()),
-        Some(Value::Str(topic)) if !topic.is_empty() => Ok(topic.clone()),
-        Some(Value::Str(_)) => Err(DriverError::InvalidInput(
+        Some(ValueView::Str(topic)) if !topic.is_empty() => Ok(topic.to_owned()),
+        Some(ValueView::Str(_)) => Err(DriverError::InvalidInput(
             "events topic must not be empty".into(),
         )),
         Some(_) => Err(DriverError::InvalidInput(
@@ -145,13 +193,11 @@ fn optional_topic(m: &BTreeMap<String, Value>) -> Result<String, DriverError> {
     }
 }
 
-fn optional_stream_limit(m: &BTreeMap<String, Value>) -> Result<usize, DriverError> {
-    match m.get("max_events") {
-        None => Ok(DEFAULT_STREAM_LIMIT),
-        Some(Value::Int(limit)) if *limit >= 0 => usize::try_from(*limit).map_err(|_error| {
-            DriverError::InvalidInput("events max_events is too large for this platform".into())
-        }),
-        Some(Value::Int(_)) => Err(DriverError::InvalidInput(
+fn optional_stream_limit(m: &ValueMap) -> Result<Option<u64>, DriverError> {
+    match m.get("max_events").map(Value::view) {
+        None => Ok(None),
+        Some(ValueView::Int(limit)) if limit >= 0 => Ok(Some(limit as u64)),
+        Some(ValueView::Int(_)) => Err(DriverError::InvalidInput(
             "events max_events must be non-negative".into(),
         )),
         Some(_) => Err(DriverError::InvalidInput(
@@ -169,20 +215,23 @@ mod tests {
     use xolotl_state::InMemoryBackend;
     use xolotl_types::{IdentityRef, ProcessId};
 
+    mod provenance;
+    mod streaming;
+
     fn ctx() -> DriverContext {
         DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
     }
 
     fn publish_input(topic: &str, event: &str) -> Value {
         let mut m = BTreeMap::new();
-        m.insert("topic".into(), Value::Str(topic.into()));
-        m.insert("event".into(), Value::Str(event.into()));
-        Value::Map(m)
+        m.insert("topic".into(), Value::string(topic.into()));
+        m.insert("event".into(), Value::string(event.into()));
+        Value::map(m)
     }
 
     #[tokio::test]
     async fn publish_appends_to_topic() -> Result<()> {
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let d = EventBusDriver::new(state.clone());
         d.call(
             MethodId::new(0),
@@ -194,19 +243,19 @@ mod tests {
         .context("publish event")?;
         let topic_path = EventBusDriver::topic_path("alerts").context("build topic path")?;
         let stored = state.read(&topic_path).await.context("read topic events")?;
-        let expected = Some(Value::List(vec![Value::Str("fire".into())]));
+        let expected = Some(Value::list(vec![Value::string("fire".into())]));
         ensure!(stored == expected, "stored events: {stored:?}");
         Ok(())
     }
 
     #[tokio::test]
     async fn publish_requires_explicit_event() -> Result<()> {
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let d = EventBusDriver::new(state);
         let mut m = BTreeMap::new();
-        m.insert("topic".into(), Value::Str("alerts".into()));
+        m.insert("topic".into(), Value::string("alerts".into()));
         let out = d
-            .call(MethodId::new(0), Value::Map(m), OutputMode::Unary, &ctx())
+            .call(MethodId::new(0), Value::map(m), OutputMode::Unary, &ctx())
             .await;
         ensure!(out.is_err(), "publish accepted a missing event");
         Ok(())
@@ -214,7 +263,7 @@ mod tests {
 
     #[tokio::test]
     async fn topic_rejects_path_delimiters() -> Result<()> {
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let d = EventBusDriver::new(state);
         let out = d
             .call(
@@ -230,13 +279,13 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_rejects_invalid_max_events() -> Result<()> {
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let d = EventBusDriver::new(state);
         let mut m = BTreeMap::new();
-        m.insert("topic".into(), Value::Str("alerts".into()));
-        m.insert("max_events".into(), Value::Int(-1));
+        m.insert("topic".into(), Value::string("alerts".into()));
+        m.insert("max_events".into(), Value::integer(-1));
         let out = d
-            .call(MethodId::new(1), Value::Map(m), OutputMode::Stream, &ctx())
+            .call(MethodId::new(1), Value::map(m), OutputMode::Stream, &ctx())
             .await;
         ensure!(out.is_err(), "negative max_events was accepted");
         Ok(())
@@ -244,35 +293,36 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_unary_returns_topic_path() -> Result<()> {
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let d = EventBusDriver::new(state.clone());
         let mut m = BTreeMap::new();
-        m.insert("topic".into(), Value::Str("alerts".into()));
+        m.insert("topic".into(), Value::string("alerts".into()));
         let out = d
-            .call(MethodId::new(1), Value::Map(m), OutputMode::Unary, &ctx())
+            .call(MethodId::new(1), Value::map(m), OutputMode::Unary, &ctx())
             .await
             .context("subscribe unary")?;
-        let expected = Outcome::Done(Value::Str("state://events/alerts".into()));
-        ensure!(out == expected, "subscribe output: {out:?}");
+        let expected = Outcome::Done(Value::string("state://events/alerts".into()));
+        ensure!(out.outcome == expected, "subscribe output: {out:?}");
         Ok(())
     }
 
     #[tokio::test]
     async fn published_event_reaches_streaming_subscriber() -> Result<()> {
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let d = Arc::new(EventBusDriver::new(state.clone()));
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let (tx, mut rx) =
+            xolotl_kernel::host::stream::channel(xolotl_kernel::stream::StreamWindow::default());
         let sink_path = Path::parse("state://stream/sub").context("parse stream sink path")?;
         let sctx =
             DriverContext::new(IdentityRef::ROOT, ProcessId::new(2)).with_stream(sink_path, tx);
 
         let mut sm = BTreeMap::new();
-        sm.insert("topic".into(), Value::Str("chat".into()));
-        sm.insert("max_events".into(), Value::Int(2));
+        sm.insert("topic".into(), Value::string("chat".into()));
+        sm.insert("max_events".into(), Value::integer(2));
         let sub = d.clone();
         let handle = tokio::spawn(async move {
-            sub.call(MethodId::new(1), Value::Map(sm), OutputMode::Stream, &sctx)
+            sub.call(MethodId::new(1), Value::map(sm), OutputMode::Stream, &sctx)
                 .await
         });
 
@@ -285,31 +335,40 @@ mod tests {
         )
         .await
         .context("publish first event")?;
-        d.call(
-            MethodId::new(0),
-            publish_input("chat", "world"),
-            OutputMode::Unary,
-            &ctx(),
-        )
-        .await
-        .context("publish second event")?;
+        let topic = EventBusDriver::topic_path("chat")?;
+        let protected = xolotl_types::TaintSet::of(xolotl_types::TaintSource::Protected {
+            path: topic.clone(),
+        });
+        state
+            .write_append_tainted(&topic, Value::string("world".into()), protected.clone())
+            .await?;
 
         let out = handle
             .await
             .context("join subscriber task")?
             .context("run subscriber")?;
         ensure!(
-            out == Outcome::Done(Value::Int(2)),
+            out.outcome == Outcome::Done(Value::string("2".into())),
             "stream subscriber output: {out:?}"
         );
-        let first = rx.recv().await;
         ensure!(
-            first == Some(Value::Str("hello".into())),
+            out.taint.has_protected(),
+            "terminal count lost observed sources"
+        );
+        let Some(xolotl_kernel::host::stream::StreamItem::Chunk(first)) = rx.recv().await else {
+            anyhow::bail!("missing first stream chunk");
+        };
+        let first = first.into_value();
+        ensure!(
+            first == TaintedValue::pristine(Value::string("hello".into())),
             "first stream chunk: {first:?}"
         );
-        let second = rx.recv().await;
+        let Some(xolotl_kernel::host::stream::StreamItem::Chunk(second)) = rx.recv().await else {
+            anyhow::bail!("missing second stream chunk");
+        };
+        let second = second.into_value();
         ensure!(
-            second == Some(Value::Str("world".into())),
+            second == TaintedValue::new(Value::string("world".into()), protected),
             "second stream chunk: {second:?}"
         );
         Ok(())

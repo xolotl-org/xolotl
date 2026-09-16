@@ -4,6 +4,9 @@ use xolotl_gateway::GatewayError;
 /// Errors raised while rendering Gateway publications as MCP objects or serving calls.
 #[derive(Debug, Error)]
 pub enum McpGatewayError {
+    /// A finite JSON response exceeds this adapter's explicit output budget.
+    #[error("MCP output admission: {0}")]
+    OutputLimit(&'static str),
     /// The MCP client requested a tool that is not published for the session.
     #[error("unknown MCP tool {0}")]
     UnknownTool(String),

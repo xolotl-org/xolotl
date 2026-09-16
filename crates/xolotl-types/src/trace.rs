@@ -74,10 +74,11 @@ impl TraceContext {
     /// derived from the Fact's `OperationId` so it is deterministic and stable
     /// across replay.
     pub fn span_for(&self, fact: &Fact) -> Span {
+        let op_seed = splitmix(fact.id.process.get());
+        let op_seed = splitmix(op_seed ^ fact.id.execution.get());
+        let op_seed = splitmix(op_seed ^ fact.id.invocation.get());
         let op_seed = splitmix(
-            fact.id.process.get()
-                ^ (fact.id.position.get() as u64).rotate_left(17)
-                ^ (fact.id.attempt as u64).rotate_left(31),
+            op_seed ^ ((u64::from(fact.id.position.get()) << 32) | u64::from(fact.id.attempt)),
         );
         Span {
             trace_id: self.trace_id,
@@ -102,24 +103,33 @@ fn splitmix(mut x: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{HandleId, MethodId, NodeId, ResourceId, Timestamp};
-    use crate::operation::{OperationId, OutcomeRef, ValueRef};
+    use crate::ids::{
+        ExecutionId, HandleId, InvocationId, MethodId, NodeId, ResourceId, Timestamp,
+    };
+    use crate::operation::OperationId;
     use crate::replay::ReplayClass;
     use crate::{IdentityRef, Value};
+    use anyhow::{Context, ensure};
 
     fn fact(process: ProcessId, node: u32, decision: DecisionTag) -> Fact {
         Fact {
-            id: OperationId::new(process, NodeId::new(node), 0),
+            id: OperationId::new(
+                process,
+                ExecutionId::FIRST,
+                InvocationId::new(u64::from(node) + 1),
+                NodeId::new(node),
+                0,
+            ),
             schema_version: Fact::SCHEMA_VERSION,
             caller: process,
             acting: IdentityRef::ROOT,
             handle: HandleId::new(0, 1),
             resource: ResourceId::new(1),
             method: MethodId::new(3),
-            input_ref: ValueRef::Inline(Value::Null),
+            input: Value::null(),
             taint: crate::taint::TaintSet::pristine(),
             decision,
-            outcome_ref: OutcomeRef::None,
+            outcome: None,
             batch: None,
             replay: ReplayClass::Deterministic,
             timestamp: Timestamp::millis(42),
@@ -162,5 +172,22 @@ mod tests {
         let s1 = ctx.span_for(&fact(ProcessId::new(1), 1, DecisionTag::Ok));
         let s2 = ctx.span_for(&fact(ProcessId::new(1), 2, DecisionTag::Ok));
         assert_ne!(s1.span_id, s2.span_id);
+    }
+
+    #[test]
+    fn repeated_call_sites_and_executions_have_distinct_spans() -> anyhow::Result<()> {
+        let ctx = TraceContext::root_for(ProcessId::new(1));
+        let original = fact(ProcessId::new(1), 1, DecisionTag::Ok);
+        let mut repeated = original.clone();
+        repeated.id.invocation = InvocationId::new(original.id.invocation.get() + 1);
+        let mut independent = original.clone();
+        independent.id.execution = ExecutionId::new(2).context("nonzero scope")?;
+        let original_span = ctx.span_for(&original);
+        let repeated_span = ctx.span_for(&repeated);
+        let independent_span = ctx.span_for(&independent);
+        ensure!(original_span.span_id != repeated_span.span_id);
+        ensure!(original_span.span_id != independent_span.span_id);
+        ensure!(repeated_span.span_id != independent_span.span_id);
+        Ok(())
     }
 }

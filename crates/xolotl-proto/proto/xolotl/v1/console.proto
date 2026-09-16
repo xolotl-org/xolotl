@@ -46,7 +46,7 @@ message ProtocolMetadata {
   uint32 protocol_version = 1;
   string server_name = 2;                 // "xolotl-console"
   string wire_encoding = 3;               // "protobuf+xolotl-console-v1"
-  uint64 server_rev = 4;                  // fact cursor (advances on every Fact)
+  uint64 server_rev = 4;                  // observed append head; completion updates do not advance it
   uint64 registry_rev = 5;                // descriptor registry revision
   uint64 server_time_ms = 6;              // wall clock for client skew detection
   repeated string capabilities = 7;       // optional feature flags
@@ -79,7 +79,7 @@ message StreamCall {
   optional string scope = 4;
   optional string justification = 5;
   optional uint64 ttl_ms = 6;
-  optional uint64 since_rev = 7;          // resume cursor (state_rev or fact_cursor)
+  optional uint64 since_rev = 7;          // reserved; current live-only streams reject this field
   optional uint32 max_batch = 8;          // max events per server flush
 }
 
@@ -108,8 +108,8 @@ message ConsoleEvent {
     Summary     summary      = 5;         // VolatileSummary coalesced
     SubscriptionClosed closed = 6;
   }
-  uint64 state_rev = 10;                  // per-subscription monotonic cursor
-  uint64 fact_cursor = 11;                // ReliableLog resume cursor
+  uint64 state_rev = 10;                  // reserved; current live-only streams emit zero
+  uint64 fact_cursor = 11;                // reserved; append positions cannot resume outcome updates
   bool coalesced = 12;                    // true if events were merged under backpressure
 }
 
@@ -137,7 +137,7 @@ message Summary {
 
 message SubscriptionClosed {
   string reason = 1;
-  optional uint64 last_rev = 2;           // last cursor delivered (for replay)
+  optional uint64 last_rev = 2;           // reserved; current live-only streams leave this absent
 }
 
 
@@ -230,7 +230,6 @@ message FieldDescriptor {
   Sensitivity sensitivity = 7;
   bool read_only = 8;
   bool computed = 9;
-  bool deprecated = 10;
 }
 
 message PaginationSpec {
@@ -261,7 +260,6 @@ enum Stability {
   STABILITY_EXPERIMENTAL = 1;
   STABILITY_BETA = 2;
   STABILITY_STABLE = 3;
-  STABILITY_DEPRECATED = 4;
 }
 
 enum RiskLevel {

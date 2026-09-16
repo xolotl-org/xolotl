@@ -21,6 +21,8 @@ mod context;
 #[cfg(feature = "standard-core")]
 mod deliberation;
 #[cfg(feature = "standard-core")]
+mod error;
+#[cfg(feature = "standard-core")]
 mod events;
 #[cfg(feature = "standard-core")]
 mod fact;
@@ -55,11 +57,15 @@ mod lock;
 #[cfg(feature = "standard-core")]
 mod memory;
 #[cfg(feature = "standard-core")]
+mod object;
+#[cfg(feature = "standard-core")]
 mod pairing;
 #[cfg(feature = "proc")]
 mod proc;
 #[cfg(feature = "standard-core")]
 mod rank;
+#[cfg(feature = "standard-core")]
+mod retrieval;
 #[cfg(feature = "standard-core")]
 mod router;
 #[cfg(feature = "standard-core")]
@@ -70,9 +76,13 @@ mod tensor;
 mod terminal;
 #[cfg(feature = "standard-core")]
 mod time;
+#[cfg(feature = "value-objects")]
+mod value_objects;
 
 #[cfg(feature = "standard-core")]
-pub use inference::{EchoBackend, InferenceBackend, InferenceMethodSupport, ModelCapabilities};
+pub use inference::{
+    EchoBackend, InferenceBackend, InferenceMethodSupport, InferenceStream, ModelCapabilities,
+};
 #[cfg(feature = "standard-core")]
 pub use install::{
     IN_PROCESS_PROJECTION_CONFIG_PREFIX, InProcessProjectionInstallEntry,
@@ -82,3 +92,11 @@ pub use install::{
 };
 #[cfg(feature = "standard-core")]
 pub use pairing::PairingDisplayEdge;
+
+#[cfg(feature = "standard-core")]
+pub use retrieval::{Embedding, EmbeddingRepresentation, RetrievalConfig};
+
+#[cfg(feature = "value-objects")]
+pub use value_objects::{
+    InstalledValueObjects, ValueObjectConfig, install_value_objects, memory_key_factory,
+};

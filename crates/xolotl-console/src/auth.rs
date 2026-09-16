@@ -3,7 +3,7 @@
 //! Account records live under `state://kernel/console/*`; credential verifiers,
 //! sessions, lockouts, and passkey challenges live under `state://vault/console/*`.
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -23,8 +23,9 @@ use webauthn_rs::prelude::{
     Webauthn, WebauthnBuilder,
 };
 use xolotl_kernel::{Bootstrap, CompiledRequestGrantTemplate, GatewayAudit};
-use xolotl_state::{Backend, StateError};
+use xolotl_state::{Backend, StateFailure};
 use xolotl_types::{CapSet, Capability, Path, ResourceName, ResourceSelector, Value};
+use xolotl_types::{ValueMap, ValueView};
 
 use crate::credentials::{LockoutState, lockout_until_ms};
 
@@ -217,12 +218,7 @@ pub async fn root_random_password_needed(
     {
         return Ok(false);
     }
-    let users = boot
-        .kernel
-        .state
-        .read_prefix(&Path::parse(USERS_PREFIX)?)
-        .await?;
-    Ok(users.is_empty())
+    Ok(!prefix_has_entries(&boot.kernel.state, Path::parse(USERS_PREFIX)?).await?)
 }
 
 /// Password login request.
@@ -364,7 +360,7 @@ pub struct PasskeyLoginFinishRequest {
 }
 
 /// Authenticated console principal used by management actions.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConsolePrincipal {
     /// Console username.
     pub(crate) username: String,
@@ -437,8 +433,8 @@ pub enum AuthError {
     Crypto(String),
 }
 
-impl From<StateError> for AuthError {
-    fn from(e: StateError) -> Self {
+impl From<StateFailure> for AuthError {
+    fn from(e: StateFailure) -> Self {
         AuthError::State(e.to_string())
     }
 }
@@ -1311,18 +1307,18 @@ impl ConsoleAuth {
         authorize_path(&boot.kernel.state, principal, "read", &sessions_root, None).await?;
         let now = now_millis();
         sweep_expired_sessions(&boot.kernel.state, now).await?;
-        let mut sessions = boot
+        let mut pages = boot
             .kernel
             .state
-            .read_prefix(&sessions_root)
-            .await?
-            .into_iter()
-            .map(|(path, value)| {
+            .pages(xolotl_state::StateScan::new(sessions_root));
+        let mut sessions = Vec::new();
+        while let Some(page) = pages.next().await? {
+            for (path, value) in page.entries {
                 let sid = path_leaf(&path, "console session id")?;
-                let session = SessionRecord::from_value(&sid, &value)?;
-                Ok(SessionSummary::from(session))
-            })
-            .collect::<Result<Vec<_>, AuthError>>()?;
+                let session = SessionRecord::from_value(&sid, &value.value)?;
+                sessions.push(SessionSummary::from(session));
+            }
+        }
         sessions.sort_by_key(|s| (s.username.clone(), s.issued_at));
         Ok(sessions)
     }
@@ -1371,18 +1367,19 @@ impl ConsoleAuth {
         validate_username(username)?;
         let user_path = Path::parse(&user_path(username)?)?;
         authorize_path(&boot.kernel.state, principal, "write", &user_path, None).await?;
-        let sessions = boot
+        let mut pages = boot
             .kernel
             .state
-            .read_prefix(&Path::parse(SESSIONS_PREFIX)?)
-            .await?;
+            .pages(xolotl_state::StateScan::new(Path::parse(SESSIONS_PREFIX)?));
         let mut revoked = 0usize;
-        for (path, value) in sessions {
-            let sid = path_leaf(&path, "console session id")?;
-            let session = SessionRecord::from_value(&sid, &value)?;
-            if session.username == username {
-                revoke_session(&boot.kernel.state, &sid).await?;
-                revoked += 1;
+        while let Some(page) = pages.next().await? {
+            for (path, value) in page.entries {
+                let sid = path_leaf(&path, "console session id")?;
+                let session = SessionRecord::from_value(&sid, &value.value)?;
+                if session.username == username {
+                    revoke_session(&boot.kernel.state, &sid).await?;
+                    revoked += 1;
+                }
             }
         }
         record_auth_audit(
@@ -1549,8 +1546,7 @@ async fn bootstrap_root_account_inner(
         ));
     }
 
-    let users = state.read_prefix(&Path::parse(USERS_PREFIX)?).await?;
-    if !users.is_empty() {
+    if prefix_has_entries(state, Path::parse(USERS_PREFIX)?).await? {
         return Ok(BootstrapOutcome::AlreadyPresent);
     }
 
@@ -1907,40 +1903,40 @@ impl UserRecord {
         let mut authn = BTreeMap::new();
         let mut password = BTreeMap::new();
         if let Some(hash_ref) = &self.password_hash_ref {
-            password.insert("hash_ref".into(), Value::Str(hash_ref.clone()));
+            password.insert("hash_ref".into(), Value::string(hash_ref.clone()));
         }
-        authn.insert("password".into(), Value::Map(password));
+        authn.insert("password".into(), Value::map(password));
         let mut totp = BTreeMap::new();
-        totp.insert("enabled".into(), Value::Bool(self.totp_enabled));
+        totp.insert("enabled".into(), Value::boolean(self.totp_enabled));
         if let Some(seed_ref) = &self.totp_seed_ref {
-            totp.insert("seed_ref".into(), Value::Str(seed_ref.clone()));
+            totp.insert("seed_ref".into(), Value::string(seed_ref.clone()));
         }
         if let Some(step) = self.totp_last_step {
-            totp.insert("last_step".into(), Value::Int(step));
+            totp.insert("last_step".into(), Value::integer(step));
         }
-        authn.insert("totp".into(), Value::Map(totp));
+        authn.insert("totp".into(), Value::map(totp));
         authn.insert("pubkeys".into(), string_values(&self.pubkeys));
 
         let mut m = BTreeMap::new();
         m.insert(
             "identity_path".into(),
-            Value::Str(self.identity_path.clone()),
+            Value::string(self.identity_path.clone()),
         );
-        m.insert("status".into(), Value::Str(self.status.clone()));
-        m.insert("authn".into(), Value::Map(authn));
+        m.insert("status".into(), Value::string(self.status.clone()));
+        m.insert("authn".into(), Value::map(authn));
         m.insert("roles".into(), string_values(&self.roles));
         m.insert("grants".into(), string_values(&self.grants));
         m.insert(
             "authority_ceiling".into(),
             string_values(&self.authority_ceiling),
         );
-        m.insert("created_by".into(), Value::Str(self.created_by.clone()));
-        m.insert("created_at".into(), Value::Int(self.created_at));
+        m.insert("created_by".into(), Value::string(self.created_by.clone()));
+        m.insert("created_at".into(), Value::integer(self.created_at));
         m.insert(
             "password_changed_at".into(),
-            Value::Int(self.password_changed_at),
+            Value::integer(self.password_changed_at),
         );
-        Value::Map(m)
+        Value::map(m)
     }
 }
 
@@ -1983,18 +1979,24 @@ impl SessionRecord {
 
     fn to_value(&self) -> Value {
         let mut m = BTreeMap::new();
-        m.insert("username".into(), Value::Str(self.username.clone()));
+        m.insert("username".into(), Value::string(self.username.clone()));
         m.insert(
             "identity_path".into(),
-            Value::Str(self.identity_path.clone()),
+            Value::string(self.identity_path.clone()),
         );
-        m.insert("issued_at".into(), Value::Int(self.issued_at));
-        m.insert("expires_at".into(), Value::Int(self.expires_at));
-        m.insert("idle_expires_at".into(), Value::Int(self.idle_expires_at));
-        m.insert("mfa_level".into(), Value::Int(self.mfa_level as i64));
-        m.insert("last_seen".into(), Value::Int(self.last_seen));
-        m.insert("source_addr".into(), Value::Str(self.source_addr.clone()));
-        Value::Map(m)
+        m.insert("issued_at".into(), Value::integer(self.issued_at));
+        m.insert("expires_at".into(), Value::integer(self.expires_at));
+        m.insert(
+            "idle_expires_at".into(),
+            Value::integer(self.idle_expires_at),
+        );
+        m.insert("mfa_level".into(), Value::integer(self.mfa_level as i64));
+        m.insert("last_seen".into(), Value::integer(self.last_seen));
+        m.insert(
+            "source_addr".into(),
+            Value::string(self.source_addr.clone()),
+        );
+        Value::map(m)
     }
 }
 
@@ -2039,12 +2041,12 @@ impl KeyChallengeRecord {
 
     fn to_value(&self) -> Value {
         let mut m = BTreeMap::new();
-        m.insert("username".into(), Value::Str(self.username.clone()));
-        m.insert("nonce".into(), Value::Str(self.nonce.clone()));
-        m.insert("origin".into(), Value::Str(self.origin.clone()));
-        m.insert("issued_at".into(), Value::Int(self.issued_at));
-        m.insert("expires_at".into(), Value::Int(self.expires_at));
-        Value::Map(m)
+        m.insert("username".into(), Value::string(self.username.clone()));
+        m.insert("nonce".into(), Value::string(self.nonce.clone()));
+        m.insert("origin".into(), Value::string(self.origin.clone()));
+        m.insert("issued_at".into(), Value::integer(self.issued_at));
+        m.insert("expires_at".into(), Value::integer(self.expires_at));
+        Value::map(m)
     }
 }
 
@@ -2117,12 +2119,16 @@ async fn revoke_key_challenge(state: &Backend, challenge_id: &str) -> Result<(),
 }
 
 async fn sweep_expired_key_challenges(state: &Backend, now: i64) -> Result<(), AuthError> {
-    let challenges = state.read_prefix(&Path::parse(CHALLENGES_PREFIX)?).await?;
-    for (path, value) in challenges {
-        let challenge_id = path_leaf(&path, "console key challenge id")?;
-        let challenge = KeyChallengeRecord::from_value(&challenge_id, &value)?;
-        if challenge.expires_at <= now {
-            revoke_key_challenge(state, &challenge_id).await?;
+    let mut pages = state.pages(xolotl_state::StateScan::new(Path::parse(
+        CHALLENGES_PREFIX,
+    )?));
+    while let Some(page) = pages.next().await? {
+        for (path, value) in page.entries {
+            let challenge_id = path_leaf(&path, "console key challenge id")?;
+            let challenge = KeyChallengeRecord::from_value(&challenge_id, &value.value)?;
+            if challenge.expires_at <= now {
+                revoke_key_challenge(state, &challenge_id).await?;
+            }
         }
     }
     Ok(())
@@ -2139,12 +2145,14 @@ async fn revoke_session(state: &Backend, sid: &str) -> Result<(), AuthError> {
 }
 
 async fn sweep_expired_sessions(state: &Backend, now: i64) -> Result<(), AuthError> {
-    let sessions = state.read_prefix(&Path::parse(SESSIONS_PREFIX)?).await?;
-    for (path, value) in sessions {
-        let sid = path_leaf(&path, "console session id")?;
-        let session = SessionRecord::from_value(&sid, &value)?;
-        if session.expires_at <= now || session.idle_expires_at <= now {
-            revoke_session(state, &sid).await?;
+    let mut pages = state.pages(xolotl_state::StateScan::new(Path::parse(SESSIONS_PREFIX)?));
+    while let Some(page) = pages.next().await? {
+        for (path, value) in page.entries {
+            let sid = path_leaf(&path, "console session id")?;
+            let session = SessionRecord::from_value(&sid, &value.value)?;
+            if session.expires_at <= now || session.idle_expires_at <= now {
+                revoke_session(state, &sid).await?;
+            }
         }
     }
     Ok(())
@@ -2156,15 +2164,14 @@ async fn enforce_session_limits(
     max_per_user: usize,
     global_limit: usize,
 ) -> Result<(), AuthError> {
-    let mut sessions = state
-        .read_prefix(&Path::parse(SESSIONS_PREFIX)?)
-        .await?
-        .into_iter()
-        .map(|(path, value)| {
+    let mut pages = state.pages(xolotl_state::StateScan::new(Path::parse(SESSIONS_PREFIX)?));
+    let mut sessions = Vec::new();
+    while let Some(page) = pages.next().await? {
+        for (path, value) in page.entries {
             let sid = path_leaf(&path, "console session id")?;
-            SessionRecord::from_value(&sid, &value)
-        })
-        .collect::<Result<Vec<_>, AuthError>>()?;
+            sessions.push(SessionRecord::from_value(&sid, &value.value)?);
+        }
+    }
     sessions.sort_by_key(|s| s.issued_at);
 
     let mut user_sessions: Vec<_> = sessions
@@ -2201,7 +2208,7 @@ async fn read_string(state: &Backend, path: &str) -> Result<Option<String>, Auth
 
 async fn write_string(state: &Backend, path: &str, value: String) -> Result<(), AuthError> {
     state
-        .write_set(&Path::parse(path)?, Value::Str(value))
+        .write_set(&Path::parse(path)?, Value::string(value))
         .await?;
     Ok(())
 }
@@ -2292,21 +2299,33 @@ async fn read_passkey_records(
     username: &str,
 ) -> Result<Vec<PasskeyCredentialRecord>, AuthError> {
     let prefix = Path::parse(&passkey_user_prefix(username)?)?;
-    let entries = state.read_prefix(&prefix).await?;
-    let mut records = Vec::with_capacity(entries.len());
-    for (_path, value) in entries {
-        let Some(encoded) = value.as_str() else {
-            return Err(AuthError::State(
-                "passkey credential record must be a string".into(),
-            ));
-        };
-        records.push(
-            serde_json::from_str(encoded).map_err(|error| {
+    let mut pages = state.pages(xolotl_state::StateScan::new(prefix));
+    let mut records = Vec::new();
+    while let Some(page) = pages.next().await? {
+        for (_path, value) in page.entries {
+            let Some(encoded) = value.value.as_str() else {
+                return Err(AuthError::State(
+                    "passkey credential record must be a string".into(),
+                ));
+            };
+            records.push(serde_json::from_str(encoded).map_err(|error| {
                 AuthError::State(format!("invalid passkey credential: {error}"))
-            })?,
-        );
+            })?);
+        }
     }
     Ok(records)
+}
+
+async fn prefix_has_entries(state: &Backend, prefix: Path) -> Result<bool, AuthError> {
+    let mut query = xolotl_state::StateScan::new(prefix);
+    query.limits.entries = std::num::NonZeroUsize::MIN;
+    let mut pages = state.pages(query);
+    while let Some(page) = pages.next().await? {
+        if !page.entries.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn state_path_string(segments: &[&str]) -> Result<String, AuthError> {
@@ -2356,7 +2375,7 @@ async fn read_lockout(state: &Backend, username: &str) -> Result<LockoutState, A
     let Some(value) = state.read(&path).await? else {
         return Ok(LockoutState::default());
     };
-    let Value::Map(map) = value else {
+    let Some(map) = value.as_map() else {
         return Ok(LockoutState::default());
     };
     let consecutive_failures = map
@@ -2383,13 +2402,13 @@ async fn write_lockout(
     let mut map = BTreeMap::new();
     map.insert(
         "consecutive_failures".into(),
-        Value::Int(lockout.consecutive_failures as i64),
+        Value::integer(lockout.consecutive_failures as i64),
     );
     map.insert(
         "locked_until_ms".into(),
-        Value::Int(lockout.locked_until_ms),
+        Value::integer(lockout.locked_until_ms),
     );
-    state.write_set(&path, Value::Map(map)).await?;
+    state.write_set(&path, Value::map(map)).await?;
     Ok(())
 }
 
@@ -2437,11 +2456,10 @@ fn hash_password(password: &str) -> Result<String, AuthError> {
 }
 
 fn hash_password_with_salt(password: &str, salt: &[u8]) -> Result<String, AuthError> {
-    let salt = SaltString::encode_b64(salt).map_err(|e| AuthError::Crypto(e.to_string()))?;
     let params = argon2_params()?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     Ok(argon2
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), salt)
         .map_err(|e| AuthError::Crypto(e.to_string()))?
         .to_string())
 }
@@ -2625,47 +2643,41 @@ fn mark_failure(bucket: &mut FailureBucket, now: i64) {
     bucket.next_allowed_at = now.saturating_add(delay);
 }
 
-fn str_field(m: &BTreeMap<String, Value>, key: &str) -> Option<String> {
+fn str_field(m: &ValueMap, key: &str) -> Option<String> {
     m.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
-fn int_field(m: &BTreeMap<String, Value>, key: &str) -> Option<i64> {
+fn int_field(m: &ValueMap, key: &str) -> Option<i64> {
     m.get(key).and_then(Value::as_int)
 }
 
-fn required_str_field(
-    m: &BTreeMap<String, Value>,
-    key: &str,
-    label: &str,
-) -> Result<String, AuthError> {
-    match m.get(key) {
-        Some(Value::Str(value)) if !value.is_empty() => Ok(value.clone()),
-        Some(Value::Str(_)) => Err(AuthError::State(format!("{label}.{key} must not be empty"))),
+fn required_str_field(m: &ValueMap, key: &str, label: &str) -> Result<String, AuthError> {
+    match m.get(key).map(Value::view) {
+        Some(ValueView::Str(value)) if !value.is_empty() => Ok(value.to_owned()),
+        Some(ValueView::Str(_)) => {
+            Err(AuthError::State(format!("{label}.{key} must not be empty")))
+        }
         Some(_) => Err(AuthError::State(format!("{label}.{key} must be a string"))),
         None => Err(AuthError::State(format!("{label}.{key} is required"))),
     }
 }
 
 fn required_map_field<'a>(
-    m: &'a BTreeMap<String, Value>,
+    m: &'a ValueMap,
     key: &str,
     label: &str,
-) -> Result<&'a BTreeMap<String, Value>, AuthError> {
-    match m.get(key) {
-        Some(Value::Map(value)) => Ok(value),
+) -> Result<&'a ValueMap, AuthError> {
+    match m.get(key).map(Value::view) {
+        Some(ValueView::Map(value)) => Ok(value),
         Some(_) => Err(AuthError::State(format!("{label}.{key} must be an object"))),
         None => Err(AuthError::State(format!("{label}.{key} is required"))),
     }
 }
 
-fn required_nonnegative_int_field(
-    m: &BTreeMap<String, Value>,
-    key: &str,
-    label: &str,
-) -> Result<i64, AuthError> {
-    match m.get(key) {
-        Some(Value::Int(value)) if *value >= 0 => Ok(*value),
-        Some(Value::Int(_)) => Err(AuthError::State(format!(
+fn required_nonnegative_int_field(m: &ValueMap, key: &str, label: &str) -> Result<i64, AuthError> {
+    match m.get(key).map(Value::view) {
+        Some(ValueView::Int(value)) if value >= 0 => Ok(value),
+        Some(ValueView::Int(_)) => Err(AuthError::State(format!(
             "{label}.{key} must be non-negative"
         ))),
         Some(_) => Err(AuthError::State(format!(
@@ -2676,7 +2688,7 @@ fn required_nonnegative_int_field(
 }
 
 fn required_string_list_field(
-    m: &BTreeMap<String, Value>,
+    m: &ValueMap,
     key: &str,
     label: &str,
 ) -> Result<Vec<String>, AuthError> {
@@ -2687,26 +2699,28 @@ fn required_string_list_field(
 }
 
 fn optional_string_field(
-    m: &BTreeMap<String, Value>,
+    m: &ValueMap,
     key: &str,
     label: &str,
 ) -> Result<Option<String>, AuthError> {
-    match m.get(key) {
-        Some(Value::Str(value)) if !value.is_empty() => Ok(Some(value.clone())),
-        Some(Value::Str(_)) => Err(AuthError::State(format!("{label}.{key} must not be empty"))),
+    match m.get(key).map(Value::view) {
+        Some(ValueView::Str(value)) if !value.is_empty() => Ok(Some(value.to_owned())),
+        Some(ValueView::Str(_)) => {
+            Err(AuthError::State(format!("{label}.{key} must not be empty")))
+        }
         Some(_) => Err(AuthError::State(format!("{label}.{key} must be a string"))),
         None => Ok(None),
     }
 }
 
 fn optional_nonnegative_int_field(
-    m: &BTreeMap<String, Value>,
+    m: &ValueMap,
     key: &str,
     label: &str,
 ) -> Result<Option<i64>, AuthError> {
-    match m.get(key) {
-        Some(Value::Int(value)) if *value >= 0 => Ok(Some(*value)),
-        Some(Value::Int(_)) => Err(AuthError::State(format!(
+    match m.get(key).map(Value::view) {
+        Some(ValueView::Int(value)) if value >= 0 => Ok(Some(value)),
+        Some(ValueView::Int(_)) => Err(AuthError::State(format!(
             "{label}.{key} must be non-negative"
         ))),
         Some(_) => Err(AuthError::State(format!(
@@ -2731,26 +2745,26 @@ fn validate_console_identity_path(identity_path: &str) -> Result<(), AuthError> 
 }
 
 fn optional_str_field(
-    m: &BTreeMap<String, Value>,
+    m: &ValueMap,
     key: &str,
     label: &str,
     default: &str,
 ) -> Result<String, AuthError> {
-    match m.get(key) {
-        Some(Value::Str(value)) => Ok(value.clone()),
+    match m.get(key).map(Value::view) {
+        Some(ValueView::Str(value)) => Ok(value.to_owned()),
         Some(_) => Err(AuthError::State(format!("{label}.{key} must be a string"))),
         None => Ok(default.to_string()),
     }
 }
 
 fn optional_int_field(
-    m: &BTreeMap<String, Value>,
+    m: &ValueMap,
     key: &str,
     label: &str,
     default: i64,
 ) -> Result<i64, AuthError> {
-    match m.get(key) {
-        Some(Value::Int(value)) => Ok(*value),
+    match m.get(key).map(Value::view) {
+        Some(ValueView::Int(value)) => Ok(value),
         Some(_) => Err(AuthError::State(format!(
             "{label}.{key} must be an integer"
         ))),
@@ -2758,20 +2772,16 @@ fn optional_int_field(
     }
 }
 
-fn optional_bool_field(
-    m: &BTreeMap<String, Value>,
-    key: &str,
-    label: &str,
-) -> Result<bool, AuthError> {
-    match m.get(key) {
-        Some(Value::Bool(value)) => Ok(*value),
+fn optional_bool_field(m: &ValueMap, key: &str, label: &str) -> Result<bool, AuthError> {
+    match m.get(key).map(Value::view) {
+        Some(ValueView::Bool(value)) => Ok(value),
         Some(_) => Err(AuthError::State(format!("{label}.{key} must be a bool"))),
         None => Ok(false),
     }
 }
 
 fn optional_string_list_field(
-    m: &BTreeMap<String, Value>,
+    m: &ValueMap,
     key: &str,
     label: &str,
 ) -> Result<Vec<String>, AuthError> {
@@ -2782,8 +2792,8 @@ fn optional_string_list_field(
 }
 
 fn string_list(v: &Value, label: &str) -> Result<Vec<String>, AuthError> {
-    match v {
-        Value::List(xs) => xs
+    match v.view() {
+        ValueView::List(xs) => xs
             .iter()
             .enumerate()
             .map(|(idx, value)| {
@@ -2798,7 +2808,7 @@ fn string_list(v: &Value, label: &str) -> Result<Vec<String>, AuthError> {
 }
 
 fn string_values(items: &[String]) -> Value {
-    Value::List(items.iter().map(|s| Value::Str(s.clone())).collect())
+    Value::list(items.iter().map(|s| Value::string(s.clone())).collect())
 }
 
 fn record_auth_audit(
@@ -2836,12 +2846,15 @@ fn audit_outcome(err: &AuthError) -> &'static str {
 }
 
 #[cfg(test)]
+mod crypto_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::{Context, bail, ensure};
     use ed25519_dalek::{Signer, SigningKey};
     use xolotl_kernel::Bootstrap;
-    use xolotl_types::{Fact, OutcomeRef};
+    use xolotl_types::Fact;
 
     fn auth_boot() -> Bootstrap {
         Bootstrap::in_memory()
@@ -2870,8 +2883,8 @@ mod tests {
         }
         Ok(facts
             .into_iter()
-            .filter(|fact| match &fact.outcome_ref {
-                OutcomeRef::Inline(Value::Map(m)) => m.contains_key("event"),
+            .filter(|fact| match &fact.outcome {
+                Some(value) => value.as_map().is_some_and(|m| m.contains_key("event")),
                 _ => false,
             })
             .collect())
@@ -2880,10 +2893,12 @@ mod tests {
     fn audit_events(boot: &Bootstrap) -> anyhow::Result<Vec<String>> {
         Ok(audit_facts(boot)?
             .into_iter()
-            .filter_map(|fact| match fact.outcome_ref {
-                OutcomeRef::Inline(Value::Map(m)) => {
-                    m.get("event").and_then(Value::as_str).map(str::to_string)
-                }
+            .filter_map(|fact| match fact.outcome {
+                Some(value) => value
+                    .as_map()
+                    .and_then(|m| m.get("event"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 _ => None,
             })
             .collect())
@@ -2892,11 +2907,19 @@ mod tests {
     fn audit_outcomes(boot: &Bootstrap, event: &str) -> anyhow::Result<Vec<String>> {
         Ok(audit_facts(boot)?
             .into_iter()
-            .filter_map(|fact| match fact.outcome_ref {
-                OutcomeRef::Inline(Value::Map(m))
-                    if m.get("event").and_then(Value::as_str) == Some(event) =>
+            .filter_map(|fact| match fact.outcome {
+                Some(value)
+                    if value
+                        .as_map()
+                        .and_then(|m| m.get("event"))
+                        .and_then(Value::as_str)
+                        == Some(event) =>
                 {
-                    m.get("outcome").and_then(Value::as_str).map(str::to_string)
+                    value
+                        .as_map()
+                        .and_then(|m| m.get("outcome"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
                 }
                 _ => None,
             })
@@ -2950,15 +2973,15 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert(
             "grants".into(),
-            Value::List(
+            Value::list(
                 grants
                     .into_iter()
-                    .map(|grant| Value::Str(grant.into()))
+                    .map(|grant| Value::string(grant.into()))
                     .collect(),
             ),
         );
-        m.insert("frozen".into(), Value::Bool(frozen));
-        Value::Map(m)
+        m.insert("frozen".into(), Value::boolean(frozen));
+        Value::map(m)
     }
 
     #[tokio::test]
@@ -3085,73 +3108,65 @@ mod tests {
             password_changed_at: 1,
         };
 
-        let mut missing_status = user.to_value();
-        let Value::Map(map) = &mut missing_status else {
-            bail!("user record must be a map");
-        };
+        let mut map = (user.to_value()).into_map().context("expected map")?;
         map.remove("status");
+        let missing_status = Value::from(map);
         ensure!(
             UserRecord::from_value("alice", &missing_status).is_err(),
             "missing status defaulted to active"
         );
 
-        let mut missing_identity = user.to_value();
-        let Value::Map(map) = &mut missing_identity else {
-            bail!("user record must be a map");
-        };
+        let mut map = (user.to_value()).into_map().context("expected map")?;
         map.remove("identity_path");
+        let missing_identity = Value::from(map);
         ensure!(
             UserRecord::from_value("alice", &missing_identity).is_err(),
             "missing identity_path was synthesized"
         );
 
-        let mut bad_hash = user.to_value();
-        let Value::Map(map) = &mut bad_hash else {
-            bail!("user record must be a map");
-        };
-        let Some(Value::Map(authn)) = map.get_mut("authn") else {
-            bail!("authn must be a map");
-        };
-        let Some(Value::Map(password)) = authn.get_mut("password") else {
-            bail!("password authn must be a map");
-        };
-        password.insert("hash_ref".into(), Value::Int(7));
+        let mut map = user.to_value().into_map().context("user map")?;
+        let mut authn = map
+            .remove("authn")
+            .and_then(Value::into_map)
+            .context("authn map")?;
+        let mut password = authn
+            .remove("password")
+            .and_then(Value::into_map)
+            .context("password map")?;
+        password.insert("hash_ref".into(), Value::integer(7))?;
+        authn.insert("password".into(), Value::from(password))?;
+        map.insert("authn".into(), Value::from(authn))?;
+        let bad_hash = Value::from(map);
         ensure!(
             UserRecord::from_value("alice", &bad_hash).is_err(),
             "malformed password hash ref was ignored"
         );
 
-        let mut wildcard_identity = user.to_value();
-        let Value::Map(map) = &mut wildcard_identity else {
-            bail!("user record must be a map");
-        };
+        let mut map = (user.to_value()).into_map().context("expected map")?;
         map.insert(
             "identity_path".into(),
-            Value::Str("identity://console/**".into()),
-        );
+            Value::string("identity://console/**".into()),
+        )?;
+        let wildcard_identity = Value::from(map);
         ensure!(
             UserRecord::from_value("alice", &wildcard_identity).is_err(),
             "wildcard identity_path was accepted"
         );
 
-        let mut clustered_identity = user.to_value();
-        let Value::Map(map) = &mut clustered_identity else {
-            bail!("user record must be a map");
-        };
+        let mut map = (user.to_value()).into_map().context("expected map")?;
         map.insert(
             "identity_path".into(),
-            Value::Str("path://remote/identity/console/alice".into()),
-        );
+            Value::string("path://remote/identity/console/alice".into()),
+        )?;
+        let clustered_identity = Value::from(map);
         ensure!(
             UserRecord::from_value("alice", &clustered_identity).is_err(),
             "clustered identity_path was accepted"
         );
 
-        let mut locked = user.to_value();
-        let Value::Map(map) = &mut locked else {
-            bail!("user record must be a map");
-        };
-        map.insert("status".into(), Value::Str("locked".into()));
+        let mut map = (user.to_value()).into_map().context("expected map")?;
+        map.insert("status".into(), Value::string("locked".into()))?;
+        let locked = Value::from(map);
         let locked = UserRecord::from_value("alice", &locked)?;
         ensure!(
             locked.status == "locked",
@@ -3232,7 +3247,10 @@ mod tests {
         let facts = audit_facts(&boot)?;
         ensure!(
             facts.into_iter().any(|fact| {
-                let OutcomeRef::Inline(Value::Map(m)) = fact.outcome_ref else {
+                let Some(value) = fact.outcome else {
+                    return false;
+                };
+                let Some(m) = value.as_map() else {
                     return false;
                 };
                 m.get("event").and_then(Value::as_str) == Some("console_credential")
@@ -3387,7 +3405,7 @@ mod tests {
             .state
             .write_set(
                 &Path::parse(&session_path("malformed")?)?,
-                Value::Map(BTreeMap::new()),
+                Value::map(BTreeMap::new()),
             )
             .await?;
 
@@ -3764,12 +3782,12 @@ mod tests {
         let mut role = BTreeMap::new();
         role.insert(
             "grants".into(),
-            Value::List(vec![
-                Value::Str("read://state/kernel/**".into()),
-                Value::Int(7),
+            Value::list(vec![
+                Value::string("read://state/kernel/**".into()),
+                Value::integer(7),
             ]),
         );
-        role.insert("frozen".into(), Value::Bool(false));
+        role.insert("frozen".into(), Value::boolean(false));
 
         ensure!(
             matches!(
@@ -3778,7 +3796,7 @@ mod tests {
                 &admin,
                 "write",
                 &Path::parse("state://kernel/console/roles/bad")?,
-                Some(&Value::Map(role))
+                Some(&Value::map(role))
             )
             .await,
             Err(AuthError::State(message)) if message.contains("console role.grants[1]")

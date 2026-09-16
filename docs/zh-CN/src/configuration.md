@@ -19,15 +19,19 @@ cargo run -p xolotl-daemon -- up
 | 配置段 | 用途 |
 | --- | --- |
 | `[storage]` | 选择 redb 持久存储或内存存储 |
-| `[server]` | 通过 `console_addr`、`external_grpc_addr` 和 `external_websocket_addr` 绑定监听器 |
+| `[server]` | 通过 `console_addr`、`application_grpc_addr`、`external_grpc_addr` 和 `external_websocket_addr` 绑定监听器 |
+| `[application_gateway]` | 选择 State profile，设置应用 gRPC 帧大小、上传与输出并发、输出驻留窗口和等待窗口 |
 | `[external_gateway.grpc]` | 设置 external gRPC 监听器的 Provider/Source session 限制 |
 | `[external_gateway.websocket]` | 设置 external WebSocket 监听器的同一组 Provider/Source session 限制 |
 | `[external_gateway.websocket.transport]` | 设置 WebSocket frame 大小、first-frame 超时、idle 超时和总连接数 |
 | `[console.root]` | 预置 root 凭据 |
 | `[console.auth]` | 设置会话 TTL、会话数量和 Argon2 校验并发限制 |
-| `[console.ws]` | 设置控制台 WebSocket 的 frame、连接数、idle、速率、订阅数、结果大小和事件背压限制 |
+| `[console.ws]` | 设置控制台 WebSocket 的 frame、连接数、idle、速率、订阅数、结果大小、已编码事件队列和所有帧的发送限制 |
 
-对应 `[server]` 字段缺失时，`xolotld` 还会读取 `XOLOTL_CONSOLE_ADDR`、`XOLOTL_EXTERNAL_GRPC_ADDR` 和 `XOLOTL_EXTERNAL_WEBSOCKET_ADDR`。配置字段和环境变量都缺失时，该监听保持关闭。
+对应 `[server]` 字段缺失时，`xolotld` 还会读取 `XOLOTL_CONSOLE_ADDR`、`XOLOTL_APPLICATION_GRPC_ADDR`、`XOLOTL_EXTERNAL_GRPC_ADDR` 和 `XOLOTL_EXTERNAL_WEBSOCKET_ADDR`。配置字段和环境变量都缺失时，该监听保持关闭。
+
+应用监听器需要可选的 `application-grpc` feature。启用地址前通过 Console 创建 profile；
+完整配置和上传协议见[应用网关](application-gateway.md)。
 
 ## External Gateway
 
@@ -137,5 +141,37 @@ HTTP inference provider 只有在宿主二进制启用对应 `xolotl-standard` f
 运行时声明放在 `state://kernel/inference/*` 和 `state://kernel/routing/inference`；
 backend 记录只保存 `state://vault/inference/<backend>/api_key` 这类 secret 引用，
 不保存原始 API key。
+
+`InferenceBackendDef.io_window_bytes` 设置请求编码和解析工作的窗口，默认 16,384 字节，
+接受任意正整数。单字节窗口也支持跨窗口的 UTF-8 字符和 JSON 转义；该窗口不限制请求、
+响应或 SSE 事件的总长度。输出通道仍通过 `StreamWindow` 独立配置，HTTP 库另行持有其
+传输缓冲区。
+记录校验完成后，已选文本按此窗口分块输出，并保留完整 UTF-8 字符；窗口小于一个字符时，
+该块最多包含四字节。输出通道计入编码后的块及其来源元数据。
+
+`response_limits` 将结果物化策略独立配置：
+
+- `max_materialized_bytes`：单个 unary 响应或原子 SSE 记录内同时保留的已选文本和数字 token 字节。
+- `max_materialized_nodes`：保留的已选值节点数，包含空值。
+- `max_json_frames`：同时打开的 JSON 容器数，包含被跳过的数据。
+
+所有上限均为可选；未设置的维度不施加配额。字节和节点计数是逻辑准入单位，不代表分配器
+或进程 RSS 上限。已知控制标签和字段名有固定存储开销，不计入已选 token 字节。
+最终 unary 输出及每条原子 SSE 增量仍需驻留存储，应用可以显式约束这些
+结果的物化，而不限制任务累计数据量。未使用的 Provider 字段会增量校验，不会组成完整 JSON
+包。例如，OpenAI Responses 完成快照中重复的输出文本不会被保留。
+
+SSE 记录必须完整结束且 JSON 校验通过，才会交付该记录中选中的 delta。后到的错误或非法
+后缀不会使同一记录的前缀提前发布。解析器只移除流开头的一次 UTF-8 BOM，并同样校验跳过的
+数据。各适配器保留其声明的 delta 语义，不会凭文本重复自行猜测累计快照。
+HTTP 错误诊断固定读取最多 8 KiB 前缀，展示最多 512 个脱敏字符，与成功响应的准入相互
+独立。达到前缀上限后停止读取，无需等待服务端结束响应体；若服务端在此之前停滞，仍需
+请求取消或客户端超时处理。字节上限不会隐式施加响应持续时间策略。
+
+嵌入式宿主通过 `StandardConfig::with_object_store` 显式安装对象能力。
+`ObjectStore` 分别接收读、写和删除适配器；
+`xolotl-storage-fs::FileObjectStore::open(root)` 提供文件实现。
+Fetch 和文件读取的大型 unary 输出、Blob 写入及 Tensor 写入需要对象写入端口；
+Blob 读取和删除需要对应端口。流式 Fetch 和文件读取无需安装对象存储。
 
 控制台认证、WebSocket 和传输安全字段是部署设置。能力检查、二次确认门槛、按路径准入、动作注册表校验和敏感值脱敏始终由运行时路径执行。

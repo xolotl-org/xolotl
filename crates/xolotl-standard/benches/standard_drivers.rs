@@ -9,6 +9,7 @@ use xolotl_types::{Failure, FloatBits, Outcome, OutputMode, Path, ResourceName, 
 
 const EXACT_INDEX_ITEMS: usize = 1_024;
 const ANN_INDEX_ITEMS: usize = 5_000;
+const IDENTICAL_INDEX_ITEMS: usize = 8_192;
 const VECTOR_DIMS: usize = 32;
 const MEMORY_RECALL_ITEMS: usize = 256;
 
@@ -61,46 +62,48 @@ fn run_effect(rt: &Runtime, boot: &Bootstrap, path: &str, input: Value) -> Outco
             literal_input: Some(input),
         }))
         .await
+        .outcome
     })
 }
 
 fn patterned_vector(seed: usize, dims: usize) -> Value {
-    Value::List(
+    xolotl_standard::EmbeddingRepresentation::Dense(
         (0..dims)
             .map(|dim| {
                 let n = ((seed.wrapping_mul(31)) ^ (dim.wrapping_mul(17))) % 257;
                 let x = (n as f64 / 128.0) - 1.0;
-                Value::Float(FloatBits(x))
+                Value::float(FloatBits(x))
             })
             .collect(),
     )
+    .into_value()
 }
 
 fn index_item(space: &str, id: usize, dims: usize) -> Value {
     let mut m = BTreeMap::new();
-    m.insert("space_id".into(), Value::Str(space.into()));
-    m.insert("id".into(), Value::Str(format!("v{id}")));
-    m.insert("vector".into(), patterned_vector(id, dims));
-    Value::Map(m)
+    m.insert("space_id".into(), Value::string(space.into()));
+    m.insert("id".into(), Value::string(format!("v{id}")));
+    m.insert("representation".into(), patterned_vector(id, dims));
+    Value::map(m)
 }
 
 fn index_batch(space: &str, count: usize, dims: usize) -> Value {
-    Value::List((0..count).map(|id| index_item(space, id, dims)).collect())
+    Value::list((0..count).map(|id| index_item(space, id, dims)).collect())
 }
 
 fn search_query(space: &str, seed: usize, dims: usize, k: i64) -> Value {
     let mut m = BTreeMap::new();
-    m.insert("space_id".into(), Value::Str(space.into()));
-    m.insert("query_vec".into(), patterned_vector(seed, dims));
-    m.insert("k".into(), Value::Int(k));
-    Value::Map(m)
+    m.insert("space_id".into(), Value::string(space.into()));
+    m.insert("representation".into(), patterned_vector(seed, dims));
+    m.insert("k".into(), Value::integer(k));
+    Value::map(m)
 }
 
 fn delete_input(space: &str, id: usize) -> Value {
     let mut m = BTreeMap::new();
-    m.insert("space_id".into(), Value::Str(space.into()));
-    m.insert("id".into(), Value::Str(format!("v{id}")));
-    Value::Map(m)
+    m.insert("space_id".into(), Value::string(space.into()));
+    m.insert("id".into(), Value::string(format!("v{id}")));
+    Value::map(m)
 }
 
 fn prepopulated_index(
@@ -109,12 +112,20 @@ fn prepopulated_index(
     count: usize,
     dims: usize,
 ) -> Result<Bootstrap, Outcome> {
+    populate_index(rt, index_batch(space, count, dims), count)
+}
+
+fn populate_index(rt: &Runtime, input: Value, count: usize) -> Result<Bootstrap, Outcome> {
     let boot = boot()?;
-    let input = index_batch(space, count, dims);
     let out = run_effect(rt, &boot, "effect://index/upsert", input);
     match out {
-        Outcome::Done(Value::List(results)) => {
-            if results.len() != count {
+        Outcome::Done(value) => {
+            let results = value
+                .as_list()
+                .ok_or_else(|| setup_failure("expected batch upsert list"))?;
+            if results.len() != count
+                || results.iter().any(|result| result != &Value::boolean(true))
+            {
                 return Err(setup_failure(format!(
                     "expected {count} index upsert results, got {}",
                     results.len()
@@ -131,10 +142,10 @@ fn prepopulated_index(
 }
 
 fn text_batch(count: usize) -> Value {
-    Value::List(
+    Value::list(
         (0..count)
             .map(|i| {
-                Value::Str(format!(
+                Value::string(format!(
                     "benchmark document {i}: deterministic baseline text"
                 ))
             })
@@ -144,20 +155,20 @@ fn text_batch(count: usize) -> Value {
 
 fn rerank_request(query: &str, candidates: usize) -> Value {
     let mut m = BTreeMap::new();
-    m.insert("query".into(), Value::Str(query.into()));
+    m.insert("query".into(), Value::string(query.into()));
     m.insert(
         "candidates".into(),
-        Value::List(
+        Value::list(
             (0..candidates)
-                .map(|i| Value::Str(format!("candidate passage {i} for {query}")))
+                .map(|i| Value::string(format!("candidate passage {i} for {query}")))
                 .collect(),
         ),
     );
-    Value::Map(m)
+    Value::map(m)
 }
 
 fn rerank_batch(requests: usize, candidates: usize) -> Value {
-    Value::List(
+    Value::list(
         (0..requests)
             .map(|i| rerank_request(&format!("query {i}"), candidates))
             .collect(),
@@ -166,23 +177,23 @@ fn rerank_batch(requests: usize, candidates: usize) -> Value {
 
 fn memory_store_input(owner: &str, id: usize) -> Value {
     let mut m = BTreeMap::new();
-    m.insert("owner".into(), Value::Str(owner.into()));
+    m.insert("owner".into(), Value::string(owner.into()));
     m.insert(
         "entry".into(),
-        Value::Str(format!(
+        Value::string(format!(
             "memory benchmark entry {id}: retrieval text about topic {}",
             id % 16
         )),
     );
-    Value::Map(m)
+    Value::map(m)
 }
 
 fn memory_recall_input(owner: &str, query: &str, k: i64) -> Value {
     let mut m = BTreeMap::new();
-    m.insert("owner".into(), Value::Str(owner.into()));
-    m.insert("query".into(), Value::Str(query.into()));
-    m.insert("k".into(), Value::Int(k));
-    Value::Map(m)
+    m.insert("owner".into(), Value::string(owner.into()));
+    m.insert("query".into(), Value::string(query.into()));
+    m.insert("k".into(), Value::integer(k));
+    Value::map(m)
 }
 
 fn prepopulated_memory(rt: &Runtime, owner: &str, entries: usize) -> Result<Bootstrap, Outcome> {
@@ -231,42 +242,60 @@ fn bench_index(c: &mut Criterion) {
     });
 
     group.bench_function("search_exact_1024x32d", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
-                let boot = prepopulated_index(&rt, "exact", EXACT_INDEX_ITEMS, VECTOR_DIMS)?;
-                let query = search_query("exact", 17, VECTOR_DIMS, 10);
-                Ok((boot, query))
+                let setup = prepopulated_index(&rt, "exact", EXACT_INDEX_ITEMS, VECTOR_DIMS)
+                    .map(|boot| (boot, search_query("exact", 17, VECTOR_DIMS, 10)));
+                assert!(
+                    setup.is_ok(),
+                    "index setup failed: {:?}",
+                    setup.as_ref().err()
+                );
+                setup
             },
-            |setup: Result<(Bootstrap, Value), Outcome>| match setup {
+            |setup: &mut Result<(Bootstrap, Value), Outcome>| match setup {
                 Ok((boot, query)) => {
-                    let out = run_effect(&rt, &boot, "effect://index/search", black_box(query));
-                    black_box(out);
+                    let out = run_effect(
+                        &rt,
+                        boot,
+                        "effect://index/search",
+                        black_box(std::mem::take(query)),
+                    );
+                    assert_search_result(&out);
+                    black_box(out)
                 }
-                Err(outcome) => {
-                    black_box(outcome);
-                }
+                Err(outcome) => black_box(outcome.clone()),
             },
-            BatchSize::LargeInput,
+            BatchSize::PerIteration,
         );
     });
 
     group.bench_function("search_ann_5000x32d", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
-                let boot = prepopulated_index(&rt, "ann", ANN_INDEX_ITEMS, VECTOR_DIMS)?;
-                let query = search_query("ann", 17, VECTOR_DIMS, 10);
-                Ok((boot, query))
+                let setup = prepopulated_index(&rt, "ann", ANN_INDEX_ITEMS, VECTOR_DIMS)
+                    .map(|boot| (boot, search_query("ann", 17, VECTOR_DIMS, 10)));
+                assert!(
+                    setup.is_ok(),
+                    "index setup failed: {:?}",
+                    setup.as_ref().err()
+                );
+                setup
             },
-            |setup: Result<(Bootstrap, Value), Outcome>| match setup {
+            |setup: &mut Result<(Bootstrap, Value), Outcome>| match setup {
                 Ok((boot, query)) => {
-                    let out = run_effect(&rt, &boot, "effect://index/search", black_box(query));
-                    black_box(out);
+                    let out = run_effect(
+                        &rt,
+                        boot,
+                        "effect://index/search",
+                        black_box(std::mem::take(query)),
+                    );
+                    assert_search_result(&out);
+                    black_box(out)
                 }
-                Err(outcome) => {
-                    black_box(outcome);
-                }
+                Err(outcome) => black_box(outcome.clone()),
             },
-            BatchSize::LargeInput,
+            BatchSize::PerIteration,
         );
     });
 
@@ -290,7 +319,76 @@ fn bench_index(c: &mut Criterion) {
         );
     });
 
+    group.bench_function("delete_identical_8192x1d", |b| {
+        b.iter_batched_ref(
+            || {
+                let space = "delete-identical";
+                let items = Value::list(
+                    (0..IDENTICAL_INDEX_ITEMS)
+                        .map(|id| {
+                            Value::map(BTreeMap::from([
+                                ("space_id".into(), Value::string(space.into())),
+                                ("id".into(), Value::string(format!("v{id}"))),
+                                (
+                                    "representation".into(),
+                                    xolotl_standard::EmbeddingRepresentation::Dense(
+                                        vec![Value::integer(1)].into(),
+                                    )
+                                    .into_value(),
+                                ),
+                            ]))
+                        })
+                        .collect(),
+                );
+                let setup = populate_index(&rt, items, IDENTICAL_INDEX_ITEMS).map(|boot| {
+                    let inputs = (0..IDENTICAL_INDEX_ITEMS)
+                        .map(|id| delete_input(space, id))
+                        .collect();
+                    (boot, inputs)
+                });
+                assert!(
+                    setup.is_ok(),
+                    "index setup failed: {:?}",
+                    setup.as_ref().err()
+                );
+                setup
+            },
+            |setup: &mut Result<(Bootstrap, Vec<Value>), Outcome>| match setup {
+                Ok((boot, inputs)) => {
+                    let mut completed = 0;
+                    for input in std::mem::take(inputs) {
+                        let out = run_effect(&rt, boot, "effect://index/delete", black_box(input));
+                        assert_eq!(out, Outcome::Done(Value::boolean(true)));
+                        black_box(out);
+                        completed += 1;
+                    }
+                    black_box(completed)
+                }
+                Err(_) => black_box(0),
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
     group.finish();
+}
+
+fn assert_search_result(outcome: &Outcome) {
+    let valid = match outcome {
+        Outcome::Done(value) => value.as_list().is_some_and(|hits| {
+            hits.len() == 10
+                && hits.iter().all(|hit| {
+                    matches!(hit.as_map().and_then(|fields| fields.get("sim")).map(Value::view),
+                    Some(xolotl_types::ValueView::Float(FloatBits(score)))
+                        if score.is_finite() && (-1.000001..=1.000001).contains(&score))
+                })
+        }),
+        _ => false,
+    };
+    assert!(
+        valid,
+        "index search did not return ten finite similarities: {outcome:?}"
+    );
 }
 
 fn bench_inference(c: &mut Criterion) {
@@ -306,7 +404,7 @@ fn bench_inference(c: &mut Criterion) {
 
     group.bench_function("infer_unary_baseline", |b| {
         let boot = boot();
-        let input = Value::Str("Summarize the benchmark fixture in one sentence.".into());
+        let input = Value::string("Summarize the benchmark fixture in one sentence.".into());
         b.iter(|| match &boot {
             Ok(boot) => {
                 let out = run_effect(

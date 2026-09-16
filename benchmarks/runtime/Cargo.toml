@@ -1,0 +1,33 @@
+[package]
+name = "xolotl-runtime-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Reproducible Xolotl workload latency and allocation measurements"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+heap-profile = ["dep:dhat"]
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+dhat = { workspace = true, optional = true }
+futures-util = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "net", "io-util"] }
+xolotl-core.workspace = true
+xolotl-graph.workspace = true
+xolotl-kernel = { workspace = true, features = ["host"] }
+xolotl-state = { workspace = true, features = ["memory"] }
+xolotl-standard = { workspace = true, features = ["openai-responses"] }
+xolotl-storage-fs.workspace = true
+xolotl-types.workspace = true
+xolotl-value-codec = { workspace = true, features = ["cbor"] }
+xolotl-value-object = { workspace = true, features = ["cbor"] }

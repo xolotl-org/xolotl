@@ -9,14 +9,15 @@ use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 #[cfg(feature = "standard-core")]
-use xolotl_kernel::{Driver, DriverContext, DriverError, MethodSpec};
+use xolotl_kernel::{Driver, DriverContext, DriverError, DriverOutput, MethodSpec};
 #[cfg(feature = "standard-core")]
 use xolotl_state::Backend;
-#[cfg(feature = "standard-core")]
 use xolotl_types::{
     ExternalInstallationDef, Failure, ManifestDef, MethodId, Outcome, OutputMode, Path, Purity,
     Role, Value,
 };
+#[cfg(feature = "standard-core")]
+use xolotl_types::{ValueMap, ValueView};
 
 /// Internal method names in registration order. `install_standard` exposes each
 /// one as a separate Resource with public method `invoke`:
@@ -139,32 +140,28 @@ impl PairingDriver {
             .map_err(|e| DriverError::Other(format!("invalid installation id {id:?}: {e}")))
     }
 
-    async fn read_record(&self, id: &str) -> Result<BTreeMap<String, Value>, DriverError> {
+    async fn read_record(&self, id: &str) -> Result<ValueMap, DriverError> {
         let value = self
             .state
             .read(&Self::pairing_path(id)?)
             .await
             .map_err(|e| DriverError::Other(e.to_string()))?
             .ok_or_else(|| DriverError::Other(format!("unknown pairing id {id:?}")))?;
-        match value {
-            Value::Map(record) => Ok(record),
+        match value.into_map() {
+            Some(record) => Ok(record),
             _ => Err(DriverError::Other(format!(
                 "malformed pairing record {id:?}"
             ))),
         }
     }
 
-    async fn write_record(
-        &self,
-        id: &str,
-        record: BTreeMap<String, Value>,
-    ) -> Result<Outcome, DriverError> {
-        let value = Value::Map(record);
+    async fn write_record(&self, id: &str, record: ValueMap) -> Result<DriverOutput, DriverError> {
+        let value = Value::from(record);
         self.state
             .write_set(&Self::pairing_path(id)?, value.clone())
             .await
             .map_err(|e| DriverError::Other(e.to_string()))?;
-        Ok(Outcome::Done(value))
+        Ok(DriverOutput::new(Outcome::Done(value)))
     }
 
     async fn load_pairing_scope(
@@ -230,19 +227,26 @@ struct PairingScope {
 #[async_trait]
 #[cfg(feature = "standard-core")]
 impl Driver for PairingDriver {
+    fn input_admission(&self, method: MethodId) -> Option<xolotl_kernel::driver::InputAdmission> {
+        match method.get() {
+            0 | 3 => Some(admit_pairing_input),
+            _ => None,
+        }
+    }
+
     async fn call(
         &self,
         method: MethodId,
         input: Value,
         _output: OutputMode,
         _ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
+    ) -> Result<DriverOutput, DriverError> {
         let m = crate::input::map(input, "pairing")?;
         match method.get() {
             // create: allocate a pairing intent and persist only a secret hash.
             0 => {
                 if let Some(outcome) = reject_inline_secret(&m) {
-                    return Ok(outcome);
+                    return Ok(DriverOutput::new(outcome));
                 }
                 reject_unknown_fields(
                     &m,
@@ -266,7 +270,7 @@ impl Driver for PairingDriver {
                     .load_pairing_scope(&installation_id, optional_str(&m, "manifest_platform")?)
                     .await?;
                 let requested_allowed = role_values(m.get("allowed_roles"), "allowed_roles")?;
-                let allowed_roles = if m.contains_key("allowed_roles") {
+                let allowed_roles = if m.get("allowed_roles").is_some() {
                     ensure_roles_allowed(&requested_allowed, &scope.roles)?;
                     requested_allowed
                 } else {
@@ -274,21 +278,57 @@ impl Driver for PairingDriver {
                 };
                 let secret = random_secret()?;
                 let expires_at = optional_nonnegative_int(&m, "expires_at", 0)?;
-                let mut record = BTreeMap::new();
-                record.insert("pairing_id".into(), Value::Str(pairing_id.clone()));
-                record.insert("installation_id".into(), Value::Str(installation_id));
-                record.insert("state".into(), Value::Str(STATE_CREATED.into()));
-                record.insert("allowed_roles".into(), string_list(allowed_roles));
+                let mut record = ValueMap::new();
+                record
+                    .insert("pairing_id".into(), Value::string(pairing_id.clone()))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                record
+                    .insert("installation_id".into(), Value::string(installation_id))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                record
+                    .insert("state".into(), Value::string(STATE_CREATED.into()))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                record
+                    .insert("allowed_roles".into(), string_list(allowed_roles))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
                 if let Some(platform) = scope.manifest_platform {
-                    record.insert("manifest_platform".into(), Value::Str(platform));
+                    record
+                        .insert("manifest_platform".into(), Value::string(platform))
+                        .map_err(|error| {
+                            DriverError::Other(format!("pairing record update failed: {error}"))
+                        })?;
                 }
-                record.insert("secret_hash".into(), Value::Str(hash_secret(&secret)));
-                record.insert(
-                    "display_checksum".into(),
-                    Value::Str(display_checksum(&secret)),
-                );
-                record.insert("expires_at".into(), Value::Int(expires_at));
-                record.insert("credential_generation".into(), Value::Int(0));
+                record
+                    .insert("secret_hash".into(), Value::string(hash_secret(&secret)))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                record
+                    .insert(
+                        "display_checksum".into(),
+                        Value::string(display_checksum(&secret)),
+                    )
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                record
+                    .insert("expires_at".into(), Value::integer(expires_at))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                record
+                    .insert("credential_generation".into(), Value::integer(0))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
                 let out = self.write_record(&pairing_id, record).await?;
                 self.stage_display_secret(&pairing_id, secret);
                 Ok(out)
@@ -319,7 +359,7 @@ impl Driver for PairingDriver {
                 let requested_roles =
                     role_values(record.get("requested_roles"), "record.requested_roles")?;
                 ensure_roles_allowed(&requested_roles, &allowed_roles)?;
-                let approved_roles = if m.contains_key("approved_roles") {
+                let approved_roles = if m.get("approved_roles").is_some() {
                     let roles = role_values(m.get("approved_roles"), "approved_roles")?;
                     ensure_roles_allowed(&roles, &requested_roles)?;
                     roles
@@ -329,22 +369,42 @@ impl Driver for PairingDriver {
                 ensure_roles_allowed(&approved_roles, &allowed_roles)?;
                 let roles = approved_roles
                     .into_iter()
-                    .map(Value::Str)
+                    .map(Value::string)
                     .collect::<Vec<_>>();
                 let generation = required_record_nonnegative_int(&record, "credential_generation")?
                     .checked_add(1)
                     .ok_or_else(|| DriverError::Other("credential_generation overflowed".into()))?;
-                record.insert("state".into(), Value::Str(STATE_APPROVED.into()));
-                record.insert(
-                    "installation_id".into(),
-                    Value::Str(installation_id.clone()),
-                );
-                record.insert("approved_roles".into(), Value::List(roles.clone()));
-                record.insert("credential_generation".into(), Value::Int(generation));
-                record.insert(
-                    "credential_hash".into(),
-                    Value::Str(credential_hash(&installation_id, pairing_id, generation)),
-                );
+                record
+                    .insert("state".into(), Value::string(STATE_APPROVED.into()))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                record
+                    .insert(
+                        "installation_id".into(),
+                        Value::string(installation_id.clone()),
+                    )
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                record
+                    .insert("approved_roles".into(), Value::list(roles.clone()))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                record
+                    .insert("credential_generation".into(), Value::integer(generation))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                record
+                    .insert(
+                        "credential_hash".into(),
+                        Value::string(credential_hash(&installation_id, pairing_id, generation)),
+                    )
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
                 for role in roles.iter().filter_map(Value::as_str) {
                     let suffix = match role {
                         "provider" => "provider",
@@ -354,16 +414,16 @@ impl Driver for PairingDriver {
                     let mut ext = BTreeMap::new();
                     ext.insert(
                         "installation_id".into(),
-                        Value::Str(installation_id.clone()),
+                        Value::string(installation_id.clone()),
                     );
-                    ext.insert("role".into(), Value::Str(role.into()));
-                    ext.insert("pairing_id".into(), Value::Str(pairing_id.into()));
-                    ext.insert("credential_generation".into(), Value::Int(generation));
-                    ext.insert("state".into(), Value::Str("ready".into()));
+                    ext.insert("role".into(), Value::string(role.into()));
+                    ext.insert("pairing_id".into(), Value::string(pairing_id.into()));
+                    ext.insert("credential_generation".into(), Value::integer(generation));
+                    ext.insert("state".into(), Value::string("ready".into()));
                     self.state
                         .write_set(
                             &Self::session_path(&installation_id, suffix)?,
-                            Value::Map(ext),
+                            Value::map(ext),
                         )
                         .await
                         .map_err(|e| DriverError::Other(e.to_string()))?;
@@ -376,13 +436,17 @@ impl Driver for PairingDriver {
                 let pairing_id = required_str(&m, "pairing_id")?;
                 let mut record = self.read_record(pairing_id).await?;
                 ensure_not_terminal(&record)?;
-                record.insert("state".into(), Value::Str(STATE_DENIED.into()));
+                record
+                    .insert("state".into(), Value::string(STATE_DENIED.into()))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
                 self.write_record(pairing_id, record).await
             }
             // replace: mark the old intent replaced and create a fresh intent.
             3 => {
                 if let Some(outcome) = reject_inline_secret(&m) {
-                    return Ok(outcome);
+                    return Ok(DriverOutput::new(outcome));
                 }
                 reject_unknown_fields(
                     &m,
@@ -429,7 +493,7 @@ impl Driver for PairingDriver {
                 let scope = self
                     .load_pairing_scope(&installation_id, manifest_platform.as_deref())
                     .await?;
-                let allowed_roles = if m.contains_key("allowed_roles") {
+                let allowed_roles = if m.get("allowed_roles").is_some() {
                     let requested_allowed = role_values(m.get("allowed_roles"), "allowed_roles")?;
                     ensure_roles_allowed(&requested_allowed, &scope.roles)?;
                     requested_allowed
@@ -439,30 +503,76 @@ impl Driver for PairingDriver {
                 };
                 let expires_at = optional_nonnegative_int(&m, "expires_at", 0)?;
                 let secret = random_secret()?;
-                let mut replacement = BTreeMap::new();
-                replacement.insert("pairing_id".into(), Value::Str(replacement_id.clone()));
-                replacement.insert("installation_id".into(), Value::Str(installation_id));
-                replacement.insert("state".into(), Value::Str(STATE_CREATED.into()));
-                replacement.insert("allowed_roles".into(), string_list(allowed_roles));
+                let mut replacement = ValueMap::new();
+                replacement
+                    .insert("pairing_id".into(), Value::string(replacement_id.clone()))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                replacement
+                    .insert("installation_id".into(), Value::string(installation_id))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                replacement
+                    .insert("state".into(), Value::string(STATE_CREATED.into()))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                replacement
+                    .insert("allowed_roles".into(), string_list(allowed_roles))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
                 if let Some(platform) = scope.manifest_platform {
-                    replacement.insert("manifest_platform".into(), Value::Str(platform));
+                    replacement
+                        .insert("manifest_platform".into(), Value::string(platform))
+                        .map_err(|error| {
+                            DriverError::Other(format!("pairing record update failed: {error}"))
+                        })?;
                 }
-                replacement.insert("secret_hash".into(), Value::Str(hash_secret(&secret)));
-                replacement.insert(
-                    "display_checksum".into(),
-                    Value::Str(display_checksum(&secret)),
-                );
-                replacement.insert("expires_at".into(), Value::Int(expires_at));
-                replacement.insert("replaces".into(), Value::Str(pairing_id.into()));
-                replacement.insert("credential_generation".into(), Value::Int(0));
+                replacement
+                    .insert("secret_hash".into(), Value::string(hash_secret(&secret)))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                replacement
+                    .insert(
+                        "display_checksum".into(),
+                        Value::string(display_checksum(&secret)),
+                    )
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                replacement
+                    .insert("expires_at".into(), Value::integer(expires_at))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                replacement
+                    .insert("replaces".into(), Value::string(pairing_id.into()))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                replacement
+                    .insert("credential_generation".into(), Value::integer(0))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
 
-                old.insert("state".into(), Value::Str(STATE_REPLACED.into()));
+                old.insert("state".into(), Value::string(STATE_REPLACED.into()))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
                 old.insert(
                     "replacement_pairing_id".into(),
-                    Value::Str(replacement_id.clone()),
-                );
+                    Value::string(replacement_id.clone()),
+                )
+                .map_err(|error| {
+                    DriverError::Other(format!("pairing record update failed: {error}"))
+                })?;
                 self.state
-                    .write_set(&Self::pairing_path(pairing_id)?, Value::Map(old.clone()))
+                    .write_set(&Self::pairing_path(pairing_id)?, Value::from(old.clone()))
                     .await
                     .map_err(|e| DriverError::Other(e.to_string()))?;
                 let out = self.write_record(&replacement_id, replacement).await?;
@@ -478,21 +588,36 @@ impl Driver for PairingDriver {
                 )?;
                 let installation_id = required_str(&m, "installation_id")?;
                 let generation_floor = credential_generation_floor(&m)?;
-                let mut record = BTreeMap::new();
-                record.insert("installation_id".into(), Value::Str(installation_id.into()));
-                record.insert("state".into(), Value::Str(STATE_REVOKED.into()));
-                record.insert(
-                    "credential_generation_floor".into(),
-                    Value::Int(generation_floor),
-                );
+                let mut record = ValueMap::new();
+                record
+                    .insert(
+                        "installation_id".into(),
+                        Value::string(installation_id.into()),
+                    )
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                record
+                    .insert("state".into(), Value::string(STATE_REVOKED.into()))
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
+                record
+                    .insert(
+                        "credential_generation_floor".into(),
+                        Value::integer(generation_floor),
+                    )
+                    .map_err(|error| {
+                        DriverError::Other(format!("pairing record update failed: {error}"))
+                    })?;
                 self.state
                     .write_set(
                         &Self::revoke_path(installation_id)?,
-                        Value::Map(record.clone()),
+                        Value::from(record.clone()),
                     )
                     .await
                     .map_err(|e| DriverError::Other(e.to_string()))?;
-                Ok(Outcome::Done(Value::Map(record)))
+                Ok(DriverOutput::new(Outcome::Done(Value::from(record))))
             }
             _ => Err(DriverError::NoSuchMethod(method)),
         }
@@ -500,11 +625,11 @@ impl Driver for PairingDriver {
 }
 
 #[cfg(feature = "standard-core")]
-fn credential_generation_floor(m: &BTreeMap<String, Value>) -> Result<i64, DriverError> {
-    match m.get("credential_generation_floor") {
+fn credential_generation_floor(m: &ValueMap) -> Result<i64, DriverError> {
+    match m.get("credential_generation_floor").map(Value::view) {
         None => Ok(1),
-        Some(Value::Int(floor)) if *floor >= 1 => Ok(*floor),
-        Some(Value::Int(_)) => Err(DriverError::Other(
+        Some(ValueView::Int(floor)) if floor >= 1 => Ok(floor),
+        Some(ValueView::Int(_)) => Err(DriverError::Other(
             "credential_generation_floor must be at least 1".into(),
         )),
         Some(_) => Err(DriverError::Other(
@@ -514,19 +639,19 @@ fn credential_generation_floor(m: &BTreeMap<String, Value>) -> Result<i64, Drive
 }
 
 #[cfg(feature = "standard-core")]
-fn field_str<'a>(m: &'a BTreeMap<String, Value>, key: &str) -> Option<&'a str> {
+fn field_str<'a>(m: &'a ValueMap, key: &str) -> Option<&'a str> {
     m.get(key).and_then(Value::as_str)
 }
 
 #[cfg(feature = "standard-core")]
 fn record_optional_str<'a>(
-    record: &'a BTreeMap<String, Value>,
+    record: &'a ValueMap,
     key: &str,
 ) -> Result<Option<&'a str>, DriverError> {
-    match record.get(key) {
+    match record.get(key).map(Value::view) {
         None => Ok(None),
-        Some(Value::Str(value)) if !value.is_empty() => Ok(Some(value.as_str())),
-        Some(Value::Str(_)) => Err(DriverError::Other(format!(
+        Some(ValueView::Str(value)) if !value.is_empty() => Ok(Some(value)),
+        Some(ValueView::Str(_)) => Err(DriverError::Other(format!(
             "pairing record field {key} must not be empty"
         ))),
         Some(_) => Err(DriverError::Other(format!(
@@ -536,54 +661,41 @@ fn record_optional_str<'a>(
 }
 
 #[cfg(feature = "standard-core")]
-fn record_required_str<'a>(
-    record: &'a BTreeMap<String, Value>,
-    key: &str,
-) -> Result<&'a str, DriverError> {
+fn record_required_str<'a>(record: &'a ValueMap, key: &str) -> Result<&'a str, DriverError> {
     record_optional_str(record, key)?
         .ok_or_else(|| DriverError::Other(format!("pairing record missing {key}")))
 }
 
 #[cfg(feature = "standard-core")]
-fn optional_str<'a>(
-    m: &'a BTreeMap<String, Value>,
-    key: &str,
-) -> Result<Option<&'a str>, DriverError> {
-    match m.get(key) {
-        Some(Value::Null) | None => Ok(None),
-        Some(Value::Str(value)) if !value.is_empty() => Ok(Some(value.as_str())),
-        Some(Value::Str(_)) => Err(DriverError::Other(format!("{key} must not be empty"))),
+fn optional_str<'a>(m: &'a ValueMap, key: &str) -> Result<Option<&'a str>, DriverError> {
+    match m.get(key).map(Value::view) {
+        Some(ValueView::Null) | None => Ok(None),
+        Some(ValueView::Str(value)) if !value.is_empty() => Ok(Some(value)),
+        Some(ValueView::Str(_)) => Err(DriverError::Other(format!("{key} must not be empty"))),
         Some(_) => Err(DriverError::Other(format!("{key} must be a string"))),
     }
 }
 
 #[cfg(feature = "standard-core")]
-fn required_str<'a>(m: &'a BTreeMap<String, Value>, key: &str) -> Result<&'a str, DriverError> {
+fn required_str<'a>(m: &'a ValueMap, key: &str) -> Result<&'a str, DriverError> {
     optional_str(m, key)?.ok_or_else(|| DriverError::Other(format!("{key} is required")))
 }
 
 #[cfg(feature = "standard-core")]
-fn optional_nonnegative_int(
-    m: &BTreeMap<String, Value>,
-    key: &str,
-    default: i64,
-) -> Result<i64, DriverError> {
-    match m.get(key) {
-        Some(Value::Null) | None => Ok(default),
-        Some(Value::Int(value)) if *value >= 0 => Ok(*value),
-        Some(Value::Int(_)) => Err(DriverError::Other(format!("{key} must be nonnegative"))),
+fn optional_nonnegative_int(m: &ValueMap, key: &str, default: i64) -> Result<i64, DriverError> {
+    match m.get(key).map(Value::view) {
+        Some(ValueView::Null) | None => Ok(default),
+        Some(ValueView::Int(value)) if value >= 0 => Ok(value),
+        Some(ValueView::Int(_)) => Err(DriverError::Other(format!("{key} must be nonnegative"))),
         Some(_) => Err(DriverError::Other(format!("{key} must be an integer"))),
     }
 }
 
 #[cfg(feature = "standard-core")]
-fn required_record_nonnegative_int(
-    record: &BTreeMap<String, Value>,
-    key: &str,
-) -> Result<i64, DriverError> {
-    match record.get(key) {
-        Some(Value::Int(value)) if *value >= 0 => Ok(*value),
-        Some(Value::Int(_)) => Err(DriverError::Other(format!(
+fn required_record_nonnegative_int(record: &ValueMap, key: &str) -> Result<i64, DriverError> {
+    match record.get(key).map(Value::view) {
+        Some(ValueView::Int(value)) if value >= 0 => Ok(value),
+        Some(ValueView::Int(_)) => Err(DriverError::Other(format!(
             "pairing record field {key} must be nonnegative"
         ))),
         Some(_) => Err(DriverError::Other(format!(
@@ -619,15 +731,15 @@ fn kernel_state_path(segments: &[&str]) -> Result<Path, xolotl_types::PathError>
 
 #[cfg(feature = "standard-core")]
 fn string_list(values: Vec<String>) -> Value {
-    Value::List(values.into_iter().map(Value::Str).collect())
+    Value::list(values.into_iter().map(Value::string).collect())
 }
 
 #[cfg(feature = "standard-core")]
 fn role_values(v: Option<&Value>, field: &str) -> Result<Vec<String>, DriverError> {
-    let roles = match v {
+    let roles = match v.map(Value::view) {
         None => Vec::new(),
-        Some(Value::Str(s)) => vec![s.clone()],
-        Some(Value::List(items)) => {
+        Some(ValueView::Str(s)) => vec![s.to_owned()],
+        Some(ValueView::List(items)) => {
             let mut roles = Vec::with_capacity(items.len());
             for item in items {
                 let Some(role) = item.as_str() else {
@@ -659,7 +771,7 @@ fn role_values(v: Option<&Value>, field: &str) -> Result<Vec<String>, DriverErro
 }
 
 #[cfg(feature = "standard-core")]
-fn ensure_not_terminal(record: &BTreeMap<String, Value>) -> Result<(), DriverError> {
+fn ensure_not_terminal(record: &ValueMap) -> Result<(), DriverError> {
     match field_str(record, "state") {
         Some(STATE_CREATED) => Ok(()),
         Some(STATE_APPROVED | STATE_DENIED | STATE_EXPIRED | STATE_REPLACED | STATE_REVOKED) => {
@@ -673,7 +785,7 @@ fn ensure_not_terminal(record: &BTreeMap<String, Value>) -> Result<(), DriverErr
 }
 
 #[cfg(feature = "standard-core")]
-fn ensure_created(record: &BTreeMap<String, Value>) -> Result<(), DriverError> {
+fn ensure_created(record: &ValueMap) -> Result<(), DriverError> {
     match field_str(record, "state") {
         Some(STATE_CREATED) => Ok(()),
         Some(state) => Err(DriverError::Other(format!(
@@ -684,17 +796,21 @@ fn ensure_created(record: &BTreeMap<String, Value>) -> Result<(), DriverError> {
 }
 
 #[cfg(feature = "standard-core")]
-fn ensure_not_expired(record: &mut BTreeMap<String, Value>) -> Result<(), DriverError> {
+fn ensure_not_expired(record: &mut ValueMap) -> Result<(), DriverError> {
     let expires_at = required_record_nonnegative_int(record, "expires_at")?;
     if expires_at > 0 && expires_at <= xolotl_kernel::now_millis() {
-        record.insert("state".into(), Value::Str(STATE_EXPIRED.into()));
+        record
+            .insert("state".into(), Value::string(STATE_EXPIRED.into()))
+            .map_err(|error| {
+                DriverError::Other(format!("pairing record update failed: {error}"))
+            })?;
         return Err(DriverError::Other("pairing intent has expired".into()));
     }
     Ok(())
 }
 
 #[cfg(feature = "standard-core")]
-fn ensure_record_sas_verified(record: &BTreeMap<String, Value>) -> Result<(), DriverError> {
+fn ensure_record_sas_verified(record: &ValueMap) -> Result<(), DriverError> {
     if matches!(
         record.get("sas_verified").and_then(Value::as_bool),
         Some(true)
@@ -730,8 +846,8 @@ fn ensure_roles_allowed(roles: &[String], allowed: &[String]) -> Result<(), Driv
 }
 
 #[cfg(feature = "standard-core")]
-fn reject_inline_secret(m: &BTreeMap<String, Value>) -> Option<Outcome> {
-    if m.contains_key("pairing_secret") {
+fn reject_inline_secret(m: &ValueMap) -> Option<Outcome> {
+    if m.get("pairing_secret").is_some() {
         return Some(Outcome::Fail(Failure::InvalidInput {
             reason: "pairing_secret must be generated by PairingDriver and exposed only through the display edge".into(),
         }));
@@ -740,13 +856,36 @@ fn reject_inline_secret(m: &BTreeMap<String, Value>) -> Option<Outcome> {
 }
 
 #[cfg(feature = "standard-core")]
-fn reject_unknown_fields(
-    m: &BTreeMap<String, Value>,
-    method: &str,
-    allowed: &[&str],
-) -> Result<(), DriverError> {
+fn admit_pairing_input(input: &Value) -> Result<(), Box<xolotl_kernel::driver::InputRejection>> {
+    let Some(fields) = input.as_map() else {
+        return Ok(());
+    };
+    let Some(Outcome::Fail(failure)) = reject_inline_secret(fields) else {
+        return Ok(());
+    };
+    let recorded_input = Value::map(
+        fields
+            .iter()
+            .map(|(key, value)| {
+                let value = if key == "pairing_secret" {
+                    Value::string("<redacted>".into())
+                } else {
+                    value.clone()
+                };
+                (key.to_owned(), value)
+            })
+            .collect(),
+    );
+    Err(Box::new(xolotl_kernel::driver::InputRejection {
+        failure,
+        recorded_input,
+    }))
+}
+
+#[cfg(feature = "standard-core")]
+fn reject_unknown_fields(m: &ValueMap, method: &str, allowed: &[&str]) -> Result<(), DriverError> {
     for key in m.keys() {
-        if !allowed.iter().any(|allowed| allowed == key) {
+        if !allowed.contains(&key) {
             return Err(DriverError::Other(format!(
                 "{method} does not accept field {key:?}"
             )));
@@ -756,10 +895,7 @@ fn reject_unknown_fields(
 }
 
 #[cfg(feature = "standard-core")]
-fn reject_inline_install_fields(
-    m: &BTreeMap<String, Value>,
-    method: &str,
-) -> Result<(), DriverError> {
+fn reject_inline_install_fields(m: &ValueMap, method: &str) -> Result<(), DriverError> {
     for key in [
         "provides",
         "emits",
@@ -770,7 +906,7 @@ fn reject_inline_install_fields(
         "trust",
         "capabilities",
     ] {
-        if m.contains_key(key) {
+        if m.get(key).is_some() {
             return Err(DriverError::Other(format!(
                 "{method} must reference an existing ExternalInstallationDef or ManifestDef; field {key:?} is not accepted"
             )));
@@ -780,10 +916,7 @@ fn reject_inline_install_fields(
 }
 
 #[cfg(feature = "standard-core")]
-fn reject_pairing_claim_fields(
-    m: &BTreeMap<String, Value>,
-    method: &str,
-) -> Result<(), DriverError> {
+fn reject_pairing_claim_fields(m: &ValueMap, method: &str) -> Result<(), DriverError> {
     for key in [
         "sas_verified",
         "requested_roles",
@@ -792,7 +925,7 @@ fn reject_pairing_claim_fields(
         "claim",
         "registry_hash",
     ] {
-        if m.contains_key(key) {
+        if m.get(key).is_some() {
             return Err(DriverError::Other(format!(
                 "{method} must not carry locked pairing claim field {key:?}"
             )));
@@ -802,7 +935,7 @@ fn reject_pairing_claim_fields(
 }
 
 #[cfg(feature = "standard-core")]
-fn reject_approve_claim_fields(m: &BTreeMap<String, Value>) -> Result<(), DriverError> {
+fn reject_approve_claim_fields(m: &ValueMap) -> Result<(), DriverError> {
     reject_inline_install_fields(m, "pairing.approve")?;
     for key in [
         "sas_verified",
@@ -814,7 +947,7 @@ fn reject_approve_claim_fields(m: &BTreeMap<String, Value>) -> Result<(), Driver
         "claim",
         "registry_hash",
     ] {
-        if m.contains_key(key) {
+        if m.get(key).is_some() {
             return Err(DriverError::Other(format!(
                 "pairing.approve must consume locked record claims; field {key:?} is not accepted"
             )));
@@ -987,7 +1120,6 @@ fn credential_hash(installation_id: &str, pairing_id: &str, generation: i64) -> 
 mod tests {
     use super::*;
     use anyhow::{Context, bail, ensure};
-    use std::sync::Arc;
     use xolotl_state::InMemoryBackend;
     use xolotl_types::{EffectCapability, IdentityRef, ProcessId, Transport, TrustLevel};
 
@@ -996,12 +1128,12 @@ mod tests {
     }
 
     fn driver() -> (PairingDriver, Backend) {
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         (PairingDriver::new(state.clone()), state)
     }
 
     fn expected_driver_error(
-        result: Result<Outcome, DriverError>,
+        result: Result<DriverOutput, DriverError>,
         label: &str,
     ) -> anyhow::Result<DriverError> {
         match result {
@@ -1010,9 +1142,9 @@ mod tests {
         }
     }
 
-    fn done_map(outcome: Outcome, label: &str) -> anyhow::Result<BTreeMap<String, Value>> {
-        match outcome {
-            Outcome::Done(Value::Map(record)) => Ok(record),
+    fn done_map(output: DriverOutput, label: &str) -> anyhow::Result<ValueMap> {
+        match output.outcome {
+            Outcome::Done(value) => value.into_map().context("expected record map"),
             other => bail!("{label}: expected map output, got {other:?}"),
         }
     }
@@ -1064,8 +1196,8 @@ mod tests {
                 args: vec![],
             },
             trust: TrustLevel::Sandboxed,
-            config_schema: Value::Null,
-            config: Value::Null,
+            config_schema: Value::null(),
+            config: Value::null(),
             projections: vec![projection],
             version: 1,
         };
@@ -1094,17 +1226,17 @@ mod tests {
             .as_map()
             .context("pairing record is not a map")?
             .clone();
-        record.insert("sas_verified".into(), Value::Bool(sas_verified));
+        record.insert("sas_verified".into(), Value::boolean(sas_verified))?;
         record.insert(
             "requested_roles".into(),
-            Value::List(
+            Value::list(
                 requested_roles
                     .iter()
-                    .map(|role| Value::Str((*role).into()))
+                    .map(|role| Value::string((*role).into()))
                     .collect(),
             ),
-        );
-        state.write_set(&path, Value::Map(record)).await?;
+        )?;
+        state.write_set(&path, Value::from(record)).await?;
         Ok(())
     }
 
@@ -1134,28 +1266,28 @@ mod tests {
         let (driver, state) = driver();
         install_external(&state, "ext-1", Role::Provider).await?;
         let mut input = BTreeMap::new();
-        input.insert("pairing_id".into(), Value::Str("pair-1".into()));
-        input.insert("installation_id".into(), Value::Str("ext-1".into()));
+        input.insert("pairing_id".into(), Value::string("pair-1".into()));
+        input.insert("installation_id".into(), Value::string("ext-1".into()));
         input.insert(
             "allowed_roles".into(),
-            Value::List(vec![Value::Str("provider".into())]),
+            Value::list(vec![Value::string("provider".into())]),
         );
         let out = driver
             .call(
                 MethodId::new(0),
-                Value::Map(input),
+                Value::map(input),
                 OutputMode::Unary,
                 &ctx(),
             )
             .await?;
         let record = done_map(out, "create pairing")?;
         ensure!(
-            record.get("state") == Some(&Value::Str(STATE_CREATED.into())),
+            record.get("state") == Some(&Value::string(STATE_CREATED.into())),
             "unexpected pairing state: {:?}",
             record.get("state")
         );
         ensure!(
-            !record.contains_key("pairing_secret"),
+            record.get("pairing_secret").is_none(),
             "pairing record exposed secret"
         );
         let pairing_path =
@@ -1165,7 +1297,7 @@ mod tests {
             .await?
             .context("pairing record missing")?;
         ensure!(
-            stored == Value::Map(record),
+            stored == Value::from(record),
             "stored pairing record did not match returned record"
         );
 
@@ -1192,18 +1324,18 @@ mod tests {
     async fn pairing_create_rejects_inline_secret() -> anyhow::Result<()> {
         let (driver, _) = driver();
         let mut input = BTreeMap::new();
-        input.insert("pairing_id".into(), Value::Str("pair-secret".into()));
-        input.insert("pairing_secret".into(), Value::Str("secret".into()));
+        input.insert("pairing_id".into(), Value::string("pair-secret".into()));
+        input.insert("pairing_secret".into(), Value::string("secret".into()));
         let out = driver
             .call(
                 MethodId::new(0),
-                Value::Map(input),
+                Value::map(input),
                 OutputMode::Unary,
                 &ctx(),
             )
             .await?;
         ensure!(
-            matches!(out, Outcome::Fail(Failure::InvalidInput { .. })),
+            matches!(out.outcome, Outcome::Fail(Failure::InvalidInput { .. })),
             "unexpected inline secret outcome: {out:?}"
         );
         Ok(())
@@ -1213,13 +1345,16 @@ mod tests {
     async fn pairing_create_requires_installed_external_scope() -> anyhow::Result<()> {
         let (driver, _) = driver();
         let mut input = BTreeMap::new();
-        input.insert("pairing_id".into(), Value::Str("pair-missing".into()));
-        input.insert("installation_id".into(), Value::Str("missing-ext".into()));
+        input.insert("pairing_id".into(), Value::string("pair-missing".into()));
+        input.insert(
+            "installation_id".into(),
+            Value::string("missing-ext".into()),
+        );
         let err = expected_driver_error(
             driver
                 .call(
                     MethodId::new(0),
-                    Value::Map(input),
+                    Value::map(input),
                     OutputMode::Unary,
                     &ctx(),
                 )
@@ -1238,17 +1373,23 @@ mod tests {
         let (driver, state) = driver();
         install_external(&state, "ext-unknown-field", Role::Provider).await?;
         let mut input = BTreeMap::new();
-        input.insert("pairing_id".into(), Value::Str("pair-unknown-field".into()));
+        input.insert(
+            "pairing_id".into(),
+            Value::string("pair-unknown-field".into()),
+        );
         input.insert(
             "installation_id".into(),
-            Value::Str("ext-unknown-field".into()),
+            Value::string("ext-unknown-field".into()),
         );
-        input.insert("connection_id".into(), Value::Str("transport-conn".into()));
+        input.insert(
+            "connection_id".into(),
+            Value::string("transport-conn".into()),
+        );
         let err = expected_driver_error(
             driver
                 .call(
                     MethodId::new(0),
-                    Value::Map(input),
+                    Value::map(input),
                     OutputMode::Unary,
                     &ctx(),
                 )
@@ -1267,17 +1408,17 @@ mod tests {
         let (driver, state) = driver();
         install_external(&state, "ext-empty-role", Role::Provider).await?;
         let mut input = BTreeMap::new();
-        input.insert("pairing_id".into(), Value::Str("pair-empty-role".into()));
+        input.insert("pairing_id".into(), Value::string("pair-empty-role".into()));
         input.insert(
             "installation_id".into(),
-            Value::Str("ext-empty-role".into()),
+            Value::string("ext-empty-role".into()),
         );
-        input.insert("allowed_roles".into(), Value::List(vec![]));
+        input.insert("allowed_roles".into(), Value::list(vec![]));
         let err = expected_driver_error(
             driver
                 .call(
                     MethodId::new(0),
-                    Value::Map(input),
+                    Value::map(input),
                     OutputMode::Unary,
                     &ctx(),
                 )
@@ -1296,26 +1437,26 @@ mod tests {
         let (driver, state) = driver();
         install_external(&state, "ext-malformed-optional", Role::Provider).await?;
         for (field, value) in [
-            ("pairing_id", Value::Int(1)),
-            ("manifest_platform", Value::Int(1)),
-            ("expires_at", Value::Str("never".into())),
-            ("expires_at", Value::Int(-1)),
+            ("pairing_id", Value::integer(1)),
+            ("manifest_platform", Value::integer(1)),
+            ("expires_at", Value::string("never".into())),
+            ("expires_at", Value::integer(-1)),
         ] {
             let mut input = BTreeMap::new();
             input.insert(
                 "pairing_id".into(),
-                Value::Str(format!("pair-malformed-{field}")),
+                Value::string(format!("pair-malformed-{field}")),
             );
             input.insert(
                 "installation_id".into(),
-                Value::Str("ext-malformed-optional".into()),
+                Value::string("ext-malformed-optional".into()),
             );
             input.insert(field.into(), value);
             let err = expected_driver_error(
                 driver
                     .call(
                         MethodId::new(0),
-                        Value::Map(input),
+                        Value::map(input),
                         OutputMode::Unary,
                         &ctx(),
                     )
@@ -1335,27 +1476,27 @@ mod tests {
         let (driver, state) = driver();
         install_external(&state, "ext-2", Role::Provider).await?;
         let mut create = BTreeMap::new();
-        create.insert("pairing_id".into(), Value::Str("pair-2".into()));
-        create.insert("installation_id".into(), Value::Str("ext-2".into()));
+        create.insert("pairing_id".into(), Value::string("pair-2".into()));
+        create.insert("installation_id".into(), Value::string("ext-2".into()));
         create.insert(
             "allowed_roles".into(),
-            Value::List(vec![Value::Str("provider".into())]),
+            Value::list(vec![Value::string("provider".into())]),
         );
         driver
             .call(
                 MethodId::new(0),
-                Value::Map(create),
+                Value::map(create),
                 OutputMode::Unary,
                 &ctx(),
             )
             .await?;
         lock_pairing_claim(&state, "pair-2", &["provider"], true).await?;
         let mut approve = BTreeMap::new();
-        approve.insert("pairing_id".into(), Value::Str("pair-2".into()));
+        approve.insert("pairing_id".into(), Value::string("pair-2".into()));
         driver
             .call(
                 MethodId::new(1),
-                Value::Map(approve),
+                Value::map(approve),
                 OutputMode::Unary,
                 &ctx(),
             )
@@ -1368,12 +1509,12 @@ mod tests {
             .context("provider session missing")?;
         let m = ext.as_map().context("provider session is not a map")?;
         ensure!(
-            m.get("state") == Some(&Value::Str("ready".into())),
+            m.get("state") == Some(&Value::string("ready".into())),
             "unexpected provider session state: {:?}",
             m.get("state")
         );
         ensure!(
-            m.get("credential_generation") == Some(&Value::Int(1)),
+            m.get("credential_generation") == Some(&Value::integer(1)),
             "unexpected credential generation: {:?}",
             m.get("credential_generation")
         );
@@ -1390,25 +1531,25 @@ mod tests {
             (
                 "pair-bad-expiry",
                 "expires_at",
-                Some(Value::Str("never".into())),
+                Some(Value::string("never".into())),
             ),
             ("pair-missing-generation", "credential_generation", None),
             (
                 "pair-bad-generation",
                 "credential_generation",
-                Some(Value::Str("0".into())),
+                Some(Value::string("0".into())),
             ),
         ] {
             let mut create = BTreeMap::new();
-            create.insert("pairing_id".into(), Value::Str(pairing_id.into()));
+            create.insert("pairing_id".into(), Value::string(pairing_id.into()));
             create.insert(
                 "installation_id".into(),
-                Value::Str("ext-persisted-security".into()),
+                Value::string("ext-persisted-security".into()),
             );
             driver
                 .call(
                     MethodId::new(0),
-                    Value::Map(create),
+                    Value::map(create),
                     OutputMode::Unary,
                     &ctx(),
                 )
@@ -1426,21 +1567,21 @@ mod tests {
                 .clone();
             match value {
                 Some(value) => {
-                    record.insert(field.into(), value);
+                    record.insert(field.into(), value)?;
                 }
                 None => {
                     record.remove(field);
                 }
             }
-            state.write_set(&path, Value::Map(record)).await?;
+            state.write_set(&path, Value::from(record)).await?;
 
             let mut approve = BTreeMap::new();
-            approve.insert("pairing_id".into(), Value::Str(pairing_id.into()));
+            approve.insert("pairing_id".into(), Value::string(pairing_id.into()));
             let err = expected_driver_error(
                 driver
                     .call(
                         MethodId::new(1),
-                        Value::Map(approve),
+                        Value::map(approve),
                         OutputMode::Unary,
                         &ctx(),
                     )
@@ -1462,12 +1603,15 @@ mod tests {
 
         for (pairing_id, method_id) in [("pair-bad-deny", 2), ("pair-bad-replace", 3)] {
             let mut create = BTreeMap::new();
-            create.insert("pairing_id".into(), Value::Str(pairing_id.into()));
-            create.insert("installation_id".into(), Value::Str("ext-bad-state".into()));
+            create.insert("pairing_id".into(), Value::string(pairing_id.into()));
+            create.insert(
+                "installation_id".into(),
+                Value::string("ext-bad-state".into()),
+            );
             driver
                 .call(
                     MethodId::new(0),
-                    Value::Map(create),
+                    Value::map(create),
                     OutputMode::Unary,
                     &ctx(),
                 )
@@ -1483,15 +1627,15 @@ mod tests {
                 .context("pairing record is not a map")?
                 .clone();
             record.remove("state");
-            state.write_set(&path, Value::Map(record)).await?;
+            state.write_set(&path, Value::from(record)).await?;
 
             let mut input = BTreeMap::new();
-            input.insert("pairing_id".into(), Value::Str(pairing_id.into()));
+            input.insert("pairing_id".into(), Value::string(pairing_id.into()));
             let err = expected_driver_error(
                 driver
                     .call(
                         MethodId::new(method_id),
-                        Value::Map(input),
+                        Value::map(input),
                         OutputMode::Unary,
                         &ctx(),
                     )
@@ -1514,8 +1658,8 @@ mod tests {
             platform: "instant_messaging_platform".into(),
             transport: Transport::Grpc { endpoint: None },
             trust: TrustLevel::Sandboxed,
-            config_schema: Value::Null,
-            config: Value::Null,
+            config_schema: Value::null(),
+            config: Value::null(),
             projections: vec![
                 xolotl_types::ExternalProjectionDef {
                     id: "source".into(),
@@ -1572,23 +1716,23 @@ mod tests {
         let mut create = BTreeMap::new();
         create.insert(
             "pairing_id".into(),
-            Value::Str("pair-instant_messaging_platform".into()),
+            Value::string("pair-instant_messaging_platform".into()),
         );
         create.insert(
             "installation_id".into(),
-            Value::Str("instant_messaging_platform".into()),
+            Value::string("instant_messaging_platform".into()),
         );
         create.insert(
             "allowed_roles".into(),
-            Value::List(vec![
-                Value::Str("source".into()),
-                Value::Str("provider".into()),
+            Value::list(vec![
+                Value::string("source".into()),
+                Value::string("provider".into()),
             ]),
         );
         driver
             .call(
                 MethodId::new(0),
-                Value::Map(create),
+                Value::map(create),
                 OutputMode::Unary,
                 &ctx(),
             )
@@ -1603,12 +1747,12 @@ mod tests {
         let mut approve = BTreeMap::new();
         approve.insert(
             "pairing_id".into(),
-            Value::Str("pair-instant_messaging_platform".into()),
+            Value::string("pair-instant_messaging_platform".into()),
         );
         driver
             .call(
                 MethodId::new(1),
-                Value::Map(approve),
+                Value::map(approve),
                 OutputMode::Unary,
                 &ctx(),
             )
@@ -1635,28 +1779,28 @@ mod tests {
         let (driver, state) = driver();
         install_external(&state, "ext-sas", Role::Provider).await?;
         let mut create = BTreeMap::new();
-        create.insert("pairing_id".into(), Value::Str("pair-sas".into()));
-        create.insert("installation_id".into(), Value::Str("ext-sas".into()));
+        create.insert("pairing_id".into(), Value::string("pair-sas".into()));
+        create.insert("installation_id".into(), Value::string("ext-sas".into()));
         create.insert(
             "allowed_roles".into(),
-            Value::List(vec![Value::Str("provider".into())]),
+            Value::list(vec![Value::string("provider".into())]),
         );
         driver
             .call(
                 MethodId::new(0),
-                Value::Map(create),
+                Value::map(create),
                 OutputMode::Unary,
                 &ctx(),
             )
             .await?;
         lock_pairing_claim(&state, "pair-sas", &["provider"], false).await?;
         let mut approve = BTreeMap::new();
-        approve.insert("pairing_id".into(), Value::Str("pair-sas".into()));
+        approve.insert("pairing_id".into(), Value::string("pair-sas".into()));
         let err = expected_driver_error(
             driver
                 .call(
                     MethodId::new(1),
-                    Value::Map(approve),
+                    Value::map(approve),
                     OutputMode::Unary,
                     &ctx(),
                 )
@@ -1675,25 +1819,25 @@ mod tests {
         let (driver, state) = driver();
         install_external(&state, "ext-claim", Role::Provider).await?;
         let mut create = BTreeMap::new();
-        create.insert("pairing_id".into(), Value::Str("pair-claim".into()));
-        create.insert("installation_id".into(), Value::Str("ext-claim".into()));
+        create.insert("pairing_id".into(), Value::string("pair-claim".into()));
+        create.insert("installation_id".into(), Value::string("ext-claim".into()));
         driver
             .call(
                 MethodId::new(0),
-                Value::Map(create),
+                Value::map(create),
                 OutputMode::Unary,
                 &ctx(),
             )
             .await?;
         lock_pairing_claim(&state, "pair-claim", &["provider"], true).await?;
         let mut approve = BTreeMap::new();
-        approve.insert("pairing_id".into(), Value::Str("pair-claim".into()));
-        approve.insert("sas_verified".into(), Value::Bool(true));
+        approve.insert("pairing_id".into(), Value::string("pair-claim".into()));
+        approve.insert("sas_verified".into(), Value::boolean(true));
         let err = expected_driver_error(
             driver
                 .call(
                     MethodId::new(1),
-                    Value::Map(approve),
+                    Value::map(approve),
                     OutputMode::Unary,
                     &ctx(),
                 )
@@ -1712,28 +1856,28 @@ mod tests {
         let (driver, state) = driver();
         install_external(&state, "ext-role", Role::Provider).await?;
         let mut create = BTreeMap::new();
-        create.insert("pairing_id".into(), Value::Str("pair-role".into()));
-        create.insert("installation_id".into(), Value::Str("ext-role".into()));
+        create.insert("pairing_id".into(), Value::string("pair-role".into()));
+        create.insert("installation_id".into(), Value::string("ext-role".into()));
         create.insert(
             "allowed_roles".into(),
-            Value::List(vec![Value::Str("provider".into())]),
+            Value::list(vec![Value::string("provider".into())]),
         );
         driver
             .call(
                 MethodId::new(0),
-                Value::Map(create),
+                Value::map(create),
                 OutputMode::Unary,
                 &ctx(),
             )
             .await?;
         lock_pairing_claim(&state, "pair-role", &["source"], true).await?;
         let mut approve = BTreeMap::new();
-        approve.insert("pairing_id".into(), Value::Str("pair-role".into()));
+        approve.insert("pairing_id".into(), Value::string("pair-role".into()));
         let err = expected_driver_error(
             driver
                 .call(
                     MethodId::new(1),
-                    Value::Map(approve),
+                    Value::map(approve),
                     OutputMode::Unary,
                     &ctx(),
                 )
@@ -1752,28 +1896,28 @@ mod tests {
         let (driver, state) = driver();
         install_external(&state, "ext-exp", Role::Provider).await?;
         let mut create = BTreeMap::new();
-        create.insert("pairing_id".into(), Value::Str("pair-exp".into()));
-        create.insert("installation_id".into(), Value::Str("ext-exp".into()));
-        create.insert("expires_at".into(), Value::Int(1));
+        create.insert("pairing_id".into(), Value::string("pair-exp".into()));
+        create.insert("installation_id".into(), Value::string("ext-exp".into()));
+        create.insert("expires_at".into(), Value::integer(1));
         create.insert(
             "allowed_roles".into(),
-            Value::List(vec![Value::Str("provider".into())]),
+            Value::list(vec![Value::string("provider".into())]),
         );
         driver
             .call(
                 MethodId::new(0),
-                Value::Map(create),
+                Value::map(create),
                 OutputMode::Unary,
                 &ctx(),
             )
             .await?;
         let mut approve = BTreeMap::new();
-        approve.insert("pairing_id".into(), Value::Str("pair-exp".into()));
+        approve.insert("pairing_id".into(), Value::string("pair-exp".into()));
         let err = expected_driver_error(
             driver
                 .call(
                     MethodId::new(1),
-                    Value::Map(approve),
+                    Value::map(approve),
                     OutputMode::Unary,
                     &ctx(),
                 )
@@ -1795,7 +1939,7 @@ mod tests {
             .context("expired pairing record is not a map")?
             .get("state");
         ensure!(
-            state == Some(&Value::Str(STATE_EXPIRED.into())),
+            state == Some(&Value::string(STATE_EXPIRED.into())),
             "expired pairing state was not terminalized"
         );
         Ok(())
@@ -1806,26 +1950,26 @@ mod tests {
         let (driver, state) = driver();
         install_external(&state, "ext-3", Role::Provider).await?;
         let mut create = BTreeMap::new();
-        create.insert("pairing_id".into(), Value::Str("pair-3".into()));
-        create.insert("installation_id".into(), Value::Str("ext-3".into()));
+        create.insert("pairing_id".into(), Value::string("pair-3".into()));
+        create.insert("installation_id".into(), Value::string("ext-3".into()));
         driver
             .call(
                 MethodId::new(0),
-                Value::Map(create),
+                Value::map(create),
                 OutputMode::Unary,
                 &ctx(),
             )
             .await?;
         let mut replace = BTreeMap::new();
-        replace.insert("pairing_id".into(), Value::Str("pair-3".into()));
+        replace.insert("pairing_id".into(), Value::string("pair-3".into()));
         replace.insert(
             "replacement_pairing_id".into(),
-            Value::Str("pair-3b".into()),
+            Value::string("pair-3b".into()),
         );
         driver
             .call(
                 MethodId::new(3),
-                Value::Map(replace),
+                Value::map(replace),
                 OutputMode::Unary,
                 &ctx(),
             )
@@ -1841,7 +1985,7 @@ mod tests {
             .context("old pairing record is not a map")?
             .get("state");
         ensure!(
-            pairing_state == Some(&Value::Str(STATE_REPLACED.into())),
+            pairing_state == Some(&Value::string(STATE_REPLACED.into())),
             "old pairing was not replaced"
         );
         let new_path = Path::parse("state://kernel/external-pairings/pair-3b")
@@ -1855,7 +1999,7 @@ mod tests {
             .context("replacement pairing record is not a map")?
             .get("state");
         ensure!(
-            pairing_state == Some(&Value::Str(STATE_CREATED.into())),
+            pairing_state == Some(&Value::string(STATE_CREATED.into())),
             "replacement pairing was not created"
         );
         Ok(())
@@ -1868,40 +2012,40 @@ mod tests {
         let mut create = BTreeMap::new();
         create.insert(
             "pairing_id".into(),
-            Value::Str("pair-replace-validate".into()),
+            Value::string("pair-replace-validate".into()),
         );
         create.insert(
             "installation_id".into(),
-            Value::Str("ext-replace-validate".into()),
+            Value::string("ext-replace-validate".into()),
         );
         driver
             .call(
                 MethodId::new(0),
-                Value::Map(create),
+                Value::map(create),
                 OutputMode::Unary,
                 &ctx(),
             )
             .await?;
 
         for (replacement_id, expires_at) in [
-            ("pair-replace-validate-b", Value::Str("never".into())),
-            ("pair/replace/bad", Value::Int(0)),
+            ("pair-replace-validate-b", Value::string("never".into())),
+            ("pair/replace/bad", Value::integer(0)),
         ] {
             let mut replace = BTreeMap::new();
             replace.insert(
                 "pairing_id".into(),
-                Value::Str("pair-replace-validate".into()),
+                Value::string("pair-replace-validate".into()),
             );
             replace.insert(
                 "replacement_pairing_id".into(),
-                Value::Str(replacement_id.into()),
+                Value::string(replacement_id.into()),
             );
             replace.insert("expires_at".into(), expires_at);
             let err = expected_driver_error(
                 driver
                     .call(
                         MethodId::new(3),
-                        Value::Map(replace),
+                        Value::map(replace),
                         OutputMode::Unary,
                         &ctx(),
                     )
@@ -1922,7 +2066,7 @@ mod tests {
                 .context("old pairing record is not a map")?
                 .get("state");
             ensure!(
-                old_state == Some(&Value::Str(STATE_CREATED.into())),
+                old_state == Some(&Value::string(STATE_CREATED.into())),
                 "old pairing was mutated before replace validation finished"
             );
             ensure!(
@@ -1945,15 +2089,18 @@ mod tests {
         let (driver, state) = driver();
         install_external(&state, "ext-replace-roles", Role::Provider).await?;
         let mut create = BTreeMap::new();
-        create.insert("pairing_id".into(), Value::Str("pair-replace-roles".into()));
+        create.insert(
+            "pairing_id".into(),
+            Value::string("pair-replace-roles".into()),
+        );
         create.insert(
             "installation_id".into(),
-            Value::Str("ext-replace-roles".into()),
+            Value::string("ext-replace-roles".into()),
         );
         driver
             .call(
                 MethodId::new(0),
-                Value::Map(create),
+                Value::map(create),
                 OutputMode::Unary,
                 &ctx(),
             )
@@ -1968,19 +2115,22 @@ mod tests {
             .context("pairing record is not a map")?
             .clone();
         record.remove("allowed_roles");
-        state.write_set(&path, Value::Map(record)).await?;
+        state.write_set(&path, Value::from(record)).await?;
 
         let mut replace = BTreeMap::new();
-        replace.insert("pairing_id".into(), Value::Str("pair-replace-roles".into()));
+        replace.insert(
+            "pairing_id".into(),
+            Value::string("pair-replace-roles".into()),
+        );
         replace.insert(
             "replacement_pairing_id".into(),
-            Value::Str("pair-replace-roles-b".into()),
+            Value::string("pair-replace-roles-b".into()),
         );
         let err = expected_driver_error(
             driver
                 .call(
                     MethodId::new(3),
-                    Value::Map(replace),
+                    Value::map(replace),
                     OutputMode::Unary,
                     &ctx(),
                 )
@@ -2000,7 +2150,7 @@ mod tests {
             .context("old pairing record is not a map")?
             .get("state");
         ensure!(
-            old_state == Some(&Value::Str(STATE_CREATED.into())),
+            old_state == Some(&Value::string(STATE_CREATED.into())),
             "old pairing was replaced despite malformed stored allowed_roles"
         );
         ensure!(
@@ -2012,21 +2162,23 @@ mod tests {
         );
 
         let mut replace_with_explicit_roles = BTreeMap::new();
-        replace_with_explicit_roles
-            .insert("pairing_id".into(), Value::Str("pair-replace-roles".into()));
+        replace_with_explicit_roles.insert(
+            "pairing_id".into(),
+            Value::string("pair-replace-roles".into()),
+        );
         replace_with_explicit_roles.insert(
             "replacement_pairing_id".into(),
-            Value::Str("pair-replace-roles-c".into()),
+            Value::string("pair-replace-roles-c".into()),
         );
         replace_with_explicit_roles.insert(
             "allowed_roles".into(),
-            Value::List(vec![Value::Str("provider".into())]),
+            Value::list(vec![Value::string("provider".into())]),
         );
         let err = expected_driver_error(
             driver
                 .call(
                     MethodId::new(3),
-                    Value::Map(replace_with_explicit_roles),
+                    Value::map(replace_with_explicit_roles),
                     OutputMode::Unary,
                     &ctx(),
                 )
@@ -2051,12 +2203,12 @@ mod tests {
     async fn revoke_writes_generation_floor() -> anyhow::Result<()> {
         let (driver, state) = driver();
         let mut input = BTreeMap::new();
-        input.insert("installation_id".into(), Value::Str("ext-4".into()));
-        input.insert("credential_generation_floor".into(), Value::Int(7));
+        input.insert("installation_id".into(), Value::string("ext-4".into()));
+        input.insert("credential_generation_floor".into(), Value::integer(7));
         driver
             .call(
                 MethodId::new(4),
-                Value::Map(input),
+                Value::map(input),
                 OutputMode::Unary,
                 &ctx(),
             )
@@ -2069,12 +2221,12 @@ mod tests {
             .context("revocation record missing")?;
         let m = revoked.as_map().context("revocation record is not a map")?;
         ensure!(
-            m.get("state") == Some(&Value::Str(STATE_REVOKED.into())),
+            m.get("state") == Some(&Value::string(STATE_REVOKED.into())),
             "unexpected revocation state: {:?}",
             m.get("state")
         );
         ensure!(
-            m.get("credential_generation_floor") == Some(&Value::Int(7)),
+            m.get("credential_generation_floor") == Some(&Value::integer(7)),
             "unexpected generation floor: {:?}",
             m.get("credential_generation_floor")
         );
@@ -2083,19 +2235,23 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_rejects_invalid_generation_floor() -> anyhow::Result<()> {
-        for floor in [Value::Int(0), Value::Int(-1), Value::Str("7".into())] {
+        for floor in [
+            Value::integer(0),
+            Value::integer(-1),
+            Value::string("7".into()),
+        ] {
             let (driver, state) = driver();
             let mut input = BTreeMap::new();
             input.insert(
                 "installation_id".into(),
-                Value::Str("ext-invalid-floor".into()),
+                Value::string("ext-invalid-floor".into()),
             );
             input.insert("credential_generation_floor".into(), floor);
 
             let err = match driver
                 .call(
                     MethodId::new(4),
-                    Value::Map(input),
+                    Value::map(input),
                     OutputMode::Unary,
                     &ctx(),
                 )

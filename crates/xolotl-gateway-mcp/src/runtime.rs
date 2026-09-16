@@ -35,12 +35,29 @@ use xolotl_types::{Outcome, Value};
 /// Transport-neutral MCP server adapter over a shared Xolotl Gateway.
 pub struct McpGateway<G: Gateway> {
     gateway: Arc<G>,
+    output_limits: crate::McpOutputLimits,
 }
 
 impl<G: Gateway> McpGateway<G> {
     /// Create an adapter over an existing authenticated Xolotl gateway.
     pub fn new(gateway: Arc<G>) -> Self {
-        Self { gateway }
+        Self {
+            gateway,
+            output_limits: crate::McpOutputLimits::default(),
+        }
+    }
+
+    /// Configure finite ordinary-JSON response budgets for this adapter.
+    /// Kernel execution and direct typed return values keep their own policies.
+    /// A response can exceed its delivery budget after execution has completed;
+    /// rejection does not roll back effects already performed by that call.
+    pub fn with_output_limits(
+        mut self,
+        limits: crate::McpOutputLimits,
+    ) -> Result<Self, McpGatewayError> {
+        limits.validate()?;
+        self.output_limits = limits;
+        Ok(self)
     }
 
     /// Return authenticated tool descriptors suitable for MCP `tools/list`.
@@ -174,7 +191,7 @@ impl<G: Gateway> McpGateway<G> {
             }
             Err(error) => return Err(error),
         };
-        let input = Value::Map(BTreeMap::from([
+        let input = Value::map(BTreeMap::from([
             ("name".into(), Value::from(prompt)),
             ("arguments".into(), args),
         ]));
@@ -310,9 +327,31 @@ impl<G: Gateway> McpGateway<G> {
         bearer_token: impl Into<String>,
         request: McpJsonRpcRequest,
     ) -> McpJsonRpcResponse {
-        let Some(id) = request.id.clone() else {
+        let response = self.dispatch_jsonrpc_request(bearer_token, request).await;
+        if let Err(error) = self.output_limits.check_message(&response) {
+            let mut rejected = jsonrpc_gateway_error(response.id, "mcp_output_budget", error);
+            if self.output_limits.check_message(&rejected).is_err() {
+                rejected.id = serde_json::Value::Null;
+            }
+            return rejected;
+        }
+        response
+    }
+
+    async fn dispatch_jsonrpc_request(
+        &self,
+        bearer_token: impl Into<String>,
+        request: McpJsonRpcRequest,
+    ) -> McpJsonRpcResponse {
+        let Some(id) = request.id else {
             return jsonrpc_error(serde_json::Value::Null, JSONRPC_INVALID_REQUEST);
         };
+        if !matches!(
+            id,
+            serde_json::Value::String(_) | serde_json::Value::Number(_)
+        ) {
+            return jsonrpc_error(serde_json::Value::Null, JSONRPC_INVALID_REQUEST);
+        }
         if request.jsonrpc != JSONRPC_VERSION {
             return jsonrpc_error(id, JSONRPC_INVALID_REQUEST);
         }
@@ -339,19 +378,27 @@ impl<G: Gateway> McpGateway<G> {
                     }
                 };
                 match self.list_tools(bearer_token).await {
-                    Ok(descriptors) => match mcp_tools_page_json(descriptors, cursor) {
-                        Ok(result) => jsonrpc_ok(id, result),
-                        Err(error) => jsonrpc_gateway_error(id, "mcp_tools_list_serialize", error),
-                    },
+                    Ok(descriptors) => {
+                        match mcp_tools_page_json(descriptors, cursor, self.output_limits) {
+                            Ok(result) => jsonrpc_ok(id, result),
+                            Err(error) => {
+                                jsonrpc_gateway_error(id, "mcp_tools_list_serialize", error)
+                            }
+                        }
+                    }
                     Err(error) => jsonrpc_gateway_error(id, "mcp_tools_list", error),
                 }
             }
             "tools/call" => match parse_tools_call_params(request.params) {
                 Ok((tool, args)) => match self.call_tool(bearer_token, &tool, args).await {
-                    Ok(outcome) => match mcp_tool_outcome_result_json(outcome) {
-                        Ok(result) => jsonrpc_ok(id, result),
-                        Err(error) => jsonrpc_gateway_error(id, "mcp_tool_result_serialize", error),
-                    },
+                    Ok(outcome) => {
+                        match mcp_tool_outcome_result_json(outcome, self.output_limits) {
+                            Ok(result) => jsonrpc_ok(id, result),
+                            Err(error) => {
+                                jsonrpc_gateway_error(id, "mcp_tool_result_serialize", error)
+                            }
+                        }
+                    }
                     Err(McpGatewayError::UnknownTool(_)) => {
                         jsonrpc_error(id, JSONRPC_INVALID_PARAMS)
                     }
@@ -367,12 +414,14 @@ impl<G: Gateway> McpGateway<G> {
                     }
                 };
                 match self.list_resources(bearer_token).await {
-                    Ok(descriptors) => match mcp_resources_page_json(descriptors, cursor) {
-                        Ok(result) => jsonrpc_ok(id, result),
-                        Err(error) => {
-                            jsonrpc_gateway_error(id, "mcp_resources_list_serialize", error)
+                    Ok(descriptors) => {
+                        match mcp_resources_page_json(descriptors, cursor, self.output_limits) {
+                            Ok(result) => jsonrpc_ok(id, result),
+                            Err(error) => {
+                                jsonrpc_gateway_error(id, "mcp_resources_list_serialize", error)
+                            }
                         }
-                    },
+                    }
                     Err(error) => jsonrpc_gateway_error(id, "mcp_resources_list", error),
                 }
             }
@@ -389,7 +438,11 @@ impl<G: Gateway> McpGateway<G> {
                 };
                 match self.list_resource_templates(bearer_token).await {
                     Ok(descriptors) => {
-                        match mcp_resource_templates_page_json(descriptors, cursor) {
+                        match mcp_resource_templates_page_json(
+                            descriptors,
+                            cursor,
+                            self.output_limits,
+                        ) {
                             Ok(result) => jsonrpc_ok(id, result),
                             Err(error) => jsonrpc_gateway_error(
                                 id,
@@ -404,7 +457,12 @@ impl<G: Gateway> McpGateway<G> {
             "resources/read" => match parse_resources_read_params(request.params) {
                 Ok(uri) => match self.read_resource_with_route(bearer_token, &uri).await {
                     Ok((Outcome::Done(value), route)) | Ok((Outcome::Short(value), route)) => {
-                        match mcp_resource_result_json(value, &uri, route.mime_type.as_deref()) {
+                        match mcp_resource_result_json(
+                            value,
+                            &uri,
+                            route.mime_type.as_deref(),
+                            self.output_limits,
+                        ) {
                             Ok(result) => jsonrpc_ok(id, result),
                             Err(error) => {
                                 jsonrpc_gateway_error(id, "mcp_resource_read_serialize", error)
@@ -429,12 +487,14 @@ impl<G: Gateway> McpGateway<G> {
                     }
                 };
                 match self.list_prompts(bearer_token).await {
-                    Ok(descriptors) => match mcp_prompts_page_json(descriptors, cursor) {
-                        Ok(result) => jsonrpc_ok(id, result),
-                        Err(error) => {
-                            jsonrpc_gateway_error(id, "mcp_prompts_list_serialize", error)
+                    Ok(descriptors) => {
+                        match mcp_prompts_page_json(descriptors, cursor, self.output_limits) {
+                            Ok(result) => jsonrpc_ok(id, result),
+                            Err(error) => {
+                                jsonrpc_gateway_error(id, "mcp_prompts_list_serialize", error)
+                            }
                         }
-                    },
+                    }
                     Err(error) => jsonrpc_gateway_error(id, "mcp_prompts_list", error),
                 }
             }
@@ -445,7 +505,8 @@ impl<G: Gateway> McpGateway<G> {
                 {
                     Ok((Outcome::Done(value), prompt_descriptor))
                     | Ok((Outcome::Short(value), prompt_descriptor)) => {
-                        match mcp_prompt_result_json(value, &prompt_descriptor) {
+                        match mcp_prompt_result_json(value, &prompt_descriptor, self.output_limits)
+                        {
                             Ok(result) => jsonrpc_ok(id, result),
                             Err(error) => {
                                 jsonrpc_gateway_error(id, "mcp_prompt_get_serialize", error)
@@ -554,7 +615,7 @@ impl<G: Gateway> McpGateway<G> {
             .submit(session, GatewaySubmission::direct_input(surface_id, input))
             .await
         {
-            Ok(result) => Ok(result.outcome),
+            Ok(result) => Ok(result.output.outcome),
             Err(error) => {
                 record_mcp_audit(&*self.gateway, Some(session), error.audit_outcome())?;
                 tracing::debug!(audit_label, error = ?error, "mcp gateway submission failed");
@@ -569,7 +630,7 @@ fn mcp_resource_read_input(uri: &str, uri_template: Option<&str>) -> Value {
     if let Some(uri_template) = uri_template {
         map.insert("uriTemplate".into(), Value::from(uri_template));
     }
-    Value::Map(map)
+    Value::map(map)
 }
 
 fn record_mcp_audit<G: Gateway>(

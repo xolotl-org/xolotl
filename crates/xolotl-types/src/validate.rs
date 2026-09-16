@@ -10,8 +10,9 @@
 //! may still be rejected by a validator when used in the wrong context.
 
 use crate::{Failure, Path};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 
 /// Validates a path's semantic correctness for a given scheme.
 ///

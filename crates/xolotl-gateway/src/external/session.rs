@@ -16,7 +16,9 @@ use xolotl_types::external::{
     InvokeResult, JsonSchema, ObservedGenerations, OutboundCommand, OverflowPolicy, Role,
     RoleReady, RoleSessionClientHello, SessionContext, SourceRateLimit,
 };
-use xolotl_types::{IdentityRef, Path, ResourceId, TaintSet, TaintSource, Value};
+use xolotl_types::{
+    IdentityRef, Path, ResourceId, TaintSet, TaintSource, Value, ValueMap, ValueView,
+};
 
 /// Daemon-to-external sender for one ready Provider or Source session.
 #[async_trait::async_trait]
@@ -439,7 +441,7 @@ impl ProviderInvocationRegistry {
             {
                 Some(ProviderInvocationError::DeadlineExceeded)
             } else if let Some(limit) = entry.max_inline_result_bytes
-                && result_inline_bytes(&req.result.outcome) > limit
+                && result_exceeds_inline_bytes(&req.result.outcome, limit)
             {
                 Some(ProviderInvocationError::ResultTooLarge)
             } else if let (Ok(value), Some(schema)) =
@@ -552,66 +554,14 @@ fn provider_context<'a>(
     Ok(ctx)
 }
 
-fn value_inline_bytes(value: &Value) -> usize {
-    let mut total = 0usize;
-    let mut stack = vec![value];
-    while let Some(value) = stack.pop() {
-        match value {
-            Value::Null | Value::Bool(_) => total = total.saturating_add(1),
-            Value::Int(_) | Value::Float(_) => total = total.saturating_add(8),
-            Value::Str(s) => total = total.saturating_add(s.len()),
-            Value::Bytes(bytes) => total = total.saturating_add(bytes.len()),
-            Value::List(items) => {
-                total = total.saturating_add(items.len());
-                for item in items {
-                    stack.push(item);
-                }
-            }
-            Value::Map(map) => {
-                total = total.saturating_add(map.len());
-                for (key, value) in map {
-                    total = total.saturating_add(key.len());
-                    stack.push(value);
-                }
-            }
-            Value::Blob(blob) => {
-                total = total.saturating_add(blob.hash.len()).saturating_add(16);
-                if let Some(mime) = &blob.mime {
-                    total = total.saturating_add(mime.len());
-                }
-            }
-            Value::Tensor(tensor) => {
-                total = total
-                    .saturating_add(tensor.blob.hash.len())
-                    .saturating_add(tensor.shape.len().saturating_mul(8))
-                    .saturating_add(24);
-                if let Some(mime) = &tensor.blob.mime {
-                    total = total.saturating_add(mime.len());
-                }
-            }
-            Value::Frame(frame) => {
-                total = total
-                    .saturating_add(frame.blob.hash.len())
-                    .saturating_add(32);
-                if let Some(mime) = &frame.blob.mime {
-                    total = total.saturating_add(mime.len());
-                }
-            }
-            Value::StreamEnd(marker) => match marker {
-                xolotl_types::StreamMarker::Done => total = total.saturating_add(1),
-                xolotl_types::StreamMarker::Error { message } => {
-                    total = total.saturating_add(message.len())
-                }
-            },
-        }
-    }
-    total
-}
-
-fn result_inline_bytes(outcome: &Result<Value, ErrorInfo>) -> usize {
+fn result_exceeds_inline_bytes(outcome: &Result<Value, ErrorInfo>, limit: usize) -> bool {
     match outcome {
-        Ok(value) => value_inline_bytes(value),
-        Err(error) => error.kind.len().saturating_add(error.message.len()),
+        Ok(value) => crate::value_inspection::inline_bytes(value, limit).is_none(),
+        Err(error) => error
+            .kind
+            .len()
+            .checked_add(error.message.len())
+            .is_none_or(|bytes| bytes > limit),
     }
 }
 
@@ -860,7 +810,7 @@ impl SourceCommandRegistry {
             {
                 Some(SourceCommandError::DeadlineExceeded)
             } else if let Some(limit) = entry.max_inline_result_bytes
-                && result_inline_bytes(&req.result.outcome) > limit
+                && result_exceeds_inline_bytes(&req.result.outcome, limit)
             {
                 Some(SourceCommandError::ResultTooLarge)
             } else if let (Ok(value), Some(schema)) =
@@ -1176,19 +1126,20 @@ async fn reserve_source_dedup(
 ) -> Result<SourceDedupReservation, SourceIngestError> {
     let pending = source_dedup_record(SourceDedupStatus::Pending, now_millis);
     match state.write_cas(&path, None, pending.clone()).await {
-        Ok(()) => Ok(SourceDedupReservation::Reserved(SourceDedupEntry {
+        Ok(_commit) => Ok(SourceDedupReservation::Reserved(SourceDedupEntry {
             path,
             pending,
         })),
-        Err(StateError::CasFailed { actual, .. }) => {
-            match source_dedup_status(actual.as_deref())? {
-                Some(SourceDedupStatus::Accepted) => Ok(SourceDedupReservation::Duplicate),
-                Some(SourceDedupStatus::Pending) => Err(SourceIngestError::Backpressured),
-                None => Err(SourceIngestError::State(
-                    "source dedup reservation changed unexpectedly".into(),
-                )),
-            }
-        }
+        Err(xolotl_state::StateFailure {
+            error: StateError::CasFailed { actual, .. },
+            ..
+        }) => match source_dedup_status(actual.as_deref())? {
+            Some(SourceDedupStatus::Accepted) => Ok(SourceDedupReservation::Duplicate),
+            Some(SourceDedupStatus::Pending) => Err(SourceIngestError::Backpressured),
+            None => Err(SourceIngestError::State(
+                "source dedup reservation changed unexpectedly".into(),
+            )),
+        },
         Err(e) => Err(SourceIngestError::State(e.to_string())),
     }
 }
@@ -1205,6 +1156,7 @@ async fn commit_source_dedup(
             source_dedup_record(SourceDedupStatus::Accepted, now_millis),
         )
         .await
+        .map(|_commit| ())
         .map_err(|e| SourceIngestError::State(e.to_string()))
 }
 
@@ -1259,15 +1211,15 @@ fn source_dedup_record(status: SourceDedupStatus, received_at_ms: i64) -> Value 
         SourceDedupStatus::Pending => "pending",
         SourceDedupStatus::Accepted => "accepted",
     };
-    record.insert("status".into(), Value::Str(status.into()));
-    record.insert("received_at_ms".into(), Value::Int(received_at_ms));
-    Value::Map(record)
+    record.insert("status".into(), Value::string(status.into()));
+    record.insert("received_at_ms".into(), Value::integer(received_at_ms));
+    Value::map(record)
 }
 
 fn source_dedup_status(
     value: Option<&Value>,
 ) -> Result<Option<SourceDedupStatus>, SourceIngestError> {
-    let Some(Value::Map(record)) = value else {
+    let Some(record) = value.and_then(Value::as_map) else {
         return match value {
             None => Ok(None),
             Some(other) => Err(SourceIngestError::State(format!(
@@ -1288,13 +1240,13 @@ fn source_dedup_status(
 }
 
 fn source_dedup_received_at(value: &Value) -> Result<i64, SourceIngestError> {
-    let Value::Map(record) = value else {
+    let Some(record) = value.as_map() else {
         return Err(SourceIngestError::State(format!(
             "source dedup record expected map, found {value:?}"
         )));
     };
-    match record.get("received_at_ms") {
-        Some(Value::Int(ts)) => Ok(*ts),
+    match record.get("received_at_ms").map(Value::view) {
+        Some(ValueView::Int(ts)) => Ok(ts),
         Some(other) => Err(SourceIngestError::State(format!(
             "source dedup record timestamp expected integer, found {other:?}"
         ))),
@@ -1330,9 +1282,9 @@ async fn reserve_source_sequence(
             .read(&path)
             .await
             .map_err(|e| SourceIngestError::State(e.to_string()))?;
-        let previous = match current {
+        let previous = match current.as_ref().map(Value::view) {
             None => None,
-            Some(Value::Int(n)) if n >= 0 => Some(n as u64),
+            Some(ValueView::Int(n)) if n >= 0 => Some(n as u64),
             Some(_) => {
                 return Err(SourceIngestError::State(
                     "source stream sequence state is not an integer".into(),
@@ -1349,20 +1301,23 @@ async fn reserve_source_sequence(
         if seq > expected {
             return Err(SourceIngestError::SequenceGap { expected, seq });
         }
-        let expected_value = previous.map(|last| Value::Int(last as i64));
+        let expected_value = previous.map(|last| Value::integer(last as i64));
         match req
             .state
-            .write_cas(&path, expected_value, Value::Int(seq as i64))
+            .write_cas(&path, expected_value, Value::integer(seq as i64))
             .await
         {
-            Ok(()) => {
+            Ok(_commit) => {
                 return Ok(Some(SourceSequenceReservation {
                     path,
                     previous,
                     seq,
                 }));
             }
-            Err(StateError::CasFailed { .. }) => continue,
+            Err(xolotl_state::StateFailure {
+                error: StateError::CasFailed { .. },
+                ..
+            }) => continue,
             Err(e) => return Err(SourceIngestError::State(e.to_string())),
         }
     }
@@ -1382,7 +1337,7 @@ async fn rollback_source_sequence(
         .read(&reservation.path)
         .await
         .map_err(|e| SourceIngestError::State(e.to_string()))?;
-    if current != Some(Value::Int(reservation.seq as i64)) {
+    if current != Some(Value::integer(reservation.seq as i64)) {
         return Ok(());
     }
     match reservation.previous {
@@ -1390,8 +1345,8 @@ async fn rollback_source_sequence(
             state
                 .write_cas(
                     &reservation.path,
-                    Some(Value::Int(reservation.seq as i64)),
-                    Value::Int(previous as i64),
+                    Some(Value::integer(reservation.seq as i64)),
+                    Value::integer(previous as i64),
                 )
                 .await
                 .map_err(|e| SourceIngestError::State(e.to_string()))?;
@@ -1443,8 +1398,11 @@ async fn reserve_source_event_rate(
                 return Err(SourceIngestError::RateLimited);
             }
             match req.state.write_cas(&path, current, new).await {
-                Ok(()) => return Err(SourceIngestError::RateLimited),
-                Err(StateError::CasFailed { .. }) => continue,
+                Ok(_commit) => return Err(SourceIngestError::RateLimited),
+                Err(xolotl_state::StateFailure {
+                    error: StateError::CasFailed { .. },
+                    ..
+                }) => continue,
                 Err(e) => return Err(SourceIngestError::State(e.to_string())),
             }
         }
@@ -1457,14 +1415,17 @@ async fn reserve_source_event_rate(
             .write_cas(&path, current.clone(), new.clone())
             .await
         {
-            Ok(()) => {
+            Ok(_commit) => {
                 return Ok(Some(SourceRateReservation {
                     path,
                     previous: current,
                     value: new,
                 }));
             }
-            Err(StateError::CasFailed { .. }) => continue,
+            Err(xolotl_state::StateFailure {
+                error: StateError::CasFailed { .. },
+                ..
+            }) => continue,
             Err(e) => return Err(SourceIngestError::State(e.to_string())),
         }
     }
@@ -1505,13 +1466,13 @@ async fn rollback_source_rate_limit(
 }
 
 fn decode_source_rate_hits(value: Option<&Value>) -> Result<Vec<i64>, SourceIngestError> {
-    match value {
+    match value.map(Value::view) {
         None => Ok(Vec::new()),
-        Some(Value::List(items)) => {
+        Some(ValueView::List(items)) => {
             let mut hits = Vec::with_capacity(items.len());
             for item in items {
-                match item {
-                    Value::Int(t) => hits.push(*t),
+                match item.view() {
+                    ValueView::Int(t) => hits.push(t),
                     other => {
                         return Err(SourceIngestError::State(format!(
                             "source event rate state expected integer timestamp, found {other:?}"
@@ -1528,7 +1489,7 @@ fn decode_source_rate_hits(value: Option<&Value>) -> Result<Vec<i64>, SourceInge
 }
 
 fn encode_source_rate_hits(hits: &[i64]) -> Value {
-    Value::List(hits.iter().copied().map(Value::Int).collect())
+    Value::list(hits.iter().copied().map(Value::integer).collect())
 }
 
 async fn append_source_event(
@@ -1580,19 +1541,20 @@ async fn append_source_event_drop_oldest(
         return append_source_event_item(&req.state, &emits.sink, event.payload.clone(), taint)
             .await;
     };
-    match current.value {
-        Value::List(items) if items.len() < max_events => {
+    match current.value.view() {
+        ValueView::List(items) if items.len() < max_events => {
             append_source_event_item(&req.state, &emits.sink, event.payload.clone(), taint).await
         }
-        Value::List(items) => {
+        ValueView::List(items) => {
             let keep = max_events.saturating_sub(1);
             let start = items.len().saturating_sub(keep);
-            let mut next = items.into_iter().skip(start).collect::<Vec<_>>();
+            let mut next = items.iter().skip(start).cloned().collect::<Vec<_>>();
             next.push(event.payload.clone());
             let next_taint = current.taint.merged(&taint);
             req.state
-                .write_set_tainted(&emits.sink, Value::List(next), next_taint)
+                .write_set_tainted(&emits.sink, Value::list(next), next_taint)
                 .await
+                .map(|_commit| ())
                 .map_err(|e| SourceIngestError::State(e.to_string()))
         }
         other => Err(SourceIngestError::State(format!(
@@ -1610,6 +1572,7 @@ async fn append_source_event_item(
     state
         .write_append_tainted(sink, payload, taint)
         .await
+        .map(|_commit| ())
         .map_err(|e| SourceIngestError::State(e.to_string()))
 }
 
@@ -1618,9 +1581,11 @@ async fn source_sink_len(state: &Backend, sink: &Path) -> Result<usize, SourceIn
         .read(sink)
         .await
         .map_err(|e| SourceIngestError::State(e.to_string()))?
+        .as_ref()
+        .map(Value::view)
     {
         None => Ok(0),
-        Some(Value::List(items)) => Ok(items.len()),
+        Some(ValueView::List(items)) => Ok(items.len()),
         Some(other) => Err(SourceIngestError::State(format!(
             "source event sink expected list, found {other:?}"
         ))),
@@ -1639,16 +1604,19 @@ async fn prune_source_dedup_window(
         "source deduplication window",
     ));
     let prefix = source_event_dedup_prefix(installation_id, projection_id)?;
-    let rows = state
-        .read_prefix(&prefix)
+    let mut pages = state.pages(xolotl_state::StateScan::new(prefix));
+    while let Some(page) = pages
+        .next()
         .await
-        .map_err(|e| SourceIngestError::State(e.to_string()))?;
-    for (path, value) in rows {
-        if source_dedup_received_at(&value)? < cutoff {
-            state
-                .write_delete(&path)
-                .await
-                .map_err(|e| SourceIngestError::State(e.to_string()))?;
+        .map_err(|error| SourceIngestError::State(error.to_string()))?
+    {
+        for (path, value) in page.entries {
+            if source_dedup_received_at(&value.value)? < cutoff {
+                state
+                    .write_delete(&path)
+                    .await
+                    .map_err(|error| SourceIngestError::State(error.to_string()))?;
+            }
         }
     }
     Ok(())
@@ -1697,7 +1665,8 @@ async fn admit_source_ingest<'a>(
         .as_ref()
         .ok_or(SourceIngestError::MissingEmits)?;
     if emits.max_inline_payload_bytes == 0
-        || value_inline_bytes(&event.payload) > emits.max_inline_payload_bytes
+        || crate::value_inspection::inline_bytes(&event.payload, emits.max_inline_payload_bytes)
+            .is_none()
     {
         return Err(SourceIngestError::PayloadTooLarge);
     }
@@ -1708,26 +1677,23 @@ async fn admit_source_ingest<'a>(
 }
 
 fn reject_source_forbidden_payload_fields(value: &Value) -> Result<(), SourceIngestError> {
-    let mut stack = vec![value];
-    while let Some(value) = stack.pop() {
-        match value {
-            Value::Map(map) => {
-                for (key, value) in map {
-                    if is_forbidden_source_payload_field(key) {
-                        return Err(SourceIngestError::ForbiddenPayloadField {
-                            field: key.clone(),
-                        });
-                    }
-                    stack.push(value);
+    use xolotl_types::value::traversal::{ValueNodeKey, ValuePostorder};
+    if !matches!(value.view(), ValueView::Map(_) | ValueView::List(_)) {
+        return Ok(());
+    }
+    let mut visited = BTreeSet::new();
+    let mut walk = ValuePostorder::new(value);
+    while let Some(node) = walk.next(|key| visited.contains(&key)) {
+        if let Some(map) = node.as_map() {
+            for key in map.keys() {
+                if is_forbidden_source_payload_field(key) {
+                    return Err(SourceIngestError::ForbiddenPayloadField {
+                        field: key.to_owned(),
+                    });
                 }
             }
-            Value::List(items) => {
-                for item in items {
-                    stack.push(item);
-                }
-            }
-            _ => {}
         }
+        visited.insert(ValueNodeKey::of(node));
     }
     Ok(())
 }
@@ -1923,22 +1889,19 @@ fn push_source_state_segment(
 
 /// Validate a Xolotl value against the external schema subset.
 pub fn validate_json_schema(schema: Option<&JsonSchema>, value: &Value) -> Result<(), String> {
-    match schema {
+    match schema.map(Value::view) {
         None => Ok(()),
-        Some(Value::Map(schema)) => validate_schema_map(schema, value),
+        Some(ValueView::Map(schema)) => validate_schema_map(schema, value),
         Some(_) => Err("schema must be an object".into()),
     }
 }
 
-fn validate_schema_map(
-    schema: &std::collections::BTreeMap<String, Value>,
-    value: &Value,
-) -> Result<(), String> {
+fn validate_schema_map(schema: &ValueMap, value: &Value) -> Result<(), String> {
     let supported: BTreeSet<&str> = ["type", "required", "properties", "items"]
         .into_iter()
         .collect();
     for key in schema.keys() {
-        if !supported.contains(key.as_str()) {
+        if !supported.contains(key) {
             return Err(format!("unsupported schema keyword `{key}`"));
         }
     }
@@ -1953,12 +1916,12 @@ fn validate_schema_map(
     }
 
     if let Some(required) = schema.get("required") {
-        let keys = match required {
-            Value::List(xs) => xs,
+        let keys = match required.view() {
+            ValueView::List(xs) => xs,
             _ => return Err("`required` must be a list".into()),
         };
-        let m = match value {
-            Value::Map(m) => m,
+        let m = match value.view() {
+            ValueView::Map(m) => m,
             _ => return Err("`required` applies only to objects".into()),
         };
         for key in keys {
@@ -1972,12 +1935,12 @@ fn validate_schema_map(
     }
 
     if let Some(properties) = schema.get("properties") {
-        let props = match properties {
-            Value::Map(m) => m,
+        let props = match properties.view() {
+            ValueView::Map(m) => m,
             _ => return Err("`properties` must be an object".into()),
         };
-        let value_map = match value {
-            Value::Map(m) => m,
+        let value_map = match value.view() {
+            ValueView::Map(m) => m,
             _ => return Err("`properties` applies only to objects".into()),
         };
         for (key, prop_schema) in props {
@@ -1989,8 +1952,8 @@ fn validate_schema_map(
     }
 
     if let Some(item_schema) = schema.get("items") {
-        let items = match value {
-            Value::List(items) => items,
+        let items = match value.view() {
+            ValueView::List(items) => items,
             _ => return Err("`items` applies only to arrays".into()),
         };
         for (index, item) in items.iter().enumerate() {
@@ -2005,18 +1968,18 @@ fn validate_schema_map(
 fn schema_type_matches(expected: &str, value: &Value) -> bool {
     match expected {
         "any" => true,
-        "null" => matches!(value, Value::Null),
-        "boolean" | "bool" => matches!(value, Value::Bool(_)),
-        "integer" | "int" => matches!(value, Value::Int(_)),
-        "number" => matches!(value, Value::Int(_) | Value::Float(_)),
-        "string" | "str" => matches!(value, Value::Str(_)),
-        "array" | "list" => matches!(value, Value::List(_)),
-        "object" | "map" => matches!(value, Value::Map(_)),
-        "bytes" => matches!(value, Value::Bytes(_)),
-        "blob" => matches!(value, Value::Blob(_)),
-        "tensor" => matches!(value, Value::Tensor(_)),
-        "frame" => matches!(value, Value::Frame(_)),
-        "stream_end" => matches!(value, Value::StreamEnd(_)),
+        "null" => matches!(value.view(), ValueView::Null),
+        "boolean" | "bool" => matches!(value.view(), ValueView::Bool(_)),
+        "integer" | "int" => matches!(value.view(), ValueView::Int(_)),
+        "number" => matches!(value.view(), ValueView::Int(_) | ValueView::Float(_)),
+        "string" | "str" => matches!(value.view(), ValueView::Str(_)),
+        "array" | "list" => matches!(value.view(), ValueView::List(_)),
+        "object" | "map" => matches!(value.view(), ValueView::Map(_)),
+        "bytes" => matches!(value.view(), ValueView::Bytes(_)),
+        "blob" => matches!(value.view(), ValueView::Blob(_)),
+        "tensor" => matches!(value.view(), ValueView::Tensor(_)),
+        "frame" => matches!(value.view(), ValueView::Frame(_)),
+        "stream_end" => matches!(value.view(), ValueView::StreamEnd(_)),
         _ => false,
     }
 }
@@ -2496,25 +2459,25 @@ mod tests {
 
     fn message_payload(text: &str) -> Value {
         let mut m = BTreeMap::new();
-        m.insert("text".into(), Value::Str(text.into()));
-        Value::Map(m)
+        m.insert("text".into(), Value::string(text.into()));
+        Value::map(m)
     }
 
     fn message_schema() -> Value {
         let mut text_schema = BTreeMap::new();
-        text_schema.insert("type".into(), Value::Str("string".into()));
+        text_schema.insert("type".into(), Value::string("string".into()));
 
         let mut props = BTreeMap::new();
-        props.insert("text".into(), Value::Map(text_schema));
+        props.insert("text".into(), Value::map(text_schema));
 
         let mut schema = BTreeMap::new();
-        schema.insert("type".into(), Value::Str("object".into()));
+        schema.insert("type".into(), Value::string("object".into()));
         schema.insert(
             "required".into(),
-            Value::List(vec![Value::Str("text".into())]),
+            Value::list(vec![Value::string("text".into())]),
         );
-        schema.insert("properties".into(), Value::Map(props));
-        Value::Map(schema)
+        schema.insert("properties".into(), Value::map(props));
+        Value::map(schema)
     }
 
     struct DenyAll;
@@ -2667,14 +2630,14 @@ mod tests {
             registry.len()
         );
 
-        let unknown = invoke_result("missing", Value::Null);
+        let unknown = invoke_result("missing", Value::null());
         ensure!(
             registry.resolve(provider_resolve(&s, &unknown))
                 == Err(ProviderInvocationError::InvocationNotFound),
             "unknown invocation should be rejected"
         );
 
-        let result = invoke_result("inv-1", Value::Str("ok".into()));
+        let result = invoke_result("inv-1", Value::string("ok".into()));
         let resolved = registry.resolve(provider_resolve(&s, &result))?;
         ensure!(resolved == result, "unexpected result: {resolved:?}");
         ensure!(registry.is_empty(), "registry should be empty");
@@ -2705,7 +2668,7 @@ mod tests {
             registry.len()
         );
 
-        let result = invoke_result("inv-1", Value::Str("ok".into()));
+        let result = invoke_result("inv-1", Value::string("ok".into()));
         let resolved = registry.resolve(provider_resolve(&s, &result))?;
         ensure!(resolved == result, "unexpected result: {resolved:?}");
         ensure!(registry.is_empty(), "registry should be empty");
@@ -2747,7 +2710,7 @@ mod tests {
             registry.len()
         );
 
-        let result = invoke_result("inv-1", Value::Str("ok".into()));
+        let result = invoke_result("inv-1", Value::string("ok".into()));
         let resolved = registry.resolve(provider_resolve(&s, &result))?;
         ensure!(resolved == result, "unexpected result: {resolved:?}");
         let mut retry = provider_register(&s, &second);
@@ -2860,7 +2823,7 @@ mod tests {
         let mut registry = ProviderInvocationRegistry::new();
         let inv = invoke("inv-1")?;
         registry.register(provider_register(&s, &inv))?;
-        let result = invoke_result("inv-1", Value::Str("ok".into()));
+        let result = invoke_result("inv-1", Value::string("ok".into()));
 
         let mut wrong_generation = provider_resolve(&s, &result);
         wrong_generation.current_binding_generation = 2;
@@ -2904,7 +2867,7 @@ mod tests {
         let mut small_limit = provider_register(&s, &inv);
         small_limit.max_inline_result_bytes = Some(4);
         registry.register(small_limit)?;
-        let result = invoke_result("large", Value::Str("too large".into()));
+        let result = invoke_result("large", Value::string("too large".into()));
         ensure!(
             registry.resolve(provider_resolve(&s, &result))
                 == Err(ProviderInvocationError::ResultTooLarge),
@@ -2936,7 +2899,7 @@ mod tests {
 
         let inv = invoke("timeout")?;
         registry.register(provider_register(&s, &inv))?;
-        let result = invoke_result("timeout", Value::Null);
+        let result = invoke_result("timeout", Value::null());
         let mut late = provider_resolve(&s, &result);
         late.now_millis = 2_000;
         ensure!(
@@ -2951,12 +2914,12 @@ mod tests {
         let s = complete_provider_handshake()?;
         let mut registry = ProviderInvocationRegistry::new();
         let inv = invoke("schema")?;
-        let schema = Value::Map(BTreeMap::from([("type".into(), Value::from("string"))]));
+        let schema = Value::map(BTreeMap::from([("type".into(), Value::from("string"))]));
         let mut register = provider_register(&s, &inv);
         register.output_schema = Some(&schema);
         registry.register(register)?;
 
-        let result = invoke_result("schema", Value::Int(7));
+        let result = invoke_result("schema", Value::integer(7));
         ensure!(
             matches!(
                 registry.resolve(provider_resolve(&s, &result)),
@@ -2985,14 +2948,14 @@ mod tests {
             registry.len()
         );
 
-        let unknown = command_result("missing", Value::Null);
+        let unknown = command_result("missing", Value::null());
         ensure!(
             registry.resolve(source_command_resolve(&s, &unknown))
                 == Err(SourceCommandError::CommandNotFound),
             "unknown command should be rejected"
         );
 
-        let result = command_result("cmd-1", Value::Str("ok".into()));
+        let result = command_result("cmd-1", Value::string("ok".into()));
         let resolved = registry.resolve(source_command_resolve(&s, &result))?;
         ensure!(resolved == result, "unexpected result: {resolved:?}");
         ensure!(registry.is_empty(), "registry should be empty");
@@ -3023,7 +2986,7 @@ mod tests {
             registry.len()
         );
 
-        let result = command_result("cmd-1", Value::Str("ok".into()));
+        let result = command_result("cmd-1", Value::string("ok".into()));
         let resolved = registry.resolve(source_command_resolve(&s, &result))?;
         ensure!(resolved == result, "unexpected result: {resolved:?}");
         ensure!(registry.is_empty(), "registry should be empty");
@@ -3039,7 +3002,7 @@ mod tests {
         register.idempotency_window_ms = 500;
         registry.register(register)?;
 
-        let result = command_result("cmd-1", Value::Str("ok".into()));
+        let result = command_result("cmd-1", Value::string("ok".into()));
         let resolved = registry.resolve(source_command_resolve(&s, &result))?;
         ensure!(resolved == result, "unexpected result: {resolved:?}");
         ensure!(registry.is_empty(), "registry should be empty");
@@ -3100,7 +3063,7 @@ mod tests {
             registry.len()
         );
 
-        let result = command_result("cmd-1", Value::Str("ok".into()));
+        let result = command_result("cmd-1", Value::string("ok".into()));
         let resolved = registry.resolve(source_command_resolve(&s, &result))?;
         ensure!(resolved == result, "unexpected result: {resolved:?}");
         let mut retry = source_command_register(&s, &second);
@@ -3224,13 +3187,13 @@ mod tests {
             registry.len()
         );
 
-        let elapsed_result = command_result("elapsed", Value::Null);
+        let elapsed_result = command_result("elapsed", Value::null());
         ensure!(
             registry.resolve(source_command_resolve(&s, &elapsed_result))
                 == Err(SourceCommandError::CommandNotFound),
             "expired command should not resolve"
         );
-        let future_result = command_result("future", Value::Str("ok".into()));
+        let future_result = command_result("future", Value::string("ok".into()));
         let resolved = registry.resolve(source_command_resolve(&s, &future_result))?;
         ensure!(resolved == future_result, "unexpected result: {resolved:?}");
         ensure!(registry.is_empty(), "registry should be empty");
@@ -3264,7 +3227,7 @@ mod tests {
         let mut registry = SourceCommandRegistry::new();
         let command = outbound_command("cmd-1", message_payload("send"));
         registry.register(source_command_register(&s, &command))?;
-        let result = command_result("cmd-1", Value::Str("ok".into()));
+        let result = command_result("cmd-1", Value::string("ok".into()));
 
         let mut wrong_generation = source_command_resolve(&s, &result);
         wrong_generation.current_installation_config_version = 2;
@@ -3307,7 +3270,7 @@ mod tests {
         let mut small_limit = source_command_register(&s, &command);
         small_limit.max_inline_result_bytes = Some(4);
         registry.register(small_limit)?;
-        let result = command_result("large", Value::Str("too large".into()));
+        let result = command_result("large", Value::string("too large".into()));
         ensure!(
             registry.resolve(source_command_resolve(&s, &result))
                 == Err(SourceCommandError::ResultTooLarge),
@@ -3344,7 +3307,7 @@ mod tests {
 
         let command = outbound_command("timeout", message_payload("send"));
         registry.register(source_command_register(&s, &command))?;
-        let result = command_result("timeout", Value::Null);
+        let result = command_result("timeout", Value::null());
         let mut late = source_command_resolve(&s, &result);
         late.now_millis = 2_000;
         ensure!(
@@ -3360,7 +3323,7 @@ mod tests {
         let mut registry = SourceCommandRegistry::new();
         let schema = message_schema();
 
-        let bad_command = outbound_command("bad-command", Value::Str("raw".into()));
+        let bad_command = outbound_command("bad-command", Value::string("raw".into()));
         let mut register = source_command_register(&s, &bad_command);
         register.command_schema = Some(&schema);
         ensure!(
@@ -3378,7 +3341,7 @@ mod tests {
         register.command_result_schema = Some(&schema);
         registry.register(register)?;
 
-        let result = command_result("bad-result", Value::Str("raw".into()));
+        let result = command_result("bad-result", Value::string("raw".into()));
         ensure!(
             matches!(
                 registry.resolve(source_command_resolve(&s, &result)),
@@ -3399,7 +3362,7 @@ mod tests {
     async fn source_ingest_rejects_before_ready_and_writes_nothing() -> anyhow::Result<()> {
         let mut s = EndpointSession::new();
         s.on_hello(&hello(), |_| ctx())?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let def = source_projection(None)?;
         let policy = PolicySnapshot::empty();
         let err = expect_source_ingest_error(
@@ -3421,7 +3384,7 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_accepts_taints_and_dedupes_event_id() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let def = source_projection(None)?;
         let policy = PolicySnapshot::empty();
         let first = ingest_source_event(
@@ -3448,7 +3411,7 @@ mod tests {
             .read_tainted(&sink)
             .await?
             .context("missing tainted source event")?;
-        let expected = Value::List(vec![message_payload("hello")]);
+        let expected = Value::list(vec![message_payload("hello")]);
         ensure!(
             tv.value == expected,
             "unexpected source event value: {:?}",
@@ -3474,7 +3437,7 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_rejects_invalid_event_id_without_state_write() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let def = source_projection(None)?;
         let policy = PolicySnapshot::empty();
 
@@ -3497,7 +3460,10 @@ mod tests {
             "unexpected source event value: {sink_value:?}"
         );
         let dedup_prefix = source_event_dedup_prefix("inst-1", "source")?;
-        let dedup_rows = state.read_prefix(&dedup_prefix).await?;
+        let dedup_rows = state
+            .query(&xolotl_state::StateScan::new(dedup_prefix))
+            .await?
+            .entries;
         ensure!(
             dedup_rows.is_empty(),
             "unexpected dedup rows: {dedup_rows:?}"
@@ -3508,7 +3474,7 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_rejects_invalid_stream_id_and_rolls_back_dedup() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let def = source_projection(None)?;
         let policy = PolicySnapshot::empty();
 
@@ -3529,7 +3495,10 @@ mod tests {
             "unexpected source event value: {sink_value:?}"
         );
         let dedup_prefix = source_event_dedup_prefix("inst-1", "source")?;
-        let dedup_rows = state.read_prefix(&dedup_prefix).await?;
+        let dedup_rows = state
+            .query(&xolotl_state::StateScan::new(dedup_prefix))
+            .await?
+            .entries;
         ensure!(
             dedup_rows.is_empty(),
             "dedup reservation was not rolled back: {dedup_rows:?}"
@@ -3540,7 +3509,7 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_enforces_stream_sequence_order() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let def = source_projection(None)?;
         let policy = PolicySnapshot::empty();
 
@@ -3588,7 +3557,7 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_duplicate_event_id_wins_before_sequence_replay() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let def = source_projection(None)?;
         let policy = PolicySnapshot::empty();
         let first = ingest_source_event(
@@ -3616,7 +3585,7 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_drop_oldest_keeps_stream_within_capacity() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let mut def = source_projection(None)?;
         def.emits.as_mut().context("missing emits")?.capacity =
             source_capacity(2, OverflowPolicy::DropOldest);
@@ -3637,7 +3606,7 @@ mod tests {
 
         let sink = source_event_sink()?;
         let value = state.read(&sink).await?;
-        let expected = Some(Value::List(vec![
+        let expected = Some(Value::list(vec![
             message_payload("two"),
             message_payload("three"),
         ]));
@@ -3651,7 +3620,7 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_backpressure_rolls_back_sequence_dedup_and_rate() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let mut def = source_projection(None)?;
         let emits = def.emits.as_mut().context("missing emits")?;
         emits.capacity = source_capacity(
@@ -3701,7 +3670,7 @@ mod tests {
 
         let sink = source_event_sink()?;
         let value = state.read(&sink).await?;
-        let expected = Some(Value::List(vec![
+        let expected = Some(Value::list(vec![
             message_payload("one"),
             message_payload("two"),
         ]));
@@ -3715,7 +3684,7 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_disconnect_policy_rejects_at_capacity() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let mut def = source_projection(None)?;
         def.emits.as_mut().context("missing emits")?.capacity =
             source_capacity(1, OverflowPolicy::DisconnectBridge);
@@ -3746,7 +3715,7 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_rate_limit_is_durable_and_windowed() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let mut def = source_projection(None)?;
         def.emits.as_mut().context("missing emits")?.rate_limit = Some(SourceRateLimit {
             window_ms: 100,
@@ -3780,7 +3749,7 @@ mod tests {
 
         let path = source_event_rate_path("inst-1", "source")?;
         let value = state.read(&path).await?;
-        let expected = Some(Value::List(vec![Value::Int(1_101)]));
+        let expected = Some(Value::list(vec![Value::integer(1_101)]));
         ensure!(value == expected, "unexpected rate state: {value:?}");
         Ok(())
     }
@@ -3788,7 +3757,7 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_payload_limit_rejects_before_dedup_or_append() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let mut def = source_projection(None)?;
         def.emits
             .as_mut()
@@ -3824,17 +3793,17 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_rejects_secret_and_taint_override_fields() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let def = source_projection(None)?;
         let policy = PolicySnapshot::empty();
         let mut nested = BTreeMap::new();
-        nested.insert("access-token".into(), Value::Str("raw-token".into()));
+        nested.insert("access-token".into(), Value::string("raw-token".into()));
         let mut payload = BTreeMap::new();
-        payload.insert("metadata".into(), Value::Map(nested));
+        payload.insert("metadata".into(), Value::map(nested));
 
         let err = expect_source_ingest_error(
             source_req(state.clone(), &s, &def, &policy),
-            event("evt-secret", Value::Map(payload)),
+            event("evt-secret", Value::map(payload)),
         )
         .await?;
         let expected = SourceIngestError::ForbiddenPayloadField {
@@ -3843,10 +3812,10 @@ mod tests {
         ensure!(err == expected, "unexpected secret field error: {err:?}");
 
         let mut payload = BTreeMap::new();
-        payload.insert("taint".into(), Value::Str("trusted".into()));
+        payload.insert("taint".into(), Value::string("trusted".into()));
         let err = expect_source_ingest_error(
             source_req(state.clone(), &s, &def, &policy),
-            event("evt-taint", Value::Map(payload)),
+            event("evt-taint", Value::map(payload)),
         )
         .await?;
         let expected = SourceIngestError::ForbiddenPayloadField {
@@ -3862,7 +3831,7 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_rejects_authority_override_fields() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let def = source_projection(None)?;
         let policy = PolicySnapshot::empty();
 
@@ -3876,8 +3845,8 @@ mod tests {
             ("evt-policy", "policy_result"),
         ] {
             let mut nested = BTreeMap::new();
-            nested.insert(field.into(), Value::Str("override".into()));
-            let payload = Value::Map(BTreeMap::from([("metadata".into(), Value::Map(nested))]));
+            nested.insert(field.into(), Value::string("override".into()));
+            let payload = Value::map(BTreeMap::from([("metadata".into(), Value::map(nested))]));
             let err = expect_source_ingest_error(
                 source_req(state.clone(), &s, &def, &policy),
                 event(event_id, payload),
@@ -3901,7 +3870,7 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_prunes_old_dedup_records_within_window() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let def = source_projection(None)?;
         let policy = PolicySnapshot::empty();
         let old_path = source_event_dedup_path("inst-1", "source", "old")?;
@@ -3930,7 +3899,7 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_zero_dedup_window_still_prunes_old_records() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let def = source_projection(None)?;
         let policy = PolicySnapshot::empty();
         let old_path = source_event_dedup_path("inst-1", "source", "old")?;
@@ -3959,7 +3928,7 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_dedup_uses_receipt_time_not_event_timestamp() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let def = source_projection(None)?;
         let policy = PolicySnapshot::empty();
         let mut req = source_req(state.clone(), &s, &def, &policy);
@@ -3995,7 +3964,7 @@ mod tests {
             .read_tainted(&sink)
             .await?
             .context("missing tainted source event")?;
-        let expected = Value::List(vec![message_payload("hello")]);
+        let expected = Value::list(vec![message_payload("hello")]);
         ensure!(
             tv.value == expected,
             "unexpected source event value: {:?}",
@@ -4007,7 +3976,7 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_pending_dedup_does_not_ack_duplicate() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let def = source_projection(None)?;
         let policy = PolicySnapshot::empty();
         let dedup_path = source_event_dedup_path("inst-1", "source", "evt-pending")?;
@@ -4038,12 +4007,12 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_rejects_schema_mismatch_and_policy_deny() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let def = source_projection(Some(message_schema()))?;
         let policy = PolicySnapshot::empty();
         let err = expect_source_ingest_error(
             source_req(state.clone(), &s, &def, &policy),
-            event("evt-schema", Value::Float(FloatBits(1.0))),
+            event("evt-schema", Value::float(FloatBits(1.0))),
         )
         .await?;
         ensure!(
@@ -4068,7 +4037,7 @@ mod tests {
     #[tokio::test]
     async fn source_ingest_rejects_generation_mismatches() -> anyhow::Result<()> {
         let s = complete_handshake()?;
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let def = source_projection(None)?;
         let policy = PolicySnapshot::empty();
         let mut req = source_req(state, &s, &def, &policy);
@@ -4080,7 +4049,7 @@ mod tests {
             "unexpected registry hash error: {err:?}"
         );
 
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let mut req = source_req(state, &s, &def, &policy);
         req.credential_generation = 4;
         let err =
@@ -4090,7 +4059,7 @@ mod tests {
             "unexpected credential generation error: {err:?}"
         );
 
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let mut req = source_req(state, &s, &def, &policy);
         req.current_binding_generation = 2;
         let err =
@@ -4100,7 +4069,7 @@ mod tests {
             "unexpected binding generation error: {err:?}"
         );
 
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let mut req = source_req(state, &s, &def, &policy);
         req.current_installation_config_version = 2;
         let err =
@@ -4110,7 +4079,7 @@ mod tests {
             "unexpected installation config error: {err:?}"
         );
 
-        let state: Backend = Arc::new(InMemoryBackend::new());
+        let state: Backend = InMemoryBackend::new().into_backend();
         let mut projection = source_projection(None)?;
         projection.version = 2;
         let req = source_req(state, &s, &projection, &policy);

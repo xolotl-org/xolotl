@@ -2,7 +2,7 @@ use crate::{GatewayError, GatewayGeneration, GatewayProfileRev, MIN_BEARER_TOKEN
 use sha2::Digest;
 
 /// Credentials presented by an inbound protocol adapter. They are untrusted
-/// until [`Gateway::authenticate`] verifies them against the compiled profile.
+/// until [`Gateway::authenticate`](crate::Gateway::authenticate) verifies them against the compiled profile.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PresentedCredential {
     /// A bearer secret presented through a transport credential channel.

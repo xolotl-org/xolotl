@@ -9,6 +9,7 @@
 use crate::ids::{BindingId, DriverId, EndpointId, InterfaceId, MethodId, ResourceId, SchemaId};
 use crate::path::Path;
 use crate::replay::{Purity, ReplayClass};
+use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
 /// Implements serde for a `bitflags` type via its raw integer bits.
@@ -153,6 +154,13 @@ pub struct CostModel {
 }
 
 impl CostModel {
+    /// A method without a monetary charge.
+    pub const FREE: Self = Self {
+        flat_micro_usd: 0,
+        per_1k_in_micro_usd: 0,
+        per_1k_out_micro_usd: 0,
+    };
+
     /// Estimate the micro-USD cost of one call, given
     /// input and (projected) output token counts. Used for budget reservation
     /// *before* the effect, so it is deliberately a conservative upper bound:
@@ -163,8 +171,8 @@ impl CostModel {
             .saturating_add(self.per_1k_out_micro_usd.saturating_mul(out_tokens) / 1000)
     }
 
-    /// Whether this method has any modeled cost (drives whether the budget check
-    /// even runs — a zero-cost method needs no reservation).
+    /// Whether monetary pricing is zero. Free calls still reserve concurrency;
+    /// an explicit measured token count can still consume a token budget.
     pub fn is_free(&self) -> bool {
         self.flat_micro_usd == 0 && self.per_1k_in_micro_usd == 0 && self.per_1k_out_micro_usd == 0
     }
@@ -203,6 +211,9 @@ pub struct Method {
     /// has entered `Finalizing`.
     #[serde(default)]
     pub finalize_allowed: bool,
+    /// Reject protected input before dispatch, for example for remote services.
+    #[serde(default)]
+    pub requires_unprotected_input: bool,
 }
 
 /// An algebraic law an [`Interface`] declares, used by validation,

@@ -1,0 +1,31 @@
+[package]
+name = "xolotl-storage-fs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Incremental filesystem object storage for Xolotl"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+value-workspace = ["dep:xolotl-value-codec", "tokio/fs", "tokio/io-util"]
+
+[dependencies]
+xolotl-state = { workspace = true, features = ["std"] }
+xolotl-types.workspace = true
+xolotl-value-codec = { workspace = true, optional = true }
+blake3 = { workspace = true, features = ["std"] }
+parking_lot.workspace = true
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+tempfile = { workspace = true, features = ["getrandom"] }
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+[dev-dependencies]
+anyhow = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

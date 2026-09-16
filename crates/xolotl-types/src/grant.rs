@@ -14,6 +14,7 @@
 use crate::cap::Capability;
 use crate::ids::{GrantId, ProcessId};
 use crate::value::Value;
+use alloc::{string::ToString, vec::Vec};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 

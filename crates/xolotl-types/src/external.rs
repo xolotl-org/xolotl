@@ -11,8 +11,13 @@ use crate::ids::MethodId;
 use crate::path::Path;
 use crate::replay::Purity;
 use crate::value::Value;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 pub use crate::external_descriptor::{EffectCapability, Transport, TrustLevel};
@@ -335,7 +340,7 @@ impl ExternalInstallationDef {
         if self.projections.is_empty() {
             return Err(ExternalAdmissionError::InstallationWithoutProjections);
         }
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen = alloc::collections::BTreeSet::new();
         for projection in &self.projections {
             if !seen.insert(projection.id.clone()) {
                 return Err(ExternalAdmissionError::DuplicateProjectionId(
@@ -906,8 +911,9 @@ pub enum ControlFrame {
 /// Provider data frame: one remote Operation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Invoke {
-    /// Stable across reconnect/replay: derived from the business idempotency
-    /// key when present, else from CausalPosition.
+    /// Stable request correlation identity across reconnect or checkpoint restore.
+    /// Kernel remote calls use the complete OperationId string; the data plane
+    /// applies business idempotency keys separately.
     pub invocation_id: String,
     /// Effect resource path invoked by the remote operation.
     pub effect_path: Path,
@@ -1052,7 +1058,7 @@ pub struct SourceRateLimit {
 mod tests {
     use super::*;
     use anyhow::{Context, ensure};
-    use std::fmt::Debug;
+    use core::fmt::Debug;
 
     fn check_eq<T>(actual: T, expected: T, label: &str) -> anyhow::Result<()>
     where
@@ -1089,8 +1095,8 @@ mod tests {
             platform: "instant_messaging_platform".into(),
             transport: Transport::Grpc { endpoint: None },
             trust: TrustLevel::Sandboxed,
-            config_schema: Value::Null,
-            config: Value::Null,
+            config_schema: Value::null(),
+            config: Value::null(),
             projections: vec![
                 ExternalProjectionDef {
                     id: "source".into(),
@@ -1160,8 +1166,8 @@ mod tests {
             platform: "instant_messaging_platform".into(),
             transport: Transport::Grpc { endpoint: None },
             trust: TrustLevel::Sandboxed,
-            config_schema: Value::Null,
-            config: Value::Null,
+            config_schema: Value::null(),
+            config: Value::null(),
             projections: vec![projection.clone(), projection],
             version: 1,
         };
@@ -1486,9 +1492,9 @@ mod tests {
                 rate_limit: None,
                 commands: true,
                 command_schema: None,
-                command_result_schema: Some(Value::Map(std::collections::BTreeMap::from([(
+                command_result_schema: Some(Value::map(alloc::collections::BTreeMap::from([(
                     "type".into(),
-                    Value::Str("string".into()),
+                    Value::string("string".into()),
                 )]))),
             }),
             namespace: None,
@@ -1687,8 +1693,8 @@ mod tests {
                 args: vec![],
             },
             trust: TrustLevel::Full,
-            config_schema: Value::Null,
-            config: Value::Null,
+            config_schema: Value::null(),
+            config: Value::null(),
             projections: vec![ExternalProjectionDef {
                 id: "provider".into(),
                 role: Role::Provider,

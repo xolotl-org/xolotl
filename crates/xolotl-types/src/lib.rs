@@ -1,8 +1,9 @@
+#![no_std]
 #![forbid(unsafe_code)]
 
 //! Public data types for the Xolotl runtime.
 //!
-//! This crate is leaf-level and **wasm-safe**: no async / IO, no
+//! This crate supports **`no_std + alloc`**: no async / IO, no
 //! kernel state — just the data that flows through the system, plus the
 //! control-plane *descriptors* the console and wire protocols reference. The
 //! live runtime objects that carry dispatch tables (`Handle` / `DriverPlan`)
@@ -12,7 +13,8 @@
 //! Public modules:
 //!
 //! - [`path`]   — the universal `Path` addressing type.
-//! - [`value`]  — `Value` (incl. `Blob`/`Tensor`/`Frame`), refs, `Failure`.
+//! - [`value`]  — `Value` (incl. `Blob`/`Tensor`/`Frame`) and media references.
+//! - [`failure`] — structured execution failures and recovery metadata.
 //! - [`ids`]    — compact data-plane identifiers (`ProcessId`, `HandleId`, …).
 //! - [`replay`] — `Purity` (declared) and `ReplayClass` (derived).
 //! - [`grant`]  — `Grant`/`Rights`/`ConstraintSet`: the capability *source* form.
@@ -23,25 +25,31 @@
 //! - [`chat`]      — chat message DTOs used by inference.
 //! - [`inference`] — inference backend and routing declarations.
 //! - [`in_process_projection`] — in-process projection declarations.
-//! - [`kernel_config`] — shared `state://kernel/*` config admission.
 //! - [`validate`]  — path semantic validation.
+
+#[macro_use]
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 pub mod audit;
 pub mod cap;
 pub mod chat;
+pub mod execution;
 pub mod external;
 mod external_descriptor;
+pub mod failure;
 pub mod grant;
 pub mod idempotency;
 pub mod ids;
 pub mod in_process_projection;
 pub mod inference;
-pub mod kernel_config;
 pub mod operation;
 pub mod path;
 pub mod process;
 pub mod replay;
 pub mod resource;
+pub mod tagged_value;
 pub mod taint;
 pub mod trace;
 pub mod validate;
@@ -50,6 +58,7 @@ pub mod value;
 pub use audit::{AuditRules, AuditTag};
 pub use cap::{CapError, CapSet, Capability, PredOp, Predicate};
 pub use chat::{ChatMessage, ChatMetadata, ContentPart, MessageRole, estimate_tokens};
+pub use execution::ExecutionOutput;
 pub use external::{
     AckStatus, ApplyStatus, Backoff, CommandResult, ConfigAxis, ControlFrame, DaemonContact,
     DaemonContacts, ErrorInfo, EventAck, EventSource, ExternalInstallationDef,
@@ -60,12 +69,14 @@ pub use external::{
     sandboxed_source_event_sink_path,
 };
 pub use external_descriptor::{EffectCapability, Transport, TrustLevel};
+pub use failure::Failure;
 pub use grant::{
     ConstraintSet, DeriveKind, Expiry, Grant, MethodBitmap, ResourceSelector, RightFlags, Rights,
 };
 pub use ids::{
-    BindingId, CausalPosition, DriverId, EndpointId, GrantId, GraphId, HandleId, IdentityRef,
-    InterfaceId, MethodId, NodeId, ProcessId, ResourceId, SchemaId, Timestamp,
+    BindingId, CausalPosition, DriverId, EndpointId, ExecutionId, GrantId, GraphId, HandleId,
+    IdentityRef, InterfaceId, InvocationId, MethodId, NodeId, ProcessId, ResourceId, SchemaId,
+    Timestamp,
 };
 pub use in_process_projection::{
     InProcessProjectionConfigError, InProcessProjectionDef, InProcessProjectionPhase,
@@ -74,11 +85,11 @@ pub use in_process_projection::{
 pub use inference::{
     InferenceApiDialect, InferenceAuthRef, InferenceBackendDef, InferenceConfigError,
     InferenceGroupDef, InferenceGroupPolicy, InferenceMethodSet, InferenceModelCapabilities,
-    InferenceModelDef, InferenceRoutingDef, MAX_INFERENCE_ROUTING_RETRIES,
+    InferenceModelDef, InferenceResponseLimits, InferenceRoutingDef, MAX_INFERENCE_ROUTING_RETRIES,
 };
-pub use kernel_config::{KernelConfigAdmission, KernelConfigAdmissionError, admit_kernel_config};
 pub use operation::{
-    BatchSummary, DecisionTag, Fact, Operation, OperationId, OutcomeRef, ValueRef,
+    BatchSummary, CompletionOrigin, DecisionTag, DriverOutput, DriverUsage, Fact, MethodContract,
+    Operation, OperationId, ParseOperationIdError, UsageDimension,
 };
 #[cfg(test)]
 pub use path::p;
@@ -93,12 +104,13 @@ pub use resource::{
     Metadata, Method, ModalitySet, OutputMode, OutputModeSet, Resource, ResourceDescriptor,
     ResourceKind, ResourceName,
 };
-pub use taint::{TaintSet, TaintSource};
+pub use taint::{TaintSet, TaintSource, TaintedFailure, TaintedValue};
 pub use trace::{Span, SpanId, TraceContext, TraceId};
 pub use validate::{PathRegistry, PathValidator, default_registry};
 pub use value::{
-    BlobRef, DType, Failure, FloatBits, FrameKind, FrameRef, MergeRule, StreamMarker, TensorRef,
-    Value, ValueError,
+    BlobRef, CollectionError, DType, FloatBits, FrameKind, FrameRef, MergeRule, StreamMarker,
+    TensorRef, Value, ValueBytes, ValueError, ValueIdentity, ValueList, ValueListBuilder, ValueMap,
+    ValueMapBuilder, ValueText, ValueView,
 };
 
 /// Path prefixes reserved for the kernel. Non-kernel Processes cannot register
@@ -144,6 +156,7 @@ pub fn is_fact_reserved(path: &Path) -> bool {
 
 #[cfg(test)]
 mod workspace_contract_guard_tests {
+    use alloc::{string::ToString, vec::Vec};
     use anyhow::{Context, ensure};
     use std::path::{Path as FsPath, PathBuf};
 

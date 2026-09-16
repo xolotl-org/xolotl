@@ -189,7 +189,7 @@ fn external_event(id: &str) -> ext::ExternalFrame {
         frame: Some(ext::external_frame::Frame::InboundEvent(
             inbound_event_to_pb(&InboundEvent {
                 id: id.into(),
-                payload: Value::Str("hello".into()),
+                payload: Value::string("hello".into()),
                 observed: ObservedGenerations::default(),
                 timestamp_ms: 1234,
                 stream_id: None,
@@ -204,7 +204,7 @@ fn external_invoke_result() -> ext::ExternalFrame {
         frame: Some(ext::external_frame::Frame::InvokeResult(
             invoke_result_to_pb(&InvokeResult {
                 invocation_id: "invoke-1".into(),
-                outcome: Ok(Value::Str("ok".into())),
+                outcome: Ok(Value::string("ok".into())),
             }),
         )),
     }
@@ -639,7 +639,7 @@ async fn external_session_rejects_secure_envelope_frame_type_mismatch() -> anyho
         frame: Some(ext::external_frame::Frame::InvokeResult(
             invoke_result_to_pb(&InvokeResult {
                 invocation_id: "invoke-1".into(),
-                outcome: Ok(Value::Str("ok".into())),
+                outcome: Ok(Value::string("ok".into())),
             }),
         )),
     };

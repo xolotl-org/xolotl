@@ -1,22 +1,31 @@
 //! `FactSink` records operation Facts with ReplayClass-graded persistence barriers.
 
+use crate::execution_ids::{
+    ExecutionIdError, ExecutionIdRange, ExecutionIdSource, ExecutionIds, InMemoryExecutionIdSource,
+};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::broadcast;
 use xolotl_types::{Fact, OperationId};
 
-/// A durable-write failure from the fact store (disk full, corruption, txn
-/// abort). The kernel maps a **pre-effect** failure to a denied operation —
+mod lookup;
+mod scan;
+pub use lookup::{FactLookup, FactLookupResult};
+pub use scan::{FactOrder, FactPage, FactQuery};
+
+/// A fact-store failure, including persistence, corruption and read-budget errors.
+/// The kernel maps a **pre-effect** write failure to a denied operation —
 /// prevents the effect and logs a **post-effect** failure for crash recovery to
-/// reconcile from the fsync'd pending record. Read failures fall back to an
-/// empty result so recovery treats the data as absent.
+/// reconcile from the fsync'd pending record. Read failures propagate so recovery
+/// cannot mistake unavailable data for an empty stream.
 #[derive(Debug, Error)]
-#[error("fact store write failed: {0}")]
+#[error("fact store failed: {0}")]
 pub struct FactError(pub String);
 
-/// Push subscription to facts appended after subscription creation.
+/// Push subscription to new facts and outcome updates after subscription creation.
 pub type FactStream = broadcast::Receiver<Arc<Fact>>;
 
 /// Capacity of the in-memory fact broadcast channel.
@@ -25,24 +34,58 @@ pub const FACT_BROADCAST_CAPACITY: usize = 256;
 /// Pluggable durable sink. The in-memory impl is the default; redb provides a
 /// persistent one. The kernel speaks only this trait. Read failures are
 /// surfaced so corrupted Fact storage is never treated as an empty stream.
-pub trait FactStore: Send + Sync + 'static {
-    /// Append a (possibly pending) fact. Returns the append cursor position.
-    /// Errors before the cursor advances, so a retry reuses the same slot.
+pub trait FactStore: ExecutionIdSource {
+    /// Append a (possibly pending) fact once per full `OperationId`.
+    /// Repeated appends return the original slot and retain its record without
+    /// publishing another notification, including when it has completed. Use
+    /// `complete` to add an outcome. Only distinct ids advance the append cursor;
+    /// failed writes leave the cursor unchanged.
     fn append(&self, fact: Fact) -> Result<u64, FactError>;
-    /// Mark a previously-begun fact complete (outcome filled in).
+    /// Store an outcome in the existing slot, or append if no begin was recorded.
     fn complete(&self, fact: Fact) -> Result<(), FactError>;
     /// Force durability up to the current cursor (fsync). Called for
     /// write-ahead barriers.
     fn sync(&self) -> Result<(), FactError>;
-    /// All facts for one process, in append order.
+    /// Read in the requested append order, bounding candidates, returned records
+    /// and encoded bytes before cloning or decoding, without materializing history.
+    /// See [`FactQuery`] for cursor, filtering and concurrent-update semantics.
+    fn scan(&self, query: FactQuery) -> Result<FactPage, FactError>;
+    /// Indexed lookup that filters the current caller before checking encoded
+    /// size or cloning/decoding. All decisions use one storage view.
+    /// Missing and nonmatching records are distinct; oversized matches error.
+    fn lookup(&self, query: FactLookup) -> Result<FactLookupResult, FactError>;
+    /// Indexed convenience lookup for any caller with an encoded-byte budget.
+    #[inline]
+    fn get_bounded(
+        &self,
+        id: OperationId,
+        max_encoded_bytes: NonZeroUsize,
+    ) -> Result<Option<Fact>, FactError> {
+        let query = FactLookup::new(id, max_encoded_bytes);
+        let result = self.lookup(query)?;
+        result.validate(query)?;
+        result.into_unfiltered()
+    }
+    /// Indexed convenience lookup without a per-record byte limit.
+    #[inline]
+    fn get(&self, id: OperationId) -> Result<Option<Fact>, FactError> {
+        self.get_bounded(id, NonZeroUsize::MAX)
+    }
+    /// All facts for one process, in append order. Materializes the full result;
+    /// use [`Self::scan`] when history size is not bounded by the caller.
     fn facts_of(&self, process: xolotl_types::ProcessId) -> Result<Vec<Fact>, FactError>;
-    /// All facts, in append order.
+    /// All facts, in append order. Materializes the full retained history.
     fn all_facts(&self) -> Result<Vec<Fact>, FactError>;
-    /// The current monotonic append cursor.
+    /// The locally observed monotonic append cursor. Independent adapters may
+    /// observe different heads; [`Self::scan`] captures an authoritative head.
+    /// Completion updates old slots without advancing this cursor.
     fn cursor(&self) -> u64;
-    /// Subscribe to facts appended after this call. The receiver is bounded;
-    /// slow consumers miss older entries and must catch up via `all_facts()`.
-    /// The default returns an inert receiver (never delivers), so test stores
+    /// Subscribe to appends and outcome updates. Notifications may arrive out
+    /// of commit order: treat them as invalidations and use [`Self::lookup`] for
+    /// the current record, applying the caller filter before its byte budget.
+    /// The receiver is bounded; after lag, rescan the entire
+    /// retained interval, including old slots whose outcomes may have changed.
+    /// The default returns a closed receiver, so test stores
     /// that do not exercise subscription need no override.
     fn subscribe_facts(&self) -> FactStream {
         let (_tx, rx) = broadcast::channel::<Arc<Fact>>(1);
@@ -55,6 +98,7 @@ pub trait FactStore: Send + Sync + 'static {
 pub struct InMemoryFactStore {
     inner: Mutex<FactStoreInner>,
     tx: broadcast::Sender<Arc<Fact>>,
+    execution_ids: InMemoryExecutionIdSource,
 }
 
 impl Default for InMemoryFactStore {
@@ -84,6 +128,7 @@ impl InMemoryFactStore {
         Self {
             inner: Mutex::new(FactStoreInner::default()),
             tx,
+            execution_ids: InMemoryExecutionIdSource::new(),
         }
     }
 
@@ -112,11 +157,21 @@ fn broadcast_fact(tx: &broadcast::Sender<Arc<Fact>>, fact: Arc<Fact>) {
     }
 }
 
+impl ExecutionIdSource for InMemoryFactStore {
+    fn reserve(&self, count: NonZeroU64) -> Result<ExecutionIdRange, ExecutionIdError> {
+        self.execution_ids.reserve(count)
+    }
+}
+
 impl FactStore for InMemoryFactStore {
     fn append(&self, fact: Fact) -> Result<u64, FactError> {
         let shared = Arc::new(fact);
         let pos = {
             let mut inner = self.inner.lock();
+            if let Some(&index) = inner.index.get(&shared.id) {
+                return u64::try_from(index)
+                    .map_err(|_error| FactError("fact cursor overflow".into()));
+            }
             let pos = inner.cursor;
             inner.cursor = inner
                 .cursor
@@ -156,6 +211,31 @@ impl FactStore for InMemoryFactStore {
         Ok(())
     }
 
+    fn scan(&self, query: FactQuery) -> Result<FactPage, FactError> {
+        let inner = self.inner.lock();
+        scan::scan_memory(&inner.facts, inner.cursor, query)
+    }
+
+    fn lookup(&self, query: FactLookup) -> Result<FactLookupResult, FactError> {
+        let inner = self.inner.lock();
+        let Some(&slot) = inner.index.get(&query.id) else {
+            return Ok(FactLookupResult::Missing);
+        };
+        let fact = &inner.facts[slot];
+        if query.process.is_some_and(|process| process != fact.caller) {
+            return Ok(FactLookupResult::FilteredOut);
+        }
+        if query.max_encoded_bytes != NonZeroUsize::MAX
+            && scan::encoded_size(fact, query.max_encoded_bytes.get())?.is_none()
+        {
+            return Err(FactError(format!(
+                "fact at slot {slot} exceeds encoded byte limit {}",
+                query.max_encoded_bytes
+            )));
+        }
+        Ok(FactLookupResult::Found(fact.clone()))
+    }
+
     fn facts_of(&self, process: xolotl_types::ProcessId) -> Result<Vec<Fact>, FactError> {
         Ok(self
             .inner
@@ -188,23 +268,27 @@ pub type SharedFactStore = Arc<dyn FactStore>;
 #[derive(Clone)]
 pub struct FactSink {
     store: SharedFactStore,
+    execution_ids: ExecutionIds,
 }
 
 impl FactSink {
     /// Wrap a shared fact store in the kernel-facing sink.
     pub fn new(store: SharedFactStore) -> Self {
-        Self { store }
+        Self {
+            execution_ids: ExecutionIds::new(store.clone()),
+            store,
+        }
     }
 
     /// Create a sink backed by an in-memory fact store and return both handles.
     pub fn in_memory() -> (Self, Arc<InMemoryFactStore>) {
         let store = Arc::new(InMemoryFactStore::new());
-        (
-            Self {
-                store: store.clone(),
-            },
-            store,
-        )
+        (Self::new(store.clone()), store)
+    }
+
+    /// Shared execution allocator for hosts using this fact store's identity namespace.
+    pub fn execution_ids(&self) -> ExecutionIds {
+        self.execution_ids.clone()
     }
 
     /// Begin recording an operation *before* the driver call.
@@ -238,12 +322,46 @@ impl FactSink {
         &self.store
     }
 
-    /// Return all facts for `process` in append order.
+    /// Read a page subject to its record, candidate and encoded-byte limits.
+    /// Rejects structurally invalid pages returned by a custom adapter.
+    pub fn scan(&self, query: FactQuery) -> Result<FactPage, FactError> {
+        let page = self.store.scan(query)?;
+        page.validate(query)?;
+        Ok(page)
+    }
+
+    /// Read one current record by its full operation identity, without a byte limit.
+    #[inline]
+    pub fn get(&self, id: OperationId) -> Result<Option<Fact>, FactError> {
+        self.get_bounded(id, NonZeroUsize::MAX)
+    }
+
+    /// Read one indexed record with a current-caller filter and byte budget.
+    /// Rejects nonmatching records or invalid absence states from an adapter.
+    #[inline]
+    pub fn lookup(&self, query: FactLookup) -> Result<FactLookupResult, FactError> {
+        let result = self.store.lookup(query)?;
+        result.validate(query)?;
+        Ok(result)
+    }
+
+    /// Indexed lookup with an encoded-byte budget enforced before allocation.
+    #[inline]
+    pub fn get_bounded(
+        &self,
+        id: OperationId,
+        max_encoded_bytes: NonZeroUsize,
+    ) -> Result<Option<Fact>, FactError> {
+        self.lookup(FactLookup::new(id, max_encoded_bytes))?
+            .into_unfiltered()
+    }
+
+    /// Materialize all facts for `process` in append order, without a size limit.
     pub fn facts_of(&self, process: xolotl_types::ProcessId) -> Result<Vec<Fact>, FactError> {
         self.store.facts_of(process)
     }
 
-    /// Return all facts in append order.
+    /// Materialize all retained facts in append order, without a size limit.
     pub fn all_facts(&self) -> Result<Vec<Fact>, FactError> {
         self.store.all_facts()
     }
@@ -271,23 +389,29 @@ mod tests {
     use super::*;
     use anyhow::{bail, ensure};
     use xolotl_types::{
-        DecisionTag, HandleId, IdentityRef, MethodId, NodeId, OutcomeRef, ProcessId, ReplayClass,
-        ResourceId, Timestamp, Value, ValueRef,
+        DecisionTag, ExecutionId, HandleId, IdentityRef, InvocationId, MethodId, NodeId, ProcessId,
+        ReplayClass, ResourceId, Timestamp, Value,
     };
 
-    fn fact(process: u64, pos: u32, replay: ReplayClass) -> Fact {
+    pub(super) fn fact(process: u64, pos: u32, replay: ReplayClass) -> Fact {
         Fact {
-            id: OperationId::new(ProcessId::new(process), NodeId::new(pos), 0),
+            id: OperationId::new(
+                ProcessId::new(process),
+                ExecutionId::FIRST,
+                InvocationId::new(1),
+                NodeId::new(pos),
+                0,
+            ),
             schema_version: Fact::SCHEMA_VERSION,
             caller: ProcessId::new(process),
             acting: IdentityRef::ROOT,
             handle: HandleId::new(0, 1),
             resource: ResourceId::new(1),
             method: MethodId::new(0),
-            input_ref: ValueRef::Inline(Value::Null),
+            input: Value::null(),
             taint: xolotl_types::TaintSet::pristine(),
             decision: DecisionTag::Ok,
-            outcome_ref: OutcomeRef::Inline(Value::Int(1)),
+            outcome: Some(Value::integer(1)),
             batch: None,
             replay,
             timestamp: Timestamp::millis(0),
@@ -387,6 +511,52 @@ mod tests {
             "fresh complete should advance the cursor"
         );
         ensure!(store.len() == 2, "facts should still be retained");
+        Ok(())
+    }
+
+    #[test]
+    fn independent_sinks_over_one_store_reserve_disjoint_execution_ranges() -> anyhow::Result<()> {
+        let store = Arc::new(InMemoryFactStore::new());
+        let first = FactSink::new(store.clone());
+        let second = FactSink::new(store.clone());
+        let shared = first.clone();
+        let a = first.execution_ids().allocate()?;
+        let b = shared.execution_ids().allocate()?;
+        let c = second.execution_ids().allocate()?;
+        ensure!(a.get() == 1 && b.get() == 2 && c.get() == 257);
+        ensure!(store.is_empty(), "reserving scopes should not create facts");
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_append_retains_the_original_slot_and_never_downgrades_completion()
+    -> anyhow::Result<()> {
+        let store = InMemoryFactStore::new();
+        let mut events = store.subscribe_facts();
+        let completed = fact(1, 0, ReplayClass::IdempotentEffect);
+        let mut pending = completed.clone();
+        pending.outcome = None;
+        ensure!(store.append(pending.clone())? == 0);
+        ensure!(*events.try_recv()? == pending);
+        let mut refreshed = pending.clone();
+        refreshed.timestamp = Timestamp::millis(100);
+        ensure!(store.append(refreshed.clone())? == 0);
+        ensure!(
+            events.try_recv().is_err(),
+            "duplicate append published an event"
+        );
+        ensure!(store.all_facts()? == [pending]);
+        store.complete(completed.clone())?;
+        ensure!(*events.try_recv()? == completed);
+        ensure!(store.append(refreshed)? == 0);
+        ensure!(
+            events.try_recv().is_err(),
+            "pending replay published after completion"
+        );
+        let next = fact(1, 1, ReplayClass::IdempotentEffect);
+        ensure!(store.append(next.clone())? == 1);
+        ensure!(store.all_facts()? == [completed, next]);
+        ensure!(store.cursor() == 2);
         Ok(())
     }
 }

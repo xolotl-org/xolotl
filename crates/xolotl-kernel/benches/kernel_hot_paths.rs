@@ -1,18 +1,19 @@
 use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
-use criterion::{BatchSize, Criterion};
+use criterion::{BatchSize, BenchmarkId, Criterion};
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::{Builder, Runtime};
 use xolotl_kernel::{
     Bootstrap, DataPlane, Driver, DriverContext, DriverError, DriverPlan, EchoDriver, FastPath,
-    Handle, HandleState, HandleTable, MethodSpec, OpenRequest, RequestGrantTemplate,
+    Handle, HandleState, HandleTable, InvocationOptions, MethodSpec, OpenRequest,
+    RequestGrantTemplate,
 };
 use xolotl_types::{
-    ConstraintSet, DecisionTag, DriverId, Expiry, Fact, Grant, HandleId, IdentityRef, MethodBitmap,
-    MethodId, NodeId, Operation, OperationId, Outcome, OutcomeRef, OutputMode, OutputModeSet, Path,
-    ProcessId, Purity, ReplayClass, ResourceId, ResourceName, ResourceSelector, RightFlags, Rights,
-    TaintSet, Timestamp, Value, ValueRef,
+    ConstraintSet, DecisionTag, DriverId, ExecutionId, Expiry, Fact, Grant, HandleId, IdentityRef,
+    InvocationId, MethodBitmap, MethodContract, MethodId, NodeId, Operation, OperationId, Outcome,
+    OutputMode, OutputModeSet, Path, ProcessId, Purity, ReplayClass, ResourceId, ResourceName,
+    ResourceSelector, RightFlags, Rights, TaintSet, Timestamp, Value,
 };
 
 const FIXED_OPEN_MILLIS: i64 = 1_700_000_000_000;
@@ -158,13 +159,13 @@ impl Driver for ChunkDriver {
         _input: Value,
         _output: OutputMode,
         ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
+    ) -> Result<xolotl_kernel::DriverOutput, DriverError> {
         for i in 0..self.chunks {
-            if !ctx.emit(Value::Int(i as i64)) {
-                break;
-            }
+            ctx.emit(Value::integer(i as i64)).await?;
         }
-        Ok(Outcome::Done(Value::Null))
+        Ok(xolotl_kernel::DriverOutput::new(Outcome::Done(
+            Value::null(),
+        )))
     }
 }
 
@@ -187,27 +188,34 @@ fn register_echo_effect(
     Ok(name)
 }
 
-fn unconstrained_dataplane_fixture(effect_path: &str) -> anyhow::Result<(DataPlane, Operation)> {
+fn unconstrained_dataplane_fixture(
+    effect_path: &str,
+    observes_external: bool,
+) -> anyhow::Result<(DataPlane, Operation)> {
     let boot = Bootstrap::in_memory();
-    let name = register_echo_effect(&boot, effect_path, Purity::Pure)?;
+    let method = MethodSpec {
+        observes_external,
+        ..MethodSpec::unary_async("invoke", Purity::Pure)
+    };
+    let name = boot.register_effect(effect_path, &[method], Arc::new(EchoDriver))?;
     let handle = boot
         .open_for(boot.root, &name, "perform")
         .context("root open failed")?;
-    let op = operation(boot.root, handle, 0, Value::Int(42));
+    let op = operation(boot.root, handle, 0, Value::integer(42));
     Ok((boot.kernel.data_plane(), op))
 }
 
 fn conditional_dataplane_fixture() -> anyhow::Result<(DataPlane, Operation)> {
     conditional_dataplane_fixture_with_input(
         "effect://bench/conditional",
-        Value::Str("acme".into()),
+        Value::string("acme".into()),
     )
 }
 
 fn conditional_denied_dataplane_fixture() -> anyhow::Result<(DataPlane, Operation)> {
     conditional_dataplane_fixture_with_input(
         "effect://bench/conditional-denied",
-        Value::Str("other".into()),
+        Value::string("other".into()),
     )
 }
 
@@ -261,7 +269,7 @@ fn conditional_dataplane_fixture_with_input(
     .context("constrained open failed")?;
     drop(handles);
 
-    let input = Value::Map([("tenant".into(), tenant)].into());
+    let input = Value::map([("tenant".into(), tenant)].into());
     let op = operation(child, handle, 0, input);
     Ok((boot.kernel.data_plane(), op))
 }
@@ -276,7 +284,7 @@ fn idempotent_dataplane_fixture() -> anyhow::Result<(DataPlane, Operation)> {
         boot.root,
         handle,
         0,
-        Value::Str("dedupe-keyed-input".into()),
+        Value::string("dedupe-keyed-input".into()),
     );
     Ok((boot.kernel.data_plane(), op))
 }
@@ -297,17 +305,22 @@ fn collect_dataplane_fixture(chunks: usize) -> anyhow::Result<(DataPlane, Operat
     let handle = boot
         .open_for(boot.root, &name, "perform")
         .context("root open failed")?;
-    let mut op = operation(boot.root, handle, 0, Value::Null);
+    let mut op = operation(boot.root, handle, 0, Value::null());
     op.output = OutputMode::Collect { limit: chunks };
     Ok((boot.kernel.data_plane(), op))
 }
 
 fn bench_handle(process: ProcessId, resource: ResourceId) -> Handle {
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
-    plan.insert(MethodId::new(0), Arc::new(EchoDriver));
+    plan.insert(
+        MethodId::new(0),
+        MethodContract::new(0, ReplayClass::Deterministic, OutputModeSet::UNARY),
+        Arc::new(EchoDriver),
+    );
     Handle {
         id: HandleId::new(0, 0),
         process,
+        acting: IdentityRef::ROOT,
         resource,
         rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
         driver_plan: plan,
@@ -317,7 +330,7 @@ fn bench_handle(process: ProcessId, resource: ResourceId) -> Handle {
     }
 }
 
-fn populated_handle_table(count: usize) -> (HandleTable, Vec<HandleId>) {
+fn populated_handle_table(count: usize) -> anyhow::Result<(HandleTable, Vec<HandleId>)> {
     let mut table = HandleTable::new();
     let ids = (0..count)
         .map(|i| {
@@ -326,13 +339,23 @@ fn populated_handle_table(count: usize) -> (HandleTable, Vec<HandleId>) {
                 ResourceId::new(i as u64 + 1),
             ))
         })
-        .collect();
-    (table, ids)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((table, ids))
+}
+
+fn operation_id(process: ProcessId, node: u32) -> OperationId {
+    OperationId::new(
+        process,
+        ExecutionId::FIRST,
+        InvocationId::new(u64::from(node) + 1),
+        NodeId::new(node),
+        0,
+    )
 }
 
 fn operation(process: ProcessId, handle: HandleId, node: u32, input: Value) -> Operation {
     Operation {
-        id: OperationId::new(process, NodeId::new(node), 0),
+        id: operation_id(process, node),
         process,
         acting: IdentityRef::ROOT,
         handle,
@@ -345,20 +368,20 @@ fn operation(process: ProcessId, handle: HandleId, node: u32, input: Value) -> O
 
 fn fact(process: ProcessId, node: u32, complete: bool) -> Fact {
     Fact {
-        id: OperationId::new(process, NodeId::new(node), 0),
+        id: operation_id(process, node),
         schema_version: Fact::SCHEMA_VERSION,
         caller: process,
         acting: IdentityRef::ROOT,
         handle: HandleId::new(0, 1),
         resource: ResourceId::new(1),
         method: MethodId::new(0),
-        input_ref: ValueRef::Inline(Value::Int(node as i64)),
+        input: Value::integer(node as i64),
         taint: TaintSet::pristine(),
         decision: DecisionTag::Ok,
-        outcome_ref: if complete {
-            OutcomeRef::Inline(Value::Int(node as i64))
+        outcome: if complete {
+            Some(Value::integer(node as i64))
         } else {
-            OutcomeRef::None
+            None
         },
         batch: None,
         replay: ReplayClass::NonIdempotentEffect,
@@ -472,8 +495,8 @@ fn bench_handle_table(c: &mut Criterion) -> anyhow::Result<()> {
     let mut group = c.benchmark_group("kernel/handle_table");
     let failure = BenchFailure::default();
 
+    let (table, ids) = populated_handle_table(16_384)?;
     group.bench_function("get_16384_live_handles", |b| {
-        let (table, ids) = populated_handle_table(16_384);
         let mut index = 0usize;
         b.iter(|| {
             index = (index + 1021) % ids.len();
@@ -489,11 +512,20 @@ fn bench_handle_table(c: &mut Criterion) -> anyhow::Result<()> {
     group.bench_function("revoke_then_reuse_slot", |b| {
         b.iter_batched(
             || populated_handle_table(1),
-            |(mut table, ids)| {
+            |fixture| {
+                let Some((mut table, ids)) = capture_result(&failure, fixture) else {
+                    return;
+                };
                 let old = ids[0];
                 capture_condition(&failure, table.revoke(old), "handle revoke failed");
-                let new = table.insert(bench_handle(ProcessId::new(2), ResourceId::new(2)));
-                black_box(new);
+                if let Some(new) = capture_result(
+                    &failure,
+                    table
+                        .insert(bench_handle(ProcessId::new(2), ResourceId::new(2)))
+                        .context("replacement handle admission failed"),
+                ) {
+                    black_box(new);
+                }
             },
             BatchSize::SmallInput,
         );
@@ -509,21 +541,21 @@ fn bench_dataplane(c: &mut Criterion) -> anyhow::Result<()> {
     let failure = BenchFailure::default();
 
     group.bench_function("execute_unconditional_echo_no_fact", |b| {
-        let (plane, op) = match unconstrained_dataplane_fixture("effect://bench/dataplane-hot") {
-            Ok(fixture) => fixture,
-            Err(err) => {
-                failure.record(err);
-                return;
-            }
-        };
+        let (plane, op) =
+            match unconstrained_dataplane_fixture("effect://bench/dataplane-hot", false) {
+                Ok(fixture) => fixture,
+                Err(err) => {
+                    failure.record(err);
+                    return;
+                }
+            };
         b.iter(|| {
             let out = rt.block_on(plane.execute(
                 black_box(&op),
-                0,
-                ReplayClass::Deterministic,
-                OutputModeSet::UNARY | OutputModeSet::ASYNC_PROCESS,
-                FIXED_OPEN_MILLIS,
-                false,
+                InvocationOptions {
+                    now_millis: FIXED_OPEN_MILLIS,
+                    record: false,
+                },
             ));
             black_box(out.outcome);
         });
@@ -540,11 +572,10 @@ fn bench_dataplane(c: &mut Criterion) -> anyhow::Result<()> {
         b.iter(|| {
             let out = rt.block_on(plane.execute(
                 black_box(&op),
-                0,
-                ReplayClass::Deterministic,
-                OutputModeSet::UNARY | OutputModeSet::ASYNC_PROCESS,
-                FIXED_OPEN_MILLIS,
-                false,
+                InvocationOptions {
+                    now_millis: FIXED_OPEN_MILLIS,
+                    record: false,
+                },
             ));
             black_box(out.outcome);
         });
@@ -561,11 +592,10 @@ fn bench_dataplane(c: &mut Criterion) -> anyhow::Result<()> {
         b.iter(|| {
             let out = rt.block_on(plane.execute(
                 black_box(&op),
-                0,
-                ReplayClass::Deterministic,
-                OutputModeSet::UNARY | OutputModeSet::ASYNC_PROCESS,
-                FIXED_OPEN_MILLIS,
-                false,
+                InvocationOptions {
+                    now_millis: FIXED_OPEN_MILLIS,
+                    record: false,
+                },
             ));
             black_box(out.outcome);
         });
@@ -573,7 +603,7 @@ fn bench_dataplane(c: &mut Criterion) -> anyhow::Result<()> {
 
     group.bench_function("execute_unconditional_echo_with_fact", |b| {
         let (plane, base_op) =
-            match unconstrained_dataplane_fixture("effect://bench/dataplane-fact") {
+            match unconstrained_dataplane_fixture("effect://bench/dataplane-fact", true) {
                 Ok(fixture) => fixture,
                 Err(err) => {
                     failure.record(err);
@@ -584,14 +614,13 @@ fn bench_dataplane(c: &mut Criterion) -> anyhow::Result<()> {
         b.iter(|| {
             node = node.wrapping_add(1);
             let mut op = base_op.clone();
-            op.id = OperationId::new(op.process, NodeId::new(node), 0);
+            op.id = operation_id(op.process, node);
             let out = rt.block_on(plane.execute(
                 black_box(&op),
-                0,
-                ReplayClass::Observation,
-                OutputModeSet::UNARY | OutputModeSet::ASYNC_PROCESS,
-                FIXED_OPEN_MILLIS,
-                true,
+                InvocationOptions {
+                    now_millis: FIXED_OPEN_MILLIS,
+                    record: true,
+                },
             ));
             black_box(out.outcome);
         });
@@ -607,11 +636,10 @@ fn bench_dataplane(c: &mut Criterion) -> anyhow::Result<()> {
         };
         let first = rt.block_on(plane.execute(
             &op,
-            0,
-            ReplayClass::IdempotentEffect,
-            OutputModeSet::UNARY | OutputModeSet::ASYNC_PROCESS,
-            FIXED_OPEN_MILLIS,
-            false,
+            InvocationOptions {
+                now_millis: FIXED_OPEN_MILLIS,
+                record: false,
+            },
         ));
         if !first.outcome.is_success() {
             failure.record(anyhow!("first idempotent run failed: {:?}", first.outcome));
@@ -620,11 +648,10 @@ fn bench_dataplane(c: &mut Criterion) -> anyhow::Result<()> {
         b.iter(|| {
             let out = rt.block_on(plane.execute(
                 black_box(&op),
-                0,
-                ReplayClass::IdempotentEffect,
-                OutputModeSet::UNARY | OutputModeSet::ASYNC_PROCESS,
-                FIXED_OPEN_MILLIS,
-                false,
+                InvocationOptions {
+                    now_millis: FIXED_OPEN_MILLIS,
+                    record: false,
+                },
             ));
             black_box(out.outcome);
         });
@@ -642,14 +669,13 @@ fn bench_dataplane(c: &mut Criterion) -> anyhow::Result<()> {
         b.iter(|| {
             node = node.wrapping_add(1);
             let mut op = base_op.clone();
-            op.id = OperationId::new(op.process, NodeId::new(node), 0);
+            op.id = operation_id(op.process, node);
             let out = rt.block_on(plane.execute(
                 black_box(&op),
-                0,
-                ReplayClass::Deterministic,
-                MethodSpec::STREAM_ASYNC,
-                FIXED_OPEN_MILLIS,
-                false,
+                InvocationOptions {
+                    now_millis: FIXED_OPEN_MILLIS,
+                    record: false,
+                },
             ));
             black_box(out.outcome);
         });
@@ -657,7 +683,7 @@ fn bench_dataplane(c: &mut Criterion) -> anyhow::Result<()> {
 
     group.bench_function("execute_unconditional_echo_concurrent_64", |b| {
         let (plane, op) =
-            match unconstrained_dataplane_fixture("effect://bench/dataplane-concurrent") {
+            match unconstrained_dataplane_fixture("effect://bench/dataplane-concurrent", false) {
                 Ok(fixture) => fixture,
                 Err(err) => {
                     failure.record(err);
@@ -688,16 +714,15 @@ async fn run_concurrent_echo(
     for i in 0..workers {
         let plane = plane.clone();
         let mut op = op.clone();
-        op.id = OperationId::new(op.process, NodeId::new(i as u32), 0);
+        op.id = operation_id(op.process, i as u32);
         tasks.push(tokio::spawn(async move {
             plane
                 .execute(
                     &op,
-                    0,
-                    ReplayClass::Deterministic,
-                    OutputModeSet::UNARY | OutputModeSet::ASYNC_PROCESS,
-                    FIXED_OPEN_MILLIS,
-                    false,
+                    InvocationOptions {
+                        now_millis: FIXED_OPEN_MILLIS,
+                        record: false,
+                    },
                 )
                 .await
         }));
@@ -741,6 +766,126 @@ fn bench_fact_sink(c: &mut Criterion) -> anyhow::Result<()> {
         });
     });
 
+    group.finish();
+    failure.finish()
+}
+
+fn bench_fact_reads(c: &mut Criterion) -> anyhow::Result<()> {
+    use std::num::NonZeroUsize;
+    use xolotl_kernel::{FactLookup, FactLookupResult, FactOrder, FactQuery};
+
+    let query = FactQuery::new(
+        NonZeroUsize::new(64).context("nonzero page limit")?,
+        NonZeroUsize::new(1024 * 1024).context("nonzero byte limit")?,
+    );
+    let mut group = c.benchmark_group("kernel/fact_reads");
+    let failure = BenchFailure::default();
+    for count in [64u32, 4096, 65536] {
+        let (sink, _) = xolotl_kernel::FactSink::in_memory();
+        for node in 0..count {
+            sink.begin(fact(ProcessId::new(1), node, true))?;
+        }
+        let target = fact(ProcessId::new(1), count - 1, true).id;
+        for (name, query) in [
+            ("scan_page_64", query),
+            (
+                "reverse_page_64",
+                FactQuery {
+                    order: FactOrder::Reverse,
+                    ..query
+                },
+            ),
+            (
+                "reverse_sparse_64",
+                FactQuery {
+                    order: FactOrder::Reverse,
+                    process: Some(ProcessId::new(99)),
+                    ..query
+                },
+            ),
+        ] {
+            group.bench_function(BenchmarkId::new(name, count), |b| {
+                b.iter(|| {
+                    let page =
+                        capture_result(&failure, sink.scan(black_box(query)).map_err(Into::into));
+                    if let Some(page) = page {
+                        let expected = if query.process.is_some() { 0 } else { 64 };
+                        capture_condition(
+                            &failure,
+                            page.facts.len() == expected,
+                            "fact page size mismatch",
+                        );
+                        capture_condition(
+                            &failure,
+                            page.examined == 64,
+                            "fact candidate budget mismatch",
+                        );
+                        black_box(page);
+                    }
+                });
+            });
+        }
+        group.bench_function(BenchmarkId::new("bounded_get", count), |b| {
+            b.iter(|| {
+                let record = capture_result(
+                    &failure,
+                    sink.get_bounded(black_box(target), query.max_encoded_bytes)
+                        .map_err(Into::into),
+                );
+                if let Some(record) = record {
+                    capture_condition(&failure, record.is_some(), "bounded fact lookup missed");
+                    black_box(record);
+                }
+            });
+        });
+        for (name, process) in [("scoped_get", 1), ("filtered_lookup", 99)] {
+            let lookup = FactLookup {
+                id: target,
+                process: Some(ProcessId::new(process)),
+                max_encoded_bytes: if process == 1 {
+                    query.max_encoded_bytes
+                } else {
+                    NonZeroUsize::MIN
+                },
+            };
+            group.bench_function(BenchmarkId::new(name, count), |b| {
+                b.iter(|| {
+                    let result = capture_result(
+                        &failure,
+                        sink.lookup(black_box(lookup)).map_err(Into::into),
+                    );
+                    if let Some(result) = result {
+                        capture_condition(
+                            &failure,
+                            if process == 1 {
+                                matches!(&result, FactLookupResult::Found(fact) if fact.id == target)
+                            } else {
+                                matches!(&result, FactLookupResult::FilteredOut)
+                            },
+                            "scoped fact lookup result mismatch",
+                        );
+                        black_box(result);
+                    }
+                });
+            });
+        }
+        group.bench_function(BenchmarkId::new("get", count), |b| {
+            b.iter(|| {
+                let record =
+                    capture_result(&failure, sink.get(black_box(target)).map_err(Into::into));
+                if let Some(record) = record {
+                    capture_condition(&failure, record.is_some(), "fact lookup missed");
+                    black_box(record);
+                }
+            });
+        });
+        group.bench_function(BenchmarkId::new("all_facts", count), |b| {
+            b.iter(|| {
+                let records = capture_result(&failure, sink.all_facts().map_err(Into::into));
+                black_box(records);
+            });
+        });
+    }
     group.finish();
     failure.finish()
 }
@@ -802,13 +947,338 @@ fn bench_request_spawn(c: &mut Criterion) -> anyhow::Result<()> {
     failure.finish()
 }
 
+fn bench_process_reaping(c: &mut Criterion) -> anyhow::Result<()> {
+    const BATCH: usize = 64;
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    let failure = BenchFailure::default();
+    let mut group = c.benchmark_group("process_reaping");
+    group.throughput(criterion::Throughput::Elements(BATCH as u64));
+    for live in [64usize, 4096, 65_536] {
+        let mut boot = Bootstrap::in_memory();
+        for _ in 0..live {
+            boot.request_under(boot.root, IdentityRef::ROOT, &[])?
+                .detach();
+        }
+        group.bench_function(BenchmarkId::new("batch_64", live), |b| {
+            b.iter_custom(|iterations| {
+                let mut elapsed = std::time::Duration::ZERO;
+                for _ in 0..iterations {
+                    // Bound benchmark history between batches, while retaining the
+                    // same process table and identity source. Only reaping is timed.
+                    boot.kernel.facts = xolotl_kernel::FactSink::in_memory().0;
+                    boot.kernel.state = xolotl_state::InMemoryBackend::new().into_backend();
+                    let prepared: anyhow::Result<()> = runtime.block_on(async {
+                        for _ in 0..BATCH {
+                            boot.request_under(boot.root, IdentityRef::ROOT, &[])?
+                                .finish(&xolotl_types::ExecutionOutput::new(
+                                    Outcome::Done(Value::null()),
+                                    xolotl_types::TaintSet::pristine(),
+                                ))
+                                .await?;
+                        }
+                        Ok(())
+                    });
+                    if capture_result(&failure, prepared).is_none() {
+                        break;
+                    }
+                    let start = std::time::Instant::now();
+                    let reaped = black_box(boot.kernel.processes.reap_finalized(BATCH));
+                    elapsed += start.elapsed();
+                    capture_condition(&failure, reaped == BATCH, "reaping missed completed leaves");
+                }
+                elapsed
+            });
+        });
+    }
+    group.finish();
+    failure.finish()
+}
+
+fn bench_prepared_program(c: &mut Criterion) -> anyhow::Result<()> {
+    use xolotl_graph::portable::{Expression as E, Program, Transform};
+    use xolotl_kernel::{ExecutionBuffers, ExecutionConfig, PreparedProgram};
+    use xolotl_state::TaintedValue;
+
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    let boot = Bootstrap::in_memory();
+    let executor = boot.kernel.executor_for(boot.root);
+    let failure = BenchFailure::default();
+    let mut group = c.benchmark_group("kernel/prepared");
+    for (name, body, expected) in [
+        ("input", E::Input, Value::integer(0)),
+        (
+            "transforms_64",
+            E::Sequence {
+                steps: vec![
+                    E::Transform {
+                        operation: Transform::Add { value: 1 }
+                    };
+                    64
+                ],
+            },
+            Value::integer(64),
+        ),
+        (
+            "sequential_forks_64",
+            E::Sequence {
+                steps: vec![E::literal(1).both(E::literal(2)); 64],
+            },
+            Value::list(vec![Value::integer(1), Value::integer(2)]),
+        ),
+        (
+            "asymmetric_stacks",
+            (0..32)
+                .fold(E::Input, |body, _| body.finally(E::Input))
+                .both(E::Input),
+            Value::list(vec![Value::integer(0), Value::integer(0)]),
+        ),
+    ] {
+        let program = PreparedProgram::new(&Program::new(body).compile()?)?;
+        let expected = Outcome::Done(expected);
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                let output = runtime.block_on(executor.eval_prepared(
+                    black_box(&program),
+                    TaintedValue::pristine(Value::integer(0)),
+                ));
+                capture_condition(
+                    &failure,
+                    output.outcome == expected,
+                    "prepared program output mismatch",
+                );
+                black_box(output);
+            });
+        });
+        let mut buffers = ExecutionBuffers::default();
+        buffers.reserve_for(&program, &ExecutionConfig::default())?;
+        group.bench_function(format!("{name}_reused"), |b| {
+            b.iter(|| {
+                let output = runtime.block_on(executor.eval_prepared_with_buffers(
+                    black_box(&program),
+                    TaintedValue::pristine(Value::integer(0)),
+                    &mut buffers,
+                ));
+                capture_condition(
+                    &failure,
+                    output.outcome == expected,
+                    "reused program output mismatch",
+                );
+                black_box(output);
+            });
+        });
+    }
+    group.finish();
+    failure.finish()
+}
+
+fn bench_payload_program(c: &mut Criterion) -> anyhow::Result<()> {
+    use xolotl_graph::portable::{Expression as E, Program};
+    use xolotl_kernel::{ExecutionBuffers, ExecutionConfig, PreparedProgram};
+    use xolotl_state::TaintedValue;
+
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    let boot = Bootstrap::in_memory();
+    let executor = boot.kernel.executor_for(boot.root);
+    let failure = BenchFailure::default();
+    let mut group = c.benchmark_group("kernel/payload");
+    for size in [64 * 1024, 1024 * 1024] {
+        let input = Value::bytes(vec![0x5a; size]);
+        for (name, body, expected) in [
+            ("input", E::Input, input.clone()),
+            (
+                "inputs_64",
+                E::Sequence {
+                    steps: vec![E::Input; 64],
+                },
+                input.clone(),
+            ),
+            (
+                "fork",
+                E::Input.both(E::Input),
+                Value::list(vec![input.clone(), input.clone()]),
+            ),
+            ("race", E::Input.race(E::Input), input.clone()),
+        ] {
+            let program = PreparedProgram::new(&Program::new(body).compile()?)?;
+            let mut buffers = ExecutionBuffers::default();
+            buffers.reserve_for(&program, &ExecutionConfig::default())?;
+            capture_condition(
+                &failure,
+                runtime
+                    .block_on(executor.eval_prepared_with_buffers(
+                        &program,
+                        TaintedValue::pristine(input.clone()),
+                        &mut buffers,
+                    ))
+                    .outcome
+                    == Outcome::Done(expected),
+                "payload program output mismatch",
+            );
+            group.bench_with_input(BenchmarkId::new(name, size), &input, |b, input| {
+                // Isolate execution from input creation and final output destruction.
+                b.iter_batched(
+                    || TaintedValue::pristine(input.clone()),
+                    |input| {
+                        black_box(runtime.block_on(executor.eval_prepared_with_buffers(
+                            black_box(&program),
+                            input,
+                            &mut buffers,
+                        )))
+                    },
+                    BatchSize::PerIteration,
+                );
+            });
+        }
+    }
+    group.finish();
+    failure.finish()
+}
+
+fn bench_native_admission(c: &mut Criterion) -> anyhow::Result<()> {
+    use std::{io::Write, mem::size_of};
+    use xolotl_graph::{DoNode, StepRef, compile_do};
+    use xolotl_kernel::{ExecutionBuffers, ExecutionConfig};
+    use xolotl_state::TaintedValue;
+
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    let boot = Bootstrap::in_memory();
+    let executor = boot.kernel.executor_for(boot.root);
+    let failure = BenchFailure::default();
+    let mut group = c.benchmark_group("kernel/native");
+    for depth in [1, 64] {
+        let body = (0..depth).fold(DoNode::pure(Value::integer(42)), |body, _| {
+            body.or_else(StepRef::new("unused"))
+        });
+        let graph = compile_do(&body)?;
+        group.bench_function(BenchmarkId::new("dormant_recovery", depth), |b| {
+            b.iter(|| {
+                let output = runtime.block_on(executor.eval_graph(black_box(&graph)));
+                capture_condition(
+                    &failure,
+                    output.outcome == Outcome::Done(Value::integer(42)),
+                    "dormant native recovery output mismatch",
+                );
+                black_box(output);
+            });
+        });
+        let mut buffers = ExecutionBuffers::default();
+        group.bench_function(BenchmarkId::new("dormant_recovery_reused", depth), |b| {
+            b.iter(|| {
+                let output = runtime
+                    .block_on(executor.eval_graph_with_buffers(black_box(&graph), &mut buffers));
+                capture_condition(
+                    &failure,
+                    output.outcome == Outcome::Done(Value::integer(42)),
+                    "reused dormant native recovery output mismatch",
+                );
+                black_box(output);
+            });
+        });
+        if buffers.retained_bytes() != 0 {
+            let config = ExecutionConfig::default();
+            let eager = config.max_tasks
+                * size_of::<xolotl_core::Task<TaintedValue, xolotl_types::TaintedFailure>>()
+                + config.max_frames
+                    * size_of::<
+                        Option<xolotl_core::Frame<TaintedValue, xolotl_types::TaintedFailure>>,
+                    >()
+                + config.max_tasks * config.bindings_per_task * size_of::<Option<TaintedValue>>();
+            writeln!(
+                std::io::stdout().lock(),
+                "native recovery depth {depth}: {} B retained; previous eager layout: {eager} B",
+                buffers.retained_bytes(),
+            )?;
+        }
+    }
+    group.finish();
+    failure.finish()
+}
+
+fn bench_native_steps(c: &mut Criterion) -> anyhow::Result<()> {
+    use xolotl_graph::{ActorSpec, DoNode, StepRef, compile_do};
+    use xolotl_kernel::{ExecutionBuffers, StepModule};
+
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    let boot = Bootstrap::in_memory();
+    let actor = runtime.block_on(boot.spawn_actor_under_with_steps(
+        boot.root,
+        IdentityRef::ROOT,
+        "root",
+        &ActorSpec {
+            name: "native_steps".into(),
+            body: DoNode::wait_signal(Path::parse("state://bench/native/hold")?),
+            ..ActorSpec::default()
+        },
+        StepModule::single("increment", |input, _| match input.as_int() {
+            Some(value) => DoNode::pure(value + 1),
+            _ => DoNode::fail(xolotl_types::Failure::InvalidInput {
+                reason: "expected integer".into(),
+            }),
+        })?,
+    ))?;
+    let executor = boot.kernel.executor_for(actor.process);
+    let failure = BenchFailure::default();
+    let mut group = c.benchmark_group("kernel/native_steps");
+    for depth in [1, 64] {
+        let body = (0..depth).fold(DoNode::pure(0), |body, _| {
+            body.and_then(StepRef::new("increment"))
+        });
+        let graph = compile_do(&body)?;
+        let mut buffers = ExecutionBuffers::default();
+        group.bench_function(BenchmarkId::new("sequential_reused", depth), |b| {
+            b.iter(|| {
+                let output = runtime
+                    .block_on(executor.eval_graph_with_buffers(black_box(&graph), &mut buffers));
+                capture_condition(
+                    &failure,
+                    output.outcome == Outcome::Done(Value::integer(depth)),
+                    "native step output mismatch",
+                );
+                black_box(output);
+            });
+        });
+    }
+    group.finish();
+    runtime.block_on(boot.finalize_process(actor.process))?;
+    failure.finish()
+}
+
+fn bench_execution_ids(c: &mut Criterion) -> anyhow::Result<()> {
+    let ids =
+        xolotl_kernel::ExecutionIds::new(Arc::new(xolotl_kernel::InMemoryExecutionIdSource::new()));
+    let execution = ids.allocate()?;
+    let id = OperationId::new(
+        ProcessId::new(1),
+        execution,
+        InvocationId::new(1),
+        NodeId::ROOT,
+        0,
+    );
+    let mut group = c.benchmark_group("kernel/execution_identity");
+    group.bench_function("allocate_amortized", |b| {
+        b.iter(|| black_box(ids.allocate()))
+    });
+    group.bench_function("canonical_bytes", |b| {
+        b.iter(|| black_box(black_box(id).to_bytes()))
+    });
+    group.finish();
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let mut criterion = Criterion::default().configure_from_args();
     bench_open(&mut criterion).context("kernel/open benchmarks failed")?;
     bench_handle_table(&mut criterion).context("kernel/handle_table benchmarks failed")?;
     bench_dataplane(&mut criterion).context("kernel/dataplane benchmarks failed")?;
     bench_fact_sink(&mut criterion).context("kernel/fact_sink benchmarks failed")?;
+    bench_fact_reads(&mut criterion).context("kernel/fact_reads benchmarks failed")?;
     bench_request_spawn(&mut criterion).context("request_spawn benchmarks failed")?;
+    bench_process_reaping(&mut criterion).context("process reaping benchmarks failed")?;
+    bench_prepared_program(&mut criterion).context("prepared program benchmarks failed")?;
+    bench_payload_program(&mut criterion).context("payload program benchmarks failed")?;
+    bench_native_admission(&mut criterion).context("native admission benchmarks failed")?;
+    bench_native_steps(&mut criterion).context("native step benchmarks failed")?;
+    bench_execution_ids(&mut criterion).context("execution identity benchmarks failed")?;
     criterion.final_summary();
     Ok(())
 }

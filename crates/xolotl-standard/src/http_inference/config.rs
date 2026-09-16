@@ -1,5 +1,4 @@
 use super::request;
-use serde_json::Value as JsonValue;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -54,12 +53,12 @@ impl HttpInferenceAuth {
 }
 
 /// Optional HTTP inference provider request settings.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct HttpInferenceOptions {
     /// Extra headers that are not authentication headers.
     pub(crate) default_headers: BTreeMap<String, String>,
     /// Provider-specific non-secret request fields.
-    pub(crate) request_overrides: BTreeMap<String, JsonValue>,
+    pub(crate) request_overrides: xolotl_types::ValueMap,
     /// Optional API version interpreted by the selected dialect.
     pub(crate) api_version: Option<String>,
     /// Maximum output tokens for APIs that require or accept it.
@@ -71,7 +70,7 @@ pub(crate) struct HttpInferenceOptions {
 }
 
 /// Configuration for one HTTP inference provider endpoint.
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub(crate) struct HttpInferenceConfig {
     /// Stable backend id used in router model ids.
     pub(crate) id: String,
@@ -91,6 +90,10 @@ pub(crate) struct HttpInferenceConfig {
     pub(crate) capabilities: crate::inference::ModelCapabilities,
     /// Request settings.
     pub(crate) options: HttpInferenceOptions,
+    /// Window of encoded request bytes and cooperative JSON parsing work.
+    pub(crate) io_window_bytes: core::num::NonZeroUsize,
+    /// Explicit retention policy for selected unary results and atomic SSE records.
+    pub(crate) response_limits: super::json::project::Limits,
 }
 
 impl fmt::Debug for HttpInferenceConfig {
@@ -105,6 +108,8 @@ impl fmt::Debug for HttpInferenceConfig {
             .field("auth", &self.auth)
             .field("capabilities", &self.capabilities)
             .field("options", &self.options)
+            .field("io_window_bytes", &self.io_window_bytes)
+            .field("response_limits", &self.response_limits)
             .finish()
     }
 }
@@ -128,6 +133,8 @@ impl HttpInferenceConfig {
             auth,
             capabilities: request::default_capabilities(dialect),
             options: HttpInferenceOptions::default(),
+            io_window_bytes: core::num::NonZeroUsize::MIN.saturating_add(16 * 1024 - 1),
+            response_limits: super::json::project::Limits::default(),
         }
     }
 

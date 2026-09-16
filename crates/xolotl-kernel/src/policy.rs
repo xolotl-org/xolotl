@@ -358,12 +358,15 @@ impl CompiledCheck for RateLimitCheck {
                     };
                 }
                 match self.state.write_cas(&path, current, new).await {
-                    Ok(()) => {
+                    Ok(_commit) => {
                         return PolicyDecision::Deny {
                             reason: "rate limit exceeded".into(),
                         };
                     }
-                    Err(xolotl_state::StateError::CasFailed { .. }) => continue,
+                    Err(xolotl_state::StateFailure {
+                        error: xolotl_state::StateError::CasFailed { .. },
+                        ..
+                    }) => continue,
                     Err(e) => {
                         return PolicyDecision::Deny {
                             reason: format!("rate limit state write failed: {e}"),
@@ -376,8 +379,11 @@ impl CompiledCheck for RateLimitCheck {
             hits.sort_unstable();
             let new = encode_rate_hits(&hits);
             match self.state.write_cas(&path, current, new).await {
-                Ok(()) => return PolicyDecision::Allow,
-                Err(xolotl_state::StateError::CasFailed { .. }) => continue,
+                Ok(_commit) => return PolicyDecision::Allow,
+                Err(xolotl_state::StateFailure {
+                    error: xolotl_state::StateError::CasFailed { .. },
+                    ..
+                }) => continue,
                 Err(e) => {
                     return PolicyDecision::Deny {
                         reason: format!("rate limit state write failed: {e}"),
@@ -411,22 +417,24 @@ fn rate_limit_path(
 fn decode_rate_hits(value: Option<Value>) -> Result<Vec<i64>, String> {
     match value {
         None => Ok(Vec::new()),
-        Some(Value::List(items)) => {
+        Some(value) => {
+            let items = value
+                .as_list()
+                .ok_or_else(|| format!("expected timestamp list, found {value:?}"))?;
             let mut hits = Vec::with_capacity(items.len());
             for item in items {
-                match item {
-                    Value::Int(t) => hits.push(t),
-                    other => return Err(format!("expected integer timestamp, found {other:?}")),
+                match item.as_int() {
+                    Some(t) => hits.push(t),
+                    None => return Err(format!("expected integer timestamp, found {item:?}")),
                 }
             }
             Ok(hits)
         }
-        Some(other) => Err(format!("expected timestamp list, found {other:?}")),
     }
 }
 
 fn encode_rate_hits(hits: &[i64]) -> Value {
-    Value::List(hits.iter().copied().map(Value::Int).collect())
+    Value::list(hits.iter().copied().map(Value::integer).collect())
 }
 
 /// A policy source that attaches a residual [`ConstraintCheck`] for a capability
@@ -469,7 +477,7 @@ mod tests {
     use xolotl_types::cap::Predicate;
 
     fn state() -> Backend {
-        Arc::new(InMemoryBackend::new())
+        InMemoryBackend::new().into_backend()
     }
 
     fn ctx<'a>(input: &'a Value) -> CheckCtx<'a> {
@@ -485,7 +493,7 @@ mod tests {
     async fn empty_snapshot_allows_and_is_unconditional() -> anyhow::Result<()> {
         let snap = PolicySnapshot::empty();
         ensure!(snap.is_empty(), "empty snapshot should report empty");
-        let decision = snap.check(&ctx(&Value::Null)).await;
+        let decision = snap.check(&ctx(&Value::null())).await;
         ensure!(
             decision == PolicyDecision::Allow,
             "empty snapshot should allow, got {decision:?}"
@@ -500,14 +508,14 @@ mod tests {
         };
         let snap = PolicySnapshot::new(vec![Arc::new(ConstraintCheck { constraints: cs })]);
         let mut m = BTreeMap::new();
-        m.insert("account".into(), Value::Str("alice".into()));
-        let allowed = snap.check(&ctx(&Value::Map(m))).await;
+        m.insert("account".into(), Value::string("alice".into()));
+        let allowed = snap.check(&ctx(&Value::map(m))).await;
         ensure!(
             allowed == PolicyDecision::Allow,
             "matching constraint should allow, got {allowed:?}"
         );
         // Missing field → denied.
-        let denied = snap.check(&ctx(&Value::Null)).await;
+        let denied = snap.check(&ctx(&Value::null())).await;
         ensure!(
             matches!(denied, PolicyDecision::Deny { .. }),
             "missing constraint input should deny, got {denied:?}"
@@ -518,7 +526,7 @@ mod tests {
     #[tokio::test]
     async fn first_non_allow_short_circuits() -> anyhow::Result<()> {
         let snap = PolicySnapshot::new(vec![Arc::new(ApprovalCheck::always("k", "needs ok"))]);
-        let decision = snap.check(&ctx(&Value::Null)).await;
+        let decision = snap.check(&ctx(&Value::null())).await;
         ensure!(
             matches!(decision, PolicyDecision::Ask { .. }),
             "approval check should ask, got {decision:?}"
@@ -537,21 +545,21 @@ mod tests {
             reg.clone(),
         ))]);
         // Pending → Ask.
-        let pending = snap.check(&ctx(&Value::Null)).await;
+        let pending = snap.check(&ctx(&Value::null())).await;
         ensure!(
             matches!(pending, PolicyDecision::Ask { .. }),
             "pending approval should ask, got {pending:?}"
         );
         // Approved → Allow (the suspended op would now pass on retry).
         reg.set("pay-1", ApprovalDecision::Approved);
-        let approved = snap.check(&ctx(&Value::Null)).await;
+        let approved = snap.check(&ctx(&Value::null())).await;
         ensure!(
             approved.is_allow(),
             "approved request should allow, got {approved:?}"
         );
         // Denied → Deny.
         reg.set("pay-1", ApprovalDecision::Denied);
-        let denied = snap.check(&ctx(&Value::Null)).await;
+        let denied = snap.check(&ctx(&Value::null())).await;
         ensure!(
             matches!(denied, PolicyDecision::Deny { .. }),
             "denied approval should deny, got {denied:?}"
@@ -563,25 +571,25 @@ mod tests {
     async fn rate_limit_denies_past_the_window_budget() -> anyhow::Result<()> {
         let snap = PolicySnapshot::new(vec![Arc::new(RateLimitCheck::new(2, 1000, state()))]);
         // Two allowed in the window…
-        let first = snap.check(&ctx(&Value::Null)).await;
+        let first = snap.check(&ctx(&Value::null())).await;
         ensure!(
             first.is_allow(),
             "first rate-limit hit should allow, got {first:?}"
         );
-        let second = snap.check(&ctx(&Value::Null)).await;
+        let second = snap.check(&ctx(&Value::null())).await;
         ensure!(
             second.is_allow(),
             "second rate-limit hit should allow, got {second:?}"
         );
         // …third denied.
-        let third = snap.check(&ctx(&Value::Null)).await;
+        let third = snap.check(&ctx(&Value::null())).await;
         ensure!(
             matches!(third, PolicyDecision::Deny { .. }),
             "third rate-limit hit should deny, got {third:?}"
         );
         // After the window slides past all prior hits, allowed again.
         let later = CheckCtx {
-            input: &Value::Null,
+            input: &Value::null(),
             acting: xolotl_types::IdentityRef::ROOT,
             now_millis: 2000,
             target: ResourceId::new(1),
@@ -599,19 +607,19 @@ mod tests {
         // Different targets and acting identities each get their own window.
         let snap = PolicySnapshot::new(vec![Arc::new(RateLimitCheck::new(1, 1000, state()))]);
         let alice = CheckCtx {
-            input: &Value::Null,
+            input: &Value::null(),
             acting: xolotl_types::IdentityRef::new(10),
             now_millis: 0,
             target: ResourceId::new(1),
         };
         let bob = CheckCtx {
-            input: &Value::Null,
+            input: &Value::null(),
             acting: xolotl_types::IdentityRef::new(20),
             now_millis: 0,
             target: ResourceId::new(1),
         };
         let other_target = CheckCtx {
-            input: &Value::Null,
+            input: &Value::null(),
             acting: xolotl_types::IdentityRef::new(10),
             now_millis: 0,
             target: ResourceId::new(2),
@@ -641,7 +649,7 @@ mod tests {
         // A true sliding window: a hit at t=0 and one at t=600 with max=2,
         // window=1000. At t=1100 the t=0 hit has slid out, so one more fits.
         let rl = RateLimitCheck::new(2, 1000, state());
-        let input = Value::Null;
+        let input = Value::null();
         let mk = |t: i64| CheckCtx {
             input: &input,
             acting: xolotl_types::IdentityRef::ROOT,
@@ -672,7 +680,7 @@ mod tests {
         let state = state();
         let a = RateLimitCheck::new(1, 1000, state.clone());
         let b = RateLimitCheck::new(1, 1000, state);
-        let input = Value::Null;
+        let input = Value::null();
         let mk = |t: i64| CheckCtx {
             input: &input,
             acting: xolotl_types::IdentityRef::ROOT,
@@ -694,7 +702,7 @@ mod tests {
     async fn rate_limit_persists_evicted_window() -> anyhow::Result<()> {
         let state = state();
         let rl = RateLimitCheck::new(2, 1000, state.clone());
-        let input = Value::Null;
+        let input = Value::null();
         let mk = |t: i64| CheckCtx {
             input: &input,
             acting: xolotl_types::IdentityRef::ROOT,
@@ -721,7 +729,7 @@ mod tests {
             .await
             .context("rate limit state read failed")?;
         ensure!(
-            stored == Some(Value::List(vec![Value::Int(600), Value::Int(1100)])),
+            stored == Some(Value::list(vec![Value::integer(600), Value::integer(1100)])),
             "stored rate-limit window mismatch: {stored:?}"
         );
         Ok(())

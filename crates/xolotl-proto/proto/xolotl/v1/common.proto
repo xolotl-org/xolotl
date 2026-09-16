@@ -9,6 +9,26 @@ message Path {
   repeated string segments = 3;
 }
 
+// Server-owned lineage, independent of object upload/download authority.
+message TaintSet {
+  repeated TaintSource sources = 1;
+}
+
+message TaintSource {
+  message Marker {}
+  message Inbound {
+    string source = 1;
+    string channel = 2;
+  }
+  oneof kind {
+    Marker author_constant = 1;
+    Marker model_output = 2;
+    Inbound inbound = 3;
+    string fetched_host = 4;
+    Path protected_path = 5;
+  }
+}
+
 // Self-describing value (mirrors xolotl_types::Value, including multimodal refs).
 message Value {
   oneof kind {
@@ -76,10 +96,50 @@ enum Purity {
   PURITY_EFFECTFUL = 3;
 }
 
-// Outcome failure (detail in the message string).
+// Lossless domain failure. The selected variant and all its fields are required
+// to preserve recovery decisions; a display string is not its representation.
 message Failure {
-  string kind = 1;
-  string message = 2;
+  message Marker {}
+  message PermissionDenied {
+    repeated string required = 1;
+    repeated string actual = 2;
+  }
+  message ApprovalPending {
+    string approval_key = 1;
+    string reason = 2;
+  }
+  message Quarantined {
+    string op_id = 1;
+    string reason = 2;
+  }
+  message ClassifiedError {
+    string kind = 1;
+    string message = 2;
+  }
+  message PolicyViolation {
+    string policy = 1;
+    string detail = 2;
+  }
+  message PathInvalid {
+    Path path = 1;
+    string reason = 2;
+  }
+  oneof kind {
+    PermissionDenied permission_denied = 1;
+    Path no_handler = 2;
+    string budget_exhausted = 3;
+    Marker rate_limited = 4;
+    ApprovalPending approval_pending = 5;
+    Marker timeout = 6;
+    Marker cancelled = 7;
+    Quarantined quarantined = 8;
+    string invalid_input = 9;
+    ClassifiedError handler_error = 10;
+    Marker kernel_namespace_protected = 11;
+    PolicyViolation policy_violation = 12;
+    PathInvalid path_invalid = 13;
+    ClassifiedError custom = 14;
+  }
 }
 
 // Outcome of evaluating an Operation / program node.

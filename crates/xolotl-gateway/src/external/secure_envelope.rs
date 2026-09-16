@@ -5,6 +5,12 @@ use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
 
+// Require both AEAD key cleanup and cipher's gated buffer-cleanup support.
+const _: () = {
+    const fn assert_key_cleanup<T: cipher::zeroize::ZeroizeOnDrop>() {}
+    assert_key_cleanup::<ChaCha20Poly1305>();
+};
+
 /// Default replay window size for secure external envelopes.
 pub const DEFAULT_SECURE_ENVELOPE_REPLAY_WINDOW: usize = 64;
 const MAX_SECURE_ENVELOPE_REPLAY_WINDOW: usize = 128;
@@ -51,7 +57,7 @@ impl ExternalCredential {
         let ciphertext = self
             .cipher(&aad)?
             .encrypt(
-                Nonce::from_slice(&nonce_bytes(&nonce_prefix, seq)),
+                &Nonce::from(nonce_bytes(&nonce_prefix, seq)),
                 Payload {
                     msg: payload,
                     aad: &aad_bytes(&self.installation_id, self.generation, &aad),
@@ -79,7 +85,7 @@ impl ExternalCredential {
         }
         self.cipher(&env.aad)?
             .decrypt(
-                Nonce::from_slice(&nonce_bytes(&env.nonce_prefix, env.aad.seq)),
+                &Nonce::from(nonce_bytes(&env.nonce_prefix, env.aad.seq)),
                 Payload {
                     msg: &env.ciphertext,
                     aad: &aad_bytes(&env.installation_id, env.generation, &env.aad),
@@ -504,6 +510,40 @@ mod tests {
         ensure!(env.ciphertext != b"hello frame", "ciphertext matched input");
         let opened = cred.open(&env, 0)?;
         ensure!(opened == b"hello frame", "unexpected plaintext: {opened:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn v1_envelope_matches_an_independent_aead_vector() -> anyhow::Result<()> {
+        // Node/OpenSSL HKDF-SHA256 and ChaCha20-Poly1305, using the v1 AAD below.
+        const CIPHERTEXT: [u8; 27] = [
+            0x55, 0x71, 0xa3, 0xc8, 0xe6, 0x0d, 0x82, 0x48, 0xcf, 0xe2, 0x70, 0xac, 0x3f, 0xe3,
+            0x40, 0x5c, 0xe7, 0x34, 0x75, 0x9f, 0xdb, 0x7a, 0xf2, 0x01, 0xe7, 0x24, 0x7d,
+        ];
+        let prefix = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let aad = valid_aad(7);
+        let nonce = nonce_bytes(&prefix, aad.seq);
+        ensure!(nonce == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12]);
+        let cred = test_credential("inst-1", 1);
+        let sealed = cred
+            .cipher(&aad)?
+            .encrypt(
+                &Nonce::from(nonce),
+                Payload {
+                    msg: b"hello frame",
+                    aad: &aad_bytes("inst-1", 1, &aad),
+                },
+            )
+            .map_err(|_error| EnvelopeError::Crypto)?;
+        ensure!(sealed == CIPHERTEXT);
+        let mut env = SecureEnvelope::from_parts("inst-1", 1, aad, prefix, CIPHERTEXT.to_vec());
+        let mut replay = SecureEnvelopeReplayWindow::default();
+        ensure!(cred.open_with_replay_window(&env, 0, &mut replay)? == b"hello frame");
+        env.aad.transcript_hash[0] ^= 1;
+        ensure!(
+            cred.open_with_replay_window(&env, 0, &mut SecureEnvelopeReplayWindow::default())
+                == Err(EnvelopeError::BadAead)
+        );
         Ok(())
     }
 

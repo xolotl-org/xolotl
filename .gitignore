@@ -2,6 +2,7 @@
 /target/
 /docs/book/
 /docs/zh-CN/book/
+__pycache__/
 
 # Environment
 .env

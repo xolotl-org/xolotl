@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use xolotl_graph::{DoNode, OperationTemplate, StepRef};
 use xolotl_types::{
     BlobRef, Capability, DType, Failure, FloatBits, FrameKind, Outcome, OutputMode, Path,
-    Predicate, ProcessId, ResourceName, StreamMarker, TensorRef, Value,
+    Predicate, ResourceName, StreamMarker, TensorRef, Value,
 };
 
 fn p(path: &str) -> anyhow::Result<Path> {
@@ -51,20 +51,24 @@ fn pb_blob() -> crate::xolotl::v1::BlobRef {
 
 fn composite_value() -> Value {
     let mut m = BTreeMap::new();
-    m.insert("null".into(), Value::Null);
-    m.insert("bool".into(), Value::Bool(true));
-    m.insert("int".into(), Value::Int(-7));
-    m.insert("float".into(), Value::Float(FloatBits(3.5)));
-    m.insert("str".into(), Value::Str("héllo".into()));
-    m.insert("bytes".into(), Value::Bytes(vec![0, 1, 2, 255]));
+    m.insert("null".into(), Value::null());
+    m.insert("bool".into(), Value::boolean(true));
+    m.insert("int".into(), Value::integer(-7));
+    m.insert("float".into(), Value::float(FloatBits(3.5)));
+    m.insert("str".into(), Value::string("héllo".into()));
+    m.insert("bytes".into(), Value::bytes(vec![0, 1, 2, 255]));
     m.insert(
         "list".into(),
-        Value::List(vec![Value::Int(1), Value::Str("x".into()), Value::Null]),
+        Value::list(vec![
+            Value::integer(1),
+            Value::string("x".into()),
+            Value::null(),
+        ]),
     );
-    m.insert("blob".into(), Value::Blob(blob()));
+    m.insert("blob".into(), Value::blob(blob()));
     m.insert(
         "tensor".into(),
-        Value::Tensor(TensorRef {
+        Value::from(TensorRef {
             blob: blob(),
             dtype: DType::F32,
             shape: vec![1, 8],
@@ -74,14 +78,14 @@ fn composite_value() -> Value {
         "frame".into(),
         Value::frame(blob(), 123_456, FrameKind::Video),
     );
-    m.insert("stream_done".into(), Value::StreamEnd(StreamMarker::Done));
+    m.insert("stream_done".into(), Value::stream_end(StreamMarker::Done));
     m.insert(
         "stream_err".into(),
-        Value::StreamEnd(StreamMarker::Error {
+        Value::stream_end(StreamMarker::Error {
             message: "boom".into(),
         }),
     );
-    Value::Map(m)
+    Value::map(m)
 }
 
 #[test]
@@ -89,6 +93,28 @@ fn value_round_trips_every_variant() {
     let v = composite_value();
     let back = value_from_pb(&value_to_pb(&v));
     assert_eq!(v, back, "structural Value mapping must be lossless");
+}
+
+#[test]
+fn protobuf_wire_round_trip_preserves_exact_float_bits() -> anyhow::Result<()> {
+    use prost::Message;
+    for bits in [
+        0,
+        1,
+        1u64 << 63,
+        f64::INFINITY.to_bits(),
+        f64::NEG_INFINITY.to_bits(),
+        0x7ff0_0000_0000_0001,
+        0x7ff8_0000_0000_1234,
+        u64::MAX,
+    ] {
+        let value = Value::float(FloatBits(f64::from_bits(bits)));
+        let bytes = value_to_pb(&value).encode_to_vec();
+        let wire = crate::xolotl::v1::Value::decode(bytes.as_slice())?;
+        let decoded = value_from_pb_checked(&wire)?;
+        ensure!(decoded == value, "protobuf changed float bits {bits:016x}");
+    }
+    Ok(())
 }
 
 #[test]
@@ -105,7 +131,7 @@ fn every_dtype_round_trips() {
         DType::U8,
         DType::Bool,
     ] {
-        let v = Value::Tensor(TensorRef {
+        let v = Value::from(TensorRef {
             blob: blob(),
             dtype: d,
             shape: vec![2],
@@ -130,7 +156,7 @@ fn every_frame_kind_round_trips() {
 #[test]
 fn empty_pb_value_is_null() {
     let pb = crate::xolotl::v1::Value { kind: None };
-    assert_eq!(value_from_pb(&pb), Value::Null);
+    assert_eq!(value_from_pb(&pb), Value::null());
 }
 
 #[test]
@@ -150,8 +176,8 @@ fn malformed_multimodal_refs_do_not_synthesize_empty_blob() {
             kind: "video".into(),
         })),
     };
-    assert_eq!(value_from_pb(&tensor), Value::Null);
-    assert_eq!(value_from_pb(&frame), Value::Null);
+    assert_eq!(value_from_pb(&tensor), Value::null());
+    assert_eq!(value_from_pb(&frame), Value::null());
 }
 
 #[test]
@@ -171,8 +197,8 @@ fn malformed_multimodal_enums_do_not_default_to_valid_variants() {
             kind: "depth".into(),
         })),
     };
-    assert_eq!(value_from_pb(&tensor), Value::Null);
-    assert_eq!(value_from_pb(&frame), Value::Null);
+    assert_eq!(value_from_pb(&tensor), Value::null());
+    assert_eq!(value_from_pb(&frame), Value::null());
 }
 
 #[test]
@@ -188,8 +214,8 @@ fn malformed_stream_markers_do_not_default_to_done() {
             kind: Some(pb::stream_marker::Kind::Done(false)),
         })),
     };
-    assert_eq!(value_from_pb(&missing_kind), Value::Null);
-    assert_eq!(value_from_pb(&false_done), Value::Null);
+    assert_eq!(value_from_pb(&missing_kind), Value::null());
+    assert_eq!(value_from_pb(&false_done), Value::null());
 }
 
 #[test]
@@ -514,10 +540,10 @@ fn program_round_trips_structurally() -> anyhow::Result<()> {
     let op = op_template(
         "effect://x/post",
         OutputMode::Collect { limit: 8 },
-        Some(Value::Str("hello".into())),
+        Some(Value::string("hello".into())),
     )?;
     let program = DoNode::Both(
-        Box::new(DoNode::Pure(Value::Int(1))),
+        Box::new(DoNode::Pure(Value::integer(1))),
         Box::new(DoNode::Op(op)),
     );
     let back = program_from_pb(&program_to_pb(&program))?;
@@ -613,7 +639,7 @@ fn program_blank_operation_method_fails_closed() -> anyhow::Result<()> {
 
 #[test]
 fn program_blank_step_and_binding_names_fail_closed() -> anyhow::Result<()> {
-    let blank_step = DoNode::pure(Value::Null).and_then(StepRef::new(ProcessId::new(1), " "));
+    let blank_step = DoNode::pure(Value::null()).and_then(StepRef::new(" "));
     ensure!(
         program_from_pb(&program_to_pb(&blank_step)).is_err(),
         "blank step name should fail closed"
@@ -621,7 +647,7 @@ fn program_blank_step_and_binding_names_fail_closed() -> anyhow::Result<()> {
 
     let blank_let = DoNode::Let {
         name: String::new(),
-        value: Box::new(DoNode::pure(Value::Int(1))),
+        value: Box::new(DoNode::pure(Value::integer(1))),
         body: Box::new(DoNode::Use("x".into())),
     };
     ensure!(
@@ -638,7 +664,19 @@ fn program_blank_step_and_binding_names_fail_closed() -> anyhow::Result<()> {
 }
 
 #[test]
-fn program_blank_failure_kind_fails_closed() -> anyhow::Result<()> {
+fn named_steps_round_trip_through_protobuf_bytes() -> anyhow::Result<()> {
+    use prost::Message;
+    let program = DoNode::pure(Value::integer(21))
+        .and_then(StepRef::new("math/double").with_arg(composite_value()))
+        .or_else(StepRef::new("recover"));
+    let bytes = program_to_pb(&program).encode_to_vec();
+    let decoded = crate::xolotl::v1::Program::decode(bytes.as_slice())?;
+    ensure!(program_from_pb(&decoded)? == program);
+    Ok(())
+}
+
+#[test]
+fn program_missing_failure_kind_fails_closed() -> anyhow::Result<()> {
     let mut program = program_to_pb(&DoNode::Fail(Failure::Timeout));
     let root = program.root.as_mut().context("missing program root")?;
     let crate::xolotl::v1::do_node::Kind::Fail(failure) =
@@ -646,11 +684,11 @@ fn program_blank_failure_kind_fails_closed() -> anyhow::Result<()> {
     else {
         bail!("expected fail node");
     };
-    failure.kind = String::new();
+    failure.kind = None;
 
     ensure!(
         program_from_pb(&program).is_err(),
-        "blank failure kind should fail closed"
+        "missing failure kind should fail closed"
     );
     Ok(())
 }
@@ -666,7 +704,7 @@ fn program_missing_root_fails_closed() {
 
 #[test]
 fn outcome_done_and_fail_map() -> anyhow::Result<()> {
-    let done = Outcome::Done(Value::Int(5));
+    let done = Outcome::Done(Value::integer(5));
     let pb = outcome_to_pb(&done);
     ensure!(
         matches!(pb.result, Some(crate::xolotl::v1::outcome::Result::Done(_))),
@@ -677,7 +715,7 @@ fn outcome_done_and_fail_map() -> anyhow::Result<()> {
     let pb = outcome_to_pb(&fail);
     match pb.result {
         Some(crate::xolotl::v1::outcome::Result::Fail(f)) => {
-            ensure!(f.kind == "timeout", "unexpected failure kind: {}", f.kind);
+            ensure!(failure_from_pb(&f)? == Failure::Timeout);
         }
         other => bail!("expected fail, got {other:?}"),
     }
@@ -714,7 +752,7 @@ fn external_handshake_frames_survive_wire() -> anyhow::Result<()> {
                     presentation_config_generation: 1,
                     alias_catalog_generation: 2,
                 }),
-                config_schema: Some(value_to_pb(&Value::Null)),
+                config_schema: Some(value_to_pb(&Value::null())),
             },
         )),
     };
@@ -769,7 +807,7 @@ fn external_session_typed_frames_roundtrip() -> anyhow::Result<()> {
         projection_id: "source".into(),
         registry_hash: "registry-abc".into(),
         observed,
-        config_schema: Some(Value::Map(Default::default())),
+        config_schema: Some(Value::map(Default::default())),
     };
     let back = role_session_client_hello_from_pb(&role_session_client_hello_to_pb(&hello))?;
     ensure!(back == hello, "hello changed: {back:?}");
@@ -798,7 +836,7 @@ fn external_session_typed_frames_roundtrip() -> anyhow::Result<()> {
 
     let event = InboundEvent {
         id: "event-1".into(),
-        payload: Value::Str("hello".into()),
+        payload: Value::string("hello".into()),
         observed,
         timestamp_ms: 1234,
         stream_id: Some("stream-1".into()),
@@ -899,16 +937,16 @@ fn external_control_frames_roundtrip_through_pb() -> anyhow::Result<()> {
         ControlFrame::PresentationProfileUpdate {
             profile_generation: 2,
             profile_hash: "profile-hash".into(),
-            profile: Value::Map(Default::default()),
+            profile: Value::map(Default::default()),
         },
         ControlFrame::InstallationConfigUpdate {
             config_version: 3,
-            config: Value::Str("cfg".into()),
+            config: Value::string("cfg".into()),
         },
         ControlFrame::PresentationConfigUpdate {
             generation: 4,
             profile_hash: "profile-hash".into(),
-            config: Value::Bool(true),
+            config: Value::boolean(true),
         },
         ControlFrame::ConfigAck {
             axis: ConfigAxis::InstallationConfig,
@@ -948,7 +986,7 @@ fn invoke_frame_types_roundtrip_through_pb() -> anyhow::Result<()> {
         invocation_id: "inv-1".into(),
         effect_path: p("effect://x/post")?,
         method_id: MethodId::new(7),
-        input: Value::Str("hello".into()),
+        input: Value::string("hello".into()),
         deadline_ms: Some(5000),
         output_stream_to: Some(p("state://chat/out")?),
     };
@@ -1037,7 +1075,7 @@ fn malformed_wire_paths_and_capabilities_fail_closed() -> anyhow::Result<()> {
     let missing_effect_path = ext::Invoke {
         invocation_id: "inv-1".into(),
         effect_path: None,
-        input: Some(crate::convert::value_to_pb(&Value::Null)),
+        input: Some(crate::convert::value_to_pb(&Value::null())),
         deadline_ms: None,
         output_stream_to: None,
         method_id: Some(0),
@@ -1050,7 +1088,7 @@ fn malformed_wire_paths_and_capabilities_fail_closed() -> anyhow::Result<()> {
     let missing_method = ext::Invoke {
         invocation_id: "inv-1".into(),
         effect_path: Some(pb_path("effect://x/post")?),
-        input: Some(crate::convert::value_to_pb(&Value::Null)),
+        input: Some(crate::convert::value_to_pb(&Value::null())),
         deadline_ms: None,
         output_stream_to: None,
         method_id: None,
@@ -1092,7 +1130,7 @@ fn malformed_wire_paths_and_capabilities_fail_closed() -> anyhow::Result<()> {
 
     let missing_event_observed = ext::InboundEvent {
         id: "event-1".into(),
-        payload: Some(crate::convert::value_to_pb(&Value::Null)),
+        payload: Some(crate::convert::value_to_pb(&Value::null())),
         timestamp_ms: 1,
         observed: None,
         stream_id: None,
@@ -1105,7 +1143,7 @@ fn malformed_wire_paths_and_capabilities_fail_closed() -> anyhow::Result<()> {
 
     let missing_command_observed = ext::OutboundCommand {
         id: "cmd-1".into(),
-        action: Some(crate::convert::value_to_pb(&Value::Null)),
+        action: Some(crate::convert::value_to_pb(&Value::null())),
         observed: None,
     };
     ensure!(
@@ -1157,12 +1195,12 @@ fn invoke_result_ok_and_err_roundtrip() -> anyhow::Result<()> {
     use xolotl_types::external::{ErrorInfo, InvokeResult};
     let ok = InvokeResult {
         invocation_id: "r1".into(),
-        outcome: Ok(Value::Int(42)),
+        outcome: Ok(Value::integer(42)),
     };
     let back = invoke_result_from_pb(&invoke_result_to_pb(&ok))?;
     ensure!(back.invocation_id == "r1", "unexpected invocation id");
     ensure!(
-        back.outcome == Ok(Value::Int(42)),
+        back.outcome == Ok(Value::integer(42)),
         "unexpected ok outcome: {:?}",
         back.outcome
     );
@@ -1225,7 +1263,7 @@ fn source_command_frames_roundtrip() -> anyhow::Result<()> {
 
     let command = OutboundCommand {
         id: "cmd-1".into(),
-        action: Value::Str("send".into()),
+        action: Value::string("send".into()),
         observed: ObservedGenerations {
             presentation_config_generation: 4,
             alias_catalog_generation: 2,
@@ -1236,7 +1274,7 @@ fn source_command_frames_roundtrip() -> anyhow::Result<()> {
 
     let ok = CommandResult {
         id: "cmd-1".into(),
-        outcome: Ok(Value::Bool(true)),
+        outcome: Ok(Value::boolean(true)),
     };
     let back = command_result_from_pb(&command_result_to_pb(&ok))?;
     ensure!(back == ok, "ok result changed: {back:?}");
@@ -1365,5 +1403,30 @@ fn console_error_codes_round_trip_every_variant() -> anyhow::Result<()> {
             "console error changed on the wire: {decoded:?}"
         );
     }
+    Ok(())
+}
+#[test]
+fn portable_program_wire_preserves_composition_identity_and_rejects_tampering() -> anyhow::Result<()>
+{
+    use prost::Message;
+    use xolotl_graph::portable::{Expression, Program, Transform};
+    let source = Program::new(
+        Expression::Input
+            .then(Expression::Transform {
+                operation: Transform::Add { value: 1 },
+            })
+            .both(Expression::Constant {
+                value: Value::bytes(vec![1, 2, 255]),
+            }),
+    );
+    let wire = portable_program_to_pb(&source)?;
+    let encoded = wire.encode_to_vec();
+    let mut decoded = crate::xolotl::v1::PortableProgram::decode(encoded.as_slice())?;
+    let back = portable_program_from_pb(&decoded)?;
+    anyhow::ensure!(back == source && back.compile()?.id() == source.compile()?.id());
+    decoded.program_id[0] ^= 1;
+    anyhow::ensure!(portable_program_from_pb(&decoded).is_err());
+    decoded.json_source = vec![b' '; 1024 * 1024 + 1];
+    anyhow::ensure!(portable_program_from_pb(&decoded).is_err());
     Ok(())
 }

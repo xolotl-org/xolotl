@@ -1,5 +1,4 @@
 use crate::McpGatewayError;
-use crate::content::validate_mcp_icons;
 use crate::uri_template::{
     mcp_uri_template_matches, mcp_uri_template_specificity, mcp_uri_template_variable_names,
     validate_mcp_uri_template,
@@ -10,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use xolotl_gateway::{
     GatewayDescriptor, GatewayPublication, GatewayPublicationDescriptor, GatewaySurfaceDescriptor,
 };
-use xolotl_types::Value;
+use xolotl_types::{Value, ValueMap, ValueView};
 
 /// Gateway publication protocol for MCP server objects.
 pub const MCP_PUBLICATION_PROTOCOL: &str = "mcp";
@@ -398,8 +397,8 @@ fn publication_property_string(
     publication: &GatewayPublicationDescriptor,
     key: &str,
 ) -> Result<Option<String>, McpGatewayError> {
-    match publication.properties.get(key) {
-        Some(Value::Str(value)) => Ok(Some(value.clone())),
+    match publication.properties.get(key).map(Value::view) {
+        Some(ValueView::Str(value)) => Ok(Some(value.to_owned())),
         Some(_) => Err(McpGatewayError::BadPublication(format!(
             "publication {}:{} property {key} must be a string",
             publication.kind, publication.name
@@ -412,9 +411,9 @@ fn publication_property_u64(
     publication: &GatewayPublicationDescriptor,
     key: &str,
 ) -> Result<Option<u64>, McpGatewayError> {
-    match publication.properties.get(key) {
-        Some(Value::Int(value)) if *value >= 0 => {
-            u64::try_from(*value).map(Some).map_err(|_error| {
+    match publication.properties.get(key).map(Value::view) {
+        Some(ValueView::Int(value)) if value >= 0 => {
+            u64::try_from(value).map(Some).map_err(|_error| {
                 McpGatewayError::BadPublication(format!(
                     "publication {}:{} property {key} is out of range",
                     publication.kind, publication.name
@@ -435,14 +434,28 @@ fn publication_icons(
     let Some(value) = publication.properties.get("icons") else {
         return Ok(None);
     };
-    let json = serde_json::to_value(value)?;
-    validate_mcp_icons(
-        &json,
-        &format!(
-            "publication {}:{} icons",
-            publication.kind, publication.name
-        ),
-    )?;
+    // Validate only the icon fields this adapter understands. Unknown metadata
+    // stays resident until the response budget admits its JSON projection.
+    let icons = value
+        .as_list()
+        .ok_or_else(|| McpGatewayError::BadResult("icons must be a JSON array".into()))?;
+    for icon in icons {
+        let map = icon
+            .as_map()
+            .ok_or_else(|| McpGatewayError::BadResult("icon must be a JSON object".into()))?;
+        if map.get("src").and_then(Value::as_str).is_none() {
+            return Err(McpGatewayError::BadResult(
+                "icon src must be a string".into(),
+            ));
+        }
+        for key in ["mimeType", "sizes"] {
+            if map.get(key).is_some_and(|value| value.as_str().is_none()) {
+                return Err(McpGatewayError::BadResult(format!(
+                    "icon {key} must be a string"
+                )));
+            }
+        }
+    }
     Ok(Some(value.clone()))
 }
 
@@ -452,7 +465,7 @@ fn publication_execution(
     let Some(value) = publication.properties.get("execution") else {
         return Ok(None);
     };
-    let Value::Map(map) = value else {
+    let Some(map) = value.as_map() else {
         return Err(McpGatewayError::BadPublication(format!(
             "publication {}:{} execution must be a map",
             publication.kind, publication.name
@@ -473,7 +486,7 @@ fn publication_completion_values(
     let Some(value) = publication.properties.get("completions") else {
         return Ok(BTreeMap::new());
     };
-    let Value::Map(map) = value else {
+    let Some(map) = value.as_map() else {
         return Err(McpGatewayError::BadPublication(format!(
             "publication {}:{} completions must be a map",
             publication.kind, publication.name
@@ -487,7 +500,7 @@ fn publication_completion_values(
                 publication.kind, publication.name
             )));
         }
-        let Value::List(items) = values else {
+        let Some(items) = values.as_list() else {
             return Err(McpGatewayError::BadPublication(format!(
                 "publication {}:{} completion values for {name} must be a list",
                 publication.kind, publication.name
@@ -495,8 +508,8 @@ fn publication_completion_values(
         };
         let mut strings = Vec::with_capacity(items.len());
         for item in items {
-            match item {
-                Value::Str(value) => strings.push(value.clone()),
+            match item.view() {
+                ValueView::Str(value) => strings.push(value.to_owned()),
                 _ => {
                     return Err(McpGatewayError::BadPublication(format!(
                         "publication {}:{} completion value for {name} must be a string",
@@ -505,7 +518,7 @@ fn publication_completion_values(
                 }
             }
         }
-        out.insert(name.clone(), strings);
+        out.insert(name.to_owned(), strings);
     }
     Ok(out)
 }
@@ -549,7 +562,7 @@ fn publication_prompt_arguments(
     let Some(value) = publication.properties.get("arguments") else {
         return Ok(Vec::new());
     };
-    let Value::List(items) = value else {
+    let Some(items) = value.as_list() else {
         return Err(McpGatewayError::BadPublication(format!(
             "publication {}:{} arguments must be a list",
             publication.kind, publication.name
@@ -557,16 +570,16 @@ fn publication_prompt_arguments(
     };
     let mut out = Vec::with_capacity(items.len());
     for item in items {
-        let Value::Map(map) = item else {
+        let Some(map) = item.as_map() else {
             return Err(McpGatewayError::BadPublication(format!(
                 "publication {}:{} argument must be a map",
                 publication.kind, publication.name
             )));
         };
-        let name = match map.get("name") {
-            Some(Value::Str(name)) => {
+        let name = match map.get("name").map(Value::view) {
+            Some(ValueView::Str(name)) => {
                 validate_mcp_name(name, "prompt argument name")?;
-                name.clone()
+                name.to_owned()
             }
             Some(_) | None => {
                 return Err(McpGatewayError::BadPublication(format!(
@@ -577,8 +590,8 @@ fn publication_prompt_arguments(
         };
         let title = optional_map_string(map, "title", "prompt argument title")?;
         let description = optional_map_string(map, "description", "prompt argument description")?;
-        let required = match map.get("required") {
-            Some(Value::Bool(required)) => *required,
+        let required = match map.get("required").map(Value::view) {
+            Some(ValueView::Bool(required)) => required,
             Some(_) => {
                 return Err(McpGatewayError::BadPublication(format!(
                     "publication {}:{} argument required must be a bool",
@@ -598,18 +611,18 @@ fn publication_prompt_arguments(
 }
 
 fn optional_map_string(
-    map: &BTreeMap<String, Value>,
+    map: &ValueMap,
     key: &'static str,
     label: &'static str,
 ) -> Result<Option<String>, McpGatewayError> {
-    match map.get(key) {
-        Some(Value::Str(value)) => {
+    match map.get(key).map(Value::view) {
+        Some(ValueView::Str(value)) => {
             if value.trim().is_empty() {
                 return Err(McpGatewayError::BadPublication(format!(
                     "{label} must not be empty"
                 )));
             }
-            Ok(Some(value.clone()))
+            Ok(Some(value.to_owned()))
         }
         Some(_) => Err(McpGatewayError::BadPublication(format!(
             "{label} must be a string"

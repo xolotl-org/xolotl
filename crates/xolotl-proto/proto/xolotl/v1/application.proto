@@ -1,0 +1,286 @@
+syntax = "proto3";
+package xolotl.v1.application;
+
+import "xolotl/v1/common.proto";
+import "xolotl/v1/program.proto";
+
+// Every call authenticates RPC bearer metadata or verified mTLS leaf certificate
+// evidence against the active Gateway profile. Messages do not claim a principal
+// or installation identity.
+service ApplicationGateway {
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+  rpc IssueUploadTicket(IssueUploadTicketRequest) returns (IssueUploadTicketResponse);
+  // Begin, Chunk*, Finish, then clean transport EOF. Receipt publication waits
+  // for EOF; resets, missing Finish and trailing frames abandon staging.
+  rpc UploadObject(stream UploadObjectRequest) returns (UploadObjectResponse);
+  // A trusted host issues the opaque grant separately. Blob hashes and upload
+  // receipts do not authorize reads. Header, Chunk*, Completed, then clean EOF.
+  rpc DownloadObject(DownloadObjectRequest) returns (stream DownloadObjectResponse);
+  // Direct surface input. The current unary RPC supports Unary and Collect;
+  // Stream, AsyncProcess and SinkOnly are rejected explicitly.
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+  // Stream output only: Accepted, Chunk*, Completed, then successful gRPC EOF.
+  // Cached outcomes are explicitly final-only; historical chunks are not replayed.
+  rpc SubmitOutput(SubmitRequest) returns (stream SubmitOutputResponse);
+}
+
+message DescribeRequest {}
+
+message DescribeResponse {
+  string profile_name = 1;
+  uint64 profile_rev = 2;
+  repeated SurfaceDescriptor surfaces = 3;
+  repeated PublicationDescriptor publications = 4;
+  LimitProfile limits = 5;
+}
+
+message SurfaceDescriptor {
+  string surface_id = 1;
+  xolotl.v1.Path target = 2;
+  optional xolotl.v1.Value input_schema = 3;
+  optional xolotl.v1.Value output_schema = 4;
+  optional xolotl.v1.Value output_stream_schema = 5;
+}
+
+message PublicationDescriptor {
+  string protocol = 1;
+  string kind = 2;
+  string name = 3;
+  optional string address = 4;
+  string surface_id = 5;
+  optional string title = 6;
+  optional string description = 7;
+  map<string, xolotl.v1.Value> properties = 8;
+  optional xolotl.v1.Value annotations = 9;
+  optional xolotl.v1.Value metadata = 10;
+}
+
+message LimitProfile {
+  uint64 max_literal_bytes = 1;
+  uint64 max_collect_limit = 2;
+  int64 max_deadline_ms_from_now = 3;
+  uint64 max_in_flight_requests = 4;
+  uint64 max_principal_in_flight_requests = 5;
+  uint64 max_surface_in_flight_requests = 6;
+  uint64 max_risk_class_in_flight_requests = 7;
+  BudgetProfile budget = 8;
+  uint64 max_stream_items = 9;
+  uint64 max_stream_bytes = 10;
+  uint64 max_stream_inline_item_bytes = 11;
+}
+
+message BudgetProfile {
+  optional uint64 max_inflight_ops = 1;
+  optional uint64 max_wall_ms = 2;
+  optional uint64 max_bytes_in = 3;
+  optional uint64 max_bytes_out = 4;
+  optional uint64 max_inline_value_bytes = 5;
+  optional uint64 max_stream_items = 6;
+  optional uint64 max_estimated_cost_micro_usd = 7;
+}
+
+enum Modality {
+  MODALITY_UNSPECIFIED = 0;
+  MODALITY_VALUE = 1;
+  MODALITY_TEXT = 2;
+  MODALITY_BYTES = 3;
+  MODALITY_TENSOR = 4;
+  MODALITY_AUDIO_FRAME = 5;
+  MODALITY_VIDEO_FRAME = 6;
+  MODALITY_POSE_FRAME = 7;
+  MODALITY_SENSOR_FRAME = 8;
+  MODALITY_EVENT = 9;
+  MODALITY_CONTROL = 10;
+}
+
+message IssueUploadTicketRequest {
+  string surface_id = 1;
+  optional string submission_token = 2;
+  Modality modality = 3;
+  optional uint64 expected_size = 4;
+  optional string expected_digest = 5;
+  repeated string allowed_media_types = 6;
+  optional uint64 expires_in_ms = 7;
+  bool single_use = 8;
+}
+
+message IssueUploadTicketResponse {
+  string ticket_id = 1;
+  int64 expires_at_ms = 2;
+  bool single_use = 3;
+}
+
+message UploadObjectRequest {
+  oneof frame {
+    BeginObjectUpload begin = 1;
+    bytes chunk = 2;
+    FinishObjectUpload finish = 3;
+  }
+}
+
+message BeginObjectUpload {
+  string ticket_id = 1;
+  optional string media_type = 2;
+  optional string submission_token = 3;
+}
+
+// Only interpretation metadata is supplied by the client. The Gateway derives
+// the content reference, digest and byte count from the received upload.
+message FinishObjectUpload {
+  oneof kind {
+    BlobUpload blob = 1;
+    TensorUpload tensor = 2;
+    FrameUpload frame = 3;
+  }
+}
+
+message BlobUpload {}
+
+message TensorUpload {
+  // Canonical common TensorRef dtype: f16, bf16, f32, f64, i8, i16, i32, i64,
+  // u8 or bool. Unknown values are rejected.
+  string dtype = 1;
+  repeated uint64 shape = 2;
+}
+
+message FrameUpload {
+  int64 ts_nanos = 1;
+  // Canonical common FrameRef kind: audio, video, pose or sensor.
+  string kind = 2;
+}
+
+message UploadObjectResponse {
+  xolotl.v1.Value item = 1;
+  xolotl.v1.PayloadProvenance provenance = 2;
+  string digest = 3;
+  uint64 size = 4;
+}
+
+message DownloadObjectRequest {
+  string read_grant_id = 1;
+  // Absolute byte offset within the object, restricted to the granted range.
+  uint64 offset = 2;
+  // Omission reads through the grant's end. Zero requests an empty range.
+  optional uint64 length = 3;
+}
+
+message DownloadObjectResponse {
+  oneof event {
+    ObjectReadHeader header = 1;
+    ObjectReadChunk chunk = 2;
+    ObjectReadCompleted completed = 3;
+  }
+}
+
+message ObjectReadHeader {
+  xolotl.v1.BlobRef blob = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+  xolotl.v1.TaintSet taint = 4;
+  int64 expires_at_ms = 5;
+}
+
+message ObjectReadChunk {
+  uint64 offset = 1;
+  bytes data = 2;
+  // Initial object/grant sources plus this read's sources, without history.
+  xolotl.v1.TaintSet taint = 3;
+}
+
+message ObjectReadCompleted {
+  uint64 next_offset = 1;
+  uint64 bytes_read = 2;
+}
+
+message SubmitRequest {
+  string surface_id = 1;
+  // Required outer message. An explicitly supplied empty Value means null.
+  xolotl.v1.Value payload = 2;
+  optional xolotl.v1.PayloadProvenance provenance = 3;
+  // Omission requests Unary. Submit accepts Unary and Collect;
+  // SubmitOutput requires an explicit Stream mode.
+  optional xolotl.v1.OutputMode output = 4;
+  optional SubmitOptions options = 5;
+}
+
+message SubmitOptions {
+  optional string idempotency_key = 1;
+  optional string submission_token = 2;
+  optional uint64 deadline_ms = 3;
+  optional string requested_encoding = 4;
+}
+
+message GatewayAccepted {
+  string submission_id = 1;
+  string trace_root = 2;
+  uint64 profile_rev = 3;
+  string surface_id = 4;
+}
+
+message SubmitResponse {
+  GatewayAccepted accepted = 1;
+  SubmissionCompletion completion = 2;
+}
+
+message SubmitOutputResponse {
+  oneof event {
+    GatewayAccepted accepted = 1;
+    OutputChunk chunk = 2;
+    SubmissionCompletion completed = 3;
+  }
+}
+
+message OutputChunk {
+  OutputValue item = 1;
+  xolotl.v1.TaintSet taint = 2;
+}
+
+// A committed complete document and the explicit authority to download it.
+// Encoding identifies its representation; MIME and nested references do not
+// authorize reads. This grant covers only this entire container object.
+message EncodedOutputObject {
+  string encoding = 1;
+  xolotl.v1.BlobRef blob = 2;
+  string read_grant_id = 3;
+  int64 expires_at_ms = 4;
+}
+
+message OutputValue {
+  oneof content {
+    xolotl.v1.Value inline = 1;
+    EncodedOutputObject object = 2;
+  }
+}
+
+// Object form encodes the shared, lossless externally tagged Failure layout
+// inside the specified value envelope. It is still a failure, never success.
+message OutputFailure {
+  oneof content {
+    xolotl.v1.Failure inline = 1;
+    EncodedOutputObject object = 2;
+  }
+}
+
+message OutputOutcome {
+  oneof kind {
+    OutputValue done = 1;
+    OutputValue short = 2;
+    OutputFailure fail = 3;
+  }
+}
+
+enum CompletionOrigin {
+  COMPLETION_ORIGIN_UNSPECIFIED = 0;
+  // The program ran in this request; individual calls may have used caches.
+  COMPLETION_ORIGIN_CURRENT_ATTEMPT = 1;
+  // The whole request reused its saved result; no historical chunks are replayed.
+  COMPLETION_ORIGIN_CACHED_OUTCOME = 2;
+}
+
+// Shared final result of Submit and SubmitOutput. Outcome and taint are required
+// by the application contract, including cached results and failures.
+message SubmissionCompletion {
+  OutputOutcome outcome = 1;
+  CompletionOrigin origin = 2;
+  xolotl.v1.TaintSet taint = 3;
+}

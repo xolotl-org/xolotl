@@ -15,8 +15,9 @@ use crate::inference::InferenceBackend;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use xolotl_kernel::{Driver, DriverContext, DriverError, MethodSpec};
-use xolotl_types::{MethodId, Outcome, OutputMode, Purity, Value};
+use xolotl_kernel::{Driver, DriverContext, DriverError, DriverOutput, MethodSpec};
+use xolotl_types::{MethodId, Outcome, OutputMode, Purity, TaintSet, TaintSource, Value};
+use xolotl_types::{ValueMap, ValueView};
 
 /// Method names for `effect://deliberation/run`; the public method is `invoke`
 /// after standard installation.
@@ -48,13 +49,13 @@ impl DeliberationDriver {
         Self { backend }
     }
 
-    fn mode_of(input: &BTreeMap<String, Value>) -> Result<Mode, DriverError> {
-        match input.get("mode") {
+    fn mode_of(input: &ValueMap) -> Result<Mode, DriverError> {
+        match input.get("mode").map(Value::view) {
             None => Ok(Mode::Vote),
-            Some(Value::Str(mode)) if mode == "vote" => Ok(Mode::Vote),
-            Some(Value::Str(mode)) if mode == "synthesize" => Ok(Mode::Synthesize),
-            Some(Value::Str(mode)) if mode == "debate" => Ok(Mode::Debate),
-            Some(Value::Str(_)) => Err(DriverError::InvalidInput(
+            Some(ValueView::Str("vote")) => Ok(Mode::Vote),
+            Some(ValueView::Str("synthesize")) => Ok(Mode::Synthesize),
+            Some(ValueView::Str("debate")) => Ok(Mode::Debate),
+            Some(ValueView::Str(_)) => Err(DriverError::InvalidInput(
                 "deliberation `mode` must be vote, synthesize, or debate".into(),
             )),
             Some(_) => Err(DriverError::InvalidInput(
@@ -71,20 +72,25 @@ impl Driver for DeliberationDriver {
         method: MethodId,
         input: Value,
         _output: OutputMode,
-        _ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
+        ctx: &DriverContext,
+    ) -> Result<DriverOutput, DriverError> {
         if method.get() != 0 {
             return Err(DriverError::NoSuchMethod(method));
         }
-        let Value::Map(m) = input else {
+        if self.backend.requires_unprotected_input() && ctx.taint.has_protected() {
+            return Err(DriverError::InvalidInput(
+                "deliberation backend requires unprotected input".into(),
+            ));
+        }
+        let Some(m) = input.as_map() else {
             return Err(DriverError::InvalidInput(
                 "deliberation input must be a map".into(),
             ));
         };
-        let question = required_non_empty_string(&m, "question", "deliberation")?.to_string();
-        let panelists = optional_bounded_usize(&m, "panelists", 2, 1, 8, "deliberation")?;
-        let max_rounds = optional_bounded_usize(&m, "max_rounds", 1, 1, 8, "deliberation")?;
-        let mode = Self::mode_of(&m)?;
+        let question = required_non_empty_string(m, "question", "deliberation")?.to_string();
+        let panelists = optional_bounded_usize(m, "panelists", 2, 1, 8, "deliberation")?;
+        let max_rounds = optional_bounded_usize(m, "max_rounds", 1, 1, 8, "deliberation")?;
+        let mode = Self::mode_of(m)?;
 
         let mut transcript: Vec<String> = Vec::new();
         let mut round = 0;
@@ -97,7 +103,7 @@ impl Driver for DeliberationDriver {
                 let prompt = build_prompt(&question, &transcript, p, mode);
                 let resp = self
                     .backend
-                    .infer(&Value::Str(prompt))
+                    .infer(&Value::string(prompt))
                     .await
                     .map_err(DriverError::Other)?;
                 contributions.push(text_of(&resp));
@@ -109,20 +115,23 @@ impl Driver for DeliberationDriver {
             }
             // Judge: converged when all panelists agree, or rounds exhausted.
             if mode != Mode::Debate || converged(&contributions) || round >= max_rounds {
-                return Ok(Outcome::Done(verdict(mode, &transcript, round)));
+                return Ok(
+                    DriverOutput::new(Outcome::Done(verdict(mode, &transcript, round)))
+                        .with_taint(TaintSet::of(TaintSource::ModelOutput)),
+                );
             }
         }
     }
 }
 
 fn required_non_empty_string<'a>(
-    m: &'a BTreeMap<String, Value>,
+    m: &'a ValueMap,
     field: &'static str,
     op: &'static str,
 ) -> Result<&'a str, DriverError> {
-    match m.get(field) {
-        Some(Value::Str(value)) if !value.is_empty() => Ok(value),
-        Some(Value::Str(_)) => Err(DriverError::InvalidInput(format!(
+    match m.get(field).map(Value::view) {
+        Some(ValueView::Str(value)) if !value.is_empty() => Ok(value),
+        Some(ValueView::Str(_)) => Err(DriverError::InvalidInput(format!(
             "{op} `{field}` must not be empty"
         ))),
         Some(_) => Err(DriverError::InvalidInput(format!(
@@ -135,17 +144,17 @@ fn required_non_empty_string<'a>(
 }
 
 fn optional_bounded_usize(
-    m: &BTreeMap<String, Value>,
+    m: &ValueMap,
     field: &'static str,
     default: usize,
     min: usize,
     max: usize,
     op: &'static str,
 ) -> Result<usize, DriverError> {
-    match m.get(field) {
+    match m.get(field).map(Value::view) {
         None => Ok(default),
-        Some(Value::Int(value)) => {
-            let value = usize::try_from(*value).map_err(|_error| {
+        Some(ValueView::Int(value)) => {
+            let value = usize::try_from(value).map_err(|_error| {
                 DriverError::InvalidInput(format!("{op} `{field}` must be between {min} and {max}"))
             })?;
             if (min..=max).contains(&value) {
@@ -172,9 +181,9 @@ fn build_prompt(question: &str, transcript: &[String], panelist: usize, mode: Mo
 }
 
 fn text_of(v: &Value) -> String {
-    match v {
-        Value::Str(s) => s.clone(),
-        other => format!("{other:?}"),
+    match v.view() {
+        ValueView::Str(s) => s.to_owned(),
+        _ => format!("{v:?}"),
     }
 }
 
@@ -256,18 +265,23 @@ fn normalize(s: &str) -> String {
 
 fn verdict(mode: Mode, transcript: &[String], rounds: usize) -> Value {
     let mut m = BTreeMap::new();
-    m.insert("rounds".into(), Value::Int(rounds as i64));
+    m.insert("rounds".into(), Value::integer(rounds as i64));
     let answer = match mode {
         Mode::Synthesize => transcript.join("\n"),
         // Vote / Debate: take the (deterministically) most common answer.
         _ => transcript.first().cloned().unwrap_or_default(),
     };
-    m.insert("answer".into(), Value::Str(answer));
+    m.insert("answer".into(), Value::string(answer));
     m.insert(
         "transcript".into(),
-        Value::List(transcript.iter().map(|t| Value::Str(t.clone())).collect()),
+        Value::list(
+            transcript
+                .iter()
+                .map(|t| Value::string(t.clone()))
+                .collect(),
+        ),
     );
-    Value::Map(m)
+    Value::map(m)
 }
 
 #[cfg(test)]
@@ -279,11 +293,11 @@ mod tests {
 
     fn run_input(mode: &str, panelists: i64, rounds: i64) -> Value {
         let mut m = BTreeMap::new();
-        m.insert("question".into(), Value::Str("best approach?".into()));
-        m.insert("mode".into(), Value::Str(mode.into()));
-        m.insert("panelists".into(), Value::Int(panelists));
-        m.insert("max_rounds".into(), Value::Int(rounds));
-        Value::Map(m)
+        m.insert("question".into(), Value::string("best approach?".into()));
+        m.insert("mode".into(), Value::string(mode.into()));
+        m.insert("panelists".into(), Value::integer(panelists));
+        m.insert("max_rounds".into(), Value::integer(rounds));
+        Value::map(m)
     }
 
     #[tokio::test]
@@ -299,10 +313,11 @@ mod tests {
             )
             .await
             .context("run vote deliberation")?;
-        match out {
-            Outcome::Done(Value::Map(m)) => {
+        match out.outcome {
+            Outcome::Done(value) => {
+                let m = value.as_map().context("expected deliberation map")?;
                 ensure!(
-                    m.get("rounds") == Some(&Value::Int(1)),
+                    m.get("rounds") == Some(&Value::integer(1)),
                     "vote rounds: {:?}",
                     m.get("rounds")
                 );
@@ -325,8 +340,9 @@ mod tests {
             )
             .await
             .context("run debate deliberation")?;
-        match out {
-            Outcome::Done(Value::Map(m)) => {
+        match out.outcome {
+            Outcome::Done(value) => {
+                let m = value.as_map().context("expected deliberation map")?;
                 let rounds = m
                     .get("rounds")
                     .and_then(|v| v.as_int())
@@ -346,7 +362,7 @@ mod tests {
         let out = d
             .call(
                 MethodId::new(0),
-                Value::Map(BTreeMap::new()),
+                Value::map(BTreeMap::new()),
                 OutputMode::Unary,
                 &ctx,
             )
@@ -354,12 +370,12 @@ mod tests {
         ensure!(out.is_err(), "deliberation accepted missing question");
 
         let mut bad_panel = BTreeMap::new();
-        bad_panel.insert("question".into(), Value::Str("best approach?".into()));
-        bad_panel.insert("panelists".into(), Value::Int(0));
+        bad_panel.insert("question".into(), Value::string("best approach?".into()));
+        bad_panel.insert("panelists".into(), Value::integer(0));
         let out = d
             .call(
                 MethodId::new(0),
-                Value::Map(bad_panel),
+                Value::map(bad_panel),
                 OutputMode::Unary,
                 &ctx,
             )
@@ -367,12 +383,12 @@ mod tests {
         ensure!(out.is_err(), "deliberation accepted out-of-range panelists");
 
         let mut bad_mode = BTreeMap::new();
-        bad_mode.insert("question".into(), Value::Str("best approach?".into()));
-        bad_mode.insert("mode".into(), Value::Str("maybe".into()));
+        bad_mode.insert("question".into(), Value::string("best approach?".into()));
+        bad_mode.insert("mode".into(), Value::string("maybe".into()));
         let out = d
             .call(
                 MethodId::new(0),
-                Value::Map(bad_mode),
+                Value::map(bad_mode),
                 OutputMode::Unary,
                 &ctx,
             )

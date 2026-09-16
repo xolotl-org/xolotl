@@ -8,6 +8,13 @@ message Program {
   optional PayloadProvenance provenance = 2;
 }
 
+// Portable source uses the same versioned document as the Rust/JSON compiler.
+// Transporting a program does not authorize its execution through a Gateway.
+message PortableProgram {
+  bytes json_source = 1;
+  bytes program_id = 2;
+}
+
 message PayloadProvenance {
   optional string upload_ticket = 1;
   optional ObjectStoreProof store_proof = 2;
@@ -68,9 +75,9 @@ message WaitSpec {
 }
 
 message StepRef {
-  uint64 process_id = 1;
-  string name = 2;
-  optional Value arg = 3;
+  // Resolved only in the executor's native module.
+  string name = 1;
+  optional Value arg = 2;
 }
 
 message OperationTemplate {

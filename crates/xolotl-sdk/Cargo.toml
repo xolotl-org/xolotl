@@ -13,17 +13,36 @@ workspace = true
 
 [features]
 default = []
-standard = ["dep:xolotl-standard", "xolotl-standard/standard"]
+serde = ["xolotl-core/serde"]
+program = ["dep:xolotl-graph", "dep:xolotl-types"]
+runtime = ["program", "dep:xolotl-kernel", "dep:xolotl-state"]
+host = ["runtime", "xolotl-kernel/host", "xolotl-state/memory"]
+multi-thread = ["host", "xolotl-kernel/multi-thread"]
+durable = ["host", "xolotl-kernel/durable"]
+plan = ["host", "dep:xolotl-plan"]
+standard = ["host", "dep:xolotl-standard", "xolotl-standard/standard"]
 
 [dependencies]
+xolotl-core.workspace = true
 xolotl-standard = { workspace = true, default-features = false, optional = true }
-xolotl-graph.workspace = true
-xolotl-kernel.workspace = true
-xolotl-plan.workspace = true
-xolotl-state.workspace = true
-xolotl-types.workspace = true
+xolotl-graph = { workspace = true, optional = true }
+xolotl-kernel = { workspace = true, optional = true }
+xolotl-plan = { workspace = true, optional = true }
+xolotl-state = { workspace = true, optional = true }
+xolotl-types = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true, default-features = false, features = ["std"] }
+async-trait = { workspace = true, default-features = false }
 serde_json = { workspace = true, default-features = false, features = ["std"] }
-tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros"] }
+tempfile = { workspace = true, features = ["getrandom"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros", "time"] }
+xolotl-storage-fs.workspace = true
+
+[[example]]
+name = "portable"
+required-features = ["host"]
+
+[[example]]
+name = "native_modules"
+required-features = ["host"]

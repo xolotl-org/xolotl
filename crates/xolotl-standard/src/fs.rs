@@ -3,23 +3,27 @@
 //!
 //! Safety: paths are canonicalized to block symlink escape; reads and
 //! `glob` are `Observation` (replayed from the recorded value), writes/deletes
-//! are `NonIdempotentEffect`. Large reads cross the `effect://blob/write`
-//! offload boundary: a `read` of a file larger than [`INLINE_MAX`] persists the
-//! bytes in the standard blob store and returns a blob reference (blake3 hash +
+//! are `NonIdempotentEffect`. Large unary reads use the configured object
+//! writer: a `read` of a file larger than [`INLINE_MAX`] uploads the
+//! bytes through the installed object port and returns a blob reference (hash +
 //! size + mime); small files are returned inline.
 
 use async_trait::async_trait;
-use std::collections::BTreeMap;
+use std::borrow::Cow;
 use std::path::{Component, Path as FsPath, PathBuf};
-use xolotl_kernel::{Driver, DriverContext, DriverError, MethodSpec};
-use xolotl_state::Backend;
-use xolotl_types::{MethodId, Outcome, OutputMode, Purity, Value};
+use tokio::io::AsyncReadExt;
+use xolotl_kernel::{
+    Driver, DriverContext, DriverError, DriverOutput, DriverUsage, MethodSpec, UsageDimension,
+};
+use xolotl_state::host::object::ObjectStore;
+use xolotl_types::{MethodId, Outcome, OutputMode, Purity, TaintedValue, Value};
+use xolotl_types::{ValueMap, ValueView};
 
 /// Internal method names in registration order. `install_standard` exposes each
 /// one as a separate `effect://fs/<method>` Resource with public method
 /// `invoke`.
 pub(crate) const FS_METHODS: &[MethodSpec] = &[
-    MethodSpec::new("read", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external(),
+    MethodSpec::new("read", Purity::Pure, MethodSpec::STREAM_ASYNC).observes_external(),
     MethodSpec::new("write", Purity::Effectful, MethodSpec::UNARY_ASYNC),
     MethodSpec::new("list", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external(),
     MethodSpec::new("delete", Purity::Effectful, MethodSpec::UNARY_ASYNC),
@@ -27,24 +31,24 @@ pub(crate) const FS_METHODS: &[MethodSpec] = &[
 ];
 
 /// Reads at or below this size inline into the returned `Value`; larger files
-/// cross the blob offload boundary and come back as a blob reference.
+/// use the object writer and come back as a blob reference.
 pub(crate) const INLINE_MAX: u64 = 1 << 20; // 1 MiB
 
 /// Drives the filesystem actions, sandboxed to a root directory.
 pub(crate) struct FsDriver {
     /// All access is confined under this canonicalized root.
     root: PathBuf,
-    state: Backend,
+    objects: ObjectStore,
 }
 
 impl FsDriver {
-    /// Create a filesystem driver rooted at `root` and using `state` for blob
+    /// Create a filesystem driver rooted at `root` and using `objects` for blob
     /// offload.
-    pub(crate) fn new(root: impl Into<PathBuf>, state: Backend) -> Result<Self, DriverError> {
+    pub(crate) fn new(root: impl Into<PathBuf>, objects: ObjectStore) -> Result<Self, DriverError> {
         let root = root.into();
         let root = std::fs::canonicalize(&root)
             .map_err(|e| DriverError::Other(format!("fs root is unavailable: {e}")))?;
-        Ok(Self { root, state })
+        Ok(Self { root, objects })
     }
 
     /// Resolve `rel` under the sandbox root, rejecting escape via `..`/symlink.
@@ -96,35 +100,63 @@ impl Driver for FsDriver {
         &self,
         method: MethodId,
         input: Value,
-        _output: OutputMode,
-        _ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
+        output: OutputMode,
+        ctx: &DriverContext,
+    ) -> Result<DriverOutput, DriverError> {
         match method.get() {
             // read
             0 => {
                 let path = string_input_or_field(&input, "path", "fs.read")?;
                 let p = self.resolve(path)?;
-                // Stat first; a file larger than INLINE_MAX is
-                // content-addressed with blake3 and returned as a BlobRef so
-                // the Fact never inlines the payload. The same state-backed
-                // blob store as `effect://blob/write` holds the bytes, so the
-                // returned BlobRef is immediately readable.
-                let meta = tokio::fs::metadata(&p)
+                let mut file = tokio::fs::File::open(&p)
                     .await
                     .map_err(|e| DriverError::Other(e.to_string()))?;
-                let bytes = tokio::fs::read(&p)
-                    .await
-                    .map_err(|e| DriverError::Other(e.to_string()))?;
-                if meta.len() > INLINE_MAX {
-                    let mime = mime_for(&p);
-                    return Ok(Outcome::Done(Value::Blob(
-                        crate::blob::write_blob_bytes(&self.state, bytes, mime).await?,
-                    )));
+                let mut buffer = crate::object::ObjectBuffer::new(
+                    self.objects.clone(),
+                    INLINE_MAX as usize,
+                    mime_for(&p),
+                    ctx.taint.clone(),
+                );
+                let mut chunk = [0_u8; crate::object::CHUNK_BYTES];
+                let mut bytes_read = 0_u64;
+                loop {
+                    let count = match file.read(&mut chunk).await {
+                        Ok(count) => count,
+                        Err(error) => {
+                            buffer.abort().await;
+                            return buffer
+                                .failure(DriverError::Other(error.to_string()))
+                                .into_output("fs");
+                        }
+                    };
+                    if count == 0 {
+                        break;
+                    }
+                    bytes_read = bytes_read
+                        .checked_add(count as u64)
+                        .ok_or_else(|| DriverError::Other("file byte count exceeds u64".into()))?;
+                    if output == OutputMode::Stream {
+                        ctx.emit(Value::bytes(chunk[..count].to_vec())).await?;
+                    } else {
+                        if let Err(error) = buffer.push(&chunk[..count]).await {
+                            return error.into_output("fs");
+                        }
+                    }
                 }
-                match String::from_utf8(bytes) {
-                    Ok(s) => Ok(Outcome::Done(Value::Str(s))),
-                    Err(e) => Ok(Outcome::Done(Value::Bytes(e.into_bytes()))),
-                }
+                let value = if output == OutputMode::Stream {
+                    TaintedValue::pristine(Value::null())
+                } else {
+                    match buffer.finish().await {
+                        Ok((value, _)) => value,
+                        Err(error) => return error.into_output("fs"),
+                    }
+                };
+                Ok(DriverOutput::new(Outcome::Done(value.value))
+                    .with_taint(value.taint)
+                    .with_usage(DriverUsage::from([(
+                        UsageDimension::BYTES_READ,
+                        bytes_read,
+                    )])))
             }
             // write
             1 => {
@@ -132,22 +164,25 @@ impl Driver for FsDriver {
                 let path = required_string_field(m, "path", "fs.write")?;
                 let p = self.resolve(path)?;
                 let content = required_field(m, "content", "fs.write")?;
-                let bytes = match content {
-                    Value::Str(s) => s.as_bytes().to_vec(),
-                    Value::Bytes(b) => b.clone(),
-                    other => {
-                        serde_json::to_vec(&other).map_err(|e| DriverError::Other(e.to_string()))?
-                    }
+                let bytes = match content.view() {
+                    ValueView::Str(s) => Cow::Borrowed(s.as_bytes()),
+                    ValueView::Bytes(b) => Cow::Borrowed(b),
+                    _ => Cow::Owned(
+                        serde_json::to_vec(content)
+                            .map_err(|e| DriverError::Other(e.to_string()))?,
+                    ),
                 };
                 if let Some(parent) = p.parent() {
                     tokio::fs::create_dir_all(parent)
                         .await
                         .map_err(|e| DriverError::Other(e.to_string()))?;
                 }
+                let usage =
+                    DriverUsage::from([(UsageDimension::BYTES_WRITTEN, bytes.len() as u64)]);
                 tokio::fs::write(&p, bytes)
                     .await
                     .map_err(|e| DriverError::Other(e.to_string()))?;
-                Ok(Outcome::Done(Value::Bool(true)))
+                Ok(DriverOutput::new(Outcome::Done(Value::boolean(true))).with_usage(usage))
             }
             // list
             2 => {
@@ -162,10 +197,10 @@ impl Driver for FsDriver {
                     .await
                     .map_err(|e| DriverError::Other(e.to_string()))?
                 {
-                    entries.push(Value::Str(e.file_name().to_string_lossy().into_owned()));
+                    entries.push(Value::string(e.file_name().to_string_lossy().into_owned()));
                 }
                 entries.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
-                Ok(Outcome::Done(Value::List(entries)))
+                Ok(DriverOutput::new(Outcome::Done(Value::list(entries))))
             }
             // delete
             3 => {
@@ -176,7 +211,7 @@ impl Driver for FsDriver {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(DriverError::Other(error.to_string())),
                 }
-                Ok(Outcome::Done(Value::Null))
+                Ok(DriverOutput::new(Outcome::Done(Value::null())))
             }
             // glob: match `pattern` (relative to root) and return sandbox-relative
             // paths, sorted. Honors `*`/`**`/`?` via the `glob` crate; every hit
@@ -198,24 +233,21 @@ impl Driver for FsDriver {
                         continue; // symlinked match escaping the sandbox
                     }
                     if let Ok(rel) = canon.strip_prefix(&self.root) {
-                        hits.push(Value::Str(rel.to_string_lossy().into_owned()));
+                        hits.push(Value::string(rel.to_string_lossy().into_owned()));
                     }
                 }
                 hits.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
                 hits.dedup();
-                Ok(Outcome::Done(Value::List(hits)))
+                Ok(DriverOutput::new(Outcome::Done(Value::list(hits))))
             }
             _ => Err(DriverError::NoSuchMethod(method)),
         }
     }
 }
 
-fn input_map<'a>(
-    input: &'a Value,
-    op: &'static str,
-) -> Result<&'a BTreeMap<String, Value>, DriverError> {
-    match input {
-        Value::Map(m) => Ok(m),
+fn input_map<'a>(input: &'a Value, op: &'static str) -> Result<&'a ValueMap, DriverError> {
+    match input.view() {
+        ValueView::Map(m) => Ok(m),
         _ => Err(DriverError::InvalidInput(format!(
             "{op} input must be a map"
         ))),
@@ -227,9 +259,9 @@ fn string_input_or_field<'a>(
     field: &'static str,
     op: &'static str,
 ) -> Result<&'a str, DriverError> {
-    match input {
-        Value::Str(value) => Ok(value),
-        Value::Map(m) => required_string_field(m, field, op),
+    match input.view() {
+        ValueView::Str(value) => Ok(value),
+        ValueView::Map(m) => required_string_field(m, field, op),
         _ => Err(DriverError::InvalidInput(format!(
             "{op} input must be a map or string {field}"
         ))),
@@ -237,12 +269,12 @@ fn string_input_or_field<'a>(
 }
 
 fn required_string_field<'a>(
-    m: &'a BTreeMap<String, Value>,
+    m: &'a ValueMap,
     field: &'static str,
     op: &'static str,
 ) -> Result<&'a str, DriverError> {
-    match m.get(field) {
-        Some(Value::Str(value)) => Ok(value),
+    match m.get(field).map(Value::view) {
+        Some(ValueView::Str(value)) => Ok(value),
         Some(_) => Err(DriverError::InvalidInput(format!(
             "{op} `{field}` must be a string"
         ))),
@@ -253,7 +285,7 @@ fn required_string_field<'a>(
 }
 
 fn required_field<'a>(
-    m: &'a BTreeMap<String, Value>,
+    m: &'a ValueMap,
     field: &'static str,
     op: &'static str,
 ) -> Result<&'a Value, DriverError> {
@@ -288,25 +320,23 @@ mod tests {
     use super::*;
     use anyhow::{Context, Result, bail, ensure};
     use std::collections::BTreeMap;
-    use std::sync::Arc;
-    use xolotl_state::{Backend, InMemoryBackend};
     use xolotl_types::{IdentityRef, ProcessId};
 
     fn write_input(path: &str, content: &str) -> Value {
         let mut m = BTreeMap::new();
-        m.insert("path".into(), Value::Str(path.into()));
-        m.insert("content".into(), Value::Str(content.into()));
-        Value::Map(m)
+        m.insert("path".into(), Value::string(path.into()));
+        m.insert("content".into(), Value::string(content.into()));
+        Value::map(m)
     }
 
     fn read_input(path: &str) -> Value {
         let mut m = BTreeMap::new();
-        m.insert("path".into(), Value::Str(path.into()));
-        Value::Map(m)
+        m.insert("path".into(), Value::string(path.into()));
+        Value::map(m)
     }
 
-    fn state() -> Backend {
-        Arc::new(InMemoryBackend::new())
+    fn state() -> ObjectStore {
+        ObjectStore::new()
     }
 
     #[tokio::test]
@@ -332,9 +362,10 @@ mod tests {
             .await
             .context("read note")?;
         ensure!(
-            out == Outcome::Done(Value::Str("hi".into())),
+            out.outcome == Outcome::Done(Value::string("hi".into())),
             "read output: {out:?}"
         );
+        ensure!(out.usage == Some(DriverUsage::from([(UsageDimension::BYTES_READ, 2)])));
         Ok(())
     }
 
@@ -364,7 +395,7 @@ mod tests {
         let out = d
             .call(
                 MethodId::new(0),
-                Value::Map(BTreeMap::new()),
+                Value::map(BTreeMap::new()),
                 OutputMode::Unary,
                 &ctx,
             )
@@ -372,11 +403,11 @@ mod tests {
         ensure!(out.is_err(), "read accepted missing path");
 
         let mut bad_path = BTreeMap::new();
-        bad_path.insert("path".into(), Value::Int(1));
+        bad_path.insert("path".into(), Value::integer(1));
         let out = d
             .call(
                 MethodId::new(2),
-                Value::Map(bad_path),
+                Value::map(bad_path),
                 OutputMode::Unary,
                 &ctx,
             )
@@ -386,7 +417,7 @@ mod tests {
         let out = d
             .call(
                 MethodId::new(4),
-                Value::Map(BTreeMap::new()),
+                Value::map(BTreeMap::new()),
                 OutputMode::Unary,
                 &ctx,
             )
@@ -401,10 +432,10 @@ mod tests {
         let d = FsDriver::new(dir.path(), state()).context("create fs driver")?;
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
         let mut m = BTreeMap::new();
-        m.insert("path".into(), Value::Str("note.txt".into()));
+        m.insert("path".into(), Value::string("note.txt".into()));
 
         let out = d
-            .call(MethodId::new(1), Value::Map(m), OutputMode::Unary, &ctx)
+            .call(MethodId::new(1), Value::map(m), OutputMode::Unary, &ctx)
             .await;
         ensure!(out.is_err(), "write accepted missing content");
         ensure!(
@@ -416,8 +447,8 @@ mod tests {
 
     fn glob_input(pattern: &str) -> Value {
         let mut m = BTreeMap::new();
-        m.insert("pattern".into(), Value::Str(pattern.into()));
-        Value::Map(m)
+        m.insert("pattern".into(), Value::string(pattern.into()));
+        Value::map(m)
     }
 
     #[tokio::test]
@@ -446,8 +477,9 @@ mod tests {
             )
             .await
             .context("glob top-level files")?;
-        match top {
-            Outcome::Done(Value::List(xs)) => {
+        match top.outcome {
+            Outcome::Done(xs_value) => {
+                let xs = xs_value.as_list().context("expected list")?;
                 let names: Vec<&str> = xs.iter().filter_map(|v| v.as_str()).collect();
                 ensure!(
                     names == vec!["a.txt", "b.txt"],
@@ -465,8 +497,9 @@ mod tests {
             )
             .await
             .context("glob recursive files")?;
-        match rec {
-            Outcome::Done(Value::List(xs)) => {
+        match rec.outcome {
+            Outcome::Done(xs_value) => {
+                let xs = xs_value.as_list().context("expected list")?;
                 let names: Vec<&str> = xs.iter().filter_map(|v| v.as_str()).collect();
                 ensure!(
                     names.contains(&"a.txt") && names.iter().any(|n| n.ends_with("d.txt")),
@@ -489,8 +522,10 @@ mod tests {
     #[tokio::test]
     async fn large_read_offloads_to_blob_ref() -> Result<()> {
         let dir = tempfile::tempdir().context("create temp dir")?;
-        let state = state();
-        let d = FsDriver::new(dir.path(), state.clone()).context("create fs driver")?;
+        let object_directory = tempfile::tempdir()?;
+        let objects =
+            xolotl_storage_fs::FileObjectStore::open(object_directory.path())?.into_object_store();
+        let d = FsDriver::new(dir.path(), objects.clone()).context("create fs driver")?;
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
         let big = "z".repeat((INLINE_MAX as usize) + 16);
         d.call(
@@ -510,8 +545,11 @@ mod tests {
             )
             .await
             .context("read large file")?;
-        match out {
-            Outcome::Done(Value::Blob(b)) => {
+        match out.outcome {
+            Outcome::Done(value) => {
+                let ValueView::Blob(b) = value.view() else {
+                    bail!("expected blob");
+                };
                 ensure!(
                     b.size == big.len() as u64,
                     "large read blob size: {}",
@@ -527,15 +565,20 @@ mod tests {
                     "large read blob mime: {:?}",
                     b.mime
                 );
-                let blob = crate::blob::BlobDriver::new(state);
-                let read = blob
-                    .call(MethodId::new(1), Value::Blob(b), OutputMode::Unary, &ctx)
-                    .await
-                    .context("read large blob")?;
-                ensure!(
-                    read == Outcome::Done(Value::Bytes(big.into_bytes())),
-                    "large read blob payload: {read:?}"
-                );
+                let mut chunk = [0_u8; crate::object::CHUNK_BYTES];
+                let mut offset = 0_usize;
+                loop {
+                    let read = objects.read_chunk(b, offset as u64, &mut chunk).await?;
+                    ensure!(
+                        chunk[..read.bytes_read]
+                            == big.as_bytes()[offset..offset + read.bytes_read]
+                    );
+                    offset += read.bytes_read;
+                    if read.end {
+                        break;
+                    }
+                }
+                ensure!(offset == big.len());
             }
             other => bail!("large read must offload to BlobRef, got {other:?}"),
         }
@@ -565,7 +608,7 @@ mod tests {
             .await
             .context("read small file")?;
         ensure!(
-            out == Outcome::Done(Value::Str("hi".into())),
+            out.outcome == Outcome::Done(Value::string("hi".into())),
             "small read output: {out:?}"
         );
         Ok(())

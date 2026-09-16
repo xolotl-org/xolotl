@@ -51,8 +51,10 @@ pub const DEFAULT_WS_MAX_STATE_LIST_LIMIT: usize = 512;
 pub const DEFAULT_WS_MAX_FACT_LIMIT: usize = 256;
 /// Default maximum trace entries returned by trace actions.
 pub const DEFAULT_WS_MAX_TRACE_LIMIT: usize = 512;
-/// Default timeout for sending an event to a WebSocket session.
-pub const DEFAULT_WS_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default per-session byte budget for queued and in-flight subscription data.
+pub const DEFAULT_WS_MAX_PENDING_EVENT_BYTES: usize = 1024 * 1024;
+/// Default timeout for sending any frame to a WebSocket session.
+pub const DEFAULT_WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Minimum accepted WebSocket frame size.
 pub const MIN_WS_MAX_FRAME_BYTES: usize = 16 * 1024;
@@ -98,10 +100,14 @@ pub const HARD_MAX_WS_FACT_LIMIT: usize = 4_096;
 pub const MIN_WS_MAX_TRACE_LIMIT: usize = 1;
 /// Hard upper bound for trace-list limit.
 pub const HARD_MAX_WS_TRACE_LIMIT: usize = 8_192;
-/// Minimum accepted event send timeout.
-pub const MIN_WS_EVENT_SEND_TIMEOUT: Duration = Duration::from_millis(100);
-/// Hard upper bound for event send timeout.
-pub const HARD_MAX_WS_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(60);
+/// Minimum accepted subscription queue byte budget.
+pub const MIN_WS_MAX_PENDING_EVENT_BYTES: usize = 16 * 1024;
+/// Hard upper bound for a session's subscription queue byte budget.
+pub const HARD_MAX_WS_PENDING_EVENT_BYTES: usize = 16 * 1024 * 1024;
+/// Minimum accepted frame send timeout.
+pub const MIN_WS_SEND_TIMEOUT: Duration = Duration::from_millis(100);
+/// Hard upper bound for frame send timeout.
+pub const HARD_MAX_WS_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Shared console backend state.
 pub struct ConsoleState {
@@ -232,7 +238,7 @@ pub(crate) fn console_transport_default() -> ConsoleTransportSecurityConfig {
 /// WebSocket runtime tuning for the Console Protocol server.
 #[derive(Clone, Debug)]
 pub struct ConsoleWsConfig {
-    /// Maximum accepted frame size.
+    /// Maximum incoming or outgoing encoded frame size.
     pub max_frame_bytes: usize,
     /// Maximum global active WebSocket connections.
     pub max_connections_global: usize,
@@ -254,8 +260,12 @@ pub struct ConsoleWsConfig {
     pub max_fact_limit: usize,
     /// Maximum trace rows per request.
     pub max_trace_limit: usize,
-    /// Timeout for delivering an event to a session.
-    pub event_send_timeout: Duration,
+    /// Encoded bytes retained by queued and in-flight subscription data frames.
+    /// A saturated queue closes the producing subscription. Bounded closure
+    /// notifications use an independent control path.
+    pub max_pending_event_bytes: usize,
+    /// Timeout for delivering any frame to a session.
+    pub send_timeout: Duration,
 }
 
 impl Default for ConsoleWsConfig {
@@ -272,7 +282,8 @@ impl Default for ConsoleWsConfig {
             max_state_list_limit: DEFAULT_WS_MAX_STATE_LIST_LIMIT,
             max_fact_limit: DEFAULT_WS_MAX_FACT_LIMIT,
             max_trace_limit: DEFAULT_WS_MAX_TRACE_LIMIT,
-            event_send_timeout: DEFAULT_WS_EVENT_SEND_TIMEOUT,
+            max_pending_event_bytes: DEFAULT_WS_MAX_PENDING_EVENT_BYTES,
+            send_timeout: DEFAULT_WS_SEND_TIMEOUT,
         }
     }
 }
@@ -318,10 +329,14 @@ impl ConsoleWsConfig {
             max_trace_limit: self
                 .max_trace_limit
                 .clamp(MIN_WS_MAX_TRACE_LIMIT, HARD_MAX_WS_TRACE_LIMIT),
-            event_send_timeout: clamp_duration(
-                self.event_send_timeout,
-                MIN_WS_EVENT_SEND_TIMEOUT,
-                HARD_MAX_WS_EVENT_SEND_TIMEOUT,
+            max_pending_event_bytes: self.max_pending_event_bytes.clamp(
+                MIN_WS_MAX_PENDING_EVENT_BYTES,
+                HARD_MAX_WS_PENDING_EVENT_BYTES,
+            ),
+            send_timeout: clamp_duration(
+                self.send_timeout,
+                MIN_WS_SEND_TIMEOUT,
+                HARD_MAX_WS_SEND_TIMEOUT,
             ),
         }
     }
@@ -467,7 +482,8 @@ mod tests {
             max_state_list_limit: 0,
             max_fact_limit: 0,
             max_trace_limit: usize::MAX,
-            event_send_timeout: Duration::ZERO,
+            max_pending_event_bytes: usize::MAX,
+            send_timeout: Duration::ZERO,
         });
         let cfg = runtime.config();
         assert_eq!(cfg.max_frame_bytes, HARD_MAX_WS_FRAME_BYTES);
@@ -484,6 +500,7 @@ mod tests {
         assert_eq!(cfg.max_state_list_limit, MIN_WS_MAX_STATE_LIST_LIMIT);
         assert_eq!(cfg.max_fact_limit, MIN_WS_MAX_FACT_LIMIT);
         assert_eq!(cfg.max_trace_limit, HARD_MAX_WS_TRACE_LIMIT);
-        assert_eq!(cfg.event_send_timeout, MIN_WS_EVENT_SEND_TIMEOUT);
+        assert_eq!(cfg.max_pending_event_bytes, HARD_MAX_WS_PENDING_EVENT_BYTES);
+        assert_eq!(cfg.send_timeout, MIN_WS_SEND_TIMEOUT);
     }
 }

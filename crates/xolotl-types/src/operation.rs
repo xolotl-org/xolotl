@@ -1,27 +1,39 @@
 //! `Operation`, `OperationId`, and `Fact` — the data-plane records.
 //!
 //! An [`Operation`] is the *only* way a side effect happens. Its identity,
-//! [`OperationId`], is causally derived — `(ProcessId, CausalPosition,
-//! attempt)` — with **no central counter**. A [`Fact`] is the immutable,
-//! write-ahead record of one operation attempt. Recovery, audit, billing, and
-//! trace projections are built from Facts. Both records stay fixed-size on the
-//! hot path: they carry *refs*, never inlined large payloads.
+//! [`OperationId`], combines its process, execution scope, dynamic invocation,
+//! source position, and retry attempt. A [`Fact`] records one operation attempt;
+//! stores complete its pending record in place. Recovery diagnostics, audit,
+//! billing and trace projections read Facts. Blob, tensor and frame payloads use
+//! external references; other inline values and retained history need host limits.
 
 use crate::ids::{
-    CausalPosition, HandleId, IdentityRef, MethodId, ProcessId, ResourceId, Timestamp,
+    CausalPosition, ExecutionId, HandleId, IdentityRef, InvocationId, MethodId, ProcessId,
 };
-use crate::replay::ReplayClass;
-use crate::value::Value;
+use crate::value::{Value, ValueView};
+use alloc::{collections::BTreeMap, string::String};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
-/// Causally-derived, globally-unique operation identity. Equal id ⇒
-/// same causal position + same attempt ⇒ exact dedup point in the Fact stream.
-/// Never depends on wall clock; needs no central counter.
+mod contract;
+mod fact;
+mod output;
+pub use contract::MethodContract;
+pub use fact::Fact;
+pub use output::{CompletionOrigin, DriverOutput, DriverUsage, UsageDimension};
+
+/// Identity of one operation attempt within a retained allocator namespace.
+///
+/// Source positions remain stable when a node is visited again. Invocation
+/// tickets distinguish those visits; execution scopes distinguish independent
+/// evaluations. Checkpoint restoration preserves every coordinate.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct OperationId {
     /// Process that owns this causal position.
     pub process: ProcessId,
+    /// Scope assigned once to the hosted evaluation or administrative sequence.
+    pub execution: ExecutionId,
+    /// Dynamic request ticket within the execution; zero is for administrative events.
+    pub invocation: InvocationId,
     /// Stable position in the compiled graph = `NodeId`.
     pub position: CausalPosition,
     /// Incremented only on explicit retry; crash-replay reuses the same value.
@@ -30,106 +42,106 @@ pub struct OperationId {
 
 impl OperationId {
     /// Create an operation id from its causal coordinates.
-    pub fn new(process: ProcessId, position: CausalPosition, attempt: u32) -> Self {
+    pub const fn new(
+        process: ProcessId,
+        execution: ExecutionId,
+        invocation: InvocationId,
+        position: CausalPosition,
+        attempt: u32,
+    ) -> Self {
         Self {
             process,
+            execution,
+            invocation,
             position,
             attempt,
         }
     }
 
-    /// The same causal position at the next explicit retry.
-    pub fn retry(self) -> Self {
-        Self {
-            attempt: self.attempt + 1,
-            ..self
+    /// The same invocation at the next explicit retry, or `None` at exhaustion.
+    pub const fn retry(self) -> Option<Self> {
+        match self.attempt.checked_add(1) {
+            Some(attempt) => Some(Self { attempt, ..self }),
+            None => None,
         }
+    }
+
+    /// Encode all coordinates in fixed-width, big-endian order without allocation.
+    /// The byte ordering agrees with the identifier's coordinate ordering.
+    pub fn to_bytes(self) -> [u8; 32] {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&self.process.get().to_be_bytes());
+        bytes[8..16].copy_from_slice(&self.execution.get().to_be_bytes());
+        bytes[16..24].copy_from_slice(&self.invocation.get().to_be_bytes());
+        bytes[24..28].copy_from_slice(&self.position.get().to_be_bytes());
+        bytes[28..].copy_from_slice(&self.attempt.to_be_bytes());
+        bytes
     }
 }
 
-impl std::fmt::Display for OperationId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for OperationId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "{}/{}/{}",
+            "{}/{}/{}/{}/{}",
             self.process.get(),
+            self.execution.get(),
+            self.invocation.get(),
             self.position.get(),
             self.attempt
         )
     }
 }
 
-/// Reference to an operation's input/output value. On the hot path large
-/// payloads are passed by ref so the Fact stays fixed-size. For
-/// small inline values the ref *is* the value.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ValueRef {
-    /// A small value carried inline.
-    Inline(Value),
-    /// A large value addressed by content hash (blob/tensor/frame); the bytes
-    /// live in the blob/tensor store, never in the Fact.
-    External {
-        /// Content hash for the external payload.
-        hash: String,
-        /// Byte size of the external payload.
-        size: u64,
-    },
+/// An operation identifier was not five canonical unsigned decimal coordinates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParseOperationIdError;
+
+impl core::fmt::Display for ParseOperationIdError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("invalid operation id: expected process/execution/invocation/position/attempt")
+    }
 }
 
-impl ValueRef {
-    /// Wrap a value, externalizing it if it carries a large out-of-line ref.
-    pub fn of(v: Value) -> Self {
-        match &v {
-            Value::Blob(b) => ValueRef::External {
-                hash: b.hash.clone(),
-                size: b.size,
-            },
-            Value::Tensor(t) => ValueRef::External {
-                hash: t.blob.hash.clone(),
-                size: t.blob.size,
-            },
-            Value::Frame(fr) => ValueRef::External {
-                hash: fr.blob.hash.clone(),
-                size: fr.blob.size,
-            },
-            _ => ValueRef::Inline(v),
-        }
-    }
+impl core::error::Error for ParseOperationIdError {}
 
-    /// Project a borrowed value into the fixed-size Fact representation.
-    /// Inline values are cloned because Facts own their replay/audit snapshot;
-    /// out-of-line values only copy the content-address metadata.
-    pub fn of_ref(v: &Value) -> Self {
-        match v {
-            Value::Blob(b) => ValueRef::External {
-                hash: b.hash.clone(),
-                size: b.size,
-            },
-            Value::Tensor(t) => ValueRef::External {
-                hash: t.blob.hash.clone(),
-                size: t.blob.size,
-            },
-            Value::Frame(fr) => ValueRef::External {
-                hash: fr.blob.hash.clone(),
-                size: fr.blob.size,
-            },
-            _ => ValueRef::Inline(v.clone()),
-        }
-    }
+impl core::str::FromStr for OperationId {
+    type Err = ParseOperationIdError;
 
-    /// Borrow the inline value if this reference carries one.
-    pub fn as_inline(&self) -> Option<&Value> {
-        match self {
-            ValueRef::Inline(v) => Some(v),
-            ValueRef::External { .. } => None,
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        fn component(value: Option<&str>) -> Result<u64, ParseOperationIdError> {
+            let value = value.ok_or(ParseOperationIdError)?;
+            if value.is_empty()
+                || (value.len() > 1 && value.starts_with('0'))
+                || !value.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(ParseOperationIdError);
+            }
+            value.parse().map_err(|_error| ParseOperationIdError)
         }
+        let mut parts = value.split('/');
+        let process = ProcessId::new(component(parts.next())?);
+        let execution = ExecutionId::new(component(parts.next())?).ok_or(ParseOperationIdError)?;
+        let invocation = InvocationId::new(component(parts.next())?);
+        let position =
+            u32::try_from(component(parts.next())?).map_err(|_error| ParseOperationIdError)?;
+        let attempt =
+            u32::try_from(component(parts.next())?).map_err(|_error| ParseOperationIdError)?;
+        if parts.next().is_some() {
+            return Err(ParseOperationIdError);
+        }
+        Ok(Self::new(
+            process,
+            execution,
+            invocation,
+            CausalPosition::new(position),
+            attempt,
+        ))
     }
 }
 
 /// A single actual call — the one path through which side effects occur.
-/// Carries the input `Value` for dispatch; the data plane projects it to a
-/// fixed-size [`ValueRef`] when recording the Fact. Large modality
+/// Carries the input `Value` for dispatch and shares it with the Fact. Large modality
 /// values (`Blob`/`Tensor`/`Frame`) are *already* out-of-line refs, so passing
 /// them by value here is cheap — the bytes never travel inline.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -144,7 +156,7 @@ pub struct Operation {
     pub handle: HandleId,
     /// Interface method id selected by open/dispatch.
     pub method: MethodId,
-    /// The input passed to the driver. Recorded in the Fact as `ValueRef::of`.
+    /// The complete input passed to the driver and shared with its Fact.
     pub input: Value,
     /// Provenance of the input value. Propagates input→output: the
     /// outcome inherits this taint, and outbound/memory policies read it.
@@ -182,79 +194,8 @@ impl DecisionTag {
     }
 }
 
-/// Reference to a materialized outcome summary. The hot path writes only
-/// this ref; audit/billing/trace projections materialize the detail lazily
-/// from `input_ref` / `outcome_ref`.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OutcomeRef {
-    /// A small outcome carried inline.
-    Inline(Value),
-    /// A large outcome addressed by content hash.
-    External {
-        /// Content hash for the external payload.
-        hash: String,
-        /// Byte size of the external payload.
-        size: u64,
-    },
-    /// No completed success body: pending facts and failures use this. A
-    /// successful unit/null outcome is recorded as `Inline(Value::Null)` so
-    /// recovery can distinguish completion from "begun, not completed".
-    None,
-}
-
-impl OutcomeRef {
-    /// Wrap a success value, externalizing large payload references.
-    pub fn of(v: Value) -> Self {
-        match &v {
-            Value::Blob(b) => OutcomeRef::External {
-                hash: b.hash.clone(),
-                size: b.size,
-            },
-            Value::Tensor(t) => OutcomeRef::External {
-                hash: t.blob.hash.clone(),
-                size: t.blob.size,
-            },
-            Value::Frame(fr) => OutcomeRef::External {
-                hash: fr.blob.hash.clone(),
-                size: fr.blob.size,
-            },
-            _ => OutcomeRef::Inline(v),
-        }
-    }
-
-    /// Project a borrowed success body into the Fact outcome representation.
-    /// Like [`ValueRef::of_ref`], this avoids cloning tensor/blob/frame wrapper
-    /// fields that are not stored in the hot record.
-    pub fn of_ref(v: &Value) -> Self {
-        match v {
-            Value::Blob(b) => OutcomeRef::External {
-                hash: b.hash.clone(),
-                size: b.size,
-            },
-            Value::Tensor(t) => OutcomeRef::External {
-                hash: t.blob.hash.clone(),
-                size: t.blob.size,
-            },
-            Value::Frame(fr) => OutcomeRef::External {
-                hash: fr.blob.hash.clone(),
-                size: fr.blob.size,
-            },
-            _ => OutcomeRef::Inline(v.clone()),
-        }
-    }
-
-    /// Borrow the inline success body if this reference carries one.
-    pub fn as_inline(&self) -> Option<&Value> {
-        match self {
-            OutcomeRef::Inline(v) => Some(v),
-            OutcomeRef::External { .. } | OutcomeRef::None => None,
-        }
-    }
-}
-
 /// Compact shape/cost metadata for one explicit batchable Operation.
-/// Recovery still uses `outcome_ref`, so summarizing a batch preserves the
+/// Recovery still uses the complete outcome, so summarizing a batch preserves the
 /// completed result.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BatchSummary {
@@ -265,283 +206,214 @@ pub struct BatchSummary {
     /// Estimated output tokens for the whole batch.
     pub output_tokens: u64,
     /// Redacted structural summary of the input.
+    #[serde(with = "crate::tagged_value")]
     pub input_summary: Value,
     /// Redacted structural summary of the output.
+    #[serde(with = "crate::tagged_value")]
     pub output_summary: Value,
 }
 
 impl BatchSummary {
     /// Build a summary for list-shaped batch input and optional outcome.
-    pub fn new(input: &Value, outcome: Option<&OutcomeRef>) -> Option<Self> {
-        let Value::List(items) = input else {
-            return None;
-        };
-        let output = outcome.and_then(OutcomeRef::as_inline);
+    pub fn new(input: &Value, output: Option<&Value>) -> Option<Self> {
+        let items = input.as_list()?;
         Some(Self {
             elements: items.len() as u64,
             input_tokens: input.approx_tokens(),
             output_tokens: output.map(Value::approx_tokens).unwrap_or(0),
             input_summary: summarize_value(input),
-            output_summary: output.map(summarize_value).unwrap_or(Value::Null),
+            output_summary: output.map(summarize_value).unwrap_or_default(),
         })
     }
 
     /// Convert the summary to a value for audit and console projections.
     pub fn to_value(&self) -> Value {
         let mut m = BTreeMap::new();
-        m.insert("elements".into(), Value::Int(self.elements as i64));
-        m.insert("input_tokens".into(), Value::Int(self.input_tokens as i64));
+        m.insert("elements".into(), Value::integer(self.elements as i64));
+        m.insert(
+            "input_tokens".into(),
+            Value::integer(self.input_tokens as i64),
+        );
         m.insert(
             "output_tokens".into(),
-            Value::Int(self.output_tokens as i64),
+            Value::integer(self.output_tokens as i64),
         );
         m.insert("input_summary".into(), self.input_summary.clone());
         m.insert("output_summary".into(), self.output_summary.clone());
-        Value::Map(m)
+        Value::map(m)
     }
 }
 
 fn summarize_value(v: &Value) -> Value {
-    match v {
-        Value::Null => kind("null"),
-        Value::Bool(_) => kind("bool"),
-        Value::Int(_) => kind("int"),
-        Value::Float(_) => kind("float"),
-        Value::Str(s) => {
+    let mut current = v;
+    let mut lengths = alloc::vec::Vec::new();
+    while let Some(items) = current.as_list() {
+        let Some(first) = items.get(0) else { break };
+        lengths.push(items.len());
+        current = first;
+    }
+    let mut summary = summarize_shallow(current);
+    for length in lengths.into_iter().rev() {
+        let mut map = kind_map("list");
+        map.insert("len".into(), Value::integer(length as i64));
+        map.insert("elem".into(), summary);
+        summary = Value::map(map);
+    }
+    summary
+}
+
+fn summarize_shallow(v: &Value) -> Value {
+    match v.view() {
+        ValueView::Null => kind("null"),
+        ValueView::Bool(_) => kind("bool"),
+        ValueView::Int(_) => kind("int"),
+        ValueView::Float(_) => kind("float"),
+        ValueView::Str(s) => {
             let mut m = kind_map("str");
-            m.insert("chars".into(), Value::Int(s.chars().count() as i64));
-            Value::Map(m)
+            m.insert("chars".into(), Value::integer(s.chars().count() as i64));
+            Value::map(m)
         }
-        Value::Bytes(b) => {
+        ValueView::Bytes(b) => {
             let mut m = kind_map("bytes");
-            m.insert("bytes".into(), Value::Int(b.len() as i64));
-            Value::Map(m)
+            m.insert("bytes".into(), Value::integer(b.len() as i64));
+            Value::map(m)
         }
-        Value::List(items) => {
+        ValueView::List(items) => {
             let mut m = kind_map("list");
-            m.insert("len".into(), Value::Int(items.len() as i64));
-            if let Some(first) = items.first() {
-                m.insert("elem".into(), summarize_value(first));
-            }
-            Value::Map(m)
+            m.insert("len".into(), Value::integer(items.len() as i64));
+            Value::map(m)
         }
-        Value::Map(fields) => {
+        ValueView::Map(fields) => {
             let mut m = kind_map("map");
-            m.insert("fields".into(), Value::Int(fields.len() as i64));
+            m.insert("fields".into(), Value::integer(fields.len() as i64));
             m.insert(
                 "keys".into(),
-                Value::List(fields.keys().take(8).cloned().map(Value::Str).collect()),
+                Value::list(fields.keys().take(8).map(Value::from).collect()),
             );
-            Value::Map(m)
+            Value::map(m)
         }
-        Value::Blob(b) => {
+        ValueView::Blob(b) => {
             let mut m = kind_map("blob");
-            m.insert("hash".into(), Value::Str(b.hash.clone()));
-            m.insert("size".into(), Value::Int(b.size as i64));
+            m.insert("hash".into(), Value::string(b.hash.clone()));
+            m.insert("size".into(), Value::integer(b.size as i64));
             if let Some(mime) = &b.mime {
-                m.insert("mime".into(), Value::Str(mime.clone()));
+                m.insert("mime".into(), Value::string(mime.clone()));
             }
-            Value::Map(m)
+            Value::map(m)
         }
-        Value::Tensor(t) => {
+        ValueView::Tensor(t) => {
             let mut m = kind_map("tensor");
-            m.insert("hash".into(), Value::Str(t.blob.hash.clone()));
-            m.insert("size".into(), Value::Int(t.blob.size as i64));
+            m.insert("hash".into(), Value::string(t.blob.hash.clone()));
+            m.insert("size".into(), Value::integer(t.blob.size as i64));
             m.insert(
                 "shape".into(),
-                Value::List(t.shape.iter().map(|n| Value::Int(*n as i64)).collect()),
+                Value::list(t.shape.iter().map(|n| Value::integer(*n as i64)).collect()),
             );
-            m.insert("dtype".into(), Value::Str(format!("{:?}", t.dtype)));
-            Value::Map(m)
+            m.insert("dtype".into(), Value::string(format!("{:?}", t.dtype)));
+            Value::map(m)
         }
-        Value::Frame(fr) => {
+        ValueView::Frame(fr) => {
             let mut m = kind_map("frame");
-            m.insert("hash".into(), Value::Str(fr.blob.hash.clone()));
-            m.insert("size".into(), Value::Int(fr.blob.size as i64));
-            m.insert("ts_nanos".into(), Value::Int(fr.ts_nanos));
-            m.insert("kind".into(), Value::Str(format!("{:?}", fr.kind)));
-            Value::Map(m)
+            m.insert("hash".into(), Value::string(fr.blob.hash.clone()));
+            m.insert("size".into(), Value::integer(fr.blob.size as i64));
+            m.insert("ts_nanos".into(), Value::integer(fr.ts_nanos));
+            m.insert("kind".into(), Value::string(format!("{:?}", fr.kind)));
+            Value::map(m)
         }
-        Value::StreamEnd(_) => kind("stream_end"),
+        ValueView::StreamEnd(_) => kind("stream_end"),
     }
 }
 
 fn kind(name: &str) -> Value {
-    Value::Map(kind_map(name))
+    Value::map(kind_map(name))
 }
 
 fn kind_map(name: &str) -> BTreeMap<String, Value> {
-    BTreeMap::from([("kind".into(), Value::Str(name.into()))])
-}
-
-/// Immutable record of one operation attempt; the system's write-ahead source
-/// of truth. Fixed-size hot record: refs + lightweight tags only.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Fact {
-    /// `OperationId` — globally unique, no central counter.
-    pub id: OperationId,
-    /// Fact schema version used for migration and replay compatibility.
-    pub schema_version: u32,
-    /// Process that issued the operation.
-    pub caller: ProcessId,
-    /// Identity the operation ran as.
-    pub acting: IdentityRef,
-    /// Handle used to authorize and dispatch the operation.
-    pub handle: HandleId,
-    /// Resource id resolved by the handle.
-    pub resource: ResourceId,
-    /// Method id invoked on the resource interface.
-    pub method: MethodId,
-    /// Reference only; large objects are blob/tensor refs.
-    pub input_ref: ValueRef,
-    /// Provenance of the input, recorded for audit / why-not. Defaults
-    /// to pristine for Facts written before taint tracking existed.
-    #[serde(default)]
-    pub taint: crate::taint::TaintSet,
-    /// Fixed-size decision tag, not a full snapshot.
-    pub decision: DecisionTag,
-    /// Reference; the summary is materialized on the projection side.
-    pub outcome_ref: OutcomeRef,
-    /// Optional  batch summary. It describes a `List` input to a batchable
-    /// method while `input_ref`/`outcome_ref` remain the replay material.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub batch: Option<BatchSummary>,
-    /// Replay class derived from method purity and operation semantics.
-    pub replay: ReplayClass,
-    /// Timestamp assigned when the Fact was recorded.
-    pub timestamp: Timestamp,
-}
-
-impl Fact {
-    /// Current Fact schema version. Bumping this requires a
-    /// migration so historical Facts stay replayable.
-    pub const SCHEMA_VERSION: u32 = 1;
-
-    /// Whether this Fact records a completed attempt (has an outcome). A
-    /// pending Fact (begun, not completed) is handled per ReplayClass on
-    /// recovery.
-    pub fn is_complete(&self) -> bool {
-        !matches!(self.outcome_ref, OutcomeRef::None) || !self.decision.is_ok()
-    }
+    BTreeMap::from([("kind".into(), Value::string(name.into()))])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ids::NodeId;
-    use crate::value::{BlobRef, Value};
-    use anyhow::{bail, ensure};
+    use crate::value::Value;
+    use alloc::string::ToString;
+    use anyhow::ensure;
 
     #[test]
-    fn operation_id_is_causal_not_counter() {
-        let a = OperationId::new(ProcessId::new(1), NodeId::new(5), 0);
-        let b = OperationId::new(ProcessId::new(1), NodeId::new(5), 0);
-        assert_eq!(
-            a, b,
-            "same causal position + attempt ⇒ same id (dedup anchor)"
+    fn operation_id_distinguishes_execution_invocation_and_retry() -> anyhow::Result<()> {
+        let a = OperationId::new(
+            ProcessId::new(1),
+            ExecutionId::FIRST,
+            InvocationId::new(9),
+            NodeId::new(5),
+            0,
         );
-        assert_ne!(a, a.retry(), "retry bumps attempt");
-    }
-
-    #[test]
-    fn value_ref_externalizes_large_payloads() -> anyhow::Result<()> {
-        let blob = Value::Blob(BlobRef {
-            hash: "abc".into(),
-            size: 1_000_000,
-            mime: None,
-        });
-        match ValueRef::of(blob) {
-            ValueRef::External { hash, size } => {
-                ensure!(hash == "abc", "unexpected external hash: {hash}");
-                ensure!(size == 1_000_000, "unexpected external size: {size}");
-            }
-            other => bail!("large blob was not externalized: {other:?}"),
-        }
+        let b = a;
         ensure!(
-            matches!(ValueRef::of(Value::Int(3)), ValueRef::Inline(_)),
-            "small scalar was not inlined"
+            a == b,
+            "identical execution coordinates must share an identity"
         );
+        ensure!(Some(a) != a.retry(), "retry bumps attempt");
+        ensure!(
+            OperationId {
+                attempt: u32::MAX,
+                ..a
+            }
+            .retry()
+            .is_none()
+        );
+        let execution =
+            ExecutionId::new(2).ok_or_else(|| anyhow::anyhow!("missing execution id"))?;
+        ensure!(a != OperationId { execution, ..a });
+        ensure!(
+            a != OperationId {
+                invocation: InvocationId::new(10),
+                ..a
+            }
+        );
+        ensure!(core::mem::size_of::<OperationId>() == 32);
         Ok(())
     }
 
     #[test]
-    fn borrowed_refs_externalize_large_payloads_without_owned_value() {
-        let blob = Value::Blob(BlobRef {
-            hash: "abc".into(),
-            size: 1_000_000,
-            mime: None,
-        });
-
-        assert_eq!(
-            ValueRef::of_ref(&blob),
-            ValueRef::External {
-                hash: "abc".into(),
-                size: 1_000_000
-            }
-        );
-        assert_eq!(
-            OutcomeRef::of_ref(&blob),
-            OutcomeRef::External {
-                hash: "abc".into(),
-                size: 1_000_000
-            }
-        );
-        assert_eq!(
-            ValueRef::of_ref(&Value::Int(3)),
-            ValueRef::Inline(Value::Int(3))
-        );
-    }
-
-    #[test]
-    fn null_success_is_a_completed_outcome() {
-        let f = Fact {
-            id: OperationId::new(ProcessId::new(2), NodeId::new(1), 0),
-            schema_version: Fact::SCHEMA_VERSION,
-            caller: ProcessId::new(2),
-            acting: IdentityRef::ROOT,
-            handle: HandleId::new(0, 1),
-            resource: ResourceId::new(7),
-            method: MethodId::new(0),
-            input_ref: ValueRef::Inline(Value::Null),
-            taint: crate::taint::TaintSet::pristine(),
-            decision: DecisionTag::Ok,
-            outcome_ref: OutcomeRef::of(Value::Null),
-            batch: None,
-            replay: ReplayClass::Deterministic,
-            timestamp: Timestamp::millis(123),
-        };
-        assert!(matches!(f.outcome_ref, OutcomeRef::Inline(Value::Null)));
-        assert!(f.is_complete());
-    }
-
-    #[test]
-    fn fact_serde_roundtrip() -> anyhow::Result<()> {
-        let f = Fact {
-            id: OperationId::new(ProcessId::new(2), NodeId::new(1), 0),
-            schema_version: Fact::SCHEMA_VERSION,
-            caller: ProcessId::new(2),
-            acting: IdentityRef::ROOT,
-            handle: HandleId::new(0, 1),
-            resource: ResourceId::new(7),
-            method: MethodId::new(0),
-            input_ref: ValueRef::Inline(Value::Str("hi".into())),
-            taint: crate::taint::TaintSet::pristine(),
-            decision: DecisionTag::Ok,
-            outcome_ref: OutcomeRef::Inline(Value::Int(1)),
-            batch: None,
-            replay: ReplayClass::Deterministic,
-            timestamp: Timestamp::millis(123),
-        };
-        let s = serde_json::to_string(&f)?;
-        let back: Fact = serde_json::from_str(&s)?;
-        ensure!(f == back, "fact serde roundtrip changed value");
+    fn operation_id_text_and_bytes_preserve_every_coordinate() -> anyhow::Result<()> {
+        let id: OperationId = "1/2/4294967296/4/5".parse()?;
+        ensure!(id.to_string() == "1/2/4294967296/4/5");
+        let bytes = id.to_bytes();
+        ensure!(bytes[..8] == 1u64.to_be_bytes());
+        ensure!(bytes[8..16] == 2u64.to_be_bytes());
+        ensure!(bytes[16..24] == 4294967296u64.to_be_bytes());
+        ensure!(bytes[24..28] == 4u32.to_be_bytes());
+        ensure!(bytes[28..] == 5u32.to_be_bytes());
+        for invalid in [
+            "1/2/3",
+            "1/0/3/4/5",
+            "1/2/3/4/5/6",
+            "1/02/3/4/5",
+            "1/+2/3/4/5",
+            " 1/2/3/4/5",
+            "1/2/3/4/5\n",
+            "1//3/4/5",
+            "1/2/3/4294967296/5",
+            "1/2/3/4/4294967296",
+            "1/18446744073709551616/3/4/5",
+        ] {
+            ensure!(
+                invalid.parse::<OperationId>().is_err(),
+                "accepted {invalid:?}"
+            );
+        }
         Ok(())
     }
 
     #[test]
     fn batch_summary_summarizes_shape_without_replacing_outcome() -> anyhow::Result<()> {
-        let input = Value::List(vec![Value::Str("alpha".into()), Value::Str("beta".into())]);
-        let outcome = OutcomeRef::of(Value::List(vec![Value::Int(1), Value::Int(2)]));
+        let input = Value::list(vec![
+            Value::string("alpha".into()),
+            Value::string("beta".into()),
+        ]);
+        let outcome = Value::list(vec![Value::integer(1), Value::integer(2)]);
         let summary = BatchSummary::new(&input, Some(&outcome))
             .ok_or_else(|| anyhow::anyhow!("batch summary was not created"))?;
         ensure!(
@@ -549,12 +421,9 @@ mod tests {
             "unexpected batch elements: {}",
             summary.elements
         );
+        ensure!(outcome.as_list().is_some(), "outcome was replaced");
         ensure!(
-            matches!(outcome, OutcomeRef::Inline(Value::List(_))),
-            "outcome was replaced"
-        );
-        ensure!(
-            matches!(summary.to_value(), Value::Map(_)),
+            summary.to_value().as_map().is_some(),
             "summary did not render as map"
         );
         Ok(())

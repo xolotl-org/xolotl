@@ -1,34 +1,33 @@
-//! The single execution IR: `ExecutionGraph` / `Node` / `NodeKind`.
+//! Native composition graph, lowered into the shared core instructions.
 //!
 //! `NodeId == CausalPosition`: assigned at compile time, stable while
-//! the Program is unchanged, never derived from wall clock or randomness. It
-//! is the anchor for concurrency-safe recovery and idempotent dedup.
+//! the Program is unchanged, never derived from wall clock or randomness.
+//! Operation identity also includes an execution scope, dynamic invocation and
+//! retry attempt; a source position alone cannot identify or recover an effect.
 
+use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
-use xolotl_types::{Failure, MethodId, NodeId, OutputMode, Path, ProcessId, ResourceName, Value};
+use xolotl_types::{Failure, MethodId, NodeId, OutputMode, Path, ResourceName, Value};
 
-/// A reference to a named step function on the owning Process. Steps
-/// are **pure** `Value -> Do<A>` continuations; they are named, not closures,
-/// so the graph is serializable and cannot smuggle cross-identity code.
+/// A named continuation resolved in the executor's composed module.
+/// The same graph can run in different processes with independently installed
+/// functions. A reference cannot select another process's code; cross-process
+/// work goes through Operations on Resources.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StepRef {
-    /// Process that owns the named step. The executor rejects a `StepRef` whose
-    /// process differs from the currently running Process.
-    pub process: ProcessId,
-    /// Step name on `process`'s step table. Cross-process work is only possible
-    /// via Operations on Resources.
+    /// Continuation name in the executor's module.
     pub name: String,
     /// Optional inline argument supplied at compile time, passed alongside the
     /// piped-in value (used by `for_each`-style helpers).
-    #[serde(default)]
+    #[serde(default, with = "xolotl_types::tagged_value::optional")]
     pub arg: Option<Value>,
 }
 
 impl StepRef {
-    /// Create a reference to a named step on `process`.
-    pub fn new(process: ProcessId, name: impl Into<String>) -> Self {
+    /// Create a reference to a step in the executing process.
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
-            process,
             name: name.into(),
             arg: None,
         }
@@ -46,6 +45,7 @@ impl StepRef {
 /// method; the concrete input is bound from the upstream value when the
 /// Executor reaches the node.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OperationTemplate {
     /// Resource the operation targets (control-plane name; the Executor maps
     /// it to an owned Handle).
@@ -61,7 +61,7 @@ pub struct OperationTemplate {
     pub output: OutputMode,
     /// A literal input fixed at compile time. When `None`, the node's input is
     /// the value flowing in along its incoming edge.
-    #[serde(default)]
+    #[serde(default, with = "xolotl_types::tagged_value::optional")]
     pub literal_input: Option<Value>,
 }
 
@@ -105,7 +105,7 @@ pub enum WaitSpec {
 #[serde(rename_all = "snake_case")]
 pub enum NodeKind {
     /// Produce a value immediately.
-    Pure(Value),
+    Pure(#[serde(with = "xolotl_types::tagged_value")] Value),
     /// Produce a failure immediately (failure-dual of `Pure`; the Executor
     /// propagates it along the edges to the nearest enclosing `Branch`).
     Fail(Failure),
@@ -171,8 +171,8 @@ pub struct Edge {
     pub kind: EdgeKind,
 }
 
-/// The single execution IR. All Program formats compile to this; the
-/// Executor only advances a cursor over it.
+/// Native composition graph, lowered into the shared core instruction image.
+/// Portable source compiles directly to that same image without this graph.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionGraph {
     /// Nodes in stable id order as produced by the compiler.
@@ -240,11 +240,23 @@ mod tests {
     use anyhow::{Context, anyhow, ensure};
 
     fn s(name: &str) -> StepRef {
-        StepRef::new(ProcessId::new(1), name)
+        StepRef::new(name)
     }
 
     fn p(path: &str) -> anyhow::Result<Path> {
         Path::parse(path).map_err(|error| anyhow!("path parse failed for {path}: {error}"))
+    }
+
+    #[test]
+    fn step_reference_serializes_without_process_identity() -> anyhow::Result<()> {
+        let step = StepRef::new("module/finish").with_arg(Value::integer(7));
+        let json = serde_json::to_value(&step)?;
+        ensure!(json.as_object().context("step must be an object")?.len() == 2);
+        ensure!(serde_json::from_value::<StepRef>(json.clone())? == step);
+        let mut pinned = json;
+        pinned["process"] = serde_json::json!(42);
+        ensure!(serde_json::from_value::<StepRef>(pinned).is_err());
+        Ok(())
     }
 
     #[test]
@@ -253,7 +265,7 @@ mod tests {
             nodes: vec![
                 Node {
                     id: NodeId::new(0),
-                    kind: NodeKind::Pure(Value::Int(1)),
+                    kind: NodeKind::Pure(Value::integer(1)),
                 },
                 Node {
                     id: NodeId::new(1),
@@ -298,7 +310,7 @@ mod tests {
             "operation should be side-effecting"
         );
         ensure!(
-            !NodeKind::Pure(Value::Null).is_side_effecting(),
+            !NodeKind::Pure(Value::null()).is_side_effecting(),
             "pure node should not be side-effecting"
         );
         ensure!(

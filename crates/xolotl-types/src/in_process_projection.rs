@@ -2,8 +2,12 @@
 
 use crate::external::{EventSource, OverflowPolicy, Role};
 use crate::{EffectCapability, Path, Value};
+use alloc::collections::BTreeSet;
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use thiserror::Error;
 
 /// In-process projection declaration stored under
@@ -334,7 +338,7 @@ mod tests {
                 Purity::Effectful,
             )],
             emits: None,
-            config: Value::Null,
+            config: Value::null(),
             version: 1,
         }
     }
@@ -407,7 +411,7 @@ mod tests {
                 command_schema: None,
                 command_result_schema: None,
             }),
-            config: Value::Null,
+            config: Value::null(),
             version: 1,
         };
         value
@@ -433,7 +437,7 @@ mod tests {
                 command_schema: None,
                 command_result_schema: None,
             }),
-            config: Value::Null,
+            config: Value::null(),
             version: 1,
         };
         let result = value.validate_admission("events");

@@ -1,33 +1,55 @@
-//! Lossless conversions between `xolotl_types` (kernel-side) and the generated
-//! protobuf wire types (`crate::xolotl::v1`). These are the canonical
-//! marshalling functions for every gRPC adapter — there is no JSON shortcut and
-//! no deferred mapping: every `Value` variant, every `Path` / `Capability` /
-//! `Failure` / `Outcome` / `DoNode` round-trips structurally.
+//! Canonical conversions between domain types and protobuf wire messages.
+//! Typed values, paths, capabilities, and composition trees retain their wire
+//! structure. Failures preserve their exact variants and recovery metadata.
+//! Checked decoders validate required fields and enum representations. They do
+//! not replace execution admission or verify ownership of referenced objects.
 
 use crate::xolotl::v1 as pb;
 use thiserror::Error;
 use xolotl_graph::{DoNode, OperationTemplate, StepRef, WaitSpec};
 use xolotl_types::{
     BlobRef, CapError, Capability, DType, Failure, FloatBits, FrameKind, FrameRef, MethodId,
-    Outcome, OutputMode, Path, PathError, ProcessId, ResourceName, StreamMarker, TensorRef, Value,
+    Outcome, OutputMode, Path, PathError, ResourceName, StreamMarker, TensorRef, Value, ValueView,
 };
 
+/// Rejection of malformed, unsupported, or unrepresentable wire-domain data.
 #[derive(Debug, Error)]
 pub enum ConvertError {
+    /// Invalid portable source document or source identity.
+    #[error("portable program: {0}")]
+    Portable(#[from] xolotl_graph::portable::CompileError),
+    /// A path component violates the domain path syntax.
     #[error("path: {0}")]
     Path(#[from] PathError),
+    /// A capability target, verb, or predicate cannot be parsed or validated.
     #[error("capability: {0}")]
     Capability(#[from] CapError),
+    /// Required message or oneof is absent, or a required string is blank or
+    /// has surrounding whitespace. The diagnostic identifies the field.
     #[error("missing required field: {0}")]
     Missing(&'static str),
+    /// A named discriminant or its sentinel value is not supported by the domain.
     #[error("unsupported wire enum value: {0}")]
     Enum(&'static str),
+    /// An unknown numeric protobuf enum value, retaining the rejected number.
     #[error("unsupported wire enum value for field {field}: {value}")]
-    EnumValue { field: &'static str, value: i32 },
+    EnumValue {
+        /// Wire field whose discriminant could not be interpreted.
+        field: &'static str,
+        /// Raw enum number received from the peer.
+        value: i32,
+    },
+    /// A numeric field cannot be represented in the destination domain type.
     #[error("numeric value out of range for field: {0}")]
     Range(&'static str),
+    /// A numeric conversion failed, retaining both the field and received value.
     #[error("numeric value out of range for field {field}: {value}")]
-    RangeValue { field: &'static str, value: u64 },
+    RangeValue {
+        /// Wire field whose value exceeded the destination type's range.
+        field: &'static str,
+        /// Unsigned value received before conversion to the destination type.
+        value: u64,
+    },
 }
 
 fn enum_value<T>(field: &'static str, value: i32) -> Result<T, ConvertError>
@@ -42,84 +64,93 @@ where
 /// `xolotl_types::Value` → wire `Value`. Total and lossless.
 pub fn value_to_pb(v: &Value) -> pb::Value {
     use pb::value::Kind;
-    let kind = match v {
-        Value::Null => Kind::NullVal(pb::NullValue::NullValue as i32),
-        Value::Bool(b) => Kind::BoolVal(*b),
-        Value::Int(i) => Kind::IntVal(*i),
-        Value::Float(FloatBits(f)) => Kind::FloatVal(*f),
-        Value::Str(s) => Kind::StrVal(s.clone()),
-        Value::Bytes(b) => Kind::BytesVal(b.clone()),
-        Value::List(xs) => Kind::ListVal(pb::ListValue {
+    let kind = match v.view() {
+        ValueView::Null => Kind::NullVal(pb::NullValue::NullValue as i32),
+        ValueView::Bool(b) => Kind::BoolVal(b),
+        ValueView::Int(i) => Kind::IntVal(i),
+        ValueView::Float(FloatBits(f)) => Kind::FloatVal(f),
+        ValueView::Str(s) => Kind::StrVal(s.to_owned()),
+        ValueView::Bytes(b) => Kind::BytesVal(b.to_vec()),
+        ValueView::List(xs) => Kind::ListVal(pb::ListValue {
             items: xs.iter().map(value_to_pb).collect(),
         }),
-        Value::Map(m) => Kind::MapVal(pb::MapValue {
-            entries: m.iter().map(|(k, v)| (k.clone(), value_to_pb(v))).collect(),
+        ValueView::Map(m) => Kind::MapVal(pb::MapValue {
+            entries: m
+                .iter()
+                .map(|(k, v)| (k.to_owned(), value_to_pb(v)))
+                .collect(),
         }),
-        Value::Blob(b) => Kind::BlobVal(blob_to_pb(b)),
-        Value::Tensor(t) => Kind::TensorVal(tensor_to_pb(t)),
-        Value::Frame(fr) => Kind::FrameVal(frame_to_pb(fr)),
-        Value::StreamEnd(m) => Kind::StreamEndVal(stream_marker_to_pb(m)),
+        ValueView::Blob(b) => Kind::BlobVal(blob_to_pb(b)),
+        ValueView::Tensor(t) => Kind::TensorVal(tensor_to_pb(t)),
+        ValueView::Frame(fr) => Kind::FrameVal(frame_to_pb(fr)),
+        ValueView::StreamEnd(m) => Kind::StreamEndVal(stream_marker_to_pb(m)),
     };
     pb::Value { kind: Some(kind) }
 }
 
-/// Wire `Value` → `xolotl_types::Value`. An absent oneof maps to `Null`.
+/// Decode a wire value using permissive fallbacks. An absent oneof, invalid
+/// tensor/frame metadata, or invalid stream marker maps to `Null`; unrecognized
+/// null enum numbers are also accepted as null. Use [`value_from_pb_checked`]
+/// when invalid input must be reported rather than replaced.
 pub fn value_from_pb(v: &pb::Value) -> Value {
     use pb::value::Kind;
     match &v.kind {
-        None => Value::Null,
-        Some(Kind::NullVal(_)) => Value::Null,
-        Some(Kind::BoolVal(b)) => Value::Bool(*b),
-        Some(Kind::IntVal(i)) => Value::Int(*i),
-        Some(Kind::FloatVal(f)) => Value::Float(FloatBits(*f)),
-        Some(Kind::StrVal(s)) => Value::Str(s.clone()),
-        Some(Kind::BytesVal(b)) => Value::Bytes(b.clone()),
-        Some(Kind::ListVal(l)) => Value::List(l.items.iter().map(value_from_pb).collect()),
-        Some(Kind::MapVal(m)) => Value::Map(
+        None => Value::null(),
+        Some(Kind::NullVal(_)) => Value::null(),
+        Some(Kind::BoolVal(b)) => Value::boolean(*b),
+        Some(Kind::IntVal(i)) => Value::integer(*i),
+        Some(Kind::FloatVal(f)) => Value::float(FloatBits(*f)),
+        Some(Kind::StrVal(s)) => Value::string(s.clone()),
+        Some(Kind::BytesVal(b)) => Value::bytes(b.clone()),
+        Some(Kind::ListVal(l)) => Value::list(l.items.iter().map(value_from_pb).collect()),
+        Some(Kind::MapVal(m)) => Value::map(
             m.entries
                 .iter()
                 .map(|(k, v)| (k.clone(), value_from_pb(v)))
                 .collect(),
         ),
-        Some(Kind::BlobVal(b)) => Value::Blob(blob_from_pb(b)),
-        Some(Kind::TensorVal(t)) => tensor_from_pb(t).map_or(Value::Null, Value::Tensor),
-        Some(Kind::FrameVal(fr)) => frame_from_pb(fr).map_or(Value::Null, Value::Frame),
+        Some(Kind::BlobVal(b)) => Value::blob(blob_from_pb(b)),
+        Some(Kind::TensorVal(t)) => tensor_from_pb(t).map_or(Value::null(), Value::from),
+        Some(Kind::FrameVal(fr)) => frame_from_pb(fr).map_or(Value::null(), Value::from),
         Some(Kind::StreamEndVal(m)) => {
-            stream_marker_from_pb(m).map_or(Value::Null, Value::StreamEnd)
+            stream_marker_from_pb(m).map_or(Value::null(), Value::stream_end)
         }
     }
 }
 
 /// Wire `Value` → `xolotl_types::Value` with canonical field validation.
+/// Recursively validates null enum numbers, tensor/frame metadata and stream
+/// markers. An absent outer value oneof still means null. Blob identifiers and
+/// declared lengths are retained without loading or authenticating stored data.
 pub fn value_from_pb_checked(v: &pb::Value) -> Result<Value, ConvertError> {
     use pb::value::Kind;
     Ok(match &v.kind {
-        None => Value::Null,
+        None => Value::null(),
         Some(Kind::NullVal(raw)) => {
             enum_value::<pb::NullValue>("value.null", *raw)?;
-            Value::Null
+            Value::null()
         }
-        Some(Kind::BoolVal(b)) => Value::Bool(*b),
-        Some(Kind::IntVal(i)) => Value::Int(*i),
-        Some(Kind::FloatVal(f)) => Value::Float(FloatBits(*f)),
-        Some(Kind::StrVal(s)) => Value::Str(s.clone()),
-        Some(Kind::BytesVal(b)) => Value::Bytes(b.clone()),
-        Some(Kind::ListVal(l)) => Value::List(
+        Some(Kind::BoolVal(b)) => Value::boolean(*b),
+        Some(Kind::IntVal(i)) => Value::integer(*i),
+        Some(Kind::FloatVal(f)) => Value::float(FloatBits(*f)),
+        Some(Kind::StrVal(s)) => Value::string(s.clone()),
+        Some(Kind::BytesVal(b)) => Value::bytes(b.clone()),
+        Some(Kind::ListVal(l)) => Value::list(
             l.items
                 .iter()
                 .map(value_from_pb_checked)
                 .collect::<Result<Vec<_>, _>>()?,
         ),
-        Some(Kind::MapVal(m)) => Value::Map(
+        Some(Kind::MapVal(m)) => Value::map(
             m.entries
                 .iter()
                 .map(|(k, v)| Ok((k.clone(), value_from_pb_checked(v)?)))
                 .collect::<Result<_, ConvertError>>()?,
         ),
-        Some(Kind::BlobVal(b)) => Value::Blob(blob_from_pb(b)),
-        Some(Kind::TensorVal(t)) => Value::Tensor(tensor_from_pb_checked(t)?),
-        Some(Kind::FrameVal(fr)) => Value::Frame(frame_from_pb_checked(fr)?),
-        Some(Kind::StreamEndVal(m)) => Value::StreamEnd(stream_marker_from_pb_checked(m)?),
+        Some(Kind::BlobVal(b)) => Value::blob(blob_from_pb(b)),
+        Some(Kind::TensorVal(t)) => Value::from(tensor_from_pb_checked(t)?),
+        Some(Kind::FrameVal(fr)) => Value::from(frame_from_pb_checked(fr)?),
+        Some(Kind::StreamEndVal(m)) => Value::stream_end(stream_marker_from_pb_checked(m)?),
     })
 }
 
@@ -225,7 +256,7 @@ fn stream_marker_from_pb_checked(m: &pb::StreamMarker) -> Result<StreamMarker, C
     }
 }
 
-fn dtype_str(d: DType) -> &'static str {
+pub(crate) fn dtype_str(d: DType) -> &'static str {
     match d {
         DType::F16 => "f16",
         DType::Bf16 => "bf16",
@@ -239,7 +270,9 @@ fn dtype_str(d: DType) -> &'static str {
         DType::Bool => "bool",
     }
 }
-fn dtype_from_str(s: &str) -> Option<DType> {
+/// Decode the canonical protobuf tensor dtype shared by references and upload
+/// descriptors. Unknown strings, aliases and noncanonical casing return `None`.
+pub fn dtype_from_str(s: &str) -> Option<DType> {
     Some(match s {
         "f16" => DType::F16,
         "bf16" => DType::Bf16,
@@ -255,7 +288,7 @@ fn dtype_from_str(s: &str) -> Option<DType> {
     })
 }
 
-fn frame_kind_str(k: FrameKind) -> &'static str {
+pub(crate) fn frame_kind_str(k: FrameKind) -> &'static str {
     match k {
         FrameKind::Audio => "audio",
         FrameKind::Video => "video",
@@ -263,7 +296,9 @@ fn frame_kind_str(k: FrameKind) -> &'static str {
         FrameKind::Sensor => "sensor",
     }
 }
-fn frame_kind_from_str(s: &str) -> Option<FrameKind> {
+/// Decode the canonical protobuf frame category shared by references and upload
+/// descriptors. Unknown strings, aliases and noncanonical casing return `None`.
+pub fn frame_kind_from_str(s: &str) -> Option<FrameKind> {
     Some(match s {
         "audio" => FrameKind::Audio,
         "video" => FrameKind::Video,
@@ -326,6 +361,36 @@ pub fn capability_from_pb(c: &pb::Capability) -> Result<Capability, ConvertError
 
 // Program and DoNode conversions.
 
+/// Encode a portable source document using the shared compiler and source identity.
+/// This envelope does not grant permission to submit arbitrary code to a Gateway.
+pub fn portable_program_to_pb(
+    program: &xolotl_graph::portable::Program,
+) -> Result<pb::PortableProgram, ConvertError> {
+    use xolotl_graph::portable::CompileError;
+    let compiled = program.compile()?;
+    let source =
+        serde_json::to_vec(program).map_err(|error| CompileError::Encoding(error.to_string()))?;
+    if source.len() > 1024 * 1024 {
+        return Err(CompileError::Capacity.into());
+    }
+    Ok(pb::PortableProgram {
+        json_source: source,
+        program_id: compiled.id().to_vec(),
+    })
+}
+
+/// Decode, compile and verify a portable program before the host considers admission.
+pub fn portable_program_from_pb(
+    program: &pb::PortableProgram,
+) -> Result<xolotl_graph::portable::Program, ConvertError> {
+    use xolotl_graph::portable::{CompileError, Program};
+    let source = Program::from_json(&program.json_source)?;
+    if source.compile()?.id().as_slice() != program.program_id {
+        return Err(CompileError::Encoding("source identity mismatch".into()).into());
+    }
+    Ok(source)
+}
+
 /// `DoNode` → wire `Program`.
 pub fn program_to_pb(root: &DoNode) -> pb::Program {
     pb::Program {
@@ -334,7 +399,8 @@ pub fn program_to_pb(root: &DoNode) -> pb::Program {
     }
 }
 
-/// Wire `Program` → `DoNode`.
+/// Decode the required program root using checked node conversion. Attached
+/// payload provenance is left to ingress admission and is not consumed here.
 pub fn program_from_pb(program: &pb::Program) -> Result<DoNode, ConvertError> {
     do_node_from_pb(
         program
@@ -344,6 +410,8 @@ pub fn program_from_pb(program: &pb::Program) -> Result<DoNode, ConvertError> {
     )
 }
 
+/// Recursively encode a native composition tree, retaining named step references
+/// and typed constants. Failure nodes preserve their structured metadata.
 pub fn do_node_to_pb(node: &DoNode) -> pb::DoNode {
     use pb::do_node::Kind;
     let kind = match node {
@@ -381,6 +449,10 @@ pub fn do_node_to_pb(node: &DoNode) -> pb::DoNode {
     pb::DoNode { kind: Some(kind) }
 }
 
+/// Recursively decode a native composition tree, checking required children,
+/// canonical nonblank names, typed values, paths, and output modes. This does
+/// not resolve lexical names or native steps, impose a tree-size budget, or
+/// authorize resource access; those checks belong to compilation and admission.
 pub fn do_node_from_pb(node: &pb::DoNode) -> Result<DoNode, ConvertError> {
     use pb::do_node::Kind;
     Ok(
@@ -463,7 +535,6 @@ pub fn do_node_from_pb(node: &pb::DoNode) -> Result<DoNode, ConvertError> {
 
 fn step_ref_to_pb(step: &StepRef) -> pb::StepRef {
     pb::StepRef {
-        process_id: step.process.get(),
         name: step.name.clone(),
         arg: step.arg.as_ref().map(value_to_pb),
     }
@@ -471,7 +542,6 @@ fn step_ref_to_pb(step: &StepRef) -> pb::StepRef {
 
 fn step_ref_from_pb(step: &pb::StepRef) -> Result<StepRef, ConvertError> {
     Ok(StepRef {
-        process: ProcessId::new(step.process_id),
         name: required_nonblank(&step.name, "step.name")?,
         arg: step.arg.as_ref().map(value_from_pb_checked).transpose()?,
     })
@@ -532,6 +602,8 @@ fn operation_template_from_pb(
     })
 }
 
+/// Encode a concrete delivery mode. Collection limits are retained; all other
+/// modes use zero for the otherwise ignored `collect_limit` field.
 pub fn output_mode_to_pb(mode: OutputMode) -> pb::OutputMode {
     let (kind, collect_limit) = match mode {
         OutputMode::Unary => (pb::OutputModeKind::Unary, 0),
@@ -546,6 +618,9 @@ pub fn output_mode_to_pb(mode: OutputMode) -> pb::OutputMode {
     }
 }
 
+/// Decode a delivery mode, rejecting unspecified or unknown enum numbers.
+/// A collection limit must fit the host's `usize`; zero is valid. The limit
+/// field is ignored for other modes, and method output support is checked later.
 pub fn output_mode_from_pb(mode: &pb::OutputMode) -> Result<OutputMode, ConvertError> {
     let kind = enum_value::<pb::OutputModeKind>("output.kind", mode.kind)?;
     Ok(match kind {
@@ -584,48 +659,115 @@ pub fn failure_kind(f: &Failure) -> &'static str {
         Failure::PolicyViolation { .. } => "policy_violation",
         Failure::PathInvalid { .. } => "path_invalid",
         Failure::Custom { .. } => "custom",
-        // `Failure` is #[non_exhaustive]; any future variant gets a generic tag.
-        _ => "error",
     }
 }
 
-/// `Failure` → wire `Failure` (kind tag + human-readable message).
+/// `Failure` → wire `Failure`, retaining every structured field.
 pub fn failure_to_pb(f: &Failure) -> pb::Failure {
-    pb::Failure {
-        kind: failure_kind(f).to_string(),
-        message: f.to_string(),
-    }
+    use pb::failure::{self as wire, Kind, Marker};
+    let kind = match f {
+        Failure::PermissionDenied { required, actual } => {
+            Kind::PermissionDenied(wire::PermissionDenied {
+                required: required.clone(),
+                actual: actual.clone(),
+            })
+        }
+        Failure::NoHandler { path } => Kind::NoHandler(path_to_pb(path)),
+        Failure::BudgetExhausted { dim } => Kind::BudgetExhausted(dim.clone()),
+        Failure::RateLimited => Kind::RateLimited(Marker {}),
+        Failure::ApprovalPending {
+            approval_key,
+            reason,
+        } => Kind::ApprovalPending(wire::ApprovalPending {
+            approval_key: approval_key.clone(),
+            reason: reason.clone(),
+        }),
+        Failure::Timeout => Kind::Timeout(Marker {}),
+        Failure::Cancelled => Kind::Cancelled(Marker {}),
+        Failure::Quarantined { op_id, reason } => Kind::Quarantined(wire::Quarantined {
+            op_id: op_id.clone(),
+            reason: reason.clone(),
+        }),
+        Failure::InvalidInput { reason } => Kind::InvalidInput(reason.clone()),
+        Failure::HandlerError { kind, message } => Kind::HandlerError(wire::ClassifiedError {
+            kind: kind.clone(),
+            message: message.clone(),
+        }),
+        Failure::KernelNamespaceProtected => Kind::KernelNamespaceProtected(Marker {}),
+        Failure::PolicyViolation { policy, detail } => {
+            Kind::PolicyViolation(wire::PolicyViolation {
+                policy: policy.clone(),
+                detail: detail.clone(),
+            })
+        }
+        Failure::PathInvalid { path, reason } => Kind::PathInvalid(wire::PathInvalid {
+            path: Some(path_to_pb(path)),
+            reason: reason.clone(),
+        }),
+        Failure::Custom { kind, message } => Kind::Custom(wire::ClassifiedError {
+            kind: kind.clone(),
+            message: message.clone(),
+        }),
+    };
+    pb::Failure { kind: Some(kind) }
 }
 
-/// Wire `Failure` → `Failure`. The wire failure form is intentionally compact
-/// (stable kind + display message), so variants without enough structured
-/// fields are materialized as `Custom`.
+/// Wire `Failure` → `Failure`, rejecting absent variants and malformed paths.
+/// Text fields are preserved verbatim, including empty strings and whitespace.
 pub fn failure_from_pb(f: &pb::Failure) -> Result<Failure, ConvertError> {
-    let kind = required_nonblank(&f.kind, "failure.kind")?;
-    Ok(match kind.as_str() {
-        "rate_limited" => Failure::RateLimited,
-        "timeout" => Failure::Timeout,
-        "cancelled" => Failure::Cancelled,
-        "kernel_namespace_protected" => Failure::KernelNamespaceProtected,
-        "invalid_input" => Failure::InvalidInput {
-            reason: f.message.clone(),
+    use pb::failure::Kind;
+    Ok(
+        match f
+            .kind
+            .as_ref()
+            .ok_or(ConvertError::Missing("failure.kind"))?
+        {
+            Kind::PermissionDenied(detail) => Failure::PermissionDenied {
+                required: detail.required.clone(),
+                actual: detail.actual.clone(),
+            },
+            Kind::NoHandler(path) => Failure::NoHandler {
+                path: path_from_pb(path)?,
+            },
+            Kind::BudgetExhausted(dim) => Failure::BudgetExhausted { dim: dim.clone() },
+            Kind::RateLimited(_) => Failure::RateLimited,
+            Kind::ApprovalPending(detail) => Failure::ApprovalPending {
+                approval_key: detail.approval_key.clone(),
+                reason: detail.reason.clone(),
+            },
+            Kind::Timeout(_) => Failure::Timeout,
+            Kind::Cancelled(_) => Failure::Cancelled,
+            Kind::Quarantined(detail) => Failure::Quarantined {
+                op_id: detail.op_id.clone(),
+                reason: detail.reason.clone(),
+            },
+            Kind::InvalidInput(reason) => Failure::InvalidInput {
+                reason: reason.clone(),
+            },
+            Kind::HandlerError(detail) => Failure::HandlerError {
+                kind: detail.kind.clone(),
+                message: detail.message.clone(),
+            },
+            Kind::KernelNamespaceProtected(_) => Failure::KernelNamespaceProtected,
+            Kind::PolicyViolation(detail) => Failure::PolicyViolation {
+                policy: detail.policy.clone(),
+                detail: detail.detail.clone(),
+            },
+            Kind::PathInvalid(detail) => Failure::PathInvalid {
+                path: path_from_pb(
+                    detail
+                        .path
+                        .as_ref()
+                        .ok_or(ConvertError::Missing("failure.path_invalid.path"))?,
+                )?,
+                reason: detail.reason.clone(),
+            },
+            Kind::Custom(detail) => Failure::Custom {
+                kind: detail.kind.clone(),
+                message: detail.message.clone(),
+            },
         },
-        "handler_error" => Failure::HandlerError {
-            kind: "handler_error".into(),
-            message: f.message.clone(),
-        },
-        "permission_denied" | "no_handler" | "budget_exhausted" | "approval_pending"
-        | "quarantined" | "policy_violation" | "path_invalid" | "custom" | "error" => {
-            Failure::Custom {
-                kind: kind.clone(),
-                message: f.message.clone(),
-            }
-        }
-        other => Failure::Custom {
-            kind: other.into(),
-            message: f.message.clone(),
-        },
-    })
+    )
 }
 
 /// `Outcome` → wire `Outcome`, structurally (Done/Fail/Short).

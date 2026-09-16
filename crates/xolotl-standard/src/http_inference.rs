@@ -7,9 +7,12 @@ mod backend;
 mod config;
 mod dialects;
 mod error;
+mod json;
 mod request;
 mod routing;
 mod state;
+mod stream;
+mod transport;
 
 #[cfg(test)]
 mod tests;

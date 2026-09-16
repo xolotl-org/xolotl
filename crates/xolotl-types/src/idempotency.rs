@@ -1,132 +1,223 @@
-//! Idempotency key derivation.
+//! Lossless idempotency key material, hashed only at the storage boundary.
 //!
-//! The default idempotency key for an operation is its [`OperationId`] —
-//! `(process, CausalPosition, attempt)` — which is already stable across
-//! crash-replay, so re-executing a recovered program reuses the same key
-//! and a supporting handler dedupes automatically.
-//!
-//! Business code may override the key with an `_idem_key` field in the op input
-//! to dedupe across *different* operations (e.g. an outbox). Critically, the
-//! override is **not** free-form: a key derived purely from attacker-influenced
-//! input would let an injected Plan forge or collide keys to suppress or bypass
-//! deduplication. So the effective key is always bound to the **authenticated
-//! context** — the `acting` identity and the `CausalPosition` — with the
-//! business string mixed in, never replacing it. This module is the pure,
-//! wasm-safe derivation; the dedup store lives in the kernel
-//! (`state://idemp/<blake3(key)>`).
+//! Default keys retain the full operation identity. Business keys deliberately
+//! span executions, but remain bound to identity, call position, resource,
+//! method, output representation and adaptation phase. Creating an asynchronous
+//! process and executing its effect can never publish into the same cache slot.
 
-use crate::ids::IdentityRef;
-use crate::operation::OperationId;
-use crate::value::Value;
+use crate::{IdentityRef, MethodId, OperationId, OutputMode, ResourceId, Value};
+use alloc::string::String;
 
-/// The reserved input field a caller sets to supply a business idempotency key.
+/// Reserved input field for a business key shared across operation identities.
 pub const IDEM_KEY_FIELD: &str = "_idem_key";
 
-/// Derive the effective idempotency key for an operation. If the input
-/// carries `_idem_key`, the result binds it to the authenticated context
-/// (`acting` + `CausalPosition`) so it cannot be forged or collided by injected
-/// input alone; otherwise the key is the operation's own stable id. The return
-/// is a stable string; the kernel hashes it into a legal
-/// `state://idemp/<blake3(key)>` path segment.
-pub fn derive_key(op_id: OperationId, acting: IdentityRef, input: &Value) -> String {
-    match business_key(input) {
-        Some(biz) => {
-            // Bind the business key to the authenticated context. The position
-            // anchors it to a specific call site; acting anchors it to a
-            // specific identity — neither is attacker-controlled. The hash only
-            // compacts the binding; the *security* is the binding itself, not
-            // hash strength, so a fast deterministic mix (FNV-1a) suffices.
-            let mut h = FNV_OFFSET;
-            h = fnv_mix(h, b"xolotl-idem-v1");
-            h = fnv_mix(h, &acting.get().to_le_bytes());
-            h = fnv_mix(h, &(op_id.position.get() as u64).to_le_bytes());
-            h = fnv_mix(h, biz.as_bytes());
-            format!("idem-{h:016x}")
+/// The opened target and result representation associated with a cached effect.
+#[derive(Clone, Copy, Debug)]
+pub struct KeyScope {
+    /// Resource selected by the admitted handle.
+    pub resource: ResourceId,
+    /// Method in that resource's interface.
+    pub method: MethodId,
+    /// Representation returned to the caller.
+    pub output: OutputMode,
+    /// Whether this call publishes a process reference for a separately run effect.
+    pub creates_process: bool,
+}
+
+/// Derive canonical key material without reducing business keys to a short hash.
+/// A host hashes the complete returned string into its storage key.
+pub fn derive_key(
+    op_id: OperationId,
+    acting: IdentityRef,
+    input: &Value,
+    scope: KeyScope,
+) -> String {
+    let output = match scope.output {
+        OutputMode::Unary => "unary".into(),
+        OutputMode::Stream => "stream".into(),
+        OutputMode::Collect { limit } => format!("collect:{limit}"),
+        OutputMode::SinkOnly => "sink".into(),
+        OutputMode::AsyncProcess => "process".into(),
+    };
+    let prefix = format!(
+        "xolotl-idem-v2/{}/{}/{}/{}/{}/",
+        acting.get(),
+        scope.resource.get(),
+        scope.method.get(),
+        output,
+        if scope.creates_process {
+            "spawn"
+        } else {
+            "call"
         }
-        None => format!("op-{op_id}"),
+    );
+    match business_key(input) {
+        Some(business) => format!(
+            "{prefix}business/{}/{}/{business}",
+            op_id.position.get(),
+            business.len()
+        ),
+        None => format!("{prefix}operation/{op_id}"),
     }
 }
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-fn fnv_mix(mut h: u64, bytes: &[u8]) -> u64 {
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
-}
-
-/// Extract the business-supplied `_idem_key` string, if present and well-typed.
 fn business_key(input: &Value) -> Option<&str> {
-    match input {
-        Value::Map(m) => match m.get(IDEM_KEY_FIELD) {
-            Some(Value::Str(s)) if !s.is_empty() => Some(s),
-            _ => None,
-        },
-        _ => None,
-    }
+    input
+        .as_map()?
+        .get(IDEM_KEY_FIELD)?
+        .as_str()
+        .filter(|key| !key.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::NodeId;
-    use crate::ids::ProcessId;
-    use std::collections::BTreeMap;
+    use crate::{ExecutionId, InvocationId, NodeId, ProcessId};
+    use alloc::collections::BTreeMap;
 
     fn op() -> OperationId {
-        OperationId::new(ProcessId::new(1), NodeId::new(3), 0)
+        OperationId::new(
+            ProcessId::new(1),
+            ExecutionId::FIRST,
+            InvocationId::new(7),
+            NodeId::new(3),
+            0,
+        )
+    }
+
+    fn scope() -> KeyScope {
+        KeyScope {
+            resource: ResourceId::new(8),
+            method: MethodId::new(2),
+            output: OutputMode::Unary,
+            creates_process: false,
+        }
+    }
+
+    fn input(key: &str) -> Value {
+        Value::map(BTreeMap::from([(
+            IDEM_KEY_FIELD.into(),
+            Value::string(key.into()),
+        )]))
     }
 
     #[test]
-    fn default_key_is_the_operation_id() {
-        let k = derive_key(op(), IdentityRef::ROOT, &Value::Null);
-        assert_eq!(k, "op-1/3/0");
+    fn default_key_preserves_all_operation_coordinates() {
+        let key = derive_key(op(), IdentityRef::ROOT, &Value::null(), scope());
+        assert!(key.ends_with("/operation/1/1/7/3/0"));
+        for other in [
+            OperationId {
+                process: ProcessId::new(2),
+                ..op()
+            },
+            OperationId {
+                invocation: InvocationId::new(8),
+                ..op()
+            },
+            OperationId {
+                position: NodeId::new(4),
+                ..op()
+            },
+            OperationId { attempt: 1, ..op() },
+        ] {
+            assert_ne!(
+                key,
+                derive_key(other, IdentityRef::ROOT, &Value::null(), scope())
+            );
+        }
     }
 
     #[test]
-    fn retry_keeps_default_key_stable_only_within_attempt() {
-        // The default key includes attempt, so a crash-replay (same attempt)
-        // reuses the key, while an explicit retry (attempt+1) gets a new one.
-        let replay = derive_key(op(), IdentityRef::ROOT, &Value::Null);
-        let retried = derive_key(op().retry(), IdentityRef::ROOT, &Value::Null);
-        assert_eq!(replay, "op-1/3/0");
-        assert_eq!(retried, "op-1/3/1");
-    }
-
-    #[test]
-    fn business_key_binds_to_auth_context() {
-        let mut m = BTreeMap::new();
-        m.insert(IDEM_KEY_FIELD.into(), Value::Str("order-42".into()));
-        let input = Value::Map(m);
-        let k_alice = derive_key(op(), IdentityRef::new(10), &input);
-        let k_bob = derive_key(op(), IdentityRef::new(20), &input);
-        // Same business key, different acting identity ⇒ different effective key
-        // (an injected Plan acting as Bob can't collide Alice's idem record).
-        assert_ne!(k_alice, k_bob);
-        assert!(k_alice.starts_with("idem-"));
-    }
-
-    #[test]
-    fn business_key_is_stable_for_same_context() {
-        let mut m = BTreeMap::new();
-        m.insert(IDEM_KEY_FIELD.into(), Value::Str("order-42".into()));
-        let input = Value::Map(m);
+    fn business_keys_span_executions_without_losing_key_material() {
+        let business = "orders/create/42\0operation/1/2/3/4/5";
+        let value = input(business);
+        let first = derive_key(op(), IdentityRef::ROOT, &value, scope());
+        let independent = OperationId {
+            process: ProcessId::new(2),
+            invocation: InvocationId::new(8),
+            attempt: 1,
+            ..op()
+        };
         assert_eq!(
-            derive_key(op(), IdentityRef::new(10), &input),
-            derive_key(op(), IdentityRef::new(10), &input)
+            first,
+            derive_key(independent, IdentityRef::ROOT, &value, scope())
+        );
+        assert!(first.ends_with(business));
+        assert_ne!(
+            first,
+            derive_key(op(), IdentityRef::new(20), &value, scope())
+        );
+        assert_ne!(
+            first,
+            derive_key(
+                OperationId {
+                    position: NodeId::new(4),
+                    ..op()
+                },
+                IdentityRef::ROOT,
+                &value,
+                scope()
+            )
         );
     }
 
     #[test]
-    fn empty_or_mistyped_business_key_falls_back_to_op_id() {
-        let mut m = BTreeMap::new();
-        m.insert(IDEM_KEY_FIELD.into(), Value::Int(7)); // wrong type
+    fn resource_method_representation_and_adapter_have_separate_namespaces() {
+        let value = input("order-42");
+        let key = derive_key(op(), IdentityRef::ROOT, &value, scope());
+        for other in [
+            KeyScope {
+                resource: ResourceId::new(9),
+                ..scope()
+            },
+            KeyScope {
+                method: MethodId::new(3),
+                ..scope()
+            },
+            KeyScope {
+                output: OutputMode::Stream,
+                ..scope()
+            },
+            KeyScope {
+                output: OutputMode::Collect { limit: 1 },
+                ..scope()
+            },
+            KeyScope {
+                creates_process: true,
+                ..scope()
+            },
+        ] {
+            assert_ne!(key, derive_key(op(), IdentityRef::ROOT, &value, other));
+        }
+        let process = KeyScope {
+            output: OutputMode::AsyncProcess,
+            ..scope()
+        };
+        assert_ne!(
+            derive_key(op(), IdentityRef::ROOT, &value, process),
+            derive_key(
+                op(),
+                IdentityRef::ROOT,
+                &value,
+                KeyScope {
+                    creates_process: true,
+                    ..process
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn empty_and_mistyped_business_keys_use_operation_identity() {
+        let fallback = derive_key(op(), IdentityRef::ROOT, &Value::null(), scope());
         assert_eq!(
-            derive_key(op(), IdentityRef::ROOT, &Value::Map(m)),
-            "op-1/3/0"
+            fallback,
+            derive_key(op(), IdentityRef::ROOT, &input(""), scope())
+        );
+        let wrong = Value::map(BTreeMap::from([(IDEM_KEY_FIELD.into(), Value::integer(7))]));
+        assert_eq!(
+            fallback,
+            derive_key(op(), IdentityRef::ROOT, &wrong, scope())
         );
     }
 }

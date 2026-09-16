@@ -4,8 +4,12 @@
 //! providers and routing without storing HTTP clients or plaintext credentials.
 
 use crate::{ModalitySet, Path, Value, is_vault_reserved};
+use alloc::collections::BTreeMap;
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// Maximum accepted retry count for one inference route attempt.
@@ -106,6 +110,25 @@ impl Default for InferenceModelCapabilities {
     }
 }
 
+/// Optional materialization policy for selected HTTP response fields.
+///
+/// Unary results and atomic SSE deltas retain their selected data until JSON
+/// completion. Unused envelope fields do not consume these logical budgets.
+/// These are not allocator or cumulative request/stream byte limits.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceResponseLimits {
+    /// Maximum simultaneously retained selected text and numeric token bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_materialized_bytes: Option<u64>,
+    /// Maximum selected value nodes retained in one unary response or SSE record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_materialized_nodes: Option<u64>,
+    /// Maximum simultaneously open JSON containers, including skipped fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_json_frames: Option<usize>,
+}
+
 /// HTTP inference backend declaration stored under
 /// `state://kernel/inference/backends/<id>`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -128,6 +151,13 @@ pub struct InferenceBackendDef {
     /// Optional API version interpreted by the selected dialect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_version: Option<String>,
+    /// Encoded request and parsing work window, defaulting to 16 KiB.
+    /// It does not limit the size of an event, request or response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_window_bytes: Option<core::num::NonZeroUsize>,
+    /// Optional selected-result materialization and active parser frame policy.
+    #[serde(default)]
+    pub response_limits: InferenceResponseLimits,
     /// Optimistic concurrency version.
     #[serde(default)]
     pub version: u64,
@@ -477,26 +507,24 @@ fn validate_overrides(overrides: &BTreeMap<String, Value>) -> Result<(), Inferen
 }
 
 fn validate_sensitive_override_field(key: &str, value: &Value) -> Result<(), InferenceConfigError> {
-    let lower = key.to_ascii_lowercase();
-    if is_sensitive_request_field(&lower) || lower.contains("secret") || lower.contains("api_key") {
-        return Err(InferenceConfigError::ReservedRequestField(key.to_string()));
-    }
-    match value {
-        Value::Map(map) => {
-            for (child, child_value) in map {
-                validate_sensitive_override_field(child, child_value)?;
-            }
+    let mut pending = vec![(key, value)];
+    let mut visited = alloc::collections::BTreeSet::new();
+    while let Some((key, value)) = pending.pop() {
+        let lower = key.to_ascii_lowercase();
+        if is_sensitive_request_field(&lower)
+            || lower.contains("secret")
+            || lower.contains("api_key")
+        {
+            return Err(InferenceConfigError::ReservedRequestField(key.to_string()));
         }
-        Value::List(items) => {
-            for item in items {
-                if let Value::Map(map) = item {
-                    for (child, child_value) in map {
-                        validate_sensitive_override_field(child, child_value)?;
-                    }
-                }
-            }
+        if !visited.insert(crate::value::traversal::ValueNodeKey::of(value)) {
+            continue;
         }
-        _ => {}
+        match value.view() {
+            crate::ValueView::Map(map) => pending.extend(map.iter()),
+            crate::ValueView::List(items) => pending.extend(items.iter().map(|item| (key, item))),
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -568,6 +596,8 @@ mod tests {
             default_headers: BTreeMap::new(),
             request_overrides: BTreeMap::new(),
             api_version: None,
+            io_window_bytes: None,
+            response_limits: Default::default(),
             version: 0,
         };
         ensure!(
@@ -607,10 +637,12 @@ mod tests {
             default_headers: BTreeMap::new(),
             request_overrides: BTreeMap::new(),
             api_version: None,
+            io_window_bytes: None,
+            response_limits: Default::default(),
             version: 0,
         };
         def.request_overrides
-            .insert("tools".into(), Value::List(vec![]));
+            .insert("tools".into(), Value::list(vec![]));
         ensure!(
             matches!(
                 def.validate_admission("openai"),
@@ -657,6 +689,8 @@ mod tests {
             default_headers: BTreeMap::new(),
             request_overrides: BTreeMap::new(),
             api_version: Some("2023-06-01".into()),
+            io_window_bytes: None,
+            response_limits: Default::default(),
             version: 0,
         };
 

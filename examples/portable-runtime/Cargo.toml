@@ -1,0 +1,22 @@
+[package]
+name = "xolotl-portable-example"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+xolotl-sdk = { path = "../../crates/xolotl-sdk", default-features = false, features = ["runtime"] }
+xolotl-graph = { path = "../../crates/xolotl-graph", default-features = false }
+
+[[bin]]
+name = "portable-runtime"
+path = "src/main.rs"
+required-features = ["std"]

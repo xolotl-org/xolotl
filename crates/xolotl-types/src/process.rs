@@ -9,7 +9,8 @@
 use crate::grant::Expiry;
 use crate::ids::{GrantId, IdentityRef, ProcessId};
 use crate::path::Path;
-use crate::value::{Failure, Value};
+use crate::{Failure, Value};
+use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
 /// Reference to a Program source. The kernel does
@@ -115,14 +116,21 @@ impl BudgetState {
         est_micro_usd: u64,
         est_tokens: u64,
     ) -> Result<(), String> {
+        let inflight = self
+            .inflight_ops
+            .checked_add(1)
+            .ok_or_else(|| String::from("inflight_ops"))?;
         if let Some(max) = spec.max_inflight_ops
-            && self.inflight_ops + 1 > max
+            && inflight > max
         {
             return Err("inflight_ops".into());
         }
         // Daily and monthly USD share the single `spent_micro_usd` counter; the
         // tighter limit binds.
-        let projected_usd = self.spent_micro_usd.saturating_add(est_micro_usd);
+        let projected_usd = self
+            .spent_micro_usd
+            .checked_add(est_micro_usd)
+            .ok_or_else(|| String::from("spent_micro_usd"))?;
         if let Some(max) = spec.daily_micro_usd
             && projected_usd > max
         {
@@ -133,14 +141,18 @@ impl BudgetState {
         {
             return Err("monthly_micro_usd".into());
         }
+        let projected_tokens = self
+            .inference_tokens
+            .checked_add(est_tokens)
+            .ok_or_else(|| String::from("inference_tokens"))?;
         if let Some(max) = spec.max_inference_tokens
-            && self.inference_tokens.saturating_add(est_tokens) > max
+            && projected_tokens > max
         {
             return Err("inference_tokens".into());
         }
-        self.inflight_ops += 1;
+        self.inflight_ops = inflight;
         self.spent_micro_usd = projected_usd;
-        self.inference_tokens = self.inference_tokens.saturating_add(est_tokens);
+        self.inference_tokens = projected_tokens;
         Ok(())
     }
 
@@ -349,11 +361,11 @@ mod tests {
 
     #[test]
     fn outcome_into_value() -> anyhow::Result<()> {
-        let value = Outcome::Done(Value::Int(1))
+        let value = Outcome::Done(Value::integer(1))
             .into_value()
             .map_err(|error| anyhow::anyhow!("done outcome returned failure: {error:?}"))?;
         ensure!(
-            value == Value::Int(1),
+            value == Value::integer(1),
             "unexpected outcome value: {value:?}"
         );
         ensure!(
@@ -374,7 +386,7 @@ mod tests {
 
     #[test]
     fn outcome_serde() -> anyhow::Result<()> {
-        let o = Outcome::Done(Value::Str("ok".into()));
+        let o = Outcome::Done(Value::string("ok".into()));
         let s = serde_json::to_string(&o)?;
         let back: Outcome = serde_json::from_str(&s)?;
         ensure!(o == back, "outcome serde roundtrip changed value");

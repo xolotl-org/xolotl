@@ -1,72 +1,55 @@
-use crate::{STATE_HISTORY_TABLE, STATE_VALUES_TABLE};
-use async_trait::async_trait;
-use parking_lot::Mutex;
+use crate::{STATE_HISTORY_TABLE, STATE_META_TABLE, STATE_VALUES_TABLE};
 use redb::{Database, ReadableDatabase, ReadableTable};
-use std::sync::{
-    Arc,
-    atomic::{AtomicI64, Ordering},
-};
+use std::future::{Ready, ready};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::broadcast;
 use xolotl_state::{
-    StateBackend, StateError, StateEvent, StateHistoryEntry, StateResult, StateStream, TaintedValue,
+    Backend, StateCommit, StateError, StateEvent, StateFailure, StateFlush, StateHistoryEntry,
+    StateMutation, StateResult, StateStream, StateWatch, StateWrite, TaintedValue,
 };
-use xolotl_types::{MergeRule, Path, TaintSet, Value};
+use xolotl_types::{Path, TaintSet, Value};
 
-#[derive(Clone, Debug)]
-struct Subscriber {
-    pattern: Path,
-    sender: broadcast::Sender<StateEvent>,
-}
+mod codec;
+mod mutation;
+mod read;
+use codec::{decode_envelope, decode_history_entry, encode_envelope, encode_history_entry};
+
+use crate::schema::LAST_HISTORY_MILLIS;
+
+pub(crate) type Subscriptions = xolotl_state::host::WatchRegistry;
 
 /// redb-backed implementation of the Xolotl `state://` backend.
 pub struct RedbStateBackend {
     db: Arc<Database>,
-    history_clock: Arc<AtomicI64>,
-    subs: Mutex<Vec<Subscriber>>,
+    subs: Arc<Subscriptions>,
 }
 
 impl RedbStateBackend {
-    pub(crate) fn new(db: Arc<Database>, history_clock: Arc<AtomicI64>) -> Self {
-        Self {
-            db,
-            history_clock,
-            subs: Mutex::new(Vec::new()),
-        }
+    /// Install the supported state capabilities over this shared database.
+    pub fn into_backend(self) -> Backend {
+        let port = Arc::new(self);
+        Backend::new()
+            .with_read(port.clone())
+            .with_write(port.clone())
+            .with_query(port.clone())
+            .with_history(port.clone())
+            .with_watch(port.clone())
+            .with_flush(port)
     }
-
-    fn next_millis(&self) -> i64 {
-        loop {
-            let observed = self.history_clock.load(Ordering::Relaxed);
-            let wall = now_millis();
-            let next = if wall > observed { wall } else { observed + 1 };
-            if self
-                .history_clock
-                .compare_exchange(observed, next, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return next;
-            }
-        }
+    pub(crate) fn new(db: Arc<Database>, subs: Arc<Subscriptions>) -> Self {
+        Self { db, subs }
     }
 
     fn notify(&self, event: StateEvent) {
-        let target = event.path().clone();
-        let mut subs = self.subs.lock();
-        subs.retain(|s| {
-            if !target.matches(&s.pattern) {
-                return true;
-            }
-            s.sender.send(event.clone()).is_ok()
-        });
+        let targets = self.subs.matching(event.path());
+        for target in targets {
+            let _sent = target.send(event.clone());
+        }
     }
 
-    fn record_history_in_txn(
-        &self,
-        txn: &redb::WriteTransaction,
-        event: &StateEvent,
-    ) -> StateResult<()> {
-        Self::record_history_at_millis_in_txn(txn, event, self.next_millis())
+    fn record_history_in_txn(txn: &redb::WriteTransaction, event: &StateEvent) -> StateResult<()> {
+        let ts = next_history_millis_in_txn(txn)?;
+        Self::record_history_at_millis_in_txn(txn, event, ts)
     }
 
     fn record_history_at_millis_in_txn(
@@ -75,12 +58,7 @@ impl RedbStateBackend {
         ts: i64,
     ) -> StateResult<()> {
         let path = event.path();
-        let entry = StateHistoryEntry {
-            at_millis: ts,
-            event: event.clone(),
-        };
-        let entry_bytes =
-            serde_json::to_vec(&serialize_history_entry(&entry)?).map_err(StateError::Serde)?;
+        let entry_bytes = encode_history_entry(ts, event)?;
 
         let mut base_key = path.to_string().into_bytes();
         base_key.push(0xFF);
@@ -115,6 +93,28 @@ impl RedbStateBackend {
     }
 }
 
+fn backend_error(error: impl ToString) -> StateFailure {
+    StateError::Backend(error.to_string()).into()
+}
+
+fn next_history_millis_in_txn(txn: &redb::WriteTransaction) -> StateResult<i64> {
+    let mut meta = txn
+        .open_table(STATE_META_TABLE)
+        .map_err(|error| StateError::Backend(error.to_string()))?;
+    let observed = meta
+        .get(LAST_HISTORY_MILLIS)
+        .map_err(|error| StateError::Backend(error.to_string()))?
+        .map(|value| value.value())
+        .ok_or_else(|| StateError::Backend("state history metadata missing".into()))?;
+    let next = observed
+        .checked_add(1)
+        .ok_or_else(|| StateError::Backend("history timestamp exhausted".into()))?
+        .max(now_millis());
+    meta.insert(LAST_HISTORY_MILLIS, next)
+        .map_err(|error| StateError::Backend(error.to_string()))?;
+    Ok(next)
+}
+
 fn now_millis() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
@@ -123,47 +123,6 @@ fn now_millis() -> i64 {
             before_epoch.saturating_neg()
         }
     }
-}
-
-fn serialize_history_entry(entry: &StateHistoryEntry) -> StateResult<serde_json::Value> {
-    let event_json = match &entry.event {
-        StateEvent::Set { path, value, taint } => {
-            let value = value_to_json(value)?;
-            let taint = serde_json::to_value(taint).map_err(StateError::Serde)?;
-            serde_json::json!({
-                "type": "set",
-                "path": path.to_string(),
-                "value": value,
-                "taint": taint,
-            })
-        }
-        StateEvent::Append { path, item, taint } => {
-            let item = value_to_json(item)?;
-            let taint = serde_json::to_value(taint).map_err(StateError::Serde)?;
-            serde_json::json!({
-                "type": "append",
-                "path": path.to_string(),
-                "item": item,
-                "taint": taint,
-            })
-        }
-        StateEvent::Delete { path } => serde_json::json!({
-            "type": "delete",
-            "path": path.to_string(),
-        }),
-    };
-    Ok(serde_json::json!({
-        "at_millis": entry.at_millis,
-        "event": event_json,
-    }))
-}
-
-fn value_to_json(v: &Value) -> StateResult<serde_json::Value> {
-    serde_json::to_value(v).map_err(StateError::Serde)
-}
-
-fn json_to_value(j: &serde_json::Value) -> StateResult<Value> {
-    serde_json::from_value(j.clone()).map_err(StateError::Serde)
 }
 
 fn history_scan_end(path: &Path) -> Vec<u8> {
@@ -187,647 +146,30 @@ fn history_key_parts(key: &[u8]) -> StateResult<(Path, i64)> {
     let ts_start = separator + 1;
     let ts_end = ts_start + 8;
     if key.len() < ts_end {
-        return Err(StateError::Backend(
-            "history key missing timestamp bytes".into(),
-        ));
+        return Err(StateError::Backend("history key missing timestamp bytes".into()).into());
     }
     let mut ts = [0u8; 8];
     ts.copy_from_slice(&key[ts_start..ts_end]);
     Ok((path, i64::from_be_bytes(ts)))
 }
 
-/// On-disk envelope persisting a value with its taint. Stored as JSON
-/// in `STATE_VALUES_TABLE`; bare `Value` encodings are rejected so provenance is
-/// preserved. We build the JSON by hand (this crate doesn't depend on `serde`
-/// derive directly).
-fn encode_envelope(value: &Value, taint: &TaintSet) -> Result<Vec<u8>, StateError> {
-    let json = serde_json::json!({
-        "__xolotl_env": 1,
-        "value": value_to_json(value)?,
-        "taint": serde_json::to_value(taint).map_err(StateError::Serde)?,
-    });
-    serde_json::to_vec(&json).map_err(StateError::Serde)
-}
-
-fn decode_envelope(bytes: &[u8]) -> StateResult<TaintedValue> {
-    let json: serde_json::Value = serde_json::from_slice(bytes).map_err(StateError::Serde)?;
-    let marker = json
-        .get("__xolotl_env")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| StateError::Backend("state value missing envelope marker".into()))?;
-    if marker != 1 {
-        return Err(StateError::Backend(format!(
-            "unsupported state envelope version {marker}"
-        )));
-    }
-    let value = json
-        .get("value")
-        .map(json_to_value)
-        .transpose()?
-        .ok_or_else(|| StateError::Backend("state envelope missing value".into()))?;
-    let taint = match json.get("taint") {
-        Some(t) => serde_json::from_value(t.clone()).map_err(StateError::Serde)?,
-        None => TaintSet::pristine(),
-    };
-    Ok(TaintedValue::new(value, taint))
-}
-
-#[async_trait]
-impl StateBackend for RedbStateBackend {
-    async fn read_tainted(&self, path: &Path) -> StateResult<Option<TaintedValue>> {
-        let key = path.to_string();
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-        let table = txn
-            .open_table(STATE_VALUES_TABLE)
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-        match table.get(key.as_str()) {
-            Ok(Some(guard)) => Ok(Some(decode_envelope(guard.value())?)),
-            Ok(None) => Ok(None),
-            Err(e) => Err(StateError::Backend(e.to_string())),
-        }
-    }
-
-    async fn write_set_tainted(
-        &self,
-        path: &Path,
-        value: Value,
-        taint: TaintSet,
-    ) -> StateResult<()> {
-        let key = path.to_string();
-        let bytes = encode_envelope(&value, &taint)?;
-        let ev = StateEvent::Set {
-            path: path.clone(),
-            value,
-            taint,
-        };
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(STATE_VALUES_TABLE)
-                .map_err(|e| StateError::Backend(e.to_string()))?;
-            table
-                .insert(key.as_str(), bytes.as_slice())
-                .map_err(|e| StateError::Backend(e.to_string()))?;
-        }
-        self.record_history_in_txn(&txn, &ev)?;
-        txn.commit()
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-
-        self.notify(ev);
-        Ok(())
-    }
-
-    async fn write_append_tainted(
-        &self,
-        path: &Path,
-        item: Value,
-        taint: TaintSet,
-    ) -> StateResult<()> {
-        let key = path.to_string();
-        let ev = StateEvent::Append {
-            path: path.clone(),
-            item: item.clone(),
-            taint: taint.clone(),
-        };
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(STATE_VALUES_TABLE)
-                .map_err(|e| StateError::Backend(e.to_string()))?;
-            let current = match table.get(key.as_str()) {
-                Ok(Some(guard)) => decode_envelope(guard.value())?,
-                _ => TaintedValue::pristine(Value::List(Vec::new())),
-            };
-            match current.value {
-                Value::List(mut xs) => {
-                    xs.push(item);
-                    // The sequence's taint accrues every appended item's lineage.
-                    let mut t = current.taint;
-                    t.union(&taint);
-                    let bytes = encode_envelope(&Value::List(xs), &t)?;
-                    table
-                        .insert(key.as_str(), bytes.as_slice())
-                        .map_err(|e| StateError::Backend(e.to_string()))?;
-                }
-                other => {
-                    return Err(StateError::Backend(format!(
-                        "append on non-list at {} (current: {:?})",
-                        path, other
-                    )));
-                }
-            }
-        }
-        self.record_history_in_txn(&txn, &ev)?;
-        txn.commit()
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-
-        self.notify(ev);
-        Ok(())
-    }
-
-    async fn write_cas_tainted(
-        &self,
-        path: &Path,
-        expected: Option<Value>,
-        new: Value,
-        taint: TaintSet,
-    ) -> StateResult<()> {
-        let key = path.to_string();
-        let ev = StateEvent::Set {
-            path: path.clone(),
-            value: new.clone(),
-            taint: taint.clone(),
-        };
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(STATE_VALUES_TABLE)
-                .map_err(|e| StateError::Backend(e.to_string()))?;
-            let actual = match table.get(key.as_str()) {
-                Ok(Some(guard)) => Some(decode_envelope(guard.value())?.value),
-                Ok(None) => None,
-                Err(e) => return Err(StateError::Backend(e.to_string())),
-            };
-            if actual != expected {
-                return Err(StateError::CasFailed {
-                    path: path.to_string(),
-                    expected: expected.map(Box::new),
-                    actual: actual.map(Box::new),
-                });
-            }
-            let bytes = encode_envelope(&new, &taint)?;
-            table
-                .insert(key.as_str(), bytes.as_slice())
-                .map_err(|e| StateError::Backend(e.to_string()))?;
-        }
-        self.record_history_in_txn(&txn, &ev)?;
-        txn.commit()
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-
-        self.notify(ev);
-        Ok(())
-    }
-
-    async fn write_delete(&self, path: &Path) -> StateResult<()> {
-        let key = path.to_string();
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-        let existed;
-        {
-            let mut table = txn
-                .open_table(STATE_VALUES_TABLE)
-                .map_err(|e| StateError::Backend(e.to_string()))?;
-            existed = table
-                .remove(key.as_str())
-                .map_err(|e| StateError::Backend(e.to_string()))?
-                .is_some();
-        }
-        let ev = StateEvent::Delete { path: path.clone() };
-        if existed {
-            self.record_history_in_txn(&txn, &ev)?;
-        }
-        txn.commit()
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-
-        if existed {
-            self.notify(ev);
-        }
-        Ok(())
-    }
-
-    async fn subscribe(&self, pattern: &Path) -> StateResult<StateStream> {
-        let (tx, rx) = broadcast::channel(256);
-        self.subs.lock().push(Subscriber {
-            pattern: pattern.clone(),
-            sender: tx,
-        });
-        Ok(rx)
-    }
-
-    async fn read_prefix(&self, prefix: &Path) -> StateResult<Vec<(Path, Value)>> {
-        Ok(self
-            .read_prefix_tainted(prefix)
-            .await?
-            .into_iter()
-            .map(|(path, tv)| (path, tv.value))
-            .collect())
-    }
-
-    async fn read_prefix_tainted(&self, prefix: &Path) -> StateResult<Vec<(Path, TaintedValue)>> {
-        let prefix_str = prefix.to_string();
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-        let table = txn
-            .open_table(STATE_VALUES_TABLE)
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-
-        let mut results = Vec::new();
-        let range = table
-            .range(prefix_str.as_str()..)
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-
-        for entry in range {
-            let (key_guard, val_guard) = entry.map_err(|e| StateError::Backend(e.to_string()))?;
-            let key_str = key_guard.value();
-            if !key_str.starts_with(prefix_str.as_str()) {
-                break;
-            }
-            let path = Path::parse(key_str)
-                .map_err(|e| StateError::Backend(format!("invalid path in db: {e}")))?;
-            if path != *prefix && !prefix.is_prefix_of(&path) {
-                continue;
-            }
-            let val = decode_envelope(val_guard.value())?;
-            results.push((path, val));
-        }
-        Ok(results)
-    }
-
-    async fn read_range(
-        &self,
-        path: &Path,
-        from_millis: i64,
-        to_millis: i64,
-    ) -> StateResult<Vec<StateHistoryEntry>> {
-        let path_str = path.to_string();
-        let prefix_start = path_str.into_bytes();
-        let prefix_end = history_scan_end(path);
-
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-        let table = txn
-            .open_table(STATE_HISTORY_TABLE)
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-
-        let mut results = Vec::new();
-        let range = table
-            .range(prefix_start.as_slice()..prefix_end.as_slice())
-            .map_err(|e| StateError::Backend(e.to_string()))?;
-
-        for entry in range {
-            let (key_guard, val_guard) = entry.map_err(|e| StateError::Backend(e.to_string()))?;
-            let (event_path, at_millis) = history_key_parts(key_guard.value())?;
-            if event_path != *path && !path.is_prefix_of(&event_path) {
-                continue;
-            }
-            if at_millis < from_millis || at_millis >= to_millis {
-                continue;
-            }
-            let json: serde_json::Value =
-                serde_json::from_slice(val_guard.value()).map_err(StateError::Serde)?;
-            results.push(deserialize_history_entry(&json)?);
-        }
-        results.sort_by_key(|entry| entry.at_millis);
-        Ok(results)
-    }
-
-    async fn write_merge(&self, path: &Path, value: Value, rule: MergeRule) -> StateResult<()> {
-        let current = self.read(path).await?;
-        let merged = xolotl_state::merge_values(current, value, rule);
-        self.write_set(path, merged).await
-    }
-
-    async fn flush(&self) -> StateResult<()> {
-        Ok(())
+impl StateWatch for RedbStateBackend {
+    type Subscription = StateStream;
+    type Subscribe<'a> = Ready<StateResult<StateStream>>;
+    fn subscribe<'a>(&'a self, pattern: &'a Path) -> Self::Subscribe<'a> {
+        ready(self.subs.subscribe(
+            pattern.clone(),
+            std::num::NonZeroUsize::MIN.saturating_add(255),
+        ))
     }
 }
 
-fn deserialize_history_entry(json: &serde_json::Value) -> StateResult<StateHistoryEntry> {
-    let at_millis = json
-        .get("at_millis")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| StateError::Backend("history entry missing at_millis".into()))?;
-    let event_json = json
-        .get("event")
-        .ok_or_else(|| StateError::Backend("history entry missing event".into()))?;
-    let event_type = event_json
-        .get("type")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| StateError::Backend("history event missing type".into()))?;
-    let path = Path::parse(
-        event_json
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| StateError::Backend("history event missing path".into()))?,
-    )
-    .map_err(|e| StateError::Backend(format!("history event path is invalid: {e}")))?;
-    let event =
-        match event_type {
-            "set" => {
-                let value = json_to_value(event_json.get("value").ok_or_else(|| {
-                    StateError::Backend("history set event missing value".into())
-                })?)?;
-                let taint =
-                    serde_json::from_value(event_json.get("taint").cloned().ok_or_else(|| {
-                        StateError::Backend("history set event missing taint".into())
-                    })?)
-                    .map_err(StateError::Serde)?;
-                StateEvent::Set { path, value, taint }
-            }
-            "append" => {
-                let item = json_to_value(event_json.get("item").ok_or_else(|| {
-                    StateError::Backend("history append event missing item".into())
-                })?)?;
-                let taint =
-                    serde_json::from_value(event_json.get("taint").cloned().ok_or_else(|| {
-                        StateError::Backend("history append event missing taint".into())
-                    })?)
-                    .map_err(StateError::Serde)?;
-                StateEvent::Append { path, item, taint }
-            }
-            "delete" => StateEvent::Delete { path },
-            _ => {
-                return Err(StateError::Backend(format!(
-                    "unsupported history event type {event_type:?}"
-                )));
-            }
-        };
-    Ok(StateHistoryEntry { at_millis, event })
+impl StateFlush for RedbStateBackend {
+    type Flush<'a> = Ready<StateResult<()>>;
+    fn flush(&self) -> Self::Flush<'_> {
+        ready(Ok(()))
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::RedbStore;
-    use anyhow::{Context, anyhow, bail, ensure};
-    use xolotl_types::Path;
-
-    fn p(s: &str) -> anyhow::Result<Path> {
-        Path::parse(s).map_err(|error| anyhow!("path parse failed for {s}: {error}"))
-    }
-
-    fn tmp_backend() -> anyhow::Result<RedbStateBackend> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.keep().join("test.redb");
-        Ok(RedbStore::open(path)?.state_backend())
-    }
-
-    #[tokio::test]
-    async fn set_and_read() -> anyhow::Result<()> {
-        let b = tmp_backend()?;
-        b.write_set(&p("state://x")?, Value::Int(42)).await?;
-        let v = b.read(&p("state://x")?).await?;
-        ensure!(v == Some(Value::Int(42)), "unexpected value: {v:?}");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_missing_returns_none() -> anyhow::Result<()> {
-        let b = tmp_backend()?;
-        let value = b.read(&p("state://nope")?).await?;
-        ensure!(value.is_none(), "unexpected value: {value:?}");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn bare_value_encoding_is_rejected() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.keep().join("test.redb");
-        let store = RedbStore::open(path)?;
-        {
-            let txn = store.db.begin_write()?;
-            {
-                let mut table = txn.open_table(crate::STATE_VALUES_TABLE)?;
-                let bare = serde_json::to_vec(&value_to_json(&Value::Int(7))?)?;
-                table.insert("state://bad-encoding", bare.as_slice())?;
-            }
-            txn.commit()?;
-        }
-
-        let b = store.state_backend();
-        let err = match b.read(&p("state://bad-encoding")?).await {
-            Ok(value) => bail!("expected encoding error, got {value:?}"),
-            Err(error) => error,
-        };
-        ensure!(
-            matches!(&err, StateError::Backend(message) if message.contains("envelope marker")),
-            "bare Value encoding must not be treated as pristine: {err:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn append_creates_and_grows() -> anyhow::Result<()> {
-        let b = tmp_backend()?;
-        b.write_append(&p("state://log")?, Value::Int(1)).await?;
-        b.write_append(&p("state://log")?, Value::Int(2)).await?;
-        let v = b
-            .read(&p("state://log")?)
-            .await?
-            .context("missing log value")?;
-        match v {
-            Value::List(xs) => ensure!(xs.len() == 2, "unexpected list length: {}", xs.len()),
-            other => bail!("expected list, got {other:?}"),
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn history_keeps_multiple_events_for_same_path_in_one_millisecond() -> anyhow::Result<()>
-    {
-        let dir = tempfile::tempdir()?;
-        let path = dir.keep().join("test.redb");
-        let store = RedbStore::open(path)?;
-        let state_path = p("state://history/collide")?;
-        let txn = store.db.begin_write()?;
-        RedbStateBackend::record_history_at_millis_in_txn(
-            &txn,
-            &StateEvent::Set {
-                path: state_path.clone(),
-                value: Value::Int(1),
-                taint: TaintSet::pristine(),
-            },
-            1_700_000_000_000,
-        )?;
-        RedbStateBackend::record_history_at_millis_in_txn(
-            &txn,
-            &StateEvent::Set {
-                path: state_path.clone(),
-                value: Value::Int(2),
-                taint: TaintSet::pristine(),
-            },
-            1_700_000_000_000,
-        )?;
-        txn.commit()?;
-
-        let backend = store.state_backend();
-        let entries = backend.read_range(&state_path, 0, i64::MAX).await?;
-        ensure!(entries.len() == 2, "unexpected entries: {entries:?}");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn history_clock_is_shared_across_state_backends() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.keep().join("test.redb");
-        let store = RedbStore::open(path)?;
-        let first = store.state_backend();
-        let second = store.state_backend();
-        let state_path = p("state://history/shared-clock")?;
-
-        first.write_set(&state_path, Value::Int(1)).await?;
-        second.write_set(&state_path, Value::Int(2)).await?;
-
-        let entries = first.read_range(&state_path, 0, i64::MAX).await?;
-        match entries.as_slice() {
-            [first, second] => ensure!(
-                first.at_millis < second.at_millis,
-                "history timestamps must preserve write order across backends"
-            ),
-            other => bail!("expected 2 entries, got {other:?}"),
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cas_success_and_failure() -> anyhow::Result<()> {
-        let b = tmp_backend()?;
-        b.write_set(&p("state://k")?, Value::Int(1)).await?;
-        b.write_cas(&p("state://k")?, Some(Value::Int(1)), Value::Int(2))
-            .await?;
-        let value = b.read(&p("state://k")?).await?;
-        ensure!(value == Some(Value::Int(2)), "unexpected value: {value:?}");
-
-        let err = b
-            .write_cas(&p("state://k")?, Some(Value::Int(99)), Value::Int(3))
-            .await;
-        ensure!(
-            matches!(err, Err(StateError::CasFailed { .. })),
-            "expected CasFailed"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_removes() -> anyhow::Result<()> {
-        let b = tmp_backend()?;
-        b.write_set(&p("state://k")?, Value::Int(1)).await?;
-        b.write_delete(&p("state://k")?).await?;
-        let value = b.read(&p("state://k")?).await?;
-        ensure!(value.is_none(), "unexpected value: {value:?}");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn merge_missing_path_uses_incoming_value() -> anyhow::Result<()> {
-        let b = tmp_backend()?;
-        b.write_merge(&p("state://k")?, Value::Int(7), MergeRule::Shallow)
-            .await?;
-        let value = b.read(&p("state://k")?).await?;
-        ensure!(value == Some(Value::Int(7)), "unexpected value: {value:?}");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn prefix_scan() -> anyhow::Result<()> {
-        let b = tmp_backend()?;
-        b.write_set(
-            &p("state://memory/alice/persona")?,
-            Value::Str("hello".into()),
-        )
-        .await?;
-        b.write_set(&p("state://memory/alice/prefs")?, Value::Int(1))
-            .await?;
-        b.write_set(
-            &p("state://memory/bob/persona")?,
-            Value::Str("world".into()),
-        )
-        .await?;
-        b.write_set(&p("state://other")?, Value::Int(99)).await?;
-
-        let results = b.read_prefix(&p("state://memory/alice")?).await?;
-        ensure!(results.len() == 2, "unexpected results: {results:?}");
-        ensure!(
-            results
-                .iter()
-                .all(|(path, _)| path.to_string().starts_with("state://memory/alice")),
-            "unexpected prefix results: {results:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn prefix_scan_is_segment_aware() -> anyhow::Result<()> {
-        let b = tmp_backend()?;
-        b.write_set(&p("state://memory/alice")?, Value::Int(1))
-            .await?;
-        b.write_set(&p("state://memory/aliceevil")?, Value::Int(2))
-            .await?;
-        b.write_set(&p("state://memory/alice/prefs")?, Value::Int(3))
-            .await?;
-
-        let results = b.read_prefix(&p("state://memory/alice")?).await?;
-        let paths: Vec<String> = results
-            .into_iter()
-            .map(|(path, _)| path.to_string())
-            .collect();
-        ensure!(
-            paths == vec!["state://memory/alice", "state://memory/alice/prefs"],
-            "unexpected paths: {paths:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_range_includes_descendants_but_not_string_prefix_siblings() -> anyhow::Result<()>
-    {
-        let b = tmp_backend()?;
-        b.write_set(&p("state://memory")?, Value::Int(1)).await?;
-        b.write_set(&p("state://memory/alice")?, Value::Int(2))
-            .await?;
-        b.write_set(&p("state://memoryevil")?, Value::Int(3))
-            .await?;
-
-        let entries = b.read_range(&p("state://memory")?, 0, i64::MAX).await?;
-        let paths: Vec<String> = entries
-            .into_iter()
-            .map(|entry| match entry.event {
-                StateEvent::Set { path, .. } => path.to_string(),
-                StateEvent::Append { path, .. } => path.to_string(),
-                StateEvent::Delete { path } => path.to_string(),
-            })
-            .collect();
-        ensure!(
-            paths == vec!["state://memory", "state://memory/alice"],
-            "unexpected paths: {paths:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn subscribe_receives_events() -> anyhow::Result<()> {
-        let b = tmp_backend()?;
-        let mut rx = b.subscribe(&p("state://watched/**")?).await?;
-        b.write_set(&p("state://watched/a")?, Value::Int(1)).await?;
-        let ev = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
-            .await
-            .map_err(|error| anyhow!("timed out waiting for event: {error}"))?
-            .map_err(|error| anyhow!("event receive failed: {error}"))?;
-        match ev {
-            StateEvent::Set { path, .. } => ensure!(
-                path.to_string() == "state://watched/a",
-                "unexpected path: {path}"
-            ),
-            other => bail!("wrong event: {other:?}"),
-        }
-        Ok(())
-    }
-}
+mod tests;

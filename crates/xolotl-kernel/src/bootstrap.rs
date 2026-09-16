@@ -16,14 +16,11 @@
 use crate::driver::{DriverDescriptor, DynDriver};
 use crate::kernel::Kernel;
 use crate::open::{OpenError, OpenRequest, open_resource_with_attached};
-use crate::process::{FinalizeStart, ProcessEntry, TaskAttachment};
+use crate::process::{ProcessEntry, TaskAttachment};
 use crate::registry::{AdmissionError, ResolveError};
-use crate::step::{StepFn, StepInstallError};
-use futures_util::FutureExt;
-use std::collections::{BTreeMap, BTreeSet};
-use std::panic::AssertUnwindSafe;
+use crate::step::StepModule;
+use std::collections::BTreeMap;
 use thiserror::Error;
-use xolotl_graph::{ActorSpec, DoNode, LintSeverity, lint_actor};
 use xolotl_types::{
     Binding, CapError, ConstraintSet, DriverRef, Expiry, Fact, Grant, HandleId, IdentityRef,
     Interface, InterfaceFamily, InterfaceSet, Metadata, Method, MethodBitmap, ModalitySet,
@@ -31,8 +28,18 @@ use xolotl_types::{
     ResourceKind, ResourceName, ResourceSelector, RightFlags, Rights, SchemaId, Transport,
 };
 
+#[cfg(feature = "durable")]
+pub(crate) mod durable;
+#[cfg(feature = "durable")]
+pub use durable::{DurableRecovery, DurableRecoveryConfig, DurableRecoveryReport};
+mod request;
+pub use request::{ProcessCleanupFailure, ProcessCleanupReport, RequestProcess};
+mod actor;
+pub(crate) mod finalize;
+
 /// A ready kernel plus the root Process id. The root holds an
 /// omnipotent grant; everything else is attenuated from it.
+#[derive(Clone)]
 pub struct Bootstrap {
     /// Assembled kernel instance.
     pub kernel: Kernel,
@@ -80,25 +87,6 @@ pub struct SpawnedActor {
     pub process: ProcessId,
     /// Directory entry written under `state://agents/<identity>/<name>`.
     pub directory: Path,
-}
-
-/// Process-local step installed before a spawned actor body starts.
-#[derive(Clone)]
-pub struct ProcessStepBinding {
-    /// Name referenced by `StepRef`.
-    pub name: String,
-    /// Step function registered under `name`.
-    pub step: StepFn,
-}
-
-impl ProcessStepBinding {
-    /// Create a process-local step binding.
-    pub fn new(name: impl Into<String>, step: StepFn) -> Self {
-        Self {
-            name: name.into(),
-            step,
-        }
-    }
 }
 
 struct EffectRegistration<'a> {
@@ -169,12 +157,48 @@ pub enum BootstrapError {
         /// Process id supplied by the caller.
         process: ProcessId,
     },
+    /// A terminal or finalizing process cannot admit children or start work.
+    #[error("process {process} is closing and cannot start work")]
+    ProcessUnavailable {
+        /// Authority anchor whose lifecycle no longer permits request admission.
+        process: ProcessId,
+    },
+    /// Process storage or identity admission was rejected before execution.
+    #[error("process admission failed: {0}")]
+    ProcessAdmission(#[source] crate::process::ProcessAdmissionError),
+    /// Completion would wait on the caller or let finalizers wait on each other.
+    #[error("process {process} cannot be joined from this execution context")]
+    ProcessBusy {
+        /// Process whose owner must first return or request cancellation.
+        process: ProcessId,
+    },
+    /// Background process creation requires an active Tokio runtime.
+    #[error("process {process} requires an active Tokio runtime")]
+    ProcessRuntimeUnavailable {
+        /// Process whose task could not be started.
+        process: ProcessId,
+    },
+    /// A lifecycle completion was given a nonterminal status.
+    #[error("cannot finish process {process} with nonterminal status {status:?}")]
+    NonterminalStatus {
+        /// Process whose lifecycle would have been changed.
+        process: ProcessId,
+        /// Rejected status.
+        status: ProcessStatus,
+    },
     /// Writing a bootstrap fact failed.
     #[error("fact write failed: {0}")]
     Fact(#[from] crate::FactError),
+    /// An execution identity could not be reserved before dispatch or cleanup.
+    #[error("execution identity allocation failed: {0}")]
+    ExecutionId(#[from] crate::ExecutionIdError),
+    /// Persisting the terminal checkpoint retirement failed; cleanup is retryable.
+    #[cfg(feature = "durable")]
+    #[error("checkpoint lifecycle failed: {0}")]
+    Checkpoint(#[source] Box<xolotl_types::Failure>),
     /// Writing bootstrap state failed.
     #[error("state write failed: {0}")]
-    State(#[source] Box<xolotl_state::StateError>),
+    State(#[source] Box<xolotl_state::StateFailure>),
     /// Actor admission rejected a declaration before execution.
     #[error("actor {actor:?} rejected: {message}")]
     ActorAdmission {
@@ -191,25 +215,6 @@ pub enum BootstrapError {
         /// Lint failure.
         message: String,
     },
-    /// Actor step bindings contain the same name more than once.
-    #[error("actor {actor:?} has duplicate step binding {name:?}")]
-    DuplicateStepBinding {
-        /// Actor name.
-        actor: String,
-        /// Step name.
-        name: String,
-    },
-    /// Installing a process-local step failed.
-    #[error("actor {actor:?} step {name:?} install failed: {source}")]
-    StepInstall {
-        /// Actor name.
-        actor: String,
-        /// Step name.
-        name: String,
-        /// Step table error.
-        #[source]
-        source: StepInstallError,
-    },
     /// Actor body or finalizer references a step that was not supplied.
     #[error("actor {actor:?} references missing step binding {name:?}")]
     MissingStepBinding {
@@ -220,9 +225,20 @@ pub enum BootstrapError {
     },
 }
 
-impl From<xolotl_state::StateError> for BootstrapError {
-    fn from(source: xolotl_state::StateError) -> Self {
+impl From<xolotl_state::StateFailure> for BootstrapError {
+    fn from(source: xolotl_state::StateFailure) -> Self {
         Self::State(Box::new(source))
+    }
+}
+
+impl From<crate::process::ProcessAdmissionError> for BootstrapError {
+    fn from(source: crate::process::ProcessAdmissionError) -> Self {
+        match source {
+            crate::process::ProcessAdmissionError::Unavailable { process } => {
+                Self::ProcessUnavailable { process }
+            }
+            other => Self::ProcessAdmission(other),
+        }
     }
 }
 
@@ -242,6 +258,8 @@ pub struct MethodSpec {
     pub observes_external: bool,
     /// Whether the method may run while the owning Process is finalizing.
     pub finalize_allowed: bool,
+    /// Whether protected input must be rejected before this method runs.
+    pub requires_unprotected_input: bool,
 }
 
 impl MethodSpec {
@@ -261,6 +279,7 @@ impl MethodSpec {
             batchable: false,
             observes_external: false,
             finalize_allowed: false,
+            requires_unprotected_input: false,
         }
     }
 
@@ -279,6 +298,12 @@ impl MethodSpec {
     /// Allow this method to be called from a Process finalizer.
     pub const fn finalize_allowed(mut self) -> Self {
         self.finalize_allowed = true;
+        self
+    }
+
+    /// Require unprotected input, independently of a resource's name or scheme.
+    pub const fn unprotected_input(mut self) -> Self {
+        self.requires_unprotected_input = true;
         self
     }
 
@@ -325,22 +350,16 @@ impl Bootstrap {
     }
 
     fn seed(kernel: Kernel) -> Self {
-        // Create the root/system Process.
-        let root = kernel.processes.fresh_id();
-        let mut entry = ProcessEntry::new(root, None, IdentityRef::ROOT);
-        entry.status = ProcessStatus::Running;
-        kernel.processes.insert(entry);
-
-        // Root holds the omnipotent grant.
-        let grant = Grant {
-            id: kernel.registry.next_grant_id(),
-            holder: root,
-            selector: ResourceSelector::all(),
-            rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
-            constraints: ConstraintSet::empty(),
-            expires: Expiry::Never,
-        };
-        kernel.registry.register_grant(grant);
+        let root = kernel.processes.initialize_root(|root| {
+            kernel.registry.register_grant(Grant {
+                id: kernel.registry.next_grant_id(),
+                holder: root,
+                selector: ResourceSelector::all(),
+                rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
+                constraints: ConstraintSet::empty(),
+                expires: Expiry::Never,
+            });
+        });
 
         Bootstrap { kernel, root }
     }
@@ -691,7 +710,7 @@ impl Bootstrap {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        self.spawn_request_process_under_inner(anchor, identity, &compiled)
+        self.spawn_request_process_under_inner(anchor, identity, compiled, StepModule::default())
     }
 
     /// Spawn a request Process under `anchor` with pre-parsed request grants.
@@ -701,6 +720,18 @@ impl Bootstrap {
         identity: IdentityRef,
         grants: &[CompiledRequestGrantTemplate],
     ) -> Result<ProcessId, BootstrapError> {
+        self.spawn_request_process_under_with_steps(anchor, identity, grants, StepModule::default())
+    }
+
+    /// Spawn a request with attenuated grants and a shared native module.
+    /// The module is attached before any executor can observe the new process.
+    pub fn spawn_request_process_under_with_steps(
+        &self,
+        anchor: ProcessId,
+        identity: IdentityRef,
+        grants: &[CompiledRequestGrantTemplate],
+        steps: StepModule,
+    ) -> Result<ProcessId, BootstrapError> {
         let parsed: Vec<_> = grants
             .iter()
             .map(|grant| ParsedRequestGrantTemplate {
@@ -708,19 +739,25 @@ impl Bootstrap {
                 methods: Some(grant.methods),
             })
             .collect();
-        self.spawn_request_process_under_inner(anchor, identity, &parsed)
+        self.spawn_request_process_under_inner(anchor, identity, parsed, steps)
     }
 
     fn spawn_request_process_under_inner(
         &self,
         anchor: ProcessId,
         identity: IdentityRef,
-        grants: &[ParsedRequestGrantTemplate],
+        mut grants: Vec<ParsedRequestGrantTemplate>,
+        steps: StepModule,
     ) -> Result<ProcessId, BootstrapError> {
-        let planned = self.plan_request_grants(anchor, grants)?;
-        let child = self.kernel.processes.fresh_id();
-        let entry = self.request_process_entry(child, anchor, identity, planned);
-        self.kernel.processes.insert(entry);
+        let child = self.kernel.processes.fresh_id()?;
+        for grant in &mut grants {
+            xolotl_graph::bind_process_self_capability(&mut grant.selector.pattern, child);
+        }
+        let planned = self.plan_request_grants(anchor, &grants)?;
+        let mut entry = self.request_process_entry(child, anchor, identity, planned);
+        entry.steps = steps;
+        entry.scope.start();
+        self.kernel.processes.admit_child(entry)?;
         Ok(child)
     }
 
@@ -729,8 +766,12 @@ impl Bootstrap {
         anchor: ProcessId,
         grants: &[ParsedRequestGrantTemplate],
     ) -> Result<Vec<PlannedRequestGrant>, BootstrapError> {
-        if !self.kernel.processes.exists(anchor) {
-            return Err(BootstrapError::NoSuchProcess { process: anchor });
+        match self.kernel.processes.status(anchor) {
+            None => return Err(BootstrapError::NoSuchProcess { process: anchor }),
+            Some(status) if status.is_terminal() || status == ProcessStatus::Finalizing => {
+                return Err(BootstrapError::ProcessUnavailable { process: anchor });
+            }
+            Some(_) => {}
         }
         let now_millis = crate::executor::now_millis();
         let mut anchor_grants = self.kernel.registry.grants_of(anchor);
@@ -779,7 +820,6 @@ impl Bootstrap {
         planned: Vec<PlannedRequestGrant>,
     ) -> ProcessEntry {
         let mut entry = ProcessEntry::new(child, Some(anchor), identity);
-        entry.status = ProcessStatus::Running;
 
         for grant in planned {
             entry.attached_grants.push(Grant {
@@ -821,226 +861,65 @@ impl Bootstrap {
         ConstraintSet { predicates }
     }
 
-    /// Spawn a named long-lived actor Process under `anchor`.
-    ///
-    /// The actor receives only the capabilities declared by
-    /// `spec.declared_capabilities`, intersected with the anchor's grants. Its
-    /// body still runs through the ordinary Executor and every effect goes
-    /// through `open()`, Handle checks, Policy, Driver dispatch, and Facts.
-    pub async fn spawn_actor_under(
+    /// Classify every retained Fact, including records of processes already reaped
+    /// or not yet restored, and persist quarantine entries to `state://quarantine/*`.
+    /// Uses default per-page read budgets. Returns the aggregate recovery report
+    /// without scheduling execution; quiesce Fact writers for stable results.
+    pub async fn recover_all(&self) -> Result<crate::recovery::RecoveryReport, crate::FactError> {
+        crate::recovery::recover_all_persisting(&self.kernel.facts, &self.kernel.state).await
+    }
+
+    /// Classify retained Facts with explicit record and encoded-byte page budgets.
+    /// See [`crate::recovery::recover_all_persisting_with_limits`] for consistency
+    /// and partial-failure semantics.
+    pub async fn recover_all_with_limits(
         &self,
-        anchor: ProcessId,
-        identity: IdentityRef,
-        identity_segment: &str,
-        spec: &ActorSpec,
-    ) -> Result<SpawnedActor, BootstrapError> {
-        self.spawn_actor_under_with_steps(
-            anchor,
-            identity,
-            identity_segment,
-            spec,
-            std::iter::empty::<ProcessStepBinding>(),
+        limits: crate::RecoveryLimits,
+    ) -> Result<crate::RecoveryReport, crate::FactError> {
+        crate::recovery::recover_all_persisting_with_limits(
+            &self.kernel.facts,
+            &self.kernel.state,
+            limits,
         )
         .await
-    }
-
-    /// Spawn a named long-lived actor Process with process-local steps already
-    /// installed before the body starts.
-    pub async fn spawn_actor_under_with_steps<I>(
-        &self,
-        anchor: ProcessId,
-        identity: IdentityRef,
-        identity_segment: &str,
-        spec: &ActorSpec,
-        step_bindings: I,
-    ) -> Result<SpawnedActor, BootstrapError>
-    where
-        I: IntoIterator<Item = ProcessStepBinding>,
-    {
-        let step_bindings: Vec<ProcessStepBinding> = step_bindings.into_iter().collect();
-        validate_actor_segment("actor name", &spec.name)?;
-        validate_actor_segment("actor identity segment", identity_segment)?;
-        validate_actor_step_bindings(spec, &step_bindings)?;
-        let child = self.kernel.processes.fresh_id();
-        let spec = spec.bind_process_local_refs(child).map_err(|source| {
-            BootstrapError::ActorAdmission {
-                actor: spec.name.clone(),
-                message: source.to_string(),
-            }
-        })?;
-        xolotl_graph::compile_do(&spec.body).map_err(|source| BootstrapError::ActorAdmission {
-            actor: spec.name.clone(),
-            message: source.to_string(),
-        })?;
-        for (index, finalizer) in spec.finalizers.iter().enumerate() {
-            xolotl_graph::compile_do(finalizer).map_err(|source| {
-                BootstrapError::ActorAdmission {
-                    actor: spec.name.clone(),
-                    message: format!("finalizer[{index}] compile failed: {source}"),
-                }
-            })?;
-        }
-
-        let lint_message = actor_lint_message(&spec);
-        if let Some(message) = lint_message {
-            return Err(BootstrapError::ActorLint {
-                actor: spec.name.clone(),
-                message,
-            });
-        }
-
-        let parsed = spec
-            .declared_capabilities
-            .iter()
-            .map(|literal| {
-                ResourceSelector::parse(literal)
-                    .map(|selector| ParsedRequestGrantTemplate {
-                        selector,
-                        methods: None,
-                    })
-                    .map_err(|source| BootstrapError::Selector {
-                        literal: literal.clone(),
-                        source,
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let directory = actor_directory_path(identity_segment, &spec.name)?;
-        let inbox = actor_inbox_path(identity_segment, &spec.name)?;
-        let planned = self.plan_request_grants(anchor, &parsed)?;
-        let mut entry = self.request_process_entry(child, anchor, identity, planned);
-        entry.budget_spec = spec.budget.clone();
-        let body = spec.body.clone();
-        let finalizers: Vec<DoNode> = spec.finalizers.clone();
-        entry.on_finalize.extend(finalizers.iter().cloned());
-        entry.directory = Some(directory.clone());
-
-        let initial = actor_directory_value(&spec, child, ProcessStatus::Running, &inbox);
-        install_process_step_bindings(&self.kernel.steps, child, &spec.name, &step_bindings)?;
-        if let Err(source) = self.kernel.state.write_cas(&directory, None, initial).await {
-            self.kernel.handles.write().revoke_owned_by(child);
-            cleanup_process_steps(&self.kernel.steps, child);
-            return Err(BootstrapError::State(Box::new(source)));
-        }
-
-        self.kernel.processes.insert(entry);
-
-        let kernel = self.kernel.clone();
-        let actor_name = spec.name.clone();
-        let task = tokio::spawn(async move {
-            let outcome = match AssertUnwindSafe(kernel.executor_for(child).eval(&body))
-                .catch_unwind()
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(payload) => xolotl_types::Outcome::Fail(xolotl_types::Failure::HandlerError {
-                    kind: "panic".into(),
-                    message: panic_payload_message("actor process", payload),
-                }),
-            };
-            let status = match &outcome {
-                xolotl_types::Outcome::Fail(_) => ProcessStatus::Failed,
-                _ => ProcessStatus::Completed,
-            };
-            match kernel.processes.begin_finalizing(child) {
-                FinalizeStart::Started => {
-                    if let Err(error) =
-                        finish_process_terminal_attempt(&kernel, child, status).await
-                    {
-                        tracing::error!(
-                            actor = %actor_name,
-                            process = child.get(),
-                            error = %error,
-                            "actor process terminal finalization failed"
-                        );
-                    }
-                }
-                FinalizeStart::AlreadyFinalizing | FinalizeStart::AlreadyTerminal => {}
-                FinalizeStart::NoSuchProcess => {
-                    tracing::error!(
-                        actor = %actor_name,
-                        process = child.get(),
-                        "actor process disappeared before terminal finalization"
-                    );
-                }
-            }
-            kernel.processes.remove_task(child);
-            outcome
-        });
-        match self
-            .kernel
-            .processes
-            .attach_task(child, task.abort_handle())
-        {
-            TaskAttachment::Attached | TaskAttachment::AlreadyTerminal => {}
-            TaskAttachment::NoSuchProcess => {
-                task.abort();
-                cleanup_process_steps(&self.kernel.steps, child);
-                return Err(BootstrapError::NoSuchProcess { process: child });
-            }
-            TaskAttachment::AlreadyAttached => {
-                task.abort();
-                cleanup_process_steps(&self.kernel.steps, child);
-                return Err(BootstrapError::ActorAdmission {
-                    actor: spec.name.clone(),
-                    message: "process already has an attached task".into(),
-                });
-            }
-        }
-
-        Ok(SpawnedActor {
-            process: child,
-            directory,
-        })
-    }
-
-    /// Recover every unfinished Process from its Fact stream, persisting any
-    /// quarantine entries to `state://quarantine/*`.
-    /// Returns the aggregate recovery report. Called by the daemon on boot.
-    pub async fn recover_all(&self) -> Result<crate::recovery::RecoveryReport, crate::FactError> {
-        let mut agg = crate::recovery::RecoveryReport::default();
-        for pid in self.kernel.processes.all_ids() {
-            let report = crate::recovery::recover_process_persisting(
-                &self.kernel.facts,
-                &self.kernel.state,
-                pid,
-            )
-            .await?;
-            agg.skipped += report.skipped;
-            agg.retried += report.retried;
-            agg.quarantined += report.quarantined;
-            agg.schema_mismatched += report.schema_mismatched;
-        }
-        Ok(agg)
     }
 
     /// Record a Gateway-layer audit Fact for pre-Operation events such as
     /// console login/logout/root bootstrap. Credential material is
     /// intentionally absent: only redacted event metadata reaches the Fact log.
     pub fn record_gateway_audit(&self, audit: GatewayAudit<'_>) -> Result<(), crate::FactError> {
-        let process = self.kernel.processes.fresh_id();
-        let mut entry = ProcessEntry::new(process, None, IdentityRef::ROOT);
-        entry.status = ProcessStatus::Completed;
+        let execution = self
+            .kernel
+            .execution_ids()
+            .allocate()
+            .map_err(|error| crate::FactError(error.to_string()))?;
+        let process = self.root;
 
         let mut outcome = std::collections::BTreeMap::new();
-        outcome.insert("event".into(), xolotl_types::Value::Str(audit.event.into()));
+        outcome.insert(
+            "event".into(),
+            xolotl_types::Value::string(audit.event.into()),
+        );
         outcome.insert(
             "outcome".into(),
-            xolotl_types::Value::Str(audit.outcome.into()),
+            xolotl_types::Value::string(audit.outcome.into()),
         );
         if let Some(username) = audit.username {
-            outcome.insert("username".into(), xolotl_types::Value::Str(username.into()));
+            outcome.insert(
+                "username".into(),
+                xolotl_types::Value::string(username.into()),
+            );
         }
         if let Some(source_addr) = audit.source_addr {
             outcome.insert(
                 "source_addr".into(),
-                xolotl_types::Value::Str(source_addr.into()),
+                xolotl_types::Value::string(source_addr.into()),
             );
         }
         if let Some(mfa_level) = audit.mfa_level {
             outcome.insert(
                 "mfa_level".into(),
-                xolotl_types::Value::Int(i64::from(mfa_level)),
+                xolotl_types::Value::integer(i64::from(mfa_level)),
             );
         }
         if let Some(details) = audit.details {
@@ -1048,113 +927,28 @@ impl Bootstrap {
         }
 
         self.kernel.facts.complete(Fact {
-            id: xolotl_types::OperationId::new(process, GATEWAY_AUDIT_NODE, 0),
+            id: xolotl_types::OperationId::new(
+                process,
+                execution,
+                xolotl_types::InvocationId::new(0),
+                GATEWAY_AUDIT_NODE,
+                0,
+            ),
             schema_version: Fact::SCHEMA_VERSION,
             caller: process,
             acting: IdentityRef::ROOT,
             handle: xolotl_types::HandleId::new(0, 0),
             resource: xolotl_types::ResourceId::new(0),
             method: xolotl_types::MethodId::new(0),
-            input_ref: xolotl_types::ValueRef::Inline(xolotl_types::Value::Null),
+            input: xolotl_types::Value::null(),
             taint: xolotl_types::TaintSet::author(),
             decision: xolotl_types::DecisionTag::Ok,
-            outcome_ref: xolotl_types::OutcomeRef::Inline(xolotl_types::Value::Map(outcome)),
+            outcome: Some(xolotl_types::Value::map(outcome)),
             batch: None,
             replay: xolotl_types::ReplayClass::Observation,
             timestamp: xolotl_types::Timestamp::millis(crate::executor::now_millis()),
         })?;
-        self.kernel.processes.insert(entry);
         Ok(())
-    }
-
-    /// Finalize a Process by marking teardown state, cancelling descendants,
-    /// running finalizers, revoking owned handles, and recording the
-    /// `ProcessFinalized` lifecycle marker.
-    pub async fn finalize_process(&self, process: ProcessId) -> Result<(), BootstrapError> {
-        let procs = &self.kernel.processes;
-        let terminal_status = procs
-            .status(process)
-            .filter(|current| current.is_terminal())
-            .unwrap_or(ProcessStatus::Completed);
-        match procs.begin_finalizing(process) {
-            FinalizeStart::Started => {}
-            FinalizeStart::AlreadyFinalizing | FinalizeStart::AlreadyTerminal => return Ok(()),
-            FinalizeStart::NoSuchProcess => return Err(BootstrapError::NoSuchProcess { process }),
-        }
-
-        // Cancel descendants deepest-first while this process remains in
-        // Finalizing until its own cleanup completes.
-        for descendant in procs.subtree_post_order(process) {
-            if descendant != process {
-                let cancelled = procs.cancel_if_non_terminal(descendant).ok_or(
-                    BootstrapError::NoSuchProcess {
-                        process: descendant,
-                    },
-                )?;
-                procs.abort_task(descendant);
-                self.kernel.handles.write().revoke_owned_by(descendant);
-                cleanup_process_steps(&self.kernel.steps, descendant);
-                if cancelled && let Some(directory) = procs.directory(descendant) {
-                    update_actor_directory_status(
-                        &self.kernel.state,
-                        &directory,
-                        ProcessStatus::Cancelled,
-                    )
-                    .await?;
-                }
-            }
-        }
-        procs.abort_task(process);
-
-        finish_process_terminal_attempt(&self.kernel, process, terminal_status).await
-    }
-
-    /// Mark a Process cancelled so its next execution boundary stops work.
-    pub fn cancel_process(&self, process: ProcessId) -> Result<bool, BootstrapError> {
-        self.kernel
-            .processes
-            .cancel_if_non_terminal(process)
-            .ok_or(BootstrapError::NoSuchProcess { process })
-    }
-
-    /// Finish a request Process after its program returned an outcome.
-    pub async fn finish_request_process(
-        &self,
-        process: ProcessId,
-        outcome: &xolotl_types::Outcome,
-    ) -> Result<(), BootstrapError> {
-        let status = match outcome {
-            xolotl_types::Outcome::Fail(
-                xolotl_types::Failure::Cancelled | xolotl_types::Failure::Timeout,
-            ) => ProcessStatus::Cancelled,
-            xolotl_types::Outcome::Fail(_) => ProcessStatus::Failed,
-            xolotl_types::Outcome::Done(_) | xolotl_types::Outcome::Short(_) => {
-                ProcessStatus::Completed
-            }
-        };
-        self.finish_process_as(process, status).await
-    }
-
-    /// Run finalizers, revoke handles, and record lifecycle state with an
-    /// explicit terminal status.
-    pub async fn finish_process_as(
-        &self,
-        process: ProcessId,
-        status: ProcessStatus,
-    ) -> Result<(), BootstrapError> {
-        let terminal_status = self
-            .kernel
-            .processes
-            .status(process)
-            .filter(|current| current.is_terminal())
-            .unwrap_or(status);
-        match self.kernel.processes.begin_finalizing(process) {
-            FinalizeStart::Started => {
-                finish_process_terminal_attempt(&self.kernel, process, terminal_status).await
-            }
-            FinalizeStart::AlreadyFinalizing | FinalizeStart::AlreadyTerminal => Ok(()),
-            FinalizeStart::NoSuchProcess => Err(BootstrapError::NoSuchProcess { process }),
-        }
     }
 }
 
@@ -1163,168 +957,16 @@ impl Bootstrap {
 const FINALIZED_NODE: xolotl_types::NodeId = xolotl_types::NodeId::new(u32::MAX);
 const GATEWAY_AUDIT_NODE: xolotl_types::NodeId = xolotl_types::NodeId::new(u32::MAX - 1);
 
-fn finalized_marker_path(process: ProcessId) -> Result<Path, PathError> {
+fn finalized_marker_path(
+    process: ProcessId,
+    execution: xolotl_types::ExecutionId,
+) -> Result<Path, PathError> {
     Path::try_new("state")?
         .try_push("kernel")?
         .try_push("process")?
         .try_push_literal(process.get().to_string())?
+        .try_push_literal(execution.get().to_string())?
         .try_push("finalized")
-}
-
-async fn finish_process_terminal_attempt(
-    kernel: &Kernel,
-    process: ProcessId,
-    terminal_status: ProcessStatus,
-) -> Result<(), BootstrapError> {
-    let result = finish_process_terminal(kernel, process, terminal_status).await;
-    if result.is_err() && kernel.processes.release_finalizing(process).is_none() {
-        tracing::error!(
-            process = process.get(),
-            "process disappeared while releasing failed finalization attempt"
-        );
-    }
-    result
-}
-
-async fn finish_process_terminal(
-    kernel: &Kernel,
-    process: ProcessId,
-    terminal_status: ProcessStatus,
-) -> Result<(), BootstrapError> {
-    let mut finalizer_failures = kernel
-        .processes
-        .finalizer_failures(process)
-        .ok_or(BootstrapError::NoSuchProcess { process })?;
-    let base_failure_index = finalizer_failures.len();
-    for (index, body) in kernel
-        .processes
-        .take_finalizers(process)
-        .into_iter()
-        .enumerate()
-    {
-        let ex = kernel.executor_for(process).with_finalizer_mode();
-        if let xolotl_types::Outcome::Fail(failure) = ex.eval(&body).await {
-            let failure = failure.to_string();
-            tracing::warn!(
-                process = process.get(),
-                %failure,
-                "process finalizer failed"
-            );
-            let mut item = BTreeMap::new();
-            item.insert(
-                "index".into(),
-                xolotl_types::Value::Int((base_failure_index + index) as i64),
-            );
-            item.insert("failure".into(), xolotl_types::Value::Str(failure));
-            finalizer_failures.push(xolotl_types::Value::Map(item));
-        }
-    }
-    kernel
-        .processes
-        .set_finalizer_failures(process, finalizer_failures.clone())
-        .ok_or(BootstrapError::NoSuchProcess { process })?;
-
-    let revoked = kernel.handles.write().revoke_owned_by(process);
-    let finalizer_failure_count = finalizer_failures.len();
-    let finalized = Fact {
-        id: xolotl_types::OperationId::new(process, FINALIZED_NODE, 0),
-        schema_version: Fact::SCHEMA_VERSION,
-        caller: process,
-        acting: kernel
-            .processes
-            .identity(process)
-            .ok_or(BootstrapError::NoSuchProcess { process })?,
-        handle: xolotl_types::HandleId::new(0, 0),
-        resource: xolotl_types::ResourceId::new(0),
-        method: xolotl_types::MethodId::new(0),
-        input_ref: xolotl_types::ValueRef::Inline(xolotl_types::Value::Null),
-        taint: xolotl_types::TaintSet::pristine(),
-        decision: xolotl_types::DecisionTag::Ok,
-        outcome_ref: xolotl_types::OutcomeRef::Inline(xolotl_types::Value::Map({
-            let mut m = BTreeMap::new();
-            m.insert(
-                "event".into(),
-                xolotl_types::Value::Str("ProcessFinalized".into()),
-            );
-            m.insert(
-                "status".into(),
-                xolotl_types::Value::Str(process_status_label(terminal_status).into()),
-            );
-            m.insert(
-                "revoked_handles".into(),
-                xolotl_types::Value::Int(revoked as i64),
-            );
-            m.insert(
-                "finalizer_failure_count".into(),
-                xolotl_types::Value::Int(finalizer_failure_count as i64),
-            );
-            if !finalizer_failures.is_empty() {
-                m.insert(
-                    "finalizer_failures".into(),
-                    xolotl_types::Value::List(finalizer_failures),
-                );
-            }
-            m
-        })),
-        batch: None,
-        replay: xolotl_types::ReplayClass::Observation,
-        timestamp: xolotl_types::Timestamp::millis(crate::executor::now_millis()),
-    };
-    kernel.facts.complete(finalized)?;
-    let actual_status = kernel
-        .processes
-        .mark_terminal_status(process, terminal_status)
-        .ok_or(BootstrapError::NoSuchProcess { process })?;
-
-    let marker_path = finalized_marker_path(process).map_err(|source| BootstrapError::Path {
-        literal: format!("state://kernel/process/{}/finalized", process.get()),
-        source,
-    })?;
-    let marker_result = kernel
-        .state
-        .write_set(&marker_path, xolotl_types::Value::Int(revoked as i64))
-        .await
-        .map_err(BootstrapError::from);
-    let directory_result = match kernel.processes.directory(process) {
-        Some(directory) => {
-            update_actor_directory_status(&kernel.state, &directory, actual_status).await
-        }
-        None => Ok(()),
-    };
-
-    match (marker_result, directory_result) {
-        (Ok(()), Ok(())) => {
-            cleanup_process_steps(&kernel.steps, process);
-            kernel
-                .processes
-                .complete_finalization(process)
-                .ok_or(BootstrapError::NoSuchProcess { process })
-        }
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Err(primary), Err(secondary)) => {
-            tracing::error!(
-                process = process.get(),
-                error = %secondary,
-                "process directory update failed after finalize marker failure"
-            );
-            Err(primary)
-        }
-    }
-}
-
-fn actor_lint_message(spec: &ActorSpec) -> Option<String> {
-    let mut messages = Vec::new();
-    for finding in lint_actor(spec) {
-        if finding.severity == LintSeverity::Error {
-            messages.push(finding.message);
-        }
-    }
-    if messages.is_empty() {
-        None
-    } else {
-        Some(messages.join("; "))
-    }
 }
 
 pub(crate) fn panic_payload_message(
@@ -1340,229 +982,18 @@ pub(crate) fn panic_payload_message(
     format!("{context} panicked")
 }
 
-fn validate_actor_segment(label: &'static str, value: &str) -> Result<(), BootstrapError> {
-    if value.trim().is_empty() {
-        return Err(BootstrapError::ActorAdmission {
-            actor: value.to_string(),
-            message: format!("{label} must not be empty"),
-        });
-    }
-    let mut chars = value.chars();
-    let valid = matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if valid {
-        Ok(())
-    } else {
-        Err(BootstrapError::ActorAdmission {
-            actor: value.to_string(),
-            message: format!(
-                "{label} must start with an ASCII letter or digit and contain only ASCII letters, digits, '_' or '-'"
-            ),
-        })
-    }
-}
-
-fn validate_process_step_bindings(
-    actor: &str,
-    bindings: &[ProcessStepBinding],
-) -> Result<BTreeSet<String>, BootstrapError> {
-    let mut seen = BTreeSet::new();
-    for binding in bindings {
-        if binding.name.trim().is_empty() {
-            return Err(BootstrapError::ActorAdmission {
-                actor: actor.to_string(),
-                message: "step name must not be empty".into(),
-            });
-        }
-        if !seen.insert(binding.name.clone()) {
-            return Err(BootstrapError::DuplicateStepBinding {
-                actor: actor.to_string(),
-                name: binding.name.clone(),
-            });
-        }
-    }
-    Ok(seen)
-}
-
-fn validate_actor_step_bindings(
-    spec: &ActorSpec,
-    bindings: &[ProcessStepBinding],
-) -> Result<(), BootstrapError> {
-    let provided = validate_process_step_bindings(&spec.name, bindings)?;
-    let mut required = BTreeSet::new();
-    collect_step_names(&spec.name, &spec.body, &mut required)?;
-    for finalizer in &spec.finalizers {
-        collect_step_names(&spec.name, finalizer, &mut required)?;
-    }
-    for name in required {
-        if !provided.contains(name.as_str()) {
-            return Err(BootstrapError::MissingStepBinding {
-                actor: spec.name.clone(),
-                name,
-            });
-        }
-    }
-    Ok(())
-}
-
-fn collect_step_names(
-    actor: &str,
-    node: &DoNode,
-    out: &mut BTreeSet<String>,
-) -> Result<(), BootstrapError> {
-    match node {
-        DoNode::AndThen { d, then } => {
-            collect_step_names(actor, d, out)?;
-            insert_step_name(actor, &then.name, out)
-        }
-        DoNode::OrElse { d, or } => {
-            collect_step_names(actor, d, out)?;
-            insert_step_name(actor, &or.name, out)
-        }
-        DoNode::Both(left, right) | DoNode::Race(left, right) => {
-            collect_step_names(actor, left, out)?;
-            collect_step_names(actor, right, out)
-        }
-        DoNode::Let { value, body, .. } => {
-            collect_step_names(actor, value, out)?;
-            collect_step_names(actor, body, out)
-        }
-        DoNode::Acting { body, .. } => collect_step_names(actor, body, out),
-        DoNode::Pure(_) | DoNode::Use(_) | DoNode::Fail(_) | DoNode::Wait(_) | DoNode::Op(_) => {
-            Ok(())
+fn task_attachment_error(process: ProcessId, attachment: TaskAttachment) -> BootstrapError {
+    match attachment {
+        TaskAttachment::NoSuchProcess => BootstrapError::NoSuchProcess { process },
+        TaskAttachment::AlreadyTerminal => BootstrapError::ProcessUnavailable { process },
+        TaskAttachment::NoRuntime => BootstrapError::ProcessRuntimeUnavailable { process },
+        TaskAttachment::Attached | TaskAttachment::AlreadyAttached => {
+            BootstrapError::ProcessBusy { process }
         }
     }
 }
 
-fn insert_step_name(
-    actor: &str,
-    name: &str,
-    out: &mut BTreeSet<String>,
-) -> Result<(), BootstrapError> {
-    if name.trim().is_empty() {
-        return Err(BootstrapError::ActorAdmission {
-            actor: actor.to_string(),
-            message: "step reference name must not be empty".into(),
-        });
-    }
-    out.insert(name.to_string());
-    Ok(())
-}
-
-fn install_process_step_bindings(
-    steps: &crate::step::StepTable,
-    process: ProcessId,
-    actor: &str,
-    bindings: &[ProcessStepBinding],
-) -> Result<(), BootstrapError> {
-    for binding in bindings {
-        if let Err(source) =
-            steps.install_step_fn(process, binding.name.clone(), binding.step.clone())
-        {
-            cleanup_process_steps(steps, process);
-            return Err(BootstrapError::StepInstall {
-                actor: actor.to_string(),
-                name: binding.name.clone(),
-                source,
-            });
-        }
-    }
-    Ok(())
-}
-
-fn cleanup_process_steps(steps: &crate::step::StepTable, process: ProcessId) {
-    let removed_steps = steps.remove_process(process);
-    if removed_steps > 0 {
-        tracing::debug!(
-            process = process.get(),
-            removed_steps,
-            "removed process-local steps"
-        );
-    }
-}
-
-fn actor_directory_path(identity_segment: &str, name: &str) -> Result<Path, BootstrapError> {
-    Path::try_new("state")
-        .and_then(|path| path.try_push("agents"))
-        .and_then(|path| path.try_push_literal(identity_segment))
-        .and_then(|path| path.try_push_literal(name))
-        .map_err(|source| BootstrapError::Path {
-            literal: format!("state://agents/{identity_segment}/{name}"),
-            source,
-        })
-}
-
-fn actor_inbox_path(identity_segment: &str, name: &str) -> Result<Path, BootstrapError> {
-    actor_directory_path(identity_segment, name)?
-        .try_push("inbox")
-        .map_err(|source| BootstrapError::Path {
-            literal: format!("state://agents/{identity_segment}/{name}/inbox"),
-            source,
-        })
-}
-
-fn actor_directory_value(
-    spec: &ActorSpec,
-    process: ProcessId,
-    status: ProcessStatus,
-    inbox: &Path,
-) -> xolotl_types::Value {
-    let mut m = BTreeMap::new();
-    m.insert("name".into(), xolotl_types::Value::Str(spec.name.clone()));
-    m.insert(
-        "path".into(),
-        xolotl_types::Value::Str(format!("process://{}", process.get())),
-    );
-    m.insert(
-        "process".into(),
-        xolotl_types::Value::Str(process.get().to_string()),
-    );
-    m.insert(
-        "status".into(),
-        xolotl_types::Value::Str(process_status_label(status).into()),
-    );
-    m.insert("inbox".into(), xolotl_types::Value::Str(inbox.to_string()));
-    m.insert(
-        "declared_capabilities".into(),
-        xolotl_types::Value::List(
-            spec.declared_capabilities
-                .iter()
-                .cloned()
-                .map(xolotl_types::Value::Str)
-                .collect(),
-        ),
-    );
-    xolotl_types::Value::Map(m)
-}
-
-async fn update_actor_directory_status(
-    state: &xolotl_state::Backend,
-    directory: &Path,
-    status: ProcessStatus,
-) -> Result<(), BootstrapError> {
-    let Some(mut value) = state.read(directory).await? else {
-        return Err(BootstrapError::ActorAdmission {
-            actor: directory.to_string(),
-            message: "actor directory entry is missing".into(),
-        });
-    };
-    match &mut value {
-        xolotl_types::Value::Map(map) => {
-            map.insert(
-                "status".into(),
-                xolotl_types::Value::Str(process_status_label(status).into()),
-            );
-            state.write_set(directory, value).await?;
-            Ok(())
-        }
-        _ => Err(BootstrapError::ActorAdmission {
-            actor: directory.to_string(),
-            message: "actor directory entry must be a map".into(),
-        }),
-    }
-}
-
-fn process_status_label(status: ProcessStatus) -> &'static str {
+pub(crate) fn process_status_label(status: ProcessStatus) -> &'static str {
     match status {
         ProcessStatus::Created => "created",
         ProcessStatus::Running => "running",
@@ -1639,6 +1070,7 @@ fn build_methods(
             cost,
             batchable: spec.batchable,
             finalize_allowed: spec.finalize_allowed,
+            requires_unprotected_input: spec.requires_unprotected_input,
         })
         .collect()
 }
@@ -1652,7 +1084,9 @@ fn strip_scheme(path: &str) -> String {
 mod tests {
     use super::*;
     use crate::driver::EchoDriver;
+    use crate::step::{StepBinding, StepFn};
     use anyhow::{Context, bail, ensure};
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use xolotl_graph::{ActorSpec, DoNode, OperationTemplate, StepRef};
     use xolotl_types::{OutputMode, Value};
@@ -1691,16 +1125,16 @@ mod tests {
         let boot = Bootstrap::in_memory();
         let spec = ActorSpec {
             name: "housekeeper".into(),
-            body: DoNode::pure(Value::Str("done".into())),
+            body: DoNode::pure(Value::string("done".into())),
             ..ActorSpec::default()
         };
         let actor = boot
             .spawn_actor_under(boot.root, xolotl_types::IdentityRef::ROOT, "root", &spec)
             .await?;
         let value = wait_actor_status(&boot, &actor.directory, "completed").await?;
-        let Value::Map(map) = value else {
-            bail!("actor directory entry must be a map");
-        };
+        let map = value
+            .as_map()
+            .context("actor directory entry must be a map")?;
         ensure!(
             map.get("status").and_then(Value::as_str) == Some("completed"),
             "actor status was not completed: {map:?}"
@@ -1731,7 +1165,7 @@ mod tests {
                 method: "invoke".into(),
                 method_id: None,
                 output: OutputMode::Unary,
-                literal_input: Some(Value::Str("hello".into())),
+                literal_input: Some(Value::string("hello".into())),
             }),
             declared_capabilities: vec!["perform://effect/echo/actor-body".into()],
             ..ActorSpec::default()
@@ -1755,7 +1189,7 @@ mod tests {
         let before = boot.kernel.processes.count();
         let spec = ActorSpec {
             name: "missing_step".into(),
-            body: DoNode::pure(Value::Null).and_then(StepRef::new(boot.root, "send")),
+            body: DoNode::pure(Value::null()).and_then(StepRef::new("send")),
             ..ActorSpec::default()
         };
         let err = expect_bootstrap_error(
@@ -1786,7 +1220,7 @@ mod tests {
         )?;
         let spec = ActorSpec {
             name: "bound_step".into(),
-            body: DoNode::pure(Value::Null).and_then(StepRef::new(boot.root, "send")),
+            body: DoNode::pure(Value::null()).and_then(StepRef::new("send")),
             declared_capabilities: vec!["perform://effect/echo/actor-bound-step".into()],
             ..ActorSpec::default()
         };
@@ -1797,7 +1231,7 @@ mod tests {
                 xolotl_types::IdentityRef::ROOT,
                 "root",
                 &spec,
-                [ProcessStepBinding::new(
+                StepModule::new([StepBinding::new(
                     "send",
                     Arc::new(move |_, _| {
                         DoNode::op(OperationTemplate {
@@ -1805,10 +1239,10 @@ mod tests {
                             method: "invoke".into(),
                             method_id: None,
                             output: OutputMode::Unary,
-                            literal_input: Some(Value::Str("from-bound-step".into())),
+                            literal_input: Some(Value::string("from-bound-step".into())),
                         })
                     }),
-                )],
+                )])?,
             )
             .await?;
         wait_actor_status(&boot, &actor.directory, "completed").await?;
@@ -1818,9 +1252,127 @@ mod tests {
             "bound step operation should record a fact"
         );
         ensure!(
-            boot.kernel.steps.get(actor.process, "send").is_none(),
+            boot.kernel.processes.steps(actor.process).is_empty(),
             "process-local step should be removed after actor completion"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actors_share_nested_steps_with_local_paths_and_finalizers() -> anyhow::Result<()> {
+        use crate::{Driver, DriverContext, DriverError};
+        use xolotl_types::{Failure, MethodId, Outcome};
+
+        #[derive(Default)]
+        struct Writes(parking_lot::Mutex<Vec<(ProcessId, Option<Path>, Value)>>);
+
+        #[async_trait::async_trait]
+        impl Driver for Writes {
+            async fn call(
+                &self,
+                _method: MethodId,
+                input: Value,
+                _output: OutputMode,
+                ctx: &DriverContext,
+            ) -> Result<crate::DriverOutput, DriverError> {
+                self.0
+                    .lock()
+                    .push((ctx.caller, ctx.target_path.clone(), input.clone()));
+                Ok(crate::DriverOutput::new(Outcome::Done(input)))
+            }
+        }
+
+        let boot = Bootstrap::in_memory();
+        let writes = Arc::new(Writes::default());
+        boot.register_subtree_resource(
+            "state",
+            InterfaceFamily::Value,
+            &[MethodSpec::new(
+                "write",
+                Purity::Idempotent,
+                MethodSpec::UNARY_ASYNC,
+            )],
+            writes.clone(),
+        )?;
+        let signal = Path::parse("state://process/self/start")?;
+        let target = ResourceName::new(Path::parse("state://process/self/scratch")?);
+        let steps = StepModule::new([
+            StepBinding::new(
+                "entry",
+                Arc::new(move |_, _| {
+                    DoNode::wait_signal(signal.clone())
+                        .and_then(StepRef::new("store"))
+                        .and_then(StepRef::new("recoverable"))
+                }),
+            ),
+            StepBinding::new(
+                "store",
+                Arc::new(move |input, arg| {
+                    DoNode::op(OperationTemplate {
+                        target: target.clone(),
+                        method: "write".into(),
+                        method_id: None,
+                        output: OutputMode::Unary,
+                        literal_input: Some(arg.unwrap_or(input)),
+                    })
+                }),
+            ),
+            StepBinding::new(
+                "recoverable",
+                Arc::new(|_, _| {
+                    DoNode::fail(Failure::Cancelled)
+                        .or_else(StepRef::new("store").with_arg(Value::integer(7)))
+                }),
+            ),
+            StepBinding::new(
+                "cleanup",
+                Arc::new(|_, _| DoNode::pure(99).and_then(StepRef::new("store"))),
+            ),
+        ])?;
+        let spec = ActorSpec {
+            name: "shared_steps".into(),
+            body: DoNode::pure(Value::null()).and_then(StepRef::new("entry")),
+            declared_capabilities: vec!["write://state/process/self/**".into()],
+            finalizers: vec![DoNode::pure(Value::null()).and_then(StepRef::new("cleanup"))],
+            ..ActorSpec::default()
+        };
+        let mut actors = Vec::new();
+        for identity in ["first", "second"] {
+            actors.push(
+                boot.spawn_actor_under_with_steps(
+                    boot.root,
+                    xolotl_types::IdentityRef::ROOT,
+                    identity,
+                    &spec,
+                    steps.clone(),
+                )
+                .await?,
+            );
+        }
+        for (index, actor) in actors.iter().enumerate() {
+            let signal = Path::parse(&format!("state://process/{}/start", actor.process.get()))?;
+            boot.kernel
+                .state
+                .write_cas(&signal, None, Value::integer(index as i64))
+                .await?;
+            wait_actor_status(&boot, &actor.directory, "completed").await?;
+            let expected_path =
+                Path::parse(&format!("state://process/{}/scratch", actor.process.get()))?;
+            let observed = writes.0.lock();
+            let local: Vec<_> = observed
+                .iter()
+                .filter(|(caller, _, _)| *caller == actor.process)
+                .collect();
+            ensure!(
+                local.len() == 3,
+                "missing body, recovery or finalizer operation: {local:?}"
+            );
+            for ((_, path, value), expected) in local.into_iter().zip([index as i64, 7, 99]) {
+                ensure!(path.as_ref() == Some(&expected_path));
+                ensure!(*value == Value::integer(expected));
+            }
+            ensure!(boot.kernel.processes.steps(actor.process).is_empty());
+        }
         Ok(())
     }
 
@@ -1842,11 +1394,9 @@ mod tests {
             .context("registered completion finalizer effect did not resolve")?;
         let spec = ActorSpec {
             name: "completion_finalizer".into(),
-            body: DoNode::pure(Value::Null),
+            body: DoNode::pure(Value::null()),
             declared_capabilities: vec!["perform://effect/echo/actor-completion-finalizer".into()],
-            finalizers: vec![
-                DoNode::pure(Value::Null).and_then(StepRef::new(boot.root, "cleanup")),
-            ],
+            finalizers: vec![DoNode::pure(Value::null()).and_then(StepRef::new("cleanup"))],
             ..ActorSpec::default()
         };
         let step_target = name.clone();
@@ -1856,7 +1406,7 @@ mod tests {
                 xolotl_types::IdentityRef::ROOT,
                 "root",
                 &spec,
-                [ProcessStepBinding::new(
+                StepModule::new([StepBinding::new(
                     "cleanup",
                     Arc::new(move |_, _| {
                         DoNode::op(OperationTemplate {
@@ -1864,10 +1414,10 @@ mod tests {
                             method: "invoke".into(),
                             method_id: None,
                             output: OutputMode::Unary,
-                            literal_input: Some(Value::Str("cleanup".into())),
+                            literal_input: Some(Value::string("cleanup".into())),
                         })
                     }),
-                )],
+                )])?,
             )
             .await?;
 
@@ -1878,7 +1428,7 @@ mod tests {
             "completion finalizer operation should record a fact"
         );
         ensure!(
-            boot.kernel.steps.get(actor.process, "cleanup").is_none(),
+            boot.kernel.processes.steps(actor.process).is_empty(),
             "finalizer step should be removed after actor completion"
         );
         Ok(())
@@ -1889,7 +1439,7 @@ mod tests {
         let boot = Bootstrap::in_memory();
         let spec = ActorSpec {
             name: "failing_finalizer".into(),
-            body: DoNode::pure(Value::Null),
+            body: DoNode::pure(Value::null()),
             finalizers: vec![DoNode::Fail(xolotl_types::Failure::InvalidInput {
                 reason: "cleanup failed".into(),
             })],
@@ -1905,16 +1455,19 @@ mod tests {
             .iter()
             .find(|fact| fact.id.position == FINALIZED_NODE)
             .context("missing ProcessFinalized fact")?;
-        let xolotl_types::OutcomeRef::Inline(Value::Map(map)) = &finalized.outcome_ref else {
-            bail!("ProcessFinalized outcome must be a map");
-        };
+        let map = finalized
+            .outcome
+            .as_ref()
+            .and_then(Value::as_map)
+            .context("ProcessFinalized outcome must be a map")?;
         ensure!(
             map.get("finalizer_failure_count").and_then(Value::as_int) == Some(1),
             "finalizer failure count was not recorded: {map:?}"
         );
-        let Some(Value::List(failures)) = map.get("finalizer_failures") else {
-            bail!("finalizer failures list missing");
-        };
+        let failures = map
+            .get("finalizer_failures")
+            .and_then(Value::as_list)
+            .context("finalizer failures list missing")?;
         ensure!(failures.len() == 1, "unexpected failures: {failures:?}");
         ensure!(
             failures
@@ -1963,9 +1516,11 @@ mod tests {
             .iter()
             .find(|fact| fact.id.position == FINALIZED_NODE)
             .context("missing ProcessFinalized fact")?;
-        let xolotl_types::OutcomeRef::Inline(Value::Map(map)) = &finalized.outcome_ref else {
-            bail!("ProcessFinalized outcome must be a map");
-        };
+        let map = finalized
+            .outcome
+            .as_ref()
+            .and_then(Value::as_map)
+            .context("ProcessFinalized outcome must be a map")?;
         ensure!(
             map.get("status").and_then(Value::as_str) == Some("failed"),
             "ProcessFinalized status was overwritten: {map:?}"
@@ -1973,37 +1528,93 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn actor_spawn_rejects_duplicate_step_bindings() -> anyhow::Result<()> {
+    #[test]
+    fn request_local_templates_bind_before_attenuation() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        let before = boot.kernel.processes.count();
-        let spec = ActorSpec {
-            name: "duplicate_steps".into(),
-            body: DoNode::pure(Value::Null),
-            ..ActorSpec::default()
+        let template = CompiledRequestGrantTemplate {
+            selector: ResourceSelector::parse("write://state/process/self/scratch@account=alice")?,
+            methods: MethodBitmap::method(0),
         };
-        let step: StepFn = Arc::new(|v, _| DoNode::pure(v));
-        let err = expect_bootstrap_error(
-            boot.spawn_actor_under_with_steps(
-                boot.root,
-                xolotl_types::IdentityRef::ROOT,
-                "root",
-                &spec,
-                [
-                    ProcessStepBinding::new("same", step.clone()),
-                    ProcessStepBinding::new("same", step),
-                ],
-            )
-            .await,
+        let process = boot.spawn_request_process_under_with_steps(
+            boot.root,
+            xolotl_types::IdentityRef::ROOT,
+            std::slice::from_ref(&template),
+            StepModule::default(),
         )?;
+        let grants = boot.kernel.processes.attached_grants(process);
+        let grant = grants.first().context("request has no attached grant")?;
         ensure!(
-            matches!(err, BootstrapError::DuplicateStepBinding { .. }),
-            "unexpected duplicate binding error: {err:?}"
+            grant.selector.pattern.to_string()
+                == format!("write://state/process/{}/scratch", process.get())
         );
         ensure!(
-            boot.kernel.processes.count() == before,
-            "duplicate step bindings should not create a process"
+            grant.constraints.predicates
+                == [template
+                    .selector
+                    .pattern
+                    .predicate
+                    .clone()
+                    .context("missing predicate")?]
         );
+        ensure!(template.selector.pattern.segments[1].as_str() == "self");
+
+        let before = boot.kernel.processes.count();
+        let rejected = boot.spawn_request_process_under_with_steps(
+            process,
+            xolotl_types::IdentityRef::ROOT,
+            &[template],
+            StepModule::default(),
+        );
+        ensure!(matches!(
+            rejected,
+            Err(BootstrapError::CapabilityCeiling { .. })
+        ));
+        ensure!(boot.kernel.processes.count() == before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_modules_are_isolated_and_released_after_finalization() -> anyhow::Result<()> {
+        use xolotl_types::{Failure, Outcome};
+        let boot = Bootstrap::in_memory();
+        let step: StepFn = Arc::new(|v, _| DoNode::pure(v));
+        let weak = Arc::downgrade(&step);
+        let process = boot.spawn_request_process_under_with_steps(
+            boot.root,
+            xolotl_types::IdentityRef::ROOT,
+            &[],
+            StepModule::new([StepBinding::new("identity", step)])?,
+        )?;
+        let program = DoNode::pure(42).and_then(StepRef::new("identity"));
+        let executor = boot.kernel.executor_for(process);
+        let outcome = executor.eval(&program).await;
+        ensure!(outcome.outcome == Outcome::Done(Value::integer(42)));
+        ensure!(
+            matches!(
+                boot.kernel
+                    .executor_for(boot.root)
+                    .eval(&program)
+                    .await
+                    .outcome,
+                Outcome::Fail(_)
+            ),
+            "request functions must not leak to the parent"
+        );
+        let overridden = boot
+            .kernel
+            .executor_for(process)
+            .with_steps(StepModule::single("identity", |_, _| DoNode::pure(99))?);
+        ensure!(overridden.eval(&program).await.outcome == Outcome::Done(Value::integer(99)));
+        ensure!(executor.eval(&program).await == outcome);
+        boot.finish_request_process(process, &outcome).await?;
+        ensure!(boot.kernel.processes.steps(process).is_empty());
+        ensure!(
+            executor.eval(&program).await.outcome == Outcome::Fail(Failure::Cancelled),
+            "a retained executor must not invoke code after its process terminates"
+        );
+        ensure!(weak.upgrade().is_some());
+        drop(executor);
+        ensure!(weak.upgrade().is_none());
         Ok(())
     }
 
@@ -2020,7 +1631,7 @@ mod tests {
                 method: "invoke".into(),
                 method_id: None,
                 output: OutputMode::Unary,
-                literal_input: Some(Value::Null),
+                literal_input: Some(Value::null()),
             }),
             ..ActorSpec::default()
         };
@@ -2040,11 +1651,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_spawn_directory_conflict_does_not_insert_process() -> anyhow::Result<()> {
+    async fn actor_spawn_directory_conflict_leaves_only_terminal_admission_state()
+    -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
         let spec = ActorSpec {
             name: "singleton".into(),
-            body: DoNode::pure(Value::Null),
+            body: DoNode::pure(Value::null()),
             ..ActorSpec::default()
         };
         let first = boot
@@ -2059,10 +1671,22 @@ mod tests {
             matches!(err, BootstrapError::State(_)),
             "unexpected error: {err:?}"
         );
+        ensure!(boot.drain_cleanup().await.failures.is_empty());
+        ensure!(boot.kernel.processes.count() == before_second + 1);
+        let rejected = boot
+            .kernel
+            .processes
+            .children_of(boot.root)
+            .into_iter()
+            .find(|process| *process != first.process)
+            .context("missing rejected admission")?;
         ensure!(
-            boot.kernel.processes.count() == before_second,
-            "conflicting actor should not create a process"
+            boot.kernel
+                .processes
+                .status(rejected)
+                .is_some_and(ProcessStatus::is_terminal)
         );
+        ensure!(!boot.kernel.processes.has_task(rejected));
         wait_actor_status(&boot, &first.directory, "completed").await?;
         Ok(())
     }
@@ -2091,8 +1715,8 @@ mod tests {
                 .as_map()
                 .and_then(|map| map.get("status"))
                 .and_then(Value::as_str)
-                == Some("completed"),
-            "actor directory status was not completed: {value:?}"
+                == Some("cancelled"),
+            "actor directory status was not cancelled: {value:?}"
         );
         ensure!(
             !boot.kernel.processes.abort_task(actor.process),
@@ -2126,7 +1750,7 @@ mod tests {
                 method: "invoke".into(),
                 method_id: None,
                 output: OutputMode::Unary,
-                literal_input: Some(Value::Str("cleanup".into())),
+                literal_input: Some(Value::string("cleanup".into())),
             })],
             ..ActorSpec::default()
         };
@@ -2145,7 +1769,10 @@ mod tests {
 
     #[tokio::test]
     async fn actor_finalizer_rejects_method_without_finalize_allowance() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let boot = Bootstrap::in_memory();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
         let name = boot.register_effect(
             "effect://echo/not-finalize-allowed",
             &[MethodSpec::new(
@@ -2153,7 +1780,10 @@ mod tests {
                 Purity::Effectful,
                 MethodSpec::UNARY_ASYNC,
             )],
-            Arc::new(EchoDriver),
+            Arc::new(crate::FnDriver(move |_method, input| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(input)
+            })),
         )?;
         let resource_id = boot
             .kernel
@@ -2162,14 +1792,14 @@ mod tests {
             .context("registered finalizer denial effect did not resolve")?;
         let spec = ActorSpec {
             name: "finalizer_denied".into(),
-            body: DoNode::pure(Value::Null),
+            body: DoNode::pure(Value::null()),
             declared_capabilities: vec!["perform://effect/echo/not-finalize-allowed".into()],
             finalizers: vec![DoNode::op(OperationTemplate {
                 target: name,
                 method: "invoke".into(),
                 method_id: None,
                 output: OutputMode::Unary,
-                literal_input: Some(Value::Str("cleanup".into())),
+                literal_input: Some(Value::string("cleanup".into())),
             })],
             ..ActorSpec::default()
         };
@@ -2180,16 +1810,23 @@ mod tests {
         wait_actor_status(&boot, &actor.directory, "completed").await?;
         let facts = boot.kernel.facts.facts_of(actor.process)?;
         ensure!(
-            !facts.iter().any(|fact| fact.resource == resource_id),
-            "finalizer-only denied operation should not dispatch"
+            calls.load(Ordering::SeqCst) == 0,
+            "denied finalizer reached its driver"
+        );
+        ensure!(
+            facts.iter().any(|fact| fact.resource == resource_id
+                && fact.decision == xolotl_types::DecisionTag::Denied),
+            "denied finalizer should retain its admission record"
         );
         let finalized = facts
             .iter()
             .find(|fact| fact.id.position == FINALIZED_NODE)
             .context("missing ProcessFinalized fact")?;
-        let xolotl_types::OutcomeRef::Inline(Value::Map(map)) = &finalized.outcome_ref else {
-            bail!("ProcessFinalized outcome must be a map");
-        };
+        let map = finalized
+            .outcome
+            .as_ref()
+            .and_then(Value::as_map)
+            .context("ProcessFinalized outcome must be a map")?;
         ensure!(
             map.get("finalizer_failure_count").and_then(Value::as_int) == Some(1),
             "denied finalizer failure was not recorded: {map:?}"
@@ -2211,37 +1848,51 @@ mod tests {
             Arc::new(EchoDriver),
         )?;
         let ex = boot.kernel.executor_for(boot.root).with_finalizer_mode();
+        ensure!(
+            boot.kernel
+                .processes
+                .begin_finalizing(boot.root, ProcessStatus::Completed)
+                == crate::process::FinalizeStart::Started
+        );
         let local_target = ResourceName::new(Path::parse(&format!(
             "state://process/{}/cleanup",
             boot.root.get()
         ))?);
-        let local = ex
-            .eval(&DoNode::op(OperationTemplate {
-                target: local_target,
-                method: "write".into(),
-                method_id: None,
-                output: OutputMode::Unary,
-                literal_input: Some(Value::Str("cleanup".into())),
-            }))
-            .await;
+        let local_program = DoNode::op(OperationTemplate {
+            target: local_target,
+            method: "write".into(),
+            method_id: None,
+            output: OutputMode::Unary,
+            literal_input: Some(Value::string("cleanup".into())),
+        });
+        let local = crate::process::scope_finalizer(
+            &boot.kernel.processes,
+            boot.root,
+            ex.eval(&local_program),
+        )
+        .await;
         ensure!(
-            matches!(local, xolotl_types::Outcome::Done(_)),
+            matches!(local.outcome, xolotl_types::Outcome::Done(_)),
             "current process state write should be allowed in finalizer mode: {local:?}"
         );
 
         let sibling_target = ResourceName::new(Path::parse("state://process/999999/cleanup")?);
-        let sibling = ex
-            .eval(&DoNode::op(OperationTemplate {
-                target: sibling_target,
-                method: "write".into(),
-                method_id: None,
-                output: OutputMode::Unary,
-                literal_input: Some(Value::Str("cleanup".into())),
-            }))
-            .await;
+        let sibling_program = DoNode::op(OperationTemplate {
+            target: sibling_target,
+            method: "write".into(),
+            method_id: None,
+            output: OutputMode::Unary,
+            literal_input: Some(Value::string("cleanup".into())),
+        });
+        let sibling = crate::process::scope_finalizer(
+            &boot.kernel.processes,
+            boot.root,
+            ex.eval(&sibling_program),
+        )
+        .await;
         ensure!(
             matches!(
-                sibling,
+                sibling.outcome,
                 xolotl_types::Outcome::Fail(xolotl_types::Failure::PolicyViolation { .. })
             ),
             "other process state write should be denied in finalizer mode: {sibling:?}"
@@ -2262,7 +1913,7 @@ mod tests {
                 method: "invoke".into(),
                 method_id: None,
                 output: OutputMode::Unary,
-                literal_input: Some(Value::Null),
+                literal_input: Some(Value::null()),
             })],
             ..ActorSpec::default()
         };
@@ -2335,11 +1986,11 @@ mod tests {
             method: "invoke".into(),
             method_id: None,
             output: OutputMode::Unary,
-            literal_input: Some(Value::Str("hello".into())),
+            literal_input: Some(Value::string("hello".into())),
         });
         let out = ex.eval(&prog).await;
         ensure!(
-            out == xolotl_types::Outcome::Done(Value::Str("hello".into())),
+            out.outcome == xolotl_types::Outcome::Done(Value::string("hello".into())),
             "unexpected operation outcome: {out:?}"
         );
 
@@ -2374,9 +2025,9 @@ mod tests {
             method: "invoke".into(),
             method_id: None,
             output: OutputMode::Stream,
-            literal_input: Some(Value::Str("hello".into())),
+            literal_input: Some(Value::string("hello".into())),
         });
-        match ex.eval(&prog).await {
+        match ex.eval(&prog).await.outcome {
             xolotl_types::Outcome::Fail(xolotl_types::Failure::InvalidInput { reason }) => {
                 ensure!(
                     reason.contains("does not support output mode"),
@@ -2407,9 +2058,9 @@ mod tests {
             method: "invoke".into(),
             method_id: None,
             output: OutputMode::Stream,
-            literal_input: Some(Value::Str("hello".into())),
+            literal_input: Some(Value::string("hello".into())),
         });
-        match ex.eval(&prog).await {
+        match ex.eval(&prog).await.outcome {
             xolotl_types::Outcome::Fail(xolotl_types::Failure::InvalidInput { reason }) => {
                 ensure!(
                     reason.contains("does not support output mode"),
@@ -2463,9 +2114,9 @@ mod tests {
             method: "invoke".into(),
             method_id: None,
             output: OutputMode::Unary,
-            literal_input: Some(Value::Str("hi".into())),
+            literal_input: Some(Value::string("hi".into())),
         });
-        match ex.eval(&prog).await {
+        match ex.eval(&prog).await.outcome {
             xolotl_types::Outcome::Fail(xolotl_types::Failure::BudgetExhausted { dim }) => {
                 ensure!(
                     dim == "daily_micro_usd",
@@ -2509,13 +2160,13 @@ mod tests {
             method: "invoke".into(),
             method_id: None,
             output: OutputMode::Unary,
-            literal_input: Some(Value::List(vec![
-                Value::Str("a".into()),
-                Value::Str("b".into()),
-                Value::Str("c".into()),
+            literal_input: Some(Value::list(vec![
+                Value::string("a".into()),
+                Value::string("b".into()),
+                Value::string("c".into()),
             ])),
         });
-        match ex.eval(&prog).await {
+        match ex.eval(&prog).await.outcome {
             xolotl_types::Outcome::Fail(xolotl_types::Failure::BudgetExhausted { dim }) => {
                 ensure!(
                     dim == "daily_micro_usd",
@@ -2582,11 +2233,11 @@ mod tests {
             method: "invoke".into(),
             method_id: None,
             output: OutputMode::Unary,
-            literal_input: Some(Value::Str("ok".into())),
+            literal_input: Some(Value::string("ok".into())),
         });
         let out = ex.eval(&prog).await;
         ensure!(
-            out == xolotl_types::Outcome::Done(Value::Str("ok".into())),
+            out.outcome == xolotl_types::Outcome::Done(Value::string("ok".into())),
             "unexpected budgeted operation outcome: {out:?}"
         );
         // Settled: inflight released, spend reflects the flat charge.
@@ -2622,19 +2273,18 @@ mod tests {
         let handle = boot.open_for(boot.root, &name, "perform")?;
         let ex = boot.kernel.executor_for(boot.root);
         ex.bind_handle(name.clone(), handle);
-        ex.steps
-            .install(boot.root, "echo_back", |v, _| DoNode::pure(v))?;
+        let ex = ex.with_steps(StepModule::single("echo_back", |v, _| DoNode::pure(v))?);
         let prog = DoNode::Op(OperationTemplate {
             target: name,
             method: "invoke".into(),
             method_id: None,
             output: OutputMode::Unary,
-            literal_input: Some(Value::Str("hi".into())),
+            literal_input: Some(Value::string("hi".into())),
         })
-        .and_then(xolotl_graph::StepRef::new(boot.root, "echo_back"));
+        .and_then(xolotl_graph::StepRef::new("echo_back"));
         let out = ex.eval(&prog).await;
         ensure!(
-            out == xolotl_types::Outcome::Done(Value::Str("hi".into())),
+            out.outcome == xolotl_types::Outcome::Done(Value::string("hi".into())),
             "unexpected consumed operation outcome: {out:?}"
         );
         let facts = boot.kernel.facts.facts_of(boot.root)?;
@@ -2655,7 +2305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_marks_completed_and_writes_marker() -> anyhow::Result<()> {
+    async fn finalize_marks_cancelled_and_writes_marker() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
         // Spawn a child request Process, then finalize it.
         let child = boot.spawn_request_process_under_with_request_grants(
@@ -2665,11 +2315,17 @@ mod tests {
         )?;
         boot.finalize_process(child).await?;
         ensure!(
-            boot.kernel.processes.status(child) == Some(xolotl_types::ProcessStatus::Completed),
-            "child process should be completed"
+            boot.kernel.processes.status(child) == Some(xolotl_types::ProcessStatus::Cancelled),
+            "unfinished child process should be cancelled"
         );
         // The finalize marker is written to state.
-        let path = finalized_marker_path(child)?;
+        let path = finalized_marker_path(
+            child,
+            boot.kernel
+                .processes
+                .lifecycle_execution(child)
+                .context("missing lifecycle scope")?,
+        )?;
         let marker = boot.kernel.state.read(&path).await?;
         ensure!(marker.is_some(), "finalize marker should be written");
         // Finalization appends a ProcessFinalized Fact to the Fact stream.
@@ -2677,8 +2333,9 @@ mod tests {
         ensure!(
             facts.iter().any(|f| {
                 f.id.position == xolotl_types::NodeId::new(u32::MAX)
-                    && matches!(&f.outcome_ref, xolotl_types::OutcomeRef::Inline(xolotl_types::Value::Map(m))
-                        if m.get("event").and_then(|v| v.as_str()) == Some("ProcessFinalized"))
+                    && f.outcome.as_ref().and_then(Value::as_map).is_some_and(|m| {
+                        m.get("event").and_then(Value::as_str) == Some("ProcessFinalized")
+                    })
             }),
             "finalize records a ProcessFinalized Fact"
         );
@@ -2708,9 +2365,11 @@ mod tests {
             .iter()
             .find(|fact| fact.id.position == FINALIZED_NODE)
             .context("missing ProcessFinalized fact")?;
-        let xolotl_types::OutcomeRef::Inline(Value::Map(map)) = &finalized.outcome_ref else {
-            bail!("ProcessFinalized outcome must be a map");
-        };
+        let map = finalized
+            .outcome
+            .as_ref()
+            .and_then(Value::as_map)
+            .context("ProcessFinalized outcome must be a map")?;
         ensure!(
             map.get("status").and_then(Value::as_str) == Some("cancelled"),
             "ProcessFinalized status should remain cancelled: {map:?}"
@@ -2718,9 +2377,30 @@ mod tests {
         Ok(())
     }
 
-    struct FailingFinalizeFactStore;
+    #[derive(Default)]
+    struct FailingFinalizeFactStore(crate::InMemoryExecutionIdSource);
+
+    impl crate::ExecutionIdSource for FailingFinalizeFactStore {
+        fn reserve(
+            &self,
+            count: std::num::NonZeroU64,
+        ) -> Result<crate::ExecutionIdRange, crate::ExecutionIdError> {
+            self.0.reserve(count)
+        }
+    }
 
     impl crate::fact::FactStore for FailingFinalizeFactStore {
+        fn scan(&self, query: crate::FactQuery) -> Result<crate::FactPage, crate::FactError> {
+            crate::InMemoryFactStore::new().scan(query)
+        }
+
+        fn lookup(
+            &self,
+            _query: crate::FactLookup,
+        ) -> Result<crate::FactLookupResult, crate::FactError> {
+            Ok(crate::FactLookupResult::Missing)
+        }
+
         fn append(&self, _fact: Fact) -> Result<u64, crate::fact::FactError> {
             Err(crate::fact::FactError("simulated append failure".into()))
         }
@@ -2763,7 +2443,27 @@ mod tests {
         }
     }
 
+    impl crate::ExecutionIdSource for FailOnceCompleteFactStore {
+        fn reserve(
+            &self,
+            count: std::num::NonZeroU64,
+        ) -> Result<crate::ExecutionIdRange, crate::ExecutionIdError> {
+            self.inner.reserve(count)
+        }
+    }
+
     impl crate::fact::FactStore for FailOnceCompleteFactStore {
+        fn scan(&self, query: crate::FactQuery) -> Result<crate::FactPage, crate::FactError> {
+            self.inner.scan(query)
+        }
+
+        fn lookup(
+            &self,
+            query: crate::FactLookup,
+        ) -> Result<crate::FactLookupResult, crate::FactError> {
+            self.inner.lookup(query)
+        }
+
         fn append(&self, fact: Fact) -> Result<u64, crate::fact::FactError> {
             self.inner.append(fact)
         }
@@ -2800,8 +2500,8 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_fact_failure_keeps_process_finalizing() -> anyhow::Result<()> {
-        let facts = crate::fact::FactSink::new(Arc::new(FailingFinalizeFactStore));
-        let state: xolotl_state::Backend = Arc::new(xolotl_state::InMemoryBackend::new());
+        let facts = crate::fact::FactSink::new(Arc::new(FailingFinalizeFactStore::default()));
+        let state = xolotl_state::InMemoryBackend::new().into_backend();
         let boot = Bootstrap::from_kernel(crate::Kernel::with_backends(state, facts));
         let child = boot.spawn_request_process_under_with_request_grants(
             boot.root,
@@ -2822,15 +2522,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retrying_owned_completion_preserves_independent_actor_lifetime() -> anyhow::Result<()>
+    {
+        let facts = crate::fact::FactSink::new(Arc::new(FailOnceCompleteFactStore::new()));
+        let state = xolotl_state::InMemoryBackend::new().into_backend();
+        let boot = Bootstrap::from_kernel(crate::Kernel::with_backends(state, facts));
+        let parent = boot.request_under(boot.root, IdentityRef::ROOT, &[])?;
+        let parent_id = parent.id();
+        let spec = ActorSpec {
+            name: "independent_completion".into(),
+            body: DoNode::wait_signal(Path::parse("state://signal/never")?),
+            ..ActorSpec::default()
+        };
+        let actor = boot
+            .spawn_actor_under(parent_id, IdentityRef::ROOT, "root", &spec)
+            .await?;
+        ensure!(
+            parent
+                .finish(&xolotl_types::ExecutionOutput::new(
+                    xolotl_types::Outcome::Done(Value::null()),
+                    xolotl_types::TaintSet::pristine()
+                ))
+                .await
+                .is_err()
+        );
+        let report = boot.drain_cleanup().await;
+        ensure!(report.failures.is_empty());
+        ensure!(boot.kernel.processes.status(parent_id) == Some(ProcessStatus::Completed));
+        ensure!(boot.kernel.processes.status(actor.process) == Some(ProcessStatus::Running));
+        boot.finalize_process(parent_id).await?;
+        ensure!(boot.kernel.processes.status(actor.process) == Some(ProcessStatus::Cancelled));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn finalize_can_retry_after_fact_failure() -> anyhow::Result<()> {
         let facts = crate::fact::FactSink::new(Arc::new(FailOnceCompleteFactStore::new()));
-        let state: xolotl_state::Backend = Arc::new(xolotl_state::InMemoryBackend::new());
+        let state = xolotl_state::InMemoryBackend::new().into_backend();
         let boot = Bootstrap::from_kernel(crate::Kernel::with_backends(state, facts));
+        let effect = boot.register_effect(
+            "effect://finalize-retry",
+            &[MethodSpec::new(
+                "invoke",
+                Purity::Pure,
+                MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(crate::EchoDriver),
+        )?;
         let child = boot.spawn_request_process_under_with_request_grants(
             boot.root,
             xolotl_types::IdentityRef::ROOT,
-            &[],
+            &[RequestGrantTemplate {
+                literal: "perform://effect/finalize-retry",
+                methods: MethodBitmap::method(0),
+            }],
         )?;
+        boot.open_for(child, &effect, "perform")?;
 
         let err = expect_bootstrap_error(boot.finalize_process(child).await)?;
         ensure!(
@@ -2842,20 +2589,52 @@ mod tests {
             "failed finalize should leave process retryable"
         );
 
+        let (record, revoked) = boot
+            .kernel
+            .processes
+            .finalization_record(child)
+            .context("missing retry record")?;
+        ensure!(revoked == 1);
         boot.finalize_process(child).await?;
         ensure!(
-            boot.kernel.processes.status(child) == Some(xolotl_types::ProcessStatus::Completed),
-            "retry should complete process finalization"
+            boot.kernel.processes.status(child) == Some(xolotl_types::ProcessStatus::Cancelled),
+            "retry should preserve the forced cancellation intent"
         );
         ensure!(
             boot.kernel
                 .state
-                .read(&finalized_marker_path(child)?)
+                .read(&finalized_marker_path(
+                    child,
+                    boot.kernel
+                        .processes
+                        .lifecycle_execution(child)
+                        .context("missing lifecycle scope")?
+                )?)
                 .await?
                 .is_some(),
             "retry should write the finalized marker"
         );
         let facts = boot.kernel.facts.facts_of(child)?;
+        let committed = facts
+            .iter()
+            .find(|fact| fact.id.position == FINALIZED_NODE)
+            .context("missing committed record")?;
+        ensure!(committed.timestamp == record.timestamp);
+        ensure!(committed.outcome == record.outcome);
+        ensure!(
+            boot.kernel
+                .state
+                .read(&finalized_marker_path(
+                    child,
+                    boot.kernel
+                        .processes
+                        .lifecycle_execution(child)
+                        .context("missing lifecycle scope")?
+                )?)
+                .await?
+                == Some(Value::integer(1))
+        );
+        ensure!(boot.kernel.processes.attached_grants(child).is_empty());
         ensure!(
             facts.iter().any(|fact| fact.id.position == FINALIZED_NODE),
             "retry should record the ProcessFinalized fact"
@@ -2863,10 +2642,104 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn interrupted_finalization_preserves_remaining_work_and_wakes_another_owner()
+    -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Poll;
+        let boot = Bootstrap::in_memory();
+        let process = boot.kernel.processes.fresh_id()?;
+        let calls = Arc::new([
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        ]);
+        let modules = (0..3)
+            .map(|index| {
+                let calls = Arc::clone(&calls);
+                let wait = Path::parse("state://signals/interrupted-finalizer")?;
+                StepModule::single(format!("step{index}"), move |_, _| {
+                    calls[index].fetch_add(1, Ordering::SeqCst);
+                    if index == 1 {
+                        DoNode::wait_signal(wait.clone())
+                    } else {
+                        DoNode::pure(Value::null())
+                    }
+                })
+                .map_err(anyhow::Error::from)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut entry = ProcessEntry::new(process, Some(boot.root), IdentityRef::ROOT);
+        entry.scope.start();
+        entry.steps = StepModule::compose(modules)?;
+        entry.on_finalize = (0..3)
+            .rev()
+            .map(|index| {
+                DoNode::pure(Value::null())
+                    .and_then(xolotl_graph::StepRef::new(format!("step{index}")))
+            })
+            .collect();
+        boot.kernel.processes.insert(entry);
+
+        let mut first = Box::pin(boot.finish_process_as(process, ProcessStatus::Failed));
+        ensure!(
+            std::future::poll_fn(|cx| Poll::Ready(first.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        ensure!(calls[0].load(Ordering::SeqCst) == 1 && calls[1].load(Ordering::SeqCst) == 1);
+        ensure!(!boot.cancel_process(process)?);
+        ensure!(boot.kernel.processes.status(process) == Some(ProcessStatus::Finalizing));
+        let mut second = Box::pin(boot.finalize_process(process));
+        ensure!(
+            std::future::poll_fn(|cx| Poll::Ready(second.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(1), second).await??;
+        ensure!(calls.iter().all(|calls| calls.load(Ordering::SeqCst) == 1));
+        ensure!(boot.kernel.processes.status(process) == Some(ProcessStatus::Failed));
+        let facts = boot.kernel.facts.facts_of(process)?;
+        let fact = facts
+            .iter()
+            .find(|fact| fact.id.position == FINALIZED_NODE)
+            .context("missing finalization fact")?;
+        let record = fact
+            .outcome
+            .as_ref()
+            .and_then(Value::as_map)
+            .context("invalid lifecycle record")?;
+        ensure!(
+            record
+                .get("finalizer_failure_count")
+                .and_then(Value::as_int)
+                == Some(1)
+        );
+        let failures = record
+            .get("finalizer_failures")
+            .and_then(Value::as_list)
+            .context("missing failures")?;
+        let failure = failures
+            .first()
+            .and_then(Value::as_map)
+            .context("invalid failure")?;
+        ensure!(failure.get("index").and_then(Value::as_int) == Some(1));
+        ensure!(
+            failure
+                .get("failure")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("interrupted"))
+        );
+        boot.finalize_process(process).await?;
+        ensure!(calls.iter().all(|calls| calls.load(Ordering::SeqCst) == 1));
+        Ok(())
+    }
+
     #[test]
     fn gateway_audit_fact_failure_does_not_insert_audit_process() -> anyhow::Result<()> {
-        let facts = crate::fact::FactSink::new(Arc::new(FailingFinalizeFactStore));
-        let state: xolotl_state::Backend = Arc::new(xolotl_state::InMemoryBackend::new());
+        let facts = crate::fact::FactSink::new(Arc::new(FailingFinalizeFactStore::default()));
+        let state = xolotl_state::InMemoryBackend::new().into_backend();
         let boot = Bootstrap::from_kernel(crate::Kernel::with_backends(state, facts));
         let before = boot.kernel.processes.all_ids().len();
 
@@ -2922,9 +2795,9 @@ mod tests {
         boot: &Bootstrap,
         selectors: &[&str],
     ) -> anyhow::Result<xolotl_types::ProcessId> {
-        let anchor = boot.kernel.processes.fresh_id();
+        let anchor = boot.kernel.processes.fresh_id()?;
         let mut entry = ProcessEntry::new(anchor, Some(boot.root), xolotl_types::IdentityRef::ROOT);
-        entry.status = ProcessStatus::Running;
+        entry.scope.start();
         boot.kernel.processes.insert(entry);
         for sel in selectors {
             let grant = Grant {
@@ -3041,9 +2914,9 @@ mod tests {
     #[test]
     fn request_grant_template_narrows_anchor_method_rights() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        let anchor = boot.kernel.processes.fresh_id();
+        let anchor = boot.kernel.processes.fresh_id()?;
         let mut entry = ProcessEntry::new(anchor, Some(boot.root), xolotl_types::IdentityRef::ROOT);
-        entry.status = ProcessStatus::Running;
+        entry.scope.start();
         boot.kernel.processes.insert(entry);
         boot.kernel.registry.register_grant(Grant {
             id: boot.kernel.registry.next_grant_id(),
@@ -3082,9 +2955,9 @@ mod tests {
     #[test]
     fn request_grant_derivation_preserves_parent_limits() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        let anchor = boot.kernel.processes.fresh_id();
+        let anchor = boot.kernel.processes.fresh_id()?;
         let mut entry = ProcessEntry::new(anchor, Some(boot.root), xolotl_types::IdentityRef::ROOT);
-        entry.status = ProcessStatus::Running;
+        entry.scope.start();
         boot.kernel.processes.insert(entry);
         let expires = Expiry::At(crate::executor::now_millis() + 60_000);
         boot.kernel.registry.register_grant(Grant {
@@ -3171,9 +3044,9 @@ mod tests {
     #[test]
     fn compiled_request_grant_template_uses_anchor_backstop() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        let anchor = boot.kernel.processes.fresh_id();
+        let anchor = boot.kernel.processes.fresh_id()?;
         let mut entry = ProcessEntry::new(anchor, Some(boot.root), xolotl_types::IdentityRef::ROOT);
-        entry.status = ProcessStatus::Running;
+        entry.scope.start();
         boot.kernel.processes.insert(entry);
         boot.kernel.registry.register_grant(Grant {
             id: boot.kernel.registry.next_grant_id(),
@@ -3217,11 +3090,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_replays_completed_effect_without_reissuing() -> anyhow::Result<()> {
-        // Re-running a recovered program must not repeat an effect that already
-        // happened. We run a consumed Operation once, build a ReplayMap from the
-        // fact stream, then re-run the same program with the map; the effect
-        // driver must not be called the second time.
+    async fn separate_evaluations_record_distinct_effects() -> anyhow::Result<()> {
         use crate::driver::FnDriver;
         use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -3239,7 +3108,7 @@ mod tests {
             )],
             StdArc::new(FnDriver(|_m: xolotl_types::MethodId, _in: Value| {
                 CALLS.fetch_add(1, Ordering::SeqCst);
-                Ok(Value::Int(7))
+                Ok(Value::integer(7))
             })),
         )?;
         let handle = boot.open_for(boot.root, &name, "perform")?;
@@ -3250,17 +3119,19 @@ mod tests {
             method: "invoke".into(),
             method_id: None,
             output: OutputMode::Unary,
-            literal_input: Some(Value::Null),
+            literal_input: Some(Value::null()),
         })
-        .and_then(xolotl_graph::StepRef::new(boot.root, "use_it"));
+        .and_then(xolotl_graph::StepRef::new("use_it"));
 
-        let ex1 = boot.kernel.executor_for(boot.root);
+        let steps = StepModule::single("use_it", |v, _| DoNode::pure(v))?;
+        let ex1 = boot
+            .kernel
+            .executor_for(boot.root)
+            .with_steps(steps.clone());
         ex1.bind_handle(name.clone(), handle);
-        ex1.steps
-            .install(boot.root, "use_it", |v, _| DoNode::pure(v))?;
         let first = ex1.eval(&prog).await;
         ensure!(
-            first == xolotl_types::Outcome::Done(Value::Int(7)),
+            first.outcome == xolotl_types::Outcome::Done(Value::integer(7)),
             "unexpected first run outcome: {first:?}"
         );
         ensure!(
@@ -3268,22 +3139,48 @@ mod tests {
             "effect fires on the first run"
         );
 
-        // Build a replay map from the recorded facts and re-run.
-        let facts = boot.kernel.facts.facts_of(boot.root)?;
-        let replay = StdArc::new(crate::recovery::ReplayMap::from_facts(&facts));
-        ensure!(!replay.is_empty(), "the completed effect was recorded");
+        let repeated = ex1.eval(&prog).await;
+        ensure!(repeated == first);
         let handle2 = boot.open_for(boot.root, &name, "perform")?;
-        let ex2 = boot.kernel.executor_for(boot.root).with_replay(replay);
+        let ex2 = boot.kernel.executor_for(boot.root).with_steps(steps);
         ex2.bind_handle(name.clone(), handle2);
         let out = ex2.eval(&prog).await;
 
         ensure!(
-            CALLS.load(Ordering::SeqCst) == 1,
-            "recovery must NOT re-issue the already-recorded effect"
+            CALLS.load(Ordering::SeqCst) == 3,
+            "each independent evaluation must execute its effect"
         );
         ensure!(
-            out == xolotl_types::Outcome::Done(Value::Int(7)),
-            "recorded outcome is replayed"
+            out.outcome == xolotl_types::Outcome::Done(Value::integer(7)),
+            "unexpected independent evaluation result"
+        );
+        let facts = boot.kernel.facts.facts_of(boot.root)?;
+        ensure!(facts.len() == 3);
+        ensure!(
+            facts
+                .iter()
+                .map(|fact| fact.id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                == 3
+        );
+        ensure!(
+            facts
+                .iter()
+                .all(|fact| fact.id.position == facts[0].id.position)
+        );
+        ensure!(
+            facts
+                .iter()
+                .all(|fact| fact.id.invocation == facts[0].id.invocation)
+        );
+        ensure!(
+            facts
+                .iter()
+                .map(|fact| fact.id.execution)
+                .collect::<BTreeSet<_>>()
+                .len()
+                == 3
         );
         Ok(())
     }

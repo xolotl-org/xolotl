@@ -2,6 +2,7 @@
 
 use crate::replay::Purity;
 use crate::value::Value;
+use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
 /// How the kernel communicates with this provider.

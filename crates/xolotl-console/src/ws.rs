@@ -1,5 +1,11 @@
 //! Console WebSocket protocol endpoint.
 
+mod facts;
+mod outbound;
+mod subscriptions;
+
+use subscriptions::{SubscriptionEvent, Subscriptions};
+
 use crate::auth::{self, ConsolePrincipal, SessionSummary};
 use crate::mgmt::{self, MgmtError};
 use crate::protocol::{
@@ -27,30 +33,28 @@ use crate::protocol::{
     ACTION_RUNTIME_PROCESS_INSPECT, ACTION_SECRET_CATALOG, ACTION_SECRET_REVEAL,
     ACTION_STATE_SNAPSHOT, ACTION_VISIBILITY_AUTHORITY_DESCRIBE, ACTION_VISIBILITY_STATE_LIST,
     ACTION_VISIBILITY_STATE_READ, ActionCall, ActionDescriptor, ActionResult, ClientFrame,
-    ConsoleErrorCode, ConsoleEvent, PrincipalSummary, RequiredAuthority, STREAM_AUDIT_FACTS,
-    STREAM_STATE_WATCH, ServerFrame, StreamCall,
+    ConsoleErrorCode, PrincipalSummary, RequiredAuthority, STREAM_AUDIT_FACTS, STREAM_STATE_WATCH,
+    ServerFrame, StreamCall,
 };
 use crate::recipes::{self, StateMethod as RecipeStateMethod};
 use crate::state::{
     ConsoleState, ConsoleWsLimit, HARD_MAX_WS_FACT_LIMIT, HARD_MAX_WS_FRAME_BYTES,
-    HARD_MAX_WS_STATE_LIST_LIMIT, HARD_MAX_WS_SUBSCRIPTIONS, HARD_MAX_WS_TRACE_LIMIT,
+    HARD_MAX_WS_STATE_LIST_LIMIT, HARD_MAX_WS_SUBSCRIPTIONS,
 };
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use futures_util::{Sink, SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
-use xolotl_state::StateEvent;
 use xolotl_types::{
-    Capability, ExternalInstallationDef, NodeId, OperationId, Path, ProcSpec, ProcessId,
-    RestartPolicy, Transport, Value,
+    Capability, ExternalInstallationDef, OperationId, Path, ProcSpec, ProcessId, RestartPolicy,
+    Transport, Value, ValueMap, ValueView,
 };
 
 const MAX_VISIBILITY_TTL_MS: u64 = 10 * 60 * 1000;
@@ -69,7 +73,7 @@ pub(crate) async fn upgrade(
     }
     // Downgrade protection: if the client offers any subprotocol, exactly the
     // protobuf console subprotocol must be among them. A client offering only a
-    // legacy/unknown subprotocol is rejected rather than silently downgraded.
+    // unknown subprotocol is rejected.
     if let Some(offered) = headers.get("sec-websocket-protocol")
         && !offered
             .to_str()
@@ -115,55 +119,8 @@ pub(crate) struct WsSession {
     hello_accepted: bool,
     source_addr: String,
     counted_user: Option<String>,
-    subscriptions: BTreeMap<u64, SubscriptionHandle>,
-    event_tx: mpsc::Sender<SubscriptionMessage>,
+    subscriptions: Subscriptions,
     rate: FrameRate,
-}
-
-struct SubscriptionHandle {
-    shutdown: tokio::sync::oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-const SUBSCRIPTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
-
-async fn shutdown_subscription(handle: SubscriptionHandle) {
-    let SubscriptionHandle { shutdown, mut task } = handle;
-    if shutdown.send(()).is_err() {
-        tracing::debug!("console subscription shutdown receiver was already closed");
-    }
-    match tokio::time::timeout(SUBSCRIPTION_SHUTDOWN_TIMEOUT, &mut task).await {
-        Ok(result) => record_subscription_join(result),
-        Err(_elapsed) => {
-            task.abort();
-            match task.await {
-                Ok(()) => {}
-                Err(error) if error.is_cancelled() => {
-                    tracing::debug!("console subscription task aborted during shutdown");
-                }
-                Err(error) => {
-                    tracing::warn!(?error, "console subscription task failed during shutdown");
-                }
-            }
-        }
-    }
-}
-
-fn record_subscription_join(result: Result<(), tokio::task::JoinError>) {
-    match result {
-        Ok(()) => {}
-        Err(error) if error.is_cancelled() => {
-            tracing::debug!("console subscription task cancelled during shutdown");
-        }
-        Err(error) => {
-            tracing::warn!(?error, "console subscription task failed during shutdown");
-        }
-    }
-}
-
-struct SubscriptionMessage {
-    stream: u64,
-    event: ConsoleEvent,
 }
 
 impl Drop for WsSession {
@@ -208,7 +165,7 @@ impl FrameRate {
 
 async fn session(socket: WebSocket, state: Arc<ConsoleState>, source_addr: String) {
     let (mut tx, mut rx) = socket.split();
-    let (event_tx, mut event_rx) = mpsc::channel::<SubscriptionMessage>(256);
+    let subscriptions = Subscriptions::new(state.ws.config());
     let mut sess = WsSession {
         state,
         principal: None,
@@ -216,13 +173,15 @@ async fn session(socket: WebSocket, state: Arc<ConsoleState>, source_addr: Strin
         hello_accepted: false,
         source_addr,
         counted_user: None,
-        subscriptions: BTreeMap::new(),
-        event_tx,
+        subscriptions,
         rate: FrameRate::default(),
     };
     let mut idle = Box::pin(tokio::time::sleep(sess.state.ws.config().idle_timeout));
 
     loop {
+        if sess.subscriptions.failed() {
+            break;
+        }
         tokio::select! {
             _ = &mut idle => {
                 record_ws_audit(&sess.state, sess.principal.as_ref(), Some(&sess.source_addr), "idle_timeout");
@@ -236,7 +195,7 @@ async fn session(socket: WebSocket, state: Arc<ConsoleState>, source_addr: Strin
                     break;
                 };
                 let close_after = should_close_after_reply(&sess, &reply);
-                if let Err(error) = send(&mut tx, reply).await {
+                if let Err(error) = outbound::send_frame(&mut tx, reply, sess.state.ws.config()).await {
                     record_ws_send_error(&sess, &error);
                     break;
                 }
@@ -244,32 +203,29 @@ async fn session(socket: WebSocket, state: Arc<ConsoleState>, source_addr: Strin
                     break;
                 }
             }
-            Some(msg) = event_rx.recv() => {
-                let Some(sid) = sess.sid.clone() else {
-                    break;
-                };
-                match sess.state.auth.authenticate_sid(&sess.state.boot, &sid).await {
-                    Ok(principal) => {
-                        sess.principal = Some(principal);
-                    }
-                    Err(e) => {
-                        record_ws_audit(&sess.state, sess.principal.as_ref(), Some(&sess.source_addr), "invalid_session");
-                        if let Err(error) = send(&mut tx, auth_error_frame(None, e)).await {
-                            record_ws_send_error(&sess, &error);
-                        }
+            event = sess.subscriptions.next() => {
+                let SubscriptionEvent { stream, bytes, budget, deadline } = match event {
+                    Ok(event) => event,
+                    Err(error) => {
+                        record_ws_send_error(&sess, &outbound::SendError::Encode(error));
                         break;
                     }
+                };
+                if let Err(frame) = authenticated_principal(&mut sess, None).await {
+                    if let Err(error) = outbound::send_frame(&mut tx, *frame, sess.state.ws.config()).await {
+                        record_ws_send_error(&sess, &error);
+                    }
+                    break;
                 }
-                if let Err(error) = send_with_timeout(
-                    &mut tx,
-                    ServerFrame::Event {
-                        stream: msg.stream,
-                        event: msg.event,
-                    },
-                    sess.state.ws.config().event_send_timeout,
-                )
-                .await
-                {
+                if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+                    tracing::debug!(stream, "console subscription event expired before delivery");
+                    continue;
+                }
+                let send_deadline = tokio::time::Instant::now() + sess.state.ws.config().send_timeout;
+                let send_deadline = deadline.map_or(send_deadline, |expiry| expiry.min(send_deadline));
+                let delivered = outbound::send_encoded_until(&mut tx, bytes, send_deadline).await;
+                drop(budget);
+                if let Err(error) = delivered {
                     record_ws_send_error(&sess, &error);
                     record_ws_audit(&sess.state, sess.principal.as_ref(), Some(&sess.source_addr), "backpressure_close");
                     break;
@@ -278,10 +234,7 @@ async fn session(socket: WebSocket, state: Arc<ConsoleState>, source_addr: Strin
         }
     }
 
-    drop(event_rx);
-    for (_, handle) in std::mem::take(&mut sess.subscriptions) {
-        shutdown_subscription(handle).await;
-    }
+    sess.subscriptions.shutdown().await;
 }
 
 async fn receive_client_message(sess: &mut WsSession, msg: Message) -> Option<ServerFrame> {
@@ -470,8 +423,17 @@ async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
                             message: ws_limit_message(limit),
                         };
                     }
-                    let summary = PrincipalSummary::from(&principal);
                     sess.counted_user = Some(principal.username.clone());
+                    sess.subscriptions.shutdown().await;
+                    if sess.subscriptions.failed() {
+                        sess.sid = None;
+                        return ServerFrame::Error {
+                            id: None,
+                            code: ConsoleErrorCode::Internal,
+                            message: "previous subscriptions could not be stopped".into(),
+                        };
+                    }
+                    let summary = PrincipalSummary::from(&principal);
                     sess.principal = Some(principal);
                     sess.sid = Some(sid);
                     ServerFrame::Authenticated {
@@ -492,7 +454,7 @@ async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
             }
             let principal = match authenticated_principal(sess, Some(id)).await {
                 Ok(p) => p,
-                Err(frame) => return frame,
+                Err(frame) => return *frame,
             };
             match dispatch_call(sess, &principal, call).await {
                 Ok(result) => ServerFrame::Reply { id, result },
@@ -513,7 +475,7 @@ async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
             }
             let principal = match authenticated_principal(sess, None).await {
                 Ok(p) => p,
-                Err(frame) => return frame,
+                Err(frame) => return *frame,
             };
             match subscribe(sess, &principal, id, stream).await {
                 Ok(()) => ServerFrame::Reply {
@@ -536,10 +498,10 @@ async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
                 return frame;
             }
             if let Err(frame) = authenticated_principal(sess, Some(id)).await {
-                return frame;
+                return *frame;
             }
-            if let Some(handle) = sess.subscriptions.remove(&id) {
-                shutdown_subscription(handle).await;
+            if let Err(error) = sess.subscriptions.stop(id).await {
+                return console_error_frame(Some(id), ConsoleError::Operation(error.to_string()));
             }
             ServerFrame::Reply {
                 id,
@@ -552,7 +514,7 @@ async fn handle_frame(sess: &mut WsSession, frame: ClientFrame) -> ServerFrame {
 async fn authenticated_principal(
     sess: &mut WsSession,
     id: Option<u64>,
-) -> Result<ConsolePrincipal, ServerFrame> {
+) -> Result<ConsolePrincipal, Box<ServerFrame>> {
     let Some(sid) = sess.sid.clone() else {
         record_ws_audit(
             &sess.state,
@@ -560,11 +522,11 @@ async fn authenticated_principal(
             Some(&sess.source_addr),
             "not_authenticated",
         );
-        return Err(ServerFrame::Error {
+        return Err(Box::new(ServerFrame::Error {
             id,
             code: ConsoleErrorCode::NotAuthenticated,
             message: "not authenticated".into(),
-        });
+        }));
     };
     match sess
         .state
@@ -572,10 +534,7 @@ async fn authenticated_principal(
         .authenticate_sid(&sess.state.boot, &sid)
         .await
     {
-        Ok(p) => {
-            sess.principal = Some(p.clone());
-            Ok(p)
-        }
+        Ok(p) => refresh_principal(sess, p, id),
         Err(e) => {
             record_ws_audit(
                 &sess.state,
@@ -583,9 +542,38 @@ async fn authenticated_principal(
                 Some(&sess.source_addr),
                 "invalid_session",
             );
-            Err(auth_error_frame(id, e))
+            sess.sid = None;
+            Err(Box::new(auth_error_frame(id, e)))
         }
     }
+}
+
+fn refresh_principal(
+    sess: &mut WsSession,
+    principal: ConsolePrincipal,
+    id: Option<u64>,
+) -> Result<ConsolePrincipal, Box<ServerFrame>> {
+    if sess
+        .principal
+        .as_ref()
+        .is_some_and(|previous| previous != &principal)
+    {
+        record_ws_audit(
+            &sess.state,
+            sess.principal.as_ref(),
+            Some(&sess.source_addr),
+            "authority_changed",
+        );
+        sess.sid = None;
+        return Err(Box::new(ServerFrame::Error {
+            id,
+            code: ConsoleErrorCode::Forbidden,
+            message: "console session authority changed; reconnect and authorize new subscriptions"
+                .into(),
+        }));
+    }
+    sess.principal = Some(principal.clone());
+    Ok(principal)
 }
 
 async fn dispatch_call(
@@ -720,7 +708,7 @@ async fn dispatch_call(
             let mut input = input_map(input_value(&call.input)?)?;
             let path = string_arg(&mut input, "path")?;
             let value = mgmt::inspect_config(&sess.state, principal, &path).await?;
-            value.unwrap_or(Value::Null)
+            value.unwrap_or(Value::null())
         }
         ACTION_CONFIG_LIST => {
             let mut input = input_map(input_value(&call.input)?)?;
@@ -742,7 +730,7 @@ async fn dispatch_call(
             let username = string_arg(&mut input, "username")?;
             let path = console_user_path(&username)?;
             let value = mgmt::inspect(&sess.state, principal, &path).await?;
-            value.unwrap_or(Value::Null)
+            value.unwrap_or(Value::null())
         }
         ACTION_ACCESS_USER_LIST => {
             let entries =
@@ -770,9 +758,11 @@ async fn dispatch_call(
             let Some(mut value) = mgmt::inspect(&sess.state, principal, &path).await? else {
                 return Err(ConsoleError::BadRequest("unknown console user".into()));
             };
-            match &mut value {
-                Value::Map(m) => {
-                    m.insert("status".into(), Value::Str("disabled".into()));
+            match value.as_map().cloned() {
+                Some(mut m) => {
+                    m.insert("status".into(), Value::string("disabled".into()))
+                        .map_err(|error| ConsoleError::BadRequest(error.to_string()))?;
+                    value = Value::from(m);
                 }
                 _ => {
                     return Err(ConsoleError::BadRequest(
@@ -789,7 +779,7 @@ async fn dispatch_call(
             let role = string_arg(&mut input, "role")?;
             let path = console_role_path(&role)?;
             let value = mgmt::inspect(&sess.state, principal, &path).await?;
-            value.unwrap_or(Value::Null)
+            value.unwrap_or(Value::null())
         }
         ACTION_ACCESS_ROLE_LIST => {
             let entries =
@@ -844,7 +834,7 @@ async fn dispatch_call(
                 sess.sid = None;
                 sess.principal = None;
             }
-            map_value([("count", Value::Int(1))])
+            map_value([("count", Value::integer(1))])
         }
         ACTION_ACCESS_SESSION_REVOKE_USER => {
             let mut input = input_map(input_value(&call.input)?)?;
@@ -864,14 +854,14 @@ async fn dispatch_call(
                 sess.sid = None;
                 sess.principal = None;
             }
-            map_value([("count", Value::Int(count as i64))])
+            map_value([("count", Value::integer(count as i64))])
         }
         ACTION_RUNTIME_PROCESS_INSPECT => {
             require_visibility_access(principal, &call)?;
             let mut input = input_map(input_value(&call.input)?)?;
-            let process = optional_u64_arg(&mut input, "process")?;
+            let process = facts::optional_cursor_arg(&mut input, "process")?;
             let include_recent_facts =
-                optional_bool_arg(&mut input, "include_recent_facts")?.unwrap_or(true);
+                optional_bool_arg(&mut input, "include_recent_facts")?.unwrap_or(false);
             let limit = optional_usize_arg(&mut input, "limit")?.unwrap_or(64);
             let target = process.map(|pid| format!("process:{pid}"));
             record_visibility_audit(
@@ -881,24 +871,19 @@ async fn dispatch_call(
                 "runtime_process_inspect",
                 VisibilityAuditDetails::action(&call, target.as_deref()),
             )?;
-            process_inspect(
-                sess,
-                principal,
-                process,
-                include_recent_facts,
-                bounded_limit(
-                    limit,
-                    sess.state.ws.config().max_fact_limit,
-                    HARD_MAX_WS_FACT_LIMIT,
-                ),
-            )
-            .await?
+            process_inspect(sess, principal, process, include_recent_facts, limit).await?
         }
         ACTION_AUDIT_FACTS_RECENT => {
             require_visibility_access(principal, &call)?;
             let mut input = input_map(input_value(&call.input)?)?;
-            let process = optional_u64_arg(&mut input, "process")?;
-            let limit = optional_usize_arg(&mut input, "limit")?.unwrap_or(64);
+            let process = facts::optional_cursor_arg(&mut input, "process")?;
+            authorize_fact_read(principal, process)?;
+            let query = facts::query(
+                sess.state.ws.config(),
+                facts::ReadKind::Recent,
+                process,
+                &mut input,
+            )?;
             let target = process
                 .map(|pid| fact_path(pid).map(|path| path.to_string()))
                 .transpose()?
@@ -910,24 +895,24 @@ async fn dispatch_call(
                 "audit_facts_recent",
                 VisibilityAuditDetails::action(&call, Some(&target)),
             )?;
-            recent_facts(
-                sess,
-                principal,
-                process,
-                bounded_limit(
-                    limit,
-                    sess.state.ws.config().max_fact_limit,
-                    HARD_MAX_WS_FACT_LIMIT,
-                ),
-            )
-            .await?
+            facts::read_page(
+                &sess.state.boot.kernel.facts,
+                query,
+                facts::ReadKind::Recent,
+            )?
         }
         ACTION_LINEAGE_TRACE_READ => {
             require_visibility_access(principal, &call)?;
             let mut input = input_map(input_value(&call.input)?)?;
-            let process = u64_arg(&mut input, "process")?;
-            let from = optional_usize_arg(&mut input, "from")?.unwrap_or(0);
-            let limit = optional_usize_arg(&mut input, "limit")?.unwrap_or(128);
+            let process = facts::optional_cursor_arg(&mut input, "process")?
+                .ok_or_else(|| ConsoleError::BadRequest("process is required".into()))?;
+            authorize_fact_read(principal, Some(process))?;
+            let query = facts::query(
+                sess.state.ws.config(),
+                facts::ReadKind::Trace,
+                Some(process),
+                &mut input,
+            )?;
             let target = fact_path(process)?.to_string();
             record_visibility_audit(
                 &sess.state,
@@ -936,23 +921,19 @@ async fn dispatch_call(
                 "lineage_trace_read",
                 VisibilityAuditDetails::action(&call, Some(&target)),
             )?;
-            trace_read(
-                sess,
-                principal,
-                process,
-                from,
-                bounded_limit(
-                    limit,
-                    sess.state.ws.config().max_trace_limit,
-                    HARD_MAX_WS_TRACE_LIMIT,
-                ),
-            )
-            .await?
+            facts::read_page(&sess.state.boot.kernel.facts, query, facts::ReadKind::Trace)?
         }
         ACTION_LINEAGE_FACT_READ => {
             require_visibility_access(principal, &call)?;
             let mut input = input_map(input_value(&call.input)?)?;
             let op_id = parse_operation_id(&string_arg(&mut input, "op_id")?)?;
+            let process =
+                facts::optional_cursor_arg(&mut input, "process")?.unwrap_or(op_id.process.get());
+            authorize_fact_read(principal, Some(process))?;
+            let max_bytes = facts::byte_limit(
+                sess.state.ws.config(),
+                optional_usize_arg(&mut input, "max_bytes")?,
+            )?;
             record_visibility_audit(
                 &sess.state,
                 principal,
@@ -960,7 +941,14 @@ async fn dispatch_call(
                 "lineage_fact_read",
                 VisibilityAuditDetails::action(&call, Some(&format!("operation:{op_id}"))),
             )?;
-            lineage_fact_read(sess, principal, op_id).await?
+            facts::read_detail(
+                &sess.state.boot.kernel.facts,
+                xolotl_kernel::FactLookup {
+                    id: op_id,
+                    process: Some(ProcessId::new(process)),
+                    max_encoded_bytes: max_bytes,
+                },
+            )?
         }
         ACTION_HEALTH_SUMMARY => health_summary(sess, principal).await?,
         ACTION_EXTERNAL_INSTALLATION_LIST => {
@@ -977,7 +965,7 @@ async fn dispatch_call(
             let id = string_arg(&mut input, "id")?;
             let path = external_installation_path(&id)?;
             let value = mgmt::inspect(&sess.state, principal, &path).await?;
-            value.unwrap_or(Value::Null)
+            value.unwrap_or(Value::null())
         }
         ACTION_EXTERNAL_INSTALLATION_INSTALL | ACTION_EXTERNAL_INSTALLATION_UPDATE => {
             let mut input = input_map(input_value(&call.input)?)?;
@@ -1011,7 +999,7 @@ async fn dispatch_call(
                 sess,
                 principal,
                 "effect://proc/kill",
-                map_value([("id", Value::Str(installation.id))]),
+                map_value([("id", Value::string(installation.id))]),
             )
             .await?
         }
@@ -1029,11 +1017,11 @@ async fn dispatch_call(
             let installation =
                 read_external_installation(sess, principal, &installation_id).await?;
             let mut m = BTreeMap::new();
-            m.insert("installation_id".into(), Value::Str(installation.id));
+            m.insert("installation_id".into(), Value::string(installation.id));
             if let Some(floor) = credential_generation_floor {
-                m.insert("credential_generation_floor".into(), Value::Int(floor));
+                m.insert("credential_generation_floor".into(), Value::integer(floor));
             }
-            invoke_effect(sess, principal, "effect://external/revoke", Value::Map(m)).await?
+            invoke_effect(sess, principal, "effect://external/revoke", Value::map(m)).await?
         }
         ACTION_EXTERNAL_MANIFEST_LIST => {
             let entries =
@@ -1045,7 +1033,7 @@ async fn dispatch_call(
             let platform = string_arg(&mut input, "platform")?;
             let path = external_manifest_path(&platform)?;
             let value = mgmt::inspect(&sess.state, principal, &path).await?;
-            value.unwrap_or(Value::Null)
+            value.unwrap_or(Value::null())
         }
         ACTION_EXTERNAL_MANIFEST_WRITE_CAS => {
             let mut input = input_map(input_value(&call.input)?)?;
@@ -1072,7 +1060,7 @@ async fn dispatch_call(
             let id = string_arg(&mut input, "id")?;
             let path = projection_status_path(&id)?;
             let value = mgmt::inspect(&sess.state, principal, &path).await?;
-            value.unwrap_or(Value::Null)
+            value.unwrap_or(Value::null())
         }
         ACTION_INFERENCE_BACKEND_LIST => {
             let entries =
@@ -1085,7 +1073,7 @@ async fn dispatch_call(
             let id = string_arg(&mut input, "id")?;
             let path = inference_backend_path(&id)?;
             let value = mgmt::inspect(&sess.state, principal, &path).await?;
-            value.unwrap_or(Value::Null)
+            value.unwrap_or(Value::null())
         }
         ACTION_INFERENCE_BACKEND_WRITE_CAS => {
             let mut input = input_map(input_value(&call.input)?)?;
@@ -1109,7 +1097,7 @@ async fn dispatch_call(
             let id = string_arg(&mut input, "id")?;
             let path = inference_model_path(&id)?;
             let value = mgmt::inspect(&sess.state, principal, &path).await?;
-            value.unwrap_or(Value::Null)
+            value.unwrap_or(Value::null())
         }
         ACTION_INFERENCE_MODEL_WRITE_CAS => {
             let mut input = input_map(input_value(&call.input)?)?;
@@ -1133,7 +1121,7 @@ async fn dispatch_call(
             let name = string_arg(&mut input, "name")?;
             let path = inference_group_path(&name)?;
             let value = mgmt::inspect(&sess.state, principal, &path).await?;
-            value.unwrap_or(Value::Null)
+            value.unwrap_or(Value::null())
         }
         ACTION_INFERENCE_GROUP_WRITE_CAS => {
             let mut input = input_map(input_value(&call.input)?)?;
@@ -1149,7 +1137,7 @@ async fn dispatch_call(
         ACTION_INFERENCE_ROUTING_READ => {
             let value =
                 mgmt::inspect(&sess.state, principal, "state://kernel/routing/inference").await?;
-            value.unwrap_or(Value::Null)
+            value.unwrap_or(Value::null())
         }
         ACTION_INFERENCE_ROUTING_WRITE_CAS => {
             let mut input = input_map(input_value(&call.input)?)?;
@@ -1192,10 +1180,10 @@ async fn dispatch_call(
                 principal,
                 "effect://external/pairing/approve",
                 map_value([
-                    ("pairing_id", Value::Str(pairing_id)),
+                    ("pairing_id", Value::string(pairing_id)),
                     (
                         "approved_roles",
-                        Value::List(approved_roles.into_iter().map(Value::Str).collect()),
+                        Value::list(approved_roles.into_iter().map(Value::string).collect()),
                     ),
                 ]),
             )
@@ -1210,7 +1198,7 @@ async fn dispatch_call(
                 sess,
                 principal,
                 "effect://external/pairing/deny",
-                map_value([("pairing_id", Value::Str(pairing_id))]),
+                map_value([("pairing_id", Value::string(pairing_id))]),
             )
             .await?
         }
@@ -1244,13 +1232,14 @@ async fn subscribe(
     id: u64,
     stream: StreamCall,
 ) -> Result<(), ConsoleError> {
+    sess.subscriptions.reap_finished();
     let max_subscriptions = sess
         .state
         .ws
         .config()
         .max_subscriptions
         .min(HARD_MAX_WS_SUBSCRIPTIONS);
-    if sess.subscriptions.len() >= max_subscriptions && !sess.subscriptions.contains_key(&id) {
+    if sess.subscriptions.len() >= max_subscriptions && !sess.subscriptions.contains(id) {
         return Err(ConsoleError::RateLimited);
     }
     if stream.since_rev.is_some() {
@@ -1258,15 +1247,28 @@ async fn subscribe(
             "since_rev is invalid for live-only console streams".into(),
         ));
     }
+    if !matches!(
+        stream.stream.as_str(),
+        STREAM_STATE_WATCH | STREAM_AUDIT_FACTS
+    ) {
+        return Err(ConsoleError::BadRequest(format!(
+            "unknown console stream: {}",
+            stream.stream
+        )));
+    }
+    require_stream_visibility_access(principal, &stream)?;
+    let ttl_ms = stream
+        .ttl_ms
+        .ok_or_else(|| ConsoleError::BadRequest("visibility access requires ttl_ms".into()))?;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(ttl_ms);
 
     match stream.stream.as_str() {
         STREAM_STATE_WATCH => {
-            require_stream_visibility_access(principal, &stream)?;
             let mut input = input_map(input_value(&stream.input)?)?;
             let pattern = Path::parse(&string_arg(&mut input, "pattern")?)?;
             ensure_observable_state_path(&pattern)?;
             auth::authorize_path(&sess.state.state, principal, "subscribe", &pattern, None).await?;
-            let mut rx = sess.state.state.subscribe(&pattern).await?;
+            let rx = sess.state.state.subscribe(&pattern).await?;
             let target = pattern.to_string();
             record_visibility_audit(
                 &sess.state,
@@ -1275,39 +1277,20 @@ async fn subscribe(
                 "state_watch",
                 VisibilityAuditDetails::stream(&stream, Some(&target)),
             )?;
-            let event_tx = sess.event_tx.clone();
-            let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
-            if let Some(handle) = sess.subscriptions.remove(&id) {
-                shutdown_subscription(handle).await;
-            }
-            let task = tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = &mut shutdown_rx => break,
-                        ev = rx.recv() => {
-                            let Ok(ev) = ev else { break };
-                            let event = state_event(ev);
-                            if event_tx.send(SubscriptionMessage { stream: id, event }).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-            sess.subscriptions.insert(
-                id,
-                SubscriptionHandle {
-                    shutdown: shutdown_tx,
-                    task,
-                },
-            );
+            sess.subscriptions
+                .replace(id, rx, subscriptions::state_event, "state", deadline)
+                .await
+                .map_err(|error| ConsoleError::Operation(error.to_string()))?;
             Ok(())
         }
         STREAM_AUDIT_FACTS => {
-            require_stream_visibility_access(principal, &stream)?;
             let mut input = input_map(input_value(&stream.input)?)?;
-            let process = optional_u64_arg(&mut input, "process")?;
+            let process = facts::optional_cursor_arg(&mut input, "process")?;
             authorize_fact_read(principal, process)?;
+            let max_bytes = facts::byte_limit(
+                sess.state.ws.config(),
+                optional_usize_arg(&mut input, "max_bytes")?,
+            )?;
             let target = process
                 .map(|pid| fact_path(pid).map(|path| path.to_string()))
                 .transpose()?
@@ -1319,55 +1302,13 @@ async fn subscribe(
                 "audit_facts_stream",
                 VisibilityAuditDetails::stream(&stream, Some(&target)),
             )?;
-            let event_tx = sess.event_tx.clone();
-            let state = sess.state.clone();
-            let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
-            if let Some(handle) = sess.subscriptions.remove(&id) {
-                shutdown_subscription(handle).await;
-            }
-            let task = tokio::spawn(async move {
-                let mut seen = 0usize;
-                let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
-                loop {
-                    tokio::select! {
-                        _ = &mut shutdown_rx => break,
-                        _ = interval.tick() => {
-                            let facts = match state.boot.kernel.facts.all_facts() {
-                                Ok(facts) => facts,
-                                Err(e) => {
-                                    send_subscription_closed(&event_tx, id, e.to_string()).await;
-                                    break;
-                                }
-                            };
-                            for fact in facts.iter().skip(seen).filter(|fact| {
-                                process.is_none_or(|pid| fact.caller.get() == pid)
-                            }) {
-                                let fact = fact_value(fact.clone());
-                                if event_tx
-                                    .send(SubscriptionMessage {
-                                        stream: id,
-                                        event: ConsoleEvent::Audit {
-                                            fact,
-                                        },
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            seen = facts.len();
-                        }
-                    }
-                }
-            });
-            sess.subscriptions.insert(
-                id,
-                SubscriptionHandle {
-                    shutdown: shutdown_tx,
-                    task,
-                },
-            );
+            let sink = sess.state.boot.kernel.facts.clone();
+            let receiver = sink.store().subscribe_facts();
+            let project = facts::live_projection(sink, process, max_bytes);
+            sess.subscriptions
+                .replace(id, receiver, project, "fact", deadline)
+                .await
+                .map_err(|error| ConsoleError::Operation(error.to_string()))?;
             Ok(())
         }
         other => Err(ConsoleError::BadRequest(format!(
@@ -1384,38 +1325,39 @@ async fn snapshot(
     let mut input = input_map(input_value(&call.input)?)?;
     let since_rev = optional_u64_arg(&mut input, "since_rev")?;
     let sections = match input.remove("sections") {
-        Some(Value::List(items)) => items,
-        Some(_) => {
-            return Err(ConsoleError::BadRequest(
-                "sections must be a list of section maps".into(),
-            ));
-        }
+        Some(value) => value.into_list().ok_or_else(|| {
+            ConsoleError::BadRequest("sections must be a list of section maps".into())
+        })?,
         None => vec![
             map_value([
-                ("kind", Value::Str("kernel_config".into())),
-                ("prefix", Value::Str("state://kernel".into())),
+                ("kind", Value::string("kernel_config".into())),
+                ("prefix", Value::string("state://kernel".into())),
             ]),
-            map_value([("kind", Value::Str("sessions".into()))]),
+            map_value([("kind", Value::string("sessions".into()))]),
             map_value([
-                ("kind", Value::Str("runtime".into())),
-                ("limit", Value::Int(64)),
+                ("kind", Value::string("runtime".into())),
+                ("limit", Value::integer(64)),
             ]),
-        ],
+        ]
+        .into(),
     };
 
     let mut out = BTreeMap::new();
-    out.insert("server_rev".into(), Value::Int(server_rev(sess) as i64));
-    out.insert("registry_rev".into(), Value::Int(registry_rev(sess) as i64));
+    out.insert("server_rev".into(), Value::integer(server_rev(sess) as i64));
+    out.insert(
+        "registry_rev".into(),
+        Value::integer(registry_rev(sess) as i64),
+    );
     out.insert(
         "fact_cursor".into(),
-        Value::Int(sess.state.boot.kernel.facts.cursor() as i64),
+        facts::cursor_value(sess.state.boot.kernel.facts.cursor()),
     );
-    out.insert("truncated".into(), Value::List(Vec::new()));
+    out.insert("truncated".into(), Value::list(Vec::new()));
     if let Some(since_rev) = since_rev {
-        out.insert("since_rev".into(), Value::Int(since_rev as i64));
+        out.insert("since_rev".into(), Value::integer(since_rev as i64));
     }
-    for section in sections {
-        let mut section = input_map(section)?;
+    for section in &sections {
+        let mut section = input_map(section.clone())?;
         let kind = string_arg(&mut section, "kind")?;
         match kind.as_str() {
             "kernel_config" => {
@@ -1432,6 +1374,12 @@ async fn snapshot(
                 out.insert("sessions".into(), sessions_value(&sessions));
             }
             "runtime" => {
+                if out.contains_key("runtime") {
+                    return Err(ConsoleError::BadRequest(
+                        "runtime snapshot section may be requested only once".into(),
+                    ));
+                }
+                let process = facts::optional_cursor_arg(&mut section, "process")?;
                 let include_recent_facts =
                     optional_bool_arg(&mut section, "include_recent_facts")?.unwrap_or(false);
                 if include_recent_facts {
@@ -1448,7 +1396,7 @@ async fn snapshot(
                     )?;
                 }
                 let runtime =
-                    process_inspect(sess, principal, None, include_recent_facts, limit).await?;
+                    process_inspect(sess, principal, process, include_recent_facts, limit).await?;
                 out.insert("runtime".into(), runtime);
             }
             other => {
@@ -1458,7 +1406,7 @@ async fn snapshot(
             }
         }
     }
-    Ok(Value::Map(out))
+    Ok(Value::map(out))
 }
 
 async fn visibility_state_read(
@@ -1469,7 +1417,7 @@ async fn visibility_state_read(
     let path = Path::parse(path)?;
     ensure_observable_state_path(&path)?;
     auth::authorize_path(&sess.state.state, principal, "read", &path, None).await?;
-    run_state_op(sess, principal, path, "read", Value::Null).await
+    run_state_op(sess, principal, path, "read", Value::null()).await
 }
 
 async fn visibility_state_list(
@@ -1481,14 +1429,16 @@ async fn visibility_state_list(
     let prefix = Path::parse(prefix)?;
     ensure_observable_state_path(&prefix)?;
     auth::authorize_path(&sess.state.state, principal, "read", &prefix, None).await?;
-    let mut out = run_state_op(sess, principal, prefix, "list", Value::Null).await?;
-    if let Value::List(items) = &mut out {
+    let mut out = run_state_op(sess, principal, prefix, "list", Value::null()).await?;
+    if let Some(items) = out.as_list() {
         let max = bounded_limit(
             limit,
             sess.state.ws.config().max_state_list_limit,
             HARD_MAX_WS_STATE_LIST_LIMIT,
         );
-        items.truncate(max);
+        if items.len() > max {
+            out = Value::list(items.iter().take(max).cloned().collect());
+        }
     }
     Ok(out)
 }
@@ -1525,11 +1475,32 @@ async fn process_inspect(
     limit: usize,
 ) -> Result<Value, ConsoleError> {
     require_process_inspect(principal)?;
+    if include_recent_facts {
+        if process.is_none() {
+            return Err(ConsoleError::BadRequest(
+                "include_recent_facts requires an explicit process".into(),
+            ));
+        }
+        authorize_fact_read(principal, process)?;
+    }
     let limit = bounded_limit(
         limit,
         sess.state.ws.config().max_fact_limit,
         HARD_MAX_WS_FACT_LIMIT,
     );
+    let recent_query = if include_recent_facts {
+        Some(facts::query(
+            sess.state.ws.config(),
+            facts::ReadKind::Recent,
+            process,
+            &mut ValueMap::from(BTreeMap::from([(
+                "limit".into(),
+                Value::integer(limit as i64),
+            )])),
+        )?)
+    } else {
+        None
+    };
     let process_ids = match process {
         Some(process) => vec![ProcessId::new(process)],
         None => sess.state.boot.kernel.processes.all_ids(),
@@ -1537,21 +1508,15 @@ async fn process_inspect(
     let mut rows = Vec::with_capacity(process_ids.len());
     for process in process_ids {
         let mut row = BTreeMap::new();
-        row.insert(
-            "process".into(),
-            Value::Int(u64_to_i64_saturating(process.get())),
-        );
+        row.insert("process".into(), facts::cursor_value(process.get()));
         if let Some(status) = sess.state.boot.kernel.processes.status(process) {
-            row.insert("status".into(), Value::Str(format!("{status:?}")));
-            row.insert("terminal".into(), Value::Bool(status.is_terminal()));
+            row.insert("status".into(), Value::string(format!("{status:?}")));
+            row.insert("terminal".into(), Value::boolean(status.is_terminal()));
         } else {
-            row.insert("status".into(), Value::Str("Unknown".into()));
+            row.insert("status".into(), Value::string("Unknown".into()));
         }
         if let Some(identity) = sess.state.boot.kernel.processes.identity(process) {
-            row.insert(
-                "identity".into(),
-                Value::Int(u64_to_i64_saturating(identity.get())),
-            );
+            row.insert("identity".into(), facts::cursor_value(identity.get()));
         }
         let children = sess
             .state
@@ -1560,120 +1525,23 @@ async fn process_inspect(
             .processes
             .children_of(process)
             .into_iter()
-            .map(|child| Value::Int(u64_to_i64_saturating(child.get())))
+            .map(|child| facts::cursor_value(child.get()))
             .collect();
-        row.insert("children".into(), Value::List(children));
-        let facts = sess.state.boot.kernel.facts.facts_of(process)?;
-        row.insert("fact_count".into(), Value::Int(facts.len() as i64));
-        if include_recent_facts {
+        row.insert("children".into(), Value::list(children));
+        if let Some(mut query) = recent_query {
+            query.process = Some(process);
             row.insert(
                 "recent_facts".into(),
-                Value::List(
-                    facts
-                        .into_iter()
-                        .rev()
-                        .take(limit)
-                        .map(fact_value)
-                        .collect(),
-                ),
+                facts::read_page(
+                    &sess.state.boot.kernel.facts,
+                    query,
+                    facts::ReadKind::Recent,
+                )?,
             );
         }
-        rows.push(Value::Map(row));
+        rows.push(Value::map(row));
     }
-    Ok(Value::List(rows))
-}
-
-async fn recent_facts(
-    sess: &WsSession,
-    principal: &ConsolePrincipal,
-    process: Option<u64>,
-    limit: usize,
-) -> Result<Value, ConsoleError> {
-    authorize_fact_read(principal, process)?;
-    let facts = sess
-        .state
-        .boot
-        .kernel
-        .facts
-        .all_facts()?
-        .into_iter()
-        .filter(|fact| process.is_none_or(|pid| fact.caller.get() == pid))
-        .rev()
-        .take(bounded_limit(
-            limit,
-            sess.state.ws.config().max_fact_limit,
-            HARD_MAX_WS_FACT_LIMIT,
-        ))
-        .collect();
-    Ok(facts_value(facts))
-}
-
-async fn trace_read(
-    sess: &WsSession,
-    principal: &ConsolePrincipal,
-    process: u64,
-    from: usize,
-    limit: usize,
-) -> Result<Value, ConsoleError> {
-    authorize_fact_read(principal, Some(process))?;
-    let all = sess
-        .state
-        .boot
-        .kernel
-        .facts
-        .all_facts()?
-        .into_iter()
-        .filter(|fact| fact.caller.get() == process)
-        .collect::<Vec<_>>();
-    let limit = bounded_limit(
-        limit,
-        sess.state.ws.config().max_trace_limit,
-        HARD_MAX_WS_TRACE_LIMIT,
-    );
-    let rows = all
-        .iter()
-        .skip(from)
-        .take(limit)
-        .cloned()
-        .collect::<Vec<_>>();
-    let partial = from.saturating_add(rows.len()) < all.len();
-    let mut out = BTreeMap::new();
-    out.insert("process".into(), Value::Int(u64_to_i64_saturating(process)));
-    out.insert("from".into(), Value::Int(usize_to_i64_saturating(from)));
-    out.insert("limit".into(), Value::Int(usize_to_i64_saturating(limit)));
-    out.insert(
-        "total_facts".into(),
-        Value::Int(usize_to_i64_saturating(all.len())),
-    );
-    out.insert("items".into(), facts_value(rows));
-    out.insert("partial".into(), Value::Bool(true));
-    out.insert(
-        "partial_reason".into(),
-        Value::Str(if partial {
-            "trace result is paged; request the next page to continue reconstruction".into()
-        } else {
-            "trace result is a fact-order projection; use lineage fact and operation indexes for detailed records".into()
-        }),
-    );
-    Ok(Value::Map(out))
-}
-
-async fn lineage_fact_read(
-    sess: &WsSession,
-    principal: &ConsolePrincipal,
-    op_id: OperationId,
-) -> Result<Value, ConsoleError> {
-    authorize_fact_read(principal, Some(op_id.process.get()))?;
-    let fact = sess
-        .state
-        .boot
-        .kernel
-        .facts
-        .all_facts()?
-        .into_iter()
-        .find(|fact| fact.id == op_id)
-        .ok_or_else(|| ConsoleError::BadRequest(format!("unknown operation id: {op_id}")))?;
-    fact_detail_value(fact)
+    Ok(Value::list(rows))
 }
 
 async fn health_summary(
@@ -1699,58 +1567,58 @@ async fn health_summary(
             .and_then(Value::as_int)
             .unwrap_or(0)
             + 1;
-        process_status.insert(status, Value::Int(next));
-    }
-
-    let facts = sess.state.boot.kernel.facts.all_facts()?;
-    let mut decisions = BTreeMap::new();
-    for fact in &facts {
-        let key = format!("{:?}", fact.decision);
-        let next = decisions.get(&key).and_then(Value::as_int).unwrap_or(0) + 1;
-        decisions.insert(key, Value::Int(next));
+        process_status.insert(status, Value::integer(next));
     }
 
     let registry = registry_counts_value(sess.state.boot.kernel.registry.counts());
     let cfg = sess.state.ws.config();
     Ok(map_value([
-        ("status", Value::Str("ok".into())),
-        ("server_rev", Value::Int(server_rev(sess) as i64)),
-        ("registry_rev", Value::Int(registry_rev(sess) as i64)),
-        ("process_count", Value::Int(process_ids.len() as i64)),
-        ("process_status", Value::Map(process_status)),
-        ("fact_count", Value::Int(facts.len() as i64)),
+        ("status", Value::string("ok".into())),
+        ("server_rev", Value::integer(server_rev(sess) as i64)),
+        ("registry_rev", Value::integer(registry_rev(sess) as i64)),
+        ("process_count", Value::integer(process_ids.len() as i64)),
+        ("process_status", Value::map(process_status)),
+        (
+            "fact_sample",
+            facts::sample(&sess.state.boot.kernel.facts, cfg)?,
+        ),
         (
             "fact_cursor",
-            Value::Int(sess.state.boot.kernel.facts.cursor() as i64),
+            facts::cursor_value(sess.state.boot.kernel.facts.cursor()),
         ),
-        ("fact_decisions", Value::Map(decisions)),
         ("registry", registry),
         (
             "ws_limits",
             map_value([
-                ("max_frame_bytes", Value::Int(cfg.max_frame_bytes as i64)),
+                (
+                    "max_frame_bytes",
+                    Value::integer(cfg.max_frame_bytes as i64),
+                ),
                 (
                     "max_connections_global",
-                    Value::Int(cfg.max_connections_global as i64),
+                    Value::integer(cfg.max_connections_global as i64),
                 ),
                 (
                     "max_connections_per_source",
-                    Value::Int(cfg.max_connections_per_source as i64),
+                    Value::integer(cfg.max_connections_per_source as i64),
                 ),
                 (
                     "max_connections_per_user",
-                    Value::Int(cfg.max_connections_per_user as i64),
+                    Value::integer(cfg.max_connections_per_user as i64),
                 ),
                 (
                     "max_subscriptions",
-                    Value::Int(cfg.max_subscriptions as i64),
+                    Value::integer(cfg.max_subscriptions as i64),
                 ),
                 (
                     "max_state_list_limit",
-                    Value::Int(cfg.max_state_list_limit as i64),
+                    Value::integer(cfg.max_state_list_limit as i64),
                 ),
-                ("max_fact_limit", Value::Int(cfg.max_fact_limit as i64)),
-                ("max_trace_limit", Value::Int(cfg.max_trace_limit as i64)),
+                ("max_fact_limit", Value::integer(cfg.max_fact_limit as i64)),
+                (
+                    "max_trace_limit",
+                    Value::integer(cfg.max_trace_limit as i64),
+                ),
             ]),
         ),
     ]))
@@ -1760,15 +1628,18 @@ fn authority_principal_effective(principal: &ConsolePrincipal) -> Result<Value, 
     let grants = principal
         .grants
         .iter()
-        .map(|cap| Value::Str(cap.to_string()))
+        .map(|cap| Value::string(cap.to_string()))
         .collect::<Vec<_>>();
     let root_data_authority = serde_value(protocol::protocol_metadata(0, 0).root_data_authority)?;
     Ok(map_value([
-        ("username", Value::Str(principal.username.clone())),
-        ("identity_path", Value::Str(principal.identity_path.clone())),
-        ("mfa_level", Value::Int(i64::from(principal.mfa_level))),
-        ("grant_count", Value::Int(grants.len() as i64)),
-        ("grants", Value::List(grants)),
+        ("username", Value::string(principal.username.clone())),
+        (
+            "identity_path",
+            Value::string(principal.identity_path.clone()),
+        ),
+        ("mfa_level", Value::integer(i64::from(principal.mfa_level))),
+        ("grant_count", Value::integer(grants.len() as i64)),
+        ("grants", Value::list(grants)),
         ("root_data_authority", root_data_authority),
     ]))
 }
@@ -1782,7 +1653,7 @@ fn authority_action_matrix(
         .filter(|descriptor| domain.is_none_or(|d| descriptor.domain == d))
         .map(|descriptor| authority_action_row(principal, &descriptor))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Value::List(rows))
+    Ok(Value::list(rows))
 }
 
 fn authority_why_denied(
@@ -1837,28 +1708,31 @@ fn authority_action_row(
     let visibility = serde_value(&descriptor.visibility)?;
     let implementation_status = serde_value(&descriptor.status)?;
     Ok(map_value([
-        ("action", Value::Str(descriptor.id.clone())),
-        ("domain", Value::Str(descriptor.domain.clone())),
-        ("status", Value::Str(status.into())),
+        ("action", Value::string(descriptor.id.clone())),
+        ("domain", Value::string(descriptor.domain.clone())),
+        ("status", Value::string(status.into())),
         ("risk", risk),
         ("visibility", visibility),
         ("implementation_status", implementation_status),
-        ("authority_ok", Value::Bool(authority_ok)),
-        ("requires_step_up", Value::Bool(descriptor.requires_step_up)),
-        ("mfa_level", Value::Int(i64::from(principal.mfa_level))),
-        ("requires_visibility_gate", Value::Bool(visibility_gate)),
-        ("authority", Value::List(checks)),
+        ("authority_ok", Value::boolean(authority_ok)),
+        (
+            "requires_step_up",
+            Value::boolean(descriptor.requires_step_up),
+        ),
+        ("mfa_level", Value::integer(i64::from(principal.mfa_level))),
+        ("requires_visibility_gate", Value::boolean(visibility_gate)),
+        ("authority", Value::list(checks)),
         (
             "why",
-            Value::List(why.into_iter().map(Value::Str).collect()),
+            Value::list(why.into_iter().map(Value::string).collect()),
         ),
     ]))
 }
 
 fn authority_required_check(principal: &ConsolePrincipal, required: &RequiredAuthority) -> Value {
     let mut row = BTreeMap::new();
-    row.insert("verb".into(), Value::Str(required.verb.clone()));
-    row.insert("target".into(), Value::Str(required.target.clone()));
+    row.insert("verb".into(), Value::string(required.verb.clone()));
+    row.insert("target".into(), Value::string(required.target.clone()));
     match required_capability(required) {
         Ok(required_cap) => {
             let allowed = principal
@@ -1870,12 +1744,12 @@ fn authority_required_check(principal: &ConsolePrincipal, required: &RequiredAut
                     .grants
                     .iter()
                     .any(|grant| grant.predicate.is_some() && grant.covers_cap(&required_cap));
-            row.insert("allowed".into(), Value::Bool(allowed));
-            row.insert("conditional".into(), Value::Bool(conditional));
+            row.insert("allowed".into(), Value::boolean(allowed));
+            row.insert("conditional".into(), Value::boolean(conditional));
             if !allowed {
                 row.insert(
                     "why_not".into(),
-                    Value::Str(
+                    Value::string(
                         if conditional {
                             "matching grant is predicate-bound; action input is required"
                         } else {
@@ -1887,15 +1761,15 @@ fn authority_required_check(principal: &ConsolePrincipal, required: &RequiredAut
             }
         }
         Err(e) => {
-            row.insert("allowed".into(), Value::Bool(false));
-            row.insert("conditional".into(), Value::Bool(false));
+            row.insert("allowed".into(), Value::boolean(false));
+            row.insert("conditional".into(), Value::boolean(false));
             row.insert(
                 "why_not".into(),
-                Value::Str(format!("descriptor authority is malformed: {e:?}")),
+                Value::string(format!("descriptor authority is malformed: {e:?}")),
             );
         }
     }
-    Value::Map(row)
+    Value::map(row)
 }
 
 async fn authority_resource_access(
@@ -1918,10 +1792,10 @@ async fn authority_resource_access(
     let is_local_state = path.scheme() == "state" && path.cluster().is_none();
     if is_local_state && xolotl_types::is_vault_reserved(&path) {
         return Ok(map_value([
-            ("target", Value::Str(path.to_string())),
-            ("verb", Value::Str(verb.to_string())),
-            ("allowed", Value::Bool(false)),
-            ("why_not", Value::Str("secret_custody_required".into())),
+            ("target", Value::string(path.to_string())),
+            ("verb", Value::string(verb.to_string())),
+            ("allowed", Value::boolean(false)),
+            ("why_not", Value::string("secret_custody_required".into())),
         ]));
     }
 
@@ -1938,19 +1812,19 @@ async fn authority_resource_access(
         }
     };
     let mut row = BTreeMap::new();
-    row.insert("target".into(), Value::Str(path.to_string()));
-    row.insert("verb".into(), Value::Str(verb.to_string()));
+    row.insert("target".into(), Value::string(path.to_string()));
+    row.insert("verb".into(), Value::string(verb.to_string()));
     match result {
         Ok(via) => {
-            row.insert("allowed".into(), Value::Bool(true));
-            row.insert("via".into(), Value::Str(via.into()));
+            row.insert("allowed".into(), Value::boolean(true));
+            row.insert("via".into(), Value::string(via.into()));
         }
         Err(e) => {
-            row.insert("allowed".into(), Value::Bool(false));
-            row.insert("why_not".into(), Value::Str(e.to_string()));
+            row.insert("allowed".into(), Value::boolean(false));
+            row.insert("why_not".into(), Value::string(e.to_string()));
         }
     }
-    Ok(Value::Map(row))
+    Ok(Value::map(row))
 }
 
 async fn pairing_action(
@@ -1970,9 +1844,11 @@ async fn pairing_action(
             .map(str::to_string)
             .ok_or_else(|| ConsoleError::Operation("pairing result has no pairing_id".into()))?;
         if let Some(secret) = sess.state.pairing_display.take_display_secret(&pairing_id) {
-            match &mut out {
-                Value::Map(m) => {
-                    m.insert("display_secret".into(), Value::Str(secret));
+            match out.as_map().cloned() {
+                Some(mut m) => {
+                    m.insert("display_secret".into(), Value::string(secret))
+                        .map_err(|error| ConsoleError::Operation(error.to_string()))?;
+                    out = Value::from(m);
                 }
                 _ => {
                     return Err(ConsoleError::Operation(
@@ -2064,33 +1940,14 @@ fn bounded_limit(requested: usize, configured: usize, hard: usize) -> usize {
     requested.min(configured).min(hard)
 }
 
-fn usize_to_i64_saturating(value: usize) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
-
 fn u64_to_i64_saturating(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-#[derive(Debug)]
-enum WsSendError {
-    Transport(String),
-    Timeout,
-}
-
-impl fmt::Display for WsSendError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Transport(error) => write!(f, "transport send failed: {error}"),
-            Self::Timeout => f.write_str("transport send timed out"),
-        }
-    }
-}
-
-fn record_ws_send_error(sess: &WsSession, error: &WsSendError) {
+fn record_ws_send_error(sess: &WsSession, error: &outbound::SendError) {
     let username = sess.principal.as_ref().map(|p| p.username.as_str());
     match error {
-        WsSendError::Transport(message) => {
+        outbound::SendError::Transport(message) => {
             tracing::debug!(
                 %message,
                 username = username.unwrap_or("<anonymous>"),
@@ -2098,7 +1955,7 @@ fn record_ws_send_error(sess: &WsSession, error: &WsSendError) {
                 "console WebSocket transport send failed"
             );
         }
-        WsSendError::Timeout => {
+        outbound::SendError::Timeout | outbound::SendError::Encode(_) => {
             tracing::warn!(
                 error = %error,
                 username = username.unwrap_or("<anonymous>"),
@@ -2106,32 +1963,6 @@ fn record_ws_send_error(sess: &WsSession, error: &WsSendError) {
                 "console WebSocket frame send failed"
             );
         }
-    }
-}
-
-async fn send<S>(tx: &mut S, frame: ServerFrame) -> Result<(), WsSendError>
-where
-    S: Sink<Message> + Unpin,
-    S::Error: fmt::Display,
-{
-    let bytes = crate::wire::encode_server_frame(&frame);
-    tx.send(Message::Binary(bytes.into()))
-        .await
-        .map_err(|e| WsSendError::Transport(e.to_string()))
-}
-
-async fn send_with_timeout<S>(
-    tx: &mut S,
-    frame: ServerFrame,
-    timeout: Duration,
-) -> Result<(), WsSendError>
-where
-    S: Sink<Message> + Unpin,
-    S::Error: fmt::Display,
-{
-    match tokio::time::timeout(timeout, send(tx, frame)).await {
-        Ok(result) => result,
-        Err(_) => Err(WsSendError::Timeout),
     }
 }
 
@@ -2190,8 +2021,8 @@ impl From<xolotl_types::PathError> for ConsoleError {
     }
 }
 
-impl From<xolotl_state::StateError> for ConsoleError {
-    fn from(e: xolotl_state::StateError) -> Self {
+impl From<xolotl_state::StateFailure> for ConsoleError {
+    fn from(e: xolotl_state::StateFailure) -> Self {
         Self::Operation(e.to_string())
     }
 }
@@ -2381,19 +2212,22 @@ fn record_visibility_audit(
 ) -> Result<(), ConsoleError> {
     let mut details = BTreeMap::new();
     if let Some(scope) = audit.scope {
-        details.insert("scope".into(), Value::Str(scope.to_string()));
+        details.insert("scope".into(), Value::string(scope.to_string()));
     }
     if let Some(justification) = audit.justification {
         details.insert(
             "justification".into(),
-            Value::Str(justification.to_string()),
+            Value::string(justification.to_string()),
         );
     }
     if let Some(ttl_ms) = audit.ttl_ms {
-        details.insert("ttl_ms".into(), Value::Int(u64_to_i64_saturating(ttl_ms)));
+        details.insert(
+            "ttl_ms".into(),
+            Value::integer(u64_to_i64_saturating(ttl_ms)),
+        );
     }
     if let Some(target) = audit.target {
-        details.insert("target".into(), Value::Str(target.to_string()));
+        details.insert("target".into(), Value::string(target.to_string()));
     }
     state
         .boot
@@ -2403,7 +2237,7 @@ fn record_visibility_audit(
             source_addr,
             outcome,
             mfa_level: Some(principal.mfa_level),
-            details: Some(Value::Map(details)),
+            details: Some(Value::map(details)),
         })?;
     Ok(())
 }
@@ -2421,138 +2255,66 @@ fn ws_limit_message(limit: ConsoleWsLimit) -> String {
 }
 
 fn entries_value(entries: Vec<(String, Value)>) -> Value {
-    Value::List(
+    Value::list(
         entries
             .into_iter()
             .map(|(path, value)| {
                 let mut m = BTreeMap::new();
-                m.insert("path".into(), Value::Str(path));
+                m.insert("path".into(), Value::string(path));
                 m.insert("value".into(), value);
-                Value::Map(m)
+                Value::map(m)
             })
             .collect(),
     )
 }
 
 fn sessions_value(sessions: &[SessionSummary]) -> Value {
-    Value::List(
+    Value::list(
         sessions
             .iter()
             .map(|s| {
                 let mut m = BTreeMap::new();
-                m.insert("sid".into(), Value::Str(s.sid.clone()));
-                m.insert("username".into(), Value::Str(s.username.clone()));
-                m.insert("identity_path".into(), Value::Str(s.identity_path.clone()));
-                m.insert("issued_at".into(), Value::Int(s.issued_at));
-                m.insert("expires_at".into(), Value::Int(s.expires_at));
-                m.insert("idle_expires_at".into(), Value::Int(s.idle_expires_at));
-                m.insert("mfa_level".into(), Value::Int(s.mfa_level as i64));
-                m.insert("last_seen".into(), Value::Int(s.last_seen));
-                m.insert("source_addr".into(), Value::Str(s.source_addr.clone()));
-                Value::Map(m)
+                m.insert("sid".into(), Value::string(s.sid.clone()));
+                m.insert("username".into(), Value::string(s.username.clone()));
+                m.insert(
+                    "identity_path".into(),
+                    Value::string(s.identity_path.clone()),
+                );
+                m.insert("issued_at".into(), Value::integer(s.issued_at));
+                m.insert("expires_at".into(), Value::integer(s.expires_at));
+                m.insert("idle_expires_at".into(), Value::integer(s.idle_expires_at));
+                m.insert("mfa_level".into(), Value::integer(s.mfa_level as i64));
+                m.insert("last_seen".into(), Value::integer(s.last_seen));
+                m.insert("source_addr".into(), Value::string(s.source_addr.clone()));
+                Value::map(m)
             })
             .collect(),
     )
 }
 
-fn facts_value(facts: Vec<xolotl_types::Fact>) -> Value {
-    Value::List(facts.into_iter().map(fact_value).collect())
-}
-
-fn fact_value(f: xolotl_types::Fact) -> Value {
-    let mut m = BTreeMap::new();
-    m.insert("op_id".into(), Value::Str(f.id.to_string()));
-    m.insert("caller".into(), Value::Int(f.caller.get() as i64));
-    m.insert("acting".into(), Value::Int(f.acting.get() as i64));
-    m.insert("resource".into(), Value::Int(f.resource.get() as i64));
-    m.insert("method".into(), Value::Int(f.method.get() as i64));
-    m.insert("decision".into(), Value::Str(format!("{:?}", f.decision)));
-    m.insert("replay".into(), Value::Str(format!("{:?}", f.replay)));
-    m.insert("timestamp".into(), Value::Int(f.timestamp.get()));
-    m.insert("tainted".into(), Value::Bool(!f.taint.is_pristine()));
-    m.insert("protected".into(), Value::Bool(f.taint.has_protected()));
-    if let Some(batch) = f.batch {
-        m.insert("batch".into(), batch.to_value());
-    }
-    Value::Map(m)
-}
-
-fn fact_detail_value(f: xolotl_types::Fact) -> Result<Value, ConsoleError> {
-    let mut m = match fact_value(f.clone()) {
-        Value::Map(m) => m,
-        _ => BTreeMap::new(),
-    };
-    m.insert("schema_version".into(), Value::Int(f.schema_version as i64));
-    m.insert("handle".into(), Value::Str(f.handle.to_string()));
-    m.insert("input_ref".into(), serde_value(&f.input_ref)?);
-    m.insert("outcome_ref".into(), serde_value(&f.outcome_ref)?);
-    m.insert("partial".into(), Value::Bool(true));
-    m.insert(
-        "partial_reason".into(),
-        Value::Str(
-            "lineage fact detail excludes materialized payload, state revision, and driver endpoint projections"
-                .into(),
-        ),
-    );
-    Ok(Value::Map(m))
-}
-
 fn registry_counts_value(counts: xolotl_kernel::registry::RegistryCounts) -> Value {
     map_value([
-        ("resources", Value::Int(counts.resources as i64)),
-        ("interfaces", Value::Int(counts.interfaces as i64)),
-        ("drivers", Value::Int(counts.drivers as i64)),
-        ("endpoints", Value::Int(counts.endpoints as i64)),
-        ("bindings", Value::Int(counts.bindings as i64)),
-        ("grants", Value::Int(counts.grants as i64)),
-        ("policies", Value::Int(counts.policies as i64)),
-        ("names", Value::Int(counts.names as i64)),
+        ("resources", Value::integer(counts.resources as i64)),
+        ("interfaces", Value::integer(counts.interfaces as i64)),
+        ("drivers", Value::integer(counts.drivers as i64)),
+        ("endpoints", Value::integer(counts.endpoints as i64)),
+        ("bindings", Value::integer(counts.bindings as i64)),
+        ("grants", Value::integer(counts.grants as i64)),
+        ("policies", Value::integer(counts.policies as i64)),
+        ("names", Value::integer(counts.names as i64)),
         (
             "open_cache_entries",
-            Value::Int(counts.open_cache_entries as i64),
+            Value::integer(counts.open_cache_entries as i64),
         ),
-        ("open_cache_hits", Value::Int(counts.open_cache_hits as i64)),
+        (
+            "open_cache_hits",
+            Value::integer(counts.open_cache_hits as i64),
+        ),
         (
             "open_cache_misses",
-            Value::Int(counts.open_cache_misses as i64),
+            Value::integer(counts.open_cache_misses as i64),
         ),
     ])
-}
-
-fn state_event(ev: StateEvent) -> ConsoleEvent {
-    match ev {
-        StateEvent::Set { path, value, .. } => ConsoleEvent::StateSet {
-            path: path.to_string(),
-            value,
-        },
-        StateEvent::Append { path, item, .. } => ConsoleEvent::StateAppend {
-            path: path.to_string(),
-            item,
-        },
-        StateEvent::Delete { path } => ConsoleEvent::StateDelete {
-            path: path.to_string(),
-        },
-    }
-}
-
-async fn send_subscription_closed(
-    event_tx: &mpsc::Sender<SubscriptionMessage>,
-    stream: u64,
-    reason: String,
-) {
-    if event_tx
-        .send(SubscriptionMessage {
-            stream,
-            event: ConsoleEvent::SubscriptionClosed { reason },
-        })
-        .await
-        .is_err()
-    {
-        tracing::debug!(
-            stream,
-            "console subscription owner closed before close event could be delivered"
-        );
-    }
 }
 
 fn validate_upgrade_headers(
@@ -3028,33 +2790,31 @@ fn fact_path(process: u64) -> Result<Path, ConsoleError> {
 }
 
 fn reject_secret_fields(input: &Value) -> Result<(), ConsoleError> {
+    use std::collections::BTreeSet;
+    use xolotl_types::value::traversal::{ValueNodeKey, ValuePostorder};
+    if !matches!(input.view(), ValueView::Map(_) | ValueView::List(_)) {
+        return Ok(());
+    }
     let denied = ["pairing_secret", "secret", "raw_secret", "sas_verified"];
-    let mut stack = vec![input];
-    while let Some(value) = stack.pop() {
-        match value {
-            Value::Map(map) => {
-                for (k, v) in map {
-                    if denied.iter().any(|field| field == k) {
-                        return Err(ConsoleError::BadRequest(format!(
-                            "{k} is not accepted in console pairing input"
-                        )));
-                    }
-                    stack.push(v);
+    let mut visited = BTreeSet::new();
+    let mut walk = ValuePostorder::new(input);
+    while let Some(node) = walk.next(|key| visited.contains(&key)) {
+        if let Some(map) = node.as_map() {
+            for key in map.keys() {
+                if denied.contains(&key) {
+                    return Err(ConsoleError::BadRequest(format!(
+                        "{key} is not accepted in console pairing input"
+                    )));
                 }
             }
-            Value::List(items) => {
-                for item in items {
-                    stack.push(item);
-                }
-            }
-            _ => {}
         }
+        visited.insert(ValueNodeKey::of(node));
     }
     Ok(())
 }
 
 fn map_value(items: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
-    Value::Map(
+    Value::map(
         items
             .into_iter()
             .map(|(key, value)| (key.to_string(), value))
@@ -3141,19 +2901,18 @@ fn input_value(input: &Value) -> Result<Value, ConsoleError> {
     Ok(input.clone())
 }
 
-fn input_map(input: Value) -> Result<BTreeMap<String, Value>, ConsoleError> {
-    match input {
-        Value::Null => Ok(BTreeMap::new()),
-        Value::Map(m) => Ok(m),
-        _ => Err(ConsoleError::BadRequest(
-            "console action input must be a map".into(),
-        )),
+fn input_map(input: Value) -> Result<ValueMap, ConsoleError> {
+    if input.is_null() {
+        return Ok(ValueMap::new());
     }
+    input
+        .into_map()
+        .ok_or_else(|| ConsoleError::BadRequest("console action input must be a map".into()))
 }
 
-fn string_arg(input: &mut BTreeMap<String, Value>, name: &str) -> Result<String, ConsoleError> {
-    match input.remove(name) {
-        Some(Value::Str(s)) if !s.is_empty() => Ok(s),
+fn string_arg(input: &mut ValueMap, name: &str) -> Result<String, ConsoleError> {
+    match input.remove(name).as_ref().map(Value::view) {
+        Some(ValueView::Str(s)) if !s.is_empty() => Ok(s.to_owned()),
         Some(_) => Err(ConsoleError::BadRequest(format!(
             "{name} must be a non-empty string"
         ))),
@@ -3161,89 +2920,48 @@ fn string_arg(input: &mut BTreeMap<String, Value>, name: &str) -> Result<String,
     }
 }
 
-fn optional_string_arg(
-    input: &mut BTreeMap<String, Value>,
-    name: &str,
-) -> Result<Option<String>, ConsoleError> {
-    match input.remove(name) {
-        Some(Value::Null) | None => Ok(None),
-        Some(Value::Str(s)) if !s.is_empty() => Ok(Some(s)),
+fn optional_string_arg(input: &mut ValueMap, name: &str) -> Result<Option<String>, ConsoleError> {
+    match input.remove(name).as_ref().map(Value::view) {
+        Some(ValueView::Null) | None => Ok(None),
+        Some(ValueView::Str(s)) if !s.is_empty() => Ok(Some(s.to_owned())),
         Some(_) => Err(ConsoleError::BadRequest(format!(
             "{name} must be a non-empty string"
         ))),
     }
 }
 
-fn value_arg(input: &mut BTreeMap<String, Value>, name: &str) -> Result<Value, ConsoleError> {
+fn value_arg(input: &mut ValueMap, name: &str) -> Result<Value, ConsoleError> {
     input
         .remove(name)
         .ok_or_else(|| ConsoleError::BadRequest(format!("{name} is required")))
 }
 
 fn parse_operation_id(raw: &str) -> Result<OperationId, ConsoleError> {
-    let mut parts = raw.split('/');
-    let process = parts
-        .next()
-        .ok_or_else(|| ConsoleError::BadRequest("op_id must be process/position/attempt".into()))?
-        .parse::<u64>()
-        .map_err(|_error| ConsoleError::BadRequest("op_id process must be u64".into()))?;
-    let position = parts
-        .next()
-        .ok_or_else(|| ConsoleError::BadRequest("op_id must be process/position/attempt".into()))?
-        .parse::<u32>()
-        .map_err(|_error| ConsoleError::BadRequest("op_id position must be u32".into()))?;
-    let attempt = parts
-        .next()
-        .ok_or_else(|| ConsoleError::BadRequest("op_id must be process/position/attempt".into()))?
-        .parse::<u32>()
-        .map_err(|_error| ConsoleError::BadRequest("op_id attempt must be u32".into()))?;
-    if parts.next().is_some() {
-        return Err(ConsoleError::BadRequest(
-            "op_id must be process/position/attempt".into(),
-        ));
-    }
-    Ok(OperationId::new(
-        ProcessId::new(process),
-        NodeId::new(position),
-        attempt,
-    ))
+    raw.parse()
+        .map_err(|error| ConsoleError::BadRequest(format!("invalid op_id: {error}")))
 }
 
-fn u64_arg(input: &mut BTreeMap<String, Value>, name: &str) -> Result<u64, ConsoleError> {
-    optional_u64_arg(input, name)?
-        .ok_or_else(|| ConsoleError::BadRequest(format!("{name} is required")))
-}
-
-fn optional_u64_arg(
-    input: &mut BTreeMap<String, Value>,
-    name: &str,
-) -> Result<Option<u64>, ConsoleError> {
-    match input.remove(name) {
-        Some(Value::Null) | None => Ok(None),
-        Some(Value::Int(i)) if i >= 0 => Ok(Some(i as u64)),
+fn optional_u64_arg(input: &mut ValueMap, name: &str) -> Result<Option<u64>, ConsoleError> {
+    match input.remove(name).as_ref().map(Value::view) {
+        Some(ValueView::Null) | None => Ok(None),
+        Some(ValueView::Int(i)) if i >= 0 => Ok(Some(i as u64)),
         Some(_) => Err(ConsoleError::BadRequest(format!(
             "{name} must be a non-negative integer"
         ))),
     }
 }
 
-fn optional_i64_arg(
-    input: &mut BTreeMap<String, Value>,
-    name: &str,
-) -> Result<Option<i64>, ConsoleError> {
-    match input.remove(name) {
-        Some(Value::Null) | None => Ok(None),
-        Some(Value::Int(i)) => Ok(Some(i)),
+fn optional_i64_arg(input: &mut ValueMap, name: &str) -> Result<Option<i64>, ConsoleError> {
+    match input.remove(name).as_ref().map(Value::view) {
+        Some(ValueView::Null) | None => Ok(None),
+        Some(ValueView::Int(i)) => Ok(Some(i)),
         Some(_) => Err(ConsoleError::BadRequest(format!(
             "{name} must be an integer"
         ))),
     }
 }
 
-fn optional_usize_arg(
-    input: &mut BTreeMap<String, Value>,
-    name: &str,
-) -> Result<Option<usize>, ConsoleError> {
+fn optional_usize_arg(input: &mut ValueMap, name: &str) -> Result<Option<usize>, ConsoleError> {
     optional_u64_arg(input, name)?
         .map(|v| {
             usize::try_from(v)
@@ -3269,26 +2987,20 @@ fn validate_external_installation_def(id: &str, value: &Value) -> Result<(), Con
     })
 }
 
-fn optional_bool_arg(
-    input: &mut BTreeMap<String, Value>,
-    name: &str,
-) -> Result<Option<bool>, ConsoleError> {
-    match input.remove(name) {
-        Some(Value::Null) | None => Ok(None),
-        Some(Value::Bool(b)) => Ok(Some(b)),
+fn optional_bool_arg(input: &mut ValueMap, name: &str) -> Result<Option<bool>, ConsoleError> {
+    match input.remove(name).as_ref().map(Value::view) {
+        Some(ValueView::Null) | None => Ok(None),
+        Some(ValueView::Bool(b)) => Ok(Some(b)),
         Some(_) => Err(ConsoleError::BadRequest(format!("{name} must be a bool"))),
     }
 }
 
-fn string_list_arg(
-    input: &mut BTreeMap<String, Value>,
-    name: &str,
-) -> Result<Vec<String>, ConsoleError> {
-    match input.remove(name) {
-        Some(Value::List(items)) => items
-            .into_iter()
-            .map(|item| match item {
-                Value::Str(s) if !s.is_empty() => Ok(s),
+fn string_list_arg(input: &mut ValueMap, name: &str) -> Result<Vec<String>, ConsoleError> {
+    match input.remove(name).as_ref().map(Value::view) {
+        Some(ValueView::List(items)) => items
+            .iter()
+            .map(|item| match item.view() {
+                ValueView::Str(s) if !s.is_empty() => Ok(s.to_owned()),
                 _ => Err(ConsoleError::BadRequest(format!(
                     "{name} must be a list of non-empty strings"
                 ))),
@@ -3357,9 +3069,33 @@ mod tests {
         Ok(axum::http::HeaderValue::from_bytes(b"\xff")?)
     }
 
-    struct FailingFactStore;
+    #[derive(Default)]
+    struct FailingFactStore(xolotl_kernel::InMemoryExecutionIdSource);
+
+    impl xolotl_kernel::ExecutionIdSource for FailingFactStore {
+        fn reserve(
+            &self,
+            count: std::num::NonZeroU64,
+        ) -> Result<xolotl_kernel::ExecutionIdRange, xolotl_kernel::ExecutionIdError> {
+            self.0.reserve(count)
+        }
+    }
 
     impl xolotl_kernel::FactStore for FailingFactStore {
+        fn scan(
+            &self,
+            _query: xolotl_kernel::FactQuery,
+        ) -> Result<xolotl_kernel::FactPage, xolotl_kernel::FactError> {
+            Err(xolotl_kernel::FactError("unexpected fact scan".into()))
+        }
+
+        fn lookup(
+            &self,
+            _query: xolotl_kernel::FactLookup,
+        ) -> Result<xolotl_kernel::FactLookupResult, xolotl_kernel::FactError> {
+            Err(xolotl_kernel::FactError("unexpected fact lookup".into()))
+        }
+
         fn append(&self, _fact: xolotl_types::Fact) -> Result<u64, xolotl_kernel::FactError> {
             Err(xolotl_kernel::FactError("simulated append failure".into()))
         }
@@ -3378,11 +3114,15 @@ mod tests {
             &self,
             _process: xolotl_types::ProcessId,
         ) -> Result<Vec<xolotl_types::Fact>, xolotl_kernel::FactError> {
-            Ok(Vec::new())
+            Err(xolotl_kernel::FactError(
+                "unexpected unbounded fact read".into(),
+            ))
         }
 
         fn all_facts(&self) -> Result<Vec<xolotl_types::Fact>, xolotl_kernel::FactError> {
-            Ok(Vec::new())
+            Err(xolotl_kernel::FactError(
+                "unexpected unbounded fact read".into(),
+            ))
         }
 
         fn cursor(&self) -> u64 {
@@ -3406,11 +3146,19 @@ mod tests {
             .facts
             .all_facts()?
             .into_iter()
-            .filter_map(|fact| match fact.outcome_ref {
-                xolotl_types::OutcomeRef::Inline(Value::Map(m))
-                    if m.get("event").and_then(Value::as_str) == Some(event) =>
+            .filter_map(|fact| match fact.outcome {
+                Some(value)
+                    if value
+                        .as_map()
+                        .and_then(|m| m.get("event"))
+                        .and_then(Value::as_str)
+                        == Some(event) =>
                 {
-                    m.get("outcome").and_then(Value::as_str).map(str::to_string)
+                    value
+                        .as_map()
+                        .and_then(|m| m.get("outcome"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
                 }
                 _ => None,
             })
@@ -3418,6 +3166,7 @@ mod tests {
     }
 
     fn test_session(st: Arc<ConsoleState>, principal: ConsolePrincipal) -> WsSession {
+        let subscriptions = Subscriptions::new(st.ws.config());
         WsSession {
             state: st,
             principal: Some(principal),
@@ -3425,8 +3174,7 @@ mod tests {
             hello_accepted: true,
             source_addr: "test".into(),
             counted_user: None,
-            subscriptions: BTreeMap::new(),
-            event_tx: mpsc::channel(1).0,
+            subscriptions,
             rate: FrameRate::default(),
         }
     }
@@ -3442,7 +3190,7 @@ mod tests {
     }
 
     fn unauth_session(st: Arc<ConsoleState>) -> WsSession {
-        let (tx, _rx) = mpsc::channel(1);
+        let subscriptions = Subscriptions::new(st.ws.config());
         WsSession {
             state: st,
             principal: None,
@@ -3450,8 +3198,7 @@ mod tests {
             hello_accepted: false,
             source_addr: "test".into(),
             counted_user: None,
-            subscriptions: BTreeMap::new(),
-            event_tx: tx,
+            subscriptions,
             rate: FrameRate::default(),
         }
     }
@@ -3466,9 +3213,79 @@ mod tests {
     }
 
     #[test]
+    fn refreshed_authority_cannot_inherit_a_previous_session() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let previous = root_principal()?;
+        let mut candidates = vec![previous.clone(); 4];
+        candidates[0].username = "another-user".into();
+        candidates[1].identity_path = "identity://another-user".into();
+        candidates[2].grants = xolotl_types::CapSet::default();
+        candidates[3].mfa_level = 1;
+        for principal in candidates {
+            let mut sess = test_session(st.clone(), previous.clone());
+            let frame = match refresh_principal(&mut sess, principal, Some(7)) {
+                Ok(_) => bail!("changed authority was accepted"),
+                Err(frame) => frame,
+            };
+            ensure!(matches!(
+                *frame,
+                ServerFrame::Error {
+                    id: Some(7),
+                    code: ConsoleErrorCode::Forbidden,
+                    ..
+                }
+            ));
+            ensure!(sess.sid.is_none());
+            ensure!(should_close_after_reply(&sess, &frame));
+            ensure!(sess.principal.as_ref() == Some(&previous));
+        }
+        let mut sess = test_session(st, previous.clone());
+        ensure!(refresh_principal(&mut sess, previous, None).is_ok());
+        ensure!(sess.sid.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_auth_joins_and_clears_previous_subscriptions() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let (token, mut previous, _password) = root_login(&st).await?;
+        previous.username = "previous-user".into();
+        let mut sess = test_session(st, previous);
+        let (source, receiver) = tokio::sync::broadcast::channel(2);
+        sess.subscriptions
+            .replace(
+                9,
+                receiver,
+                |_| {
+                    Ok(Some(ConsoleEvent::Audit {
+                        fact: Value::integer(1),
+                    }))
+                },
+                "test",
+                tokio::time::Instant::now() + Duration::from_secs(60),
+            )
+            .await?;
+        source.send(())?;
+        let reply = handle_frame(&mut sess, ClientFrame::Auth { token }).await;
+        ensure!(matches!(reply, ServerFrame::Authenticated { .. }));
+        ensure!(
+            source.receiver_count() == 0,
+            "previous worker survived authentication"
+        );
+        ensure!(sess.subscriptions.len() == 0);
+        ensure!(
+            tokio::time::timeout(Duration::from_millis(10), sess.subscriptions.next())
+                .await
+                .is_err(),
+            "old queued data survived authentication"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn visibility_audit_fact_failure_is_not_swallowed() -> anyhow::Result<()> {
-        let facts = xolotl_kernel::FactSink::new(Arc::new(FailingFactStore));
-        let state: xolotl_state::Backend = Arc::new(xolotl_state::InMemoryBackend::new());
+        let facts = xolotl_kernel::FactSink::new(Arc::new(FailingFactStore::default()));
+        let state: xolotl_state::Backend = xolotl_state::InMemoryBackend::new().into_backend();
         let boot = Arc::new(Bootstrap::from_kernel(
             xolotl_kernel::Kernel::with_backends(state, facts),
         ));
@@ -3581,8 +3398,8 @@ mod tests {
                 args: vec![],
             },
             trust: TrustLevel::Sandboxed,
-            config_schema: Value::Null,
-            config: Value::Null,
+            config_schema: Value::null(),
+            config: Value::null(),
             projections: vec![ExternalProjectionDef {
                 id: "provider".into(),
                 role: Role::Provider,
@@ -3607,6 +3424,8 @@ mod tests {
             default_headers: BTreeMap::new(),
             request_overrides: BTreeMap::new(),
             api_version: None,
+            io_window_bytes: None,
+            response_limits: Default::default(),
             version: 0,
         };
         Ok(serde_json::from_value(serde_json::to_value(def)?)?)
@@ -3686,11 +3505,11 @@ mod tests {
 
     #[test]
     fn pairing_input_rejects_secret_fields_inside_lists() {
-        let input = Value::List(vec![map_value([(
+        let input = Value::list(vec![map_value([(
             "nested",
-            Value::List(vec![map_value([(
+            Value::list(vec![map_value([(
                 "pairing_secret",
-                Value::Str("do-not-accept".into()),
+                Value::string("do-not-accept".into()),
             )])]),
         )])]);
         assert!(matches!(
@@ -3701,7 +3520,7 @@ mod tests {
 
     #[test]
     fn pairing_input_rejects_untrusted_claim_field() {
-        let input = map_value([("sas_verified", Value::Bool(true))]);
+        let input = map_value([("sas_verified", Value::boolean(true))]);
         assert!(matches!(
             reject_secret_fields(&input),
             Err(ConsoleError::BadRequest(_))
@@ -3717,18 +3536,18 @@ mod tests {
                 map_value([
                     (
                         "sections",
-                        Value::List(vec![
+                        Value::list(vec![
                             map_value([
-                                ("kind", Value::Str("kernel_config".into())),
-                                ("prefix", Value::Str("state://kernel/audit".into())),
+                                ("kind", Value::string("kernel_config".into())),
+                                ("prefix", Value::string("state://kernel/audit".into())),
                             ]),
                             map_value([
-                                ("kind", Value::Str("runtime".into())),
-                                ("limit", Value::Int(8)),
+                                ("kind", Value::string("runtime".into())),
+                                ("limit", Value::integer(8)),
                             ]),
                         ]),
                     ),
-                    ("since_rev", Value::Int(3)),
+                    ("since_rev", Value::integer(3)),
                 ]),
             )?,
         };
@@ -3740,9 +3559,9 @@ mod tests {
         // The server frame path also encodes to a decodable protobuf envelope.
         let reply = ServerFrame::Reply {
             id: 7,
-            result: ActionResult::value(Value::Str("ok".into()), 11),
+            result: ActionResult::value(Value::string("ok".into()), 11),
         };
-        let server_bytes = crate::wire::encode_server_frame(&reply);
+        let server_bytes = crate::wire::encode_server_frame(&reply, HARD_MAX_WS_FRAME_BYTES)?;
         let server_frame = crate::wire::decode_server_frame(&server_bytes)
             .map_err(|message| anyhow::anyhow!(message))?;
         ensure!(
@@ -3825,7 +3644,7 @@ mod tests {
             &mut sess,
             ClientFrame::Call {
                 id: 42,
-                call: call(ACTION_PROTOCOL_DESCRIBE, Value::Null)?,
+                call: call(ACTION_PROTOCOL_DESCRIBE, Value::null())?,
             },
         )
         .await;
@@ -3906,7 +3725,7 @@ mod tests {
                 id: 11,
                 call: call(
                     ACTION_PAIRING_DENY,
-                    map_value([("pairing_id", Value::Str("pair-ws".into()))]),
+                    map_value([("pairing_id", Value::string("pair-ws".into()))]),
                 )?,
             },
         )
@@ -3945,7 +3764,7 @@ mod tests {
                     ACTION_CONFIG_READ,
                     map_value([(
                         "path",
-                        Value::Str("state://vault/console/root/password".into()),
+                        Value::string("state://vault/console/root/password".into()),
                     )]),
                 )?,
             },
@@ -3994,7 +3813,7 @@ mod tests {
             &mut sess,
             ClientFrame::Call {
                 id: 13,
-                call: visibility_call(ACTION_SECRET_REVEAL, Value::Null)?,
+                call: visibility_call(ACTION_SECRET_REVEAL, Value::null())?,
             },
         )
         .await;
@@ -4051,39 +3870,39 @@ mod tests {
     #[test]
     fn protocol_action_calls_are_protobuf_frames() -> anyhow::Result<()> {
         let actions = vec![
-            call(ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE, Value::Null)?,
-            call(ACTION_AUTHORITY_ACTION_MATRIX, Value::Null)?,
+            call(ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE, Value::null())?,
+            call(ACTION_AUTHORITY_ACTION_MATRIX, Value::null())?,
             call(
                 ACTION_AUTHORITY_WHY_DENIED,
-                map_value([("action", Value::Str(ACTION_CONFIG_WRITE_CAS.into()))]),
+                map_value([("action", Value::string(ACTION_CONFIG_WRITE_CAS.into()))]),
             )?,
-            call(ACTION_ACCESS_USER_LIST, Value::Null)?,
-            call(ACTION_ACCESS_ROLE_LIST, Value::Null)?,
-            call(ACTION_ACCESS_SESSION_LIST, Value::Null)?,
+            call(ACTION_ACCESS_USER_LIST, Value::null())?,
+            call(ACTION_ACCESS_ROLE_LIST, Value::null())?,
+            call(ACTION_ACCESS_SESSION_LIST, Value::null())?,
             call(
                 ACTION_AUDIT_FACTS_RECENT,
-                map_value([("limit", Value::Int(10))]),
+                map_value([("limit", Value::integer(10))]),
             )?,
             call(
                 ACTION_LINEAGE_TRACE_READ,
                 map_value([
-                    ("process", Value::Int(1)),
-                    ("from", Value::Int(0)),
-                    ("limit", Value::Int(10)),
+                    ("process", Value::integer(1)),
+                    ("from", Value::integer(0)),
+                    ("limit", Value::integer(10)),
                 ]),
             )?,
             call(
                 ACTION_LINEAGE_FACT_READ,
-                map_value([("op_id", Value::Str("1/0/0".into()))]),
+                map_value([("op_id", Value::string("1/1/1/0/0".into()))]),
             )?,
-            call(ACTION_HEALTH_SUMMARY, Value::Null)?,
+            call(ACTION_HEALTH_SUMMARY, Value::null())?,
             call(
                 ACTION_EXTERNAL_INSTALLATION_START,
-                map_value([("id", Value::Str("acme".into()))]),
+                map_value([("id", Value::string("acme".into()))]),
             )?,
             call(
                 ACTION_PAIRING_DENY,
-                map_value([("pairing_id", Value::Str("pair-a".into()))]),
+                map_value([("pairing_id", Value::string("pair-a".into()))]),
             )?,
         ];
         for (idx, call) in actions.into_iter().enumerate() {
@@ -4103,7 +3922,7 @@ mod tests {
             id: 1,
             stream: StreamCall {
                 stream: STREAM_STATE_WATCH.into(),
-                input: map_value([("pattern", Value::Str("state://kernel/**".into()))]),
+                input: map_value([("pattern", Value::string("state://kernel/**".into()))]),
                 scope: Some("test".into()),
                 justification: Some("test stream".into()),
                 ttl_ms: Some(60_000),
@@ -4133,9 +3952,9 @@ mod tests {
             call(
                 ACTION_EXTERNAL_INSTALLATION_INSTALL,
                 map_value([
-                    ("id", Value::Str("acme".into())),
+                    ("id", Value::string("acme".into())),
                     ("def", extension_installation("acme", 0)?),
-                    ("expected_version", Value::Null),
+                    ("expected_version", Value::null()),
                 ]),
             )?,
         )
@@ -4146,8 +3965,9 @@ mod tests {
             visibility_call(
                 ACTION_RUNTIME_PROCESS_INSPECT,
                 map_value([
-                    ("include_recent_facts", Value::Bool(true)),
-                    ("limit", Value::Int(8)),
+                    ("process", Value::string("7".into())),
+                    ("include_recent_facts", Value::boolean(true)),
+                    ("limit", Value::integer(8)),
                 ]),
             )?,
         )
@@ -4158,13 +3978,13 @@ mod tests {
             &principal,
             visibility_call(
                 ACTION_AUDIT_FACTS_RECENT,
-                map_value([("limit", Value::Int(16))]),
+                map_value([("limit", Value::integer(16))]),
             )?,
         )
         .await?;
         ensure!(
-            matches!(output_value(facts)?, Value::List(_)),
-            "recent facts output was not a list"
+            matches!((output_value(facts)?).view(), ValueView::Map(page) if matches!(page.get("items").map(Value::view), Some(ValueView::List(_)))),
+            "recent facts output was not a page"
         );
         Ok(())
     }
@@ -4190,7 +4010,7 @@ mod tests {
         let result = dispatch_call(
             &mut sess,
             &principal,
-            call(ACTION_PROTOCOL_DESCRIBE, Value::Null)?,
+            call(ACTION_PROTOCOL_DESCRIBE, Value::null())?,
         )
         .await
         .map_err(|error| anyhow::anyhow!("metadata action failed: {error:?}"))?;
@@ -4217,17 +4037,17 @@ mod tests {
             &principal,
             call(
                 ACTION_AUTHORITY_ACTION_MATRIX,
-                map_value([("domain", Value::Str("visibility".into()))]),
+                map_value([("domain", Value::string("visibility".into()))]),
             )?,
         )
         .await?;
-        let Value::List(rows) = output_value(out)? else {
+        let Some(rows) = (output_value(out)?).into_list() else {
             bail!("expected matrix rows");
         };
         ensure!(
             rows.iter().any(|row| {
                 row.as_map().is_some_and(
-                    |m| matches!(m.get("status"), Some(Value::Str(s)) if s == "step_up_required"),
+                    |m| matches!(m.get("status").map(Value::view), Some(ValueView::Str(s)) if s == "step_up_required"),
                 )
             }),
             "matrix did not report step_up_required"
@@ -4240,18 +4060,18 @@ mod tests {
             &principal,
             call(
                 ACTION_AUTHORITY_ACTION_MATRIX,
-                map_value([("domain", Value::Str("visibility".into()))]),
+                map_value([("domain", Value::string("visibility".into()))]),
             )?,
         )
         .await?;
-        let Value::List(rows) = output_value(out)? else {
+        let Some(rows) = (output_value(out)?).into_list() else {
             bail!("expected matrix rows");
         };
         ensure!(
             rows.iter().any(|row| {
             row.as_map().is_some_and(|m| {
-                matches!(m.get("action"), Some(Value::Str(a)) if a == ACTION_VISIBILITY_STATE_READ)
-                    && matches!(m.get("status"), Some(Value::Str(s)) if s == "visibility_gate_required")
+                matches!(m.get("action").map(Value::view), Some(ValueView::Str(a)) if a == ACTION_VISIBILITY_STATE_READ)
+                    && matches!(m.get("status").map(Value::view), Some(ValueView::Str(s)) if s == "visibility_gate_required")
             })
             }),
             "matrix did not report visibility gate"
@@ -4269,12 +4089,12 @@ mod tests {
             dispatch_call(
                 &mut sess,
                 &principal,
-                call(ACTION_RESOURCE_TYPE_LIST, Value::Null)?,
+                call(ACTION_RESOURCE_TYPE_LIST, Value::null())?,
             )
             .await?,
         )?;
         ensure!(
-            matches!(list, Value::List(items) if !items.is_empty()),
+            matches!(list.view(), ValueView::List(items) if !items.is_empty()),
             "resource type list was empty or not a list"
         );
 
@@ -4284,21 +4104,21 @@ mod tests {
                 &principal,
                 call(
                     ACTION_RESOURCE_TYPE_DESCRIBE,
-                    map_value([("resource_type", Value::Str("access.user".into()))]),
+                    map_value([("resource_type", Value::string("access.user".into()))]),
                 )?,
             )
             .await?,
         )?;
-        let Value::Map(descriptor) = descriptor else {
+        let Some(descriptor) = (descriptor).into_map() else {
             bail!("expected resource descriptor map");
         };
-        let Some(Value::List(fields)) = descriptor.get("fields") else {
+        let Some(fields) = descriptor.get("fields").and_then(Value::as_list) else {
             bail!("resource descriptor fields missing");
         };
         ensure!(
             fields.iter().any(|field| {
                 field.as_map().is_some_and(|map| {
-                matches!(map.get("semantic_kind"), Some(Value::Str(kind)) if kind == "resource_ref")
+                matches!(map.get("semantic_kind").map(Value::view), Some(ValueView::Str(kind)) if kind == "resource_ref")
             })
             }),
             "resource descriptor did not include a resource_ref field"
@@ -4310,13 +4130,13 @@ mod tests {
                 &principal,
                 call(
                     ACTION_RESOURCE_VIEW_DESCRIBE,
-                    map_value([("view", Value::Str("access.users".into()))]),
+                    map_value([("view", Value::string("access.users".into()))]),
                 )?,
             )
             .await?,
         )?;
         ensure!(
-            matches!(view, Value::Map(map) if map.get("resource_type") == Some(&Value::Str("access.user".into()))),
+            matches!(view.view(), ValueView::Map(map) if map.get("resource_type") == Some(&Value::string("access.user".into()))),
             "resource view descriptor did not target access.user"
         );
         Ok(())
@@ -4332,7 +4152,7 @@ mod tests {
             &principal,
             call(
                 ACTION_CHANGE_SET_CREATE,
-                map_value([("registry_rev", Value::Int(1))]),
+                map_value([("registry_rev", Value::integer(1))]),
             )?,
         )
         .await;
@@ -4351,18 +4171,18 @@ mod tests {
                 &principal,
                 call(
                     ACTION_AUTHORITY_ACTION_MATRIX,
-                    map_value([("domain", Value::Str("change_set".into()))]),
+                    map_value([("domain", Value::string("change_set".into()))]),
                 )?,
             )
             .await?,
         )?;
-        let Value::List(rows) = matrix else {
+        let Some(rows) = (matrix).into_list() else {
             bail!("expected matrix rows");
         };
         ensure!(
             rows.iter().all(|row| {
                 row.as_map()
-                    .is_some_and(|map| map.get("status") == Some(&Value::Str("planned".into())))
+                    .is_some_and(|map| map.get("status") == Some(&Value::string("planned".into())))
             }),
             "planned domain status mismatch"
         );
@@ -4382,18 +4202,18 @@ mod tests {
                 map_value([
                     (
                         "target",
-                        Value::Str("state://chat/source/messages/1".into()),
+                        Value::string("state://chat/source/messages/1".into()),
                     ),
-                    ("verb", Value::Str("read".into())),
+                    ("verb", Value::string("read".into())),
                 ]),
             )?,
         )
         .await?;
-        let Value::Map(row) = output_value(out)? else {
+        let Some(row) = (output_value(out)?).into_map() else {
             bail!("expected map");
         };
         ensure!(
-            row.get("allowed") == Some(&Value::Bool(true)),
+            row.get("allowed") == Some(&Value::boolean(true)),
             "business state read should be allowed"
         );
 
@@ -4405,22 +4225,22 @@ mod tests {
                 map_value([
                     (
                         "target",
-                        Value::Str("state://vault/console/root/password".into()),
+                        Value::string("state://vault/console/root/password".into()),
                     ),
-                    ("verb", Value::Str("read".into())),
+                    ("verb", Value::string("read".into())),
                 ]),
             )?,
         )
         .await?;
-        let Value::Map(row) = output_value(out)? else {
+        let Some(row) = (output_value(out)?).into_map() else {
             bail!("expected map");
         };
         ensure!(
-            row.get("allowed") == Some(&Value::Bool(false)),
+            row.get("allowed") == Some(&Value::boolean(false)),
             "vault read should not be allowed"
         );
         ensure!(
-            row.get("why_not") == Some(&Value::Str("secret_custody_required".into())),
+            row.get("why_not") == Some(&Value::string("secret_custody_required".into())),
             "vault read should require secret custody"
         );
         Ok(())
@@ -4436,15 +4256,15 @@ mod tests {
             &principal,
             call(
                 ACTION_AUTHORITY_WHY_DENIED,
-                map_value([("action", Value::Str(ACTION_PAIRING_DENY.into()))]),
+                map_value([("action", Value::string(ACTION_PAIRING_DENY.into()))]),
             )?,
         )
         .await?;
-        let Value::Map(row) = output_value(out)? else {
+        let Some(row) = (output_value(out)?).into_map() else {
             bail!("expected map");
         };
         ensure!(
-            row.get("status") == Some(&Value::Str("step_up_required".into())),
+            row.get("status") == Some(&Value::string("step_up_required".into())),
             "why-denied did not report step_up_required"
         );
         Ok(())
@@ -4458,28 +4278,45 @@ mod tests {
         let out = dispatch_call(
             &mut sess,
             &principal,
-            call(ACTION_HEALTH_SUMMARY, Value::Null)?,
+            call(ACTION_HEALTH_SUMMARY, Value::null())?,
         )
         .await?;
-        let Value::Map(row) = output_value(out)? else {
+        let Some(row) = (output_value(out)?).into_map() else {
             bail!("expected map");
         };
         ensure!(
-            row.get("status") == Some(&Value::Str("ok".into())),
+            row.get("status") == Some(&Value::string("ok".into())),
             "health status was not ok"
         );
         ensure!(
-            matches!(row.get("registry"), Some(Value::Map(_))),
+            matches!(
+                row.get("registry").map(Value::view),
+                Some(ValueView::Map(_))
+            ),
             "health summary missing registry map"
         );
         ensure!(
-            matches!(row.get("process_status"), Some(Value::Map(_))),
+            matches!(
+                row.get("process_status").map(Value::view),
+                Some(ValueView::Map(_))
+            ),
             "health summary missing process_status map"
         );
         ensure!(
-            matches!(row.get("fact_cursor"), Some(Value::Int(_))),
+            matches!(
+                row.get("fact_cursor").map(Value::view),
+                Some(ValueView::Str(_))
+            ),
             "health summary missing fact_cursor"
         );
+        let sample = row
+            .get("fact_sample")
+            .and_then(Value::as_map)
+            .context("health fact sample")?;
+        ensure!(sample.get("order").and_then(Value::as_str) == Some("reverse"));
+        ensure!(sample.contains_key("sampled_facts") && sample.contains_key("decisions"));
+        ensure!(sample.contains_key("next") && sample.contains_key("complete"));
+        ensure!(!row.contains_key("fact_count") && !row.contains_key("fact_decisions"));
         Ok(())
     }
 
@@ -4491,7 +4328,7 @@ mod tests {
         st.state
             .write_set(
                 &Path::parse("state://chat/source/messages/lineage")?,
-                Value::Str("lineage fact source".into()),
+                Value::string("lineage fact source".into()),
             )
             .await?;
         let mut sess = test_session(st.clone(), principal.clone());
@@ -4502,7 +4339,7 @@ mod tests {
                 ACTION_VISIBILITY_STATE_READ,
                 map_value([(
                     "path",
-                    Value::Str("state://chat/source/messages/lineage".into()),
+                    Value::string("state://chat/source/messages/lineage".into()),
                 )]),
             )?,
         )
@@ -4518,7 +4355,7 @@ mod tests {
             &principal,
             call(
                 ACTION_LINEAGE_FACT_READ,
-                map_value([("op_id", Value::Str(op_id.clone()))]),
+                map_value([("op_id", Value::string(op_id.clone()))]),
             )?,
         )
         .await
@@ -4536,33 +4373,117 @@ mod tests {
             &principal,
             visibility_call(
                 ACTION_LINEAGE_FACT_READ,
-                map_value([("op_id", Value::Str(op_id.clone()))]),
+                map_value([("op_id", Value::string(op_id.clone()))]),
             )?,
         )
         .await?;
-        let Value::Map(row) = output_value(out)? else {
+        let Some(row) = (output_value(out)?).into_map() else {
             bail!("expected map");
         };
         ensure!(
-            row.get("op_id") == Some(&Value::Str(op_id)),
+            row.get("op_id") == Some(&Value::string(op_id)),
             "lineage fact op_id mismatch"
         );
+        ensure!(row.contains_key("input"), "lineage fact missing input");
+        ensure!(row.contains_key("outcome"), "lineage fact missing outcome");
         ensure!(
-            matches!(row.get("input_ref"), Some(Value::Map(_))),
-            "lineage fact missing input_ref"
-        );
-        ensure!(
-            matches!(row.get("outcome_ref"), Some(Value::Map(_))),
-            "lineage fact missing outcome_ref"
-        );
-        ensure!(
-            row.get("partial") == Some(&Value::Bool(true)),
+            row.get("partial") == Some(&Value::boolean(true)),
             "lineage fact should be marked partial"
         );
         ensure!(
-            matches!(row.get("partial_reason"), Some(Value::Str(_))),
+            matches!(
+                row.get("partial_reason").map(Value::view),
+                Some(ValueView::Str(_))
+            ),
             "lineage fact missing partial_reason"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lineage_fact_read_authorizes_and_filters_the_current_caller() -> anyhow::Result<()> {
+        use xolotl_types::{
+            DecisionTag, ExecutionId, Fact, HandleId, IdentityRef, InvocationId, MethodId, NodeId,
+            ReplayClass, ResourceId, TaintSet, Timestamp,
+        };
+
+        let state = console_state()?;
+        let op_id = OperationId::new(
+            ProcessId::new(7),
+            ExecutionId::FIRST,
+            InvocationId::new(1),
+            NodeId::new(0),
+            0,
+        );
+        state.boot.kernel.facts.complete(Fact {
+            id: op_id,
+            schema_version: Fact::SCHEMA_VERSION,
+            caller: ProcessId::new(8),
+            acting: IdentityRef::ROOT,
+            handle: HandleId::new(0, 1),
+            resource: ResourceId::new(1),
+            method: MethodId::new(0),
+            input: Value::string("x".repeat(2048)),
+            taint: TaintSet::pristine(),
+            decision: DecisionTag::Ok,
+            outcome: Some(Value::integer(42)),
+            batch: None,
+            replay: ReplayClass::Observation,
+            timestamp: Timestamp::millis(0),
+        })?;
+        let mut principal = root_principal()?;
+        principal.identity_path = "identity://console/reader".into();
+        principal.grants = xolotl_types::CapSet::from_strs(["read://state/fact/7"])?;
+        let mut sess = test_session(state, principal.clone());
+        let op_id = op_id.to_string();
+        let default_scope = visibility_call(
+            ACTION_LINEAGE_FACT_READ,
+            map_value([
+                ("op_id", Value::string(op_id.clone())),
+                ("max_bytes", Value::integer(1024)),
+            ]),
+        )?;
+        ensure!(matches!(
+            dispatch_call(&mut sess, &principal, default_scope.clone()).await,
+            Err(ConsoleError::BadRequest(message)) if message == format!("unknown operation id: {op_id}")
+        ));
+        let selected_scope = visibility_call(
+            ACTION_LINEAGE_FACT_READ,
+            map_value([
+                ("op_id", Value::string(op_id.clone())),
+                ("process", Value::string("8".into())),
+            ]),
+        )?;
+        ensure!(matches!(
+            dispatch_call(&mut sess, &principal, selected_scope.clone()).await,
+            Err(ConsoleError::Auth(auth::AuthError::PermissionDenied))
+        ));
+
+        principal.grants = xolotl_types::CapSet::from_strs(["read://state/fact/8"])?;
+        ensure!(matches!(
+            dispatch_call(&mut sess, &principal, default_scope).await,
+            Err(ConsoleError::Auth(auth::AuthError::PermissionDenied))
+        ));
+        let oversized = visibility_call(
+            ACTION_LINEAGE_FACT_READ,
+            map_value([
+                ("op_id", Value::string(op_id.clone())),
+                ("process", Value::string("8".into())),
+                ("max_bytes", Value::integer(1024)),
+            ]),
+        )?;
+        ensure!(matches!(
+            dispatch_call(&mut sess, &principal, oversized).await,
+            Err(ConsoleError::Operation(_))
+        ));
+        let output = dispatch_call(&mut sess, &principal, selected_scope).await?;
+        let Some(row) = (output_value(output)?).into_map() else {
+            bail!("expected fact detail map");
+        };
+        ensure!(row.get("op_id") == Some(&Value::string(op_id)));
+        ensure!(row.get("caller") == Some(&Value::string("8".into())));
+        ensure!(row.get("input") == Some(&Value::string("x".repeat(2048))));
+        ensure!(row.get("outcome") == Some(&Value::integer(42)));
         Ok(())
     }
 
@@ -4574,7 +4495,7 @@ mod tests {
         st.state
             .write_set(
                 &Path::parse("state://chat/source/messages/trace")?,
-                Value::Str("trace source".into()),
+                Value::string("trace source".into()),
             )
             .await?;
         let mut sess = test_session(st.clone(), principal.clone());
@@ -4585,7 +4506,7 @@ mod tests {
                 ACTION_VISIBILITY_STATE_READ,
                 map_value([(
                     "path",
-                    Value::Str("state://chat/source/messages/trace".into()),
+                    Value::string("state://chat/source/messages/trace".into()),
                 )]),
             )?,
         )
@@ -4602,26 +4523,29 @@ mod tests {
             visibility_call(
                 ACTION_LINEAGE_TRACE_READ,
                 map_value([
-                    ("process", Value::Int(process as i64)),
-                    ("from", Value::Int(0)),
-                    ("limit", Value::Int(8)),
+                    ("process", Value::integer(process as i64)),
+                    ("from", Value::integer(0)),
+                    ("limit", Value::integer(8)),
                 ]),
             )?,
         )
         .await?;
-        let Value::Map(row) = output_value(out)? else {
+        let Some(row) = (output_value(out)?).into_map() else {
             bail!("expected map");
         };
         ensure!(
-            row.get("partial") == Some(&Value::Bool(true)),
+            row.get("partial") == Some(&Value::boolean(true)),
             "lineage trace should be partial"
         );
         ensure!(
-            matches!(row.get("partial_reason"), Some(Value::Str(_))),
+            matches!(
+                row.get("partial_reason").map(Value::view),
+                Some(ValueView::Str(_))
+            ),
             "lineage trace missing partial_reason"
         );
         ensure!(
-            matches!(row.get("items"), Some(Value::List(items)) if !items.is_empty()),
+            matches!(row.get("items").map(Value::view), Some(ValueView::List(items)) if !items.is_empty()),
             "lineage trace items missing or empty"
         );
         Ok(())
@@ -4639,9 +4563,9 @@ mod tests {
             call(
                 ACTION_EXTERNAL_INSTALLATION_INSTALL,
                 map_value([
-                    ("id", Value::Str("pairable".into())),
+                    ("id", Value::string("pairable".into())),
                     ("def", extension_installation("pairable", 0)?),
-                    ("expected_version", Value::Null),
+                    ("expected_version", Value::null()),
                 ]),
             )?,
         )
@@ -4655,20 +4579,20 @@ mod tests {
                     (
                         "input",
                         map_value([
-                            ("pairing_id", Value::Str("pair-ws".into())),
-                            ("installation_id", Value::Str("pairable".into())),
+                            ("pairing_id", Value::string("pair-ws".into())),
+                            ("installation_id", Value::string("pairable".into())),
                         ]),
                     ),
-                    ("reveal_display_secret", Value::Bool(true)),
+                    ("reveal_display_secret", Value::boolean(true)),
                 ]),
             )?,
         )
         .await?;
-        let Value::Map(m) = output_value(out)? else {
+        let Some(m) = (output_value(out)?).into_map() else {
             bail!("expected map");
         };
         ensure!(
-            matches!(m.get("display_secret"), Some(Value::Str(s)) if !s.is_empty()),
+            matches!(m.get("display_secret").map(Value::view), Some(ValueView::Str(s)) if !s.is_empty()),
             "pairing display secret was missing"
         );
         ensure!(
@@ -4688,7 +4612,7 @@ mod tests {
             &principal,
             call(
                 ACTION_PAIRING_DENY,
-                map_value([("pairing_id", Value::Str("pair-ws".into()))]),
+                map_value([("pairing_id", Value::string("pair-ws".into()))]),
             )?,
         )
         .await
@@ -4716,10 +4640,10 @@ mod tests {
                 map_value([
                     (
                         "path",
-                        Value::Str("state://kernel/external-installations/acme".into()),
+                        Value::string("state://kernel/external-installations/acme".into()),
                     ),
                     ("value", extension_installation("acme", 0)?),
-                    ("expected_version", Value::Null),
+                    ("expected_version", Value::null()),
                 ]),
             )?,
         )
@@ -4742,20 +4666,25 @@ mod tests {
         let (token, _principal, password) = root_login(&st).await?;
         let principal = step_up_principal(&st, &token, password).await?;
         let mut sess = test_session(st.clone(), principal.clone());
-        let mut bad = extension_installation("acme", 0)?;
-        let Value::Map(root) = &mut bad else {
-            bail!("expected installation map");
-        };
-        let Some(Value::List(projections)) = root.get_mut("projections") else {
-            bail!("expected projections");
-        };
-        let Some(Value::Map(provider)) = projections.first_mut() else {
-            bail!("expected provider projection");
-        };
+        let mut root = extension_installation("acme", 0)?
+            .into_map()
+            .context("installation map")?;
+        let mut projections = root
+            .remove("projections")
+            .and_then(Value::into_list)
+            .context("projections")?;
+        let mut provider = projections
+            .get(0)
+            .and_then(Value::as_map)
+            .cloned()
+            .context("provider projection")?;
         provider.insert(
             "namespace".into(),
-            Value::Str("effect://external-provider/other".into()),
-        );
+            Value::string("effect://external-provider/other".into()),
+        )?;
+        projections.set(0, Value::from(provider))?;
+        root.insert("projections".into(), Value::from(projections))?;
+        let bad = Value::from(root);
 
         let err = match dispatch_call(
             &mut sess,
@@ -4763,9 +4692,9 @@ mod tests {
             call(
                 ACTION_EXTERNAL_INSTALLATION_INSTALL,
                 map_value([
-                    ("id", Value::Str("acme".into())),
+                    ("id", Value::string("acme".into())),
                     ("def", bad.clone()),
-                    ("expected_version", Value::Null),
+                    ("expected_version", Value::null()),
                 ]),
             )?,
         )
@@ -4794,10 +4723,10 @@ mod tests {
                 map_value([
                     (
                         "path",
-                        Value::Str("state://kernel/external-installations/acme".into()),
+                        Value::string("state://kernel/external-installations/acme".into()),
                     ),
                     ("value", bad),
-                    ("expected_version", Value::Null),
+                    ("expected_version", Value::null()),
                 ]),
             )?,
         )
@@ -4833,7 +4762,7 @@ mod tests {
             &principal,
             call(
                 ACTION_EXTERNAL_INSTALLATION_STOP,
-                map_value([("id", Value::Str("missing".into()))]),
+                map_value([("id", Value::string("missing".into()))]),
             )?,
         )
         .await;
@@ -4852,7 +4781,7 @@ mod tests {
             &principal,
             call(
                 ACTION_EXTERNAL_INSTALLATION_REVOKE,
-                map_value([("installation_id", Value::Str("missing".into()))]),
+                map_value([("installation_id", Value::string("missing".into()))]),
             )?,
         )
         .await;
@@ -4872,8 +4801,8 @@ mod tests {
             call(
                 ACTION_EXTERNAL_INSTALLATION_REVOKE,
                 map_value([
-                    ("installation_id", Value::Str("missing".into())),
-                    ("credential_generation_floor", Value::Int(0)),
+                    ("installation_id", Value::string("missing".into())),
+                    ("credential_generation_floor", Value::integer(0)),
                 ]),
             )?,
         )
@@ -4903,9 +4832,9 @@ mod tests {
             call(
                 ACTION_INFERENCE_BACKEND_WRITE_CAS,
                 map_value([
-                    ("id", Value::Str("deepseek".into())),
+                    ("id", Value::string("deepseek".into())),
                     ("def", inference_backend("deepseek")?),
-                    ("expected_version", Value::Null),
+                    ("expected_version", Value::null()),
                 ]),
             )?,
         )
@@ -4915,12 +4844,12 @@ mod tests {
             &principal,
             call(
                 ACTION_INFERENCE_BACKEND_READ,
-                map_value([("id", Value::Str("deepseek".into()))]),
+                map_value([("id", Value::string("deepseek".into()))]),
             )?,
         )
         .await?;
         ensure!(
-            matches!(output_value(out)?, Value::Map(_)),
+            matches!((output_value(out)?).view(), ValueView::Map(_)),
             "inference backend read did not return a map"
         );
 
@@ -4930,9 +4859,9 @@ mod tests {
             call(
                 ACTION_INFERENCE_BACKEND_WRITE_CAS,
                 map_value([
-                    ("id", Value::Str("other".into())),
+                    ("id", Value::string("other".into())),
                     ("def", inference_backend("deepseek")?),
-                    ("expected_version", Value::Null),
+                    ("expected_version", Value::null()),
                 ]),
             )?,
         )
@@ -4961,10 +4890,10 @@ mod tests {
                 map_value([
                     (
                         "path",
-                        Value::Str("state://kernel/inference/backends/other".into()),
+                        Value::string("state://kernel/inference/backends/other".into()),
                     ),
                     ("value", inference_backend("deepseek")?),
-                    ("expected_version", Value::Null),
+                    ("expected_version", Value::null()),
                 ]),
             )?,
         )
@@ -4988,7 +4917,7 @@ mod tests {
         st.state
             .write_set(
                 &Path::parse("state://chat/source/messages/1")?,
-                Value::Str("hello from chat".into()),
+                Value::string("hello from chat".into()),
             )
             .await?;
         let before = fact_count(&st)?;
@@ -4998,12 +4927,15 @@ mod tests {
             &principal,
             visibility_call(
                 ACTION_VISIBILITY_STATE_READ,
-                map_value([("path", Value::Str("state://chat/source/messages/1".into()))]),
+                map_value([(
+                    "path",
+                    Value::string("state://chat/source/messages/1".into()),
+                )]),
             )?,
         )
         .await?;
         ensure!(
-            output_value(out)? == Value::Str("hello from chat".into()),
+            output_value(out)? == Value::string("hello from chat".into()),
             "visibility read returned unexpected value"
         );
         let after = fact_count(&st)?;
@@ -5021,7 +4953,7 @@ mod tests {
         st.state
             .write_set(
                 &Path::parse("state://chat/source/messages/1")?,
-                Value::Str("hello from chat".into()),
+                Value::string("hello from chat".into()),
             )
             .await?;
         let before = st.boot.kernel.processes.all_ids().len();
@@ -5034,7 +4966,10 @@ mod tests {
             &principal,
             visibility_call(
                 ACTION_VISIBILITY_STATE_READ,
-                map_value([("path", Value::Str("state://chat/source/messages/1".into()))]),
+                map_value([(
+                    "path",
+                    Value::string("state://chat/source/messages/1".into()),
+                )]),
             )?,
         )
         .await
@@ -5060,7 +4995,10 @@ mod tests {
             &wildcard_principal,
             visibility_call(
                 ACTION_VISIBILITY_STATE_READ,
-                map_value([("path", Value::Str("state://chat/source/messages/1".into()))]),
+                map_value([(
+                    "path",
+                    Value::string("state://chat/source/messages/1".into()),
+                )]),
             )?,
         )
         .await
@@ -5091,7 +5029,10 @@ mod tests {
             &principal,
             call(
                 ACTION_VISIBILITY_STATE_READ,
-                map_value([("path", Value::Str("state://chat/source/messages/1".into()))]),
+                map_value([(
+                    "path",
+                    Value::string("state://chat/source/messages/1".into()),
+                )]),
             )?,
         )
         .await
@@ -5111,7 +5052,7 @@ mod tests {
                 ACTION_VISIBILITY_STATE_READ,
                 map_value([(
                     "path",
-                    Value::Str("state://vault/console/root/password".into()),
+                    Value::string("state://vault/console/root/password".into()),
                 )]),
             )?,
         )
@@ -5132,7 +5073,7 @@ mod tests {
                 ACTION_VISIBILITY_STATE_READ,
                 map_value([(
                     "path",
-                    Value::Str("path://remote/state/chat/source/messages/1".into()),
+                    Value::string("path://remote/state/chat/source/messages/1".into()),
                 )]),
             )?,
         )
@@ -5158,9 +5099,13 @@ mod tests {
             .facts
             .all_facts()?
             .into_iter()
-            .filter(|fact| match &fact.outcome_ref {
-                xolotl_types::OutcomeRef::Inline(Value::Map(m)) => {
-                    m.get("event").and_then(Value::as_str) == Some("console_visibility")
+            .filter(|fact| match &fact.outcome {
+                Some(value) => {
+                    value
+                        .as_map()
+                        .and_then(|m| m.get("event"))
+                        .and_then(Value::as_str)
+                        == Some("console_visibility")
                 }
                 _ => false,
             })
@@ -5191,7 +5136,7 @@ mod tests {
             &principal,
             ActionCall {
                 action: ACTION_CONFIG_READ.into(),
-                input: Value::Str("not-a-map".into()),
+                input: Value::string("not-a-map".into()),
                 ..Default::default()
             },
         )
@@ -5208,6 +5153,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_metadata_does_not_read_fact_storage() -> anyhow::Result<()> {
+        let facts = xolotl_kernel::FactSink::new(Arc::new(FailingFactStore::default()));
+        let backend: xolotl_state::Backend = xolotl_state::InMemoryBackend::new().into_backend();
+        let boot = Arc::new(Bootstrap::from_kernel(
+            xolotl_kernel::Kernel::with_backends(backend, facts),
+        ));
+        let state = ConsoleState::shared(boot).context("console state")?;
+        let mut principal = root_principal()?;
+        principal.grants =
+            xolotl_types::CapSet::from_strs(["perform://effect/kernel/process/inspect"])?;
+        let sess = test_session(state, principal.clone());
+        let output = process_inspect(&sess, &principal, Some(7), false, 0).await?;
+        let Some(rows) = (output).into_list() else {
+            bail!("expected process rows");
+        };
+        let row = rows
+            .first()
+            .and_then(Value::as_map)
+            .context("process row")?;
+        ensure!(!row.contains_key("fact_count") && !row.contains_key("recent_facts"));
+        ensure!(matches!(
+            process_inspect(&sess, &principal, Some(7), true, 1).await,
+            Err(ConsoleError::Auth(auth::AuthError::PermissionDenied))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn embedded_recent_facts_require_the_requested_fact_scope() -> anyhow::Result<()> {
+        let state = console_state()?;
+        let mut principal = root_principal()?;
+        principal.identity_path = "identity://console/reader".into();
+        principal.grants = xolotl_types::CapSet::from_strs([
+            "perform://effect/kernel/process/inspect",
+            "read://state/fact/7",
+        ])?;
+        let mut sess = test_session(state, principal.clone());
+        let output = dispatch_call(
+            &mut sess,
+            &principal,
+            visibility_call(
+                ACTION_RUNTIME_PROCESS_INSPECT,
+                map_value([
+                    ("process", Value::string("7".into())),
+                    ("include_recent_facts", Value::boolean(true)),
+                ]),
+            )?,
+        )
+        .await?;
+        let Some(rows) = (output_value(output)?).into_list() else {
+            bail!("expected process rows");
+        };
+        let row = rows
+            .first()
+            .and_then(Value::as_map)
+            .context("process row")?;
+        ensure!(
+            matches!(row.get("recent_facts").map(Value::view), Some(ValueView::Map(page)) if page.contains_key("next") && page.contains_key("items"))
+        );
+        ensure!(matches!(
+            process_inspect(&sess, &principal, None, true, 1).await,
+            Err(ConsoleError::BadRequest(_))
+        ));
+        ensure!(matches!(
+            process_inspect(&sess, &principal, Some(8), true, 1).await,
+            Err(ConsoleError::Auth(auth::AuthError::PermissionDenied))
+        ));
+        let snapshot = visibility_call(
+            ACTION_STATE_SNAPSHOT,
+            map_value([(
+                "sections",
+                Value::list(vec![map_value([
+                    ("kind", Value::string("runtime".into())),
+                    ("process", Value::string("8".into())),
+                    ("include_recent_facts", Value::boolean(true)),
+                ])]),
+            )]),
+        )?;
+        ensure!(matches!(
+            dispatch_call(&mut sess, &principal, snapshot).await,
+            Err(ConsoleError::Auth(auth::AuthError::PermissionDenied))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn snapshot_runtime_facts_require_visibility_gate() -> anyhow::Result<()> {
         let st = console_state()?;
         let (token, principal, password) = root_login(&st).await?;
@@ -5219,28 +5250,40 @@ mod tests {
                 ACTION_STATE_SNAPSHOT,
                 map_value([(
                     "sections",
-                    Value::List(vec![map_value([("kind", Value::Str("runtime".into()))])]),
+                    Value::list(vec![map_value([("kind", Value::string("runtime".into()))])]),
                 )]),
             )?,
         )
         .await?;
-        let Value::Map(row) = output_value(out)? else {
+        let Some(row) = (output_value(out)?).into_map() else {
             bail!("expected map");
         };
         ensure!(
-            matches!(row.get("server_rev"), Some(Value::Int(_))),
+            matches!(
+                row.get("server_rev").map(Value::view),
+                Some(ValueView::Int(_))
+            ),
             "snapshot missing server_rev"
         );
         ensure!(
-            matches!(row.get("registry_rev"), Some(Value::Int(_))),
+            matches!(
+                row.get("registry_rev").map(Value::view),
+                Some(ValueView::Int(_))
+            ),
             "snapshot missing registry_rev"
         );
         ensure!(
-            matches!(row.get("fact_cursor"), Some(Value::Int(_))),
+            matches!(
+                row.get("fact_cursor").map(Value::view),
+                Some(ValueView::Str(_))
+            ),
             "snapshot missing fact_cursor"
         );
         ensure!(
-            matches!(row.get("truncated"), Some(Value::List(_))),
+            matches!(
+                row.get("truncated").map(Value::view),
+                Some(ValueView::List(_))
+            ),
             "snapshot missing truncated list"
         );
 
@@ -5248,9 +5291,10 @@ mod tests {
         let mut sess = test_session(st, principal.clone());
         let input = map_value([(
             "sections",
-            Value::List(vec![map_value([
-                ("kind", Value::Str("runtime".into())),
-                ("include_recent_facts", Value::Bool(true)),
+            Value::list(vec![map_value([
+                ("kind", Value::string("runtime".into())),
+                ("process", Value::string("7".into())),
+                ("include_recent_facts", Value::boolean(true)),
             ])]),
         )]);
         let err = match dispatch_call(
@@ -5275,32 +5319,42 @@ mod tests {
         )
         .await?;
         ensure!(
-            matches!(output_value(out)?, Value::Map(_)),
+            matches!((output_value(out)?).view(), ValueView::Map(_)),
             "visibility-gated snapshot output was not a map"
         );
+        let runtime = map_value([
+            ("kind", Value::string("runtime".into())),
+            ("process", Value::string("7".into())),
+            ("include_recent_facts", Value::boolean(true)),
+        ]);
+        let duplicate = visibility_call(
+            ACTION_STATE_SNAPSHOT,
+            map_value([("sections", Value::list(vec![runtime.clone(), runtime]))]),
+        )?;
+        ensure!(matches!(
+            dispatch_call(&mut sess, &principal, duplicate).await,
+            Err(ConsoleError::BadRequest(message)) if message.contains("only once")
+        ));
         Ok(())
     }
 
     #[tokio::test]
-    async fn subscription_rejects_resume_without_replacing_existing_subscription()
+    async fn subscription_rejects_invalid_resume_and_ttl_without_replacing_existing_subscription()
     -> anyhow::Result<()> {
         let st = console_state()?;
         let (token, _principal, password) = root_login(&st).await?;
         let principal = step_up_principal(&st, &token, password).await?;
         let mut sess = test_session(st, principal.clone());
-        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            match shutdown_rx.await {
-                Ok(()) | Err(_) => {}
-            }
-        });
-        let previous = sess
-            .subscriptions
-            .insert(7, SubscriptionHandle { shutdown, task });
-        ensure!(
-            previous.is_none(),
-            "test subscription id was already present"
-        );
+        let (_source, receiver) = tokio::sync::broadcast::channel(1);
+        sess.subscriptions
+            .replace(
+                7,
+                receiver,
+                subscriptions::state_event,
+                "state",
+                tokio::time::Instant::now() + Duration::from_secs(60),
+            )
+            .await?;
 
         let err = match subscribe(
             &mut sess,
@@ -5310,7 +5364,7 @@ mod tests {
                 stream: STREAM_STATE_WATCH.into(),
                 input: json_bytes(&map_value([(
                     "pattern",
-                    Value::Str("state://kernel/**".into()),
+                    Value::string("state://kernel/**".into()),
                 )]))?,
                 scope: Some("test".into()),
                 justification: Some("test stream".into()),
@@ -5329,14 +5383,29 @@ mod tests {
             "unexpected subscription resume error: {err:?}"
         );
         ensure!(
-            sess.subscriptions.contains_key(&7),
+            sess.subscriptions.contains(7),
             "failed subscription resume removed existing subscription"
         );
-        let handle = sess
-            .subscriptions
-            .remove(&7)
-            .context("test subscription should remain available for cleanup")?;
-        shutdown_subscription(handle).await;
+        for ttl_ms in [None, Some(0), Some(u64::MAX)] {
+            let result = subscribe(
+                &mut sess,
+                &principal,
+                7,
+                StreamCall {
+                    stream: STREAM_STATE_WATCH.into(),
+                    input: map_value([("pattern", Value::string("state://kernel/**".into()))]),
+                    scope: Some("test".into()),
+                    justification: Some("test stream".into()),
+                    ttl_ms,
+                    since_rev: None,
+                    max_batch: None,
+                },
+            )
+            .await;
+            ensure!(matches!(result, Err(ConsoleError::BadRequest(_))));
+            ensure!(sess.subscriptions.contains(7) && _source.receiver_count() == 1);
+        }
+        sess.subscriptions.stop(7).await?;
         Ok(())
     }
 
@@ -5345,18 +5414,7 @@ mod tests {
         let st = console_state()?;
         let (token, _principal, password) = root_login(&st).await?;
         let principal = step_up_principal(&st, &token, password).await?;
-        let (tx, _rx) = mpsc::channel(1);
-        let mut sess = WsSession {
-            state: st,
-            principal: Some(principal.clone()),
-            sid: Some("not-used".into()),
-            hello_accepted: true,
-            source_addr: "test".into(),
-            counted_user: None,
-            subscriptions: BTreeMap::new(),
-            event_tx: tx,
-            rate: FrameRate::default(),
-        };
+        let mut sess = test_session(st, principal.clone());
         let err = match subscribe(
             &mut sess,
             &principal,
@@ -5365,7 +5423,7 @@ mod tests {
                 stream: STREAM_STATE_WATCH.into(),
                 input: json_bytes(&map_value([(
                     "pattern",
-                    Value::Str("state://vault/**".into()),
+                    Value::string("state://vault/**".into()),
                 )]))?,
                 scope: Some("test".into()),
                 justification: Some("test stream".into()),
@@ -5390,7 +5448,10 @@ mod tests {
             2,
             StreamCall {
                 stream: STREAM_STATE_WATCH.into(),
-                input: json_bytes(&map_value([("pattern", Value::Str("state://**".into()))]))?,
+                input: json_bytes(&map_value([(
+                    "pattern",
+                    Value::string("state://**".into()),
+                )]))?,
                 scope: Some("test".into()),
                 justification: Some("test stream".into()),
                 ttl_ms: Some(60_000),
@@ -5606,7 +5667,7 @@ mod tests {
         let compiled = recipes::CompiledRecipe::state(
             path,
             RecipeStateMethod::Append,
-            Value::Str("probe-value".into()),
+            Value::string("probe-value".into()),
         )
         .map_err(|e| anyhow::anyhow!("compile recipe: {e}"))?;
         recipes::execute(&sess, &principal, compiled)
@@ -5639,7 +5700,7 @@ mod tests {
         let before = st.boot.kernel.facts.cursor();
 
         let path = Path::parse("state://chat/source/messages/bridge_probe")?;
-        let compiled = recipes::CompiledRecipe::state(path, RecipeStateMethod::Read, Value::Null)
+        let compiled = recipes::CompiledRecipe::state(path, RecipeStateMethod::Read, Value::null())
             .map_err(|e| anyhow::anyhow!("compile recipe: {e}"))?;
         let err = match recipes::execute(&sess, &principal, compiled).await {
             Ok(value) => bail!("read without matching principal grant succeeded: {value:?}"),
@@ -5672,7 +5733,7 @@ mod tests {
         let compiled = recipes::CompiledRecipe::state(
             path,
             RecipeStateMethod::Append,
-            Value::Str("should-not-write".into()),
+            Value::string("should-not-write".into()),
         )
         .map_err(|e| anyhow::anyhow!("compile recipe: {e}"))?;
         let err = match recipes::execute(&sess, &principal, compiled).await {
@@ -5697,7 +5758,7 @@ mod tests {
         st.boot
             .kernel
             .state
-            .write_set(&path, Value::Str("readable".into()))
+            .write_set(&path, Value::string("readable".into()))
             .await?;
         let principal = ConsolePrincipal {
             username: "reader".into(),
@@ -5706,13 +5767,13 @@ mod tests {
             mfa_level: 2,
         };
         let sess = test_session(st, principal.clone());
-        let compiled = recipes::CompiledRecipe::state(path, RecipeStateMethod::Read, Value::Null)
+        let compiled = recipes::CompiledRecipe::state(path, RecipeStateMethod::Read, Value::null())
             .map_err(|e| anyhow::anyhow!("compile recipe: {e}"))?;
         let value = recipes::execute(&sess, &principal, compiled)
             .await
             .context("read recipe with matching principal grant")?;
         ensure!(
-            value == Value::Str("readable".into()),
+            value == Value::string("readable".into()),
             "unexpected read recipe output: {value:?}"
         );
         Ok(())
@@ -5731,7 +5792,7 @@ mod tests {
         let before = st.boot.kernel.facts.cursor();
 
         let path = Path::parse("effect://kernel/process/inspect")?;
-        let compiled = recipes::CompiledRecipe::effect(path, Value::Null)
+        let compiled = recipes::CompiledRecipe::effect(path, Value::null())
             .map_err(|e| anyhow::anyhow!("compile recipe: {e}"))?;
         let err = match recipes::execute(&sess, &principal, compiled).await {
             Ok(value) => bail!("effect invoke without perform grant succeeded: {value:?}"),
@@ -5756,7 +5817,7 @@ mod tests {
 
         // A path the root request grant does not cover: a reserved vault path.
         let path = Path::parse("state://vault/unreachable/recipe_probe")?;
-        let compiled = recipes::CompiledRecipe::state(path, RecipeStateMethod::Read, Value::Null)
+        let compiled = recipes::CompiledRecipe::state(path, RecipeStateMethod::Read, Value::null())
             .map_err(|e| anyhow::anyhow!("compile recipe: {e}"))?;
         let err = match recipes::execute(&sess, &principal, compiled).await {
             Ok(value) => bail!("vault read should be denied by open_for, got {value:?}"),

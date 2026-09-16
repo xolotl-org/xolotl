@@ -6,11 +6,14 @@
 //! Operation options live in structured input values, and attenuation
 //! predicates live on capabilities.
 
+use alloc::{string::String, vec::Vec};
+use core::fmt;
+use core::hash::{Hash, Hasher};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
-use std::fmt;
-use std::hash::{Hash, Hasher};
 use thiserror::Error;
+
+pub(crate) mod identifier;
 
 /// A parsed path. Internally stored normalized: scheme + segments + optional
 /// cluster.
@@ -32,13 +35,13 @@ impl PartialEq for Path {
 impl Eq for Path {}
 
 impl PartialOrd for Path {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for Path {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         self.cluster
             .cmp(&other.cluster)
             .then_with(|| self.scheme.cmp(&other.scheme))
@@ -56,7 +59,7 @@ impl Hash for Path {
 
 impl Serialize for Path {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
+        serializer.collect_str(self)
     }
 }
 
@@ -311,18 +314,14 @@ impl Path {
 // Path syntax accepts a narrow ASCII set so validation stays predictable.
 
 fn is_scheme_ident(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    identifier::validate(s.as_bytes(), identifier::IdentifierKind::Scheme).is_ok()
 }
 
 fn is_cluster_ident(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    matches!(
+        identifier::validate(s.as_bytes(), identifier::IdentifierKind::Cluster),
+        Ok(()) | Err(identifier::IdentifierError::ReservedCluster)
+    )
 }
 
 fn validate_cluster_ident(s: &str) -> Result<(), PathError> {
@@ -339,17 +338,7 @@ fn validate_cluster_ident(s: &str) -> Result<(), PathError> {
 }
 
 fn is_segment_ident(s: &str) -> bool {
-    // Wildcard patterns are valid segments (for pattern-matching, not for
-    // real target paths — PathValidators enforce the distinction).
-    if is_wildcard_segment(s) {
-        return true;
-    }
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphanumeric() => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == ':')
+    identifier::validate(s.as_bytes(), identifier::IdentifierKind::Segment).is_ok()
 }
 
 fn is_wildcard_segment(s: &str) -> bool {
@@ -357,12 +346,7 @@ fn is_wildcard_segment(s: &str) -> bool {
 }
 
 fn is_ident(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    is_scheme_ident(s)
 }
 
 fn split_canonical_cluster(head: &str) -> Option<(&str, &str)> {
@@ -382,10 +366,7 @@ fn split_canonical_cluster(head: &str) -> Option<(&str, &str)> {
 }
 
 fn is_standard_scheme(s: &str) -> bool {
-    matches!(
-        s,
-        "state" | "effect" | "process" | "proc" | "blob" | "tensor"
-    )
+    identifier::is_standard_scheme(s.as_bytes())
 }
 
 fn match_segments(pat: &[SmolStr], seg: &[SmolStr]) -> bool {
@@ -415,18 +396,61 @@ fn match_segments(pat: &[SmolStr], seg: &[SmolStr]) -> bool {
     si == seg.len()
 }
 
+/// Borrow the canonical text without assembling a temporary path string.
+pub(crate) struct CanonicalParts<'a> {
+    path: &'a Path,
+    prefix: u8,
+    segments: core::slice::Iter<'a, SmolStr>,
+    separator: bool,
+    pending: Option<&'a str>,
+}
+
+impl Path {
+    pub(crate) fn canonical_parts(&self) -> CanonicalParts<'_> {
+        CanonicalParts {
+            path: self,
+            prefix: 0,
+            segments: self.segments.iter(),
+            separator: self.cluster.is_some(),
+            pending: None,
+        }
+    }
+}
+
+impl<'a> Iterator for CanonicalParts<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let prefix = match (self.path.cluster(), self.prefix) {
+            (Some(_), 0) => Some("path://"),
+            (Some(cluster), 1) => Some(cluster),
+            (Some(_), 2) => Some("/"),
+            (Some(_), 3) | (None, 0) => Some(self.path.scheme()),
+            (None, 1) => Some("://"),
+            _ => None,
+        };
+        if let Some(prefix) = prefix {
+            self.prefix += 1;
+            return Some(prefix);
+        }
+        if let Some(segment) = self.pending.take() {
+            return Some(segment);
+        }
+        let segment = self.segments.next()?.as_str();
+        if self.separator {
+            self.pending = Some(segment);
+            Some("/")
+        } else {
+            self.separator = true;
+            Some(segment)
+        }
+    }
+}
+
 impl fmt::Display for Path {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(c) = &self.cluster {
-            write!(f, "path://{}/{}", c, self.scheme)?;
-        } else {
-            write!(f, "{}://", self.scheme)?;
-        }
-        for (i, s) in self.segments.iter().enumerate() {
-            if i > 0 || self.cluster.is_some() {
-                f.write_str("/")?;
-            }
-            f.write_str(s)?;
+        for part in self.canonical_parts() {
+            f.write_str(part)?;
         }
         Ok(())
     }
@@ -441,6 +465,7 @@ pub fn p(s: &str) -> anyhow::Result<Path> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
     use anyhow::{Context, bail, ensure};
 
     #[test]

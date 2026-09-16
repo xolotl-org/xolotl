@@ -2,8 +2,10 @@
 
 //! `xolotl-gateway-grpc` - gRPC protocol adapter.
 //!
-//! Tonic adapter for external Provider and Source sessions.
+//! Independent application and external Provider/Source admission boundaries.
 //!
+//! [`ApplicationGrpcService`] exposes profile discovery, object uploads and typed
+//! submission through [`xolotl_gateway::Gateway`].
 //! [`ExternalGrpcService`] serves `xolotl.v1.external.ExternalService.Session`.
 //! Values are marshalled with the structural `xolotl-proto` conversions.
 //!
@@ -26,8 +28,13 @@ use xolotl_proto::xolotl::v1::external::external_service_server::{
     ExternalService as ExternalGrpc, ExternalServiceServer,
 };
 
+mod application;
 mod session;
 mod transport;
+pub use application::{
+    ApplicationGrpcConfig, ApplicationGrpcService, ApplicationIngress,
+    ApplicationObjectDownloadStream, ApplicationOutputStream,
+};
 use session::drive_external_session;
 use transport::{validate_grpc_transport, verified_grpc_source_addr};
 

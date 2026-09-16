@@ -21,25 +21,25 @@ use crate::{
     time::{TIME_METHODS, TimeDriver},
 };
 use async_trait::async_trait;
-#[cfg(any(feature = "fetch", feature = "fs", feature = "terminal"))]
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use thiserror::Error;
 #[cfg(test)]
 use xolotl_kernel::RequestGrantTemplate;
-use xolotl_kernel::{Bootstrap, BootstrapError, Driver, DriverContext, DriverError, MethodSpec};
-use xolotl_types::{
-    CostModel, InProcessProjectionDef, MethodId, Outcome, OutputMode, Path, Role, Value,
+use xolotl_kernel::{
+    Bootstrap, BootstrapError, Driver, DriverContext, DriverError, DriverOutput, MethodSpec,
 };
+use xolotl_types::{CostModel, InProcessProjectionDef, MethodId, OutputMode, Path, Role, Value};
 #[cfg(any(feature = "fetch", feature = "fs", feature = "terminal"))]
 use xolotl_types::{EffectCapability, Metadata, Purity};
+#[cfg(any(feature = "fetch", feature = "fs", feature = "terminal"))]
+use xolotl_types::{ValueMap, ValueView};
 
 /// Kernel-state prefix for in-process projection declarations.
 pub const IN_PROCESS_PROJECTION_CONFIG_PREFIX: &str = "state://kernel/projections/in-process";
 
 /// Configuration for the standard provider set.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct StandardConfig {
     /// Standard modules installed by [`install_standard`].
     modules: StandardModules,
@@ -50,6 +50,10 @@ pub struct StandardConfig {
     effect_overrides: Vec<TestEffectOverride>,
     /// Host-local edges that cannot be represented as runtime state.
     host_edges: StandardHostEdges,
+    /// Optional chunked object storage used by blob, tensor, filesystem, and fetch.
+    objects: xolotl_state::host::object::ObjectStore,
+    /// Retrieval windows and its separately admitted tensor read capability.
+    retrieval: crate::RetrievalConfig,
 }
 
 /// One standard-core module that can be installed.
@@ -82,7 +86,7 @@ pub enum StandardModule {
     Rank,
     /// Expose `effect://compress/*`.
     Compress,
-    /// Expose `effect://tensor/*`.
+    /// Expose `effect://tensor/write` without requiring a State catalog.
     Tensor,
     /// Expose `effect://proc/*`.
     Proc,
@@ -218,7 +222,7 @@ pub enum InstallError {
     },
     /// State backend operation failed.
     #[error("state operation failed: {0}")]
-    State(#[source] Box<xolotl_state::StateError>),
+    State(#[source] Box<xolotl_state::StateFailure>),
     /// Declaration value could not be decoded.
     #[error("in-process projection {id:?} is malformed: {source}")]
     Decode {
@@ -297,13 +301,26 @@ impl From<BootstrapError> for InstallError {
     }
 }
 
-impl From<xolotl_state::StateError> for InstallError {
-    fn from(source: xolotl_state::StateError) -> Self {
+impl From<xolotl_state::StateFailure> for InstallError {
+    fn from(source: xolotl_state::StateFailure) -> Self {
         Self::State(Box::new(source))
     }
 }
 
 impl StandardConfig {
+    /// Configure retrieval's cooperative windows and explicit tensor reader.
+    /// Installing general Blob object ports does not silently enable index reads.
+    pub fn with_retrieval(mut self, retrieval: crate::RetrievalConfig) -> Self {
+        self.retrieval = retrieval;
+        self
+    }
+
+    /// Install object capabilities independently of the State backend.
+    pub fn with_object_store(mut self, objects: xolotl_state::host::object::ObjectStore) -> Self {
+        self.objects = objects;
+        self
+    }
+
     /// Use a specific set of standard modules.
     pub fn with_modules(mut self, modules: StandardModules) -> Self {
         self.modules = modules;
@@ -396,6 +413,16 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
         // Inference carries a modeled cost so the budget reserve/settle path has a
         // real estimate.
         let inference: Arc<dyn Driver> = inference_driver.clone();
+        let methods: Vec<_> = INFERENCE_METHODS
+            .iter()
+            .map(|method| {
+                if inference_driver.requires_unprotected_input() {
+                    method.unprotected_input()
+                } else {
+                    *method
+                }
+            })
+            .collect();
         for path in [
             "effect://inference/infer",
             "effect://inference/embed",
@@ -405,7 +432,7 @@ pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(),
             register_standard_effect_with_cost(
                 boot,
                 path,
-                INFERENCE_METHODS,
+                &methods,
                 inference.clone(),
                 inference_cost_model(),
                 &configured_paths,
@@ -482,18 +509,25 @@ fn rank_driver_for(
 /// state.
 pub async fn install_declared_in_process_projections(
     boot: &Bootstrap,
+    config: &StandardConfig,
 ) -> Result<InProcessProjectionInstallReport, InstallError> {
     let prefix = parse_path(IN_PROCESS_PROJECTION_CONFIG_PREFIX)?;
-    let declarations = boot.kernel.state.read_prefix(&prefix).await?;
-    let mut entries = Vec::with_capacity(declarations.len());
-    for (path, value) in declarations {
-        let (id, desired, result) = install_in_process_projection_report_entry(boot, &path, value);
-        entries.push(InProcessProjectionInstallEntry {
-            id,
-            path,
-            desired,
-            result,
-        });
+    let mut pages = boot
+        .kernel
+        .state
+        .pages(xolotl_state::StateScan::new(prefix));
+    let mut entries = Vec::new();
+    while let Some(page) = pages.next().await? {
+        for (path, value) in page.entries {
+            let (id, desired, result) =
+                install_in_process_projection_report_entry(boot, &path, value.value, config);
+            entries.push(InProcessProjectionInstallEntry {
+                id,
+                path,
+                desired,
+                result,
+            });
+        }
     }
     Ok(InProcessProjectionInstallReport { entries })
 }
@@ -502,6 +536,7 @@ fn install_in_process_projection_report_entry(
     boot: &Bootstrap,
     path: &Path,
     value: Value,
+    config: &StandardConfig,
 ) -> (
     String,
     Option<InProcessProjectionInstalled>,
@@ -516,7 +551,8 @@ fn install_in_process_projection_report_entry(
         Err(error) => return (id, None, Err(error)),
     };
     let desired = InProcessProjectionInstalled::from_def(&def);
-    let result = install_decoded_in_process_projection(boot, &def).map(|()| desired.clone());
+    let result =
+        install_decoded_in_process_projection(boot, &def, config).map(|()| desired.clone());
     (id, Some(desired), result)
 }
 
@@ -525,10 +561,11 @@ pub fn install_in_process_projection_value(
     boot: &Bootstrap,
     path: &Path,
     value: Value,
+    config: &StandardConfig,
 ) -> Result<InProcessProjectionInstalled, InstallError> {
     let id = in_process_projection_path_id(path)?.to_string();
     let def = decode_in_process_projection_def(&id, value)?;
-    install_decoded_in_process_projection(boot, &def)?;
+    install_decoded_in_process_projection(boot, &def, config)?;
     Ok(InProcessProjectionInstalled::from_def(&def))
 }
 
@@ -596,6 +633,7 @@ impl InProcessProjectionInstalled {
 fn install_decoded_in_process_projection(
     _boot: &Bootstrap,
     def: &InProcessProjectionDef,
+    _config: &StandardConfig,
 ) -> Result<(), InstallError> {
     def.validate_admission(&def.id)
         .map_err(|error| InstallError::Declaration {
@@ -607,7 +645,7 @@ fn install_decoded_in_process_projection(
             require_provider_role(def)?;
             #[cfg(feature = "fetch")]
             {
-                install_fetch_driver(_boot, def)
+                install_fetch_driver(_boot, def, _config)
             }
             #[cfg(not(feature = "fetch"))]
             {
@@ -621,7 +659,7 @@ fn install_decoded_in_process_projection(
             require_provider_role(def)?;
             #[cfg(feature = "fs")]
             {
-                install_fs_driver(_boot, def)
+                install_fs_driver(_boot, def, _config)
             }
             #[cfg(not(feature = "fs"))]
             {
@@ -661,7 +699,9 @@ fn install_core_standard(
     let index = if config.modules.contains(StandardModule::Memory)
         || config.modules.contains(StandardModule::Index)
     {
-        Some(Arc::new(IndexDriver::new()))
+        Some(Arc::new(
+            IndexDriver::new().with_config(config.retrieval.clone()),
+        ))
     } else {
         None
     };
@@ -674,6 +714,16 @@ fn install_core_standard(
     };
     if config.modules.contains(StandardModule::Memory) {
         let embedder = model_backend_for(&model_backend, StandardModule::Memory)?;
+        let methods: Vec<_> = MEMORY_METHODS
+            .iter()
+            .map(|method| {
+                if embedder.requires_unprotected_input() && method.name != "forget" {
+                    method.unprotected_input()
+                } else {
+                    *method
+                }
+            })
+            .collect();
         let index_for_memory = index_driver_for(&index, StandardModule::Memory)?;
         let rank_for_memory = rank_driver_for(&rank, StandardModule::Memory)?;
         let memory: Arc<dyn Driver> = Arc::new(
@@ -687,18 +737,13 @@ fn install_core_standard(
             "effect://memory/forget",
             "effect://memory/commit",
             "effect://memory/consolidate",
+            "effect://memory/rebuild",
         ] {
-            register_standard_effect(
-                boot,
-                path,
-                MEMORY_METHODS,
-                memory.clone(),
-                &configured_paths,
-            )?;
+            register_standard_effect(boot, path, &methods, memory.clone(), &configured_paths)?;
         }
     }
     if config.modules.contains(StandardModule::Blob) {
-        let blob: Arc<dyn Driver> = Arc::new(BlobDriver::new(state.clone()));
+        let blob: Arc<dyn Driver> = Arc::new(BlobDriver::new(config.objects.clone()));
         for path in [
             "effect://blob/write",
             "effect://blob/read",
@@ -753,10 +798,20 @@ fn install_core_standard(
     }
     if config.modules.contains(StandardModule::Deliberation) {
         let backend = model_backend_for(&model_backend, StandardModule::Deliberation)?;
+        let methods: Vec<_> = DELIBERATION_METHODS
+            .iter()
+            .map(|method| {
+                if backend.requires_unprotected_input() {
+                    method.unprotected_input()
+                } else {
+                    *method
+                }
+            })
+            .collect();
         register_standard_effect(
             boot,
             "effect://deliberation/run",
-            DELIBERATION_METHODS,
+            &methods,
             Arc::new(DeliberationDriver::new(backend)),
             &configured_paths,
         )?;
@@ -814,32 +869,31 @@ fn install_core_standard(
     }
     if config.modules.contains(StandardModule::Compress) {
         let backend = model_backend_for(&model_backend, StandardModule::Compress)?;
+        let methods: Vec<_> = crate::compress::COMPRESS_METHODS
+            .iter()
+            .map(|method| {
+                if backend.requires_unprotected_input() && method.name == "summarize" {
+                    method.unprotected_input()
+                } else {
+                    *method
+                }
+            })
+            .collect();
         let compress: Arc<dyn Driver> = Arc::new(crate::compress::CompressDriver::new(backend));
         for path in ["effect://compress/summarize", "effect://compress/trim-plan"] {
-            register_standard_effect(
-                boot,
-                path,
-                crate::compress::COMPRESS_METHODS,
-                compress.clone(),
-                &configured_paths,
-            )?;
+            register_standard_effect(boot, path, &methods, compress.clone(), &configured_paths)?;
         }
     }
     if config.modules.contains(StandardModule::Tensor) {
-        let tensor: Arc<dyn Driver> = Arc::new(crate::tensor::TensorDriver::new(state.clone()));
-        for path in [
+        let tensor: Arc<dyn Driver> =
+            Arc::new(crate::tensor::TensorDriver::new(config.objects.clone()));
+        register_standard_effect(
+            boot,
             "effect://tensor/write",
-            "effect://tensor/read",
-            "effect://tensor/delete",
-        ] {
-            register_standard_effect(
-                boot,
-                path,
-                crate::tensor::TENSOR_METHODS,
-                tensor.clone(),
-                &configured_paths,
-            )?;
-        }
+            crate::tensor::TENSOR_METHODS,
+            tensor,
+            &configured_paths,
+        )?;
     }
     if config.modules.contains(StandardModule::Proc) {
         let proc: Arc<dyn Driver> = Arc::new(crate::proc::ProcDriver::new(state.clone()));
@@ -899,7 +953,7 @@ fn install_core_standard(
             "state",
             xolotl_types::InterfaceFamily::Value,
             crate::state::STATE_METHODS,
-            Arc::new(crate::state::StateDriver::new(state.clone())),
+            Arc::new(crate::state::StateDriver::new(state)),
         )?;
     }
 
@@ -932,12 +986,13 @@ fn install_core_standard(
 fn install_fetch_driver(
     boot: &Bootstrap,
     def: &InProcessProjectionDef,
+    host: &StandardConfig,
 ) -> Result<(), InstallError> {
     require_expected_provides(def, &[("effect://fetch/get", Purity::Effectful)])?;
     let config = optional_config_map(def)?;
     reject_unknown_config_fields(def, config, &[])?;
     let driver: Arc<dyn Driver> = Arc::new(
-        crate::fetch::FetchDriver::new(boot.kernel.state.clone()).map_err(|error| {
+        crate::fetch::FetchDriver::new(host.objects.clone()).map_err(|error| {
             InstallError::InvalidConfig {
                 implementation: def.implementation.clone(),
                 message: error.to_string(),
@@ -958,7 +1013,11 @@ fn install_fetch_driver(
 }
 
 #[cfg(feature = "fs")]
-fn install_fs_driver(boot: &Bootstrap, def: &InProcessProjectionDef) -> Result<(), InstallError> {
+fn install_fs_driver(
+    boot: &Bootstrap,
+    def: &InProcessProjectionDef,
+    host: &StandardConfig,
+) -> Result<(), InstallError> {
     require_expected_provides(
         def,
         &[
@@ -973,7 +1032,7 @@ fn install_fs_driver(boot: &Bootstrap, def: &InProcessProjectionDef) -> Result<(
     reject_unknown_config_fields(def, config, &["root"])?;
     let root = required_string(def, config, "root")?;
     let driver: Arc<dyn Driver> = Arc::new(
-        crate::fs::FsDriver::new(root, boot.kernel.state.clone()).map_err(|error| {
+        crate::fs::FsDriver::new(root, host.objects.clone()).map_err(|error| {
             InstallError::InvalidConfig {
                 implementation: def.implementation.clone(),
                 message: error.to_string(),
@@ -1128,12 +1187,10 @@ fn require_provider_role(def: &InProcessProjectionDef) -> Result<(), InstallErro
 }
 
 #[cfg(feature = "fetch")]
-fn optional_config_map(
-    def: &InProcessProjectionDef,
-) -> Result<&BTreeMap<String, Value>, InstallError> {
-    match &def.config {
-        Value::Map(map) => Ok(map),
-        Value::Null => Ok(empty_config_map()),
+fn optional_config_map(def: &InProcessProjectionDef) -> Result<&ValueMap, InstallError> {
+    match def.config.view() {
+        ValueView::Map(map) => Ok(map),
+        ValueView::Null => Ok(empty_config_map()),
         _ => Err(InstallError::InvalidConfig {
             implementation: def.implementation.clone(),
             message: "config must be an object".into(),
@@ -1142,11 +1199,9 @@ fn optional_config_map(
 }
 
 #[cfg(any(feature = "fs", feature = "terminal"))]
-fn required_config_map(
-    def: &InProcessProjectionDef,
-) -> Result<&BTreeMap<String, Value>, InstallError> {
-    match &def.config {
-        Value::Map(map) => Ok(map),
+fn required_config_map(def: &InProcessProjectionDef) -> Result<&ValueMap, InstallError> {
+    match def.config.view() {
+        ValueView::Map(map) => Ok(map),
         _ => Err(InstallError::InvalidConfig {
             implementation: def.implementation.clone(),
             message: "config must be an object".into(),
@@ -1155,19 +1210,19 @@ fn required_config_map(
 }
 
 #[cfg(feature = "fetch")]
-fn empty_config_map() -> &'static BTreeMap<String, Value> {
-    static EMPTY: std::sync::OnceLock<BTreeMap<String, Value>> = std::sync::OnceLock::new();
-    EMPTY.get_or_init(BTreeMap::new)
+fn empty_config_map() -> &'static ValueMap {
+    static EMPTY: std::sync::OnceLock<ValueMap> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(ValueMap::new)
 }
 
 #[cfg(any(feature = "fetch", feature = "fs", feature = "terminal"))]
 fn reject_unknown_config_fields(
     def: &InProcessProjectionDef,
-    config: &BTreeMap<String, Value>,
+    config: &ValueMap,
     allowed: &[&str],
 ) -> Result<(), InstallError> {
     for key in config.keys() {
-        if !allowed.iter().any(|allowed_key| key == allowed_key) {
+        if !allowed.contains(&key) {
             return Err(InstallError::InvalidConfig {
                 implementation: def.implementation.clone(),
                 message: format!("unknown config field {key:?}"),
@@ -1180,7 +1235,7 @@ fn reject_unknown_config_fields(
 #[cfg(feature = "fs")]
 fn required_string<'a>(
     def: &InProcessProjectionDef,
-    config: &'a BTreeMap<String, Value>,
+    config: &'a ValueMap,
     field: &'static str,
 ) -> Result<&'a str, InstallError> {
     let value = config
@@ -1205,7 +1260,7 @@ fn required_string<'a>(
 #[cfg(feature = "terminal")]
 fn required_string_list(
     def: &InProcessProjectionDef,
-    config: &BTreeMap<String, Value>,
+    config: &ValueMap,
     field: &'static str,
 ) -> Result<Vec<String>, InstallError> {
     let value = config
@@ -1220,7 +1275,7 @@ fn required_string_list(
 #[cfg(feature = "terminal")]
 fn optional_string_list(
     def: &InProcessProjectionDef,
-    config: &BTreeMap<String, Value>,
+    config: &ValueMap,
     field: &'static str,
 ) -> Result<Option<Vec<String>>, InstallError> {
     config
@@ -1235,7 +1290,7 @@ fn string_list(
     field: &'static str,
     value: &Value,
 ) -> Result<Vec<String>, InstallError> {
-    let Value::List(values) = value else {
+    let Some(values) = value.as_list() else {
         return Err(InstallError::InvalidConfig {
             implementation: def.implementation.clone(),
             message: format!("{field} must be a list of strings"),
@@ -1442,12 +1497,10 @@ fn register_single_effect_with_cost(
 
 fn invoke_spec_for_path(path: &str, methods: &[MethodSpec]) -> Option<MethodSpec> {
     let idx = method_index_for_path(path, methods)?;
-    let method = methods[idx];
-    let mut spec = MethodSpec::new("invoke", method.purity, method.supports);
-    spec.batchable = method.batchable;
-    spec.observes_external = method.observes_external;
-    spec.finalize_allowed = method.finalize_allowed;
-    Some(spec)
+    Some(MethodSpec {
+        name: "invoke",
+        ..methods[idx]
+    })
 }
 
 fn method_index_for_path(path: &str, methods: &[MethodSpec]) -> Option<usize> {
@@ -1471,13 +1524,21 @@ impl SingleMethodDriver {
 
 #[async_trait]
 impl Driver for SingleMethodDriver {
+    fn input_admission(&self, method: MethodId) -> Option<xolotl_kernel::driver::InputAdmission> {
+        if method.get() == 0 {
+            self.inner.input_admission(self.inner_method)
+        } else {
+            None
+        }
+    }
+
     async fn call(
         &self,
         method: MethodId,
         input: Value,
         output: OutputMode,
         ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
+    ) -> Result<DriverOutput, DriverError> {
         if method.get() != 0 {
             return Err(DriverError::NoSuchMethod(method));
         }
@@ -1501,7 +1562,7 @@ mod tests {
     #[async_trait::async_trait]
     impl InferenceBackend for StaticBackend {
         async fn infer(&self, _input: &Value) -> Result<Value, String> {
-            Ok(Value::Str("configured-router".into()))
+            Ok(Value::string("configured-router".into()))
         }
 
         async fn embed(&self, _input: &Value) -> Result<Value, String> {
@@ -1541,7 +1602,7 @@ mod tests {
                 Purity::Effectful,
             )],
             emits: None,
-            config: Value::Null,
+            config: Value::null(),
             version: 1,
         }
     }
@@ -1551,7 +1612,11 @@ mod tests {
     fn in_process_projection_declaration_fails_when_feature_is_absent() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
         install_default(&boot)?;
-        let err = match install_decoded_in_process_projection(&boot, &fetch_projection_def()) {
+        let err = match install_decoded_in_process_projection(
+            &boot,
+            &fetch_projection_def(),
+            &StandardConfig::default(),
+        ) {
             Ok(()) => bail!("fetch projection unexpectedly installed without fetch feature"),
             Err(error) => error,
         };
@@ -1574,7 +1639,8 @@ mod tests {
         let boot = Bootstrap::in_memory();
         install_default(&boot)?;
         let def = fetch_projection_def();
-        install_decoded_in_process_projection(&boot, &def).context("install fetch projection")?;
+        install_decoded_in_process_projection(&boot, &def, &StandardConfig::default())
+            .context("install fetch projection")?;
         let name = resource_name("effect://fetch/get")?;
         let first = boot
             .kernel
@@ -1583,7 +1649,8 @@ mod tests {
             .map_err(|error| anyhow::anyhow!("{error:?}"))
             .context("resolve first fetch resource")?;
 
-        install_decoded_in_process_projection(&boot, &def).context("reinstall fetch projection")?;
+        install_decoded_in_process_projection(&boot, &def, &StandardConfig::default())
+            .context("reinstall fetch projection")?;
         let second = boot
             .kernel
             .registry
@@ -1601,11 +1668,16 @@ mod tests {
         let boot = Bootstrap::in_memory();
         install_default(&boot)?;
         let def = fetch_projection_def();
-        install_decoded_in_process_projection(&boot, &def).context("install fetch projection")?;
+        install_decoded_in_process_projection(&boot, &def, &StandardConfig::default())
+            .context("install fetch projection")?;
 
         let mut duplicate = fetch_projection_def();
         duplicate.id = "other_fetch".into();
-        let err = match install_decoded_in_process_projection(&boot, &duplicate) {
+        let err = match install_decoded_in_process_projection(
+            &boot,
+            &duplicate,
+            &StandardConfig::default(),
+        ) {
             Ok(()) => bail!("duplicate projection unexpectedly relinked fetch effect"),
             Err(error) => error,
         };
@@ -1627,7 +1699,8 @@ mod tests {
         let err = match install_in_process_projection_value(
             &boot,
             &Path::parse("path://remote/state/kernel/projections/in-process/fetch")?,
-            Value::Null,
+            Value::null(),
+            &StandardConfig::default(),
         ) {
             Ok(_) => bail!("clustered declaration path was unexpectedly accepted"),
             Err(error) => error,
@@ -1640,7 +1713,12 @@ mod tests {
     }
 
     async fn run_standard_inference(boot: &Bootstrap) -> anyhow::Result<Outcome> {
-        run_standard_effect(boot, "effect://inference/infer", Value::Str("hello".into())).await
+        run_standard_effect(
+            boot,
+            "effect://inference/infer",
+            Value::string("hello".into()),
+        )
+        .await
     }
 
     async fn run_standard_effect(
@@ -1668,7 +1746,7 @@ mod tests {
             output: OutputMode::Unary,
             literal_input: Some(input),
         });
-        Ok(ex.eval(&prog).await)
+        Ok(ex.eval(&prog).await.outcome)
     }
 
     #[cfg(not(any(
@@ -1683,7 +1761,7 @@ mod tests {
         install_default(&boot)?;
         let out = run_standard_inference(&boot).await?;
         ensure!(
-            matches!(out, Outcome::Done(Value::Str(_))),
+            matches!(out, Outcome::Done(ref value) if value.as_str().is_some()),
             "expected inference text output, got {out:?}"
         );
         Ok(())
@@ -1757,11 +1835,11 @@ mod tests {
                 method: "invoke".into(),
                 method_id: None,
                 output: OutputMode::Unary,
-                literal_input: Some(Value::Str("hello".into())),
+                literal_input: Some(Value::string("hello".into())),
             }))
             .await;
         ensure!(
-            matches!(out, Outcome::Done(Value::Str(ref text)) if text == "configured-router"),
+            matches!(out.outcome, Outcome::Done(ref value) if value.as_str() == Some("configured-router")),
             "expected configured router output, got {out:?}"
         );
         Ok(())
@@ -1774,7 +1852,7 @@ mod tests {
         install_standard(&boot, &config).map_err(anyhow::Error::msg)?;
         let out = run_standard_inference(&boot).await?;
         ensure!(
-            matches!(out, Outcome::Done(Value::Str(ref text)) if text == "configured-router"),
+            matches!(out, Outcome::Done(ref value) if value.as_str() == Some("configured-router")),
             "expected host backend output, got {out:?}"
         );
         Ok(())
@@ -1787,34 +1865,32 @@ mod tests {
         install_standard(&boot, &config).map_err(anyhow::Error::msg)?;
 
         let mut deliberation_input = std::collections::BTreeMap::new();
-        deliberation_input.insert("question".into(), Value::Str("choose".into()));
-        deliberation_input.insert("panelists".into(), Value::Int(1));
+        deliberation_input.insert("question".into(), Value::string("choose".into()));
+        deliberation_input.insert("panelists".into(), Value::integer(1));
         let deliberation = run_standard_effect(
             &boot,
             "effect://deliberation/run",
-            Value::Map(deliberation_input),
+            Value::map(deliberation_input),
         )
         .await?;
         ensure!(
-            matches!(deliberation, Outcome::Done(Value::Map(ref map)) if map
-                .get("answer")
+            matches!(deliberation, Outcome::Done(ref value) if value.as_map().and_then(|map| map.get("answer"))
                 .and_then(Value::as_str)
                 == Some("configured-router")),
             "expected deliberation to use host backend, got {deliberation:?}"
         );
 
         let mut compress_input = std::collections::BTreeMap::new();
-        compress_input.insert("text".into(), Value::Str("word ".repeat(500)));
-        compress_input.insert("max_tokens".into(), Value::Int(1));
+        compress_input.insert("text".into(), Value::string("word ".repeat(500)));
+        compress_input.insert("max_tokens".into(), Value::integer(1));
         let compress = run_standard_effect(
             &boot,
             "effect://compress/summarize",
-            Value::Map(compress_input),
+            Value::map(compress_input),
         )
         .await?;
         ensure!(
-            matches!(compress, Outcome::Done(Value::Map(ref map)) if map
-                .get("summary")
+            matches!(compress, Outcome::Done(ref value) if value.as_map().and_then(|map| map.get("summary"))
                 .and_then(Value::as_str)
                 == Some("configured-router")),
             "expected compress to use host backend, got {compress:?}"
@@ -1867,11 +1943,11 @@ mod tests {
             method: "write".into(),
             method_id: None,
             output: OutputMode::Unary,
-            literal_input: Some(Value::Str("hello-state".into())),
+            literal_input: Some(Value::string("hello-state".into())),
         });
-        let written = ex.eval(&write).await;
+        let written = ex.eval(&write).await.outcome;
         ensure!(
-            written == Outcome::Done(Value::Bool(true)),
+            written == Outcome::Done(Value::boolean(true)),
             "state write outcome: {written:?}"
         );
 
@@ -1885,11 +1961,11 @@ mod tests {
             method: "read".into(),
             method_id: None,
             output: OutputMode::Unary,
-            literal_input: Some(Value::Null),
+            literal_input: Some(Value::null()),
         });
-        let read_out = ex.eval(&read).await;
+        let read_out = ex.eval(&read).await.outcome;
         ensure!(
-            read_out == Outcome::Done(Value::Str("hello-state".into())),
+            read_out == Outcome::Done(Value::string("hello-state".into())),
             "state read outcome: {read_out:?}"
         );
         Ok(())
@@ -1912,14 +1988,14 @@ mod tests {
             method: "write".into(),
             method_id: None,
             output: OutputMode::Unary,
-            literal_input: Some(Value::Str("from-the-web".into())),
+            literal_input: Some(Value::string("from-the-web".into())),
         });
         let entry_taint = xolotl_types::TaintSet::of(xolotl_types::TaintSource::Fetched {
             host: "evil.example".into(),
         });
-        let outcome = ex.eval_tainted(&write, entry_taint).await;
+        let outcome = ex.eval_tainted(&write, entry_taint).await.outcome;
         ensure!(
-            outcome == Outcome::Done(Value::Bool(true)),
+            outcome == Outcome::Done(Value::boolean(true)),
             "tainted write outcome: {outcome:?}"
         );
 
@@ -1955,16 +2031,16 @@ mod tests {
             method: "write".into(),
             method_id: None,
             output: OutputMode::Unary,
-            literal_input: Some(Value::Str("lazy-write".into())),
+            literal_input: Some(Value::string("lazy-write".into())),
         });
-        let out = ex.eval(&write).await;
+        let out = ex.eval(&write).await.outcome;
         ensure!(
-            out == Outcome::Done(Value::Bool(true)),
+            out == Outcome::Done(Value::boolean(true)),
             "root should lazy-open a write handle when it has write grant: {out:?}"
         );
         let persisted = boot.kernel.state.read(&target_path).await?;
         ensure!(
-            persisted == Some(Value::Str("lazy-write".into())),
+            persisted == Some(Value::string("lazy-write".into())),
             "lazy write did not persist: {persisted:?}"
         );
         Ok(())
@@ -1998,9 +2074,9 @@ mod tests {
             method: "write".into(),
             method_id: None,
             output: OutputMode::Unary,
-            literal_input: Some(Value::Str("must-not-write".into())),
+            literal_input: Some(Value::string("must-not-write".into())),
         });
-        let out = ex.eval(&write).await;
+        let out = ex.eval(&write).await.outcome;
         ensure!(
             matches!(
                 out,
@@ -2038,11 +2114,16 @@ mod tests {
             method: "read".into(),
             method_id: None,
             output: OutputMode::Unary,
-            literal_input: Some(Value::Null),
+            literal_input: Some(Value::null()),
         });
-        match ex.eval(&read).await {
-            Outcome::Done(Value::List(_)) => {}
-            other => bail!("expected fact projection list, got {other:?}"),
+        match ex.eval(&read).await.outcome {
+            Outcome::Done(value)
+                if value
+                    .as_map()
+                    .and_then(|page| page.get("items"))
+                    .and_then(Value::as_list)
+                    .is_some() => {}
+            other => bail!("expected fact projection page, got {other:?}"),
         }
 
         let global_fact_path = resource_name("state://fact")?;
@@ -2056,12 +2137,17 @@ mod tests {
             method: "read".into(),
             method_id: None,
             output: OutputMode::Unary,
-            literal_input: Some(Value::Null),
+            literal_input: Some(Value::null()),
         });
-        match ex.eval(&read_global).await {
-            Outcome::Done(Value::List(_)) => {}
+        match ex.eval(&read_global).await.outcome {
+            Outcome::Done(value)
+                if value
+                    .as_map()
+                    .and_then(|page| page.get("items"))
+                    .and_then(Value::as_list)
+                    .is_some() => {}
             other => {
-                bail!("expected global fact projection list, got {other:?}");
+                bail!("expected global fact projection page, got {other:?}");
             }
         }
 
@@ -2198,9 +2284,9 @@ mod tests {
             method: "check".into(),
             method_id: None,
             output: OutputMode::Unary,
-            literal_input: Some(Value::Null),
+            literal_input: Some(Value::null()),
         });
-        let sibling_out = ex.eval(&sibling_check_on_ask).await;
+        let sibling_out = ex.eval(&sibling_check_on_ask).await.outcome;
         ensure!(
             matches!(
                 sibling_out,
@@ -2234,12 +2320,12 @@ mod tests {
             method: "invoke".into(),
             method_id: None,
             output: OutputMode::Unary,
-            literal_input: Some(Value::Map(std::collections::BTreeMap::from([
-                ("pairing_id".into(), Value::Str("pair-old".into())),
-                ("pairing_secret".into(), Value::Str("old-secret".into())),
+            literal_input: Some(Value::map(std::collections::BTreeMap::from([
+                ("pairing_id".into(), Value::string("pair-old".into())),
+                ("pairing_secret".into(), Value::string("old-secret".into())),
             ]))),
         });
-        let out = ex.eval(&prog).await;
+        let out = ex.eval(&prog).await.outcome;
         ensure!(
             matches!(
                 out,
@@ -2250,19 +2336,117 @@ mod tests {
 
         let facts = boot.kernel.facts.all_facts().map_err(anyhow::Error::msg)?;
         ensure!(facts.len() == 1, "fact count: {}", facts.len());
-        let Some(Value::Map(input)) = facts[0].input_ref.as_inline() else {
+        let Some(input) = facts[0].input.as_map() else {
             bail!("expected inline redacted input");
         };
         ensure!(
-            input.get("pairing_secret") == Some(&Value::Str("<redacted>".into())),
+            input.get("pairing_secret") == Some(&Value::string("<redacted>".into())),
             "pairing_secret was not redacted"
         );
         ensure!(
             !input
                 .values()
-                .any(|v| v == &Value::Str("old-secret".into())),
+                .any(|v| v == &Value::string("old-secret".into())),
             "raw pairing secret leaked into facts"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pairing_admission_follows_the_driver_when_mounted_at_another_path()
+    -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let path = "effect://custom/onboarding";
+        boot.register_effect(
+            path,
+            &[MethodSpec::new(
+                "invoke",
+                Purity::Effectful,
+                MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(SingleMethodDriver::new(
+                Arc::new(PairingDriver::new(boot.kernel.state.clone())),
+                3,
+            )),
+        )?;
+        let output = run_standard_effect(
+            &boot,
+            path,
+            Value::map(std::collections::BTreeMap::from([
+                ("pairing_id".into(), Value::string("pair-old".into())),
+                (
+                    "pairing_secret".into(),
+                    Value::string("secret-value".into()),
+                ),
+            ])),
+        )
+        .await?;
+        ensure!(matches!(
+            output,
+            Outcome::Fail(xolotl_types::Failure::InvalidInput { .. })
+        ));
+        let facts = boot.kernel.facts.all_facts().map_err(anyhow::Error::msg)?;
+        ensure!(facts.len() == 1);
+        let Some(input) = facts[0].input.as_map() else {
+            bail!("missing recorded input")
+        };
+        ensure!(input.get("pairing_secret") == Some(&Value::string("<redacted>".into())));
+        ensure!(input.get("pairing_id") == Some(&Value::string("pair-old".into())));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_input_requirement_survives_standard_method_remapping() -> anyhow::Result<()> {
+        struct RemoteBackend;
+        #[async_trait::async_trait]
+        impl InferenceBackend for RemoteBackend {
+            fn requires_unprotected_input(&self) -> bool {
+                true
+            }
+            async fn infer(&self, _input: &Value) -> Result<Value, String> {
+                Err("backend was invoked".into())
+            }
+            async fn embed(&self, _input: &Value) -> Result<Value, String> {
+                Err("backend was invoked".into())
+            }
+        }
+        let boot = Bootstrap::in_memory();
+        install_standard(
+            &boot,
+            &StandardConfig::default().with_inference_backend(Arc::new(RemoteBackend)),
+        )?;
+        for path in [
+            "effect://inference/infer",
+            "effect://compress/summarize",
+            "effect://deliberation/run",
+            "effect://memory/store",
+        ] {
+            let name = resource_name(path)?;
+            let handle = boot
+                .open_for(boot.root, &name, "perform")
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let executor = boot.kernel.executor_for(boot.root);
+            executor.bind_handle(name.clone(), handle);
+            let operation = DoNode::Op(OperationTemplate {
+                target: name,
+                method: "invoke".into(),
+                method_id: None,
+                output: OutputMode::Unary,
+                literal_input: Some(Value::null()),
+            });
+            let taint = xolotl_types::TaintSet::of(xolotl_types::TaintSource::Protected {
+                path: Path::parse("state://vault/private")?,
+            });
+            let output = executor.eval_tainted(&operation, taint).await.outcome;
+            ensure!(
+                output
+                    == Outcome::Fail(xolotl_types::Failure::policy(
+                        "taint",
+                        "method requires unprotected input"
+                    )),
+                "{path}: {output:?}"
+            );
+        }
         Ok(())
     }
 

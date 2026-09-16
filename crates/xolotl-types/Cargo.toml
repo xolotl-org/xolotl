@@ -16,10 +16,16 @@ default = []
 
 [dependencies]
 bitflags = { workspace = true, default-features = false }
-serde = { workspace = true, default-features = false, features = ["derive", "std"] }
-serde_json = { workspace = true, default-features = false, features = ["std"] }
-smol_str = { workspace = true, default-features = false, features = ["serde", "std"] }
-thiserror = { workspace = true, default-features = false, features = ["std"] }
+blake3 = { workspace = true, default-features = false }
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
+serde_json = { workspace = true, default-features = false, features = ["alloc"] }
+smol_str = { workspace = true, default-features = false, features = ["serde"] }
+thiserror = { workspace = true, default-features = false }
 
 [dev-dependencies]
 anyhow = { workspace = true, default-features = false, features = ["std"] }
+criterion = { workspace = true, default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "collection_build"
+harness = false

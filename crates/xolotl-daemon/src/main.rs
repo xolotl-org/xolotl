@@ -19,7 +19,11 @@
 //! registries and the root Process, install in-process implementations, recover, start
 //! gateways, and report ready.
 
+#[cfg(feature = "application-grpc")]
+mod application;
 mod config;
+#[cfg(any(feature = "external-gateway", feature = "application-grpc"))]
+mod transport;
 
 use anyhow::Result;
 use config::XolotlConfig;
@@ -36,7 +40,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 #[cfg(feature = "external-gateway")]
 use std::time::Duration;
-#[cfg(feature = "external-gateway")]
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 #[cfg(feature = "external-gateway")]
@@ -45,8 +48,6 @@ use xolotl_console::{
     BootstrapOutcome, ConsoleState, ConsoleTransportSecurityConfig, PairingSecretDisplay,
     RootProvisioning,
 };
-#[cfg(feature = "external-gateway")]
-use xolotl_gateway::GatewayTransportSecurityConfig;
 #[cfg(all(test, feature = "external-gateway"))]
 use xolotl_gateway::external::SourceCommandRegister;
 #[cfg(feature = "external-gateway")]
@@ -73,6 +74,8 @@ use xolotl_standard::{
 };
 use xolotl_state::StateEvent;
 use xolotl_storage_redb::RedbStore;
+#[cfg(feature = "external-gateway")]
+use xolotl_types::Value;
 #[cfg(all(test, feature = "external-gateway"))]
 use xolotl_types::external::ObservedGenerations;
 #[cfg(all(test, feature = "external-gateway"))]
@@ -94,7 +97,7 @@ use xolotl_types::{
 };
 #[cfg(feature = "external-gateway")]
 use xolotl_types::{IdentityRef, ResourceId};
-use xolotl_types::{InProcessProjectionPhase, InProcessProjectionStatus, Path, Value};
+use xolotl_types::{InProcessProjectionPhase, InProcessProjectionStatus, Path};
 
 const CONSOLE_ADDR_ENV: &str = "XOLOTL_CONSOLE_ADDR";
 #[cfg(feature = "external-websocket")]
@@ -212,25 +215,37 @@ async fn serve() -> Result<()> {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting xolotld");
 
     let cfg = XolotlConfig::load()?.unwrap_or_default();
+    #[cfg(not(feature = "application-grpc"))]
+    if optional_env_var("XOLOTL_APPLICATION_GRPC_ADDR")?.is_some() {
+        anyhow::bail!("XOLOTL_APPLICATION_GRPC_ADDR requires the application-grpc build feature");
+    }
 
     // Open the state backend and fact sink.
+    #[cfg(feature = "durable")]
+    let mut checkpoint_store = None;
     let (state, facts): (Backend, FactSink) = match cfg.storage.kind.as_str() {
         "memory" => {
             tracing::info!("state + facts: in-memory (non-persistent)");
             (
-                Arc::new(xolotl_sdk::InMemoryBackend::new()),
+                xolotl_sdk::InMemoryBackend::new().into_backend(),
                 FactSink::in_memory().0,
             )
         }
         _ => {
             let store = RedbStore::open(&cfg.storage.path)
                 .map_err(|e| anyhow::anyhow!("open storage '{}': {e}", cfg.storage.path))?;
+            #[cfg(feature = "durable")]
+            {
+                checkpoint_store = Some(
+                    Arc::new(store.checkpoint_store()) as Arc<dyn xolotl_sdk::CheckpointStore>
+                );
+            }
             tracing::info!(path = %cfg.storage.path, "state + facts: redb");
             let fact_store = store
                 .fact_store()
                 .map_err(|e| anyhow::anyhow!("open fact store: {e}"))?;
             (
-                Arc::new(store.state_backend()),
+                store.state_backend().into_backend(),
                 FactSink::new(Arc::new(fact_store)),
             )
         }
@@ -238,11 +253,31 @@ async fn serve() -> Result<()> {
 
     // Build the kernel, root Process, and standard providers.
     let kernel = Kernel::with_backends(state, facts);
+    #[cfg(feature = "durable")]
+    let kernel = match checkpoint_store {
+        Some(store) => kernel.with_checkpoint_store(store),
+        None => kernel,
+    };
     let boot = Arc::new(Bootstrap::from_kernel(kernel));
+    #[cfg(feature = "durable")]
+    boot.reserve_checkpoint_process_ids()?;
     let pairing_display = PairingDisplayEdge::default();
-    let standard_config = standard_config(pairing_display.clone());
+    let object_path = cfg
+        .storage
+        .object_path
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(&cfg.storage.path).with_extension("objects"));
+    let objects = xolotl_storage_fs::FileObjectStore::open(&object_path).map_err(|error| {
+        anyhow::anyhow!("open object storage '{}': {error}", object_path.display())
+    })?;
+    let objects = objects.into_object_store();
+    #[cfg(feature = "application-grpc")]
+    let application_objects = objects.clone();
+    let standard_config = standard_config(pairing_display.clone()).with_object_store(objects);
     install_standard(&boot, &standard_config)?;
-    let projection_report = install_declared_in_process_projections(&boot).await?;
+    let projection_report =
+        install_declared_in_process_projections(&boot, &standard_config).await?;
     let declared_projections = projection_report.installed_count();
     let rejected_projections = projection_report.rejected_count();
     reconcile_in_process_projection_report_status(&boot, projection_report.entries).await?;
@@ -297,9 +332,46 @@ async fn serve() -> Result<()> {
         );
     }
 
+    #[cfg(feature = "application-grpc")]
+    let application =
+        application::ApplicationGateway::start(&cfg, boot.clone(), application_objects).await?;
+
     // Start gateways.
     let mut handles = Vec::new();
-    handles.push(start_in_process_projection_reconciler(boot.clone()).await?);
+    #[cfg(feature = "durable")]
+    if boot.kernel.checkpoint_store().is_some() {
+        let mut programs = boot.checkpoint_recovery()?;
+        handles.push(tokio::spawn(async move {
+            loop {
+                match programs.advance().await {
+                    Ok(report) => {
+                        if report.resumed + report.quarantined > 0 {
+                            tracing::info!(
+                                resumed = report.resumed,
+                                quarantined = report.quarantined,
+                                deferred = report.deferred,
+                                "portable checkpoint recovery advanced"
+                            );
+                        }
+                        if report.complete {
+                            break;
+                        }
+                        if report.deferred != 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        } else {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "checkpoint recovery advance failed; retrying");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }));
+    }
+    handles
+        .push(start_in_process_projection_reconciler(boot.clone(), standard_config.clone()).await?);
 
     let console_addr = match cfg.server.console_addr.clone() {
         Some(addr) => Some(addr),
@@ -334,10 +406,13 @@ async fn serve() -> Result<()> {
     start_external_websocket(&cfg, &boot, &mut handles).await?;
     #[cfg(feature = "external-grpc")]
     start_external_grpc(&cfg, &boot, &mut handles).await?;
-
     // Mark the daemon ready.
     tracing::info!("xolotld ready");
-    wait_for_shutdown().await?;
+    let shutdown = wait_for_shutdown().await;
+    #[cfg(feature = "application-grpc")]
+    if let Some(application) = application {
+        application.shutdown().await;
+    }
     let shutdown_report = shutdown_background_tasks(handles).await;
     tracing::debug!(
         completed = shutdown_report.completed,
@@ -346,6 +421,7 @@ async fn serve() -> Result<()> {
         "background task shutdown complete"
     );
     tracing::info!("graceful shutdown");
+    shutdown?;
     Ok(())
 }
 
@@ -408,6 +484,7 @@ impl PairingSecretDisplay for StandardPairingSecretDisplay {
 
 async fn start_in_process_projection_reconciler(
     boot: Arc<Bootstrap>,
+    config: StandardConfig,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let pattern = in_process_projection_watch_pattern()
         .map_err(|error| anyhow::anyhow!("build in-process projection watch pattern: {error}"))?;
@@ -417,7 +494,7 @@ async fn start_in_process_projection_reconciler(
             match events.recv().await {
                 Ok(StateEvent::Set { path, value, .. }) => {
                     let id = in_process_projection_declaration_id(&path);
-                    let result = install_in_process_projection_value(&boot, &path, value);
+                    let result = install_in_process_projection_value(&boot, &path, value, &config);
                     if let Err(error) =
                         write_in_process_projection_result_status(&boot, id.as_deref(), &result)
                             .await
@@ -438,7 +515,7 @@ async fn start_in_process_projection_reconciler(
                         "in-process projection declaration path received append event"
                     );
                 }
-                Ok(StateEvent::Delete { path }) => {
+                Ok(StateEvent::Delete { path, .. }) => {
                     if let Err(error) = delete_in_process_projection_status(&boot, &path).await {
                         tracing::error!(
                             path = %path,
@@ -451,12 +528,12 @@ async fn start_in_process_projection_reconciler(
                         "in-process projection declaration was deleted; live registry entries remain until restart"
                     );
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                Err(xolotl_sdk::StateWatchError::Lagged(skipped)) => {
                     tracing::error!(
                         skipped,
                         "in-process projection declaration watcher lagged; reconciling declarations"
                     );
-                    match install_declared_in_process_projections(&boot).await {
+                    match install_declared_in_process_projections(&boot, &config).await {
                         Ok(report) => {
                             if let Err(error) =
                                 reconcile_in_process_projection_report_status(&boot, report.entries)
@@ -476,8 +553,8 @@ async fn start_in_process_projection_reconciler(
                         }
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    tracing::error!("in-process projection declaration watcher closed");
+                Err(error) => {
+                    tracing::error!(%error, "in-process projection declaration watcher stopped");
                     break;
                 }
             }
@@ -542,13 +619,18 @@ async fn delete_stale_in_process_projection_statuses(
     declared_ids: &BTreeSet<String>,
 ) -> Result<()> {
     let prefix = in_process_projection_status_prefix()?;
-    let statuses = boot.kernel.state.read_prefix(&prefix).await?;
-    for (path, _) in statuses {
-        let Some(id) = in_process_projection_status_path_id(&path) else {
-            continue;
-        };
-        if !declared_ids.contains(&id) {
-            boot.kernel.state.write_delete(&path).await?;
+    let mut pages = boot
+        .kernel
+        .state
+        .pages(xolotl_state::StateScan::new(prefix));
+    while let Some(page) = pages.next().await? {
+        for (path, _) in page.entries {
+            let Some(id) = in_process_projection_status_path_id(&path) else {
+                continue;
+            };
+            if !declared_ids.contains(&id) {
+                boot.kernel.state.write_delete(&path).await?;
+            }
         }
     }
     Ok(())
@@ -731,7 +813,7 @@ async fn start_external_websocket(
         .transport_security
         .validate_plain_listener("external WebSocket gateway", &addr)?;
     let listen_addr = security.listen_addr;
-    log_external_transport_security("external WebSocket gateway", &addr, &security.config);
+    transport::log_transport_security("external WebSocket gateway", &addr, &security.config);
     let listener = TcpListener::bind(listen_addr).await?;
     let handler = DaemonExternalSessionHandler::with_limits(
         boot.kernel.state.clone(),
@@ -769,7 +851,7 @@ async fn start_external_grpc(
         .transport_security
         .validate_grpc_listener("external gRPC gateway", &addr)?;
     let listen_addr = security.listen_addr;
-    log_external_transport_security("external gRPC gateway", &addr, &security.config);
+    transport::log_transport_security("external gRPC gateway", &addr, &security.config);
     let handler = DaemonExternalSessionHandler::with_limits(
         boot.kernel.state.clone(),
         boot.kernel.registry.clone(),
@@ -782,7 +864,7 @@ async fn start_external_grpc(
         },
     );
     tracing::info!(%addr, "external gRPC gateway listening");
-    let mut server = grpc_server_builder(&security)?;
+    let mut server = transport::grpc_server_builder(&security)?;
     handles.push(tokio::spawn(async move {
         if let Err(e) = server
             .add_service(service.into_server())
@@ -793,36 +875,6 @@ async fn start_external_grpc(
         }
     }));
     Ok(())
-}
-
-#[cfg(feature = "external-grpc")]
-fn grpc_server_builder(
-    security: &config::GatewayListenerSecurity,
-) -> Result<tonic::transport::Server> {
-    let server = tonic::transport::Server::builder();
-    if let Some(tls) = security.tls.as_ref() {
-        return server
-            .tls_config(tonic_server_tls_config(tls)?)
-            .map_err(|error| anyhow::anyhow!("configure gRPC TLS listener: {error}"));
-    }
-    Ok(server)
-}
-
-#[cfg(feature = "external-grpc")]
-fn tonic_server_tls_config(
-    tls: &config::GatewayListenerTlsMaterial,
-) -> Result<tonic::transport::ServerTlsConfig> {
-    let identity = tonic::transport::Identity::from_pem(
-        tls.certificate_chain_pem.clone(),
-        tls.private_key_pem.clone(),
-    );
-    let mut config = tonic::transport::ServerTlsConfig::new().identity(identity);
-    if !tls.client_trust_roots_pem.is_empty() {
-        config = config.client_ca_root(tonic::transport::Certificate::from_pem(
-            tls.client_trust_roots_pem.clone(),
-        ));
-    }
-    Ok(config)
 }
 
 #[cfg(feature = "external-gateway")]
@@ -2206,7 +2258,7 @@ fn external_registry_hash(
 
 #[cfg(feature = "external-gateway")]
 fn credential_generation_from_record(
-    record: &std::collections::BTreeMap<String, Value>,
+    record: &xolotl_types::ValueMap,
 ) -> Result<u64, tonic::Status> {
     let generation = record
         .get("credential_generation")
@@ -2223,9 +2275,7 @@ fn credential_generation_from_record(
 }
 
 #[cfg(feature = "external-gateway")]
-fn key_epoch_from_record(
-    record: &std::collections::BTreeMap<String, Value>,
-) -> Result<u64, tonic::Status> {
+fn key_epoch_from_record(record: &xolotl_types::ValueMap) -> Result<u64, tonic::Status> {
     let Some(value) = record.get("key_epoch") else {
         return Ok(0);
     };
@@ -2440,6 +2490,7 @@ fn register_provider_binding(
             cost: CostModel::default(),
             batchable: false,
             finalize_allowed: declaration.finalize_allowed,
+            requires_unprotected_input: true,
         }],
         laws: Vec::new(),
     });
@@ -2563,7 +2614,6 @@ fn validate_external_control_frame(
     }
 }
 
-#[cfg(feature = "external-gateway")]
 fn now_millis() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
@@ -2729,25 +2779,6 @@ fn log_console_transport_security(addr: &str, config: &ConsoleTransportSecurityC
     }
 }
 
-#[cfg(feature = "external-gateway")]
-fn log_external_transport_security(
-    label: &'static str,
-    addr: &str,
-    config: &GatewayTransportSecurityConfig,
-) {
-    if config.is_unsafe() {
-        tracing::warn!(
-            %label,
-            %addr,
-            mode = config.mode.as_str(),
-            unsafe_relaxations = ?config.unsafe_relaxation_names(),
-            "external gateway unsafe transport enabled"
-        );
-    } else {
-        tracing::info!(%label, %addr, mode = config.mode.as_str(), "external gateway transport");
-    }
-}
-
 #[cfg(unix)]
 async fn wait_for_shutdown() -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -2774,7 +2805,9 @@ async fn wait_for_shutdown() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::{Context as _, bail};
+    use anyhow::Context as _;
+    #[cfg(feature = "external-gateway")]
+    use anyhow::bail;
     #[cfg(feature = "external-grpc")]
     use serde_json::json;
     #[cfg(feature = "external-grpc")]
@@ -2805,6 +2838,7 @@ mod tests {
         };
     }
 
+    #[cfg(feature = "external-gateway")]
     macro_rules! assert_ne {
         ($left:expr, $right:expr $(,)?) => {
             match (&$left, &$right) {
@@ -3470,7 +3504,7 @@ mod tests {
             &handler,
             InboundEvent {
                 id: "evt-1".into(),
-                payload: Value::Str("hello".into()),
+                payload: Value::string("hello".into()),
                 observed: Default::default(),
                 timestamp_ms: 1,
                 stream_id: None,
@@ -3486,11 +3520,17 @@ mod tests {
         let rows = boot
             .kernel
             .state
-            .read_prefix(&parse_test_path("state://events/external/chat/source")?)
+            .query(&xolotl_sdk::StateScan::new(parse_test_path(
+                "state://events/external/chat/source",
+            )?))
             .await
             .map_err(|error| anyhow::anyhow!("reading source event sink: {error}"))?;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1, Value::List(vec![Value::Str("hello".into())]));
+        assert_eq!(rows.entries.len(), 1);
+        assert!(rows.next.is_none());
+        assert_eq!(
+            rows.entries[0].1.value,
+            Value::list(vec![Value::string("hello".into())])
+        );
         Ok(())
     }
 
@@ -3584,7 +3624,7 @@ mod tests {
             &handler,
             InboundEvent {
                 id: "evt-schema".into(),
-                payload: Value::Int(1),
+                payload: Value::integer(1),
                 observed: Default::default(),
                 timestamp_ms: 1,
                 stream_id: None,
@@ -3682,7 +3722,7 @@ mod tests {
             &handler,
             ControlFrame::InstallationConfigUpdate {
                 config_version: context.installation_config_version + 1,
-                config: Value::Null,
+                config: Value::null(),
             },
             &session,
             context.clone(),
@@ -3728,7 +3768,7 @@ mod tests {
             ControlFrame::PresentationProfileUpdate {
                 profile_generation: 1,
                 profile_hash: String::new(),
-                profile: Value::Null,
+                profile: Value::null(),
             },
             &session,
             context,
@@ -3759,7 +3799,7 @@ mod tests {
 
         let command = xolotl_types::external::OutboundCommand {
             id: "cmd-1".into(),
-            action: Value::Str("sync".into()),
+            action: Value::string("sync".into()),
             observed: Default::default(),
         };
         let receiver = handler
@@ -3772,7 +3812,7 @@ mod tests {
         let sent = xolotl_proto::outbound_command_from_pb(&sent)
             .context("decoding outbound command frame")?;
         assert_eq!(sent.id, "cmd-1");
-        assert_eq!(sent.action, Value::Str("sync".into()));
+        assert_eq!(sent.action, Value::string("sync".into()));
         assert_eq!(
             sent.observed.presentation_config_generation,
             context.presentation_config_generation
@@ -3780,7 +3820,7 @@ mod tests {
 
         let expected = CommandResult {
             id: "cmd-1".into(),
-            outcome: Ok(Value::Str("ok".into())),
+            outcome: Ok(Value::string("ok".into())),
         };
         ExternalSessionHandler::on_command_result(
             &handler,
@@ -3799,7 +3839,7 @@ mod tests {
             &handler,
             CommandResult {
                 id: "cmd-1".into(),
-                outcome: Ok(Value::Str("again".into())),
+                outcome: Ok(Value::string("again".into())),
             },
             &session,
             context.clone(),
@@ -3815,7 +3855,7 @@ mod tests {
             .send_source_command(
                 xolotl_types::external::OutboundCommand {
                     id: "cmd-bad-action".into(),
-                    action: Value::Int(7),
+                    action: Value::integer(7),
                     observed: Default::default(),
                 },
                 &session,
@@ -3834,7 +3874,7 @@ mod tests {
             .send_source_command(
                 xolotl_types::external::OutboundCommand {
                     id: "cmd-bad-result".into(),
-                    action: Value::Str("sync".into()),
+                    action: Value::string("sync".into()),
                     observed: Default::default(),
                 },
                 &session,
@@ -3848,7 +3888,7 @@ mod tests {
             &handler,
             CommandResult {
                 id: "cmd-bad-result".into(),
-                outcome: Ok(Value::Int(7)),
+                outcome: Ok(Value::integer(7)),
             },
             &session,
             context.clone(),
@@ -3867,7 +3907,7 @@ mod tests {
             .send_source_command(
                 xolotl_types::external::OutboundCommand {
                     id: "cmd-large-result".into(),
-                    action: Value::Str("sync".into()),
+                    action: Value::string("sync".into()),
                     observed: Default::default(),
                 },
                 &session,
@@ -3881,7 +3921,7 @@ mod tests {
             &handler,
             CommandResult {
                 id: "cmd-large-result".into(),
-                outcome: Ok(Value::Str("x".repeat(
+                outcome: Ok(Value::string("x".repeat(
                     config::DEFAULT_EXTERNAL_SOURCE_COMMAND_MAX_INLINE_RESULT_BYTES + 1,
                 ))),
             },
@@ -3902,7 +3942,7 @@ mod tests {
             .send_source_command(
                 xolotl_types::external::OutboundCommand {
                     id: "cmd-large-error".into(),
-                    action: Value::Str("sync".into()),
+                    action: Value::string("sync".into()),
                     observed: Default::default(),
                 },
                 &session,
@@ -3956,7 +3996,7 @@ mod tests {
             .send_source_command(
                 xolotl_types::external::OutboundCommand {
                     id: "cmd-timeout".into(),
-                    action: Value::Str("sync".into()),
+                    action: Value::string("sync".into()),
                     observed: Default::default(),
                 },
                 &session,
@@ -3983,7 +4023,7 @@ mod tests {
             &handler,
             CommandResult {
                 id: "cmd-timeout".into(),
-                outcome: Ok(Value::Str("late".into())),
+                outcome: Ok(Value::string("late".into())),
             },
             &session,
             context.clone(),
@@ -4024,7 +4064,7 @@ mod tests {
             .send_source_command(
                 xolotl_types::external::OutboundCommand {
                     id: "cmd-1".into(),
-                    action: Value::Str("sync".into()),
+                    action: Value::string("sync".into()),
                     observed: Default::default(),
                 },
                 &session,
@@ -4039,7 +4079,7 @@ mod tests {
             .send_source_command(
                 xolotl_types::external::OutboundCommand {
                     id: "cmd-2".into(),
-                    action: Value::Str("sync".into()),
+                    action: Value::string("sync".into()),
                     observed: Default::default(),
                 },
                 &session,
@@ -4091,7 +4131,7 @@ mod tests {
             .send_source_command(
                 xolotl_types::external::OutboundCommand {
                     id: "cmd-1".into(),
-                    action: Value::Str("sync".into()),
+                    action: Value::string("sync".into()),
                     observed: Default::default(),
                 },
                 &session,
@@ -4106,7 +4146,7 @@ mod tests {
             .send_source_command(
                 xolotl_types::external::OutboundCommand {
                     id: "cmd-2".into(),
-                    action: Value::Str("sync".into()),
+                    action: Value::string("sync".into()),
                     observed: Default::default(),
                 },
                 &session,
@@ -4146,7 +4186,7 @@ mod tests {
             .send_source_command(
                 xolotl_types::external::OutboundCommand {
                     id: "cmd-1".into(),
-                    action: Value::Str("sync".into()),
+                    action: Value::string("sync".into()),
                     observed: Default::default(),
                 },
                 &session,
@@ -4180,7 +4220,7 @@ mod tests {
             .send_source_command(
                 xolotl_types::external::OutboundCommand {
                     id: "cmd-close".into(),
-                    action: Value::Str("sync".into()),
+                    action: Value::string("sync".into()),
                     observed: Default::default(),
                 },
                 &session,
@@ -4203,7 +4243,7 @@ mod tests {
             .send_source_command(
                 xolotl_types::external::OutboundCommand {
                     id: "cmd-after-close".into(),
-                    action: Value::Str("sync".into()),
+                    action: Value::string("sync".into()),
                     observed: Default::default(),
                 },
                 &session,
@@ -4234,7 +4274,7 @@ mod tests {
             invocation_id: "invoke-1".into(),
             effect_path: parse_test_path("effect://external-provider/chat/search")?,
             method_id: xolotl_types::MethodId::new(0),
-            input: Value::Str("query".into()),
+            input: Value::string("query".into()),
             deadline_ms: None,
             output_stream_to: None,
         };
@@ -4245,7 +4285,7 @@ mod tests {
 
         let expected = InvokeResult {
             invocation_id: "invoke-1".into(),
-            outcome: Ok(Value::Str("result".into())),
+            outcome: Ok(Value::string("result".into())),
         };
         ExternalSessionHandler::on_invoke_result(
             &handler,
@@ -4266,7 +4306,7 @@ mod tests {
             &handler,
             InvokeResult {
                 invocation_id: "invoke-1".into(),
-                outcome: Ok(Value::Str("again".into())),
+                outcome: Ok(Value::string("again".into())),
             },
             &session,
             context.clone(),
@@ -4282,7 +4322,7 @@ mod tests {
             invocation_id: "invoke-large".into(),
             effect_path: parse_test_path("effect://external-provider/chat/search")?,
             method_id: xolotl_types::MethodId::new(0),
-            input: Value::Str("query".into()),
+            input: Value::string("query".into()),
             deadline_ms: None,
             output_stream_to: None,
         };
@@ -4294,7 +4334,7 @@ mod tests {
             &handler,
             InvokeResult {
                 invocation_id: "invoke-large".into(),
-                outcome: Ok(Value::Str("x".repeat(
+                outcome: Ok(Value::string("x".repeat(
                     config::DEFAULT_EXTERNAL_PROVIDER_MAX_INLINE_RESULT_BYTES + 1,
                 ))),
             },
@@ -4315,7 +4355,7 @@ mod tests {
             invocation_id: "invoke-large-error".into(),
             effect_path: parse_test_path("effect://external-provider/chat/search")?,
             method_id: xolotl_types::MethodId::new(0),
-            input: Value::Str("query".into()),
+            input: Value::string("query".into()),
             deadline_ms: None,
             output_stream_to: None,
         };
@@ -4349,7 +4389,7 @@ mod tests {
             invocation_id: "invoke-schema".into(),
             effect_path: parse_test_path("effect://external-provider/chat/search")?,
             method_id: xolotl_types::MethodId::new(0),
-            input: Value::Str("query".into()),
+            input: Value::string("query".into()),
             deadline_ms: None,
             output_stream_to: None,
         };
@@ -4361,7 +4401,7 @@ mod tests {
             &handler,
             InvokeResult {
                 invocation_id: "invoke-schema".into(),
-                outcome: Ok(Value::Int(7)),
+                outcome: Ok(Value::integer(7)),
             },
             &session,
             context,
@@ -4396,7 +4436,7 @@ mod tests {
             invocation_id: "invoke-stale".into(),
             effect_path: parse_test_path("effect://external-provider/chat/search")?,
             method_id: xolotl_types::MethodId::new(0),
-            input: Value::Str("query".into()),
+            input: Value::string("query".into()),
             deadline_ms: None,
             output_stream_to: None,
         };
@@ -4442,7 +4482,7 @@ mod tests {
             invocation_id: "invoke-1".into(),
             effect_path: parse_test_path("effect://external-provider/chat/search")?,
             method_id: xolotl_types::MethodId::new(0),
-            input: Value::Str("query".into()),
+            input: Value::string("query".into()),
             deadline_ms: None,
             output_stream_to: None,
         };
@@ -4455,7 +4495,7 @@ mod tests {
             invocation_id: "invoke-2".into(),
             effect_path: parse_test_path("effect://external-provider/chat/search")?,
             method_id: xolotl_types::MethodId::new(0),
-            input: Value::Str("query".into()),
+            input: Value::string("query".into()),
             deadline_ms: None,
             output_stream_to: None,
         };
@@ -4503,7 +4543,7 @@ mod tests {
             invocation_id: "invoke-1".into(),
             effect_path: parse_test_path("effect://external-provider/chat/search")?,
             method_id: xolotl_types::MethodId::new(0),
-            input: Value::Str("query".into()),
+            input: Value::string("query".into()),
             deadline_ms: None,
             output_stream_to: None,
         };
@@ -4516,7 +4556,7 @@ mod tests {
             invocation_id: "invoke-2".into(),
             effect_path: parse_test_path("effect://external-provider/chat/summarize")?,
             method_id: xolotl_types::MethodId::new(0),
-            input: Value::Str("query".into()),
+            input: Value::string("query".into()),
             deadline_ms: None,
             output_stream_to: None,
         };
@@ -4564,7 +4604,7 @@ mod tests {
             invocation_id: "invoke-1".into(),
             effect_path: parse_test_path("effect://external-provider/chat/search")?,
             method_id: xolotl_types::MethodId::new(0),
-            input: Value::Str("query".into()),
+            input: Value::string("query".into()),
             deadline_ms: None,
             output_stream_to: None,
         };
@@ -4577,7 +4617,7 @@ mod tests {
             invocation_id: "invoke-2".into(),
             effect_path: parse_test_path("effect://external-provider/chat/search")?,
             method_id: xolotl_types::MethodId::new(0),
-            input: Value::Str("query".into()),
+            input: Value::string("query".into()),
             deadline_ms: None,
             output_stream_to: None,
         };
@@ -4966,7 +5006,7 @@ mod tests {
             invocation_id: "invoke-remote".into(),
             effect_path: parse_test_path("effect://external-provider/chat/search")?,
             method_id: MethodId::new(0),
-            input: Value::Str("query".into()),
+            input: Value::string("query".into()),
             deadline_ms: None,
             output_stream_to: None,
         };
@@ -4982,7 +5022,7 @@ mod tests {
 
         let expected = InvokeResult {
             invocation_id: "invoke-remote".into(),
-            outcome: Ok(Value::Str("result".into())),
+            outcome: Ok(Value::string("result".into())),
         };
         ExternalSessionHandler::on_invoke_result(
             &handler,
@@ -5010,7 +5050,7 @@ mod tests {
                     invocation_id: "invoke-undeclared-effect".into(),
                     effect_path: parse_test_path("effect://external-provider/chat/admin")?,
                     method_id: MethodId::new(0),
-                    input: Value::Str("query".into()),
+                    input: Value::string("query".into()),
                     deadline_ms: Some(now_millis() + 200),
                     output_stream_to: None,
                 },
@@ -5042,7 +5082,7 @@ mod tests {
                     invocation_id: "invoke-wrong-method".into(),
                     effect_path: parse_test_path("effect://external-provider/chat/search")?,
                     method_id: MethodId::new(99),
-                    input: Value::Str("query".into()),
+                    input: Value::string("query".into()),
                     deadline_ms: Some(now_millis() + 200),
                     output_stream_to: None,
                 },
@@ -5074,7 +5114,7 @@ mod tests {
                     invocation_id: "invoke-stale-generation".into(),
                     effect_path: parse_test_path("effect://external-provider/chat/search")?,
                     method_id: MethodId::new(0),
-                    input: Value::Str("query".into()),
+                    input: Value::string("query".into()),
                     deadline_ms: Some(now_millis() + 200),
                     output_stream_to: None,
                 },
@@ -5102,7 +5142,7 @@ mod tests {
                     invocation_id: "invoke-bad-input".into(),
                     effect_path: parse_test_path("effect://external-provider/chat/search")?,
                     method_id: MethodId::new(0),
-                    input: Value::Int(7),
+                    input: Value::integer(7),
                     deadline_ms: Some(now_millis() + 200),
                     output_stream_to: None,
                 },
@@ -5181,7 +5221,7 @@ mod tests {
             invocation_id: "invoke-timeout".into(),
             effect_path: parse_test_path("effect://external-provider/chat/search")?,
             method_id: MethodId::new(0),
-            input: Value::Str("query".into()),
+            input: Value::string("query".into()),
             deadline_ms: Some(deadline_ms),
             output_stream_to: None,
         };

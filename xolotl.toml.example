@@ -7,11 +7,31 @@
 [storage]
 kind = "redb"           # "redb" (persistent) or "memory" (non-persistent)
 path = "xolotl.db"       # single redb file for state and FactStore tables
+# object_path = "xolotl.objects" # object files; defaults beside the database, independent of state kind
 
 [server]
 console_addr = "127.0.0.1:9000"
 external_grpc_addr = "127.0.0.1:9444"
 external_websocket_addr = "127.0.0.1:9200"
+# application_grpc_addr = "127.0.0.1:9445" # optional application-grpc feature; provision profile first
+
+# Application authorization lives at state://kernel/gateway/profiles/<profile>.
+# Create it through Console config.write_cas before enabling the listener.
+# [application_gateway]
+# profile = "tasks"
+# [application_gateway.grpc]
+# max_frame_bytes = 65536 # complete protobuf frame, not cumulative upload size
+# max_concurrent_uploads = 8
+# max_concurrent_output_responses = 8 # retained response bodies, including transport buffers
+# output_window_chunks = 16
+# output_window_bytes = 262144 # resident charged bytes, not cumulative output size
+# first_frame_timeout_ms = 15000
+# idle_timeout_ms = 30000
+# storage_timeout_ms = 120000
+
+# [application_gateway.grpc.transport_security]
+# mode = "local_trusted"
+# TLS and proxy fields are the same as external_gateway.grpc.transport_security.
 
 [external_gateway.grpc]
 # External gRPC accepts Provider and Source role sessions.
@@ -107,7 +127,7 @@ mode = "local_trusted" # production_tls | trusted_reverse_proxy | local_trusted 
 
 # Console WebSocket limits.
 [console.ws]
-max_frame_bytes = 1048576          # 1 MiB; hard-capped by backend at 4 MiB
+max_frame_bytes = 1048576          # Incoming and outgoing; hard max 4 MiB
 max_connections_global = 256
 max_connections_per_source = 32
 max_connections_per_user = 8
@@ -118,4 +138,5 @@ max_subscriptions = 32
 max_state_list_limit = 512
 max_fact_limit = 256
 max_trace_limit = 512
-event_send_timeout_ms = 5000
+max_pending_event_bytes = 1048576  # Per session; hard max 16 MiB
+send_timeout_ms = 5000            # All outgoing frames

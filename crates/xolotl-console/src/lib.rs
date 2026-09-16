@@ -45,20 +45,21 @@ pub use protocol::{
 pub use state::{
     ConsoleState, ConsoleTransportSecurityConfig, ConsoleTransportSecurityMode,
     ConsoleTrustedProxyConfig, ConsoleUnsafeTransportRelaxation, ConsoleWsConfig,
-    DEFAULT_WS_EVENT_SEND_TIMEOUT, DEFAULT_WS_IDLE_TIMEOUT, DEFAULT_WS_MAX_BYTES_PER_SECOND,
-    DEFAULT_WS_MAX_CONNECTIONS_GLOBAL, DEFAULT_WS_MAX_CONNECTIONS_PER_SOURCE,
-    DEFAULT_WS_MAX_CONNECTIONS_PER_USER, DEFAULT_WS_MAX_FACT_LIMIT, DEFAULT_WS_MAX_FRAME_BYTES,
-    DEFAULT_WS_MAX_FRAMES_PER_SECOND, DEFAULT_WS_MAX_STATE_LIST_LIMIT,
-    DEFAULT_WS_MAX_SUBSCRIPTIONS, DEFAULT_WS_MAX_TRACE_LIMIT, HARD_MAX_WS_BYTES_PER_SECOND,
-    HARD_MAX_WS_CONNECTIONS_GLOBAL, HARD_MAX_WS_CONNECTIONS_PER_SOURCE,
-    HARD_MAX_WS_CONNECTIONS_PER_USER, HARD_MAX_WS_EVENT_SEND_TIMEOUT, HARD_MAX_WS_FACT_LIMIT,
+    DEFAULT_WS_IDLE_TIMEOUT, DEFAULT_WS_MAX_BYTES_PER_SECOND, DEFAULT_WS_MAX_CONNECTIONS_GLOBAL,
+    DEFAULT_WS_MAX_CONNECTIONS_PER_SOURCE, DEFAULT_WS_MAX_CONNECTIONS_PER_USER,
+    DEFAULT_WS_MAX_FACT_LIMIT, DEFAULT_WS_MAX_FRAME_BYTES, DEFAULT_WS_MAX_FRAMES_PER_SECOND,
+    DEFAULT_WS_MAX_PENDING_EVENT_BYTES, DEFAULT_WS_MAX_STATE_LIST_LIMIT,
+    DEFAULT_WS_MAX_SUBSCRIPTIONS, DEFAULT_WS_MAX_TRACE_LIMIT, DEFAULT_WS_SEND_TIMEOUT,
+    HARD_MAX_WS_BYTES_PER_SECOND, HARD_MAX_WS_CONNECTIONS_GLOBAL,
+    HARD_MAX_WS_CONNECTIONS_PER_SOURCE, HARD_MAX_WS_CONNECTIONS_PER_USER, HARD_MAX_WS_FACT_LIMIT,
     HARD_MAX_WS_FRAME_BYTES, HARD_MAX_WS_FRAMES_PER_SECOND, HARD_MAX_WS_IDLE_TIMEOUT,
-    HARD_MAX_WS_STATE_LIST_LIMIT, HARD_MAX_WS_SUBSCRIPTIONS, HARD_MAX_WS_TRACE_LIMIT,
-    MIN_WS_CONNECTIONS_GLOBAL, MIN_WS_CONNECTIONS_PER_SOURCE, MIN_WS_CONNECTIONS_PER_USER,
-    MIN_WS_EVENT_SEND_TIMEOUT, MIN_WS_IDLE_TIMEOUT, MIN_WS_MAX_BYTES_PER_SECOND,
-    MIN_WS_MAX_FACT_LIMIT, MIN_WS_MAX_FRAME_BYTES, MIN_WS_MAX_FRAMES_PER_SECOND,
-    MIN_WS_MAX_STATE_LIST_LIMIT, MIN_WS_MAX_SUBSCRIPTIONS, MIN_WS_MAX_TRACE_LIMIT,
-    NoPairingSecretDisplay, PairingSecretDisplay,
+    HARD_MAX_WS_PENDING_EVENT_BYTES, HARD_MAX_WS_SEND_TIMEOUT, HARD_MAX_WS_STATE_LIST_LIMIT,
+    HARD_MAX_WS_SUBSCRIPTIONS, HARD_MAX_WS_TRACE_LIMIT, MIN_WS_CONNECTIONS_GLOBAL,
+    MIN_WS_CONNECTIONS_PER_SOURCE, MIN_WS_CONNECTIONS_PER_USER, MIN_WS_IDLE_TIMEOUT,
+    MIN_WS_MAX_BYTES_PER_SECOND, MIN_WS_MAX_FACT_LIMIT, MIN_WS_MAX_FRAME_BYTES,
+    MIN_WS_MAX_FRAMES_PER_SECOND, MIN_WS_MAX_PENDING_EVENT_BYTES, MIN_WS_MAX_STATE_LIST_LIMIT,
+    MIN_WS_MAX_SUBSCRIPTIONS, MIN_WS_MAX_TRACE_LIMIT, MIN_WS_SEND_TIMEOUT, NoPairingSecretDisplay,
+    PairingSecretDisplay,
 };
 
 /// Build the console router.
@@ -421,7 +422,7 @@ mod tests {
     use std::sync::Arc;
     use xolotl_kernel::Bootstrap;
     use xolotl_standard::{StandardConfig, install_standard};
-    use xolotl_types::{OutcomeRef, Value};
+    use xolotl_types::Value;
 
     fn auth_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -440,11 +441,19 @@ mod tests {
             .facts
             .all_facts()?
             .into_iter()
-            .filter_map(|fact| match fact.outcome_ref {
-                OutcomeRef::Inline(Value::Map(m))
-                    if m.get("event").and_then(Value::as_str) == Some(event) =>
+            .filter_map(|fact| match fact.outcome {
+                Some(value)
+                    if value
+                        .as_map()
+                        .and_then(|m| m.get("event"))
+                        .and_then(Value::as_str)
+                        == Some(event) =>
                 {
-                    m.get("outcome").and_then(Value::as_str).map(str::to_string)
+                    value
+                        .as_map()
+                        .and_then(|m| m.get("outcome"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
                 }
                 _ => None,
             })

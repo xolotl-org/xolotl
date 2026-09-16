@@ -1,0 +1,122 @@
+name: Rust
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  workspace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo test --workspace --no-default-features --locked
+      - name: Lint all workspace targets
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Document all public workspace APIs
+        run: cargo doc --workspace --all-features --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings -W missing-docs
+      - run: cargo run -p xolotl-sdk --features host --example portable --locked
+      - run: cargo run -p xolotl-sdk --features host --example native_modules --locked
+  minimal:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["", "serde", "program", "program,serde", "runtime", "runtime,serde"]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: thumbv7em-none-eabi
+      - run: cargo check -p xolotl-sdk --no-default-features --features "${{ matrix.features }}" --target thumbv7em-none-eabi --lib --locked
+      - run: cargo tree -p xolotl-sdk --no-default-features --features "${{ matrix.features }}" --edges normal --locked
+      - name: Enforce the allocator-free SDK dependency boundary
+        if: matrix.features == ''
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          tree = subprocess.check_output([
+              "cargo", "tree", "-p", "xolotl-sdk", "--no-default-features",
+              "--edges", "normal", "--prefix", "none", "--format", "{p}", "--locked",
+          ], text=True)
+          packages = {line.split()[0] for line in tree.splitlines() if line.strip()}
+          assert packages == {"xolotl-sdk", "xolotl-core"}, tree
+          PY
+  portable-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: thumbv7em-none-eabi
+          components: rustfmt, clippy
+      - run: cargo test -p xolotl-kernel --no-default-features --locked
+      - run: cargo test -p xolotl-state --no-default-features --lib --locked
+      - run: cargo test -p xolotl-state --no-default-features --features std --lib --test object_write --locked
+      - name: Document portable APIs without host features
+        run: cargo doc -p xolotl-core -p xolotl-kernel -p xolotl-state -p xolotl-sdk --no-default-features --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings -W missing-docs
+      - run: cargo fmt --manifest-path examples/portable-runtime/Cargo.toml -- --check
+      - run: cargo run --manifest-path examples/portable-runtime/Cargo.toml --locked
+      - run: cargo test --manifest-path examples/portable-runtime/Cargo.toml --locked
+      - run: cargo check --manifest-path examples/portable-runtime/Cargo.toml --no-default-features --target thumbv7em-none-eabi --lib --locked
+      - run: cargo clippy --manifest-path examples/portable-runtime/Cargo.toml --all-targets --locked -- -D warnings
+  host-features:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: [host, "host,plan", "host,durable", "host,multi-thread", standard]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - run: cargo check -p xolotl-sdk --no-default-features --features "${{ matrix.features }}" --locked
+  standard-features:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["", standard-core, value-objects, http-stream, openai-responses, openai-chat, anthropic-messages, gemini-generate-content]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - run: cargo test -p xolotl-standard --no-default-features --features "${{ matrix.features }}" --lib --locked
+      - run: cargo tree -p xolotl-standard --no-default-features --features "${{ matrix.features }}" --edges normal --locked
+  portable-values:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package: [xolotl-value-codec, xolotl-value-object]
+        features: ["", cbor]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: thumbv7em-none-eabi
+      - run: cargo check -p "${{ matrix.package }}" --no-default-features --features "${{ matrix.features }}" --target thumbv7em-none-eabi --lib --locked
+      - run: cargo test -p "${{ matrix.package }}" --no-default-features --features "${{ matrix.features }}" --locked
+  structured-output:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package: [xolotl-gateway, xolotl-gateway-grpc]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - run: cargo check -p "${{ matrix.package }}" --no-default-features --features structured-output --lib --locked
+  daemon-features:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["", application-grpc, external-grpc, external-websocket]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - run: cargo check -p xolotl-daemon --no-default-features --features "${{ matrix.features }}" --locked

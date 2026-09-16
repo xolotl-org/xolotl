@@ -11,14 +11,21 @@ description.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["memory"]
+std = ["dep:serde", "dep:serde_json", "thiserror/std"]
+tokio = ["std", "dep:tokio", "dep:tokio-stream", "dep:parking_lot"]
+memory = ["std", "tokio", "dep:parking_lot"]
+test-support = ["std"]
+
 [dependencies]
-async-trait = { workspace = true, default-features = false }
-dashmap = { workspace = true, default-features = false }
 xolotl-types.workspace = true
-parking_lot = { workspace = true, default-features = false }
-serde_json = { workspace = true, default-features = false, features = ["std"] }
-thiserror = { workspace = true, default-features = false, features = ["std"] }
-tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros"] }
+parking_lot = { workspace = true, default-features = false, optional = true }
+serde = { workspace = true, optional = true, features = ["derive", "std"] }
+serde_json = { workspace = true, default-features = false, features = ["std"], optional = true }
+thiserror = { workspace = true, default-features = false }
+tokio = { workspace = true, default-features = false, features = ["sync"], optional = true }
+tokio-stream = { workspace = true, default-features = false, features = ["sync"], optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true, default-features = false, features = ["std"] }
@@ -28,3 +35,8 @@ tokio = { workspace = true, default-features = false, features = ["rt", "sync", 
 [[bench]]
 name = "in_memory_state"
 harness = false
+required-features = ["memory"]
+
+[[example]]
+name = "state_footprint"
+required-features = ["memory"]

@@ -223,25 +223,31 @@ fn is_common_password(password: &str) -> bool {
 /// Serialize a password policy to a [`Value`] map for descriptor/config output.
 pub fn password_policy_to_value(policy: &PasswordPolicy) -> Value {
     let mut map = std::collections::BTreeMap::new();
-    map.insert("min_length".into(), Value::Int(policy.min_length as i64));
+    map.insert(
+        "min_length".into(),
+        Value::integer(policy.min_length as i64),
+    );
     map.insert(
         "min_entropy_bits".into(),
-        Value::Int(i64::from(policy.min_entropy_bits)),
+        Value::integer(i64::from(policy.min_entropy_bits)),
     );
     map.insert(
         "max_common_password_matches".into(),
-        Value::Int(policy.max_common_password_matches as i64),
+        Value::integer(policy.max_common_password_matches as i64),
     );
     map.insert(
         "min_length_floor".into(),
-        Value::Int(PASSWORD_MIN_LENGTH_FLOOR as i64),
+        Value::integer(PASSWORD_MIN_LENGTH_FLOOR as i64),
     );
     map.insert(
         "min_entropy_floor".into(),
-        Value::Int(i64::from(PASSWORD_MIN_ENTROPY_FLOOR)),
+        Value::integer(i64::from(PASSWORD_MIN_ENTROPY_FLOOR)),
     );
-    map.insert("max_length".into(), Value::Int(PASSWORD_MAX_LENGTH as i64));
-    Value::Map(map)
+    map.insert(
+        "max_length".into(),
+        Value::integer(PASSWORD_MAX_LENGTH as i64),
+    );
+    Value::map(map)
 }
 
 /// Account lockout state persisted at `state://kernel/console/users/<u>/lockout`.
@@ -290,16 +296,22 @@ pub fn lockout_policy_to_value(threshold: u32, base_ms: i64, max_ms: i64) -> Val
             locked_until_ms: locked_until,
         };
         let mut row = std::collections::BTreeMap::new();
-        row.insert("consecutive_failures".into(), Value::Int(failures as i64));
-        row.insert("locked_for_ms".into(), Value::Int(state.remaining_ms(now)));
-        schedule.push(Value::Map(row));
+        row.insert(
+            "consecutive_failures".into(),
+            Value::integer(failures as i64),
+        );
+        row.insert(
+            "locked_for_ms".into(),
+            Value::integer(state.remaining_ms(now)),
+        );
+        schedule.push(Value::map(row));
     }
     let mut map = std::collections::BTreeMap::new();
-    map.insert("threshold".into(), Value::Int(threshold as i64));
-    map.insert("base_ms".into(), Value::Int(base_ms));
-    map.insert("max_ms".into(), Value::Int(max_ms));
-    map.insert("schedule".into(), Value::List(schedule));
-    Value::Map(map)
+    map.insert("threshold".into(), Value::integer(threshold as i64));
+    map.insert("base_ms".into(), Value::integer(base_ms));
+    map.insert("max_ms".into(), Value::integer(max_ms));
+    map.insert("schedule".into(), Value::list(schedule));
+    Value::map(map)
 }
 
 #[cfg(test)]

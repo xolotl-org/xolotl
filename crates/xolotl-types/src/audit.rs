@@ -7,6 +7,10 @@
 //! emits [`AuditTag`]s, which downstream tooling indexes or alerts on.
 
 use crate::operation::{DecisionTag, Fact};
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 use serde::{Deserialize, Serialize};
 
 /// A tag a projector attaches to a Fact. These are the standard audit
@@ -119,9 +123,7 @@ fn decision_name(d: DecisionTag) -> &'static str {
 }
 
 fn custom_label(fact: &Fact) -> Option<String> {
-    let crate::OutcomeRef::Inline(crate::Value::Map(fields)) = &fact.outcome_ref else {
-        return None;
-    };
+    let fields = fact.outcome.as_ref()?.as_map()?;
     fields
         .get("event")
         .and_then(crate::Value::as_str)
@@ -132,8 +134,10 @@ fn custom_label(fact: &Fact) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{HandleId, MethodId, NodeId, ProcessId, ResourceId, Timestamp};
-    use crate::operation::{OperationId, OutcomeRef, ValueRef};
+    use crate::ids::{
+        ExecutionId, HandleId, InvocationId, MethodId, NodeId, ProcessId, ResourceId, Timestamp,
+    };
+    use crate::operation::OperationId;
     use crate::replay::ReplayClass;
     use crate::taint::{TaintSet, TaintSource};
     use crate::{IdentityRef, Path, Value};
@@ -147,17 +151,23 @@ mod tests {
         decision: DecisionTag,
     ) -> Fact {
         Fact {
-            id: OperationId::new(caller, NodeId::new(1), 0),
+            id: OperationId::new(
+                caller,
+                ExecutionId::FIRST,
+                InvocationId::new(1),
+                NodeId::new(1),
+                0,
+            ),
             schema_version: Fact::SCHEMA_VERSION,
             caller,
             acting,
             handle: HandleId::new(0, 1),
             resource: ResourceId::new(resource),
             method: MethodId::new(0),
-            input_ref: ValueRef::Inline(Value::Null),
+            input: Value::null(),
             taint,
             decision,
-            outcome_ref: OutcomeRef::None,
+            outcome: None,
             batch: None,
             replay: ReplayClass::Deterministic,
             timestamp: Timestamp::millis(0),
@@ -241,9 +251,9 @@ mod tests {
             1,
             DecisionTag::Ok,
         );
-        f.outcome_ref = OutcomeRef::Inline(Value::Map(std::collections::BTreeMap::from([(
+        f.outcome = Some(Value::map(alloc::collections::BTreeMap::from([(
             "event".into(),
-            Value::Str("console_login".into()),
+            Value::string("console_login".into()),
         )])));
         assert!(
             AuditRules::default()

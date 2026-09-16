@@ -9,9 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 use xolotl_graph::{DoNode, OperationTemplate, StepRef};
-use xolotl_types::{
-    OutputMode, Path, PathRegistry, ProcessId, ResourceName, Value, default_registry,
-};
+use xolotl_types::{OutputMode, Path, PathRegistry, ResourceName, Value, default_registry};
 
 /// JSON value used by Plan documents before they are lowered to
 /// [`xolotl_types::Value`].
@@ -137,9 +135,8 @@ pub enum Step {
     },
 }
 
-/// A process-local step reference (name + optional inline arg). The compiler
-/// binds it to the caller-supplied ProcessId so the serialized Do graph carries
-/// the `StepRef { process, name }` invariant explicitly.
+/// A process-local step reference (name + optional inline arg). The executing
+/// process supplies the function; compiled plans contain no process ids for steps.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StepRefSpec {
     /// Process-local step name.
@@ -209,13 +206,13 @@ pub enum PlanError {
     Json(String),
 }
 
-/// Compile a Plan into a [`DoNode`] program for `process`.
-pub fn compile_for(process: ProcessId, plan: &Plan) -> Result<DoNode, PlanError> {
+/// Compile a Plan into a [`DoNode`] program reusable across processes.
+pub fn compile(plan: &Plan) -> Result<DoNode, PlanError> {
     if plan.steps.is_empty() {
         return Err(PlanError::Empty);
     }
     validate_plan(plan)?;
-    compile_steps(process, &plan.steps)
+    compile_steps(&plan.steps)
 }
 
 /// Static validation pass run before lowering.
@@ -485,7 +482,7 @@ fn is_mergeable(step: &Step) -> bool {
 /// are paired into `Both` for parallelism.
 ///
 /// Parallel pairing is local and left-to-right.
-fn compile_steps(process: ProcessId, steps: &[Step]) -> Result<DoNode, PlanError> {
+fn compile_steps(steps: &[Step]) -> Result<DoNode, PlanError> {
     if steps.is_empty() {
         return Err(PlanError::Empty);
     }
@@ -496,12 +493,12 @@ fn compile_steps(process: ProcessId, steps: &[Step]) -> Result<DoNode, PlanError
         match step {
             Step::Then { name, arg } => {
                 let c = current.ok_or(PlanError::BadFirstStep("then"))?;
-                current = Some(c.and_then(step_ref(process, name, arg)));
+                current = Some(c.and_then(step_ref(name, arg)));
                 i += 1;
             }
             Step::OnFail { name, arg } => {
                 let c = current.ok_or(PlanError::BadFirstStep("on_fail"))?;
-                current = Some(c.or_else(step_ref(process, name, arg)));
+                current = Some(c.or_else(step_ref(name, arg)));
                 i += 1;
             }
             other => {
@@ -513,11 +510,11 @@ fn compile_steps(process: ProcessId, steps: &[Step]) -> Result<DoNode, PlanError
                             && independent(other, next) =>
                     {
                         i += 2;
-                        DoNode::both(step_to_do(process, other)?, step_to_do(process, next)?)
+                        DoNode::both(step_to_do(other)?, step_to_do(next)?)
                     }
                     _ => {
                         i += 1;
-                        step_to_do(process, other)?
+                        step_to_do(other)?
                     }
                 };
                 current = Some(match current {
@@ -533,8 +530,8 @@ fn compile_steps(process: ProcessId, steps: &[Step]) -> Result<DoNode, PlanError
     current.ok_or(PlanError::Empty)
 }
 
-fn step_ref(process: ProcessId, name: &str, arg: &Option<JsonValue>) -> StepRef {
-    let sr = StepRef::new(process, name);
+fn step_ref(name: &str, arg: &Option<JsonValue>) -> StepRef {
+    let sr = StepRef::new(name);
     match arg {
         Some(a) => sr.with_arg(json_to_value(a)),
         None => sr,
@@ -552,7 +549,7 @@ fn op(path: &str, method: &str, input: Option<Value>) -> Result<DoNode, PlanErro
     }))
 }
 
-fn step_to_do(process: ProcessId, step: &Step) -> Result<DoNode, PlanError> {
+fn step_to_do(step: &Step) -> Result<DoNode, PlanError> {
     Ok(match step {
         Step::Perform { target, input } => op(target, "invoke", input.as_ref().map(json_to_value))?,
         Step::Read { path, .. } => op(path, "read", None)?,
@@ -560,23 +557,17 @@ fn step_to_do(process: ProcessId, step: &Step) -> Result<DoNode, PlanError> {
             // The handling step is carried as literal input so a compatible
             // subscribe driver can wire delivery.
             let mut m = BTreeMap::new();
-            m.insert("step".into(), Value::Str(step.name.clone()));
+            m.insert("step".into(), Value::string(step.name.clone()));
             if let Some(a) = &step.arg {
                 m.insert("arg".into(), json_to_value(a));
             }
-            op(path, "subscribe", Some(Value::Map(m)))?
+            op(path, "subscribe", Some(Value::map(m)))?
         }
         Step::Write { path, value, mode } => op(path, mode.method(), Some(json_to_value(value)))?,
         Step::Then { .. } => return Err(PlanError::BadFirstStep("then")),
         Step::OnFail { .. } => return Err(PlanError::BadFirstStep("on_fail")),
-        Step::Parallel { left, right } => DoNode::both(
-            compile_steps(process, left)?,
-            compile_steps(process, right)?,
-        ),
-        Step::Race { left, right } => DoNode::race(
-            compile_steps(process, left)?,
-            compile_steps(process, right)?,
-        ),
+        Step::Parallel { left, right } => DoNode::both(compile_steps(left)?, compile_steps(right)?),
+        Step::Race { left, right } => DoNode::race(compile_steps(left)?, compile_steps(right)?),
         Step::Let { name, value } => DoNode::r#let(
             name.clone(),
             DoNode::pure(json_to_value(value)),
@@ -585,16 +576,16 @@ fn step_to_do(process: ProcessId, step: &Step) -> Result<DoNode, PlanError> {
         Step::Use { name } => DoNode::use_(name.clone()),
         Step::Pure { value } => DoNode::pure(json_to_value(value)),
         Step::Acting { identity, body } => {
-            DoNode::acting(Path::parse(identity)?, compile_steps(process, body)?)
+            DoNode::acting(Path::parse(identity)?, compile_steps(body)?)
         }
         Step::Bracket {
             acquire,
             body,
             release,
         } => {
-            let acquire_node = step_to_do(process, acquire)?;
-            let body_node = compile_steps(process, body)?;
-            let release_ref = step_ref(process, &release.name, &release.arg);
+            let acquire_node = step_to_do(acquire)?;
+            let body_node = compile_steps(body)?;
+            let release_ref = step_ref(&release.name, &release.arg);
             let released_on_success = body_node.and_then(release_ref.clone());
             let released_on_failure = released_on_success.or_else(release_ref);
             DoNode::r#let("_resource", acquire_node, released_on_failure)
@@ -604,25 +595,25 @@ fn step_to_do(process: ProcessId, step: &Step) -> Result<DoNode, PlanError> {
 
 fn json_to_value(j: &JsonValue) -> Value {
     match j {
-        JsonValue::Null => Value::Null,
-        JsonValue::Bool(b) => Value::Bool(*b),
+        JsonValue::Null => Value::null(),
+        JsonValue::Bool(b) => Value::boolean(*b),
         JsonValue::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Value::Int(i)
+                Value::integer(i)
             } else if let Some(f) = n.as_f64() {
-                Value::Float(xolotl_types::FloatBits(f))
+                Value::float(xolotl_types::FloatBits(f))
             } else {
-                Value::Null
+                Value::null()
             }
         }
-        JsonValue::String(s) => Value::Str(s.clone()),
-        JsonValue::Array(xs) => Value::List(xs.iter().map(json_to_value).collect()),
+        JsonValue::String(s) => Value::string(s.clone()),
+        JsonValue::Array(xs) => Value::list(xs.iter().map(json_to_value).collect()),
         JsonValue::Object(m) => {
             let mut bm = BTreeMap::new();
             for (k, v) in m {
                 bm.insert(k.clone(), json_to_value(v));
             }
-            Value::Map(bm)
+            Value::map(bm)
         }
     }
 }
@@ -651,12 +642,8 @@ mod tests {
         }
     }
 
-    fn pid() -> ProcessId {
-        ProcessId::new(1)
-    }
-
     fn compile_test(plan: &Plan) -> Result<DoNode, PlanError> {
-        compile_for(pid(), plan)
+        compile(plan)
     }
 
     #[test]
@@ -674,7 +661,7 @@ mod tests {
                 );
                 ensure!(t.method == "invoke", "unexpected method: {}", t.method);
                 ensure!(
-                    t.literal_input == Some(Value::Str("hello".into())),
+                    t.literal_input == Some(Value::string("hello".into())),
                     "unexpected input: {:?}",
                     t.literal_input
                 );
@@ -832,7 +819,7 @@ mod tests {
             DoNode::Op(t) => {
                 ensure!(t.method == "subscribe", "unexpected method: {}", t.method);
                 ensure!(
-                    matches!(t.literal_input, Some(Value::Map(_))),
+                    t.literal_input.as_ref().and_then(Value::as_map).is_some(),
                     "unexpected input: {:?}",
                     t.literal_input
                 );
@@ -886,18 +873,18 @@ steps:
     #[test]
     fn json_value_to_kernel_value() -> anyhow::Result<()> {
         let v = json_to_value(&serde_json::json!({"n": 7, "ok": true, "list": [1, 2]}));
-        match v {
-            Value::Map(m) => {
+        match v.as_map() {
+            Some(m) => {
                 ensure!(
-                    m.get("n").context("missing n")? == &Value::Int(7),
+                    m.get("n").context("missing n")? == &Value::integer(7),
                     "unexpected n"
                 );
                 ensure!(
-                    m.get("ok").context("missing ok")? == &Value::Bool(true),
+                    m.get("ok").context("missing ok")? == &Value::boolean(true),
                     "unexpected ok"
                 );
                 ensure!(
-                    matches!(m.get("list").context("missing list")?, Value::List(_)),
+                    m.get("list").context("missing list")?.as_list().is_some(),
                     "unexpected list"
                 );
             }

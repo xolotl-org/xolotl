@@ -3,9 +3,9 @@
 //!
 //! The compiler's contract is **stable, deterministic [`NodeId`]s**: the same
 //! `DoNode` always compiles to the same node ids, assigned in a fixed
-//! pre-order traversal, never depending on wall clock or randomness. `NodeId
-//! == CausalPosition` — this is the anchor that lets concurrency and
-//! crash-recovery coexist.
+//! pre-order traversal, never depending on wall clock or randomness. These are
+//! source positions; execution scopes and dynamic request tickets distinguish
+//! independent evaluations and repeated visits to a node.
 //!
 //! Compilation rules:
 //!
@@ -24,7 +24,11 @@
 
 use crate::r#do::DoNode;
 use crate::graph::{BranchKind, Edge, EdgeKind, ExecutionGraph, JoinKind, Node, NodeKind};
-use std::collections::HashMap;
+use alloc::{
+    collections::BTreeMap,
+    string::{String, ToString},
+    vec::Vec,
+};
 use thiserror::Error;
 use xolotl_types::{NodeId, Value};
 
@@ -41,6 +45,9 @@ pub enum CompileError {
         /// Maximum number of nodes accepted by the compiler.
         max: usize,
     },
+    /// The explicit base and graph size exceeded the source-position namespace.
+    #[error("graph causal position exhausted")]
+    PositionExhausted,
     /// The graph could not be serialized for structural hashing.
     #[error("graph hash serialization failed: {message}")]
     GraphHash {
@@ -57,10 +64,9 @@ struct Compiler {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
     /// Name → the NodeId that produces the bound value (for `Use` edges).
-    bindings: HashMap<String, NodeId>,
-    /// Base id offset: the first node gets `base`, the next `base+1`, … This
-    /// lets spliced `Step` subgraphs receive globally-unique CausalPositions
-    /// that continue past the parent graph.
+    bindings: BTreeMap<String, NodeId>,
+    /// Explicit source id offset. Dynamic module invocations use a local base
+    /// of zero; execution tickets distinguish repeated visits to their nodes.
     base: u32,
 }
 
@@ -77,7 +83,7 @@ impl Compiler {
         Self {
             nodes: Vec::new(),
             edges: Vec::new(),
-            bindings: HashMap::new(),
+            bindings: BTreeMap::new(),
             base: 0,
         }
     }
@@ -86,7 +92,7 @@ impl Compiler {
         Self {
             nodes: Vec::new(),
             edges: Vec::new(),
-            bindings: HashMap::new(),
+            bindings: BTreeMap::new(),
             base,
         }
     }
@@ -95,7 +101,11 @@ impl Compiler {
         if self.nodes.len() >= MAX_NODES {
             return Err(CompileError::TooLarge { max: MAX_NODES });
         }
-        let id = NodeId::new(self.base + self.nodes.len() as u32);
+        let id = NodeId::new(
+            self.base
+                .checked_add(self.nodes.len() as u32)
+                .ok_or(CompileError::PositionExhausted)?,
+        );
         self.nodes.push(Node { id, kind });
         Ok(id)
     }
@@ -218,7 +228,7 @@ impl Compiler {
                     .ok_or_else(|| CompileError::UnboundName(name.clone()))?;
                 // A Use is a pure pass-through node with a Use-edge back to the
                 // bound producer.
-                let id = self.push(NodeKind::Pure(Value::Null))?;
+                let id = self.push(NodeKind::Pure(Value::null()))?;
                 self.edge(target, id, EdgeKind::Use);
                 Ok(Span {
                     entry: id,
@@ -260,12 +270,11 @@ pub fn compile_do(program: &DoNode) -> Result<ExecutionGraph, CompileError> {
     Ok(graph)
 }
 
-/// Compile a subgraph whose node ids start at `base`. Used by the Executor to
-/// splice a `Step`'s produced subgraph into the live run with
-/// CausalPositions that continue past everything already numbered, so
-/// every Operation across the whole run keeps a unique, stable id. The returned
-/// graph's `graph_hash` is left zeroed (a spliced fragment is not independently
-/// content-addressed; the parent program's hash anchors recovery).
+/// Compile a subgraph whose source node ids start at an explicit `base`.
+/// The executor uses zero for each dynamic module; source positions are local
+/// to the module, while dynamic request tickets identify individual node visits.
+/// The returned graph's `graph_hash` is left zeroed: native fragments are linked
+/// only for this execution and cannot be stored in portable checkpoints.
 pub fn compile_do_at(program: &DoNode, base: u32) -> Result<ExecutionGraph, CompileError> {
     let mut c = Compiler::with_base(base);
     let span = c.lower(program)?;
@@ -280,26 +289,34 @@ pub fn compile_do_at(program: &DoNode, base: u32) -> Result<ExecutionGraph, Comp
 /// Content hash over the graph structure (nodes + edges + root), independent of
 /// the zeroed `graph_hash` field. Two structurally identical graphs hash equal.
 fn hash_graph(graph: &ExecutionGraph) -> Result<[u8; 32], CompileError> {
-    let mut hasher = blake3::Hasher::new();
-    // Serialize a structural view with graph_hash zeroed (it already is here).
-    let bytes = serde_json::to_vec(&(&graph.nodes, &graph.edges, graph.root)).map_err(|e| {
-        CompileError::GraphHash {
-            message: e.to_string(),
-        }
-    })?;
-    hasher.update(&bytes);
-    Ok(*hasher.finalize().as_bytes())
+    crate::fingerprint::graph(graph).map_err(|e| CompileError::GraphHash {
+        message: e.to_string(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::graph::{OperationTemplate, StepRef};
+    use alloc::collections::BTreeSet;
     use anyhow::{Context, anyhow, bail, ensure};
-    use xolotl_types::{OutputMode, Path, ProcessId, ResourceName};
+    use xolotl_types::{OutputMode, Path, ResourceName};
 
     fn s(name: &str) -> StepRef {
-        StepRef::new(ProcessId::new(1), name)
+        StepRef::new(name)
+    }
+
+    #[test]
+    fn explicit_source_offsets_never_wrap() -> anyhow::Result<()> {
+        let body = DoNode::pure(Value::null()).and_then(s("next"));
+        let graph = compile_do_at(&body, u32::MAX - 1)?;
+        ensure!(graph.nodes[0].id.get() == u32::MAX - 1);
+        ensure!(graph.nodes[1].id.get() == u32::MAX);
+        ensure!(matches!(
+            compile_do_at(&body, u32::MAX),
+            Err(CompileError::PositionExhausted)
+        ));
+        Ok(())
     }
 
     fn op(path: &str) -> anyhow::Result<OperationTemplate> {
@@ -316,8 +333,44 @@ mod tests {
     }
 
     #[test]
+    fn graph_hashes_distinguish_literal_types_and_float_bits() -> anyhow::Result<()> {
+        let values = [
+            Value::null(),
+            Value::integer(0),
+            Value::bytes(vec![1]),
+            Value::list(vec![Value::integer(1)]),
+            Value::float(xolotl_types::FloatBits(0.0)),
+            Value::float(xolotl_types::FloatBits(-0.0)),
+            Value::float(xolotl_types::FloatBits(f64::from_bits(
+                0x7ff8_0000_0000_0001,
+            ))),
+            Value::float(xolotl_types::FloatBits(f64::from_bits(
+                0x7ff8_0000_0000_0002,
+            ))),
+        ];
+        let mut pure_hashes = BTreeSet::new();
+        let mut operation_hashes = BTreeSet::new();
+        let mut step_hashes = BTreeSet::new();
+        for value in values {
+            let pure = DoNode::pure(value.clone());
+            ensure!(pure_hashes.insert(compile_do(&pure)?.graph_hash));
+            let step =
+                DoNode::pure(Value::null()).and_then(s("codec/step").with_arg(value.clone()));
+            ensure!(step_hashes.insert(compile_do(&step)?.graph_hash));
+            let mut operation = op("effect://codec/invoke")?;
+            operation.literal_input = Some(value);
+            ensure!(operation_hashes.insert(compile_do(&DoNode::op(operation))?.graph_hash));
+        }
+        let dynamic_operation = compile_do(&DoNode::op(op("effect://codec/invoke")?))?;
+        ensure!(!operation_hashes.contains(&dynamic_operation.graph_hash));
+        let no_argument = compile_do(&DoNode::pure(Value::null()).and_then(s("codec/step")))?;
+        ensure!(!step_hashes.contains(&no_argument.graph_hash));
+        Ok(())
+    }
+
+    #[test]
     fn pure_compiles_to_single_node() -> anyhow::Result<()> {
-        let g = compile_do(&DoNode::pure(Value::Int(1)))?;
+        let g = compile_do(&DoNode::pure(Value::integer(1)))?;
         ensure!(g.len() == 1, "unexpected graph length: {}", g.len());
         ensure!(g.root == NodeId::new(0), "unexpected root: {:?}", g.root);
         let root = g.node(g.root).context("missing root node")?;
@@ -377,7 +430,7 @@ mod tests {
 
     #[test]
     fn let_use_wires_use_edge() -> anyhow::Result<()> {
-        let prog = DoNode::r#let("x", DoNode::pure(Value::Int(5)), DoNode::use_("x"));
+        let prog = DoNode::r#let("x", DoNode::pure(Value::integer(5)), DoNode::use_("x"));
         let g = compile_do(&prog)?;
         ensure!(
             g.edges.iter().any(|e| e.kind == EdgeKind::Use),

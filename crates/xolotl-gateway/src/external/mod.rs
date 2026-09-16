@@ -1,7 +1,7 @@
 //! External Provider and Source session admission API.
 //!
 //! Transport adapters and the daemon use this module to share one session
-//! state machine. Application submissions enter through [`GatewaySubmission`].
+//! state machine. Application submissions enter through [`GatewaySubmission`](crate::GatewaySubmission).
 use thiserror::Error;
 use xolotl_proto::xolotl::v1::external as external_pb;
 use xolotl_proto::{

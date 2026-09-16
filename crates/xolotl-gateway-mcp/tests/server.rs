@@ -7,11 +7,11 @@ use xolotl_gateway::{
     GatewayRuntime, GatewaySurface,
 };
 use xolotl_gateway_mcp::{
-    McpGateway, McpJsonRpcResponse, mcp_prompt_publication, mcp_resource_publication,
-    mcp_resource_template_publication, mcp_tool_publication,
+    McpGateway, McpJsonRpcResponse, McpOutputLimits, mcp_prompt_publication,
+    mcp_resource_publication, mcp_resource_template_publication, mcp_tool_publication,
 };
 use xolotl_kernel::{Bootstrap, EchoDriver, FnDriver};
-use xolotl_types::{Outcome, OutcomeRef, Value};
+use xolotl_types::{Outcome, Value};
 
 const JSONRPC_INVALID_REQUEST: i64 = -32600;
 const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
@@ -72,17 +72,25 @@ fn json_array<'a>(
 }
 
 fn schema_type(kind: &str) -> Value {
-    Value::Map(BTreeMap::from([("type".into(), Value::from(kind))]))
+    Value::map(BTreeMap::from([("type".into(), Value::from(kind))]))
 }
 
 fn audit_outcomes(boot: &Bootstrap, event: &str) -> anyhow::Result<Vec<String>> {
     Ok(must(boot.kernel.facts.all_facts())?
         .into_iter()
-        .filter_map(|fact| match fact.outcome_ref {
-            OutcomeRef::Inline(Value::Map(m))
-                if m.get("event").and_then(Value::as_str) == Some(event) =>
+        .filter_map(|fact| match fact.outcome {
+            Some(value)
+                if value
+                    .as_map()
+                    .and_then(|m| m.get("event"))
+                    .and_then(Value::as_str)
+                    == Some(event) =>
             {
-                m.get("outcome").and_then(Value::as_str).map(str::to_string)
+                value
+                    .as_map()
+                    .and_then(|m| m.get("outcome"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
             }
             _ => None,
         })
@@ -148,7 +156,7 @@ async fn tool_call_runs_through_gateway() -> anyhow::Result<()> {
     let inner = must(GatewayRuntime::new(boot, profile))?;
     let mcp = McpGateway::new(Arc::new(inner));
 
-    let input = Value::Map(BTreeMap::from([("text".into(), Value::from("from-mcp"))]));
+    let input = Value::map(BTreeMap::from([("text".into(), Value::from("from-mcp"))]));
     let out = mcp.call_tool(TEST_TOKEN, "echo", input.clone()).await;
     let out = must(out)?;
     assert_eq!(out, Outcome::Done(input));
@@ -179,11 +187,11 @@ async fn descriptors_are_authenticated_and_kind_filtered() -> anyhow::Result<()>
         mcp_tool_publication("echo", "echo")
             .with_description("Echo an object")
             .with_title("Echo")
-            .with_annotations(Value::Map(BTreeMap::from([(
+            .with_annotations(Value::map(BTreeMap::from([(
                 "readOnlyHint".into(),
-                Value::Bool(true),
+                Value::boolean(true),
             )])))
-            .with_metadata(Value::Map(BTreeMap::from([(
+            .with_metadata(Value::map(BTreeMap::from([(
                 "owner".into(),
                 Value::from("xolotl-test"),
             )]))),
@@ -230,12 +238,12 @@ async fn jsonrpc_lists_and_calls_tools() -> anyhow::Result<()> {
             .with_description("Echo an object")
             .with_property(
                 "icons",
-                Value::List(vec![Value::Map(BTreeMap::from([(
+                Value::list(vec![Value::map(BTreeMap::from([(
                     "src".into(),
                     Value::from("xolotl://icons/echo.png"),
                 )]))]),
             )
-            .with_metadata(Value::Map(BTreeMap::from([(
+            .with_metadata(Value::map(BTreeMap::from([(
                 "owner".into(),
                 Value::from("xolotl-test"),
             )]))),
@@ -286,33 +294,109 @@ async fn jsonrpc_lists_and_calls_tools() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn jsonrpc_output_budgets_are_configurable_and_reset_per_response() -> anyhow::Result<()> {
+    let boot = Arc::new(Bootstrap::in_memory());
+    let target = register_echo(&boot, "effect://echo/say")?;
+    let profile = echo_profile(target, mcp_tool_publication("echo", "echo"))?;
+    let inner = Arc::new(GatewayRuntime::new(boot, profile)?);
+    let limits = McpOutputLimits {
+        max_message_bytes: 256,
+        ..McpOutputLimits::default()
+    };
+    let small = McpGateway::new(inner.clone()).with_output_limits(limits)?;
+    let large = McpGateway::new(inner).with_output_limits(McpOutputLimits {
+        max_message_bytes: 4096,
+        ..limits
+    })?;
+    let text = "\n".repeat(128);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "large-result",
+        "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"text": text}}
+    });
+    let rejected = small
+        .handle_jsonrpc_value(TEST_TOKEN, request.clone())
+        .await;
+    assert_eq!(
+        rejected.error.as_ref().map(|error| error.code),
+        Some(JSONRPC_GATEWAY_ERROR)
+    );
+    assert_eq!(rejected.id, "large-result");
+    assert!(serde_json::to_vec(&rejected)?.len() <= limits.max_message_bytes);
+
+    let accepted = large.handle_jsonrpc_value(TEST_TOKEN, request).await;
+    assert!(accepted.error.is_none());
+    assert_eq!(
+        response_result(&accepted, "large response")?["structuredContent"]["text"],
+        text
+    );
+    let typed = Value::map(BTreeMap::from([("text".into(), Value::from(text))]));
+    assert_eq!(
+        small.call_tool(TEST_TOKEN, "echo", typed.clone()).await?,
+        Outcome::Done(typed)
+    );
+
+    let next = small
+        .handle_jsonrpc_value(
+            TEST_TOKEN,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "echo", "arguments": {"text": "ok"}}
+            }),
+        )
+        .await;
+    assert!(next.error.is_none());
+    assert_eq!(
+        response_result(&next, "following response")?["structuredContent"]["text"],
+        "ok"
+    );
+
+    let oversized_id = small
+        .handle_jsonrpc_value(
+            TEST_TOKEN,
+            json!({
+                "jsonrpc": "2.0", "id": "x".repeat(1024), "method": "ping"
+            }),
+        )
+        .await;
+    assert!(oversized_id.id.is_null());
+    assert_eq!(
+        oversized_id.error.as_ref().map(|error| error.code),
+        Some(JSONRPC_GATEWAY_ERROR)
+    );
+    assert!(serde_json::to_vec(&oversized_id)?.len() <= limits.max_message_bytes);
+    Ok(())
+}
+
+#[tokio::test]
 async fn jsonrpc_passes_native_tool_content_types() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
-    let native_result = Value::Map(BTreeMap::from([
+    let native_result = Value::map(BTreeMap::from([
         (
             "content".into(),
-            Value::List(vec![
-                Value::Map(BTreeMap::from([
+            Value::list(vec![
+                Value::map(BTreeMap::from([
                     ("type".into(), Value::from("image")),
                     ("data".into(), Value::from("iVBORw0KGgo=")),
                     ("mimeType".into(), Value::from("image/png")),
                 ])),
-                Value::Map(BTreeMap::from([
+                Value::map(BTreeMap::from([
                     ("type".into(), Value::from("audio")),
                     ("data".into(), Value::from("UklGRg==")),
                     ("mimeType".into(), Value::from("audio/wav")),
                 ])),
-                Value::Map(BTreeMap::from([
+                Value::map(BTreeMap::from([
                     ("type".into(), Value::from("resource_link")),
                     ("uri".into(), Value::from("xolotl://docs/readme")),
                     ("name".into(), Value::from("readme")),
                     ("mimeType".into(), Value::from("text/markdown")),
                 ])),
-                Value::Map(BTreeMap::from([
+                Value::map(BTreeMap::from([
                     ("type".into(), Value::from("resource")),
                     (
                         "resource".into(),
-                        Value::Map(BTreeMap::from([
+                        Value::map(BTreeMap::from([
                             ("uri".into(), Value::from("xolotl://docs/embed")),
                             ("text".into(), Value::from("embedded")),
                             ("mimeType".into(), Value::from("text/plain")),
@@ -323,9 +407,9 @@ async fn jsonrpc_passes_native_tool_content_types() -> anyhow::Result<()> {
         ),
         (
             "structuredContent".into(),
-            Value::Map(BTreeMap::from([("count".into(), Value::Int(4))])),
+            Value::map(BTreeMap::from([("count".into(), Value::integer(4))])),
         ),
-        ("isError".into(), Value::Bool(false)),
+        ("isError".into(), Value::boolean(false)),
     ]));
     let target = register_fixed(&boot, "effect://tool/native", native_result)?;
     let profile = must(GatewayProfile::new("mcp-test").with_bearer_identity(
@@ -373,9 +457,9 @@ async fn jsonrpc_passes_native_tool_content_types() -> anyhow::Result<()> {
 #[tokio::test]
 async fn jsonrpc_rejects_invalid_native_tool_result() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
-    let native_result = Value::Map(BTreeMap::from([(
+    let native_result = Value::map(BTreeMap::from([(
         "content".into(),
-        Value::List(vec![Value::Map(BTreeMap::from([
+        Value::list(vec![Value::map(BTreeMap::from([
             ("type".into(), Value::from("image")),
             ("data".into(), Value::from("iVBORw0KGgo=")),
         ]))]),
@@ -455,7 +539,7 @@ async fn jsonrpc_lists_and_reads_resources() -> anyhow::Result<()> {
     let target = register_fixed(
         &boot,
         "effect://resource/read",
-        Value::Str("resource text".into()),
+        Value::string("resource text".into()),
     )?;
     let profile = must(GatewayProfile::new("mcp-test").with_bearer_identity(
         "cred-alice",
@@ -472,7 +556,7 @@ async fn jsonrpc_lists_and_reads_resources() -> anyhow::Result<()> {
             .with_title("Readme")
             .with_description("Read the project readme")
             .with_property("mimeType", Value::from("text/plain"))
-            .with_property("size", Value::Int(13)),
+            .with_property("size", Value::integer(13)),
     )
     .with_principal_surface_binding(GatewayPrincipalSurfaceBinding::allow(
         "alice",
@@ -518,7 +602,7 @@ async fn jsonrpc_reads_binary_resource_content() -> anyhow::Result<()> {
     let target = register_fixed(
         &boot,
         "effect://resource/bin",
-        Value::Bytes(vec![0, 1, 2, 253, 254, 255]),
+        Value::bytes(vec![0, 1, 2, 253, 254, 255]),
     )?;
     let profile = must(GatewayProfile::new("mcp-test").with_bearer_identity(
         "cred-alice",
@@ -635,10 +719,10 @@ async fn jsonrpc_lists_and_gets_prompts() -> anyhow::Result<()> {
             .with_description("Review prompt")
             .with_property(
                 "arguments",
-                Value::List(vec![Value::Map(BTreeMap::from([
+                Value::list(vec![Value::map(BTreeMap::from([
                     ("name".into(), Value::from("target")),
                     ("description".into(), Value::from("Review target")),
-                    ("required".into(), Value::Bool(true)),
+                    ("required".into(), Value::boolean(true)),
                 ]))]),
             ),
     )
@@ -703,16 +787,16 @@ async fn jsonrpc_completes_prompt_and_resource_template_arguments() -> anyhow::R
         mcp_prompt_publication("review", "prompt")
             .with_property(
                 "arguments",
-                Value::List(vec![Value::Map(BTreeMap::from([(
+                Value::list(vec![Value::map(BTreeMap::from([(
                     "name".into(),
                     Value::from("target"),
                 )]))]),
             )
             .with_property(
                 "completions",
-                Value::Map(BTreeMap::from([(
+                Value::map(BTreeMap::from([(
                     "target".into(),
-                    Value::List(vec![
+                    Value::list(vec![
                         Value::from("code"),
                         Value::from("config"),
                         Value::from("docs"),
@@ -724,9 +808,9 @@ async fn jsonrpc_completes_prompt_and_resource_template_arguments() -> anyhow::R
         mcp_resource_template_publication("file", "xolotl://files/{+path}", "template")
             .with_property(
                 "completions",
-                Value::Map(BTreeMap::from([(
+                Value::map(BTreeMap::from([(
                     "path".into(),
-                    Value::List(vec![
+                    Value::list(vec![
                         Value::from("docs/readme.md"),
                         Value::from("src/lib.rs"),
                     ]),
@@ -832,6 +916,18 @@ async fn jsonrpc_rejects_unknown_and_bad_requests_without_catalog_leak() -> anyh
         missing_id.error.as_ref().map(|error| error.code),
         Some(JSONRPC_INVALID_REQUEST)
     );
+
+    let composite_id = mcp
+        .handle_jsonrpc_value(
+            TEST_TOKEN,
+            json!({"jsonrpc":"2.0","id":[1],"method":"ping"}),
+        )
+        .await;
+    assert_eq!(
+        composite_id.error.as_ref().map(|error| error.code),
+        Some(JSONRPC_INVALID_REQUEST)
+    );
+    assert!(composite_id.id.is_null());
 
     let credential_in_body = mcp
         .handle_jsonrpc_value(
@@ -983,7 +1079,7 @@ async fn auth_failure_is_redacted_and_audited() -> anyhow::Result<()> {
     let mcp = McpGateway::new(Arc::new(inner));
 
     let err = match mcp
-        .call_tool("wrong-token-for-alice-0001", "echo", Value::Null)
+        .call_tool("wrong-token-for-alice-0001", "echo", Value::null())
         .await
     {
         Ok(_) => bail!("call with wrong token unexpectedly succeeded"),

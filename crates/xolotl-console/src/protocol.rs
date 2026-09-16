@@ -348,25 +348,25 @@ pub enum ConsoleEvent {
     /// A state value was set.
     StateSet {
         /// State path that changed.
-        path: String,
+        path: xolotl_types::Path,
         /// New value.
         value: Value,
     },
     /// An item was appended to a state sequence.
     StateAppend {
         /// State sequence path that changed.
-        path: String,
+        path: xolotl_types::Path,
         /// Appended item.
         item: Value,
     },
     /// A state value was deleted.
     StateDelete {
         /// State path that was deleted.
-        path: String,
+        path: xolotl_types::Path,
     },
-    /// An audit Fact event was observed.
+    /// A current Fact projection was observed after an append or outcome update.
     Audit {
-        /// Fact projection value.
+        /// Fact projection value; replace the client's row with the same op_id.
         fact: Value,
     },
     /// Server closed the subscription.
@@ -542,9 +542,6 @@ pub struct FieldDescriptor {
     /// Whether the field is computed by the server.
     #[serde(default, skip_serializing_if = "is_false")]
     pub computed: bool,
-    /// Whether the field remains accepted while excluded from new edits.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub deprecated: bool,
 }
 
 /// High-level descriptor kind for Console Protocol actions.
@@ -696,39 +693,42 @@ pub(crate) fn coverage_report_value(server_rev: u64, registry_rev: u64) -> Value
         .map(
             |(domain, (declared, implemented, planned, custody_blocked))| {
                 let mut row = BTreeMap::new();
-                row.insert("domain".into(), Value::Str(domain));
-                row.insert("declared".into(), Value::Int(declared as i64));
-                row.insert("implemented".into(), Value::Int(implemented as i64));
-                row.insert("planned".into(), Value::Int(planned as i64));
-                row.insert("custody_blocked".into(), Value::Int(custody_blocked as i64));
-                Value::Map(row)
+                row.insert("domain".into(), Value::string(domain));
+                row.insert("declared".into(), Value::integer(declared as i64));
+                row.insert("implemented".into(), Value::integer(implemented as i64));
+                row.insert("planned".into(), Value::integer(planned as i64));
+                row.insert(
+                    "custody_blocked".into(),
+                    Value::integer(custody_blocked as i64),
+                );
+                Value::map(row)
             },
         )
         .collect();
     let mut root = BTreeMap::new();
     root.insert(
         "protocol_version".into(),
-        Value::Int(PROTOCOL_VERSION as i64),
+        Value::integer(PROTOCOL_VERSION as i64),
     );
-    root.insert("server_rev".into(), Value::Int(server_rev as i64));
-    root.insert("registry_rev".into(), Value::Int(registry_rev as i64));
-    root.insert("action_count".into(), Value::Int(actions.len() as i64));
-    root.insert("stream_count".into(), Value::Int(streams.len() as i64));
-    root.insert("domains".into(), Value::List(domain_rows));
+    root.insert("server_rev".into(), Value::integer(server_rev as i64));
+    root.insert("registry_rev".into(), Value::integer(registry_rev as i64));
+    root.insert("action_count".into(), Value::integer(actions.len() as i64));
+    root.insert("stream_count".into(), Value::integer(streams.len() as i64));
+    root.insert("domains".into(), Value::list(domain_rows));
     root.insert(
         "root_data_authority".into(),
         to_value(protocol_metadata(server_rev, registry_rev).root_data_authority),
     );
     root.insert(
         "invariants".into(),
-        Value::List(vec![
-            Value::Str("no_raw_shell".into()),
-            Value::Str("all_calls_use_operation_fact_policy".into()),
-            Value::Str("root_views_all_business_data".into()),
-            Value::Str("vault_secret_custody_separate".into()),
+        Value::list(vec![
+            Value::string("no_raw_shell".into()),
+            Value::string("all_calls_use_operation_fact_policy".into()),
+            Value::string("root_views_all_business_data".into()),
+            Value::string("vault_secret_custody_separate".into()),
         ]),
     );
-    Value::Map(root)
+    Value::map(root)
 }
 
 /// Return one action descriptor encoded as a Xolotl value.
@@ -747,7 +747,7 @@ pub(crate) fn action_status(action_id: &str) -> Option<ImplementationStatus> {
 
 /// Return resource type summaries visible through the semantic edit contract.
 pub(crate) fn resource_type_list_value() -> Value {
-    Value::List(
+    Value::list(
         [
             resource_type_summary(
                 "config.entry",
@@ -1393,26 +1393,32 @@ pub(crate) fn secret_catalog_value() -> Value {
             "pairing display secrets are available only on the create/replace edge",
         ),
     ];
-    Value::List(rows)
+    Value::list(rows)
 }
 
 /// Return root data authority and visibility-gate metadata.
 pub(crate) fn visibility_authority_value() -> Value {
     let mut root = BTreeMap::new();
-    root.insert("root_can_view_all_business_data".into(), Value::Bool(true));
+    root.insert(
+        "root_can_view_all_business_data".into(),
+        Value::boolean(true),
+    );
     root.insert(
         "requires_step_up_for_protected_payload".into(),
-        Value::Bool(true),
+        Value::boolean(true),
     );
-    root.insert("bypasses_operation_fact_policy".into(), Value::Bool(false));
-    root.insert("business_prefix".into(), Value::Str("state://**".into()));
+    root.insert(
+        "bypasses_operation_fact_policy".into(),
+        Value::boolean(false),
+    );
+    root.insert("business_prefix".into(), Value::string("state://**".into()));
     root.insert(
         "secret_prefix".into(),
-        Value::Str("state://vault/**".into()),
+        Value::string("state://vault/**".into()),
     );
     root.insert(
         "secret_prefix_rule".into(),
-        Value::Str("use secret.* custody actions; generic visibility reads reject vault".into()),
+        Value::string("use secret.* custody actions; generic visibility reads reject vault".into()),
     );
     root.insert(
         "password_policy".into(),
@@ -1424,7 +1430,7 @@ pub(crate) fn visibility_authority_value() -> Value {
         "lockout_policy".into(),
         crate::credentials::lockout_policy_to_value(5, 1000, 60_000),
     );
-    Value::Map(root)
+    Value::map(root)
 }
 
 /// Return the static stream descriptor registry.
@@ -1459,10 +1465,18 @@ pub fn stream_descriptors() -> Vec<StreamDescriptor> {
             input: schema(
                 "stream.audit_facts.input",
                 "map",
-                vec![field("process", "u64", false)],
+                vec![
+                    field("process", "decimal_u64", false),
+                    field("max_bytes", "positive_usize", false),
+                ],
                 vec![
                     "audit/fact streams require StreamCall.scope, justification, and ttl_ms",
                     "StreamCall.since_rev is reserved; current streams are live-only",
+                    "only notifications after subscription are observed; historical rows require explicit bounded page reads",
+                    "append and completion notifications emit current records as upserts by op_id; completed indicates outcome availability",
+                    "process filters the current caller before checking the byte budget; unrelated records do not consume that budget",
+                    "lag or an oversized matching record closes the stream; resynchronize with bounded fact pages and subscribe again",
+                    "events contain one record, so max_batch does not batch notifications",
                 ],
             ),
             event: schema("stream.audit_facts.event", "console_event", vec![], vec![]),
@@ -1755,7 +1769,10 @@ fn build_action_descriptors() -> Vec<ActionDescriptor> {
                 ],
                 vec![
                     "runtime.include_recent_facts defaults to false",
+                    "a snapshot accepts at most one runtime section",
                     "runtime.include_recent_facts=true requires ActionCall.scope, justification, and ttl_ms",
+                    "runtime.process optionally selects one process; runtime.include_recent_facts=true requires an explicit process and read authority for its state://fact path",
+                    "runtime recent_facts uses the bounded audit fact-page shape; fact_cursor is a decimal u64 string",
                 ],
             ),
             schema("state.snapshot.output", "map", vec![], vec![]),
@@ -1881,13 +1898,24 @@ fn build_action_descriptors() -> Vec<ActionDescriptor> {
                 "runtime.process_inspect.input",
                 "map",
                 vec![
-                    field("process", "u64", false),
+                    field("process", "decimal_u64", false),
                     field("include_recent_facts", "bool", false),
                     field("limit", "usize", false),
                 ],
-                vec![],
+                vec![
+                    "include_recent_facts defaults to false; true requires an explicit process and read authority for its state://fact path",
+                    "limit bounds one recent_facts page; metadata-only process rows and children are not paged",
+                ],
             ),
-            schema("runtime.process_inspect.output", "map", vec![], vec![]),
+            schema(
+                "runtime.process_inspect.output",
+                "list",
+                vec![],
+                vec![
+                    "process, identity and children IDs are decimal u64 strings",
+                    "recent_facts is a bounded fact page when requested; no all-history fact_count is computed",
+                ],
+            ),
         ),
         action(
             ACTION_AUDIT_FACTS_RECENT,
@@ -1899,12 +1927,18 @@ fn build_action_descriptors() -> Vec<ActionDescriptor> {
                 "audit.facts_recent.input",
                 "map",
                 vec![
-                    field("process", "u64", false),
-                    field("limit", "usize", false),
+                    field("process", "decimal_u64", false),
+                    field("from", "decimal_u64", false),
+                    field("before", "decimal_u64", false),
+                    field("limit", "positive_usize", false),
+                    field("max_bytes", "positive_usize", false),
+                    field("max_examined", "positive_usize", false),
                 ],
-                vec![],
+                vec![
+                    "newest append slots first; continue with before=next and the same from/filter",
+                ],
             ),
-            schema("audit.facts_recent.output", "list", vec![], vec![]),
+            fact_page_schema("audit.facts_recent.output"),
         ),
         action(
             ACTION_LINEAGE_TRACE_READ,
@@ -1916,20 +1950,20 @@ fn build_action_descriptors() -> Vec<ActionDescriptor> {
                 "lineage.trace_read.input",
                 "map",
                 vec![
-                    field("process", "u64", true),
-                    field("from", "usize", false),
-                    field("limit", "usize", false),
+                    field("process", "decimal_u64", true),
+                    field("from", "decimal_u64", false),
+                    field("before", "decimal_u64", false),
+                    field("limit", "positive_usize", false),
+                    field("max_bytes", "positive_usize", false),
+                    field("max_examined", "positive_usize", false),
                 ],
-                vec![],
-            ),
-            schema(
-                "lineage.trace_read.output",
-                "map",
-                vec![],
                 vec![
-                    "output includes partial/partial_reason because v1 exposes a fact-order projection",
+                    "from is a global append slot, not an ordinal within a process; oldest slots first",
+                    "continue with from=next and before=end using the same filter",
+                    "partial/partial_reason describe omitted lineage projections independently of page completion",
                 ],
             ),
+            fact_page_schema("lineage.trace_read.output"),
         ),
         action(
             ACTION_LINEAGE_FACT_READ,
@@ -1940,8 +1974,16 @@ fn build_action_descriptors() -> Vec<ActionDescriptor> {
             schema(
                 "lineage.fact_read.input",
                 "map",
-                vec![field("op_id", "operation_id", true)],
-                vec!["requires ActionCall.scope, justification, and ttl_ms"],
+                vec![
+                    field("op_id", "operation_id", true),
+                    field("process", "decimal_u64", false),
+                    field("max_bytes", "positive_usize", false),
+                ],
+                vec![
+                    "requires ActionCall.scope, justification, and ttl_ms",
+                    "process defaults to the process in op_id and requires read authority for state://fact/<process>",
+                    "only a record whose current caller matches process is visible; missing or nonmatching records are reported as unknown",
+                ],
             ),
             schema(
                 "lineage.fact_read.output",
@@ -1949,6 +1991,7 @@ fn build_action_descriptors() -> Vec<ActionDescriptor> {
                 vec![],
                 vec![
                     "output includes partial/partial_reason when lineage projections are not fully materialized",
+                    "indexed lookup filters the current caller before enforcing the record byte budget or copying/decoding; an oversized matching record fails the read",
                 ],
             ),
         ),
@@ -1959,7 +2002,17 @@ fn build_action_descriptors() -> Vec<ActionDescriptor> {
             ActionPolicy::new(RiskLevel::Low, VisibilityTier::ManagementState, false),
             vec![authority("read", "state://kernel/**")],
             schema("health.summary.input", "null", vec![], vec![]),
-            schema("health.summary.output", "map", vec![], vec![]),
+            schema(
+                "health.summary.output",
+                "map",
+                vec![],
+                vec![
+                    "fact_sample contains sampled_facts and decisions for one bounded reverse page with from/next/end/order/complete/examined/encoded_bytes",
+                    "sample counts describe only that page; no all-history fact_count or fact_decisions is computed",
+                    "fact_cursor is a decimal u64 append-head string, not an outcome-update revision",
+                    "process_count and process_status still enumerate the current process table",
+                ],
+            ),
         ),
         external_action(
             ACTION_EXTERNAL_INSTALLATION_LIST,
@@ -2499,6 +2552,34 @@ fn schema(
     }
 }
 
+fn fact_page_schema(schema_id: &str) -> SchemaDescriptor {
+    schema(
+        schema_id,
+        "map",
+        vec![
+            field("items", "list<fact_summary>", true),
+            field("from", "decimal_u64", true),
+            field("next", "decimal_u64|null", true),
+            field("end", "decimal_u64", true),
+            field("order", "forward|reverse", true),
+            field("complete", "bool", true),
+            field("examined", "usize", true),
+            field("encoded_bytes", "usize", true),
+            field("process", "decimal_u64", false),
+            field("partial", "bool", false),
+            field("partial_reason", "string", false),
+        ],
+        vec![
+            "decimal_u64 inputs accept non-negative integers or decimal strings; cursor and fact ID outputs use exact decimal strings",
+            "from is inclusive and end is exclusive; reverse pages shrink their upper bound; append bounds do not freeze completion updates",
+            "next=null and complete=true mean the interval is exhausted; an empty items list can still have a continuation",
+            "limit bounds returned rows; max_examined bounds storage candidates including filtered rows; max_bytes bounds stored Fact JSON bytes before copying or decoding",
+            "encoded_bytes is the sum of returned Fact JSON lengths, not the projected response or heap size",
+            "max_bytes is capped at min(max_frame_bytes/8, 262144); max_examined defaults to max(limit, 4096) and is capped at 65536",
+        ],
+    )
+}
+
 fn field(name: &str, kind: &str, required: bool) -> FieldDescriptor {
     FieldDescriptor {
         name: name.into(),
@@ -2510,7 +2591,6 @@ fn field(name: &str, kind: &str, required: bool) -> FieldDescriptor {
         sensitivity: None,
         read_only: false,
         computed: false,
-        deprecated: false,
     }
 }
 
@@ -2525,10 +2605,10 @@ fn semantic_field(name: &str, kind: &str, required: bool, semantic_kind: &str) -
 
 fn secret_row(path: &str, class: SecretClass, policy: &str) -> Value {
     let mut row = BTreeMap::new();
-    row.insert("path".into(), Value::Str(path.into()));
+    row.insert("path".into(), Value::string(path.into()));
     row.insert("class".into(), to_value(class));
-    row.insert("policy".into(), Value::Str(policy.into()));
-    Value::Map(row)
+    row.insert("policy".into(), Value::string(policy.into()));
+    Value::map(row)
 }
 
 fn resource_type_summary(
@@ -2540,13 +2620,13 @@ fn resource_type_summary(
     status: ImplementationStatus,
 ) -> Value {
     value_map([
-        ("resource_type", Value::Str(resource_type.into())),
-        ("title", Value::Str(title.into())),
-        ("default_view", Value::Str(default_view.into())),
-        ("read_action", Value::Str(read_action.into())),
+        ("resource_type", Value::string(resource_type.into())),
+        ("title", Value::string(title.into())),
+        ("default_view", Value::string(default_view.into())),
+        ("read_action", Value::string(read_action.into())),
         (
             "update_action",
-            update_action.map_or(Value::Null, |action| Value::Str(action.into())),
+            update_action.map_or(Value::null(), |action| Value::string(action.into())),
         ),
         ("status", to_value(status)),
     ])
@@ -2573,43 +2653,43 @@ fn resource_type_descriptor(
     display_fields: Vec<&str>,
 ) -> Value {
     value_map([
-        ("resource_type", Value::Str(meta.resource_type.into())),
-        ("title", Value::Str(meta.title.into())),
+        ("resource_type", Value::string(meta.resource_type.into())),
+        ("title", Value::string(meta.title.into())),
         ("status", to_value(meta.status)),
-        ("default_view", Value::Str(meta.default_view.into())),
-        ("read_action", Value::Str(actions.read.into())),
+        ("default_view", Value::string(meta.default_view.into())),
+        ("read_action", Value::string(actions.read.into())),
         (
             "list_action",
             actions
                 .list
-                .map_or(Value::Null, |action| Value::Str(action.into())),
+                .map_or(Value::null(), |action| Value::string(action.into())),
         ),
         (
             "update_action",
             actions
                 .update
-                .map_or(Value::Null, |action| Value::Str(action.into())),
+                .map_or(Value::null(), |action| Value::string(action.into())),
         ),
         (
             "validate_action",
             actions
                 .validate
-                .map_or(Value::Null, |action| Value::Str(action.into())),
+                .map_or(Value::null(), |action| Value::string(action.into())),
         ),
-        ("revision_field", Value::Str("expected_version".into())),
-        ("fields", Value::List(fields)),
+        ("revision_field", Value::string("expected_version".into())),
+        ("fields", Value::list(fields)),
         (
             "display_fields",
-            Value::List(
+            Value::list(
                 display_fields
                     .into_iter()
-                    .map(|field| Value::Str(field.into()))
+                    .map(|field| Value::string(field.into()))
                     .collect(),
             ),
         ),
         (
             "notes",
-            Value::List(vec![Value::Str(
+            Value::list(vec![Value::string(
                 "descriptor supplies semantic edit metadata only; every write still calls the fixed action descriptor".into(),
             )]),
         ),
@@ -2625,15 +2705,14 @@ fn semantic_contract_field(
     read_only: bool,
 ) -> Value {
     value_map([
-        ("name", Value::Str(name.into())),
-        ("kind", Value::Str(kind.into())),
-        ("required", Value::Bool(required)),
-        ("stable_id", Value::Str(name.into())),
-        ("semantic_kind", Value::Str(semantic_kind.into())),
-        ("sensitivity", Value::Str(sensitivity.into())),
-        ("read_only", Value::Bool(read_only)),
-        ("computed", Value::Bool(false)),
-        ("deprecated", Value::Bool(false)),
+        ("name", Value::string(name.into())),
+        ("kind", Value::string(kind.into())),
+        ("required", Value::boolean(required)),
+        ("stable_id", Value::string(name.into())),
+        ("semantic_kind", Value::string(semantic_kind.into())),
+        ("sensitivity", Value::string(sensitivity.into())),
+        ("read_only", Value::boolean(read_only)),
+        ("computed", Value::boolean(false)),
     ])
 }
 
@@ -2645,33 +2724,33 @@ fn resource_view_descriptor(
     projection_fields: Vec<&str>,
 ) -> Value {
     value_map([
-        ("view", Value::Str(view.into())),
-        ("resource_type", Value::Str(resource_type.into())),
-        ("read_action", Value::Str(read_action.into())),
-        ("query_schema", Value::Str(format!("{view}.query"))),
+        ("view", Value::string(view.into())),
+        ("resource_type", Value::string(resource_type.into())),
+        ("read_action", Value::string(read_action.into())),
+        ("query_schema", Value::string(format!("{view}.query"))),
         (
             "projection_schema",
-            Value::Str(format!("{view}.projection")),
+            Value::string(format!("{view}.projection")),
         ),
-        ("pagination", Value::Str("offset_or_cursor".into())),
+        ("pagination", Value::string("offset_or_cursor".into())),
         (
             "filtering",
-            Value::List(vec![
-                Value::Str("domain_fixed".into()),
-                Value::Str("text".into()),
+            Value::list(vec![
+                Value::string("domain_fixed".into()),
+                Value::string("text".into()),
             ]),
         ),
         (
             "sorting",
-            Value::List(vec![Value::Str("stable_display_field".into())]),
+            Value::list(vec![Value::string("stable_display_field".into())]),
         ),
-        ("refresh_stream", Value::Str(refresh_stream.into())),
+        ("refresh_stream", Value::string(refresh_stream.into())),
         (
             "projection_fields",
-            Value::List(
+            Value::list(
                 projection_fields
                     .into_iter()
-                    .map(|field| Value::Str(field.into()))
+                    .map(|field| Value::string(field.into()))
                     .collect(),
             ),
         ),
@@ -2679,7 +2758,7 @@ fn resource_view_descriptor(
 }
 
 fn value_map(items: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
-    Value::Map(
+    Value::map(
         items
             .into_iter()
             .map(|(key, value)| (key.to_string(), value))
@@ -2696,7 +2775,7 @@ fn to_value<T: Serialize>(value: T) -> Value {
         Ok(json) => json,
         Err(error) => {
             tracing::error!(?error, "console protocol descriptor serialization failed");
-            return Value::Null;
+            return Value::null();
         }
     };
     match serde_json::from_value(json) {
@@ -2706,7 +2785,7 @@ fn to_value<T: Serialize>(value: T) -> Value {
                 ?error,
                 "console protocol descriptor value conversion failed"
             );
-            Value::Null
+            Value::null()
         }
     }
 }
@@ -2821,17 +2900,19 @@ mod tests {
 
     #[test]
     fn edit_descriptors_are_shape_independent() -> anyhow::Result<()> {
-        let Some(Value::Map(descriptor)) = resource_type_descriptor_value("access.user") else {
+        let Some(descriptor) =
+            resource_type_descriptor_value("access.user").and_then(Value::into_map)
+        else {
             bail!("missing access.user resource descriptor");
         };
-        let Some(Value::List(fields)) = descriptor.get("fields") else {
+        let Some(fields) = descriptor.get("fields").and_then(Value::as_list) else {
             bail!("resource descriptor must include fields");
         };
         ensure!(
             fields.iter().any(|field| {
                 field.as_map().is_some_and(|map| {
-                matches!(map.get("semantic_kind"), Some(Value::Str(kind)) if kind == "resource_ref")
-            })
+                    map.get("semantic_kind").and_then(Value::as_str) == Some("resource_ref")
+                })
             }),
             "resource descriptor did not include resource_ref field"
         );

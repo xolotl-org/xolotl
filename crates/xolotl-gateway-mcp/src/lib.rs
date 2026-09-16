@@ -12,10 +12,19 @@
 //! still goes through [`xolotl_gateway::Gateway`], so authentication, Process
 //! creation, schema checks, policy, taint, Fact recording, budget, and audit use
 //! the shared Gateway path.
+//!
+//! JSON-RPC responses project typed values into ordinary JSON under configurable
+//! [`McpOutputLimits`]. Admission accounts for shared descendants before JSON
+//! expansion, counts generated JSON nodes before materialization, and checks
+//! the encoded response including escaping and envelopes.
+//! Ordinary JSON does not preserve every resident type or non-finite float.
+//! Use typed calls or Xolotl's tagged format when those distinctions matter;
+//! finite MCP response budgets do not constrain cumulative kernel streams.
 
 mod content;
 mod error;
 mod jsonrpc;
+mod output;
 mod params;
 mod publication;
 mod render;
@@ -25,6 +34,7 @@ mod validation;
 
 pub use error::McpGatewayError;
 pub use jsonrpc::{McpJsonRpcError, McpJsonRpcRequest, McpJsonRpcResponse};
+pub use output::{MAX_MCP_JSON_VALUE_DEPTH, McpOutputLimits};
 pub use publication::{
     MCP_PUBLICATION_KIND_PROMPT, MCP_PUBLICATION_KIND_RESOURCE,
     MCP_PUBLICATION_KIND_RESOURCE_TEMPLATE, MCP_PUBLICATION_KIND_TOOL, MCP_PUBLICATION_PROTOCOL,

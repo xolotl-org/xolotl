@@ -3,41 +3,42 @@
 //! Safety: URL admission runs before the request and on every redirect.
 //! Literal IPs that are loopback, private, link-local, or unspecified are
 //! rejected, as are `.local`/`.internal` names. `fetch` is `Effectful`.
-//! Large responses are offloaded to a content-addressed [`BlobRef`] so Facts
+//! Large responses are offloaded to a content-addressed [`xolotl_types::BlobRef`] so Facts
 //! never inline big payloads.
 
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::net::Ipv6Addr;
-use xolotl_kernel::{Driver, DriverContext, DriverError, MethodSpec};
-use xolotl_state::Backend;
-use xolotl_types::{BlobRef, MethodId, Outcome, OutputMode, Purity, Value};
+use xolotl_kernel::{
+    Driver, DriverContext, DriverError, DriverOutput, DriverUsage, MethodSpec, UsageDimension,
+};
+use xolotl_state::host::object::ObjectStore;
+use xolotl_types::{
+    MethodId, Outcome, OutputMode, Purity, TaintSet, TaintSource, TaintedValue, Value,
+};
 
 /// Bodies larger than this are offloaded to a blob ref.
 /// 1 MiB keeps Facts small while inlining typical pages.
 pub(crate) const INLINE_BODY_LIMIT: usize = 1 << 20;
 
 /// Method names in registration order for `effect://fetch/get`.
-pub(crate) const FETCH_METHODS: &[MethodSpec] = &[MethodSpec::new(
-    "get",
-    Purity::Effectful,
-    MethodSpec::UNARY_ASYNC,
-)];
+pub(crate) const FETCH_METHODS: &[MethodSpec] =
+    &[MethodSpec::new("get", Purity::Effectful, MethodSpec::STREAM_ASYNC).unprotected_input()];
 
 /// Drives `effect://fetch/get`.
 pub(crate) struct FetchDriver {
     client: reqwest::Client,
-    state: Backend,
+    objects: ObjectStore,
 }
 
 impl FetchDriver {
-    /// Create a fetch driver that offloads large responses into `state`.
-    pub(crate) fn new(state: Backend) -> Result<Self, DriverError> {
+    /// Create a fetch driver with explicit large-object storage capabilities.
+    pub(crate) fn new(objects: ObjectStore) -> Result<Self, DriverError> {
         let client = reqwest::Client::builder()
             .redirect(fetch_redirect_policy())
             .build()
             .map_err(|error| DriverError::Other(format!("fetch client init failed: {error}")))?;
-        Ok(Self { client, state })
+        Ok(Self { client, objects })
     }
 }
 
@@ -108,49 +109,22 @@ fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
     unique_local || link_local
 }
 
-/// Decide how a fetched response body is surfaced.
-/// Small bodies are inlined as a `Str`; bodies at or over [`INLINE_BODY_LIMIT`]
-/// are returned as a content-addressed [`Value::Blob`] so the Fact stays small.
-/// Callers that produce a BlobRef must also persist the bytes via
-/// `body_to_value_persisted`.
-pub(crate) fn body_to_value(bytes: Vec<u8>, mime: Option<String>) -> Value {
-    if bytes.len() >= INLINE_BODY_LIMIT {
-        let hash = blake3::hash(&bytes).to_hex().to_string();
-        let size = bytes.len() as u64;
-        Value::Blob(BlobRef { hash, size, mime })
-    } else {
-        match String::from_utf8(bytes) {
-            Ok(s) => Value::Str(s),
-            Err(e) => Value::Bytes(e.into_bytes()),
-        }
-    }
-}
-
-async fn body_to_value_persisted(
-    state: &Backend,
-    bytes: Vec<u8>,
-    mime: Option<String>,
-) -> Result<Value, DriverError> {
-    if bytes.len() >= INLINE_BODY_LIMIT {
-        Ok(Value::Blob(
-            crate::blob::write_blob_bytes(state, bytes, mime).await?,
-        ))
-    } else {
-        Ok(body_to_value(bytes, mime))
-    }
-}
-
 #[async_trait]
 impl Driver for FetchDriver {
     async fn call(
         &self,
         method: MethodId,
         input: Value,
-        _output: OutputMode,
-        _ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
+        output: OutputMode,
+        ctx: &DriverContext,
+    ) -> Result<DriverOutput, DriverError> {
         if method.get() != 0 {
             return Err(DriverError::NoSuchMethod(method));
+        }
+        if ctx.taint.has_protected() {
+            return Err(DriverError::InvalidInput(
+                "fetch requires unprotected input".into(),
+            ));
         }
         let raw = input
             .as_str()
@@ -162,13 +136,18 @@ impl Driver for FetchDriver {
             })
             .ok_or_else(|| DriverError::Other("fetch requires a url".into()))?;
         let url = validate_url(raw)?;
-        let resp = self
+        let mut resp = self
             .client
             .get(url)
             .send()
             .await
             .map_err(|e| DriverError::Transport(e.to_string()))?;
         let status = resp.status().as_u16() as i64;
+        let host = resp
+            .url()
+            .host_str()
+            .ok_or_else(|| DriverError::Transport("fetch response URL has no host".into()))?;
+        let source = TaintSet::of(TaintSource::Fetched { host: host.into() });
         let mime = match resp.headers().get(reqwest::header::CONTENT_TYPE) {
             Some(value) => {
                 let value = value.to_str().map_err(|error| {
@@ -178,18 +157,58 @@ impl Driver for FetchDriver {
             }
             None => None,
         };
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| DriverError::Transport(e.to_string()))?;
-        let mut m = BTreeMap::new();
-        m.insert("status".into(), Value::Int(status));
-        // Inline small bodies, offload large ones to a BlobRef.
-        m.insert(
-            "body".into(),
-            body_to_value_persisted(&self.state, body.to_vec(), mime).await?,
+        let mut buffer = crate::object::ObjectBuffer::new(
+            self.objects.clone(),
+            INLINE_BODY_LIMIT - 1,
+            mime,
+            source.clone().merged(&ctx.taint),
         );
-        Ok(Outcome::Done(Value::Map(m)))
+        let mut bytes_read = 0_u64;
+        loop {
+            let bytes = match resp.chunk().await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => break,
+                Err(error) => {
+                    buffer.abort().await;
+                    return buffer
+                        .failure(DriverError::Transport(error.to_string()))
+                        .into_output("fetch");
+                }
+            };
+            bytes_read = bytes_read
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| DriverError::Other("response byte count exceeds u64".into()))?;
+            if output == OutputMode::Stream {
+                for chunk in bytes.chunks(crate::object::CHUNK_BYTES) {
+                    ctx.emit_tainted(TaintedValue::new(
+                        Value::bytes(chunk.to_vec()),
+                        source.clone(),
+                    ))
+                    .await?;
+                }
+            } else {
+                if let Err(error) = buffer.push(&bytes).await {
+                    return error.into_output("fetch");
+                }
+            }
+        }
+        let mut m = BTreeMap::new();
+        m.insert("status".into(), Value::integer(status));
+        let body = if output == OutputMode::Stream {
+            TaintedValue::pristine(Value::null())
+        } else {
+            match buffer.finish().await {
+                Ok((value, _)) => value,
+                Err(error) => return error.into_output("fetch"),
+            }
+        };
+        m.insert("body".into(), body.value);
+        Ok(DriverOutput::new(Outcome::Done(Value::map(m)))
+            .with_taint(source.merged(&body.taint))
+            .with_usage(DriverUsage::from([(
+                UsageDimension::BYTES_READ,
+                bytes_read,
+            )])))
     }
 }
 
@@ -197,8 +216,6 @@ impl Driver for FetchDriver {
 mod tests {
     use super::*;
     use anyhow::{Context, Result, bail, ensure};
-    use std::sync::Arc;
-    use xolotl_state::{Backend, InMemoryBackend};
     use xolotl_types::{IdentityRef, ProcessId};
 
     #[test]
@@ -268,80 +285,139 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn body_to_value_inlines_small_text() -> Result<()> {
-        let v = body_to_value(b"hello world".to_vec(), Some("text/plain".into()));
-        ensure!(
-            v == Value::Str("hello world".into()),
-            "small text value: {v:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn body_to_value_keeps_small_binary_as_bytes() -> Result<()> {
-        let v = body_to_value(vec![0xff, 0xfe, 0x00], None);
-        ensure!(
-            v == Value::Bytes(vec![0xff, 0xfe, 0x00]),
-            "small binary value: {v:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn body_to_value_offloads_large_body_to_blob() -> Result<()> {
-        let big = vec![b'a'; INLINE_BODY_LIMIT];
-        let expected_hash = blake3::hash(&big).to_hex().to_string();
-        match body_to_value(big, Some("application/octet-stream".into())) {
-            Value::Blob(b) => {
-                ensure!(
-                    b.size == INLINE_BODY_LIMIT as u64,
-                    "large body size: {}",
-                    b.size
-                );
-                ensure!(
-                    b.mime.as_deref() == Some("application/octet-stream"),
-                    "large body mime: {:?}",
-                    b.mime
-                );
-                ensure!(b.hash == expected_hash, "large body hash: {}", b.hash);
+    async fn response(
+        bytes: Vec<u8>,
+        objects: ObjectStore,
+    ) -> Result<(FetchDriver, Value, tokio::task::JoinHandle<Result<()>>)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0_u8; 4096];
+            let count = socket.read(&mut request).await?;
+            ensure!(count != 0);
+            socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", bytes.len()).as_bytes()).await?;
+            for chunk in bytes.chunks(4096) {
+                socket.write_all(chunk).await?;
             }
-            other => bail!("expected blob offload, got {other:?}"),
+            Ok(())
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("public.example", address)
+            .build()?;
+        Ok((
+            FetchDriver { client, objects },
+            Value::string(format!("http://public.example:{}/", address.port())),
+            server,
+        ))
+    }
+
+    #[tokio::test]
+    async fn response_stream_offloads_at_threshold_and_preserves_source() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let objects =
+            xolotl_storage_fs::FileObjectStore::open(directory.path())?.into_object_store();
+        for bytes in [
+            b"hello".to_vec(),
+            vec![0xff, 0xfe],
+            vec![b'a'; INLINE_BODY_LIMIT],
+        ] {
+            let (driver, input, server) = response(bytes.clone(), objects.clone()).await?;
+            let output = driver
+                .call(
+                    MethodId::new(0),
+                    input,
+                    OutputMode::Unary,
+                    &DriverContext::new(IdentityRef::ROOT, ProcessId::new(1)),
+                )
+                .await?;
+            server.await??;
+            let source = TaintSet::of(TaintSource::Fetched {
+                host: "public.example".into(),
+            });
+            ensure!(output.taint == source);
+            let Outcome::Done(result_value) = output.outcome else {
+                bail!("expected response")
+            };
+            let result = result_value.as_map().context("expected map")?;
+            let body = result.get("body").context("expected body")?;
+            if bytes.len() >= INLINE_BODY_LIMIT {
+                let xolotl_types::ValueView::Blob(reference) = body.view() else {
+                    bail!("expected blob")
+                };
+                ensure!(reference.hash == blake3::hash(&bytes).to_hex().to_string());
+                ensure!(reference.size == bytes.len() as u64);
+                ensure!(
+                    objects
+                        .metadata(reference)
+                        .await?
+                        .context("object was not published")?
+                        .taint
+                        == source
+                );
+                let mut chunk = [0_u8; crate::object::CHUNK_BYTES];
+                let read = objects.read_chunk(reference, 0, &mut chunk).await?;
+                ensure!(chunk[..read.bytes_read] == bytes[..read.bytes_read]);
+            } else {
+                let expected = match String::from_utf8(bytes) {
+                    Ok(text) => Value::string(text),
+                    Err(error) => Value::bytes(error.into_bytes()),
+                };
+                ensure!(body == &expected);
+            }
         }
-        let small = vec![b'a'; INLINE_BODY_LIMIT - 1];
-        ensure!(
-            matches!(body_to_value(small, None), Value::Str(_)),
-            "small body should stay inline"
-        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn persisted_large_body_is_readable_from_blob_store() -> Result<()> {
-        let state: Backend = Arc::new(InMemoryBackend::new());
-        let big = vec![b'a'; INLINE_BODY_LIMIT];
-        let value =
-            body_to_value_persisted(&state, big.clone(), Some("application/octet-stream".into()))
-                .await
-                .context("persist body to blob store")?;
-        let Value::Blob(blob_ref) = value else {
-            bail!("expected blob ref");
+    async fn streamed_fetch_exceeds_window_without_object_storage() -> Result<()> {
+        use xolotl_kernel::host::stream::{StreamItem, channel};
+        let expected = INLINE_BODY_LIMIT * 2;
+        let (driver, input, server) = response(vec![b'a'; expected], ObjectStore::new()).await?;
+        let (sink, mut receiver) = channel(xolotl_kernel::stream::StreamWindow::default());
+        let context =
+            DriverContext::new(IdentityRef::ROOT, ProcessId::new(1)).with_stream_sink(sink);
+        let read = driver.call(MethodId::new(0), input, OutputMode::Stream, &context);
+        let consume = async {
+            let mut count = 0;
+            while count < expected {
+                let StreamItem::Chunk(chunk) = receiver.recv().await.context("expected chunk")?
+                else {
+                    bail!("unexpected end")
+                };
+                let value = chunk.into_value();
+                ensure!(
+                    value.taint
+                        == TaintSet::of(TaintSource::Fetched {
+                            host: "public.example".into()
+                        })
+                );
+                let Some(bytes) = value.value.as_bytes() else {
+                    bail!("expected bytes")
+                };
+                ensure!(bytes.len() <= crate::object::CHUNK_BYTES);
+                count += bytes.len();
+            }
+            Ok::<_, anyhow::Error>(())
         };
-        let blob = crate::blob::BlobDriver::new(state);
-        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
-        let read = blob
-            .call(
-                MethodId::new(1),
-                Value::Blob(blob_ref),
-                OutputMode::Unary,
-                &ctx,
-            )
-            .await
-            .context("read persisted body")?;
+        let (result, consumed) = tokio::join!(read, consume);
+        consumed?;
+        let output = result?;
+        server.await??;
         ensure!(
-            read == Outcome::Done(Value::Bytes(big)),
-            "persisted body read: {read:?}"
+            output.usage
+                == Some(DriverUsage::from([(
+                    UsageDimension::BYTES_READ,
+                    expected as u64
+                )]))
         );
+        let Outcome::Done(result_value) = output.outcome else {
+            bail!("expected response")
+        };
+        let result = result_value.as_map().context("expected map")?;
+        ensure!(result.get("body") == Some(&Value::null()));
         Ok(())
     }
 }

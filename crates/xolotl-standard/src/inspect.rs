@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use std::collections::BTreeMap;
-use xolotl_kernel::{Driver, DriverContext, DriverError, MethodSpec};
+use xolotl_kernel::{Driver, DriverContext, DriverError, DriverOutput, MethodSpec};
 use xolotl_types::{MethodId, Outcome, OutputMode, ProcessId, Purity, Value};
 
 /// `effect://kernel/process/inspect`.
@@ -33,44 +33,35 @@ impl Driver for KernelInspectDriver {
         input: Value,
         _output: OutputMode,
         _ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
+    ) -> Result<DriverOutput, DriverError> {
         if method.get() != 0 {
             return Err(DriverError::NoSuchMethod(method));
         }
-        let input = crate::input::map(input, "inspect")?;
-        let process = match input.get("process") {
-            Some(value) => {
-                let raw = value.as_int().ok_or_else(|| {
-                    DriverError::InvalidInput("inspect.process must be an integer".into())
-                })?;
-                let pid = u64::try_from(raw).map_err(|_error| {
-                    DriverError::InvalidInput("inspect.process must be non-negative".into())
-                })?;
-                Some(ProcessId::new(pid))
-            }
-            None => None,
-        };
-        let include_facts = match input.get("include_recent_facts") {
+        let mut input = crate::input::map(input, "inspect")?;
+        let process = crate::fact::read::take_cursor(&mut input, "process")?.map(ProcessId::new);
+        let include_facts = match input
+            .remove("include_recent_facts")
+            .as_ref()
+            .map(Value::view)
+        {
             None => false,
-            Some(Value::Bool(value)) => *value,
+            Some(xolotl_types::ValueView::Bool(value)) => value,
             Some(_) => {
                 return Err(DriverError::InvalidInput(
                     "inspect.include_recent_facts must be a boolean".into(),
                 ));
             }
         };
-        let limit = match input.get("limit") {
-            Some(value) => {
-                let raw = value.as_int().ok_or_else(|| {
-                    DriverError::InvalidInput("inspect.limit must be an integer".into())
-                })?;
-                usize::try_from(raw).map_err(|_error| {
-                    DriverError::InvalidInput("inspect.limit must be non-negative".into())
-                })?
-            }
-            None => 32,
+        if include_facts && process.is_none() {
+            return Err(DriverError::InvalidInput(
+                "inspect.include_recent_facts requires an explicit process".into(),
+            ));
         }
-        .min(256);
+        let query = crate::fact::read::parse_query(
+            Value::from(input),
+            xolotl_kernel::FactOrder::Reverse,
+            32,
+        )?;
 
         let ids = match process {
             Some(pid) => vec![pid],
@@ -79,53 +70,41 @@ impl Driver for KernelInspectDriver {
         let mut rows = Vec::with_capacity(ids.len());
         for pid in ids {
             let mut row = BTreeMap::new();
-            row.insert("process".into(), Value::Int(pid.get() as i64));
+            row.insert("process".into(), Value::string(pid.get().to_string()));
             if let Some(status) = self.processes.status(pid) {
-                row.insert("status".into(), Value::Str(format!("{status:?}")));
-                row.insert("terminal".into(), Value::Bool(status.is_terminal()));
+                row.insert("status".into(), Value::string(format!("{status:?}")));
+                row.insert("terminal".into(), Value::boolean(status.is_terminal()));
             } else {
-                row.insert("status".into(), Value::Str("Unknown".into()));
+                row.insert("status".into(), Value::string("Unknown".into()));
             }
             if let Some(identity) = self.processes.identity(pid) {
-                row.insert("identity".into(), Value::Int(identity.get() as i64));
+                row.insert("identity".into(), Value::string(identity.get().to_string()));
             }
             let children = self
                 .processes
                 .children_of(pid)
                 .into_iter()
-                .map(|child| Value::Int(child.get() as i64))
+                .map(|child| Value::string(child.get().to_string()))
                 .collect();
-            row.insert("children".into(), Value::List(children));
-            let facts = self
-                .facts
-                .facts_of(pid)
-                .map_err(|e| DriverError::Other(e.to_string()))?;
-            row.insert("fact_count".into(), Value::Int(facts.len() as i64));
+            row.insert("children".into(), Value::list(children));
             if include_facts {
+                let query = xolotl_kernel::FactQuery {
+                    process: Some(pid),
+                    ..query
+                };
+                let page = self
+                    .facts
+                    .scan(query)
+                    .map_err(|error| DriverError::Other(error.to_string()))?;
                 row.insert(
                     "recent_facts".into(),
-                    Value::List(facts.iter().rev().take(limit).map(project_fact).collect()),
+                    crate::fact::read::page_value(query, page),
                 );
             }
-            rows.push(Value::Map(row));
+            rows.push(Value::map(row));
         }
-        Ok(Outcome::Done(Value::List(rows)))
+        Ok(DriverOutput::new(Outcome::Done(Value::list(rows))))
     }
-}
-
-fn project_fact(f: &xolotl_types::Fact) -> Value {
-    let mut m = BTreeMap::new();
-    m.insert("op_id".into(), Value::Str(f.id.to_string()));
-    m.insert("caller".into(), Value::Int(f.caller.get() as i64));
-    m.insert("acting".into(), Value::Int(f.acting.get() as i64));
-    m.insert("resource".into(), Value::Int(f.resource.get() as i64));
-    m.insert("method".into(), Value::Int(f.method.get() as i64));
-    m.insert("decision".into(), Value::Str(format!("{:?}", f.decision)));
-    m.insert("replay".into(), Value::Str(format!("{:?}", f.replay)));
-    m.insert("timestamp".into(), Value::Int(f.timestamp.get()));
-    m.insert("tainted".into(), Value::Bool(!f.taint.is_pristine()));
-    m.insert("protected".into(), Value::Bool(f.taint.has_protected()));
-    Value::Map(m)
 }
 
 #[cfg(test)]
@@ -133,7 +112,109 @@ mod tests {
     use super::*;
     use anyhow::{Context, Result, bail, ensure};
     use xolotl_kernel::Bootstrap;
-    use xolotl_types::{IdentityRef, NodeId, OperationId};
+    use xolotl_types::IdentityRef;
+
+    #[derive(Default)]
+    struct RejectFactReads(xolotl_kernel::InMemoryExecutionIdSource);
+
+    impl xolotl_kernel::ExecutionIdSource for RejectFactReads {
+        fn reserve(
+            &self,
+            count: std::num::NonZeroU64,
+        ) -> Result<xolotl_kernel::ExecutionIdRange, xolotl_kernel::ExecutionIdError> {
+            self.0.reserve(count)
+        }
+    }
+
+    impl xolotl_kernel::FactStore for RejectFactReads {
+        fn append(&self, _fact: xolotl_types::Fact) -> Result<u64, xolotl_kernel::FactError> {
+            Err(xolotl_kernel::FactError("unexpected append".into()))
+        }
+        fn complete(&self, _fact: xolotl_types::Fact) -> Result<(), xolotl_kernel::FactError> {
+            Err(xolotl_kernel::FactError("unexpected complete".into()))
+        }
+        fn sync(&self) -> Result<(), xolotl_kernel::FactError> {
+            Ok(())
+        }
+        fn scan(
+            &self,
+            _query: xolotl_kernel::FactQuery,
+        ) -> Result<xolotl_kernel::FactPage, xolotl_kernel::FactError> {
+            Err(xolotl_kernel::FactError("unexpected fact read".into()))
+        }
+        fn lookup(
+            &self,
+            _query: xolotl_kernel::FactLookup,
+        ) -> Result<xolotl_kernel::FactLookupResult, xolotl_kernel::FactError> {
+            Err(xolotl_kernel::FactError("unexpected fact read".into()))
+        }
+        fn facts_of(
+            &self,
+            _process: ProcessId,
+        ) -> Result<Vec<xolotl_types::Fact>, xolotl_kernel::FactError> {
+            Err(xolotl_kernel::FactError("unexpected fact read".into()))
+        }
+        fn all_facts(&self) -> Result<Vec<xolotl_types::Fact>, xolotl_kernel::FactError> {
+            Err(xolotl_kernel::FactError("unexpected fact read".into()))
+        }
+        fn cursor(&self) -> u64 {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn process_metadata_does_not_require_fact_storage() -> Result<()> {
+        let boot = Bootstrap::in_memory();
+        let driver = KernelInspectDriver::new(
+            boot.kernel.processes.clone(),
+            xolotl_kernel::FactSink::new(std::sync::Arc::new(RejectFactReads::default())),
+        );
+        let ctx = DriverContext::new(IdentityRef::ROOT, boot.root);
+        let Outcome::Done(rows_value) = driver
+            .call(MethodId::new(0), Value::null(), OutputMode::Unary, &ctx)
+            .await?
+            .outcome
+        else {
+            bail!("expected process rows")
+        };
+        let rows = rows_value.as_list().context("expected list")?;
+        let Some(row) = rows.first().and_then(Value::as_map) else {
+            bail!("missing process")
+        };
+        ensure!(row.get("fact_count").is_none() && row.get("recent_facts").is_none());
+        let without_process = driver
+            .call(
+                MethodId::new(0),
+                Value::map(BTreeMap::from([(
+                    "include_recent_facts".into(),
+                    Value::boolean(true),
+                )])),
+                OutputMode::Unary,
+                &ctx,
+            )
+            .await;
+        ensure!(matches!(
+            without_process,
+            Err(DriverError::InvalidInput(message))
+                if message == "inspect.include_recent_facts requires an explicit process"
+        ));
+        let with_process = driver
+            .call(
+                MethodId::new(0),
+                Value::map(BTreeMap::from([
+                    ("include_recent_facts".into(), Value::boolean(true)),
+                    ("process".into(), Value::string(boot.root.get().to_string())),
+                ])),
+                OutputMode::Unary,
+                &ctx,
+            )
+            .await;
+        ensure!(matches!(
+            with_process,
+            Err(DriverError::Other(message)) if message == "fact store failed: unexpected fact read"
+        ));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn inspect_lists_processes() -> Result<()> {
@@ -142,14 +223,14 @@ mod tests {
         let out = d
             .call(
                 MethodId::new(0),
-                Value::Null,
+                Value::null(),
                 OutputMode::Unary,
                 &DriverContext::new(IdentityRef::ROOT, boot.root),
             )
             .await
             .context("inspect processes")?;
-        let rows = match out {
-            Outcome::Done(Value::List(rows)) => rows,
+        let rows = match out.outcome {
+            Outcome::Done(value) => value.into_list().context("expected process rows")?,
             other => bail!("expected rows, got {other:?}"),
         };
         ensure!(!rows.is_empty(), "expected at least one process row");
@@ -170,22 +251,21 @@ mod tests {
         .context("record gateway audit")?;
         let d = KernelInspectDriver::new(boot.kernel.processes.clone(), boot.kernel.facts.clone());
         let mut input = BTreeMap::new();
-        input.insert("include_recent_facts".into(), Value::Bool(true));
-        input.insert("limit".into(), Value::Int(8));
+        input.insert("include_recent_facts".into(), Value::boolean(true));
+        input.insert("process".into(), Value::string(boot.root.get().to_string()));
+        input.insert("limit".into(), Value::integer(8));
         let out = d
             .call(
                 MethodId::new(0),
-                Value::Map(input),
+                Value::map(input),
                 OutputMode::Unary,
                 &DriverContext::new(IdentityRef::ROOT, boot.root),
             )
             .await
             .context("inspect recent facts")?;
-        if !matches!(out, Outcome::Done(Value::List(_))) {
+        if !matches!(out.outcome, Outcome::Done(ref value) if value.as_list().is_some()) {
             bail!("expected rows, got {out:?}");
         };
-        let id = OperationId::new(boot.root, NodeId::new(1), 0);
-        ensure!(id.process == boot.root, "operation id process mismatch");
         Ok(())
     }
 
@@ -194,11 +274,11 @@ mod tests {
         let boot = Bootstrap::in_memory();
         let d = KernelInspectDriver::new(boot.kernel.processes.clone(), boot.kernel.facts.clone());
         let mut input = BTreeMap::new();
-        input.insert("include_recent_facts".into(), Value::Str("yes".into()));
+        input.insert("include_recent_facts".into(), Value::string("yes".into()));
         let out = d
             .call(
                 MethodId::new(0),
-                Value::Map(input),
+                Value::map(input),
                 OutputMode::Unary,
                 &DriverContext::new(IdentityRef::ROOT, boot.root),
             )

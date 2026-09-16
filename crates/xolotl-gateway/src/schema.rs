@@ -1,7 +1,6 @@
-use crate::{CompiledGatewayProfile, CompiledSurfaceDescriptor, GatewayError, GatewayModality};
+use crate::{CompiledSurfaceDescriptor, GatewayError, GatewayModality};
 use std::collections::{BTreeMap, BTreeSet};
-use xolotl_graph::DoNode;
-use xolotl_types::{Failure, Outcome, OutputMode, Value};
+use xolotl_types::{ExecutionOutput, Failure, Outcome, OutputMode, Value, ValueView};
 
 const MAX_VALUE_SCHEMA_DEPTH: usize = 32;
 const MAX_VALUE_SCHEMA_NODES: usize = 1024;
@@ -60,7 +59,7 @@ fn compile_value_schema_inner(
         .as_map()
         .ok_or_else(|| GatewayError::InvalidProfile(format!("{label} must be a schema object")))?;
     for key in map.keys() {
-        if !matches!(key.as_str(), "type" | "required" | "properties" | "items") {
+        if !matches!(key, "type" | "required" | "properties" | "items") {
             return Err(GatewayError::InvalidProfile(format!(
                 "{label} contains unsupported schema key {key}"
             )));
@@ -88,8 +87,10 @@ fn compile_value_schema_inner(
     };
 
     let mut required = BTreeSet::new();
-    match map.get("required") {
-        Some(Value::List(items)) if matches!(kind, ValueSchemaKind::Map | ValueSchemaKind::Any) => {
+    match map.get("required").map(Value::view) {
+        Some(ValueView::List(items))
+            if matches!(kind, ValueSchemaKind::Map | ValueSchemaKind::Any) =>
+        {
             for item in items {
                 let Some(field) = item.as_str() else {
                     return Err(GatewayError::InvalidProfile(format!(
@@ -113,8 +114,8 @@ fn compile_value_schema_inner(
     }
 
     let mut properties = BTreeMap::new();
-    match map.get("properties") {
-        Some(Value::Map(entries))
+    match map.get("properties").map(Value::view) {
+        Some(ValueView::Map(entries))
             if matches!(kind, ValueSchemaKind::Map | ValueSchemaKind::Any) =>
         {
             for (field, child) in entries {
@@ -124,7 +125,7 @@ fn compile_value_schema_inner(
                     )));
                 }
                 properties.insert(
-                    field.clone(),
+                    field.to_owned(),
                     compile_value_schema_inner(
                         child,
                         &format!("{label}.properties.{field}"),
@@ -187,6 +188,21 @@ fn validate_surface_output(
     Ok(())
 }
 
+pub(super) fn validate_surface_output_stream_item(
+    surface: &CompiledSurfaceDescriptor,
+    value: &Value,
+) -> Result<(), GatewayError> {
+    if let Some(schema) = &surface.output_stream_schema_validator {
+        validate_value_schema(
+            schema,
+            value,
+            "output stream item",
+            "surface output_stream_schema",
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn validate_surface_stream_item(
     surface: &CompiledSurfaceDescriptor,
     modality: GatewayModality,
@@ -217,27 +233,27 @@ fn validate_value_schema(
 ) -> Result<(), GatewayError> {
     let matches_kind = match schema.kind {
         ValueSchemaKind::Any => true,
-        ValueSchemaKind::Null => matches!(value, Value::Null),
-        ValueSchemaKind::Bool => matches!(value, Value::Bool(_)),
-        ValueSchemaKind::Int => matches!(value, Value::Int(_)),
-        ValueSchemaKind::Number => matches!(value, Value::Int(_) | Value::Float(_)),
-        ValueSchemaKind::Str => matches!(value, Value::Str(_)),
-        ValueSchemaKind::List => matches!(value, Value::List(_)),
-        ValueSchemaKind::Map => matches!(value, Value::Map(_)),
-        ValueSchemaKind::Bytes => matches!(value, Value::Bytes(_)),
-        ValueSchemaKind::Blob => matches!(value, Value::Blob(_)),
-        ValueSchemaKind::Tensor => matches!(value, Value::Tensor(_)),
-        ValueSchemaKind::Frame => matches!(value, Value::Frame(_)),
-        ValueSchemaKind::StreamEnd => matches!(value, Value::StreamEnd(_)),
+        ValueSchemaKind::Null => matches!(value.view(), ValueView::Null),
+        ValueSchemaKind::Bool => matches!(value.view(), ValueView::Bool(_)),
+        ValueSchemaKind::Int => matches!(value.view(), ValueView::Int(_)),
+        ValueSchemaKind::Number => matches!(value.view(), ValueView::Int(_) | ValueView::Float(_)),
+        ValueSchemaKind::Str => matches!(value.view(), ValueView::Str(_)),
+        ValueSchemaKind::List => matches!(value.view(), ValueView::List(_)),
+        ValueSchemaKind::Map => matches!(value.view(), ValueView::Map(_)),
+        ValueSchemaKind::Bytes => matches!(value.view(), ValueView::Bytes(_)),
+        ValueSchemaKind::Blob => matches!(value.view(), ValueView::Blob(_)),
+        ValueSchemaKind::Tensor => matches!(value.view(), ValueView::Tensor(_)),
+        ValueSchemaKind::Frame => matches!(value.view(), ValueView::Frame(_)),
+        ValueSchemaKind::StreamEnd => matches!(value.view(), ValueView::StreamEnd(_)),
     };
     if !matches_kind {
         return Err(GatewayError::Rejected(format!(
             "{path} does not match {schema_label}"
         )));
     }
-    if let Value::Map(map) = value {
+    if let Some(map) = value.as_map() {
         for required in &schema.required {
-            if !map.contains_key(required) {
+            if map.get(required).is_none() {
                 return Err(GatewayError::Rejected(format!(
                     "{path} is missing required field {required}"
                 )));
@@ -254,7 +270,7 @@ fn validate_value_schema(
             }
         }
     }
-    if let (Value::List(items), Some(item_schema)) = (value, &schema.items) {
+    if let (ValueView::List(items), Some(item_schema)) = (value.view(), &schema.items) {
         for (index, item) in items.iter().enumerate() {
             validate_value_schema(item_schema, item, &format!("{path}[{index}]"), schema_label)?;
         }
@@ -263,39 +279,18 @@ fn validate_value_schema(
 }
 
 pub(super) fn enforce_surface_output_schema(
-    profile: &CompiledGatewayProfile,
-    principal_id: &str,
-    program: &DoNode,
-    outcome: Outcome,
-) -> Outcome {
-    let Some(surface) = output_schema_surface_for_program(profile, principal_id, program) else {
-        return outcome;
-    };
-    match outcome {
-        Outcome::Done(value) => match validate_surface_output(surface, &value) {
-            Ok(()) => Outcome::Done(value),
-            Err(error) => Outcome::Fail(output_schema_failure(&surface.surface_id, error)),
-        },
-        Outcome::Short(value) => match validate_surface_output(surface, &value) {
-            Ok(()) => Outcome::Short(value),
-            Err(error) => Outcome::Fail(output_schema_failure(&surface.surface_id, error)),
-        },
-        Outcome::Fail(failure) => Outcome::Fail(failure),
+    surface: &CompiledSurfaceDescriptor,
+    requested_output: OutputMode,
+    output: &mut ExecutionOutput,
+) {
+    if requested_output == OutputMode::SinkOnly {
+        return;
     }
-}
-
-fn output_schema_surface_for_program<'a>(
-    profile: &'a CompiledGatewayProfile,
-    principal_id: &str,
-    program: &DoNode,
-) -> Option<&'a CompiledSurfaceDescriptor> {
-    let DoNode::Op(tmpl) = program else {
-        return None;
-    };
-    if tmpl.output == OutputMode::SinkOnly {
-        return None;
+    if let Some(value) = output.outcome.value()
+        && let Err(error) = validate_surface_output(surface, value)
+    {
+        output.outcome = Outcome::Fail(output_schema_failure(&surface.surface_id, error));
     }
-    profile.operation_surface_for_principal(principal_id, &tmpl.target, &tmpl.method)
 }
 
 fn output_schema_failure(surface_id: &str, error: GatewayError) -> Failure {
@@ -304,3 +299,6 @@ fn output_schema_failure(surface_id: &str, error: GatewayError) -> Failure {
         message: format!("surface {surface_id} output did not match declared schema: {error}"),
     }
 }
+
+#[cfg(test)]
+mod tests;

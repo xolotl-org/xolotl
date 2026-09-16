@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 
 //! Console Protocol DTO exports, action ids, stream ids, and compact action codes.
+//!
+//! An identifier reserves a protocol name; it does not guarantee that a host
+//! implements or authorizes that operation. Query the host's registry descriptors
+//! for implementation status, schemas, and admission requirements.
 
 pub use xolotl_proto::xolotl::v1::console as pb;
 
@@ -11,109 +15,206 @@ pub use pb::{
     StateAppend, StateDelete, StateSet, StreamCall, StreamDescriptor, SubscriptionClosed, Summary,
 };
 
+/// Protocol revision sent during the Console handshake.
 pub const CONSOLE_PROTOCOL_VERSION: u32 = 1;
+/// Server identifier advertised by the Console endpoint.
 pub const SERVER_NAME: &str = "xolotl-console";
+/// Payload encoding negotiated independently of the WebSocket transport.
 pub const WIRE_ENCODING: &str = "protobuf+xolotl-console-v1";
+/// WebSocket subprotocol identifying the Console v1 transport.
 pub const SUBPROTOCOL: &str = "xolotl-console-v1";
 
+/// Encodings this protocol implementation accepts during negotiation.
 pub fn accepted_encodings() -> &'static [&'static str] {
     &[WIRE_ENCODING]
 }
 
+/// Retrieve protocol metadata and negotiation capabilities.
 pub const ACTION_PROTOCOL_DESCRIBE: &str = "protocol.describe";
+/// Retrieve the registered action and stream descriptors.
 pub const ACTION_PROTOCOL_REGISTRY_SNAPSHOT: &str = "protocol.registry.snapshot";
+/// Retrieve the descriptor for one action identifier.
 pub const ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET: &str = "protocol.action_descriptor.get";
+/// Report implementation coverage grouped by registry domain.
 pub const ACTION_REGISTRY_COVERAGE_REPORT: &str = "registry.coverage.report";
+/// Enumerate resource types exposed by the management registry.
 pub const ACTION_RESOURCE_TYPE_LIST: &str = "resource.type.list";
+/// Describe one managed resource type and its schema.
 pub const ACTION_RESOURCE_TYPE_DESCRIBE: &str = "resource.type.describe";
+/// Describe the registered presentation of a managed resource.
 pub const ACTION_RESOURCE_VIEW_DESCRIBE: &str = "resource.view.describe";
+/// Create a staged management change set.
 pub const ACTION_CHANGE_SET_CREATE: &str = "change_set.create";
+/// Update the contents of a staged change set.
 pub const ACTION_CHANGE_SET_UPDATE: &str = "change_set.update";
+/// Validate a change set before application.
 pub const ACTION_CHANGE_SET_VALIDATE: &str = "change_set.validate";
+/// Compare a change set with its target configuration.
 pub const ACTION_CHANGE_SET_DIFF: &str = "change_set.diff";
+/// Evaluate a change set without committing its changes.
 pub const ACTION_CHANGE_SET_DRY_RUN: &str = "change_set.dry_run";
+/// Apply an admitted change set.
 pub const ACTION_CHANGE_SET_APPLY: &str = "change_set.apply";
+/// Discard a staged change set.
 pub const ACTION_CHANGE_SET_DISCARD: &str = "change_set.discard";
+/// Inspect the effective authority of a principal.
 pub const ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE: &str = "authority.principal.effective";
+/// Inspect which registered actions a principal may perform.
 pub const ACTION_AUTHORITY_ACTION_MATRIX: &str = "authority.action.matrix";
+/// Inspect a principal's authority for a resource.
 pub const ACTION_AUTHORITY_RESOURCE_ACCESS: &str = "authority.resource.access";
+/// Explain an authority denial using the host's current rules.
 pub const ACTION_AUTHORITY_WHY_DENIED: &str = "authority.why_denied";
+/// Describe the caller's visibility boundary.
 pub const ACTION_VISIBILITY_AUTHORITY_DESCRIBE: &str = "visibility.authority.describe";
+/// Read state through the caller's visibility rules.
 pub const ACTION_VISIBILITY_STATE_READ: &str = "visibility.state.read";
+/// List state entries through the caller's visibility rules.
 pub const ACTION_VISIBILITY_STATE_LIST: &str = "visibility.state.list";
+/// Enumerate secret metadata without revealing secret values.
 pub const ACTION_SECRET_CATALOG: &str = "secret.catalog";
+/// Request secret disclosure through the configured custody boundary.
 pub const ACTION_SECRET_REVEAL: &str = "secret.reveal";
+/// Read a snapshot of authorized state.
 pub const ACTION_STATE_SNAPSHOT: &str = "state.snapshot";
+/// Read one runtime configuration value.
 pub const ACTION_CONFIG_READ: &str = "config.read";
+/// List runtime configuration entries.
 pub const ACTION_CONFIG_LIST: &str = "config.list";
+/// Compare and replace a runtime configuration value.
 pub const ACTION_CONFIG_WRITE_CAS: &str = "config.write_cas";
+/// Read a managed Console user record.
 pub const ACTION_ACCESS_USER_READ: &str = "access.user.read";
+/// List managed Console users.
 pub const ACTION_ACCESS_USER_LIST: &str = "access.user.list";
+/// Compare and replace a managed user record.
 pub const ACTION_ACCESS_USER_WRITE_CAS: &str = "access.user.write_cas";
+/// Disable a managed Console user.
 pub const ACTION_ACCESS_USER_DISABLE: &str = "access.user.disable";
+/// Read a managed Console role definition.
 pub const ACTION_ACCESS_ROLE_READ: &str = "access.role.read";
+/// List managed Console roles.
 pub const ACTION_ACCESS_ROLE_LIST: &str = "access.role.list";
+/// Compare and replace a managed role definition.
 pub const ACTION_ACCESS_ROLE_WRITE_CAS: &str = "access.role.write_cas";
+/// Log out the session issuing the action.
 pub const ACTION_ACCESS_SESSION_CURRENT_LOGOUT: &str = "access.session.current.logout";
+/// List sessions visible to the caller.
 pub const ACTION_ACCESS_SESSION_LIST: &str = "access.session.list";
+/// Revoke a selected Console session.
 pub const ACTION_ACCESS_SESSION_REVOKE: &str = "access.session.revoke";
+/// Revoke a user's Console sessions.
 pub const ACTION_ACCESS_SESSION_REVOKE_USER: &str = "access.session.revoke_user";
+/// Inspect the runtime state of a process.
 pub const ACTION_RUNTIME_PROCESS_INSPECT: &str = "runtime.process.inspect";
+/// Query recently retained audit facts.
 pub const ACTION_AUDIT_FACTS_RECENT: &str = "audit.facts.recent";
+/// Read lineage information for a trace.
 pub const ACTION_LINEAGE_TRACE_READ: &str = "lineage.trace.read";
+/// Read lineage information for an individual fact.
 pub const ACTION_LINEAGE_FACT_READ: &str = "lineage.fact.read";
+/// Retrieve a runtime health summary.
 pub const ACTION_HEALTH_SUMMARY: &str = "health.summary";
+/// Install an external program declaration.
 pub const ACTION_EXTERNAL_INSTALLATION_INSTALL: &str = "external.installation.install";
+/// Update an external installation declaration.
 pub const ACTION_EXTERNAL_INSTALLATION_UPDATE: &str = "external.installation.update";
+/// Request startup of an external installation.
 pub const ACTION_EXTERNAL_INSTALLATION_START: &str = "external.installation.start";
+/// Request shutdown of an external installation.
 pub const ACTION_EXTERNAL_INSTALLATION_STOP: &str = "external.installation.stop";
+/// Revoke an external installation's runtime access.
 pub const ACTION_EXTERNAL_INSTALLATION_REVOKE: &str = "external.installation.revoke";
+/// List external installation records.
 pub const ACTION_EXTERNAL_INSTALLATION_LIST: &str = "external.installation.list";
+/// Read one external installation record.
 pub const ACTION_EXTERNAL_INSTALLATION_READ: &str = "external.installation.read";
+/// List registered external program manifests.
 pub const ACTION_EXTERNAL_MANIFEST_LIST: &str = "external.manifest.list";
+/// Read one external program manifest.
 pub const ACTION_EXTERNAL_MANIFEST_READ: &str = "external.manifest.read";
+/// Compare and replace an external program manifest.
 pub const ACTION_EXTERNAL_MANIFEST_WRITE_CAS: &str = "external.manifest.write_cas";
+/// List status records for in-process projections.
 pub const ACTION_PROJECTION_IN_PROCESS_STATUS_LIST: &str = "projection.in_process.status.list";
+/// Read the status of one in-process projection.
 pub const ACTION_PROJECTION_IN_PROCESS_STATUS_READ: &str = "projection.in_process.status.read";
+/// List inference backend declarations.
 pub const ACTION_INFERENCE_BACKEND_LIST: &str = "inference.backend.list";
+/// Read an inference backend declaration.
 pub const ACTION_INFERENCE_BACKEND_READ: &str = "inference.backend.read";
+/// Compare and replace an inference backend declaration.
 pub const ACTION_INFERENCE_BACKEND_WRITE_CAS: &str = "inference.backend.write_cas";
+/// List configured model declarations.
 pub const ACTION_INFERENCE_MODEL_LIST: &str = "inference.model.list";
+/// Read one configured model declaration.
 pub const ACTION_INFERENCE_MODEL_READ: &str = "inference.model.read";
+/// Compare and replace a model declaration.
 pub const ACTION_INFERENCE_MODEL_WRITE_CAS: &str = "inference.model.write_cas";
+/// List model group declarations.
 pub const ACTION_INFERENCE_GROUP_LIST: &str = "inference.group.list";
+/// Read one model group declaration.
 pub const ACTION_INFERENCE_GROUP_READ: &str = "inference.group.read";
+/// Compare and replace a model group declaration.
 pub const ACTION_INFERENCE_GROUP_WRITE_CAS: &str = "inference.group.write_cas";
+/// Read the configured inference routing rules.
 pub const ACTION_INFERENCE_ROUTING_READ: &str = "inference.routing.read";
+/// Compare and replace inference routing rules.
 pub const ACTION_INFERENCE_ROUTING_WRITE_CAS: &str = "inference.routing.write_cas";
+/// Create an external pairing request.
 pub const ACTION_PAIRING_CREATE: &str = "pairing.create";
+/// Approve an external pairing request.
 pub const ACTION_PAIRING_APPROVE: &str = "pairing.approve";
+/// Deny an external pairing request.
 pub const ACTION_PAIRING_DENY: &str = "pairing.deny";
+/// Replace an existing external pairing.
 pub const ACTION_PAIRING_REPLACE: &str = "pairing.replace";
 
+/// List the caller-authorized passkey credentials.
 pub const ACTION_ACCESS_CREDENTIAL_PASSKEY_LIST: &str = "access.credential.passkey.list";
+/// Start or complete passkey registration as defined by the action schema.
 pub const ACTION_ACCESS_CREDENTIAL_PASSKEY_REGISTER: &str = "access.credential.passkey.register";
+/// Change a passkey's display name.
 pub const ACTION_ACCESS_CREDENTIAL_PASSKEY_RENAME: &str = "access.credential.passkey.rename";
+/// Revoke a registered passkey credential.
 pub const ACTION_ACCESS_CREDENTIAL_PASSKEY_REVOKE: &str = "access.credential.passkey.revoke";
+/// Enroll a time-based one-time-password credential.
 pub const ACTION_ACCESS_CREDENTIAL_TOTP_ENROLL: &str = "access.credential.totp.enroll";
+/// Disable a time-based one-time-password credential.
 pub const ACTION_ACCESS_CREDENTIAL_TOTP_DISABLE: &str = "access.credential.totp.disable";
+/// Replace recovery codes through the credential management action.
 pub const ACTION_ACCESS_CREDENTIAL_RECOVERY_REGENERATE: &str =
     "access.credential.recovery.regenerate";
+/// Set a password credential under the action's authorization rules.
 pub const ACTION_ACCESS_CREDENTIAL_PASSWORD_SET: &str = "access.credential.password.set";
+/// Change a password credential under the action's verification rules.
 pub const ACTION_ACCESS_CREDENTIAL_PASSWORD_CHANGE: &str = "access.credential.password.change";
+/// Disable password-based authentication for the selected account.
 pub const ACTION_ACCESS_CREDENTIAL_PASSWORD_DISABLE: &str = "access.credential.password.disable";
 
+/// Subscribe to authorized state mutations.
 pub const STREAM_STATE_WATCH: &str = "state.watch";
+/// Subscribe to state differences for the requested scope.
 pub const STREAM_STATE_DIFF: &str = "state.diff";
+/// Subscribe to audit fact events.
 pub const STREAM_AUDIT_FACTS: &str = "audit.facts.stream";
+/// Subscribe to the audit tail selected by the stream schema.
 pub const STREAM_AUDIT_TAIL: &str = "audit.tail";
+/// Subscribe to fact lineage updates.
 pub const STREAM_LINEAGE_FACT: &str = "lineage.fact";
+/// Subscribe to process lifecycle observations.
 pub const STREAM_RUNTIME_PROCESS: &str = "runtime.process";
+/// Subscribe to Console session changes.
 pub const STREAM_ACCESS_SESSION: &str = "access.session";
+/// Subscribe to runtime configuration changes.
 pub const STREAM_CONFIG_DIFF: &str = "config.diff";
+/// Subscribe to runtime operation observations.
 pub const STREAM_RUNTIME_OPERATION: &str = "runtime.operation";
+/// Subscribe to runtime health observations.
 pub const STREAM_RUNTIME_HEALTH: &str = "runtime.health";
+/// Subscribe to pending approval requests.
 pub const STREAM_APPROVAL_PENDING: &str = "approval.pending";
+/// Subscribe to external installation lifecycle changes.
 pub const STREAM_EXTERNAL_LIFECYCLE: &str = "external.lifecycle";
 
 /// Returns the compact fast-path code for an action id, if registered.
@@ -292,24 +393,36 @@ pub fn action_id(code: u32) -> Option<&'static str> {
     })
 }
 
+/// Implementation coverage for a particular management registry revision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoverageReport {
+    /// Registry revision from which the coverage counts were derived.
     pub registry_rev: u64,
+    /// Separate action and stream counts for each registry domain.
     pub domains: Vec<CoverageDomain>,
 }
 
+/// Coverage of the descriptors grouped into one management domain.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoverageDomain {
+    /// Domain name used by the registry descriptors.
     pub domain: String,
+    /// Action descriptors grouped by implementation status.
     pub actions: CoverageCounts,
+    /// Stream descriptors grouped by implementation status.
     pub streams: CoverageCounts,
 }
 
+/// Descriptor counts by implementation status, independent of caller authority.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CoverageCounts {
+    /// Descriptors backed by a registered implementation.
     pub implemented: u32,
+    /// Declared operations awaiting an implementation.
     pub planned: u32,
+    /// Operations requiring a secret custody backend before implementation.
     pub blocked_by_custody: u32,
+    /// Operations owned outside the Console management interface.
     pub not_console_managed: u32,
 }
 

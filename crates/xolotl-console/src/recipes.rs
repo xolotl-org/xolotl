@@ -137,12 +137,12 @@ pub async fn execute(
         output: OutputMode::Unary,
         literal_input: Some(input),
     });
-    let outcome = executor.eval_tainted(&op, TaintSet::author()).await;
-    let result = match &outcome {
+    let output = executor.eval_tainted(&op, TaintSet::author()).await;
+    let result = match &output.outcome {
         Outcome::Done(value) | Outcome::Short(value) => Ok(value.clone()),
         Outcome::Fail(failure) => Err(ConsoleError::Operation(failure.to_string())),
     };
-    boot.finish_request_process(process, &outcome)
+    boot.finish_request_process(process, &output)
         .await
         .map_err(|e| ConsoleError::Operation(e.to_string()))?;
     result

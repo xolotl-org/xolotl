@@ -4,8 +4,9 @@
 > Xolotl is pre-v1. Runtime behavior, configuration paths, protobuf schemas,
 > and gateway protocols may change without compatibility guarantees.
 
-Xolotl is a Rust runtime for programs that need to call models, tools, state,
-and external connectors without handing every caller raw access.
+Xolotl is a composable Rust execution kernel for AI programs. Its default SDK
+is an allocation-free `no_std` machine; optional hosts connect models, tools,
+state, storage and external systems through capability-checked resources.
 
 A caller runs as a `Process`. It opens a `Resource` such as
 `effect://inference/infer` or `state://memory/alice/thread` and receives a
@@ -33,8 +34,12 @@ Chinese documentation: [README.zh-CN.md](README.zh-CN.md)
   WebSocket, with one gateway session model for both transports.
 - `xolotld` and `xolotl-sdk` use the same kernel. Hosts can replace state,
   facts, drivers, policy sources, and model backends.
-- Durable programs compile to `ExecutionGraph` with shared operation boundaries
-  for replay, recovery, audit, and simulation.
+- Rust and JSON portable programs share one compiler for lexical bindings,
+  recursion, loops, parallelism, races, recovery and structured cleanup.
+- The core uses caller-owned storage with explicit limits. Tokio, persistence,
+  providers and gateways are optional host components.
+- Optional durable checkpoints preserve program state and dynamic invocation
+  identities; uncertain non-idempotent effects require reconciliation.
 
 ## Documentation
 
@@ -55,7 +60,7 @@ For a local browser preview, run `mdbook serve docs` or
 Generate Rust API documentation:
 
 ```sh
-RUSTDOCFLAGS='-W missing-docs' cargo doc --workspace --no-deps
+RUSTDOCFLAGS='-D warnings -W missing-docs' cargo doc --workspace --all-features --no-deps --locked
 ```
 
 Rustdoc output is written to `target/doc/index.html`.
@@ -77,26 +82,35 @@ The runtime has four code paths:
 
 - Control path: registry, naming, admission, policy compilation, binding
   resolution, and `open()` handle compilation.
-- Data path: fixed-cost execution over `Process`, `Handle`, `Operation`, and
-  `Fact`.
+- Data path: compiled method admission, ancestor budget accounting, driver
+  dispatch and Fact recording. Ancestry checks depend on delegation depth.
 - External adapters: Providers, Sources, drivers, and protocol adapters.
-- Program execution: durable `Do<A>` programs and the execution graph.
+- Program execution: a host-driven core machine shared by portable programs
+  and the existing `Do<A>` / `ExecutionGraph` frontend.
+
+See [Core And Portable Programs](docs/src/core-and-portable.md) for the layer
+boundaries, feature matrix, composition API, limits and recovery contract.
 
 ## Workspace
 
 | Crate | Purpose |
 | --- | --- |
+| `xolotl-core` | Dependency-free default `no_std` machine, bounded storage, linking, capabilities and channels. |
 | `xolotl-types` | Core IDs, paths, values, capabilities, operations, audit types, and external Provider/Source data. |
-| `xolotl-graph` | Durable `Do<A>` program IR and execution graph compiler. |
-| `xolotl-state` | State backend traits and in-memory implementation. |
-| `xolotl-kernel` | Process, handle, registry, policy, executor, recovery, facts. |
-| `xolotl-storage-redb` | Persistent redb-backed state and FactStore. |
+| `xolotl-graph` | Portable Rust/JSON compiler plus `Do<A>` and execution graph frontend. |
+| `xolotl-state` | Independent State/object capabilities, optional host composition and memory adapters. |
+| `xolotl-value-codec` | Incremental value events, explicit key workspaces and optional CBOR encoding. |
+| `xolotl-value-object` | Structured object references, owned read/write/copy and validated EOF receipts. |
+| `xolotl-kernel` | Portable execution and invocation rules; optional hosted processes, registry, policy, recovery and facts. |
+| `xolotl-storage-redb` | Persistent redb-backed state, FactStore and optional checkpoint journals. |
+| `xolotl-storage-fs` | Incremental object storage with owned staging and atomic publication. |
 | `xolotl-standard` | Standard in-process Provider and Source implementations. |
-| `xolotl-gateway` | Shared session admission, flow-control, taint, and audit code for external protocol adapters. |
-| `xolotl-gateway-grpc` | External Provider/Source gRPC adapter using `xolotl-proto`. |
+| `xolotl-gateway` | Profile-bound application admission and object receipts; separate external Provider/Source sessions. |
+| `xolotl-gateway-grpc` | Application and external Provider/Source gRPC adapters using `xolotl-proto`. |
 | `xolotl-gateway-websocket` | External Provider/Source WebSocket adapter. |
 | `xolotl-gateway-mcp` | MCP server-side adapter for selected Gateway publications. |
 | `xolotl-proto` | Protobuf schema and hand-vendored prost/tonic bindings. |
+| `xolotl-console-protocol` | Console action schema and typed management records. |
 | `xolotl-console` | Gateway for Web Console management actions. |
 | `xolotl-daemon` | `xolotld`, the long-running host process. |
 | `xolotl-sdk` | Minimal embedded runtime facade and convenience exports. |
@@ -106,13 +120,17 @@ The runtime has four code paths:
 default `standard` feature enables the standard in-process implementations.
 Embedded hosts can install a smaller module set with
 `StandardConfig::with_modules` and can provide a model backend with
-`StandardConfig::with_inference_backend`. Gateway crates use only
-`external-session`, the shared session code for external Provider and Source
-endpoints.
+`StandardConfig::with_inference_backend`. Gateway adapters share profile and
+session contracts; listener installation belongs to the host. Structured object
+output is independently enabled and requires an explicit disclosure policy.
 
-`xolotl-sdk` starts with a minimal in-memory kernel. Embedded hosts provide
-state and facts through `XolotlBuilder`. Standard providers are opt-in through
-the SDK `standard` feature or direct `xolotl-standard` installation.
+`xolotl-sdk` has no default features and exports `xolotl_sdk::core` without
+requiring an allocator. `program` adds shared values and portable compilation
+with `no_std + alloc`. `runtime` adds cooperative execution, invocation admission,
+scope accounting and stream ports without Tokio, `Send` or boxed-future requirements.
+Enable `host` to use `Xolotl`, `XolotlBuilder` and
+an in-memory host. `plan`, `standard`, `durable` and
+`multi-thread` are opt-in. Hosts provide state and facts through `XolotlBuilder`.
 `ActorSpec` is available through `xolotl-graph` and `xolotl-sdk`; the kernel can
 spawn it as a named long-lived Process through `Bootstrap::spawn_actor_under` or
 `Xolotl::spawn_actor`. If the body or finalizers reference process-local
@@ -121,12 +139,48 @@ spawn it as a named long-lived Process through `Bootstrap::spawn_actor_under` or
 Actor declarations may use `state://process/self/...`; spawn binds it to the
 concrete Process id before linting and execution.
 
+Object ports support large data through references and chunked I/O; incremental
+handling depends on the provider. Streams apply
+backpressure to a configurable resident window; total stream length is independent
+of that window. Install an object adapter with `StandardConfig::with_object_store`.
+State reads, writes, queries, history and subscriptions can be installed separately.
+The daemon installs a filesystem object adapter beside its State database, with
+an optional `storage.object_path` override.
+
+Task-specific behavior composes ordinary capabilities:
+
+| Workload | Composition |
+| --- | --- |
+| Agents and RAG | Model calls, explicit retrieval representations, delegated tools and streamed results. |
+| Batch processing | Reused program/buffer layouts, bounded active concurrency and incremental outputs. |
+| Audio and video | Separately admitted capture/render calls, timestamped Frame references and owned device leases. |
+| Multi-agent workflows | Child scopes, channels, lexical cleanup and recoverable program modules. |
+| Training and evaluation | External job submit/observe/cancel methods with committed artifact references. |
+| Simulation and edge | Injected clocks/completions, fixed control storage and optional portable value/runtime layers. |
+
+Executable RAG, media and external-job compositions live in
+[`task_scenarios`](crates/xolotl-sdk/tests/task_scenarios.rs). They use simulated
+models/devices/services with real retrieval, execution, authority, stream credits and file objects;
+they do not benchmark hardware or add a live duplex input argument to an invocation.
+The [durable batch workflow](crates/xolotl-sdk/tests/durable/workflow.rs) composes
+child authority, incremental State results and bounded recovery of interrupted
+coordinators using serialized checkpoints in retained test memory.
+[`benchmarks/runtime`](benchmarks/runtime/README.md) measures real runtime paths
+with separate timing and heap runs.
+
 ## Build And Test
+
+Requires Rust 1.98.1 or newer with edition 2024. `rust-toolchain.toml` pins
+the tested toolchain and includes rustfmt, Clippy and the Cortex-M check target.
+Dependency versions are managed in the root `Cargo.toml`; the standalone
+portable example also has its own lockfile.
 
 ```sh
 cargo fmt --all
 cargo check --workspace
 cargo test --workspace
+cargo test --workspace --all-features
+cargo run -p xolotl-sdk --features host --example portable
 ```
 
 Build the daemon:
@@ -162,6 +216,11 @@ Default addresses from `xolotl.toml.example`:
 Each transport can be built on its own with `--no-default-features --features
 external-grpc` or `--no-default-features --features external-websocket`.
 
+Application clients can use the independent optional `application-grpc` feature
+for authenticated discovery, incremental object uploads and typed submission.
+Provision its State profile before enabling the address; see
+[Application Gateway](docs/src/application-gateway.md).
+
 On first boot, if no console root account exists and no bootstrap credentials
 are configured, `xolotld` prints a one-time root password to stderr.
 
@@ -171,7 +230,8 @@ are configured, `xolotld` prints a one-time root password to stderr.
 addresses, root bootstrap credentials, external gateway limits, gateway
 transport-security settings, and Console resource limits.
 
-- `[server]`: Console, external gRPC, and external WebSocket bind addresses.
+- `[server]`: Console, application gRPC, external gRPC, and external WebSocket bind addresses.
+- `[application_gateway]`: State profile selector and application transport windows.
 - `[external_gateway.grpc]`: Provider/Source session limits for external gRPC.
 - `[external_gateway.grpc.transport_security]`: external gRPC transport
   boundary.

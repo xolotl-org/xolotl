@@ -11,17 +11,24 @@ description = "redb-backed persistent storage adapters for Xolotl state and the 
 [lints]
 workspace = true
 
+[features]
+default = []
+durable = ["xolotl-kernel/durable"]
+
 [dependencies]
 async-trait = { workspace = true, default-features = false }
-xolotl-kernel.workspace = true
-xolotl-state.workspace = true
+xolotl-kernel = { workspace = true, features = ["host"] }
+xolotl-state = { workspace = true, features = ["std", "tokio"] }
 xolotl-types.workspace = true
 parking_lot = { workspace = true, default-features = false }
 redb = { workspace = true, default-features = false }
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
 serde_json = { workspace = true, default-features = false, features = ["std"] }
 tokio = { workspace = true, default-features = false, features = ["sync"] }
 
 [dev-dependencies]
+xolotl-state = { workspace = true, features = ["test-support", "memory"] }
+xolotl-graph.workspace = true
 anyhow = { workspace = true, default-features = false, features = ["std"] }
 criterion = { workspace = true, default-features = false, features = ["cargo_bench_support"] }
 tempfile = { workspace = true, default-features = false, features = ["getrandom"] }
@@ -30,3 +37,8 @@ tokio = { workspace = true, default-features = false, features = ["rt", "sync", 
 [[bench]]
 name = "redb_storage"
 harness = false
+
+[[bench]]
+name = "checkpoint_catalog"
+harness = false
+required-features = ["durable"]

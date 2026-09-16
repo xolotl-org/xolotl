@@ -5,7 +5,7 @@ use crate::router::{GroupPolicy, ModelEntry, ModelGroup, Router};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One HTTP inference provider registered into an inference router.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct HttpInferenceRoute {
     /// HTTP inference provider backend configuration.
     pub(crate) config: HttpInferenceConfig,
@@ -62,7 +62,7 @@ impl HttpInferenceGroup {
 }
 
 /// HTTP inference provider router configuration.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct HttpInferenceRouterConfig {
     /// HTTP inference provider routes.
     pub(crate) routes: Vec<HttpInferenceRoute>,

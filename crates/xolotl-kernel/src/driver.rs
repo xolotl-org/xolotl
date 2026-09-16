@@ -2,23 +2,30 @@
 //! plus the restricted [`DriverContext`] facade and the compiled
 //! [`DriverPlan`] dispatch table.
 //!
-//! A Driver is the handler side of a restricted effect: it receives an input
-//! and returns an [`Outcome`]. Sub-operations a driver issues run with the
-//! *caller's* authority and re-pass policy independently, which prevents a
-//! low-privilege Process from escalating through a high-privilege Driver.
+//! A Driver handles one dispatched method and returns its value, provenance,
+//! and optional usage measurements together. Operation admission, policy,
+//! accounting, and Fact recording belong to the kernel execution path.
 
+use crate::host::stream::DynStreamSink;
+pub use crate::stream::StreamSendError;
 use async_trait::async_trait;
-use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
+use xolotl_types::TaintedValue;
 use xolotl_types::{
-    DriverId, EndpointId, Failure, IdentityRef, InterfaceSet, Invoke, InvokeResult, MethodId,
-    OperationId, Outcome, OutputMode, Path, ResourceId, TaintSet, TaintSource, Transport, Value,
+    DriverId, EndpointId, Failure, IdentityRef, InterfaceSet, Invoke, InvokeResult, MethodContract,
+    MethodId, OperationId, Outcome, OutputMode, Path, ResourceId, TaintSet, TaintSource, Transport,
+    Value,
 };
+pub use xolotl_types::{DriverOutput, DriverUsage, UsageDimension};
 
 /// Error a Driver may return. Distinct from [`xolotl_types::Failure`]: a
 /// `DriverError` is mapped to a `Failure`/`DecisionTag` by the data plane.
+/// Text diagnostics inherit input provenance and must not expose data read
+/// from additional sources. Return a [`DriverOutput`] with `Outcome::Fail`
+/// and explicit taint for those failures. Stream errors already retain the
+/// rejected value's provenance.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum DriverError {
     /// Requested method is not present in this driver plan.
@@ -33,16 +40,23 @@ pub enum DriverError {
     /// Transport or endpoint failure while reaching the driver.
     #[error("transport error: {0}")]
     Transport(String),
+    /// A stream rejected a chunk, retaining ownership for an explicit retry.
+    #[error("stream sink rejected an output chunk")]
+    Stream(StreamSendError<TaintedValue>),
     /// Driver-specific failure that does not fit a narrower category.
     #[error("driver error: {0}")]
     Other(String),
 }
 
-/// Restricted facade handed to a [`Driver::call`]. It does **not** grant
-/// the driver any ambient authority: to cause further effects, a driver issues
-/// sub-operations through `submit`, which run with the original caller's
-/// identity and re-pass policy. Reads/writes of driver-local scratch go through
-/// the provided helpers, never raw state access.
+impl From<StreamSendError<TaintedValue>> for DriverError {
+    fn from(error: StreamSendError<TaintedValue>) -> Self {
+        Self::Stream(error)
+    }
+}
+
+/// Context for one [`Driver::call`]: originating caller metadata, input
+/// provenance, the resolved target, and an optional output stream sink.
+/// Further operations require admission through the kernel execution path.
 pub struct DriverContext {
     /// The identity the originating operation runs as (for sub-operations and
     /// audit). The driver cannot widen it.
@@ -63,11 +77,7 @@ pub struct DriverContext {
     /// invoked against (the registered Resource name is just the pattern).
     pub target_path: Option<xolotl_types::Path>,
     /// Sink for streaming chunks; the driver pushes incremental values here.
-    stream_tx: Option<tokio::sync::mpsc::Sender<Value>>,
-    /// Provenance of the value produced by this driver call. State-like drivers
-    /// set this from the same backend read that produced the returned Value, so
-    /// the data plane never performs a second provenance read that could race.
-    output_taint: Arc<Mutex<xolotl_types::TaintSet>>,
+    stream_sink: Option<DynStreamSink>,
 }
 
 impl DriverContext {
@@ -80,8 +90,7 @@ impl DriverContext {
             stream_to: None,
             taint: xolotl_types::TaintSet::pristine(),
             target_path: None,
-            stream_tx: None,
-            output_taint: Arc::new(Mutex::new(xolotl_types::TaintSet::pristine())),
+            stream_sink: None,
         }
     }
 
@@ -104,37 +113,59 @@ impl DriverContext {
         self
     }
 
-    /// Attach a streaming sink for `OutputMode::Stream` results.
-    pub fn with_stream(
-        mut self,
-        to: xolotl_types::Path,
-        tx: tokio::sync::mpsc::Sender<Value>,
-    ) -> Self {
-        self.stream_to = Some(to);
-        self.stream_tx = Some(tx);
+    /// Attach an output edge without a transport routing path.
+    pub fn with_stream_sink(mut self, sink: DynStreamSink) -> Self {
+        self.stream_sink = Some(sink);
         self
     }
 
-    /// Emit a streaming chunk (no-op if this op is not streaming). Returns
-    /// `false` if the sink is closed or backpressured.
-    #[must_use]
-    pub fn emit(&self, chunk: Value) -> bool {
-        match &self.stream_tx {
-            Some(tx) => tx.try_send(chunk).is_ok(),
-            None => true,
-        }
+    /// Whether this call has an explicit output edge.
+    pub fn has_stream_sink(&self) -> bool {
+        self.stream_sink.is_some()
     }
 
-    /// Record the provenance of the returned value. Ordinary drivers leave this
-    /// pristine; state projections set it from the same read envelope as the
-    /// output value.
-    pub fn set_output_taint(&self, taint: xolotl_types::TaintSet) {
-        *self.output_taint.lock() = taint;
+    /// Attach a streaming sink and a logical transport routing path.
+    pub fn with_stream(mut self, to: xolotl_types::Path, sink: DynStreamSink) -> Self {
+        self.stream_to = Some(to);
+        self.stream_sink = Some(sink);
+        self
     }
 
-    /// Return the output taint recorded by the driver.
-    pub fn output_taint(&self) -> xolotl_types::TaintSet {
-        self.output_taint.lock().clone()
+    /// Wait for capacity and emit a chunk. A closed or missing sink returns
+    /// the original value; cancellation drops the pending send with its call.
+    pub async fn emit(&self, chunk: Value) -> Result<(), StreamSendError<TaintedValue>> {
+        self.emit_tainted(TaintedValue::pristine(chunk)).await
+    }
+
+    /// Emit a value with its source provenance, retaining the originating
+    /// operation's input provenance as well.
+    pub async fn emit_tainted(
+        &self,
+        mut chunk: TaintedValue,
+    ) -> Result<(), StreamSendError<TaintedValue>> {
+        chunk.taint.union(&self.taint);
+        let Some(sink) = &self.stream_sink else {
+            return Err(StreamSendError::Closed(chunk));
+        };
+        crate::stream::send(sink.as_ref(), chunk).await
+    }
+
+    /// Attempt one send without waiting, retaining rejected values for retry.
+    pub fn try_emit(&self, chunk: Value) -> Result<(), StreamSendError<TaintedValue>> {
+        self.try_emit_tainted(TaintedValue::pristine(chunk))
+    }
+
+    /// Attempt one tainted send without waiting, retaining the full envelope
+    /// when the sink is full or closed.
+    pub fn try_emit_tainted(
+        &self,
+        mut chunk: TaintedValue,
+    ) -> Result<(), StreamSendError<TaintedValue>> {
+        chunk.taint.union(&self.taint);
+        let Some(sink) = &self.stream_sink else {
+            return Err(StreamSendError::Closed(chunk));
+        };
+        crate::stream::try_send(sink.as_ref(), chunk)
     }
 }
 
@@ -143,7 +174,14 @@ impl DriverContext {
 /// [`DriverPlan`] holds the dispatch detail).
 #[async_trait]
 pub trait Driver: Send + Sync + 'static {
-    /// Invoke `method` with `input`, producing an [`Outcome`]. The driver does
+    /// Select a pure input guard when a method is compiled into a dispatch plan.
+    /// The frozen guard runs outside registry locks and before policy or records.
+    /// Drivers without a guard add no per-invocation allocation or virtual call.
+    fn input_admission(&self, _method: MethodId) -> Option<InputAdmission> {
+        None
+    }
+
+    /// Invoke `method` with `input`, producing a [`DriverOutput`]. The driver does
     /// not receive a continuation: it returns once.
     async fn call(
         &self,
@@ -151,11 +189,23 @@ pub trait Driver: Send + Sync + 'static {
         input: Value,
         output: OutputMode,
         ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError>;
+    ) -> Result<DriverOutput, DriverError>;
 }
 
 /// Shared driver handle.
 pub type DynDriver = Arc<dyn Driver>;
+
+/// An input rejected before dispatch, with an explicitly safe audit projection.
+#[derive(Debug)]
+pub struct InputRejection {
+    /// Failure delivered to the caller.
+    pub failure: Failure,
+    /// Input projection retained in the denied operation's Fact.
+    pub recorded_input: Value,
+}
+
+/// Pure, method-specific input admission. Only rejection allocates its envelope.
+pub type InputAdmission = fn(&Value) -> Result<(), Box<InputRejection>>;
 
 /// Transport edge for a remote endpoint. Concrete gRPC,
 /// WebSocket, stdio, or test transports implement this; `DriverPlan` compiles
@@ -226,7 +276,7 @@ impl Driver for RemoteDriver {
         input: Value,
         output: OutputMode,
         ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
+    ) -> Result<DriverOutput, DriverError> {
         let Some(op_id) = ctx.operation_id else {
             return Err(DriverError::Transport(format!(
                 "endpoint {} invoke missing OperationId",
@@ -253,7 +303,7 @@ impl Driver for RemoteDriver {
         let result = self.endpoint.invoke(dispatch, invoke).await?;
         match result.outcome {
             Ok(v) => {
-                ctx.set_output_taint(TaintSet::of(TaintSource::Inbound {
+                let taint = TaintSet::of(TaintSource::Inbound {
                     source: format!(
                         "provider/endpoint/{}/resource/{}/method/{}/binding/{}",
                         self.endpoint_id.get(),
@@ -263,13 +313,13 @@ impl Driver for RemoteDriver {
                     )
                     .into(),
                     channel: self.effect_path.to_string().into(),
-                }));
-                Ok(Outcome::Done(v))
+                });
+                Ok(DriverOutput::new(Outcome::Done(v)).with_taint(taint))
             }
-            Err(e) => Ok(Outcome::Fail(Failure::HandlerError {
+            Err(e) => Ok(DriverOutput::new(Outcome::Fail(Failure::HandlerError {
                 kind: e.kind,
                 message: e.message,
-            })),
+            }))),
         }
     }
 }
@@ -292,10 +342,12 @@ pub struct DriverDescriptor {
 /// Per-method dispatch entry within a [`DriverPlan`].
 #[derive(Clone)]
 pub struct DispatchEntry {
-    /// Method id this dispatch entry serves.
-    pub method: MethodId,
+    /// Immutable authorization, replay and accounting rules selected at open.
+    pub contract: MethodContract,
     /// Driver implementation used for the method.
     pub driver: DynDriver,
+    /// Optional input admission selected once when this method was opened.
+    pub input_admission: Option<InputAdmission>,
 }
 
 /// A compiled dispatch table for one opened Resource. Produced at
@@ -313,7 +365,7 @@ pub struct DriverPlan {
     /// Handles, the open-plan cache, and the data plane all clone DriverPlan.
     /// Keep the frozen dispatch table shared so those clones stay O(1) Arc
     /// bumps per operation.
-    table: Arc<HashMap<MethodId, DynDriver>>,
+    table: Arc<HashMap<MethodId, DispatchEntry>>,
     /// Binding generation captured when the handle was opened.
     pub generation: u64,
 }
@@ -334,8 +386,25 @@ impl DriverPlan {
     }
 
     /// Add or replace a per-method driver entry.
-    pub fn insert(&mut self, method: MethodId, driver: DynDriver) {
-        Arc::make_mut(&mut self.table).insert(method, driver);
+    pub fn insert(&mut self, method: MethodId, contract: MethodContract, driver: DynDriver) {
+        let input_admission = driver.input_admission(method);
+        Arc::make_mut(&mut self.table).insert(
+            method,
+            DispatchEntry {
+                contract,
+                driver,
+                input_admission,
+            },
+        );
+    }
+
+    pub(crate) fn entry(&self, method: MethodId) -> Option<&DispatchEntry> {
+        self.table.get(&method)
+    }
+
+    /// Read the execution contract frozen into this plan for the selected method.
+    pub fn contract(&self, method: MethodId) -> Option<MethodContract> {
+        self.table.get(&method).map(|entry| entry.contract)
     }
 
     /// Dispatch `method`. The data plane has already checked rights and policy
@@ -346,12 +415,12 @@ impl DriverPlan {
         input: Value,
         output: OutputMode,
         ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
-        let driver = self
+    ) -> Result<DriverOutput, DriverError> {
+        let entry = self
             .table
             .get(&method)
             .ok_or(DriverError::NoSuchMethod(method))?;
-        driver.call(method, input, output, ctx).await
+        entry.driver.call(method, input, output, ctx).await
     }
 
     /// Whether this plan contains a dispatch entry for `method`.
@@ -376,8 +445,8 @@ impl Driver for EchoDriver {
         input: Value,
         _output: OutputMode,
         _ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
-        Ok(Outcome::Done(input))
+    ) -> Result<DriverOutput, DriverError> {
+        Ok(DriverOutput::new(Outcome::Done(input)))
     }
 }
 
@@ -396,29 +465,39 @@ where
         input: Value,
         _output: OutputMode,
         _ctx: &DriverContext,
-    ) -> Result<Outcome, DriverError> {
-        (self.0)(method, input).map(Outcome::Done)
+    ) -> Result<DriverOutput, DriverError> {
+        (self.0)(method, input).map(|value| DriverOutput::new(Outcome::Done(value)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::stream::{StreamItem, channel};
+    use crate::stream::StreamWindow;
     use anyhow::{Context, bail, ensure};
     use parking_lot::Mutex;
-    use xolotl_types::{ErrorInfo, IdentityRef, NodeId, ProcessId};
+    use xolotl_types::{ErrorInfo, ExecutionId, IdentityRef, InvocationId, NodeId, ProcessId};
 
     #[tokio::test]
     async fn driver_plan_dispatches_to_method() -> anyhow::Result<()> {
         let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
-        plan.insert(MethodId::new(0), Arc::new(EchoDriver));
+        plan.insert(
+            MethodId::new(0),
+            MethodContract::new(
+                0,
+                xolotl_types::ReplayClass::Deterministic,
+                xolotl_types::OutputModeSet::UNARY,
+            ),
+            Arc::new(EchoDriver),
+        );
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
         let out = plan
-            .call(MethodId::new(0), Value::Int(7), OutputMode::Unary, &ctx)
+            .call(MethodId::new(0), Value::integer(7), OutputMode::Unary, &ctx)
             .await
             .context("driver call failed")?;
         ensure!(
-            out == Outcome::Done(Value::Int(7)),
+            out.outcome == Outcome::Done(Value::integer(7)),
             "unexpected driver output: {out:?}"
         );
         Ok(())
@@ -429,7 +508,7 @@ mod tests {
         let plan = DriverPlan::new(DriverId::new(1), None, 0);
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
         let err = match plan
-            .call(MethodId::new(9), Value::Null, OutputMode::Unary, &ctx)
+            .call(MethodId::new(9), Value::null(), OutputMode::Unary, &ctx)
             .await
         {
             Ok(out) => bail!("expected missing method error, got {out:?}"),
@@ -467,7 +546,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let endpoint = Arc::new(RecordingEndpoint {
             seen: seen.clone(),
-            result: Ok(Value::Str("remote-ok".into())),
+            result: Ok(Value::string("remote-ok".into())),
         });
         let driver = RemoteDriver::new(
             EndpointId::new(7),
@@ -477,21 +556,32 @@ mod tests {
                 .context("effect path did not parse")?,
             endpoint,
         );
-        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let (tx, _rx) = channel(StreamWindow::default());
         let stream = Path::parse("state://stream/1/9").context("stream path did not parse")?;
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
-            .with_operation_id(OperationId::new(ProcessId::new(1), NodeId::new(9), 0))
+            .with_operation_id(OperationId::new(
+                ProcessId::new(1),
+                ExecutionId::FIRST,
+                InvocationId::new(10),
+                NodeId::new(9),
+                0,
+            ))
             .with_stream(stream.clone(), tx);
         let out = driver
-            .call(MethodId::new(0), Value::Int(1), OutputMode::Stream, &ctx)
+            .call(
+                MethodId::new(0),
+                Value::integer(1),
+                OutputMode::Stream,
+                &ctx,
+            )
             .await
             .context("remote driver call failed")?;
         ensure!(
-            out == Outcome::Done(Value::Str("remote-ok".into())),
+            out.outcome == Outcome::Done(Value::string("remote-ok".into())),
             "unexpected remote driver output: {out:?}"
         );
         ensure!(
-            ctx.output_taint().sources().iter().any(|taint_source| {
+            out.taint.sources().iter().any(|taint_source| {
                 matches!(
                     taint_source,
                     TaintSource::Inbound {
@@ -528,7 +618,10 @@ mod tests {
             dispatch.acting == IdentityRef::ROOT,
             "acting identity mismatch"
         );
-        ensure!(invoke.invocation_id == "1/9/0", "invocation id mismatch");
+        ensure!(
+            invoke.invocation_id == "1/1/10/9/0",
+            "invocation id mismatch"
+        );
         ensure!(
             invoke.effect_path.to_string() == "effect://external-provider/acme/search",
             "effect path mismatch"
@@ -545,21 +638,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_reports_backpressured_stream_sink() -> anyhow::Result<()> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    async fn emit_waits_for_capacity_and_try_emit_retains_rejected_value() -> anyhow::Result<()> {
+        let (tx, mut rx) = channel(StreamWindow {
+            max_chunks: core::num::NonZeroUsize::MIN,
+            ..StreamWindow::default()
+        });
         let stream = Path::parse("state://stream/1/10").context("stream path did not parse")?;
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1)).with_stream(stream, tx);
+        ctx.emit(Value::integer(1))
+            .await
+            .map_err(DriverError::from)?;
         ensure!(
-            ctx.emit(Value::Int(1)),
-            "first emit should fit in the sink buffer"
+            ctx.try_emit(Value::integer(2))
+                == Err(StreamSendError::Full(TaintedValue::pristine(
+                    Value::integer(2)
+                )))
+        );
+        let pending = ctx.emit(Value::integer(2));
+        tokio::pin!(pending);
+        let first_poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(pending.as_mut(), cx))
+        })
+        .await;
+        ensure!(first_poll.is_pending());
+        let Some(StreamItem::Chunk(first)) = rx.recv().await else {
+            bail!("first emitted chunk was not preserved");
+        };
+        ensure!(first.into_value() == TaintedValue::pristine(Value::integer(1)));
+        pending.await.map_err(DriverError::from)?;
+        let Some(StreamItem::Chunk(second)) = rx.recv().await else {
+            bail!("second emitted chunk was not preserved");
+        };
+        ensure!(second.into_value() == TaintedValue::pristine(Value::integer(2)));
+        drop(rx);
+        ensure!(
+            ctx.emit(Value::integer(3)).await
+                == Err(StreamSendError::Closed(TaintedValue::pristine(
+                    Value::integer(3)
+                )))
         );
         ensure!(
-            !ctx.emit(Value::Int(2)),
-            "second emit should report backpressure"
+            ctx.try_emit(Value::integer(4))
+                == Err(StreamSendError::Closed(TaintedValue::pristine(
+                    Value::integer(4)
+                )))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn emit_without_a_stream_returns_the_value() -> anyhow::Result<()> {
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+        ensure!(
+            ctx.emit(Value::integer(1)).await
+                == Err(StreamSendError::Closed(TaintedValue::pristine(
+                    Value::integer(1)
+                )))
         );
         ensure!(
-            rx.recv().await == Some(Value::Int(1)),
-            "first emitted chunk was not preserved"
+            ctx.try_emit(Value::integer(2))
+                == Err(StreamSendError::Closed(TaintedValue::pristine(
+                    Value::integer(2)
+                )))
         );
         Ok(())
     }
