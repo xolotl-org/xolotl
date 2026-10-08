@@ -1,0 +1,564 @@
+syntax = "proto3";
+package xolotl.v1.federation;
+
+// Either peer can dial. Each side sends Hello, then Authenticate after seeing
+// both Hello frames. No application frame is accepted until both proofs pass.
+// TLS 1.3 and its negotiated hybrid group are checked outside these frames;
+// the session proof binds the actual TLS exporter to both Hello values.
+service FederationService {
+  rpc Session(stream SyncFrame) returns (stream SyncFrame);
+}
+
+message SyncFrame {
+  oneof body {
+    Hello hello = 1;
+    Open open = 2;
+    Opened opened = 3;
+    Read read = 4;
+    Batch batch = 5;
+    Acknowledge acknowledge = 6;
+    Acknowledged acknowledged = 7;
+    SyncFailure failure = 8;
+    Authenticate authenticate = 9;
+    Inspect inspect = 10;
+    Inspected inspected = 11;
+    Close close = 12;
+    Closed closed = 13;
+    RegisterSubject register_subject = 14;
+    SubjectRegistered subject_registered = 15;
+    PrepareCall prepare_call = 16;
+    CallPrepared call_prepared = 17;
+    InvokeCall invoke_call = 18;
+    CallInvoked call_invoked = 19;
+    InspectCall inspect_call = 20;
+    CallInspected call_inspected = 21;
+    CancelCall cancel_call = 22;
+    CallCancelled call_cancelled = 23;
+    InspectPublic inspect_public = 24;
+    PublicInspected public_inspected = 25;
+    ReadPublic read_public = 26;
+    PublicBatch public_batch = 27;
+    ReadObject read_object = 28;
+    ObjectChunk object_chunk = 29;
+    RedeemInvitation redeem_invitation = 30;
+    InvitationRedeemed invitation_redeemed = 31;
+    InspectSnapshot inspect_snapshot = 32;
+    SnapshotOffered snapshot_offered = 33;
+    ReadSnapshot read_snapshot = 34;
+    SnapshotChunk snapshot_chunk = 35;
+    ReceiveSnapshot receive_snapshot = 36;
+    SnapshotReceived snapshot_received = 37;
+  }
+}
+
+// These fields are claims until root, online authorization and current-session
+// proof verification succeeds. Each frame is bounded by the local transport
+// limit (maximum 8 MiB); Hello itself is additionally limited to 16 KiB.
+message Hello {
+  uint32 protocol_version = 1;
+  bytes node_id = 2;                  // exactly 48 bytes, SHA-384 root fingerprint
+  uint64 max_frame_bytes = 3;
+  uint32 max_in_flight = 4;
+  uint32 max_batch_records = 5;
+  uint64 max_batch_bytes = 6;
+  bytes root_descriptor = 7;          // exactly 1984 bytes, canonical ML-DSA-65 v1
+  bytes online_authorization = 8;     // exactly 2014 bytes, canonical v1
+  bytes root_signature = 9;           // exactly 3309 bytes, signs authorization
+  bytes nonce = 10;                   // exactly 32 random bytes, nonzero
+  repeated uint32 required_features = 11; // unknown required features fail closed
+  uint32 served_capabilities = 12;    // v1 finite bitmap: publication=1, invoke=2, object=4, snapshot=8
+}
+
+// Signed by the root-authorized online ML-DSA-65 key. The signed transcript
+// includes both ordered Hello node IDs/nonces, capability digest, TLS exporter
+// and the online authorization digest. The exporter stays out of the wire.
+message Authenticate {
+  bytes online_signature = 1;         // exactly 3309 bytes
+}
+
+enum SubjectPurpose {
+  SUBJECT_PURPOSE_UNSPECIFIED = 0;
+  SUBJECT_PURPOSE_DISCOVER = 1;
+  SUBJECT_PURPOSE_SYNC = 2;
+  SUBJECT_PURPOSE_INVOKE = 3;
+  SUBJECT_PURPOSE_OBJECT_READ = 4;
+}
+
+// Registers one issuer-approved hosted subject on the authenticated session.
+// The assertion names the audience, presenting node, purpose, expiry and
+// holder key. The holder signs the current TLS-bound session separately.
+message RegisterSubject {
+  uint64 request = 1;
+  uint32 context_id = 2;               // nonzero; zero is node-self
+  SubjectPurpose purpose = 3;
+  bytes issuer_descriptor = 4;        // canonical ML-DSA-65 issuer descriptor
+  bytes assertion = 5;                // canonical signed assertion
+  bytes issuer_signature = 6;         // exactly 3309 bytes
+  bytes holder_presentation = 7;      // exactly 3309 bytes, current channel
+}
+
+message SubjectRegistered {
+  uint64 request = 1;
+  uint32 context_id = 2;
+}
+
+// A hosted holder redeems a host-issued invitation on the currently proven
+// TLS Session. The 16-byte request_id is stable across connections; the
+// context is a registered Sync subject and signs this whole business frame.
+message RedeemInvitation {
+  uint64 request = 1;
+  bytes invitation_id = 2;             // exactly 16 bytes
+  bytes request_id = 3;                // exactly 16 bytes, stable retry identity
+  uint64 expected_revision = 4;      // invitation revision observed by holder
+  bytes secret = 5;                    // absent or exactly 32 bytes
+  uint32 context_id = 6;              // nonzero Hosted Sync context
+  bytes holder_request_signature = 7;
+}
+
+message InvitationRedeemed {
+  uint64 request = 1;
+  bytes invitation_id = 2;
+  bytes request_id = 3;
+  StreamRef stream = 4;
+  uint64 grant_revision = 5;
+  uint64 grant_expires_ms = 6;
+  uint64 history_floor = 7;
+  bool currently_authorized = 8;
+}
+
+message StreamRef {
+  bytes publisher = 1;                // exactly 48 bytes
+  bytes id = 2;                       // exactly 16 bytes
+}
+
+message SubscriptionRef {
+  bytes subscriber = 1;               // exactly 48 bytes
+  bytes id = 2;                       // exactly 16 bytes
+}
+
+message Position {
+  uint64 sequence = 1;                // positive
+  bytes digest = 2;                   // exactly 48 bytes, full record digest
+}
+
+enum HistoryMode {
+  HISTORY_MODE_UNSPECIFIED = 0;
+  HISTORY_MODE_ALL = 1;
+  HISTORY_MODE_AFTER = 2;
+  HISTORY_MODE_FROM_NOW = 3;
+}
+
+message Open {
+  uint64 request = 1;                 // session correlation only
+  bytes request_id = 2;               // stable 16-byte control identity
+  SubscriptionRef subscription = 3;
+  StreamRef stream = 4;
+  optional uint64 expected_control_revision = 5;
+  HistoryMode history_mode = 6;
+  Position history_after = 7;         // required only for HISTORY_MODE_AFTER
+  uint32 context_id = 8;              // 0 is authenticated node-self
+  bytes holder_request_signature = 9; // required for hosted context
+}
+
+message Opened {
+  uint64 request = 1;
+  bytes request_id = 2;
+  SubscriptionRef subscription = 3;
+  StreamRef stream = 4;
+  string export_name = 5;
+  uint64 publisher_peer_revision = 6;
+  uint64 publisher_export_revision = 7;
+  uint64 subscription_revision = 8;
+  Position start = 9;
+}
+
+message Read {
+  uint64 request = 1;
+  SubscriptionRef subscription = 2;
+  Position after = 3;
+  uint32 max_records = 4;
+  uint64 max_bytes = 5;
+  uint32 context_id = 6;
+  bytes holder_request_signature = 7;
+}
+
+message EventRef {
+  bytes origin = 1;                  // exactly 48 bytes
+  string namespace = 2;
+  string id = 3;
+}
+
+message Record {
+  StreamRef stream = 1;
+  uint64 sequence = 2;
+  bytes publish_id = 3;              // exactly 16 bytes
+  string event_type = 4;
+  bytes schema_revision = 5;         // exactly 32 bytes
+  EventRef event_ref = 6;
+  bytes payload = 7;
+  bytes digest = 8;                  // exactly 48 bytes, checked on import
+}
+
+message Batch {
+  uint64 request = 1;
+  SubscriptionRef subscription = 2;
+  repeated Record records = 3;
+  Position head = 4;
+  uint64 minimum_available = 5;
+}
+
+// Private Node-self snapshot resynchronization. The application seals and pins
+// exact immutable bytes for a committed log position before the publisher
+// installs an offer. The receiver verifies all bytes before installing B.
+message SnapshotManifest {
+  bytes snapshot_id = 1;             // exactly 16 bytes
+  SubscriptionRef subscription = 2;
+  StreamRef stream = 3;
+  uint64 subscription_revision = 4;
+  uint64 publisher_peer_revision = 5;
+  uint64 publisher_export_revision = 6;
+  Position position = 7;             // exact covered record B
+  bytes schema_revision = 8;        // exactly 32 bytes
+  bytes content_digest = 9;         // exactly 48 bytes, SHA-384 of all content
+  uint64 content_bytes = 10;        // at most 64 MiB
+}
+
+message SnapshotOffer {
+  SnapshotManifest manifest = 1;
+  bytes publication_digest = 2;     // exactly 48 bytes, application-owned proof
+}
+
+message InspectSnapshot {
+  uint64 request = 1;
+  SubscriptionRef subscription = 2;
+  uint32 context_id = 3;            // must be zero in the v1 Node-self slice
+  bytes holder_request_signature = 4;
+}
+
+message SnapshotOffered {
+  uint64 request = 1;
+  SnapshotOffer offer = 2;
+}
+
+message ReadSnapshot {
+  uint64 request = 1;
+  SubscriptionRef subscription = 2;
+  bytes manifest_digest = 3;        // exactly 48 bytes, binds every manifest field
+  uint64 offset = 4;
+  uint32 max_bytes = 5;             // 1..=1 MiB, also within negotiated frame
+  uint32 context_id = 6;            // must be zero in the v1 Node-self slice
+  bytes holder_request_signature = 7;
+}
+
+message SnapshotChunk {
+  uint64 request = 1;
+  SubscriptionRef subscription = 2;
+  bytes manifest_digest = 3;
+  uint64 offset = 4;
+  bytes data = 5;
+  bool complete = 6;
+}
+
+// A receiver that has durably archived the exact offered bytes reports that
+// transport baseline separately from ordinary event Acknowledge. This does
+// not claim that the receiver's application projection has installed them.
+message ReceiveSnapshot {
+  uint64 request = 1;
+  SubscriptionRef subscription = 2;
+  bytes manifest_digest = 3;        // exactly 48 bytes, binds the exact manifest
+  bytes publication_digest = 4;     // exactly 48 bytes, binds the offer proof
+  Position position = 5;            // exact snapshot baseline B
+  uint32 context_id = 6;            // must be zero, private Node-self only
+  bytes holder_request_signature = 7;
+  bytes install_id = 8;              // exactly 16 bytes, receiver install identity
+  bytes archive_digest = 9;          // exactly 48 bytes, durable archive evidence
+  uint64 federation_generation = 10;
+  SnapshotSuffixCoverage suffix = 11;
+}
+
+message SnapshotSuffixCoverage {
+  Position after = 1;
+  Position through = 2;
+}
+
+message SnapshotReceived {
+  uint64 request = 1;
+  SubscriptionRef subscription = 2;
+  bytes manifest_digest = 3;
+  bytes publication_digest = 4;
+  Position position = 5;
+  bytes install_id = 6;
+  bytes archive_digest = 7;
+  uint64 federation_generation = 8;
+  SnapshotSuffixCoverage suffix = 9;
+}
+
+// Stateless public history. Only a channel-bound, proven node identity is
+// needed; these messages never carry a subscription or hosted subject context.
+message InspectPublic {
+  uint64 request = 1;
+  StreamRef stream = 2;
+}
+
+message PublicInspected {
+  uint64 request = 1;
+  StreamRef stream = 2;
+  string export_name = 3;
+  uint64 policy_revision = 4;
+  Position head = 5;
+  uint64 minimum_available = 6;
+  uint32 max_read_records = 7;
+  uint64 max_read_bytes = 8;
+}
+
+message ReadPublic {
+  uint64 request = 1;
+  StreamRef stream = 2;
+  uint64 expected_policy_revision = 3;
+  Position after = 4;
+  uint32 max_records = 5;
+  uint64 max_bytes = 6;
+}
+
+message PublicBatch {
+  uint64 request = 1;
+  StreamRef stream = 2;
+  uint64 policy_revision = 3;
+  repeated Record records = 4;
+  Position head = 5;
+  uint64 minimum_available = 6;
+}
+
+// Exact, expiring grant delivery. The receiver persists transfer_id before
+// sending its first request and reuses it across retries and fresh Sessions.
+message ObjectBlobRef {
+  bytes sha384 = 1;                    // exactly 48 bytes
+  uint64 size = 2;
+  optional string mime = 3;
+}
+
+message ReadObject {
+  uint64 request = 1;
+  bytes transfer_id = 2;              // exactly 16 bytes, stable across retries
+  uint64 grant_id = 3;
+  uint64 expected_revision = 4;
+  ObjectBlobRef blob = 5;
+  uint64 offset = 6;
+  uint32 max_bytes = 7;
+  uint32 context_id = 8;              // zero is authenticated node-self
+  bytes holder_request_signature = 9;
+}
+
+message ObjectChunk {
+  uint64 request = 1;
+  bytes transfer_id = 2;
+  uint64 grant_id = 3;
+  uint64 revision = 4;
+  uint64 offset = 5;
+  bytes data = 6;
+  bool end_of_object = 7;
+  bool end_of_range = 8;
+}
+
+// This confirms durable inbox acceptance only; application projection and
+// external effects retain their own independent positions and receipts.
+message Acknowledge {
+  uint64 request = 1;
+  SubscriptionRef subscription = 2;
+  Position position = 3;
+  uint32 context_id = 4;
+  bytes holder_request_signature = 5;
+}
+
+message Acknowledged {
+  uint64 request = 1;
+  Position position = 2;
+}
+
+// Inspect and Close are control operations on a durable subscription. The
+// subscription ID alone is never a bearer credential; the verified peer and
+// current local authority are checked for each operation.
+message Inspect {
+  uint64 request = 1;
+  SubscriptionRef subscription = 2;
+  uint32 context_id = 3;
+  bytes holder_request_signature = 4;
+}
+
+message Inspected {
+  uint64 request = 1;
+  SubscriptionRef subscription = 2;
+  StreamRef stream = 3;
+  string export_name = 4;
+  uint64 subscription_revision = 5;
+  Position start = 6;                 // exclusive lower bound
+  Position acknowledged = 7;          // durable receiver acceptance
+  Position head = 8;
+  uint64 minimum_available = 9;
+  bool closed = 10;
+}
+
+message Close {
+  uint64 request = 1;
+  bytes request_id = 2;               // stable 16-byte control identity
+  SubscriptionRef subscription = 3;
+  optional uint64 expected_subscription_revision = 4;
+  uint32 context_id = 5;
+  bytes holder_request_signature = 6;
+}
+
+message Closed {
+  uint64 request = 1;
+  bytes request_id = 2;
+  SubscriptionRef subscription = 3;
+  uint64 subscription_revision = 4;
+}
+
+// Target-assigned, unreused call locator. It grants no authority by itself.
+message CallRef {
+  bytes target = 1;                   // exactly 48 bytes, target federation node
+  bytes id = 2;                       // exactly 32 random bytes
+}
+
+enum CallStatus {
+  CALL_STATUS_UNSPECIFIED = 0;
+  CALL_STATUS_RESERVED = 1;           // no Kernel work accepted
+  CALL_STATUS_PREPARING = 2;          // original work identity fixed; acceptance uncertain
+  CALL_STATUS_ACCEPTED = 3;           // Kernel acceptance receipt checked
+  CALL_STATUS_FINISHED = 4;           // completion proven; output may have expired
+  CALL_STATUS_CLOSED = 5;             // reservation proven not accepted
+  CALL_STATUS_UNPROVEN = 6;           // no current evidence; never means not executed
+}
+
+// The origin fixes and persists this intent before sending it. The target
+// returns the same CallRef for a retry with identical stable ID and content
+// inside its declared receipt window. Prepare never executes the method.
+message PrepareCall {
+  uint64 request = 1;
+  bytes origin_request_id = 2;        // stable 16-byte source control identity
+  string export_name = 3;
+  string relative_path = 4;           // concrete path inside the export
+  string method = 5;
+  bytes contract_digest = 6;         // exactly 32 bytes
+  bytes input_digest = 7;            // exactly 48 bytes, SHA-384 of canonical input
+  uint64 input_bytes = 8;
+  uint64 prepare_deadline_ms = 9;     // absolute latest reservation time
+  uint64 execution_deadline_ms = 10;  // absolute execution deadline
+  uint64 result_retention_ms = 11;    // requested result visibility duration
+  uint32 context_id = 12;            // zero for node-self
+  bytes holder_request_signature = 13;
+}
+
+message CallPrepared {
+  uint64 request = 1;
+  bytes origin_request_id = 2;
+  CallRef call = 3;
+  CallStatus status = 4;
+  uint64 reserved_until_ms = 5;      // target-fixed, never later than requested
+  uint64 execution_deadline_ms = 6;  // target-fixed, never later than requested
+  uint64 result_retention_ms = 7;    // target-fixed duration
+  uint64 authority_revision = 8;
+  uint64 control_revision = 9;
+}
+
+// Invoke can only target a prior reservation. The target compares the stable
+// origin identity and full input against the persisted Prepare digest before
+// its atomic acceptance transition. A retry uses the same CallRef and input.
+message InvokeCall {
+  uint64 request = 1;
+  bytes origin_request_id = 2;        // exactly 16 bytes
+  CallRef call = 3;
+  bytes input = 4;                    // bounded by negotiated frame limit
+  uint32 context_id = 5;
+  bytes holder_request_signature = 6;
+}
+
+// Preparing does not assert Kernel acceptance. Accepted is returned only
+// after the original Kernel acceptance receipt has been checked. A delayed
+// retry may report Finished from the durable directory for the same CallRef;
+// Closed is a failure and must not be reported as successful invocation.
+message CallInvoked {
+  uint64 request = 1;
+  CallRef call = 2;
+  CallStatus status = 3;              // Preparing, Accepted or Finished
+  uint64 control_revision = 4;
+}
+
+message InspectCall {
+  uint64 request = 1;
+  CallRef call = 2;
+  uint32 context_id = 3;
+  bytes holder_request_signature = 4;
+}
+
+message PersistedCallResult {
+  bool succeeded = 1;                 // application result, not an effect guarantee
+  bytes output = 2;                   // canonical bounded result bytes
+  bytes output_digest = 3;            // exactly 48 bytes, SHA-384 of output
+  string failure_code = 4;            // set for a durable application failure
+}
+
+message CallInspected {
+  uint64 request = 1;
+  CallRef call = 2;
+  CallStatus status = 3;
+  uint64 control_revision = 4;
+  uint64 authority_revision = 5;
+  uint64 reserved_until_ms = 6;
+  uint64 execution_deadline_ms = 7;
+  uint64 result_retained_until_ms = 8;
+  PersistedCallResult result = 9;     // retained output; may be absent after TTL even when Finished
+  repeated bytes unresolved_effect_ids = 10; // opaque target-local IDs, bounded
+  bool cancellation_requested = 11;
+  bool kernel_cancel_accepted = 12;
+  bool execution_stopped = 13;
+}
+
+// Cancellation never implies rollback of an accepted execution or its
+// external effects. Only a still-Reserved call can become Closed directly.
+message CancelCall {
+  uint64 request = 1;
+  bytes control_request_id = 2;       // stable 16-byte cancellation identity
+  CallRef call = 3;
+  optional uint64 expected_control_revision = 4;
+  uint32 context_id = 5;
+  bytes holder_request_signature = 6;
+}
+
+message CallCancelled {
+  uint64 request = 1;
+  bytes control_request_id = 2;
+  CallRef call = 3;
+  CallStatus status = 4;
+  uint64 control_revision = 5;
+  bool cancellation_requested = 6;
+  bool kernel_cancel_accepted = 7;
+  bool execution_stopped = 8;
+}
+
+enum FailureCode {
+  FAILURE_CODE_UNSPECIFIED = 0;
+  FAILURE_CODE_INVALID = 1;
+  FAILURE_CODE_FORBIDDEN = 2;
+  FAILURE_CODE_CONFLICT = 3;
+  FAILURE_CODE_RESYNC_REQUIRED = 4;
+  FAILURE_CODE_CAPACITY = 5;
+  FAILURE_CODE_UNAVAILABLE = 6;
+  FAILURE_CODE_INTERNAL = 7;
+}
+
+// Verdict for this request's business commit, not rollback of earlier work or
+// external effects. Missing/unknown verdicts carry no commit evidence.
+enum CommitVerdict {
+  COMMIT_VERDICT_UNSPECIFIED = 0;
+  COMMIT_VERDICT_NOT_COMMITTED = 1;
+  COMMIT_VERDICT_COMMITTED = 2;
+  COMMIT_VERDICT_INDETERMINATE = 3;
+}
+
+message SyncFailure {
+  uint64 request = 1;
+  FailureCode code = 2;
+  string message = 3;
+  CommitVerdict commit_verdict = 4;
+}

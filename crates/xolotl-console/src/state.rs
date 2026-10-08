@@ -1,17 +1,16 @@
-//! Console state: kernel handles, auth state, and WebSocket runtime limits.
+//! Transport-independent Console authentication, admission and execution state.
 //!
 //! The Console Protocol host maps authenticated console users to management
 //! identities and then dispatches descriptor-named actions through authorization,
 //! state, and audited visibility gates. Actions that invoke runtime effects use
 //! capability-scoped Operations. This state object owns shared execution state.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
-use xolotl_kernel::Bootstrap;
+use std::sync::Arc;
+use xolotl_kernel::{Bootstrap, RequestProcess};
 use xolotl_state::Backend;
 
 use crate::auth::{AuthError, ConsoleAuth, ConsoleAuthConfig};
+use xolotl_kernel::host::BlockingSpawner;
 
 /// Host-provided sink for one-time pairing display secrets.
 pub trait PairingSecretDisplay: Send + Sync + 'static {
@@ -29,478 +28,455 @@ impl PairingSecretDisplay for NoPairingSecretDisplay {
     }
 }
 
-/// Default maximum WebSocket frame size.
-pub const DEFAULT_WS_MAX_FRAME_BYTES: usize = 1024 * 1024;
-/// Default global WebSocket connection limit.
-pub const DEFAULT_WS_MAX_CONNECTIONS_GLOBAL: usize = 256;
-/// Default WebSocket connection limit per source address.
-pub const DEFAULT_WS_MAX_CONNECTIONS_PER_SOURCE: usize = 32;
-/// Default WebSocket connection limit per authenticated user.
-pub const DEFAULT_WS_MAX_CONNECTIONS_PER_USER: usize = 8;
-/// Default idle timeout for WebSocket sessions.
-pub const DEFAULT_WS_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
-/// Default per-session incoming frame rate limit.
-pub const DEFAULT_WS_MAX_FRAMES_PER_SECOND: usize = 64;
-/// Default per-session incoming byte rate limit.
-pub const DEFAULT_WS_MAX_BYTES_PER_SECOND: usize = 4 * 1024 * 1024;
-/// Default subscription limit per WebSocket session.
-pub const DEFAULT_WS_MAX_SUBSCRIPTIONS: usize = 32;
 /// Default maximum entries returned by state list actions.
-pub const DEFAULT_WS_MAX_STATE_LIST_LIMIT: usize = 512;
+pub const DEFAULT_QUERY_MAX_STATE_LIST_LIMIT: usize = 512;
 /// Default maximum facts returned by fact list actions.
-pub const DEFAULT_WS_MAX_FACT_LIMIT: usize = 256;
+pub const DEFAULT_QUERY_MAX_FACT_LIMIT: usize = 256;
 /// Default maximum trace entries returned by trace actions.
-pub const DEFAULT_WS_MAX_TRACE_LIMIT: usize = 512;
-/// Default per-session byte budget for queued and in-flight subscription data.
-pub const DEFAULT_WS_MAX_PENDING_EVENT_BYTES: usize = 1024 * 1024;
-/// Default timeout for sending any frame to a WebSocket session.
-pub const DEFAULT_WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Minimum accepted WebSocket frame size.
-pub const MIN_WS_MAX_FRAME_BYTES: usize = 16 * 1024;
-/// Hard upper bound for WebSocket frame size.
-pub const HARD_MAX_WS_FRAME_BYTES: usize = 4 * 1024 * 1024;
-/// Minimum accepted global WebSocket connection limit.
-pub const MIN_WS_CONNECTIONS_GLOBAL: usize = 1;
-/// Hard upper bound for global WebSocket connection limit.
-pub const HARD_MAX_WS_CONNECTIONS_GLOBAL: usize = 100_000;
-/// Minimum accepted per-source connection limit.
-pub const MIN_WS_CONNECTIONS_PER_SOURCE: usize = 1;
-/// Hard upper bound for per-source connection limit.
-pub const HARD_MAX_WS_CONNECTIONS_PER_SOURCE: usize = 10_000;
-/// Minimum accepted per-user connection limit.
-pub const MIN_WS_CONNECTIONS_PER_USER: usize = 1;
-/// Hard upper bound for per-user connection limit.
-pub const HARD_MAX_WS_CONNECTIONS_PER_USER: usize = 10_000;
-/// Minimum accepted WebSocket idle timeout.
-pub const MIN_WS_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Hard upper bound for WebSocket idle timeout.
-pub const HARD_MAX_WS_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
-/// Minimum accepted frame rate limit.
-pub const MIN_WS_MAX_FRAMES_PER_SECOND: usize = 1;
-/// Hard upper bound for frame rate limit.
-pub const HARD_MAX_WS_FRAMES_PER_SECOND: usize = 10_000;
-/// Minimum accepted byte rate limit.
-pub const MIN_WS_MAX_BYTES_PER_SECOND: usize = 16 * 1024;
-/// Hard upper bound for byte rate limit.
-pub const HARD_MAX_WS_BYTES_PER_SECOND: usize = 64 * 1024 * 1024;
-/// Minimum accepted subscription limit.
-pub const MIN_WS_MAX_SUBSCRIPTIONS: usize = 1;
-/// Hard upper bound for subscription limit.
-pub const HARD_MAX_WS_SUBSCRIPTIONS: usize = 256;
+pub const DEFAULT_QUERY_MAX_TRACE_LIMIT: usize = 512;
 /// Minimum accepted state-list limit.
-pub const MIN_WS_MAX_STATE_LIST_LIMIT: usize = 1;
+pub const MIN_QUERY_MAX_STATE_LIST_LIMIT: usize = 1;
 /// Hard upper bound for state-list limit.
-pub const HARD_MAX_WS_STATE_LIST_LIMIT: usize = 16_384;
+pub const HARD_MAX_QUERY_STATE_LIST_LIMIT: usize = 16_384;
 /// Minimum accepted fact-list limit.
-pub const MIN_WS_MAX_FACT_LIMIT: usize = 1;
+pub const MIN_QUERY_MAX_FACT_LIMIT: usize = 1;
 /// Hard upper bound for fact-list limit.
-pub const HARD_MAX_WS_FACT_LIMIT: usize = 4_096;
+pub const HARD_MAX_QUERY_FACT_LIMIT: usize = 4_096;
 /// Minimum accepted trace-list limit.
-pub const MIN_WS_MAX_TRACE_LIMIT: usize = 1;
+pub const MIN_QUERY_MAX_TRACE_LIMIT: usize = 1;
 /// Hard upper bound for trace-list limit.
-pub const HARD_MAX_WS_TRACE_LIMIT: usize = 8_192;
-/// Minimum accepted subscription queue byte budget.
-pub const MIN_WS_MAX_PENDING_EVENT_BYTES: usize = 16 * 1024;
-/// Hard upper bound for a session's subscription queue byte budget.
-pub const HARD_MAX_WS_PENDING_EVENT_BYTES: usize = 16 * 1024 * 1024;
-/// Minimum accepted frame send timeout.
-pub const MIN_WS_SEND_TIMEOUT: Duration = Duration::from_millis(100);
-/// Hard upper bound for frame send timeout.
-pub const HARD_MAX_WS_SEND_TIMEOUT: Duration = Duration::from_secs(60);
+pub const HARD_MAX_QUERY_TRACE_LIMIT: usize = 8_192;
 
 /// Shared console backend state.
 pub struct ConsoleState {
     /// Shared kernel bootstrap handle.
     pub(crate) boot: Arc<Bootstrap>,
-    /// The state backend the console reads/writes management config through.
-    /// All management config lives under `state://kernel/*`.
+    /// Host-owned parent scope for runtime requests, when narrower than root.
+    /// Retaining the scope keeps its lifecycle ownership until Console stops.
+    pub(crate) request_anchor: Option<Arc<RequestProcess<'static>>>,
+    /// State-backed management configuration. The external installation
+    /// catalog is owned by its dedicated storage port instead.
     pub(crate) state: Backend,
     /// Authentication service.
     pub(crate) auth: ConsoleAuth,
+    /// Host-selected scheduler and shared admission for synchronous service work.
+    pub(crate) blocking_spawner: Arc<dyn BlockingSpawner>,
     /// One-time pairing display edge.
     pub(crate) pairing_display: Arc<dyn PairingSecretDisplay>,
-    /// WebSocket runtime limits and counters.
-    pub(crate) ws: ConsoleWsRuntime,
-    /// Transport security and proxy/origin policy.
-    pub(crate) transport_security: ConsoleTransportSecurityConfig,
+    /// Limits for bounded observations, shared by every transport.
+    pub(crate) queries: ConsoleQueryConfig,
+    /// Shared active action execution capacity.
+    pub(crate) calls: Arc<tokio::sync::Semaphore>,
+    /// Shared admission for credential checks and authentication flows.
+    pub(crate) authentications: Arc<tokio::sync::Semaphore>,
+    /// Subscription capacity shared by every adapter.
+    pub(crate) streams: Arc<crate::streams::StreamAdmission>,
     /// Action/stream descriptor registry with a real, deterministic revision.
     pub(crate) registry: crate::registry::DescriptorRegistry,
+    /// Host exposure and resource bounds for portable execution.
+    pub(crate) runtime: crate::runtime::RuntimeAdmission,
+    /// Service-owned jobs and bounded volatile results, shared by all adapters.
+    pub(crate) executions: Arc<crate::runtime::executions::ExecutionRegistry>,
+    /// Trusted, manifest-bounded portable program loaders.
+    pub(crate) modules: crate::runtime::ConsoleModules,
+    /// One storage owner's narrow Source management facets, without event
+    /// commit or maintenance authority.
+    pub(crate) source_management: Option<Arc<dyn xolotl_source::SourceManagement>>,
+    /// Optional local federation catalog authority; remote peers cannot invoke it.
+    pub(crate) federation_management: Option<Arc<dyn xolotl_federation::FederationManagement>>,
+    /// Immutable host-owned configuration namespace admission.
+    pub(crate) config_admissions: crate::mgmt::ConfigAdmissionRegistry,
+}
+
+/// A Console host could not be built from its declared configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum ConsoleConfigError {
+    /// A host must explicitly choose its session storage domain.
+    #[error("console session store is required")]
+    SessionStoreRequired,
+    /// Shared request capacity is outside the supported range.
+    #[error("console request capacity: {0} must be between 1 and 4096")]
+    InvalidCapacity(&'static str),
+    /// The host-owned runtime parent is from another Kernel or is unavailable.
+    #[error("console request anchor: {0}")]
+    RequestAnchor(&'static str),
+    /// Authentication or credential provider configuration is invalid.
+    #[error("console authentication configuration: {0}")]
+    Authentication(#[from] AuthError),
+    /// Runtime exposure or execution budgets are invalid.
+    #[error("console runtime configuration: {0}")]
+    Runtime(#[from] crate::runtime::RuntimeConfigError),
+    /// Module manifests or their dependency graph are invalid.
+    #[error("console module configuration: {0}")]
+    Modules(#[from] crate::runtime::ModuleConfigError),
+    /// Host configuration namespaces are invalid or overlap.
+    #[error("console config admission: {0}")]
+    ConfigAdmission(#[from] crate::mgmt::ConfigAdmissionConfigError),
+}
+
+/// Host configuration; query budgets are independent of transport framing.
+#[derive(Clone)]
+pub struct ConsoleConfig {
+    /// Explicit shared session storage domain. None is rejected; no fallback.
+    pub session_store: Option<Arc<dyn crate::session_store::ConsoleSessionStore>>,
+    /// Authentication and credential policy.
+    pub auth: ConsoleAuthConfig,
+    /// Override the Kernel host's blocking-work scheduler for Console service
+    /// work. `None` shares the Kernel's admission domain; an explicit scheduler
+    /// must enforce its own queue and worker bounds.
+    pub blocking_spawner: Option<Arc<dyn BlockingSpawner>>,
+    /// Optional live, host-created parent scope for runtime calls. Console
+    /// retains one owner. It must come from the same Kernel and remain available
+    /// while Console accepts calls.
+    pub request_anchor: Option<Arc<RequestProcess<'static>>>,
+    /// Bounds applied to every management query.
+    pub queries: ConsoleQueryConfig,
+    /// Maximum active management calls across every adapter; excess calls fail promptly.
+    pub max_concurrent_calls: usize,
+    /// Maximum concurrent authentication requests across Rust, HTTP and WebSocket
+    /// adapters, including bearer checks and host-installed verifiers.
+    /// Admitted transport bodies retain the same slot through service dispatch;
+    /// continuations release it between client requests.
+    pub max_concurrent_authentications: usize,
+    /// Subscription admission shared by every transport and embedded caller.
+    pub streams: crate::ConsoleStreamConfig,
+    /// Exposure and execution budgets for general kernel resource calls.
+    pub runtime: crate::runtime::ConsoleRuntimeConfig,
+    /// Host-assembled portable loaders, independent of transport configuration.
+    pub modules: crate::runtime::ConsoleModules,
+    /// Storage-owned Source management capability, installed from the same
+    /// owner as ingress. It combines declaration admission, the typed
+    /// installation catalog, and audited claim inspection without granting
+    /// Console event commit or maintenance authority.
+    pub source_management: Option<Arc<dyn xolotl_source::SourceManagement>>,
+    /// Host-owned federation catalog management. It shares the authoritative
+    /// store with the federation Session but is never exposed to that Session.
+    pub federation_management: Option<Arc<dyn xolotl_federation::FederationManagement>>,
+    /// Trusted verifier and binding resolver for external primary assertions.
+    /// The service never accepts preconstructed verified identity facts.
+    pub external_authentication: Option<Arc<dyn crate::ExternalPrimaryAuthentication>>,
+    /// The single account authority for externally authenticated accounts.
+    /// Its stable source ID must be restored unchanged after a restart.
+    pub account_authority: Option<Arc<dyn crate::AccountAuthority>>,
+    /// Host validators for versioned `state://kernel` configuration namespaces.
+    /// Unknown paths remain unwritable through Console configuration actions.
+    pub config_admissions: Vec<crate::ConfigNamespaceAdmission>,
+}
+
+impl std::fmt::Debug for ConsoleConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("ConsoleConfig");
+        debug.field("auth", &self.auth).field(
+            "request_anchor",
+            &self.request_anchor.as_ref().map(|anchor| anchor.id()),
+        );
+        debug
+            .field("queries", &self.queries)
+            .field("max_concurrent_calls", &self.max_concurrent_calls)
+            .field(
+                "max_concurrent_authentications",
+                &self.max_concurrent_authentications,
+            )
+            .field("streams", &self.streams)
+            .field("runtime", &self.runtime)
+            .field("modules", &self.modules)
+            .field(
+                "source_management_installed",
+                &self.source_management.is_some(),
+            )
+            .field(
+                "federation_management_installed",
+                &self.federation_management.is_some(),
+            )
+            .field(
+                "external_authentication_installed",
+                &self.external_authentication.is_some(),
+            )
+            .field(
+                "account_authority_installed",
+                &self.account_authority.is_some(),
+            )
+            .field("config_admissions", &self.config_admissions)
+            .finish()
+    }
+}
+
+impl Default for ConsoleConfig {
+    fn default() -> Self {
+        Self {
+            session_store: None,
+            auth: ConsoleAuthConfig::default(),
+            blocking_spawner: None,
+            request_anchor: None,
+            queries: ConsoleQueryConfig::default(),
+            max_concurrent_calls: 64,
+            max_concurrent_authentications: 64,
+            streams: crate::ConsoleStreamConfig::default(),
+            runtime: crate::runtime::ConsoleRuntimeConfig::default(),
+            modules: crate::runtime::ConsoleModules::default(),
+            source_management: None,
+            federation_management: None,
+            external_authentication: None,
+            account_authority: None,
+            config_admissions: Vec::new(),
+        }
+    }
 }
 
 impl ConsoleState {
-    /// Build console state with default auth, WebSocket, and pairing display.
-    #[cfg(test)]
-    pub(crate) fn new(boot: Arc<Bootstrap>) -> Result<Self, AuthError> {
-        Self::with_pairing_display_and_config(
+    pub(crate) fn runtime_anchor(&self) -> xolotl_types::ProcessId {
+        self.request_anchor
+            .as_ref()
+            .map(|anchor| anchor.id())
+            .unwrap_or_else(|| self.boot.root())
+    }
+
+    /// Borrow the host-selected blocking-work scheduler shared by this Console.
+    pub fn blocking_spawner(&self) -> &dyn BlockingSpawner {
+        self.blocking_spawner.as_ref()
+    }
+
+    /// Build a shared host with default authentication and service budgets,
+    /// inheriting the Kernel host's blocking-work port.
+    pub fn shared(
+        boot: Arc<Bootstrap>,
+        session_store: Arc<dyn crate::session_store::ConsoleSessionStore>,
+    ) -> Result<Arc<Self>, ConsoleConfigError> {
+        Self::with_config(
             boot,
-            Arc::new(NoPairingSecretDisplay),
-            ConsoleAuthConfig::default(),
-            ConsoleWsConfig::default(),
-            console_transport_default(),
+            ConsoleConfig {
+                session_store: Some(session_store),
+                ..ConsoleConfig::default()
+            },
         )
     }
 
-    /// Build console state with a custom pairing display edge.
-    #[cfg(test)]
-    pub(crate) fn with_pairing_display(
+    /// Build a shared host without a pairing display edge.
+    pub fn with_config(
         boot: Arc<Bootstrap>,
-        pairing_display: Arc<dyn PairingSecretDisplay>,
-    ) -> Result<Self, AuthError> {
-        Self::with_pairing_display_and_config(
-            boot,
-            pairing_display,
-            ConsoleAuthConfig::default(),
-            ConsoleWsConfig::default(),
-            console_transport_default(),
-        )
+        config: ConsoleConfig,
+    ) -> Result<Arc<Self>, ConsoleConfigError> {
+        Self::shared_with_pairing_display_and_config(boot, Arc::new(NoPairingSecretDisplay), config)
     }
 
-    /// Build console state with custom pairing display, auth, WS tuning, and transport security.
-    pub(crate) fn with_pairing_display_and_config(
-        boot: Arc<Bootstrap>,
-        pairing_display: Arc<dyn PairingSecretDisplay>,
-        auth: ConsoleAuthConfig,
-        ws: ConsoleWsConfig,
-        transport_security: ConsoleTransportSecurityConfig,
-    ) -> Result<Self, AuthError> {
-        let state = boot.kernel.state.clone();
-        Ok(Self {
-            boot,
-            state,
-            auth: ConsoleAuth::new(auth)?,
-            pairing_display,
-            ws: ConsoleWsRuntime::new(ws),
-            transport_security: transport_security.bounded(),
-            registry: crate::registry::DescriptorRegistry::new(),
-        })
-    }
-
-    /// Build reference-counted console state with defaults.
-    #[cfg(test)]
-    pub(crate) fn shared(boot: Arc<Bootstrap>) -> Result<Arc<Self>, AuthError> {
-        Ok(Arc::new(Self::new(boot)?))
-    }
-
-    /// Build reference-counted console state with a custom pairing display.
-    #[cfg(test)]
-    pub(crate) fn shared_with_pairing_display(
-        boot: Arc<Bootstrap>,
-        pairing_display: Arc<dyn PairingSecretDisplay>,
-    ) -> Result<Arc<Self>, AuthError> {
-        Ok(Arc::new(Self::with_pairing_display(boot, pairing_display)?))
-    }
-
-    /// Build reference-counted console state with full custom tuning.
+    /// Share one host across adapters, including a custom pairing display edge.
     pub fn shared_with_pairing_display_and_config(
         boot: Arc<Bootstrap>,
         pairing_display: Arc<dyn PairingSecretDisplay>,
-        auth: ConsoleAuthConfig,
-        ws: ConsoleWsConfig,
-        transport_security: ConsoleTransportSecurityConfig,
-    ) -> Result<Arc<Self>, AuthError> {
-        Ok(Arc::new(Self::with_pairing_display_and_config(
+        config: ConsoleConfig,
+    ) -> Result<Arc<Self>, ConsoleConfigError> {
+        if !(1..=4096).contains(&config.max_concurrent_calls) {
+            return Err(ConsoleConfigError::InvalidCapacity("max_concurrent_calls"));
+        }
+        if !(1..=4096).contains(&config.max_concurrent_authentications) {
+            return Err(ConsoleConfigError::InvalidCapacity(
+                "max_concurrent_authentications",
+            ));
+        }
+        let state = boot.kernel().state().clone();
+        let config_admissions =
+            crate::mgmt::ConfigAdmissionRegistry::new(config.config_admissions)?;
+        let runtime = crate::runtime::RuntimeAdmission::new(config.runtime)?;
+        if let Some(anchor) = config.request_anchor.as_ref() {
+            if !anchor.belongs_to(&boot) {
+                return Err(ConsoleConfigError::RequestAnchor(
+                    "parent belongs to another Kernel",
+                ));
+            }
+            if !boot
+                .kernel()
+                .processes()
+                .status(anchor.id())
+                .is_some_and(|status| {
+                    !status.is_terminal() && status != xolotl_types::ProcessStatus::Finalizing
+                })
+            {
+                return Err(ConsoleConfigError::RequestAnchor(
+                    "parent process is unavailable",
+                ));
+            }
+        }
+        let host_runtime = boot.kernel().host_runtime().clone();
+        let blocking_spawner = config
+            .blocking_spawner
+            .unwrap_or_else(|| host_runtime.blocking_spawner());
+        if i64::try_from(runtime.config.max_duration_ms)
+            .ok()
+            .and_then(|duration| host_runtime.now_millis().checked_add(duration))
+            .is_none()
+            || host_runtime
+                .deadline_after(std::time::Duration::from_millis(
+                    runtime.config.max_duration_ms,
+                ))
+                .is_none()
+        {
+            return Err(crate::runtime::RuntimeConfigError::Limit("max_duration_ms").into());
+        }
+        let executions = crate::runtime::executions::ExecutionRegistry::new_with_host_runtime(
+            runtime.config.executions.clone(),
+            host_runtime.clone(),
+        )?;
+        config.modules.link()?;
+        let streams = crate::streams::StreamAdmission::new(config.streams);
+        let registry = crate::registry::DescriptorRegistry::with_config(
+            &runtime.config,
+            streams.config(),
+            &config.modules,
+            config.account_authority.is_none(),
+            &config_admissions,
+            config.federation_management.is_some(),
+            boot.kernel().facts().is_enabled(),
+        );
+        Ok(Arc::new(Self {
             boot,
+            request_anchor: config.request_anchor,
+            state,
             pairing_display,
-            auth,
-            ws,
-            transport_security,
-        )?))
+            auth: ConsoleAuth::with_external(
+                config.auth,
+                config
+                    .session_store
+                    .ok_or(ConsoleConfigError::SessionStoreRequired)?,
+                config.external_authentication,
+                config.account_authority,
+                Arc::clone(&blocking_spawner),
+                host_runtime,
+            )?,
+            blocking_spawner,
+            queries: config.queries.bounded(),
+            calls: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_calls)),
+            authentications: Arc::new(tokio::sync::Semaphore::new(
+                config.max_concurrent_authentications,
+            )),
+            streams,
+            registry,
+            runtime,
+            executions,
+            modules: config.modules,
+            source_management: config.source_management,
+            federation_management: config.federation_management,
+            config_admissions,
+        }))
     }
 }
 
-// Transport security is unified with the external gateway: the Console uses
-// the same `GatewayTransportSecurityConfig` type, re-exported here under the
-// console-facing names so existing call sites are unchanged. The only
-// console-specific behavior is the default mode (`ProductionTls`), provided by
-// `console_transport_default()` below.
-pub use xolotl_gateway::{
-    GatewayTransportSecurityConfig as ConsoleTransportSecurityConfig,
-    GatewayTransportSecurityMode as ConsoleTransportSecurityMode,
-    GatewayTrustedProxyConfig as ConsoleTrustedProxyConfig,
-    GatewayUnsafeTransportRelaxation as ConsoleUnsafeTransportRelaxation,
-};
-
-/// Console transport-security default: `ProductionTls` with default trusted
-/// proxy settings and no unsafe relaxations. The gateway's own `Default`
-/// returns `LocalTrusted`, so console call sites that need the console default
-/// use this instead of `Default::default()`.
-#[cfg(test)]
-pub(crate) fn console_transport_default() -> ConsoleTransportSecurityConfig {
-    ConsoleTransportSecurityConfig {
-        mode: ConsoleTransportSecurityMode::ProductionTls,
-        trusted_proxy: ConsoleTrustedProxyConfig::default(),
-        unsafe_relaxations: Vec::new(),
-    }
-    .bounded()
-}
-
-/// WebSocket runtime tuning for the Console Protocol server.
-#[derive(Clone, Debug)]
-pub struct ConsoleWsConfig {
-    /// Maximum incoming or outgoing encoded frame size.
-    pub max_frame_bytes: usize,
-    /// Maximum global active WebSocket connections.
-    pub max_connections_global: usize,
-    /// Maximum active WebSocket connections per source address.
-    pub max_connections_per_source: usize,
-    /// Maximum active WebSocket connections per authenticated user.
-    pub max_connections_per_user: usize,
-    /// Idle timeout for a session.
-    pub idle_timeout: Duration,
-    /// Maximum incoming frames per second.
-    pub max_frames_per_second: usize,
-    /// Maximum incoming bytes per second.
-    pub max_bytes_per_second: usize,
-    /// Maximum active subscriptions per session.
-    pub max_subscriptions: usize,
-    /// Maximum state-list rows per request.
+/// Resource budgets for live observations through any Console adapter.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConsoleQueryConfig {
+    /// Maximum state or session entries in one page.
     pub max_state_list_limit: usize,
-    /// Maximum fact rows per request.
+    /// Maximum facts in a recent page.
     pub max_fact_limit: usize,
-    /// Maximum trace rows per request.
+    /// Maximum facts in a trace page.
     pub max_trace_limit: usize,
-    /// Encoded bytes retained by queued and in-flight subscription data frames.
-    /// A saturated queue closes the producing subscription. Bounded closure
-    /// notifications use an independent control path.
-    pub max_pending_event_bytes: usize,
-    /// Timeout for delivering any frame to a session.
-    pub send_timeout: Duration,
+    /// Maximum processes in a metadata page.
+    pub max_process_limit: usize,
+    /// Maximum backend encoded bytes in one page, before response projection.
+    pub max_page_bytes: usize,
 }
 
-impl Default for ConsoleWsConfig {
+impl Default for ConsoleQueryConfig {
     fn default() -> Self {
         Self {
-            max_frame_bytes: DEFAULT_WS_MAX_FRAME_BYTES,
-            max_connections_global: DEFAULT_WS_MAX_CONNECTIONS_GLOBAL,
-            max_connections_per_source: DEFAULT_WS_MAX_CONNECTIONS_PER_SOURCE,
-            max_connections_per_user: DEFAULT_WS_MAX_CONNECTIONS_PER_USER,
-            idle_timeout: DEFAULT_WS_IDLE_TIMEOUT,
-            max_frames_per_second: DEFAULT_WS_MAX_FRAMES_PER_SECOND,
-            max_bytes_per_second: DEFAULT_WS_MAX_BYTES_PER_SECOND,
-            max_subscriptions: DEFAULT_WS_MAX_SUBSCRIPTIONS,
-            max_state_list_limit: DEFAULT_WS_MAX_STATE_LIST_LIMIT,
-            max_fact_limit: DEFAULT_WS_MAX_FACT_LIMIT,
-            max_trace_limit: DEFAULT_WS_MAX_TRACE_LIMIT,
-            max_pending_event_bytes: DEFAULT_WS_MAX_PENDING_EVENT_BYTES,
-            send_timeout: DEFAULT_WS_SEND_TIMEOUT,
+            max_state_list_limit: DEFAULT_QUERY_MAX_STATE_LIST_LIMIT,
+            max_fact_limit: DEFAULT_QUERY_MAX_FACT_LIMIT,
+            max_trace_limit: DEFAULT_QUERY_MAX_TRACE_LIMIT,
+            max_process_limit: 256,
+            max_page_bytes: 128 * 1024,
         }
     }
 }
 
-impl ConsoleWsConfig {
-    /// Clamp all WebSocket tuning values into hard backend bounds.
+impl ConsoleQueryConfig {
+    /// Enforce server work and allocation bounds independent of client inputs.
     pub fn bounded(self) -> Self {
         Self {
-            max_frame_bytes: self
-                .max_frame_bytes
-                .clamp(MIN_WS_MAX_FRAME_BYTES, HARD_MAX_WS_FRAME_BYTES),
-            max_connections_global: self
-                .max_connections_global
-                .clamp(MIN_WS_CONNECTIONS_GLOBAL, HARD_MAX_WS_CONNECTIONS_GLOBAL),
-            max_connections_per_source: self.max_connections_per_source.clamp(
-                MIN_WS_CONNECTIONS_PER_SOURCE,
-                HARD_MAX_WS_CONNECTIONS_PER_SOURCE,
+            max_state_list_limit: self.max_state_list_limit.clamp(
+                MIN_QUERY_MAX_STATE_LIST_LIMIT,
+                HARD_MAX_QUERY_STATE_LIST_LIMIT,
             ),
-            max_connections_per_user: self.max_connections_per_user.clamp(
-                MIN_WS_CONNECTIONS_PER_USER,
-                HARD_MAX_WS_CONNECTIONS_PER_USER,
-            ),
-            idle_timeout: clamp_duration(
-                self.idle_timeout,
-                MIN_WS_IDLE_TIMEOUT,
-                HARD_MAX_WS_IDLE_TIMEOUT,
-            ),
-            max_frames_per_second: self
-                .max_frames_per_second
-                .clamp(MIN_WS_MAX_FRAMES_PER_SECOND, HARD_MAX_WS_FRAMES_PER_SECOND),
-            max_bytes_per_second: self
-                .max_bytes_per_second
-                .clamp(MIN_WS_MAX_BYTES_PER_SECOND, HARD_MAX_WS_BYTES_PER_SECOND),
-            max_subscriptions: self
-                .max_subscriptions
-                .clamp(MIN_WS_MAX_SUBSCRIPTIONS, HARD_MAX_WS_SUBSCRIPTIONS),
-            max_state_list_limit: self
-                .max_state_list_limit
-                .clamp(MIN_WS_MAX_STATE_LIST_LIMIT, HARD_MAX_WS_STATE_LIST_LIMIT),
             max_fact_limit: self
                 .max_fact_limit
-                .clamp(MIN_WS_MAX_FACT_LIMIT, HARD_MAX_WS_FACT_LIMIT),
+                .clamp(MIN_QUERY_MAX_FACT_LIMIT, HARD_MAX_QUERY_FACT_LIMIT),
             max_trace_limit: self
                 .max_trace_limit
-                .clamp(MIN_WS_MAX_TRACE_LIMIT, HARD_MAX_WS_TRACE_LIMIT),
-            max_pending_event_bytes: self.max_pending_event_bytes.clamp(
-                MIN_WS_MAX_PENDING_EVENT_BYTES,
-                HARD_MAX_WS_PENDING_EVENT_BYTES,
-            ),
-            send_timeout: clamp_duration(
-                self.send_timeout,
-                MIN_WS_SEND_TIMEOUT,
-                HARD_MAX_WS_SEND_TIMEOUT,
-            ),
+                .clamp(MIN_QUERY_MAX_TRACE_LIMIT, HARD_MAX_QUERY_TRACE_LIMIT),
+            max_process_limit: self.max_process_limit.clamp(1, 4096),
+            max_page_bytes: self.max_page_bytes.clamp(1024, 256 * 1024),
         }
     }
-}
-
-/// Runtime counters enforcing Console WebSocket limits.
-#[derive(Debug)]
-pub(crate) struct ConsoleWsRuntime {
-    config: ConsoleWsConfig,
-    counts: Mutex<ConsoleWsCounts>,
-}
-
-impl Default for ConsoleWsRuntime {
-    fn default() -> Self {
-        Self::new(ConsoleWsConfig::default())
-    }
-}
-
-impl ConsoleWsRuntime {
-    /// Create a runtime counter set with bounded configuration.
-    pub(crate) fn new(config: ConsoleWsConfig) -> Self {
-        let config = config.bounded();
-        Self {
-            config,
-            counts: Mutex::new(ConsoleWsCounts::default()),
-        }
-    }
-
-    /// Return the bounded WebSocket configuration.
-    pub(crate) fn config(&self) -> &ConsoleWsConfig {
-        &self.config
-    }
-
-    /// Reserve one connection for a source address.
-    pub(crate) fn try_acquire_source(&self, source: &str) -> Result<(), ConsoleWsLimit> {
-        let mut counts = self.counts();
-        if counts.global >= self.config.max_connections_global {
-            return Err(ConsoleWsLimit::Global);
-        }
-        if count_for(&counts.by_source, source) >= self.config.max_connections_per_source {
-            return Err(ConsoleWsLimit::Source);
-        }
-        counts.global += 1;
-        increment(&mut counts.by_source, source);
-        Ok(())
-    }
-
-    /// Release a previously reserved source-address connection.
-    pub(crate) fn release_source(&self, source: &str) {
-        let mut counts = self.counts();
-        counts.global = counts.global.saturating_sub(1);
-        decrement(&mut counts.by_source, source);
-    }
-
-    /// Move a connection's per-user accounting from `current` to `next`.
-    pub(crate) fn try_replace_user(
-        &self,
-        current: Option<&str>,
-        next: &str,
-    ) -> Result<(), ConsoleWsLimit> {
-        if current == Some(next) {
-            return Ok(());
-        }
-        let mut counts = self.counts();
-        if count_for(&counts.by_user, next) >= self.config.max_connections_per_user {
-            return Err(ConsoleWsLimit::User);
-        }
-        if let Some(current) = current {
-            decrement(&mut counts.by_user, current);
-        }
-        increment(&mut counts.by_user, next);
-        Ok(())
-    }
-
-    /// Release one user-accounted connection.
-    pub(crate) fn release_user(&self, user: &str) {
-        let mut counts = self.counts();
-        decrement(&mut counts.by_user, user);
-    }
-
-    fn counts(&self) -> MutexGuard<'_, ConsoleWsCounts> {
-        match self.counts.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
-}
-
-/// WebSocket limit class that rejected a connection or authentication update.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ConsoleWsLimit {
-    /// Global connection limit reached.
-    Global,
-    /// Per-source connection limit reached.
-    Source,
-    /// Per-user connection limit reached.
-    User,
-}
-
-#[derive(Debug, Default)]
-struct ConsoleWsCounts {
-    global: usize,
-    by_source: HashMap<String, usize>,
-    by_user: HashMap<String, usize>,
-}
-
-fn count_for(counts: &HashMap<String, usize>, key: &str) -> usize {
-    counts.get(key).copied().unwrap_or(0)
-}
-
-fn increment(counts: &mut HashMap<String, usize>, key: &str) {
-    *counts.entry(key.to_string()).or_default() += 1;
-}
-
-fn decrement(counts: &mut HashMap<String, usize>, key: &str) {
-    if let Some(count) = counts.get_mut(key) {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            counts.remove(key);
-        }
-    }
-}
-
-fn clamp_duration(value: Duration, min: Duration, max: Duration) -> Duration {
-    value.max(min).min(max)
 }
 
 #[cfg(test)]
-mod tests {
+mod admission_tests {
     use super::*;
+    use anyhow::ensure;
 
     #[test]
-    fn ws_config_is_bounded_by_backend() {
-        let runtime = ConsoleWsRuntime::new(ConsoleWsConfig {
-            max_frame_bytes: usize::MAX,
-            max_connections_global: 0,
-            max_connections_per_source: usize::MAX,
-            max_connections_per_user: 0,
-            idle_timeout: Duration::ZERO,
-            max_frames_per_second: usize::MAX,
-            max_bytes_per_second: 1,
-            max_subscriptions: usize::MAX,
-            max_state_list_limit: 0,
-            max_fact_limit: 0,
-            max_trace_limit: usize::MAX,
-            max_pending_event_bytes: usize::MAX,
-            send_timeout: Duration::ZERO,
-        });
-        let cfg = runtime.config();
-        assert_eq!(cfg.max_frame_bytes, HARD_MAX_WS_FRAME_BYTES);
-        assert_eq!(cfg.max_connections_global, MIN_WS_CONNECTIONS_GLOBAL);
-        assert_eq!(
-            cfg.max_connections_per_source,
-            HARD_MAX_WS_CONNECTIONS_PER_SOURCE
-        );
-        assert_eq!(cfg.max_connections_per_user, MIN_WS_CONNECTIONS_PER_USER);
-        assert_eq!(cfg.idle_timeout, MIN_WS_IDLE_TIMEOUT);
-        assert_eq!(cfg.max_frames_per_second, HARD_MAX_WS_FRAMES_PER_SECOND);
-        assert_eq!(cfg.max_bytes_per_second, MIN_WS_MAX_BYTES_PER_SECOND);
-        assert_eq!(cfg.max_subscriptions, HARD_MAX_WS_SUBSCRIPTIONS);
-        assert_eq!(cfg.max_state_list_limit, MIN_WS_MAX_STATE_LIST_LIMIT);
-        assert_eq!(cfg.max_fact_limit, MIN_WS_MAX_FACT_LIMIT);
-        assert_eq!(cfg.max_trace_limit, HARD_MAX_WS_TRACE_LIMIT);
-        assert_eq!(cfg.max_pending_event_bytes, HARD_MAX_WS_PENDING_EVENT_BYTES);
-        assert_eq!(cfg.send_timeout, MIN_WS_SEND_TIMEOUT);
+    fn default_blocking_spawner_is_kernel_host_port() -> anyhow::Result<()> {
+        let boot = Arc::new(Bootstrap::in_memory());
+        let blocking_spawner = boot.kernel().host_runtime().blocking_spawner();
+        let state = ConsoleState::with_config(
+            boot,
+            ConsoleConfig {
+                session_store: Some(std::sync::Arc::new(
+                    crate::session_store::MemoryConsoleSessionStore::new(
+                        crate::session_store::ConsoleSessionPolicy::default(),
+                    ),
+                )),
+                ..Default::default()
+            },
+        )?;
+        ensure!(Arc::ptr_eq(&state.blocking_spawner, &blocking_spawner));
+        Ok(())
+    }
+
+    #[test]
+    fn shared_request_capacity_requires_an_explicit_valid_range() -> anyhow::Result<()> {
+        let boot = Arc::new(Bootstrap::in_memory());
+        for value in [0, 4097, usize::MAX] {
+            for field in ["max_concurrent_calls", "max_concurrent_authentications"] {
+                let mut config = ConsoleConfig {
+                    session_store: Some(std::sync::Arc::new(
+                        crate::session_store::MemoryConsoleSessionStore::new(
+                            crate::session_store::ConsoleSessionPolicy::default(),
+                        ),
+                    )),
+                    ..Default::default()
+                };
+                match field {
+                    "max_concurrent_calls" => config.max_concurrent_calls = value,
+                    _ => config.max_concurrent_authentications = value,
+                }
+                let Err(ConsoleConfigError::InvalidCapacity(rejected)) =
+                    ConsoleState::with_config(boot.clone(), config)
+                else {
+                    anyhow::bail!("invalid {field}={value} was accepted");
+                };
+                ensure!(rejected == field);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn configured_blocking_spawner_is_shared_with_console_state() -> anyhow::Result<()> {
+        let blocking_spawner: Arc<dyn BlockingSpawner> =
+            Arc::new(xolotl_kernel::host::TokioBlockingSpawner::default());
+        let state = ConsoleState::with_config(
+            Arc::new(Bootstrap::in_memory()),
+            ConsoleConfig {
+                session_store: Some(std::sync::Arc::new(
+                    crate::session_store::MemoryConsoleSessionStore::new(
+                        crate::session_store::ConsoleSessionPolicy::default(),
+                    ),
+                )),
+                blocking_spawner: Some(Arc::clone(&blocking_spawner)),
+                ..ConsoleConfig::default()
+            },
+        )?;
+        ensure!(Arc::ptr_eq(&state.blocking_spawner, &blocking_spawner));
+        Ok(())
     }
 }

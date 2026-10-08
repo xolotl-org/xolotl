@@ -16,10 +16,10 @@ use std::task::Poll;
 use std::time::Duration;
 use xolotl_kernel::{DriverOutput, host::stream::StreamItem};
 use xolotl_sdk::{
-    ExecutionOutput, Expression, Failure, InferenceBackend, ModelCapabilities, OperationTemplate,
-    Outcome, Path, PreparedProgram, Program, RequestProcess, ResourceName, StandardConfig,
-    StandardModule, StandardModules, TaintSet, TaintedValue, Transform, Value, Xolotl,
-    XolotlBuilder,
+    ExecutionOutput, Expression, Failure, InferenceBackend, KernelBuilder, ModelCapabilities,
+    OperationTemplate, Outcome, Path, PreparedProgram, Program, RequestProcess, ResourceName,
+    StandardConfig, StandardModule, StandardModules, TaintSet, TaintedValue, Transform, Value,
+    Xolotl,
 };
 use xolotl_standard::{Embedding, EmbeddingRepresentation, InferenceStream, RetrievalConfig};
 use xolotl_state::{Backend, InMemoryBackend, StatePage, StateQuery, StateResult, StateScan};
@@ -202,12 +202,14 @@ impl Fixture {
             )
             .with_retrieval(RetrievalConfig::default().with_work_quantum(NonZeroUsize::MIN))
             .with_inference_backend(model.clone());
-        let runtime = XolotlBuilder::new()
-            .with_state_backend(state.with_query(pages.clone()))
-            .with_process_capacity(NonZeroUsize::MIN.saturating_add(1))
-            .build_with_standard(&config)?;
-        let handles = runtime.bootstrap().kernel.handles.read().len();
-        let processes = runtime.bootstrap().kernel.processes.len();
+        let runtime = Xolotl::from_kernel(
+            KernelBuilder::new(state.with_query(pages.clone()))
+                .with_process_capacity(NonZeroUsize::MIN.saturating_add(1))
+                .build(),
+        );
+        runtime.install_standard(&config)?;
+        let handles = runtime.bootstrap().kernel().handles().len();
+        let processes = runtime.bootstrap().kernel().processes().len();
         let store = invoke(
             ResourceName::new(Path::parse("effect://memory/store")?),
             OutputMode::Unary,
@@ -246,20 +248,20 @@ impl Fixture {
     ) -> anyhow::Result<()> {
         let process = request.id();
         request.finish(output).await?;
-        let kernel = &self.runtime.bootstrap().kernel;
+        let kernel = self.runtime.bootstrap().kernel();
         ensure!(
             kernel
-                .processes
+                .processes()
                 .status(process)
                 .is_some_and(|status| status.is_terminal())
         );
         ensure!(
-            kernel.handles.read().len() == self.handles,
+            kernel.handles().len() == self.handles,
             "request retained capability handles"
         );
-        ensure!(kernel.processes.reap_finalized(1) == 1);
+        ensure!(kernel.processes().reap_finalized(1) == 1);
         ensure!(
-            kernel.processes.len() == self.processes,
+            kernel.processes().len() == self.processes,
             "completed request still occupies admission"
         );
         Ok(())
@@ -284,13 +286,15 @@ impl Fixture {
             let saved = self
                 .runtime
                 .bootstrap()
-                .kernel
-                .state
+                .kernel()
+                .state()
                 .read_tainted(&Path::parse(path)?)
-                .await?
-                .context("Memory did not persist its record")?;
-            let saved_fields = saved
+                .await?;
+            let saved_value = saved
                 .value
+                .clone()
+                .context("Memory did not persist its record")?;
+            let saved_fields = saved_value
                 .as_map()
                 .context("invalid stored memory record")?;
             ensure!(saved_fields.get("content").and_then(Value::as_str) == Some(text));
@@ -425,8 +429,8 @@ async fn prepared_rag_uses_real_retrieval_authority_and_stream_backpressure() ->
             fixture
                 .runtime
                 .bootstrap()
-                .kernel
-                .state
+                .kernel()
+                .state()
                 .read(&Path::parse("state://memory/rag/notes/coffee")?)
                 .await?
                 .is_none()

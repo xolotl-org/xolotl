@@ -1,0 +1,29 @@
+[package]
+name = "xolotl-federation-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Live federation call integration for embedded Xolotl kernels"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true, default-features = false }
+sha2 = { workspace = true, default-features = false }
+tokio = { workspace = true, default-features = false, features = ["sync", "rt", "time"] }
+tracing = { workspace = true, default-features = false, features = ["std"] }
+xolotl-federation.workspace = true
+xolotl-kernel = { workspace = true, features = ["host"] }
+xolotl-types.workspace = true
+
+[dev-dependencies]
+anyhow = { workspace = true, default-features = false, features = ["std"] }
+xolotl-federation = { workspace = true }
+xolotl-sdk = { workspace = true, features = ["host", "memory"] }
+xolotl-storage-redb = { workspace = true, features = ["federation"] }
+tempfile = { workspace = true, default-features = false, features = ["getrandom"] }
+tokio = { workspace = true, default-features = false, features = ["macros", "rt-multi-thread", "test-util"] }

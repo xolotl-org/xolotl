@@ -1,12 +1,11 @@
-//! `Do<A>` — the preferred, serializable Program front-end.
+//! `Do<A>` — the native graph program front-end.
 //!
 //! `Do<A>` is a computation AST that **compiles into** an
 //! [`ExecutionGraph`](crate::graph::ExecutionGraph). The Executor runs the
-//! compiled graph, see [`crate::compile`]. `Do<A>` exists because async call
-//! stacks are unserializable, unrecoverable, and unfit for model-generated
-//! plans.
+//! compiled graph, see [`crate::compile`]. Explicit control flow makes
+//! composition inspectable and keeps host-bound continuations named.
 //!
-//! Nine combinators, each with a fixed graph-compilation rule. Steps
+//! Combinators have fixed graph-compilation rules. Steps
 //! are **named, pure** `Value -> Do<A>` continuations. Named continuations are
 //! serializable and avoid cross-identity code injection.
 
@@ -22,7 +21,7 @@ use xolotl_types::{CapError, Capability, Failure, Path, PathError, ProcessId, Va
 /// The nine combinators plus an `Op` leaf and a `Wait` leaf. Erased
 /// over the `A` type parameter — the kernel validates the Outcome shape at the
 /// boundary, the AST itself flows as data.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DoNode {
     /// `Pure :: A -> Do<A>` — lift a value.
@@ -40,6 +39,15 @@ pub enum DoNode {
         d: Box<DoNode>,
         /// Named recovery step invoked with the failure value.
         or: StepRef,
+    },
+    /// Run cleanup after the body succeeds, fails, or is cooperatively cancelled.
+    /// Cleanup receives the body's original input; the body's result is preserved
+    /// unless cleanup fails after a successful body.
+    Finally {
+        /// Guarded program.
+        body: Box<DoNode>,
+        /// Cleanup program.
+        cleanup: Box<DoNode>,
     },
     /// Run both; result is the pair.
     Both(Box<DoNode>, Box<DoNode>),
@@ -69,6 +77,136 @@ pub enum DoNode {
     Wait(WaitSpec),
     /// The side-effecting leaf: issue one Operation.
     Op(OperationTemplate),
+}
+
+impl Clone for DoNode {
+    /// Clone native control flow with an explicit work stack. Payload cloning
+    /// retains the contracts of Value, Failure, and the operation/step types.
+    fn clone(&self) -> Self {
+        let empty = || Box::new(Self::wait_deadline(0));
+        let mut cloned = Self::wait_deadline(0);
+        let mut pending = alloc::vec![(self, &mut cloned)];
+        while let Some((source, destination)) = pending.pop() {
+            *destination = match source {
+                Self::Pure(value) => Self::Pure(value.clone()),
+                Self::Fail(failure) => Self::Fail(failure.clone()),
+                Self::Op(operation) => Self::Op(operation.clone()),
+                Self::Wait(spec) => Self::Wait(spec.clone()),
+                Self::Use(name) => Self::Use(name.clone()),
+                Self::AndThen { then, .. } => Self::AndThen {
+                    d: empty(),
+                    then: then.clone(),
+                },
+                Self::OrElse { or, .. } => Self::OrElse {
+                    d: empty(),
+                    or: or.clone(),
+                },
+                Self::Acting { identity, .. } => Self::Acting {
+                    identity: identity.clone(),
+                    body: empty(),
+                },
+                Self::Finally { .. } => Self::Finally {
+                    body: empty(),
+                    cleanup: empty(),
+                },
+                Self::Let { name, .. } => Self::Let {
+                    name: name.clone(),
+                    value: empty(),
+                    body: empty(),
+                },
+                Self::Both(..) => Self::Both(empty(), empty()),
+                Self::Race(..) => Self::Race(empty(), empty()),
+            };
+            match (source, destination) {
+                (Self::AndThen { d: source, .. }, Self::AndThen { d: destination, .. })
+                | (Self::OrElse { d: source, .. }, Self::OrElse { d: destination, .. })
+                | (
+                    Self::Acting { body: source, .. },
+                    Self::Acting {
+                        body: destination, ..
+                    },
+                ) => {
+                    pending.push((source.as_ref(), destination.as_mut()));
+                }
+                (
+                    Self::Finally {
+                        body: left,
+                        cleanup: right,
+                    },
+                    Self::Finally {
+                        body: cloned_left,
+                        cleanup: cloned_right,
+                    },
+                )
+                | (
+                    Self::Let {
+                        value: left,
+                        body: right,
+                        ..
+                    },
+                    Self::Let {
+                        value: cloned_left,
+                        body: cloned_right,
+                        ..
+                    },
+                )
+                | (Self::Both(left, right), Self::Both(cloned_left, cloned_right))
+                | (Self::Race(left, right), Self::Race(cloned_left, cloned_right)) => {
+                    pending.push((right.as_ref(), cloned_right.as_mut()));
+                    pending.push((left.as_ref(), cloned_left.as_mut()));
+                }
+                _ => {}
+            }
+        }
+        cloned
+    }
+}
+
+impl crate::source_release::SourceTree for DoNode {
+    fn has_children(&self) -> bool {
+        match self {
+            Self::AndThen { .. }
+            | Self::OrElse { .. }
+            | Self::Finally { .. }
+            | Self::Both(..)
+            | Self::Race(..)
+            | Self::Let { .. }
+            | Self::Acting { .. } => true,
+            Self::Pure(_) | Self::Use(_) | Self::Fail(_) | Self::Wait(_) | Self::Op(_) => false,
+        }
+    }
+
+    fn empty() -> Self {
+        Self::Wait(WaitSpec::Deadline(0))
+    }
+
+    fn detach_children(&mut self, pending: &mut Vec<Self>) {
+        use crate::source_release::detach;
+        match self {
+            Self::AndThen { d, .. } | Self::OrElse { d, .. } | Self::Acting { body: d, .. } => {
+                detach(d.as_mut(), pending)
+            }
+            Self::Finally { body, cleanup } => {
+                detach(body.as_mut(), pending);
+                detach(cleanup.as_mut(), pending);
+            }
+            Self::Let { value, body, .. } => {
+                detach(value.as_mut(), pending);
+                detach(body.as_mut(), pending);
+            }
+            Self::Both(left, right) | Self::Race(left, right) => {
+                detach(left.as_mut(), pending);
+                detach(right.as_mut(), pending);
+            }
+            Self::Pure(_) | Self::Use(_) | Self::Fail(_) | Self::Wait(_) | Self::Op(_) => {}
+        }
+    }
+}
+
+impl Drop for DoNode {
+    fn drop(&mut self) {
+        crate::source_release::release(self);
+    }
 }
 
 impl DoNode {
@@ -108,6 +246,14 @@ impl DoNode {
         DoNode::OrElse {
             d: Box::new(self),
             or,
+        }
+    }
+
+    /// Run `cleanup` on every cooperative exit from this program.
+    pub fn finally(self, cleanup: DoNode) -> Self {
+        DoNode::Finally {
+            body: Box::new(self),
+            cleanup: Box::new(cleanup),
         }
     }
 
@@ -152,21 +298,17 @@ impl DoNode {
         DoNode::Wait(WaitSpec::Deadline(at_millis))
     }
 
-    /// Bracket pattern: acquire → use → release-on-any-exit. `release`
-    /// runs whether `body_step` succeeds or fails, like try-finally.
+    /// Acquire a value, pass it to `body_step`, then pass the acquired value
+    /// to `release_step` on every cooperative exit. The body result is retained.
     pub fn bracket(acquire: DoNode, body_step: StepRef, release_step: StepRef) -> Self {
-        DoNode::Let {
-            name: "__bracket_resource".into(),
-            value: Box::new(acquire),
-            body: Box::new(DoNode::OrElse {
-                d: Box::new(
-                    DoNode::Use("__bracket_resource".into())
-                        .and_then(body_step)
-                        .and_then(release_step.clone()),
-                ),
-                or: release_step,
-            }),
-        }
+        let resource = "__bracket_resource";
+        DoNode::r#let(
+            resource,
+            acquire,
+            DoNode::use_(resource)
+                .and_then(body_step)
+                .finally(DoNode::use_(resource).and_then(release_step)),
+        )
     }
 
     /// Bounded `retry`: desugars to a chain of [`OrElse`](DoNode::OrElse) so
@@ -194,24 +336,102 @@ impl DoNode {
 
     /// Number of AST nodes (budget / complexity heuristic).
     pub fn size(&self) -> usize {
-        match self {
-            DoNode::Pure(_)
-            | DoNode::Use(_)
-            | DoNode::Fail(_)
-            | DoNode::Wait(_)
-            | DoNode::Op(_) => 1,
-            DoNode::AndThen { d, .. }
-            | DoNode::OrElse { d, .. }
-            | DoNode::Acting { body: d, .. } => 1 + d.size(),
-            DoNode::Let { value, body, .. } => 1 + value.size() + body.size(),
-            DoNode::Both(a, b) | DoNode::Race(a, b) => 1 + a.size() + b.size(),
+        let mut count = 0;
+        let mut pending = alloc::vec![self];
+        while let Some(node) = pending.pop() {
+            count += 1;
+            match node {
+                DoNode::AndThen { d, .. }
+                | DoNode::OrElse { d, .. }
+                | DoNode::Acting { body: d, .. } => pending.push(d),
+                DoNode::Finally { body, cleanup } => {
+                    pending.push(cleanup);
+                    pending.push(body);
+                }
+                DoNode::Let { value, body, .. } => {
+                    pending.push(body);
+                    pending.push(value);
+                }
+                DoNode::Both(a, b) | DoNode::Race(a, b) => {
+                    pending.push(b);
+                    pending.push(a);
+                }
+                DoNode::Pure(_)
+                | DoNode::Use(_)
+                | DoNode::Fail(_)
+                | DoNode::Wait(_)
+                | DoNode::Op(_) => {}
+            }
         }
+        count
+    }
+
+    /// Whether any branch exceeds `max` nested nodes, counting the root as one.
+    /// Uses an explicit work stack so admission itself handles deep input.
+    pub fn exceeds_depth(&self, max: usize) -> bool {
+        if max == 0 {
+            return true;
+        }
+        if !crate::source_release::SourceTree::has_children(self) {
+            return false;
+        }
+        let mut pending = alloc::vec![(self, 1usize)];
+        while let Some((node, depth)) = pending.pop() {
+            if depth > max {
+                return true;
+            }
+            let child_depth = depth + 1;
+            match node {
+                DoNode::AndThen { d, .. }
+                | DoNode::OrElse { d, .. }
+                | DoNode::Acting { body: d, .. } => pending.push((d, child_depth)),
+                DoNode::Finally { body, cleanup } => {
+                    pending.push((cleanup, child_depth));
+                    pending.push((body, child_depth));
+                }
+                DoNode::Let { value, body, .. } => {
+                    pending.push((body, child_depth));
+                    pending.push((value, child_depth));
+                }
+                DoNode::Both(a, b) | DoNode::Race(a, b) => {
+                    pending.push((b, child_depth));
+                    pending.push((a, child_depth));
+                }
+                DoNode::Pure(_)
+                | DoNode::Use(_)
+                | DoNode::Fail(_)
+                | DoNode::Wait(_)
+                | DoNode::Op(_) => {}
+            }
+        }
+        false
     }
 
     /// Walk every `Op` leaf in evaluation order (linters / tests).
     pub fn ops(&self) -> Vec<&OperationTemplate> {
         let mut out = Vec::new();
-        self.collect_ops(&mut out);
+        let mut pending = alloc::vec![self];
+        while let Some(node) = pending.pop() {
+            match node {
+                DoNode::Op(template) => out.push(template),
+                DoNode::AndThen { d, .. }
+                | DoNode::OrElse { d, .. }
+                | DoNode::Acting { body: d, .. } => pending.push(d),
+                DoNode::Finally { body, cleanup } => {
+                    pending.push(cleanup);
+                    pending.push(body);
+                }
+                DoNode::Let { value, body, .. } => {
+                    pending.push(body);
+                    pending.push(value);
+                }
+                DoNode::Both(a, b) | DoNode::Race(a, b) => {
+                    pending.push(b);
+                    pending.push(a);
+                }
+                DoNode::Pure(_) | DoNode::Use(_) | DoNode::Fail(_) | DoNode::Wait(_) => {}
+            }
+        }
         out
     }
 
@@ -225,45 +445,37 @@ impl DoNode {
     }
 
     fn bind_process_paths(&mut self, process: ProcessId) -> Result<(), PathError> {
-        match self {
-            DoNode::AndThen { d, .. }
-            | DoNode::OrElse { d, .. }
-            | DoNode::Acting { body: d, .. } => d.bind_process_paths(process),
-            DoNode::Both(left, right) | DoNode::Race(left, right) => {
-                left.bind_process_paths(process)?;
-                right.bind_process_paths(process)
+        let mut pending = alloc::vec![self];
+        while let Some(node) = pending.pop() {
+            match node {
+                DoNode::AndThen { d, .. }
+                | DoNode::OrElse { d, .. }
+                | DoNode::Acting { body: d, .. } => pending.push(d),
+                DoNode::Finally { body, cleanup } => {
+                    pending.push(cleanup);
+                    pending.push(body);
+                }
+                DoNode::Both(left, right) | DoNode::Race(left, right) => {
+                    pending.push(right);
+                    pending.push(left);
+                }
+                DoNode::Let { value, body, .. } => {
+                    pending.push(body);
+                    pending.push(value);
+                }
+                DoNode::Wait(WaitSpec::Signal(path)) => {
+                    bind_process_self_path_in_place(path, process)?;
+                }
+                DoNode::Op(template) => {
+                    bind_process_self_path_in_place(&mut template.target.0, process)?;
+                }
+                DoNode::Pure(_)
+                | DoNode::Use(_)
+                | DoNode::Fail(_)
+                | DoNode::Wait(WaitSpec::Deadline(_)) => {}
             }
-            DoNode::Let { value, body, .. } => {
-                value.bind_process_paths(process)?;
-                body.bind_process_paths(process)
-            }
-            DoNode::Wait(WaitSpec::Signal(path)) => bind_process_self_path_in_place(path, process),
-            DoNode::Op(template) => {
-                bind_process_self_path_in_place(&mut template.target.0, process)
-            }
-            DoNode::Pure(_)
-            | DoNode::Use(_)
-            | DoNode::Fail(_)
-            | DoNode::Wait(WaitSpec::Deadline(_)) => Ok(()),
         }
-    }
-
-    fn collect_ops<'a>(&'a self, out: &mut Vec<&'a OperationTemplate>) {
-        match self {
-            DoNode::Op(t) => out.push(t),
-            DoNode::AndThen { d, .. }
-            | DoNode::OrElse { d, .. }
-            | DoNode::Acting { body: d, .. } => d.collect_ops(out),
-            DoNode::Let { value, body, .. } => {
-                value.collect_ops(out);
-                body.collect_ops(out);
-            }
-            DoNode::Both(a, b) | DoNode::Race(a, b) => {
-                a.collect_ops(out);
-                b.collect_ops(out);
-            }
-            DoNode::Pure(_) | DoNode::Use(_) | DoNode::Fail(_) | DoNode::Wait(_) => {}
-        }
+        Ok(())
     }
 }
 
@@ -353,7 +565,7 @@ mod tests {
     #[test]
     fn map_builds_and_then() -> anyhow::Result<()> {
         let d = DoNode::op(op("effect://x/post")?).map(s("project"));
-        match d {
+        match &d {
             DoNode::AndThen { then, .. } => {
                 ensure!(then.name == "project", "unexpected step: {:?}", then.name);
             }
@@ -372,14 +584,14 @@ mod tests {
     #[test]
     fn retry_nests_or_else() -> anyhow::Result<()> {
         let d = DoNode::op(op("effect://x")?).retry(2, s("again"));
-        match d {
+        match &d {
             DoNode::OrElse { d: outer_d, or } => {
                 ensure!(or.name == "again", "unexpected outer step: {:?}", or.name);
-                match *outer_d {
+                match outer_d.as_ref() {
                     DoNode::OrElse { d: inner_d, or } => {
                         ensure!(or.name == "again", "unexpected inner step: {:?}", or.name);
                         ensure!(
-                            matches!(*inner_d, DoNode::Op(_)),
+                            matches!(inner_d.as_ref(), DoNode::Op(_)),
                             "unexpected retry body: {inner_d:?}"
                         );
                     }
@@ -414,6 +626,40 @@ mod tests {
         let s = serde_json::to_string(&d)?;
         let back: DoNode = serde_json::from_str(&s)?;
         ensure!(d == back, "round trip changed node: {back:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn clone_preserves_all_native_variants_on_small_stack() -> anyhow::Result<()> {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let mut program = DoNode::pure(Value::bytes(vec![0, 255]));
+                for index in 0..2000 {
+                    program = match index % 7 {
+                        0 => program.and_then(s("next").with_arg(Value::null())),
+                        1 => program.or_else(s("recover").with_arg(Value::integer(index))),
+                        2 => program.finally(DoNode::fail(Failure::Cancelled)),
+                        3 => DoNode::both(program, DoNode::op(op("effect://clone/invoke")?)),
+                        4 => DoNode::race(DoNode::wait_deadline(index), program),
+                        5 => DoNode::r#let(
+                            "local",
+                            DoNode::pure(index),
+                            DoNode::both(program, DoNode::use_("local")),
+                        ),
+                        _ => DoNode::acting(Path::parse("identity://clone/inner")?, program),
+                    };
+                }
+                let cloned = program.clone();
+                ensure!(cloned.size() == program.size());
+                ensure!(
+                    crate::compile_do(&cloned)?.graph_hash
+                        == crate::compile_do(&program)?.graph_hash
+                );
+                Ok::<_, anyhow::Error>(())
+            })?
+            .join()
+            .map_err(|_panic| anyhow::anyhow!("small-stack clone panicked"))??;
         Ok(())
     }
 
@@ -458,8 +704,8 @@ mod tests {
             target == "state://process/42/scratch",
             "unexpected bound op target: {target}"
         );
-        match bound {
-            DoNode::Both(_, right) => match *right {
+        match &bound {
+            DoNode::Both(_, right) => match right.as_ref() {
                 DoNode::Wait(WaitSpec::Signal(path)) => {
                     ensure!(
                         path.to_string() == "state://process/42/signal",
@@ -493,11 +739,12 @@ mod tests {
             d: body,
             then: StepRef::new("finish").with_arg(Value::bytes(argument)),
         };
-        let DoNode::AndThen { d, then } = node.bind_process_local_refs(ProcessId::new(42))? else {
+        let bound = node.bind_process_local_refs(ProcessId::new(42))?;
+        let DoNode::AndThen { d, then } = &bound else {
             bail!("binding changed the program shape");
         };
         ensure!(std::ptr::from_ref(d.as_ref()) == body_ptr);
-        let DoNode::Op(operation) = *d else {
+        let DoNode::Op(operation) = d.as_ref() else {
             bail!("binding changed the operation");
         };
         ensure!(operation.target.path().to_string() == "state://process/42/scratch");

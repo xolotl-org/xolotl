@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, watch};
 use tokio::time::{Instant, Sleep};
 use tonic::Status;
@@ -55,16 +55,15 @@ impl RequestEvidence {
     }
 }
 
-/// Both clocks are captured at HTTP admission, before decoding or authentication.
+/// Transport lifetime captured at HTTP admission, before decoding or authentication.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct RpcDeadline {
     instant: Instant,
-    unix_ms: u64,
 }
 
 impl RpcDeadline {
-    pub(super) fn unix_ms(self) -> u64 {
-        self.unix_ms
+    pub(super) fn remaining(self) -> Duration {
+        self.instant.saturating_duration_since(Instant::now())
     }
 
     fn from_headers(headers: &http::HeaderMap) -> Result<Option<Self>, Status> {
@@ -82,15 +81,7 @@ impl RpcDeadline {
         let instant = Instant::now()
             .checked_add(duration)
             .ok_or_else(|| Status::invalid_argument("grpc-timeout is out of range"))?;
-        let wall = SystemTime::now()
-            .checked_add(duration)
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .ok_or_else(|| Status::invalid_argument("grpc-timeout is out of range"))?;
-        // The Gateway uses millisecond deadlines. Round up so converting its
-        // clock cannot expire a sub-millisecond RPC before the exact timer.
-        let unix_ms = u64::try_from(wall.as_nanos().div_ceil(1_000_000))
-            .map_err(|_error| Status::invalid_argument("grpc-timeout is out of range"))?;
-        Ok(Some(Self { instant, unix_ms }))
+        Ok(Some(Self { instant }))
     }
 }
 
@@ -118,22 +109,45 @@ fn parse_grpc_timeout(text: &str) -> Result<Duration, Status> {
 }
 
 /// Tonic preserves response extensions while constructing its encoded Body.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(super) struct ResponsePermit {
     _permit: Arc<OwnedSemaphorePermit>,
+    access: Option<Arc<dyn Fn() -> Result<(), Status> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ResponsePermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResponsePermit")
+            .field("protected", &self.access.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ResponsePermit {
     pub(super) fn new(permit: OwnedSemaphorePermit) -> Self {
         Self {
             _permit: Arc::new(permit),
+            access: None,
         }
+    }
+
+    pub(super) fn with_access(
+        mut self,
+        access: impl Fn() -> Result<(), Status> + Send + Sync + 'static,
+    ) -> Self {
+        self.access = Some(Arc::new(access));
+        self
+    }
+
+    fn validate_access(&self) -> Result<(), Status> {
+        self.access.as_ref().map_or(Ok(()), |access| access())
     }
 }
 
 struct ResponseBytes {
     bytes: Bytes,
-    _permit: ResponsePermit,
+    _permit: Arc<OwnedSemaphorePermit>,
 }
 
 impl AsRef<[u8]> for ResponseBytes {
@@ -330,6 +344,9 @@ impl Body for ResponseBody {
         if let Poll::Ready(status) = this.lifecycle.poll_status(cx) {
             return Poll::Ready(Some(this.close(status)));
         }
+        if let Err(status) = this.permit.validate_access() {
+            return Poll::Ready(Some(this.close(status)));
+        }
         let Some(inner) = &mut this.inner else {
             this.ended = true;
             return Poll::Ready(None);
@@ -342,6 +359,9 @@ impl Body for ResponseBody {
         }
         match frame {
             Poll::Ready(Some(Ok(frame))) => {
+                if let Err(status) = this.permit.validate_access() {
+                    return Poll::Ready(Some(this.close(status)));
+                }
                 if frame.is_trailers() {
                     this.ended = true;
                     this.inner = None;
@@ -351,7 +371,7 @@ impl Body for ResponseBody {
                 Poll::Ready(Some(Ok(frame.map_data(|bytes| {
                     Bytes::from_owner(ResponseBytes {
                         bytes,
-                        _permit: this.permit.clone(),
+                        _permit: this.permit._permit.clone(),
                     })
                 }))))
             }

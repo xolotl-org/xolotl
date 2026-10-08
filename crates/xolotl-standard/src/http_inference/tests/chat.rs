@@ -198,6 +198,58 @@ async fn router_from_state_rejects_path_id_mismatch() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn router_from_state_rejects_non_direct_declaration_paths() -> anyhow::Result<()> {
+    for (path, id) in [
+        (
+            "state://kernel/inference/backends/nested/deepseek",
+            "deepseek",
+        ),
+        ("state://kernel/inference/backends/deep.seek", "deep.seek"),
+    ] {
+        let state: Backend = xolotl_state::InMemoryBackend::new().into_backend();
+        write_state_value(
+            &state,
+            path,
+            state_value(&InferenceBackendDef {
+                id: id.into(),
+                dialect: HttpInferenceDialect::OpenAiChatCompletions,
+                base_url: "https://api.example.com".into(),
+                auth: InferenceAuthRef::None,
+                default_headers: BTreeMap::new(),
+                request_overrides: BTreeMap::new(),
+                api_version: None,
+                io_window_bytes: None,
+                response_limits: Default::default(),
+                version: 0,
+            })?,
+        )
+        .await?;
+        write_state_value(
+            &state,
+            "state://kernel/inference/models/demo",
+            state_value(&InferenceModelDef {
+                id: "demo".into(),
+                backend_id: id.into(),
+                provider_model: "demo".into(),
+                embedding_model: None,
+                capabilities: InferenceModelCapabilities::default(),
+                weight: 1,
+                version: 0,
+            })?,
+        )
+        .await?;
+
+        let Err(HttpInferenceError::StatePath { path: rejected, .. }) =
+            router_from_state(&state).await
+        else {
+            bail!("non-direct inference declaration {path} was not rejected at its path");
+        };
+        ensure!(rejected == path);
+    }
+    Ok(())
+}
+
 #[test]
 fn config_rejects_reserved_headers_and_request_fields() -> anyhow::Result<()> {
     let mut cfg = bearer_config(HttpInferenceDialect::OpenAiChatCompletions);

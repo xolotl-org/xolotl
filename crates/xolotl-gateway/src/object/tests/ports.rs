@@ -122,7 +122,7 @@ impl ObjectRead for ProbeStore {
             let mut metadata = self.inner.metadata(blob).await?;
             if let Some(metadata) = &mut metadata {
                 match self.metadata_reply {
-                    MetadataReply::WrongHash => metadata.blob.hash = "a".repeat(64),
+                    MetadataReply::WrongHash => metadata.blob.hash = "a".repeat(96),
                     MetadataReply::WrongSize => metadata.blob.size += 1,
                     MetadataReply::WrongMime => metadata.blob.mime = Some("text/plain".into()),
                     _ => {}

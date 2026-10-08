@@ -5,12 +5,14 @@ use anyhow::{Context, ensure};
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use xolotl_kernel::host::stream::{StreamItem, channel};
 use xolotl_kernel::stream::StreamWindow;
-use xolotl_kernel::{Bootstrap, CompiledRequestGrantTemplate, FactSink, InvocationOptions, Kernel};
+use xolotl_kernel::{
+    Bootstrap, CompiledRequestGrantTemplate, FactSink, InvocationOptions, KernelBuilder,
+};
 use xolotl_standard::{StandardConfig, StandardModule, StandardModules, install_standard};
 use xolotl_state::{InMemoryBackend, InMemoryOptions, MemoryHistory};
 use xolotl_types::{
-    DecisionTag, ExecutionOutput, IdentityRef, InvocationId, MethodBitmap, MethodId, NodeId,
-    Operation, OperationId, Outcome, OutputMode, Path, ProcessStatus, ResourceName,
+    DecisionTag, ExecutionOutput, GrantMethods, GrantRights, IdentityRef, InvocationId, MethodId,
+    NodeId, Operation, OperationId, Outcome, OutputMode, Path, ProcessStatus, ResourceName,
     ResourceSelector, TaintSet, TaintSource, UsageDimension, Value,
 };
 
@@ -36,7 +38,10 @@ impl ProviderCase {
             resource: ResourceName::new(Path::parse("effect://inference/infer")?),
             grants: [CompiledRequestGrantTemplate {
                 selector: ResourceSelector::parse("perform://effect/inference/infer")?,
-                methods: MethodBitmap::method(0),
+                rights: GrantRights::new(
+                    GrantMethods::name("invoke"),
+                    xolotl_types::RightFlags::empty(),
+                ),
             }],
             standard: StandardConfig::default()
                 .with_modules(StandardModules::none().with(StandardModule::Inference)),
@@ -61,12 +66,14 @@ impl ProviderCase {
         let (facts, store) = FactSink::in_memory();
         let weak_facts = Arc::downgrade(&store);
         drop(store);
-        let boot = Bootstrap::from_kernel(Kernel::with_backends(state, facts));
-        boot.kernel
-            .processes
-            .set_capacity(Some(NonZeroUsize::MIN.saturating_add(1)))?;
+        let boot = Bootstrap::from_kernel(
+            KernelBuilder::new(state)
+                .with_fact_sink(facts)
+                .with_process_capacity(NonZeroUsize::MIN.saturating_add(1))
+                .build(),
+        );
         install_standard(&boot, &self.standard)?;
-        let weak_handles = Arc::downgrade(&boot.kernel.handles);
+        let weak_handles = boot.kernel().handles().downgrade();
         // The raw listener is a fixture; its registration and accepted socket
         // belong to this sample. No detached server task survives either branch.
         let listener = tokio::net::TcpListener::from_std(self.listener.try_clone()?)?;
@@ -74,7 +81,7 @@ impl ProviderCase {
             http::serve(listener, config.work.get(), config.window.get()),
             self.invoke(&boot, config),
         )?;
-        ensure!(boot.kernel.processes.len() == 1 && boot.kernel.handles.read().is_empty());
+        ensure!(boot.kernel().processes().len() == 1 && boot.kernel().handles().is_empty());
         drop(boot);
         ensure!(
             weak_handles.upgrade().is_none() && weak_facts.upgrade().is_none(),
@@ -88,12 +95,12 @@ impl ProviderCase {
     }
 
     async fn invoke(&self, boot: &Bootstrap, config: &Config) -> anyhow::Result<()> {
-        let request = boot.request_under(boot.root, IdentityRef::ROOT, &self.grants)?;
+        let request = boot.request_under(boot.root(), IdentityRef::ROOT, &self.grants)?;
         let process = request.id();
         let operation = Operation {
             id: OperationId::new(
                 process,
-                boot.kernel.execution_ids().allocate()?,
+                boot.kernel().execution_ids().allocate()?,
                 InvocationId::new(1),
                 NodeId::new(0),
                 0,
@@ -112,18 +119,25 @@ impl ProviderCase {
             max_inline_bytes: config.window,
         });
         let weak_sink = Arc::downgrade(&sink);
-        let data_plane = boot.kernel.data_plane();
+        let data_plane = boot.kernel().data_plane();
         let call = async {
             let output = data_plane
                 .execute_with_stream(
                     &operation,
                     InvocationOptions {
+                        caller_identity: None,
                         now_millis: 0,
                         record: true,
                     },
                     sink,
                 )
                 .await;
+            ensure!(
+                output.completion_error.is_none(),
+                "provider completion failed: {:?}",
+                output.completion_error
+            );
+            let output = output.output;
             ensure!(
                 output.outcome == Outcome::Done(Value::null()),
                 "provider invocation failed: {:?}",
@@ -173,8 +187,8 @@ impl ProviderCase {
             "provider retained its stream owner"
         );
         let fact = boot
-            .kernel
-            .facts
+            .kernel()
+            .facts()
             .get(operation.id)?
             .context("missing provider Fact")?;
         ensure!(
@@ -185,8 +199,8 @@ impl ProviderCase {
         );
         let completed = ExecutionOutput::new(output.outcome, output.taint);
         request.finish(&completed).await?;
-        ensure!(boot.kernel.processes.status(process) == Some(ProcessStatus::Completed));
-        ensure!(boot.kernel.processes.reap_finalized(1) == 1);
+        ensure!(boot.kernel().processes().status(process) == Some(ProcessStatus::Completed));
+        ensure!(boot.kernel().processes().reap_finalized(1) == 1);
         drop((data_plane, operation, completed, fact, weak_sink));
         Ok(())
     }

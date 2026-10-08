@@ -12,6 +12,9 @@ pub enum Transport {
     /// In-process provider.
     #[default]
     InProcess,
+    /// Host-owned endpoint routed through an admitted external session.
+    /// The live session may use any supported wire transport.
+    HostSession,
     /// gRPC provider endpoint.
     Grpc {
         /// Optional endpoint override.

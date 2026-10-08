@@ -55,9 +55,11 @@ impl ObjectRead for Reader {
                 host: "tensor.example".into(),
             })
         } else {
-            TaintSet::of(TaintSource::Protected {
-                path: xolotl_types::Path::new("state"),
-            })
+            let path = match xolotl_types::Path::try_new("state") {
+                Ok(path) => path,
+                Err(error) => return ready(Err(StateError::Backend(error.to_string()).into())),
+            };
+            TaintSet::of(TaintSource::Protected { path })
         };
         ready(Ok(ObjectReadChunk {
             bytes_read,
@@ -74,7 +76,7 @@ fn fixture(
     fail_at: Option<u64>,
 ) -> (TensorRef, Arc<Reader>) {
     let blob = BlobRef {
-        hash: blake3::hash(&bytes).to_hex().to_string(),
+        hash: content_digest(&bytes),
         size: bytes.len() as u64,
         mime: Some("application/x-xolotl-tensor".into()),
     };

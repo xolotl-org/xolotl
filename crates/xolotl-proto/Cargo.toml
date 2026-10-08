@@ -11,14 +11,21 @@ description.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Typed client/server bindings over a caller-supplied gRPC service.
+grpc = ["dep:tonic", "dep:tonic-prost"]
+# Built-in tonic channels and the clients' `connect` constructors.
+transport = ["grpc", "tonic/transport"]
+
 [dependencies]
 xolotl-graph.workspace = true
 xolotl-types.workspace = true
 serde_json = { workspace = true, features = ["std"] }
 prost = { workspace = true, default-features = false, features = ["derive", "std"] }
 thiserror = { workspace = true, default-features = false, features = ["std"] }
-tonic = { workspace = true, default-features = false, features = ["codegen", "router", "transport"] }
-tonic-prost = { workspace = true, default-features = false }
+tonic = { workspace = true, default-features = false, features = ["codegen"], optional = true }
+tonic-prost = { workspace = true, default-features = false, optional = true }
 
 [dev-dependencies]
 anyhow = { workspace = true, default-features = false, features = ["std"] }

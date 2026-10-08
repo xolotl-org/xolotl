@@ -6,6 +6,118 @@ use super::*;
 
 const FRAME_LIMIT: usize = 64 * 1024;
 
+#[test]
+fn lookup_requires_explicit_identity_and_preserves_the_original_scope_and_epoch() -> Result<()> {
+    ensure!(lookup_request_from_pb(pb::LookupRequestRequest::default()).is_err());
+    for identity in [
+        pb::lookup_request_request::Identity::IdempotencyKey("original-key".into()),
+        pb::lookup_request_request::Identity::SubmissionToken("original-token".into()),
+    ] {
+        let lookup = lookup_request_from_pb(pb::LookupRequestRequest {
+            surface_id: "infer".into(),
+            expected_request_scope: "original-scope".into(),
+            retry_epoch: u64::MAX,
+            identity: Some(identity.clone()),
+        })?;
+        ensure!(lookup.surface_id == "infer");
+        ensure!(lookup.expected_request_scope == "original-scope");
+        ensure!(lookup.retry_epoch == u64::MAX);
+        ensure!(match identity {
+            pb::lookup_request_request::Identity::IdempotencyKey(key) => {
+                lookup.identity == GatewayRequestIdentity::IdempotencyKey(key)
+            }
+            pb::lookup_request_request::Identity::SubmissionToken(token) => {
+                lookup.identity == GatewayRequestIdentity::SubmissionToken(token)
+            }
+        });
+    }
+    Ok(())
+}
+
+#[test]
+fn lookup_evidence_preserves_uncertainty_and_charges_its_outer_envelope() -> Result<()> {
+    use pb::lookup_request_response::Evidence;
+    ensure!(matches!(
+        lookup_response_to_pb(GatewayRequestEvidence::Unproven, FRAME_LIMIT)?.evidence,
+        Some(Evidence::Unproven(_))
+    ));
+    ensure!(matches!(
+        lookup_response_to_pb(GatewayRequestEvidence::Reserved, FRAME_LIMIT)?.evidence,
+        Some(Evidence::Reserved(_))
+    ));
+    ensure!(matches!(
+        lookup_response_to_pb(GatewayRequestEvidence::Retired, FRAME_LIMIT)?.evidence,
+        Some(Evidence::Retired(_))
+    ));
+    let settled = xolotl_gateway::GatewayRequestSummary {
+        accepted: result(Outcome::Done(Value::null())).accepted,
+        result_class: xolotl_gateway::GatewayRequestResultClass::Done,
+        unresolved_operations: UnresolvedOperations::default(),
+    };
+    let response = lookup_response_to_pb(
+        GatewayRequestEvidence::Settled(Box::new(settled.clone())),
+        FRAME_LIMIT,
+    )?;
+    let exact_limit = response.encoded_len();
+    ensure!(
+        lookup_response_to_pb(
+            GatewayRequestEvidence::Settled(Box::new(settled.clone())),
+            exact_limit
+        )
+        .is_ok()
+    );
+    ensure!(
+        lookup_response_to_pb(
+            GatewayRequestEvidence::Settled(Box::new(settled)),
+            exact_limit - 1
+        )
+        .is_err()
+    );
+    let Some(Evidence::Settled(result)) = response.evidence else {
+        anyhow::bail!("settled evidence lost its summary");
+    };
+    ensure!(result.result_class == pb::RequestResultClass::Done as i32);
+    Ok(())
+}
+
+#[test]
+fn settled_summary_omits_unresolved_identities_only_with_explicit_evidence() -> Result<()> {
+    let mut unresolved = UnresolvedOperations::default();
+    ensure!(unresolved.record(&"operation".repeat(28)));
+    ensure!(unresolved.record("another-operation"));
+    let summary = xolotl_gateway::GatewayRequestSummary {
+        accepted: result(Outcome::Done(Value::null())).accepted,
+        result_class: xolotl_gateway::GatewayRequestResultClass::Done,
+        unresolved_operations: unresolved.clone(),
+    };
+    let response = lookup_response_to_pb(
+        GatewayRequestEvidence::Settled(Box::new(summary.clone())),
+        256,
+    )?;
+    ensure!(response.encoded_len() <= 256);
+    let Some(pb::lookup_request_response::Evidence::Settled(saved)) = response.evidence else {
+        anyhow::bail!("missing summary");
+    };
+    let saved = saved
+        .unresolved_operations
+        .context("missing reconciliation evidence")?;
+    ensure!(
+        saved.identities_incomplete && saved.operation_ids.len() < unresolved.operation_ids.len()
+    );
+    let response = lookup_response_to_pb(
+        GatewayRequestEvidence::Settled(Box::new(summary)),
+        FRAME_LIMIT,
+    )?;
+    let Some(pb::lookup_request_response::Evidence::Settled(saved)) = response.evidence else {
+        anyhow::bail!("missing summary");
+    };
+    let saved = saved
+        .unresolved_operations
+        .context("missing reconciliation evidence")?;
+    ensure!(!saved.identities_incomplete && saved.operation_ids == unresolved.operation_ids);
+    Ok(())
+}
+
 fn input_request() -> pb::SubmitRequest {
     pb::SubmitRequest {
         surface_id: "infer".into(),
@@ -27,9 +139,81 @@ fn result(outcome: Outcome) -> GatewaySubmitResult {
     }
 }
 
+#[test]
+fn completion_preserves_reconciliation_state_with_a_successful_value() -> Result<()> {
+    let mut result = result(Outcome::Done(Value::integer(42)));
+    result.output.unresolved_operations.record("1/2/3/4/0");
+    result.output.unresolved_operations.identities_incomplete = true;
+    let unary = submit_response_to_pb(&result, FRAME_LIMIT)?;
+    let completion = unary.completion().context("missing completion")?;
+    let unresolved = completion
+        .unresolved_operations
+        .as_ref()
+        .context("missing reconciliation state")?;
+    ensure!(unresolved.operation_ids == ["1/2/3/4/0".to_string()]);
+    ensure!(unresolved.identities_incomplete);
+    let exact = unary.encoded_len();
+    ensure!(submit_response_to_pb(&result, exact).is_ok());
+    ensure!(submit_response_to_pb(&result, exact - 1).is_err());
+    Ok(())
+}
+
+#[test]
+fn indeterminate_frames_keep_acceptance_and_mark_omitted_identities() -> Result<()> {
+    let accepted = result(Outcome::Done(Value::null())).accepted;
+    let mut unresolved = UnresolvedOperations::default();
+    for prefix in ["a", "b", "c"] {
+        unresolved.record(&format!("{prefix}{}", "x".repeat(90)));
+    }
+    let unary = submit_indeterminate_to_pb(&accepted, &unresolved, "settlement_failed", 128)?;
+    ensure!(unary.encoded_len() <= 128);
+    ensure!(
+        unary
+            .accepted
+            .as_ref()
+            .context("accepted identity missing")?
+            .submission_id
+            == accepted.submission_id
+    );
+    let unknown = unary
+        .indeterminate()
+        .context("indeterminate terminal missing")?;
+    let retained = unknown
+        .unresolved_operations
+        .as_ref()
+        .context("reconciliation state missing")?;
+    ensure!(retained.identities_incomplete);
+    ensure!(retained.operation_ids.len() < unresolved.operation_ids.len());
+    let decoded = pb::SubmitResponse::decode(unary.encode_to_vec().as_slice())?;
+    ensure!(decoded.indeterminate().is_some() && decoded.completion().is_none());
+
+    let output = output_indeterminate_to_pb(&unresolved, "settlement_failed", 128)?;
+    ensure!(output.encoded_len() <= 128);
+    let Some(pb::submit_output_response::Event::Indeterminate(unknown)) = output.event else {
+        anyhow::bail!("stream indeterminate terminal missing");
+    };
+    ensure!(
+        unknown
+            .unresolved_operations
+            .context("stream reconciliation missing")?
+            .identities_incomplete
+    );
+
+    let complete =
+        submit_indeterminate_to_pb(&accepted, &unresolved, "settlement_failed", FRAME_LIMIT)?;
+    let all = complete
+        .indeterminate()
+        .context("full reconciliation missing")?
+        .unresolved_operations
+        .as_ref()
+        .context("full identities missing")?;
+    ensure!(all.operation_ids == unresolved.operation_ids && !all.identities_incomplete);
+    Ok(())
+}
+
 fn blob() -> BlobRef {
     BlobRef {
-        hash: "a".repeat(64),
+        hash: "a".repeat(96),
         size: u64::MAX,
         mime: Some("x/y".into()),
     }
@@ -71,10 +255,11 @@ fn submission_accepts_unary_collect_and_preserves_options() -> Result<()> {
         let mut request = input_request();
         request.output = Some(xolotl_proto::output_mode_to_pb(mode));
         request.options = Some(pb::SubmitOptions {
+            expected_request_scope: Some("a".repeat(64)),
+            retry_epoch: 7,
             idempotency_key: Some("retry-key".into()),
             submission_token: Some("token".into()),
             deadline_ms: Some(u64::MAX),
-            requested_encoding: Some("protobuf".into()),
         });
         let request = pb::SubmitRequest::decode(request.encode_to_vec().as_slice())?;
         let submission = submission_from_pb(request)?;
@@ -83,10 +268,11 @@ fn submission_accepts_unary_collect_and_preserves_options() -> Result<()> {
         ensure!(
             submission.options()
                 == &SubmitOptions {
+                    expected_request_scope: Some("a".repeat(64)),
+                    retry_epoch: 7,
                     idempotency_key: Some("retry-key".into()),
                     submission_token: Some("token".into()),
                     deadline_ms: Some(u64::MAX),
-                    requested_encoding: Some("protobuf".into()),
                 }
         );
     }
@@ -129,7 +315,7 @@ fn submission_requires_outer_payload_and_checks_nested_values() -> Result<()> {
                 items: vec![common::Value {
                     kind: Some(common::value::Kind::TensorVal(common::TensorRef {
                         blob: Some(common::BlobRef {
-                            hash: "a".repeat(64),
+                            hash: "a".repeat(96),
                             size: 4,
                             mime: None,
                         }),
@@ -154,17 +340,21 @@ fn ticket_constraints_keep_unsigned_values_and_unknown_modality_is_rejected() ->
         submission_token: Some("token".into()),
         modality: pb::Modality::Tensor as i32,
         expected_size: Some(u64::MAX),
-        expected_digest: Some("a".repeat(64)),
+        expected_digest: Some("a".repeat(96)),
         allowed_media_types: vec!["application/*".into()],
         expires_in_ms: Some(u64::MAX),
         single_use: true,
+
+        max_objects: None,
+        max_total_bytes: None,
+        max_record_bytes: None,
     };
     let request = pb::IssueUploadTicketRequest::decode(request.encode_to_vec().as_slice())?;
     let ticket = issue_upload_ticket_from_pb(request)?;
     ensure!(ticket.surface_id == "infer" && ticket.modality == GatewayModality::Tensor);
     ensure!(ticket.submission_token.as_deref() == Some("token"));
     ensure!(ticket.expected_size == Some(u64::MAX) && ticket.expires_in_ms == Some(u64::MAX));
-    ensure!(ticket.expected_digest == Some("a".repeat(64)) && ticket.single_use);
+    ensure!(ticket.expected_digest == Some("a".repeat(96)) && ticket.single_use);
     ensure!(ticket.allowed_media_types == ["application/*"]);
     for modality in [pb::Modality::Unspecified as i32, -1, 99] {
         let request = pb::IssueUploadTicketRequest {
@@ -272,14 +462,14 @@ fn upload_receipt_keeps_typed_content_and_common_provenance() -> Result<()> {
         let response = CommitObjectUploadResponse {
             item,
             provenance: provenance.clone(),
-            digest: "a".repeat(64),
+            digest: "a".repeat(96),
             size: u64::MAX,
         };
         let wire = upload_response_to_pb(&response, FRAME_LIMIT)?;
         let decoded = pb::UploadObjectResponse::decode(wire.encode_to_vec().as_slice())?;
         ensure!(decoded.size == u64::MAX && decoded.digest == response.digest);
         ensure!(
-            value_from_pb_checked(decoded.item.as_ref().context("missing typed receipt")?)?
+            value_from_pb(decoded.item.as_ref().context("missing typed receipt")?)?
                 == response.item
         );
         ensure!(
@@ -302,8 +492,15 @@ fn outcomes_keep_exact_numbers_and_common_failure_contract() -> Result<()> {
         let response = result(outcome);
         let wire = submit_response_to_pb(&response, FRAME_LIMIT)?;
         let decoded = pb::SubmitResponse::decode(wire.encode_to_vec().as_slice())?;
-        ensure!(decoded.accepted.context("missing acceptance")?.profile_rev == u64::MAX);
-        let completed = decoded.completion.context("missing completion")?;
+        ensure!(
+            decoded
+                .accepted
+                .as_ref()
+                .context("missing acceptance")?
+                .profile_rev
+                == u64::MAX
+        );
+        let completed = decoded.into_completion().context("missing completion")?;
         ensure!(
             completed
                 .taint
@@ -322,7 +519,7 @@ fn outcomes_keep_exact_numbers_and_common_failure_contract() -> Result<()> {
             }
             other => anyhow::bail!("unexpected outcome {other:?}"),
         };
-        ensure!(value_from_pb_checked(&encoded_value)? == value);
+        ensure!(value_from_pb(&encoded_value)? == value);
     }
     for failure in [
         Failure::Timeout,
@@ -332,7 +529,7 @@ fn outcomes_keep_exact_numbers_and_common_failure_contract() -> Result<()> {
     ] {
         let response = result(Outcome::Fail(failure));
         let wire = submit_response_to_pb(&response, FRAME_LIMIT)?;
-        let completed = wire.completion.context("missing completion")?;
+        let completed = wire.into_completion().context("missing completion")?;
         let Some(pb::output_outcome::Kind::Fail(failure)) =
             completed.outcome.and_then(|outcome| outcome.kind)
         else {
@@ -363,6 +560,7 @@ fn discovery_keeps_full_width_limits_and_typed_publication_metadata() -> Result<
     descriptor.limits = GatewayLimitProfile {
         max_literal_bytes: usize::MAX,
         max_deadline_ms_from_now: i64::MAX,
+        max_recent_cancellations: usize::MAX,
         budget: GatewayBudgetProfile {
             max_bytes_in: Some(u64::MAX),
             max_wall_ms: Some(0),
@@ -371,12 +569,14 @@ fn discovery_keeps_full_width_limits_and_typed_publication_metadata() -> Result<
         },
         ..Default::default()
     };
-    let wire = descriptor_to_pb(&descriptor, FRAME_LIMIT)?;
+    let wire = descriptor_to_pb(&descriptor, 7, FRAME_LIMIT)?;
+    ensure!(wire.retry_epoch == 7);
     let decoded = pb::DescribeResponse::decode(wire.encode_to_vec().as_slice())?;
     ensure!(decoded.profile_rev == u64::MAX);
     let limits = decoded.limits.context("missing limits")?;
     ensure!(limits.max_literal_bytes == u64::try_from(usize::MAX)?);
     ensure!(limits.max_deadline_ms_from_now == i64::MAX);
+    ensure!(limits.max_recent_cancellations == u64::try_from(usize::MAX)?);
     let budget = limits.budget.context("missing budget")?;
     ensure!(budget.max_bytes_in == Some(u64::MAX));
     ensure!(budget.max_wall_ms == Some(0) && budget.max_bytes_out.is_none());
@@ -384,8 +584,49 @@ fn discovery_keeps_full_width_limits_and_typed_publication_metadata() -> Result<
         .publications
         .first()
         .context("missing publication")?;
+    ensure!(value_from_pb(publication.metadata.as_ref().context("missing metadata")?)? == value);
+    Ok(())
+}
+
+#[test]
+fn discovery_publication_properties_have_stable_wire_bytes() -> Result<()> {
+    let properties = [
+        ("zeta", Value::integer(7)),
+        (
+            "alpha",
+            Value::map(std::collections::BTreeMap::from([
+                ("z".into(), Value::boolean(true)),
+                ("a".into(), Value::string("nested".into())),
+            ])),
+        ),
+        ("beta", Value::string("text".into())),
+        ("é", Value::boolean(false)),
+    ];
+    let mut original = publication(None);
+    for (key, value) in &properties {
+        original.properties.insert((*key).into(), value.clone());
+    }
+    let expected = descriptor_to_pb(&descriptor(vec![original]), 0, FRAME_LIMIT)?.encode_to_vec();
+    for _ in 0..64 {
+        let mut rebuilt = publication(None);
+        for (key, value) in properties.iter().rev() {
+            rebuilt.properties.insert((*key).into(), value.clone());
+        }
+        let encoded = descriptor_to_pb(&descriptor(vec![rebuilt]), 0, FRAME_LIMIT)?.encode_to_vec();
+        ensure!(encoded == expected, "publication map wire order changed");
+    }
+    let decoded = pb::DescribeResponse::decode(expected.as_slice())?;
+    let publication = decoded
+        .publications
+        .first()
+        .context("missing publication")?;
     ensure!(
-        value_from_pb_checked(publication.metadata.as_ref().context("missing metadata")?)? == value
+        publication
+            .properties
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            == ["alpha", "beta", "zeta", "é"]
     );
     Ok(())
 }
@@ -412,7 +653,7 @@ fn response_limit_covers_envelope_and_acceptance_fields() -> Result<()> {
 fn discovery_fields_and_repeated_items_share_one_budget() -> Result<()> {
     let descriptor = descriptor(vec![publication(Some(Value::string("x".repeat(80)))); 2]);
     ensure!(
-        matches!(descriptor_to_pb(&descriptor, 128), Err(status) if status.code() == tonic::Code::ResourceExhausted)
+        matches!(descriptor_to_pb(&descriptor, 0, 128), Err(status) if status.code() == tonic::Code::ResourceExhausted)
     );
     let mut budget = ConversionBudget::new(32);
     ensure!(

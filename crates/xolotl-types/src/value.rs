@@ -6,6 +6,7 @@ use thiserror::Error;
 
 mod collection;
 pub mod event;
+pub mod inspection;
 mod payload;
 mod resident;
 mod semantics;
@@ -52,8 +53,9 @@ impl core::hash::Hash for FloatBits {
 /// A pointer to large opaque content resolved by the host's object store.
 /// Carries metadata for routing and quota.
 ///
-/// The bundled filesystem adapter and Gateway use lowercase BLAKE3 content
-/// hashes. Facts retain this reference instead of storing the object bytes.
+/// The bundled filesystem adapter and Gateway use lowercase SHA-384 content
+/// digests (96 hexadecimal characters). Facts retain this reference instead of
+/// storing the object bytes.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct BlobRef {
     /// Content hash identifying the stored bytes.
@@ -62,6 +64,32 @@ pub struct BlobRef {
     pub size: u64,
     /// Optional media type used by routing and display layers.
     pub mime: Option<String>,
+}
+
+impl BlobRef {
+    /// Binary length of the SHA-384 content digest used by bundled stores.
+    pub const HASH_BYTES: usize = 48;
+    /// Hexadecimal length of the SHA-384 content digest used by bundled stores.
+    pub const HASH_HEX_LEN: usize = Self::HASH_BYTES * 2;
+
+    /// Encode a SHA-384 content digest without intermediate allocations.
+    pub fn sha384_hex(digest: &[u8; Self::HASH_BYTES]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(Self::HASH_HEX_LEN);
+        for byte in digest {
+            encoded.push(char::from(HEX[usize::from(*byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(*byte & 0x0f)]));
+        }
+        encoded
+    }
+
+    /// Whether a content digest has the canonical bundled-store representation.
+    pub fn is_valid_hash(hash: &str) -> bool {
+        hash.len() == Self::HASH_HEX_LEN
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
 }
 
 /// Numeric dtype of a [`TensorRef`]. The kernel never computes on
@@ -164,6 +192,18 @@ mod tests {
     use super::*;
     use alloc::collections::BTreeMap;
     use anyhow::ensure;
+
+    #[test]
+    fn blob_digest_encoding_is_canonical() {
+        let mut digest = [0_u8; BlobRef::HASH_BYTES];
+        digest[0] = 0x05;
+        digest[BlobRef::HASH_BYTES - 1] = 0xfe;
+        let encoded = BlobRef::sha384_hex(&digest);
+        assert_eq!(encoded, format!("05{}fe", "00".repeat(46)));
+        assert!(BlobRef::is_valid_hash(&encoded));
+        assert!(!BlobRef::is_valid_hash(&encoded.to_ascii_uppercase()));
+        assert!(!BlobRef::is_valid_hash(&"0".repeat(64)));
+    }
 
     #[test]
     fn value_serde_roundtrip() -> anyhow::Result<()> {

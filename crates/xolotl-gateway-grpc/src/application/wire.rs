@@ -2,18 +2,23 @@
 
 use prost::Message as _;
 use tonic::Status;
+#[cfg(test)]
+use xolotl_gateway::GatewaySubmission;
 use xolotl_gateway::{
     BeginObjectUploadRequest, CommitObjectUploadResponse, GatewayAccepted, GatewayDescriptor,
     GatewayLimitProfile, GatewayModality, GatewayObjectKind, GatewayObjectUploadTicket,
-    GatewayOutputEvent, GatewayPayloadProvenance, GatewayPublicationDescriptor, GatewaySubmission,
+    GatewayOutputEvent, GatewayPayloadProvenance, GatewayPublicationDescriptor,
+    GatewayRequestEvidence, GatewayRequestIdentity, GatewayRequestLookup, GatewaySubmissionHead,
     GatewaySubmitResult, IssueObjectUploadTicketRequest, ObjectStoreProof, SubmitOptions,
 };
 use xolotl_proto::{
     MAX_VALUE_ENCODE_DEPTH, ValueEncodeLimits, dtype_from_str, failure_to_pb_bounded,
-    frame_kind_from_str, output_mode_from_pb, value_from_pb_checked, value_to_pb_bounded,
+    frame_kind_from_str, output_mode_from_pb, value_from_pb, value_to_pb_bounded,
     xolotl::v1 as common,
 };
-use xolotl_types::{CompletionOrigin, Outcome, OutputMode, Path, TaintSet, TaintSource, Value};
+use xolotl_types::{
+    CompletionOrigin, Outcome, OutputMode, Path, TaintSet, TaintSource, UnresolvedOperations, Value,
+};
 
 use common::application as pb;
 
@@ -24,6 +29,7 @@ pub(super) mod structured;
 
 pub(super) fn descriptor_to_pb(
     descriptor: &GatewayDescriptor,
+    retry_epoch: u64,
     max_frame_bytes: usize,
 ) -> Result<pb::DescribeResponse, Status> {
     let mut budget = ConversionBudget::new(max_frame_bytes);
@@ -32,12 +38,15 @@ pub(super) fn descriptor_to_pb(
     let response = pb::DescribeResponse {
         profile_name: budget.string(&descriptor.profile_name)?,
         profile_rev: descriptor.profile_rev,
+        retry_epoch,
+        max_frame_bytes: u64::try_from(max_frame_bytes).map_err(|_error| response_too_large())?,
         surfaces: descriptor
             .surfaces
             .iter()
             .map(|surface| {
                 Ok(pb::SurfaceDescriptor {
                     surface_id: budget.string(&surface.surface_id)?,
+                    request_scope: budget.string(&surface.request_scope)?,
                     target: Some(budget.path(surface.target.path())?),
                     input_schema: budget.optional_value(surface.input_schema.as_ref())?,
                     output_schema: budget.optional_value(surface.output_schema.as_ref())?,
@@ -103,6 +112,10 @@ fn limits_to_pb(limits: &GatewayLimitProfile) -> Result<pb::LimitProfile, Status
         max_stream_items: count(limits.max_stream_items)?,
         max_stream_bytes: count(limits.max_stream_bytes)?,
         max_stream_inline_item_bytes: count(limits.max_stream_inline_item_bytes)?,
+        max_recent_cancellations: count(limits.max_recent_cancellations)?,
+        max_ticket_objects: count(limits.max_ticket_objects)?,
+        max_ticket_total_bytes: limits.max_ticket_total_bytes,
+        max_ticket_record_bytes: count(limits.max_ticket_record_bytes)?,
     })
 }
 
@@ -135,6 +148,22 @@ pub(super) fn issue_upload_ticket_from_pb(
         allowed_media_types: request.allowed_media_types,
         expires_in_ms: request.expires_in_ms,
         single_use: request.single_use,
+        max_objects: request
+            .max_objects
+            .map(|value| {
+                usize::try_from(value)
+                    .map_err(|_error| Status::invalid_argument("max_objects exceeds host size"))
+            })
+            .transpose()?,
+        max_total_bytes: request.max_total_bytes,
+        max_record_bytes: request
+            .max_record_bytes
+            .map(|value| {
+                usize::try_from(value).map_err(|_error| {
+                    Status::invalid_argument("max_record_bytes exceeds host size")
+                })
+            })
+            .transpose()?,
     })
 }
 
@@ -145,6 +174,9 @@ pub(super) fn upload_ticket_to_pb(
         ticket_id: ticket.ticket_id().to_owned(),
         expires_at_ms: ticket.expires_at_ms(),
         single_use: ticket.is_single_use(),
+        max_objects: ticket.max_objects() as u64,
+        max_total_bytes: ticket.max_total_bytes(),
+        max_record_bytes: ticket.max_record_bytes() as u64,
     }
 }
 
@@ -153,6 +185,8 @@ pub(super) fn begin_upload_from_pb(request: pb::BeginObjectUpload) -> BeginObjec
         ticket_id: request.ticket_id,
         media_type: request.media_type,
         submission_token: request.submission_token,
+        expected_size: request.expected_size,
+        expected_digest: request.expected_digest,
     }
 }
 
@@ -196,25 +230,44 @@ pub(super) fn upload_response_to_pb(
     bounded_response(response, max_frame_bytes)
 }
 
+#[cfg(test)]
 pub(super) fn submission_from_pb(request: pb::SubmitRequest) -> Result<GatewaySubmission, Status> {
     decode_submission(request, SubmissionRpc::Submit)
 }
 
+#[cfg(test)]
 pub(super) fn output_submission_from_pb(
     request: pb::SubmitRequest,
 ) -> Result<GatewaySubmission, Status> {
     decode_submission(request, SubmissionRpc::SubmitOutput)
 }
 
+#[cfg(test)]
 enum SubmissionRpc {
     Submit,
     SubmitOutput,
 }
 
+#[cfg(test)]
 fn decode_submission(
     request: pb::SubmitRequest,
     rpc: SubmissionRpc,
 ) -> Result<GatewaySubmission, Status> {
+    let head = submission_head_from_pb(&request, matches!(rpc, SubmissionRpc::SubmitOutput))?;
+    let (payload, provenance) = submission_payload_from_pb(request)?;
+    let mut submission = GatewaySubmission::direct_input(head.surface_id, payload)
+        .with_requested_output(head.requested_output)
+        .with_options(head.options);
+    if let Some(provenance) = provenance {
+        submission = submission.with_provenance(provenance);
+    }
+    Ok(submission)
+}
+
+pub(super) fn submission_head_from_pb(
+    request: &pb::SubmitRequest,
+    streaming: bool,
+) -> Result<GatewaySubmissionHead, Status> {
     let output = request
         .output
         .as_ref()
@@ -222,44 +275,52 @@ fn decode_submission(
         .transpose()
         .map_err(|error| Status::invalid_argument(error.to_string()))?
         .unwrap_or(OutputMode::Unary);
-    match (rpc, output) {
-        (SubmissionRpc::Submit, OutputMode::Unary | OutputMode::Collect { .. })
-        | (SubmissionRpc::SubmitOutput, OutputMode::Stream) => {}
-        (SubmissionRpc::Submit, OutputMode::Stream) => {
+    match (streaming, output) {
+        (false, OutputMode::Unary | OutputMode::Collect { .. }) | (true, OutputMode::Stream) => {}
+        (false, OutputMode::Stream) => {
             return Err(Status::invalid_argument(
                 "Submit does not support Stream output",
             ));
         }
-        (SubmissionRpc::Submit, OutputMode::AsyncProcess | OutputMode::SinkOnly) => {
+        (false, OutputMode::AsyncProcess | OutputMode::SinkOnly) => {
             return Err(Status::invalid_argument(
                 "Submit supports only Unary and Collect output",
             ));
         }
-        (SubmissionRpc::SubmitOutput, _) => {
+        (true, _) => {
             return Err(Status::invalid_argument(
                 "SubmitOutput requires Stream output",
             ));
         }
     }
+    if request.payload.is_none() {
+        return Err(Status::invalid_argument("Submit payload is required"));
+    }
+    let options = request.options.clone().unwrap_or_default();
+    Ok(GatewaySubmissionHead {
+        surface_id: request.surface_id.clone(),
+        requested_output: output,
+        options: SubmitOptions {
+            retry_epoch: options.retry_epoch,
+            expected_request_scope: options.expected_request_scope,
+            idempotency_key: options.idempotency_key,
+            submission_token: options.submission_token,
+            deadline_ms: options.deadline_ms,
+        },
+        server_deadline: None,
+    })
+}
+
+pub(super) fn submission_payload_from_pb(
+    request: pb::SubmitRequest,
+) -> Result<(Value, Option<GatewayPayloadProvenance>), Status> {
     let payload = request
         .payload
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("Submit payload is required"))?;
-    let payload = value_from_pb_checked(payload)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let options = request.options.unwrap_or_default();
-    let mut submission = GatewaySubmission::direct_input(request.surface_id, payload)
-        .with_requested_output(output)
-        .with_options(SubmitOptions {
-            idempotency_key: options.idempotency_key,
-            submission_token: options.submission_token,
-            deadline_ms: options.deadline_ms,
-            requested_encoding: options.requested_encoding,
-        });
-    if let Some(provenance) = request.provenance {
-        submission = submission.with_provenance(provenance_from_pb(provenance));
-    }
-    Ok(submission)
+    let payload =
+        value_from_pb(payload).map_err(|error| Status::invalid_argument(error.to_string()))?;
+    Ok((payload, request.provenance.map(provenance_from_pb)))
 }
 
 pub(super) fn submit_response_to_pb(
@@ -270,10 +331,190 @@ pub(super) fn submit_response_to_pb(
     bounded_response(
         pb::SubmitResponse {
             accepted: Some(budget.accepted(&response.accepted)?),
-            completion: Some(submission_completion_to_pb(response, &mut budget)?),
+            terminal: Some(pb::submit_response::Terminal::Completion(
+                submission_completion_to_pb(response, &mut budget)?,
+            )),
         },
         max_frame_bytes,
     )
+}
+
+pub(super) fn lookup_request_from_pb(
+    request: pb::LookupRequestRequest,
+) -> Result<GatewayRequestLookup, Status> {
+    let identity = match request.identity {
+        Some(pb::lookup_request_request::Identity::IdempotencyKey(key)) => {
+            GatewayRequestIdentity::IdempotencyKey(key)
+        }
+        Some(pb::lookup_request_request::Identity::SubmissionToken(token)) => {
+            GatewayRequestIdentity::SubmissionToken(token)
+        }
+        None => {
+            return Err(Status::invalid_argument(
+                "original request identity is required",
+            ));
+        }
+    };
+    Ok(GatewayRequestLookup {
+        surface_id: request.surface_id,
+        expected_request_scope: request.expected_request_scope,
+        retry_epoch: request.retry_epoch,
+        identity,
+    })
+}
+
+pub(super) fn lookup_response_to_pb(
+    evidence: GatewayRequestEvidence,
+    max_frame_bytes: usize,
+) -> Result<pb::LookupRequestResponse, Status> {
+    use pb::lookup_request_response::Evidence;
+    let evidence = match evidence {
+        GatewayRequestEvidence::Unproven => Evidence::Unproven(pb::RequestUnproven {}),
+        GatewayRequestEvidence::Reserved => Evidence::Reserved(pb::RequestReserved {}),
+        GatewayRequestEvidence::Settled(result) => {
+            let accepted = ConversionBudget::new(max_frame_bytes).accepted(&result.accepted)?;
+            let result_class = match result.result_class {
+                xolotl_gateway::GatewayRequestResultClass::Done => pb::RequestResultClass::Done,
+                xolotl_gateway::GatewayRequestResultClass::Short => pb::RequestResultClass::Short,
+                xolotl_gateway::GatewayRequestResultClass::Fail => pb::RequestResultClass::Fail,
+            } as i32;
+            let mut summary = pb::RequestSettled {
+                accepted: Some(accepted),
+                result_class,
+                unresolved_operations: Some(common::UnresolvedOperations {
+                    operation_ids: Vec::new(),
+                    identities_incomplete: result.unresolved_operations.identities_incomplete
+                        || !result.unresolved_operations.operation_ids.is_empty(),
+                }),
+            };
+            if !result.unresolved_operations.validate() {
+                return Err(Status::internal("invalid unresolved operation identities"));
+            }
+            if message_field_len(summary.encoded_len()) > max_frame_bytes {
+                return Err(response_too_large());
+            }
+            let mut omitted = false;
+            for id in &result.unresolved_operations.operation_ids {
+                let saved = summary
+                    .unresolved_operations
+                    .as_mut()
+                    .ok_or_else(|| Status::internal("summary lost evidence"))?;
+                saved.operation_ids.push(id.clone());
+                saved.identities_incomplete = result.unresolved_operations.identities_incomplete
+                    || omitted
+                    || saved.operation_ids.len() < result.unresolved_operations.operation_ids.len();
+                if message_field_len(summary.encoded_len()) > max_frame_bytes {
+                    let saved = summary
+                        .unresolved_operations
+                        .as_mut()
+                        .ok_or_else(|| Status::internal("summary lost evidence"))?;
+                    saved.operation_ids.pop();
+                    saved.identities_incomplete = true;
+                    omitted = true;
+                }
+            }
+            Evidence::Settled(Box::new(summary))
+        }
+        GatewayRequestEvidence::Retired => Evidence::Retired(pb::RequestRetired {}),
+    };
+    bounded_response(
+        pb::LookupRequestResponse {
+            evidence: Some(evidence),
+        },
+        max_frame_bytes,
+    )
+}
+
+/// Preserve acceptance and as many observed identities as the frame can hold.
+/// The flag is set whenever this adapter omits an identity.
+pub(super) fn submit_indeterminate_to_pb(
+    accepted: &GatewayAccepted,
+    unresolved: &UnresolvedOperations,
+    reason_code: &'static str,
+    max_frame_bytes: usize,
+) -> Result<pb::SubmitResponse, Status> {
+    let accepted = ConversionBudget::new(max_frame_bytes).accepted(accepted)?;
+    let accepted_len = message_field_len(accepted.encoded_len());
+    let indeterminate =
+        bounded_indeterminate(unresolved, reason_code, max_frame_bytes, |terminal_len| {
+            accepted_len + message_field_len(terminal_len)
+        })?;
+    bounded_response(
+        pb::SubmitResponse {
+            accepted: Some(accepted),
+            terminal: Some(pb::submit_response::Terminal::Indeterminate(indeterminate)),
+        },
+        max_frame_bytes,
+    )
+}
+
+pub(super) fn output_indeterminate_to_pb(
+    unresolved: &UnresolvedOperations,
+    reason_code: &'static str,
+    max_frame_bytes: usize,
+) -> Result<pb::SubmitOutputResponse, Status> {
+    let indeterminate =
+        bounded_indeterminate(unresolved, reason_code, max_frame_bytes, message_field_len)?;
+    bounded_response(
+        pb::SubmitOutputResponse {
+            event: Some(pb::submit_output_response::Event::Indeterminate(
+                indeterminate,
+            )),
+        },
+        max_frame_bytes,
+    )
+}
+
+fn bounded_indeterminate(
+    source: &UnresolvedOperations,
+    reason_code: &'static str,
+    max_frame_bytes: usize,
+    frame_len: impl Fn(usize) -> usize,
+) -> Result<pb::SubmissionIndeterminate, Status> {
+    if !source.validate() {
+        return Err(Status::internal("invalid unresolved operation identities"));
+    }
+    let mut result = pb::SubmissionIndeterminate {
+        reason_code: reason_code.into(),
+        unresolved_operations: Some(common::UnresolvedOperations {
+            operation_ids: Vec::new(),
+            identities_incomplete: source.identities_incomplete || !source.operation_ids.is_empty(),
+        }),
+    };
+    if frame_len(result.encoded_len()) > max_frame_bytes {
+        return Err(response_too_large());
+    }
+    let mut omitted = false;
+    for id in &source.operation_ids {
+        let saved = result
+            .unresolved_operations
+            .as_mut()
+            .ok_or_else(|| Status::internal("indeterminate frame lost its evidence"))?;
+        saved.operation_ids.push(id.clone());
+        saved.identities_incomplete = source.identities_incomplete
+            || omitted
+            || saved.operation_ids.len() < source.operation_ids.len();
+        if frame_len(result.encoded_len()) > max_frame_bytes {
+            let saved = result
+                .unresolved_operations
+                .as_mut()
+                .ok_or_else(|| Status::internal("indeterminate frame lost its evidence"))?;
+            saved.operation_ids.pop();
+            saved.identities_incomplete = true;
+            omitted = true;
+        }
+    }
+    Ok(result)
+}
+
+fn message_field_len(payload_len: usize) -> usize {
+    let mut value = payload_len;
+    let mut length_bytes = 1;
+    while value >= 128 {
+        value >>= 7;
+        length_bytes += 1;
+    }
+    1 + length_bytes + payload_len
 }
 
 pub(super) fn output_accepted_to_pb(
@@ -323,6 +564,9 @@ fn submission_completion_to_pb(
             CompletionOrigin::CachedOutcome => pb::CompletionOrigin::CachedOutcome,
         } as i32,
         taint: Some(budget.taint(&response.output.taint)?),
+        unresolved_operations: Some(
+            budget.unresolved_operations(&response.output.unresolved_operations)?,
+        ),
     })
 }
 
@@ -486,6 +730,24 @@ impl ConversionBudget {
             })
             .collect::<Result<_, Status>>()?;
         Ok(common::TaintSet { sources })
+    }
+
+    fn unresolved_operations(
+        &mut self,
+        unresolved: &xolotl_types::UnresolvedOperations,
+    ) -> Result<common::UnresolvedOperations, Status> {
+        if !unresolved.validate() {
+            return Err(Status::internal("invalid unresolved operation identities"));
+        }
+        self.entries(unresolved.operation_ids.len())?;
+        Ok(common::UnresolvedOperations {
+            operation_ids: unresolved
+                .operation_ids
+                .iter()
+                .map(|id| self.string(id))
+                .collect::<Result<_, _>>()?,
+            identities_incomplete: unresolved.identities_incomplete,
+        })
     }
 }
 

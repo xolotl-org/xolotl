@@ -8,7 +8,7 @@
 
 use crate::Timestamp;
 use crate::ids::MethodId;
-use crate::path::Path;
+use crate::path::{Path, PathError, is_simple_id_segment};
 use crate::replay::Purity;
 use crate::value::Value;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -21,6 +21,68 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use crate::external_descriptor::{EffectCapability, Transport, TrustLevel};
+
+/// Kernel-state prefix for external pairing decisions.
+pub const EXTERNAL_PAIRINGS_PREFIX: &str = "state://kernel/external-pairings";
+/// Kernel-state prefix for approved external role sessions.
+pub const EXTERNAL_SESSIONS_PREFIX: &str = "state://kernel/external-sessions";
+/// Kernel-state prefix for external credential revocation floors.
+pub const EXTERNAL_CREDENTIAL_REVOCATIONS_PREFIX: &str =
+    "state://kernel/external-credential-revocations";
+/// Effect namespace for commands sent to a Source projection.
+pub const EXTERNAL_SOURCE_COMMANDS_PREFIX: &str = "effect://external-source";
+
+/// Address one external pairing decision.
+pub fn external_pairing_path(id: &str) -> Result<Path, PathError> {
+    external_child_path(EXTERNAL_PAIRINGS_PREFIX, id)
+}
+
+/// Address one installation's approved role session.
+pub fn external_session_path(installation_id: &str, role: Role) -> Result<Path, PathError> {
+    external_child_path(EXTERNAL_SESSIONS_PREFIX, installation_id)?.try_push_literal(role.as_str())
+}
+
+/// Address one installation's credential revocation floor.
+pub fn external_credential_revocation_path(installation_id: &str) -> Result<Path, PathError> {
+    external_child_path(EXTERNAL_CREDENTIAL_REVOCATIONS_PREFIX, installation_id)
+}
+
+/// Address the command effect of one Source projection. The daemon owns this
+/// path; calling its `dispatch` method still requires an ordinary Kernel grant.
+pub fn external_source_command_path(
+    installation_id: &str,
+    projection_id: &str,
+) -> Result<Path, PathError> {
+    validate_external_id(installation_id)?;
+    validate_external_id(projection_id)?;
+    Path::parse(EXTERNAL_SOURCE_COMMANDS_PREFIX)?
+        .try_push_literal(installation_id)?
+        .try_push_literal(projection_id)?
+        .try_push("command")
+}
+
+/// Build the required Provider namespace for a sandboxed installation.
+pub fn sandboxed_provider_namespace_path(installation_id: &str) -> Result<Path, PathError> {
+    validate_external_id(installation_id)?;
+    Path::try_new("effect")?
+        .try_push("external-provider")?
+        .try_push_literal(installation_id)
+}
+
+fn external_child_path(prefix: &str, id: &str) -> Result<Path, PathError> {
+    validate_external_id(id)?;
+    Path::parse(prefix)?.try_push_literal(id)
+}
+
+fn validate_external_id(id: &str) -> Result<(), PathError> {
+    if id.is_empty() {
+        return Err(PathError::EmptySegment);
+    }
+    if !is_simple_id_segment(id) {
+        return Err(PathError::BadSegmentChar(id.into()));
+    }
+    Ok(())
+}
 
 /// A JSON Schema, modeled as a [`Value`] (object) to stay wasm-safe and avoid
 /// a schema-library dependency. Used as a config contract.
@@ -68,7 +130,9 @@ pub struct ExternalInstallationDef {
     pub id: String,
     /// Connector family name.
     pub platform: String,
-    /// Transport used to communicate with the external runtime.
+    /// Transport used to communicate with the external runtime. Stdio must
+    /// name an absolute executable path; child startup does not inherit the
+    /// daemon environment.
     pub transport: Transport,
     /// Trust level assigned by admission.
     pub trust: TrustLevel,
@@ -92,6 +156,26 @@ pub enum Role {
     Provider,
     /// Emits inbound events into a state sequence.
     Source,
+}
+
+impl Role {
+    /// Stable v1 role name used in state paths, pairing records, and secure
+    /// envelope authenticated data.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Source => "source",
+        }
+    }
+
+    /// Interpret an exact v1 role name from a pairing or session record.
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "provider" => Some(Self::Provider),
+            "source" => Some(Self::Source),
+            _ => None,
+        }
+    }
 }
 
 /// Where a Source writes its inbound events: a Sequence Resource that
@@ -234,6 +318,12 @@ pub enum ExternalAdmissionError {
     /// Sandboxed installation attempted in-process transport.
     #[error("in-process transport requires full trust")]
     InProcessSandbox,
+    /// Host-managed session routing is an internal driver transport, not an installation choice.
+    #[error("host-session transport cannot be declared by an external installation")]
+    HostSessionInstallation,
+    /// Stdio installation did not name an absolute executable path.
+    #[error("stdio installation command must be an absolute executable path")]
+    InvalidStdioCommand,
 }
 
 impl ExternalProjectionDef {
@@ -337,6 +427,12 @@ impl ExternalInstallationDef {
     pub fn validate_admission(&self) -> Result<(), ExternalAdmissionError> {
         validate_installation_id(&self.id)?;
         validate_trust_transport(self.trust, &self.transport)?;
+        if let Transport::Stdio { command, .. } = &self.transport {
+            let valid = command.as_deref().is_some_and(is_absolute_executable_path);
+            if !valid {
+                return Err(ExternalAdmissionError::InvalidStdioCommand);
+            }
+        }
         if self.projections.is_empty() {
             return Err(ExternalAdmissionError::InstallationWithoutProjections);
         }
@@ -360,11 +456,21 @@ impl ExternalInstallationDef {
     }
 }
 
+fn is_absolute_executable_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'/' || bytes[2] == b'\\'))
+}
+
 fn validate_installation_id(id: &str) -> Result<(), ExternalAdmissionError> {
     if id.trim().is_empty() {
         return Err(ExternalAdmissionError::EmptyInstallationId);
     }
-    if !is_safe_id_segment(id) {
+    if !crate::path::is_simple_id_segment(id) {
         return Err(ExternalAdmissionError::MalformedInstallationId);
     }
     Ok(())
@@ -374,19 +480,10 @@ fn validate_projection_id(id: &str) -> Result<(), ExternalAdmissionError> {
     if id.trim().is_empty() {
         return Err(ExternalAdmissionError::EmptyProjectionId);
     }
-    if !is_safe_id_segment(id) {
+    if !crate::path::is_simple_id_segment(id) {
         return Err(ExternalAdmissionError::MalformedProjectionId);
     }
     Ok(())
-}
-
-fn is_safe_id_segment(id: &str) -> bool {
-    let mut chars = id.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphanumeric() => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn validate_trust_transport(
@@ -394,6 +491,7 @@ fn validate_trust_transport(
     transport: &Transport,
 ) -> Result<(), ExternalAdmissionError> {
     match (trust, transport) {
+        (_, Transport::HostSession) => Err(ExternalAdmissionError::HostSessionInstallation),
         (
             TrustLevel::Full,
             Transport::InProcess | Transport::Grpc { .. } | Transport::WebSocket { .. },
@@ -487,6 +585,7 @@ pub fn sandboxed_source_event_sink_path(
 fn transport_name(t: &Transport) -> &'static str {
     match t {
         Transport::InProcess => "in_process",
+        Transport::HostSession => "host_session",
         Transport::Grpc { .. } => "grpc",
         Transport::Stdio { .. } => "stdio",
         Transport::WebSocket { .. } => "websocket",
@@ -787,8 +886,17 @@ pub struct SessionContext {
     pub presentation_config_generation: u64,
     /// Alias catalog generation selected by the daemon.
     pub alias_catalog_generation: u64,
+    /// Storage-issued installation incarnation. Every role requires a nonzero
+    /// value; retirement followed by reinstallation invalidates prior sessions.
+    pub installation_epoch: u64,
+    /// Storage-issued active Source scope epoch for this projection. Source
+    /// sessions require a nonzero value; Provider sessions use zero. A removed
+    /// and reinstalled Source receives a new epoch, fencing older sessions.
+    pub scope_epoch: u64,
     /// Daemon-selected session id for this role connection.
     pub session_id: String,
+    /// Current AEAD key epoch selected by the daemon before authenticated Ready.
+    pub key_epoch: u64,
 }
 
 /// Ready acknowledgement for an external session.
@@ -969,6 +1077,132 @@ pub struct InboundEvent {
     /// the next sequence for `stream_id`.
     #[serde(default)]
     pub seq: Option<u64>,
+    /// Storage-issued incarnation of an ordered stream. All of `stream_id`,
+    /// `seq`, and `stream_epoch` are supplied together; data cannot open a stream.
+    #[serde(default)]
+    pub stream_epoch: Option<u64>,
+}
+
+/// Source request to inspect, open, or retire one ordered stream in the ready
+/// Source scope. An Open's `request_id` is its stable storage open identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceStreamRequest {
+    /// Correlation id, also the Open idempotency identity.
+    pub request_id: String,
+    /// Stream-local identity; the storage-issued epoch distinguishes lives.
+    pub stream_id: String,
+    /// Requested lifecycle operation.
+    pub operation: SourceStreamOperation,
+}
+
+/// Lifecycle operations on a Source stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceStreamOperation {
+    /// Read the current scope-local catalog revision and stream state.
+    Inspect,
+    /// Open only against an observed catalog revision.
+    Open {
+        /// Scope-local revision observed by the client.
+        expected_revision: u64,
+    },
+    /// Conditionally close this exact stream incarnation.
+    Retire {
+        /// Storage-issued stream incarnation; zero is invalid.
+        stream_epoch: u64,
+    },
+}
+
+/// Current state of an active ordered Source stream.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceStreamState {
+    /// Storage-issued incarnation.
+    pub stream_epoch: u64,
+    /// Last accepted sequence; zero immediately after Open.
+    pub last_seq: u64,
+    /// Stable Open request identity, returned to distinguish a retry.
+    pub open_id: String,
+    /// Catalog revision observed by the successful Open. An Open retry must
+    /// preserve both this revision and `open_id`.
+    pub opened_at_revision: u64,
+}
+
+/// Inspection or successful Open result for a Source stream.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceStreamSnapshot {
+    /// Scope-local catalog revision; changes on each Open or Retire.
+    pub revision: u64,
+    /// Active stream state, if this name is currently open.
+    pub active: Option<SourceStreamState>,
+}
+
+/// Machine-readable refusal of a Source stream lifecycle request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceStreamRejectCode {
+    /// Invalid stream path segment.
+    InvalidStreamId,
+    /// Invalid correlation/Open identity.
+    InvalidRequestId,
+    /// Zero stream epoch supplied to Retire.
+    InvalidEpoch,
+    /// Session's Source scope is no longer active.
+    ScopeInactive,
+    /// Catalog changed since Inspect; inspect again before a new Open.
+    RevisionConflict,
+    /// Another Open identity already owns this stream name.
+    AlreadyOpen,
+    /// Storage has no room for another active ordered stream.
+    QuotaExceeded,
+    /// Retire found no active stream with this name.
+    Inactive,
+    /// Retire named a prior stream incarnation.
+    StaleEpoch,
+    /// Storage proved that the requested operation aborted.
+    StorageUnavailable,
+    /// Storage could not prove whether the operation committed; inspect/retry.
+    OutcomeUnknown,
+}
+
+/// Context supplied with a deterministic lifecycle rejection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceStreamRejected {
+    /// Stable reason code.
+    pub code: SourceStreamRejectCode,
+    /// Current scope catalog revision when useful for conflict resolution.
+    pub current_revision: Option<u64>,
+    /// Current stream incarnation if a stale Retire targeted a previous life.
+    pub active_epoch: Option<u64>,
+    /// Current active state when another Open identity owns the name.
+    pub current: Option<SourceStreamSnapshot>,
+}
+
+/// Correlated outcome of a Source stream lifecycle request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceStreamResult {
+    /// Echo of the request correlation id.
+    pub request_id: String,
+    /// Echo of the requested stream identity.
+    pub stream_id: String,
+    /// One successful operation result or rejection.
+    pub outcome: SourceStreamOutcome,
+}
+
+/// Successful inspection/open/retirement or a typed refusal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceStreamOutcome {
+    /// Current stream snapshot.
+    Inspected(SourceStreamSnapshot),
+    /// Stream opened, or the same open identity retried.
+    Opened(SourceStreamSnapshot),
+    /// Exact active stream retired at this revision.
+    Retired {
+        /// Scope-local catalog revision after retirement.
+        revision: u64,
+    },
+    /// Request did not complete as requested.
+    Rejected(SourceStreamRejected),
 }
 
 /// Source data frame: a command sent back out to the source.
@@ -1002,6 +1236,9 @@ pub enum AckStatus {
     Duplicate,
     /// Event was rejected.
     Rejected,
+    /// Storage could not establish whether the event committed. This is not a
+    /// rejection; preserve the same event id and inspect or retry safely.
+    OutcomeUnknown,
 }
 
 /// Source data frame: ack of an [`InboundEvent`].
@@ -1011,9 +1248,13 @@ pub struct EventAck {
     pub id: String,
     /// Acknowledgement status.
     pub status: AckStatus,
-    /// Redacted reason when the event was rejected.
+    /// Redacted reason when the event was definitively rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reject_reason: Option<String>,
+    /// Ordered event's storage-issued incarnation, echoed to distinguish
+    /// delayed acknowledgements after retirement and same-name reopening.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_epoch: Option<u64>,
 }
 
 // Inbound stream capacity and rate limits.
@@ -1059,6 +1300,52 @@ mod tests {
     use super::*;
     use anyhow::{Context, ensure};
     use core::fmt::Debug;
+
+    #[test]
+    fn external_paths_share_one_id_rule() -> anyhow::Result<()> {
+        ensure!(
+            external_pairing_path("pair_1")?.to_string()
+                == "state://kernel/external-pairings/pair_1"
+        );
+        ensure!(
+            external_session_path("installation-1", Role::Provider)?.to_string()
+                == "state://kernel/external-sessions/installation-1/provider"
+        );
+        ensure!(
+            external_credential_revocation_path("installation-1")?.to_string()
+                == "state://kernel/external-credential-revocations/installation-1"
+        );
+        ensure!(external_pairing_path("_pair").is_err());
+        ensure!(external_session_path("_installation", Role::Source).is_err());
+        ensure!(
+            sandboxed_provider_namespace_path("installation-1")?.to_string()
+                == "effect://external-provider/installation-1"
+        );
+        ensure!(sandboxed_provider_namespace_path("_installation").is_err());
+        ensure!(
+            external_source_command_path("installation-1", "events")?.to_string()
+                == "effect://external-source/installation-1/events/command"
+        );
+        ensure!(external_source_command_path("_installation", "events").is_err());
+        ensure!(external_source_command_path("installation-1", "_events").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn role_names_match_v1_json_and_authority_paths() -> anyhow::Result<()> {
+        for role in [Role::Provider, Role::Source] {
+            ensure!(Role::from_slug(role.as_str()) == Some(role));
+            ensure!(serde_json::to_string(&role)? == format!("\"{}\"", role.as_str()));
+            ensure!(
+                external_session_path("bridge", role)?
+                    .to_string()
+                    .ends_with(role.as_str())
+            );
+        }
+        ensure!(Role::from_slug("Provider").is_none());
+        ensure!(Role::from_slug("observer").is_none());
+        Ok(())
+    }
 
     fn check_eq<T>(actual: T, expected: T, label: &str) -> anyhow::Result<()>
     where
@@ -1717,6 +2004,13 @@ mod tests {
             ),
             "full-trust stdio was accepted"
         );
+        let mut host_session = full_stdio.clone();
+        host_session.transport = Transport::HostSession;
+        check_eq(
+            host_session.validate_admission(),
+            Err(ExternalAdmissionError::HostSessionInstallation),
+            "internal host-session admission",
+        )?;
 
         let mut sandbox_in_process = full_stdio;
         sandbox_in_process.id = "tool".into();
@@ -1727,10 +2021,35 @@ mod tests {
         );
         sandbox_in_process.projections[0].provides[0].effect_path =
             "effect://external-provider/tool/run".into();
+        let mut sandbox_stdio = sandbox_in_process.clone();
+        sandbox_stdio.transport = Transport::Stdio {
+            command: Some("tool".into()),
+            args: vec![],
+        };
+        check_eq(
+            sandbox_stdio.validate_admission(),
+            Err(ExternalAdmissionError::InvalidStdioCommand),
+            "relative stdio executable admission",
+        )?;
+        sandbox_stdio.transport = Transport::Stdio {
+            command: Some("/usr/bin/tool".into()),
+            args: vec![],
+        };
+        check_eq(
+            sandbox_stdio.validate_admission(),
+            Ok(()),
+            "absolute stdio executable admission",
+        )?;
         check_eq(
             sandbox_in_process.validate_admission(),
             Err(ExternalAdmissionError::InProcessSandbox),
             "sandbox in-process admission",
+        )?;
+        sandbox_in_process.transport = Transport::HostSession;
+        check_eq(
+            sandbox_in_process.validate_admission(),
+            Err(ExternalAdmissionError::HostSessionInstallation),
+            "sandbox host-session admission",
         )?;
         Ok(())
     }
@@ -1771,7 +2090,10 @@ mod tests {
             projection_version: 1,
             presentation_config_generation: 4,
             alias_catalog_generation: 5,
+            installation_epoch: 1,
+            scope_epoch: 0,
             session_id: "session-1".into(),
+            key_epoch: 0,
         };
         let ready = RoleReady {
             accepted_context: ctx,

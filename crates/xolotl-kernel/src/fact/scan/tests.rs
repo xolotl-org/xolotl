@@ -61,7 +61,7 @@ fn byte_budget_preserves_unread_slot_and_oversized_record_errors() -> anyhow::Re
     ensure!(page.encoded_bytes == first_size && page.next == Some(1) && page.end == 2);
     q = q.next_page(&page).context("missing next page")?;
     let error = store.scan(q).err().context("oversized fact must fail")?;
-    ensure!(error.0.contains("slot 1") && error.0.contains("byte limit"));
+    ensure!(error.message().contains("slot 1") && error.message().contains("byte limit"));
     q.max_encoded_bytes = NonZeroUsize::new(large_size).context("encoded size")?;
     let page = store.scan(q)?;
     ensure!(page.facts == [large] && page.encoded_bytes == large_size);

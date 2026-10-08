@@ -27,7 +27,10 @@ impl MemoryDriver {
         }
         let mut taint = input_taint.clone();
         if consistency == "reconcile" {
-            let (_, observed) = self.rebuild_namespace(&owner, &namespace).await?;
+            let (_, observed) = self
+                .rebuild_namespace(&owner, &namespace)
+                .await
+                .map_err(|error| error.with_taint(&taint))?;
             taint.union(&observed);
         }
         let embedding = self
@@ -49,7 +52,7 @@ impl MemoryDriver {
             search.insert("metric".into(), Value::string(metric.into()));
         }
         let search: ValueMap = search.into();
-        loop {
+        for attempt in 0..self.repair_attempts.get() {
             let output = self
                 .index
                 .search_or_empty(&search, input_taint)
@@ -86,7 +89,8 @@ impl MemoryDriver {
                     .read_tainted(&path)
                     .await
                     .map_err(|error| state_error(error).with_taint(&taint))?;
-                let Some(current) = current else {
+                taint.union(&current.taint);
+                let Some(value) = current.value else {
                     if let Some(generation) = generation {
                         self.index
                             .delete_generation(&space_id, id, Some(generation))
@@ -100,7 +104,7 @@ impl MemoryDriver {
                     repaired = true;
                     continue;
                 };
-                taint.union(&current.taint);
+                let current = TaintedValue::new(value, current.taint);
                 validate_stored_entry(&path, &owner, &namespace, &current.value)
                     .map_err(|error| ObservedFailure::from(error).with_taint(&taint))?;
                 let indexed = indexed_entry(&current.value)
@@ -139,6 +143,9 @@ impl MemoryDriver {
                 entries.insert(id.to_string(), current.value);
             }
             if repaired {
+                if attempt + 1 == self.repair_attempts.get() {
+                    return Err(repair_exhausted(&taint));
+                }
                 // Retry the query after observed stale candidates were removed or
                 // replaced. Never pair an old score with the new State record.
                 tokio::task::yield_now().await;
@@ -179,6 +186,7 @@ impl MemoryDriver {
             }
             return Ok(DriverOutput::new(Outcome::Done(Value::list(result))).with_taint(taint));
         }
+        Err(repair_exhausted(&taint))
     }
 }
 
@@ -189,6 +197,7 @@ fn failure(message: &str, taint: &TaintSet) -> ObservedFailure {
 fn done(output: DriverOutput, taint: &TaintSet, component: &str) -> Result<Value, ObservedFailure> {
     match output.outcome {
         Outcome::Done(value) => Ok(value),
+        Outcome::Fail(failed) => Err(ObservedFailure::from(failed).with_taint(taint)),
         other => Err(failure(
             &format!("{component} returned an unsuccessful outcome: {other:?}"),
             taint,

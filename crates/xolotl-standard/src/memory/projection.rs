@@ -25,17 +25,17 @@ impl MemoryDriver {
             .read_tainted(path)
             .await
             .map_err(|error| state_error(error).with_taint(&entry.taint))?;
-        let previous = if let Some(current) = &current {
-            entry.taint.union(&current.taint);
-            validate_stored_entry(path, owner, namespace, &current.value)
+        entry.taint.union(&current.taint);
+        let previous = if let Some(current) = &current.value {
+            validate_stored_entry(path, owner, namespace, current)
                 .map_err(|error| ObservedFailure::from(error).with_taint(&entry.taint))?;
-            let indexed = indexed_entry(&current.value)
+            let indexed = indexed_entry(current)
                 .map_err(|error| ObservedFailure::from(error).with_taint(&entry.taint))?;
             if indexed.generation.as_str() == generation.as_str() {
                 // A committed operation owns its original representation. A
                 // retry checks its semantic request before repairing projection;
                 // it does not invoke a potentially nondeterministic model again.
-                if !same_request(&entry.value, &current.value, metric)
+                if !same_request(&entry.value, current, metric)
                     .map_err(|error| ObservedFailure::from(error).with_taint(&entry.taint))?
                 {
                     return Err(ObservedFailure::from(invalid(
@@ -43,7 +43,7 @@ impl MemoryDriver {
                     ))
                     .with_taint(&entry.taint));
                 }
-                entry.value = current.value.clone();
+                entry.value = current.clone();
                 let (published, observed) = self.reindex_existing(entry).await?;
                 entry.taint.union(&observed);
                 return Ok(published);
@@ -110,7 +110,7 @@ impl MemoryDriver {
             .state
             .write_cas_tainted(
                 path,
-                current.map(|current| current.value),
+                current.value,
                 entry.value.clone(),
                 entry.taint.clone(),
             )
@@ -133,13 +133,14 @@ impl MemoryDriver {
                     .read_tainted(path)
                     .await
                     .map_err(|error| state_error(error).with_taint(&entry.taint))?;
-                let Some(canonical) = canonical else {
+                entry.taint.union(&canonical.taint);
+                let Some(value) = canonical.value else {
                     return Err(ObservedFailure::from(invalid(
                         "memory record disappeared while confirming its existing value",
                     ))
                     .with_taint(&entry.taint));
                 };
-                entry.taint.union(&canonical.taint);
+                let canonical = TaintedValue::new(value, canonical.taint);
                 let current_generation = indexed_entry(&canonical.value)
                     .map_err(|error| ObservedFailure::from(error).with_taint(&entry.taint))?
                     .generation;
@@ -213,10 +214,11 @@ impl MemoryDriver {
             .read_tainted(&path)
             .await
             .map_err(|error| state_error(error).with_taint(&observed))?;
-        let Some(current) = current else {
+        observed.union(&current.taint);
+        let Some(value) = current.value else {
             return Ok((false, observed));
         };
-        observed.union(&current.taint);
+        let current = TaintedValue::new(value, current.taint);
         if current.value != entry.value {
             return Ok((false, observed));
         }
@@ -240,7 +242,7 @@ impl MemoryDriver {
         {
             taint.union(&page.taint);
             for (path, mut entry) in page.entries {
-                loop {
+                for attempt in 0..self.repair_attempts.get() {
                     taint.union(&entry.taint);
                     validate_stored_entry(&path, owner, namespace, &entry.value)
                         .map_err(|error| ObservedFailure::from(error).with_taint(&taint))?;
@@ -253,15 +255,19 @@ impl MemoryDriver {
                         count = count.saturating_add(1);
                         break;
                     }
-                    let Some(current) = self
+                    let current = self
                         .state
                         .read_tainted(&path)
                         .await
-                        .map_err(|error| state_error(error).with_taint(&taint))?
-                    else {
+                        .map_err(|error| state_error(error).with_taint(&taint))?;
+                    taint.union(&current.taint);
+                    let Some(value) = current.value else {
                         break;
                     };
-                    entry = current;
+                    if attempt + 1 == self.repair_attempts.get() {
+                        return Err(repair_exhausted(&taint));
+                    }
+                    entry = TaintedValue::new(value, current.taint);
                     tokio::task::yield_now().await;
                 }
             }

@@ -6,8 +6,8 @@
 //! The default `no_std + alloc` build runs linked programs with caller-owned
 //! storage and static driver, Fact, account, and cooperative scheduling adapters.
 //! It supplies no clock, thread, lock, or storage backend. `host` adds Tokio:
-//! opened dispatch plans, process ownership, state integration and optional
-//! durable execution. Both embeddings use the same admission and scope rules,
+//! opened dispatch plans, process ownership and state integration.
+//! Both embeddings use the same admission and scope rules,
 //! alongside the allocation-free control machine in `xolotl-core`.
 
 extern crate alloc;
@@ -28,6 +28,8 @@ pub mod fact;
 pub mod handle;
 #[cfg(feature = "host")]
 pub mod host;
+#[cfg(feature = "host")]
+pub mod identity;
 pub mod invocation;
 #[cfg(feature = "host")]
 pub mod kernel;
@@ -38,12 +40,10 @@ pub mod policy;
 #[cfg(feature = "host")]
 pub mod process;
 #[cfg(feature = "host")]
-pub mod recovery;
-#[cfg(feature = "host")]
 pub mod registry;
 pub mod runtime;
 #[cfg(feature = "host")]
-pub mod scheduler;
+mod runtime_domain;
 pub mod scope;
 #[cfg(feature = "host")]
 pub mod step;
@@ -53,13 +53,13 @@ pub mod values;
 #[cfg(feature = "host")]
 pub use bootstrap::{
     Bootstrap, BootstrapError, CompiledRequestGrantTemplate, GatewayAudit, MethodSpec,
-    ProcessCleanupFailure, ProcessCleanupReport, RequestGrantTemplate, RequestProcess,
-    SpawnedActor,
+    ProcessCleanupFailure, ProcessCleanupReport, RequestFinishError, RequestGrantTemplate,
+    RequestProcess, SpawnedActor,
 };
-#[cfg(feature = "durable")]
-pub use bootstrap::{DurableRecovery, DurableRecoveryConfig, DurableRecoveryReport};
 #[cfg(feature = "host")]
-pub use dataplane::DataPlane;
+pub use dataplane::FactIoMode;
+#[cfg(feature = "host")]
+pub use dataplane::{DataPlane, RequestAuthorizer};
 #[cfg(feature = "host")]
 pub use driver::{
     DispatchEntry, Driver, DriverContext, DriverDescriptor, DriverError, DriverPlan, DynDriver,
@@ -71,21 +71,24 @@ pub use execution_ids::{
 };
 #[cfg(feature = "host")]
 pub use executor::{
-    ExecutionBuffers, ExecutionConfig, ExecutionLayout, Executor, PreparedProgram, intern_identity,
-    now_millis,
+    ExecutionBuffers, ExecutionConfig, ExecutionLayout, Executor, HandleBindingError,
+    PreparedProgram,
 };
 #[cfg(feature = "host")]
 pub use fact::{
-    FACT_BROADCAST_CAPACITY, FactError, FactLookup, FactLookupResult, FactOrder, FactPage,
-    FactQuery, FactSink, FactStore, FactStream, InMemoryFactStore, SharedFactStore,
+    FACT_BROADCAST_CAPACITY, FactError, FactErrorKind, FactLookup, FactLookupResult, FactOrder,
+    FactPage, FactQuery, FactRetentionLimits, FactRetentionUsage, FactSink, FactStore, FactStream,
+    InMemoryFactStore, SharedFactStore,
 };
 #[cfg(feature = "host")]
-pub use handle::{FastPath, Handle, HandleState, HandleTable};
+pub use handle::{FastPath, Handle, HandleTable, WeakHandleTable};
+#[cfg(feature = "host")]
+pub use identity::{IdentityDirectory, IdentityError, IdentityRegistry, InMemoryIdentityDirectory};
 pub use invocation::{GrantedMethod, Invocation, InvocationOptions};
 #[cfg(feature = "host")]
-pub use kernel::Kernel;
+pub use kernel::{Kernel, KernelBuilder};
 #[cfg(feature = "host")]
-pub use open::{OpenError, OpenRequest, derive_handle, open_resource};
+pub use open::{OpenError, OpenRequest, PreparedOpen, open_resource, prepare_open};
 #[cfg(feature = "host")]
 pub use policy::{
     ApprovalCheck, ApprovalDecision, ApprovalRegistry, CapabilityPolicy, CheckCtx, CompiledCheck,
@@ -93,18 +96,18 @@ pub use policy::{
     RateLimitCheck,
 };
 #[cfg(feature = "host")]
-pub use process::{ProcessAdmissionError, ProcessCapacityError, ProcessTable};
-#[cfg(feature = "host")]
-pub use recovery::{
-    QuarantineAction, QuarantineEntry, RecoveryLimits, RecoveryReport, classify_recovery,
-    recover_process,
+pub use process::{
+    CleanupProgress, CleanupTicket, ProcessAdmissionError, ProcessCapacityError,
+    ProcessFinalizationReport, ProcessTable,
 };
 #[cfg(feature = "host")]
-pub use registry::{AdmissionError, Registry, ResolveError};
-pub use runtime::{Cooperate, Cooperative, LinkedExecution, PendingCall, RequestDriver};
+pub use registry::{AdmissionError, Registry, ResolveError, ResourceUpsert};
+pub use runtime::{
+    Cooperate, Cooperative, LinkedExecution, PendingCall, RequestCompletion, RequestDriver,
+};
 #[cfg(feature = "host")]
-pub use scheduler::{Queue, Scheduler};
-pub use scope::{CleanupScope, Scope, ScopeFinalize, ScopeRestoreError};
+pub use runtime_domain::RuntimeAssemblyError;
+pub use scope::{CleanupScope, Scope, ScopeFinalize};
 #[cfg(feature = "host")]
 pub use step::{LoaderRevision, ProgramLoader, StepBinding, StepFn, StepModule, StepModuleError};
 pub use stream::StreamSendError;

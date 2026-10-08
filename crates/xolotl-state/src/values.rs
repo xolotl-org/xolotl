@@ -21,8 +21,17 @@ pub fn append_value(
         Some(current) => current.taint.clone().merged(&taint),
         None => taint,
     };
+    append_observed_value(path, current.map(|value| &value.value), item, taint)
+}
+
+pub(crate) fn append_observed_value(
+    path: &Path,
+    current: Option<&Value>,
+    item: Value,
+    taint: TaintSet,
+) -> StateResult<TaintedValue> {
     let mut values = match current {
-        Some(current) => current.value.as_list().cloned().ok_or_else(|| {
+        Some(current) => current.as_list().cloned().ok_or_else(|| {
             StateFailure::new(
                 StateError::Backend(alloc::format!("append on non-list at {path}")),
                 taint.clone(),
@@ -34,6 +43,59 @@ pub fn append_value(
         .push(item)
         .map_err(|error| StateFailure::from(error).with_taint(&taint))?;
     Ok(TaintedValue::new(Value::from(values), taint))
+}
+
+/// Advance an existing list by removing an exact prefix and appending one item.
+/// The exact count makes an event replayable without consulting a Source rule.
+/// Provenance remains conservative even after an item leaves the current list.
+pub fn drop_prefix_append_value(
+    path: &Path,
+    current: Option<&TaintedValue>,
+    removed: u64,
+    item: Value,
+    taint: TaintSet,
+) -> StateResult<TaintedValue> {
+    let observed =
+        current.map_or_else(|| taint.clone(), |value| value.taint.clone().merged(&taint));
+    drop_prefix_append_observed_value(
+        path,
+        current.map(|value| &value.value),
+        removed,
+        item,
+        observed,
+    )
+}
+
+pub(crate) fn drop_prefix_append_observed_value(
+    path: &Path,
+    current: Option<&Value>,
+    removed: u64,
+    item: Value,
+    observed: TaintSet,
+) -> StateResult<TaintedValue> {
+    let list = current.and_then(Value::as_list).ok_or_else(|| {
+        StateFailure::new(
+            StateError::Backend(alloc::format!("prefix drop on non-list at {path}")),
+            observed.clone(),
+        )
+    })?;
+    let removed = usize::try_from(removed)
+        .ok()
+        .filter(|removed| *removed <= list.len())
+        .ok_or_else(|| {
+            StateFailure::new(
+                StateError::Backend(alloc::format!("prefix drop exceeds list at {path}")),
+                observed.clone(),
+            )
+        })?;
+    let mut values = list.clone();
+    values
+        .remove_prefix(removed)
+        .map_err(|error| StateFailure::from(error).with_taint(&observed))?;
+    values
+        .push(item)
+        .map_err(|error| StateFailure::from(error).with_taint(&observed))?;
+    Ok(TaintedValue::new(Value::from(values), observed))
 }
 
 /// Merge root maps, concatenate root lists, or replace other values.

@@ -11,7 +11,7 @@ fn document() -> Result<GatewayProfileDocument> {
             "principal_id": "client",
             "verifier": {"kind": "bearer", "token_hash": "11".repeat(32)}
         }],
-        "identity_mappings": [{"principal_id": "client", "identity_path": "process://app"}],
+        "identity_mappings": [{"principal_id": "client", "identity_path": "identity://app"}],
         "surfaces": [{"surface_id": "inspect", "target": "effect://blob/stat"}],
         "principal_surface_bindings": [{
             "principal_id": "client",
@@ -20,9 +20,25 @@ fn document() -> Result<GatewayProfileDocument> {
             "capability_ceiling": ["perform://effect/blob/stat"]
         }],
         "registered_hosts": ["localhost:9445"],
-        "limits": {"max_in_flight_requests": 2, "budget": {"max_inflight_ops": 4}}
+        "limits": {"max_in_flight_requests": 2, "max_recent_cancellations": 7,
+                   "budget": {"max_inflight_ops": 4}}
     }))
     .context("decode profile")
+}
+
+#[test]
+fn profile_declaration_path_is_shared_with_admission() -> Result<()> {
+    let path = gateway_profile_path("app")?;
+    ensure!(path.to_string() == "state://kernel/gateway/profiles/app");
+    ensure!(gateway_profile_id(&path) == Some("app"));
+    ensure!(gateway_profile_path("app/nested").is_err());
+    ensure!(gateway_profile_path("**").is_err());
+    ensure!(gateway_profile_id(&path.clone().try_push("nested")?).is_none());
+    ensure!(gateway_profile_id(&path.try_with_cluster("remote")?).is_none());
+    ensure!(gateway_profile_id(&Path::parse("state://kernel/gateway/other/app")?).is_none());
+    ensure!(gateway_profile_id(&Path::parse("state://kernel/gateway/profiles/*")?).is_none());
+    document()?.validate_admission("app")?;
+    Ok(())
 }
 
 #[test]
@@ -33,6 +49,7 @@ fn profile_document_admission_uses_explicit_bindings_and_config_revision() -> Re
     let profile = document.into_profile()?;
     ensure!(profile.revision == 3);
     ensure!(profile.limits.max_in_flight_requests == 2);
+    ensure!(profile.limits.max_recent_cancellations == 7);
     ensure!(profile.limits.budget.max_inflight_ops == Some(4));
     ensure!(profile.limits.max_stream_items == GatewayLimitProfile::default().max_stream_items);
     ensure!(profile.credentials.len() == 1);

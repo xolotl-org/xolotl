@@ -23,6 +23,7 @@ use xolotl_types::{ValueMap, ValueView};
 /// after standard installation.
 pub(crate) const DELIBERATION_METHODS: &[MethodSpec] = &[MethodSpec::new(
     "run",
+    xolotl_types::MethodAuthority::Perform,
     Purity::Effectful,
     MethodSpec::UNARY_ASYNC,
 )];

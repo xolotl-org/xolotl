@@ -11,6 +11,78 @@ use xolotl_proto::xolotl::v1::application as pb;
 use xolotl_state::object::ObjectRead;
 
 #[tokio::test]
+async fn shared_preparation_rejects_before_protobuf_payload_materialization() -> anyhow::Result<()>
+{
+    use super::harness::TOKEN;
+    use xolotl_gateway::{Gateway, GatewayError, GatewaySubmissionHead, PresentedCredential};
+    let fixture = Fixture::new(ApplicationGrpcConfig::default()).await?;
+    let session = fixture
+        .gateway
+        .authenticate(PresentedCredential::bearer(TOKEN))
+        .await?;
+    let limit = fixture
+        .gateway
+        .describe(&session)?
+        .limits
+        .max_in_flight_requests;
+    let mut owners = Vec::new();
+    let mut saturated = false;
+    for _ in 0..=limit {
+        match fixture.gateway.prepare_submission(
+            &session,
+            GatewaySubmissionHead::direct_input("echo"),
+            None,
+        ) {
+            Ok(owner) => owners.push(owner),
+            Err(GatewayError::LimitExceeded(_)) => {
+                saturated = true;
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    ensure!(saturated);
+    let mut client = fixture.client().await?;
+    for streaming in [false, true] {
+        let malformed = pb::SubmitRequest {
+            surface_id: "echo".into(),
+            payload: Some(xolotl_proto::xolotl::v1::Value {
+                kind: Some(xolotl_proto::xolotl::v1::value::Kind::NullVal(i32::MAX)),
+            }),
+            output: Some(xolotl_proto::output_mode_to_pb(if streaming {
+                xolotl_types::OutputMode::Stream
+            } else {
+                xolotl_types::OutputMode::Unary
+            })),
+            ..Default::default()
+        };
+        let status = if streaming {
+            client.submit_output(request(malformed)?).await.err()
+        } else {
+            client.submit(request(malformed)?).await.err()
+        }
+        .context("shared admission did not reject")?;
+        ensure!(status.code() == Code::ResourceExhausted);
+    }
+    drop(owners);
+    let malformed = pb::SubmitRequest {
+        surface_id: "echo".into(),
+        payload: Some(xolotl_proto::xolotl::v1::Value {
+            kind: Some(xolotl_proto::xolotl::v1::value::Kind::NullVal(i32::MAX)),
+        }),
+        ..Default::default()
+    };
+    let status = client
+        .submit(request(malformed)?)
+        .await
+        .err()
+        .context("malformed payload was accepted")?;
+    ensure!(status.code() == Code::InvalidArgument);
+    fixture.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn http2_reset_after_finish_never_commits_and_releases_the_shared_permit()
 -> anyhow::Result<()> {
     let config = ApplicationGrpcConfig {
@@ -323,7 +395,7 @@ async fn storage_timeout_drops_a_partially_completed_write_and_releases_capacity
 }
 
 #[tokio::test]
-async fn concurrent_uploads_have_one_receipt_cas_winner_and_keep_shared_content()
+async fn concurrent_identical_uploads_share_one_typed_binding_and_keep_shared_content()
 -> anyhow::Result<()> {
     let fixture = Fixture::with_options(
         ApplicationGrpcConfig::default(),
@@ -346,8 +418,7 @@ async fn concurrent_uploads_have_one_receipt_cas_winner_and_keep_shared_content(
     let right = raw.upload(&ticket.ticket_id, &frames, true).await?;
     let (left, right) = tokio::join!(left.response(), right.response());
     let (left, right) = (left?, right?);
-    ensure!((left.code == Code::Ok) != (right.code == Code::Ok));
-    ensure!([left.code, right.code].contains(&Code::InvalidArgument));
+    ensure!(left.code == Code::Ok && right.code == Code::Ok);
     ensure!(fixture.receipt_flag(&ticket.ticket_id, "committed").await?);
     ensure!(fixture.files.pending_uploads() == 0);
     let published = fixture.probe.published()?;

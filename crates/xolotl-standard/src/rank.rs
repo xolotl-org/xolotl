@@ -17,8 +17,19 @@ use xolotl_types::{ValueMap, ValueView};
 /// one as a separate `effect://rank/<method>` Resource with public method
 /// `invoke`.
 pub(crate) const RANK_METHODS: &[MethodSpec] = &[
-    MethodSpec::new("score", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external(),
-    MethodSpec::new("fuse", Purity::Pure, MethodSpec::UNARY_ASYNC),
+    MethodSpec::new(
+        "score",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Pure,
+        MethodSpec::UNARY_ASYNC,
+    )
+    .observes_external(),
+    MethodSpec::new(
+        "fuse",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Pure,
+        MethodSpec::UNARY_ASYNC,
+    ),
 ];
 
 /// Default signal weights — overridable via input `weights`.
@@ -60,11 +71,15 @@ impl RankerDriver {
         &self,
         m: &ValueMap,
         observed: &mut TaintSet,
-    ) -> Result<Vec<(String, f64)>, DriverError> {
+    ) -> Result<Vec<(String, f64)>, ObservedFailure> {
         if let Some(w) = m.get("weights").and_then(|v| v.as_map()) {
             return w
                 .iter()
-                .map(|(k, v)| as_f64(Some(v)).map(|weight| (k.to_owned(), weight)))
+                .map(|(k, v)| {
+                    as_f64(Some(v))
+                        .map(|weight| (k.to_owned(), weight))
+                        .map_err(ObservedFailure::from)
+                })
                 .collect();
         }
 
@@ -73,24 +88,27 @@ impl RankerDriver {
                 xolotl_types::Path::parse("state://kernel/rank/weights").map_err(|error| {
                     DriverError::Other(format!("rank weights path is invalid: {error}"))
                 })?;
-            let stored = state.read_tainted(&path).await.map_err(|error| {
-                observed.union(&error.taint);
-                DriverError::Other(format!("rank weights read failed: {error}"))
-            })?;
-            if let Some(stored) = &stored {
-                observed.union(&stored.taint);
-            }
-            match stored.as_ref().map(|stored| stored.value.view()) {
+            let stored = state
+                .read_tainted(&path)
+                .await
+                .map_err(ObservedFailure::from)?;
+            observed.union(&stored.taint);
+            match stored.value.as_ref().map(Value::view) {
                 Some(ValueView::Map(w)) => {
                     return w
                         .iter()
-                        .map(|(k, v)| as_f64(Some(v)).map(|weight| (k.to_owned(), weight)))
+                        .map(|(k, v)| {
+                            as_f64(Some(v))
+                                .map(|weight| (k.to_owned(), weight))
+                                .map_err(ObservedFailure::from)
+                        })
                         .collect();
                 }
                 Some(_) => {
                     return Err(DriverError::InvalidInput(
                         "state://kernel/rank/weights must be a map".into(),
-                    ));
+                    )
+                    .into());
                 }
                 None => {}
             }
@@ -102,7 +120,11 @@ impl RankerDriver {
             .collect())
     }
 
-    async fn score(&self, input: &ValueMap, observed: &mut TaintSet) -> Result<Value, DriverError> {
+    async fn score(
+        &self,
+        input: &ValueMap,
+        observed: &mut TaintSet,
+    ) -> Result<Value, ObservedFailure> {
         let weights = self.resolve_weights(input, observed).await?;
         let signals = input
             .get("signals")
@@ -159,9 +181,7 @@ impl Driver for RankerDriver {
                 let mut observed = ctx.taint.clone();
                 match self.score(&m, &mut observed).await {
                     Ok(value) => Ok(DriverOutput::new(Outcome::Done(value)).with_taint(observed)),
-                    Err(error) => ObservedFailure::from(error)
-                        .with_taint(&observed)
-                        .into_output("rank"),
+                    Err(error) => error.with_taint(&observed).into_output("rank"),
                 }
             }
             // fuse(lists): Reciprocal Rank Fusion over several ranked id-lists.

@@ -135,6 +135,12 @@ fn project_fact(f: &xolotl_types::Fact) -> Value {
     let mut m = BTreeMap::new();
     m.insert("op_id".into(), Value::string(f.id.to_string()));
     m.insert("caller".into(), Value::string(f.caller.get().to_string()));
+    m.insert(
+        "caller_identity".into(),
+        f.caller_identity.map_or(Value::null(), |identity| {
+            Value::string(identity.get().to_string())
+        }),
+    );
     m.insert("acting".into(), Value::string(f.acting.get().to_string()));
     m.insert(
         "resource".into(),

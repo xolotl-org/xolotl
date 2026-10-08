@@ -18,6 +18,7 @@ use encode::Encoding;
 
 pub(crate) const TENSOR_METHODS: &[MethodSpec] = &[MethodSpec::new(
     "write",
+    xolotl_types::MethodAuthority::Perform,
     Purity::Idempotent,
     MethodSpec::UNARY_ASYNC,
 )];

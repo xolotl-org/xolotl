@@ -1,10 +1,10 @@
 use anyhow::{Context, ensure};
 use std::{collections::BTreeMap, num::NonZeroUsize};
 use xolotl_state::{
-    InMemoryBackend, InMemoryOptions, StateError, StateHistoryQuery, StatePageLimits, StateScan,
-    TaintedValue, prelude::*,
+    InMemoryBackend, InMemoryOptions, MemoryHistory, StateError, StateHistoryQuery,
+    StatePageLimits, StateScan, TaintedValue, prelude::*,
 };
-use xolotl_storage_redb::RedbStore;
+use xolotl_storage_redb::{RedbHistory, RedbStore};
 use xolotl_types::{Path, TaintSet, TaintSource, Value};
 
 async fn bounded_pages<T: StateRead + StateWrite + StateQuery + StateHistory>(
@@ -131,7 +131,7 @@ async fn bounded_pages<T: StateRead + StateWrite + StateQuery + StateHistory>(
     let third = page.entries.get(2).context("missing delete event")?;
     ensure!(
         backend.read_at(&sequence, first.at_millis).await?
-            == Some(TaintedValue::new(
+            == xolotl_state::StateObservation::from(TaintedValue::new(
                 Value::list(vec![Value::integer(1)]),
                 protected.clone()
             ))
@@ -140,12 +140,18 @@ async fn bounded_pages<T: StateRead + StateWrite + StateQuery + StateHistory>(
     union.union(&taint);
     ensure!(
         backend.read_at(&sequence, second.at_millis).await?
-            == Some(TaintedValue::new(
+            == xolotl_state::StateObservation::from(TaintedValue::new(
                 Value::list(vec![Value::integer(1), Value::integer(2)]),
                 union
             ))
     );
-    ensure!(backend.read_at(&sequence, third.at_millis).await?.is_none());
+    ensure!(
+        backend
+            .read_at(&sequence, third.at_millis)
+            .await?
+            .value
+            .is_none()
+    );
 
     let path = Path::parse("state://oversized-history")?;
     backend
@@ -154,14 +160,27 @@ async fn bounded_pages<T: StateRead + StateWrite + StateQuery + StateHistory>(
     backend.write_set(&path, Value::integer(3)).await?;
     let mut query = StateHistoryQuery::new(path.clone(), 0, i64::MAX);
     query.limits.encoded_bytes = NonZeroUsize::MIN.saturating_add(255);
-    let error = match backend.history(&query).await {
-        Err(xolotl_state::StateFailure {
-            error: StateError::RowTooLarge(error),
-            ..
-        }) => error,
-        other => anyhow::bail!("expected oversized history row, got {other:?}"),
+    let mut progress_pages = 0;
+    let error = loop {
+        match backend.history(&query).await {
+            Ok(page) => {
+                progress_pages += 1;
+                ensure!(progress_pages <= 16);
+                ensure!(
+                    page.entries.is_empty() && page.encoded_bytes == 0 && page.taint.is_pristine()
+                );
+                ensure!(page.examined != 0 && page.next.is_some() && page.next != query.cursor);
+                query.cursor = page.next;
+            }
+            Err(xolotl_state::StateFailure {
+                error: StateError::RowTooLarge(error),
+                ..
+            }) => break error,
+            other => anyhow::bail!("expected oversized history row, got {other:?}"),
+        }
     };
     ensure!(error.path == path);
+    ensure!(error.retry == query.cursor);
     query.cursor = error.retry.clone();
     query.limits.encoded_bytes =
         NonZeroUsize::new(error.encoded_bytes).context("zero history size")?;
@@ -183,6 +202,7 @@ async fn memory_capabilities_obey_bounded_contracts() -> anyhow::Result<()> {
     for read_shards in [NonZeroUsize::MIN, NonZeroUsize::MIN.saturating_add(6)] {
         bounded_pages(&InMemoryBackend::with_options(InMemoryOptions {
             read_shards,
+            history: MemoryHistory::Full,
             ..InMemoryOptions::default()
         })?)
         .await?;
@@ -193,6 +213,6 @@ async fn memory_capabilities_obey_bounded_contracts() -> anyhow::Result<()> {
 #[tokio::test]
 async fn redb_capabilities_obey_bounded_contracts() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let store = RedbStore::open(dir.path().join("state.redb"))?;
+    let store = RedbStore::open_with_history(dir.path().join("state.redb"), RedbHistory::Full)?;
     bounded_pages(&store.state_backend()).await
 }

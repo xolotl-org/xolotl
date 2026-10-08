@@ -89,10 +89,11 @@ fn composite_value() -> Value {
 }
 
 #[test]
-fn value_round_trips_every_variant() {
+fn value_round_trips_every_variant() -> anyhow::Result<()> {
     let v = composite_value();
-    let back = value_from_pb(&value_to_pb(&v));
-    assert_eq!(v, back, "structural Value mapping must be lossless");
+    let back = value_from_pb(&value_to_pb(&v))?;
+    ensure!(v == back, "structural Value mapping must be lossless");
+    Ok(())
 }
 
 #[test]
@@ -111,14 +112,64 @@ fn protobuf_wire_round_trip_preserves_exact_float_bits() -> anyhow::Result<()> {
         let value = Value::float(FloatBits(f64::from_bits(bits)));
         let bytes = value_to_pb(&value).encode_to_vec();
         let wire = crate::xolotl::v1::Value::decode(bytes.as_slice())?;
-        let decoded = value_from_pb_checked(&wire)?;
+        let decoded = value_from_pb(&wire)?;
         ensure!(decoded == value, "protobuf changed float bits {bits:016x}");
     }
     Ok(())
 }
 
 #[test]
-fn every_dtype_round_trips() {
+fn protobuf_map_encoding_is_stable_across_reconstruction() -> anyhow::Result<()> {
+    use prost::Message;
+
+    let nested = Value::map(BTreeMap::from([
+        ("z".into(), Value::integer(3)),
+        ("a".into(), Value::string("same".into())),
+    ]));
+    let value = Value::map(BTreeMap::from([
+        ("origin".into(), Value::string("current_attempt".into())),
+        ("nested".into(), nested),
+        ("failure".into(), Value::null()),
+    ]));
+    let expected = value_to_pb(&value).encode_to_vec();
+    for _ in 0..64 {
+        let rebuilt = value_to_pb(&value).encode_to_vec();
+        ensure!(
+            rebuilt == expected,
+            "map encoding changed across reconstruction"
+        );
+        let decoded = crate::xolotl::v1::Value::decode(rebuilt.as_slice())?;
+        ensure!(value_to_pb(&value_from_pb(&decoded)?).encode_to_vec() == expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn protobuf_error_details_encoding_is_stable() -> anyhow::Result<()> {
+    use crate::xolotl::v1::external as ext;
+    use prost::Message;
+
+    let make = |keys: &[(&str, &str)]| ext::ErrorInfo {
+        code: "remote".into(),
+        message: "failed".into(),
+        details: keys
+            .iter()
+            .map(|(key, value)| ((*key).into(), (*value).into()))
+            .collect(),
+    };
+    let entries = [("zeta", "3"), ("alpha", "1"), ("beta", "2")];
+    let expected = make(&entries).encode_to_vec();
+    for _ in 0..64 {
+        ensure!(
+            make(&[("beta", "2"), ("alpha", "1"), ("zeta", "3")]).encode_to_vec() == expected,
+            "error details map wire order changed"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn every_dtype_round_trips() -> anyhow::Result<()> {
     for d in [
         DType::F16,
         DType::Bf16,
@@ -136,12 +187,13 @@ fn every_dtype_round_trips() {
             dtype: d,
             shape: vec![2],
         });
-        assert_eq!(v, value_from_pb(&value_to_pb(&v)), "dtype {d:?}");
+        ensure!(v == value_from_pb(&value_to_pb(&v))?, "dtype {d:?}");
     }
+    Ok(())
 }
 
 #[test]
-fn every_frame_kind_round_trips() {
+fn every_frame_kind_round_trips() -> anyhow::Result<()> {
     for k in [
         FrameKind::Audio,
         FrameKind::Video,
@@ -149,77 +201,20 @@ fn every_frame_kind_round_trips() {
         FrameKind::Sensor,
     ] {
         let v = Value::frame(blob(), 1, k);
-        assert_eq!(v, value_from_pb(&value_to_pb(&v)), "frame kind {k:?}");
+        ensure!(v == value_from_pb(&value_to_pb(&v))?, "frame kind {k:?}");
     }
+    Ok(())
 }
 
 #[test]
-fn empty_pb_value_is_null() {
+fn empty_pb_value_is_null() -> anyhow::Result<()> {
     let pb = crate::xolotl::v1::Value { kind: None };
-    assert_eq!(value_from_pb(&pb), Value::null());
+    ensure!(value_from_pb(&pb)? == Value::null());
+    Ok(())
 }
 
 #[test]
-fn malformed_multimodal_refs_do_not_synthesize_empty_blob() {
-    use crate::xolotl::v1 as pb;
-    let tensor = pb::Value {
-        kind: Some(pb::value::Kind::TensorVal(pb::TensorRef {
-            blob: None,
-            dtype: "f32".into(),
-            shape: vec![1],
-        })),
-    };
-    let frame = pb::Value {
-        kind: Some(pb::value::Kind::FrameVal(pb::FrameRef {
-            blob: None,
-            ts_nanos: 1,
-            kind: "video".into(),
-        })),
-    };
-    assert_eq!(value_from_pb(&tensor), Value::null());
-    assert_eq!(value_from_pb(&frame), Value::null());
-}
-
-#[test]
-fn malformed_multimodal_enums_do_not_default_to_valid_variants() {
-    use crate::xolotl::v1 as pb;
-    let tensor = pb::Value {
-        kind: Some(pb::value::Kind::TensorVal(pb::TensorRef {
-            blob: Some(pb_blob()),
-            dtype: "complex64".into(),
-            shape: vec![1],
-        })),
-    };
-    let frame = pb::Value {
-        kind: Some(pb::value::Kind::FrameVal(pb::FrameRef {
-            blob: Some(pb_blob()),
-            ts_nanos: 1,
-            kind: "depth".into(),
-        })),
-    };
-    assert_eq!(value_from_pb(&tensor), Value::null());
-    assert_eq!(value_from_pb(&frame), Value::null());
-}
-
-#[test]
-fn malformed_stream_markers_do_not_default_to_done() {
-    use crate::xolotl::v1 as pb;
-    let missing_kind = pb::Value {
-        kind: Some(pb::value::Kind::StreamEndVal(pb::StreamMarker {
-            kind: None,
-        })),
-    };
-    let false_done = pb::Value {
-        kind: Some(pb::value::Kind::StreamEndVal(pb::StreamMarker {
-            kind: Some(pb::stream_marker::Kind::Done(false)),
-        })),
-    };
-    assert_eq!(value_from_pb(&missing_kind), Value::null());
-    assert_eq!(value_from_pb(&false_done), Value::null());
-}
-
-#[test]
-fn checked_value_rejects_malformed_multimodal_refs() {
+fn value_rejects_malformed_multimodal_refs() {
     use crate::xolotl::v1 as pb;
     let null_bad_enum = pb::Value {
         kind: Some(pb::value::Kind::NullVal(99)),
@@ -256,12 +251,22 @@ fn checked_value_rejects_malformed_multimodal_refs() {
         })),
     };
 
-    assert!(value_from_pb_checked(&null_bad_enum).is_err());
-    assert!(value_from_pb_checked(&tensor_missing_blob).is_err());
-    assert!(value_from_pb_checked(&tensor_bad_dtype).is_err());
-    assert!(value_from_pb_checked(&frame_bad_kind).is_err());
-    assert!(value_from_pb_checked(&stream_marker_missing_kind).is_err());
-    assert!(value_from_pb_checked(&stream_marker_false_done).is_err());
+    assert!(value_from_pb(&null_bad_enum).is_err());
+    assert!(value_from_pb(&tensor_missing_blob).is_err());
+    assert!(value_from_pb(&tensor_bad_dtype).is_err());
+    assert!(value_from_pb(&frame_bad_kind).is_err());
+    assert!(value_from_pb(&stream_marker_missing_kind).is_err());
+    assert!(value_from_pb(&stream_marker_false_done).is_err());
+    let nested_invalid = pb::Value {
+        kind: Some(pb::value::Kind::ListVal(pb::ListValue {
+            items: vec![pb::Value {
+                kind: Some(pb::value::Kind::MapVal(pb::MapValue {
+                    entries: [("bad".into(), tensor_bad_dtype)].into(),
+                })),
+            }],
+        })),
+    };
+    assert!(value_from_pb(&nested_invalid).is_err());
 }
 
 #[test]
@@ -300,6 +305,7 @@ fn external_value_frames_reject_malformed_multimodal_refs() -> anyhow::Result<()
             observed: Some(ext::ObservedGenerations::default()),
             stream_id: None,
             seq: None,
+            stream_epoch: None,
         })
         .is_err(),
         "malformed inbound event should be rejected"
@@ -401,6 +407,7 @@ fn external_value_frames_require_explicit_value_fields() -> anyhow::Result<()> {
             observed: Some(ext::ObservedGenerations::default()),
             stream_id: None,
             seq: None,
+            stream_epoch: None,
         })
         .is_err(),
         "missing inbound payload should be rejected"
@@ -516,13 +523,21 @@ fn path_params_are_not_wire_api() {
 fn capability_round_trips() -> anyhow::Result<()> {
     let c = Capability {
         verb: "read".into(),
+        cluster: Some("phone".into()),
         scheme: "state".into(),
         segments: vec!["kernel".into(), "config".into()],
+        method: Some("read_secret".into()),
         predicate: Predicate::parse("size<100").ok(),
     };
     let back = capability_from_pb(&capability_to_pb(&c))?;
     ensure!(c.verb == back.verb, "verb changed: {}", back.verb);
+    ensure!(
+        c.cluster == back.cluster,
+        "cluster changed: {:?}",
+        back.cluster
+    );
     ensure!(c.scheme == back.scheme, "scheme changed: {}", back.scheme);
+    ensure!(c.method == back.method, "method changed: {:?}", back.method);
     ensure!(
         c.segments == back.segments,
         "segments changed: {:?}",
@@ -546,8 +561,90 @@ fn program_round_trips_structurally() -> anyhow::Result<()> {
         Box::new(DoNode::Pure(Value::integer(1))),
         Box::new(DoNode::Op(op)),
     );
-    let back = program_from_pb(&program_to_pb(&program))?;
+    let back = program_from_pb(&program_to_pb(&program)?)?;
     ensure!(program == back, "program changed: {back:?}");
+    Ok(())
+}
+
+#[test]
+fn program_finally_round_trips_structurally() -> anyhow::Result<()> {
+    let program = DoNode::pure(7).finally(DoNode::pure(Value::null()));
+    let back = program_from_pb(&program_to_pb(&program)?)?;
+    ensure!(program == back, "finally changed: {back:?}");
+    Ok(())
+}
+
+#[test]
+fn native_wire_depth_is_bounded_on_both_conversion_paths() -> anyhow::Result<()> {
+    use crate::xolotl::v1 as pb;
+    use prost::Message;
+
+    let mut program = DoNode::pure(7);
+    for _ in 1..MAX_WIRE_DO_DEPTH {
+        program = program.and_then(StepRef::new("next"));
+    }
+    let mut wire = program_to_pb(&program)?;
+    let encoded = wire.encode_to_vec();
+    let decoded = pb::Program::decode(encoded.as_slice())?;
+    ensure!(program_from_pb(&decoded)? == program);
+
+    program = program.and_then(StepRef::new("next"));
+    ensure!(xolotl_graph::compile_do(&program).is_ok());
+    ensure!(matches!(
+        program_to_pb(&program),
+        Err(ConvertError::ProgramDepth {
+            max: MAX_WIRE_DO_DEPTH
+        })
+    ));
+
+    wire.root = Some(pb::DoNode {
+        kind: Some(pb::do_node::Kind::AndThen(pb::AndThen {
+            d: wire.root.take().map(Box::new),
+            then: Some(pb::StepRef {
+                name: "next".into(),
+                arg: None,
+            }),
+        })),
+    });
+    ensure!(matches!(
+        program_from_pb(&wire),
+        Err(ConvertError::ProgramDepth {
+            max: MAX_WIRE_DO_DEPTH
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn native_wire_depth_counts_nested_values() -> anyhow::Result<()> {
+    use crate::xolotl::v1 as pb;
+
+    let nested = Value::list(vec![Value::list(vec![Value::integer(7)])]);
+    let mut program = DoNode::pure(nested.clone());
+    for _ in 1..MAX_WIRE_DO_DEPTH {
+        program = program.and_then(StepRef::new("next"));
+    }
+    ensure!(matches!(
+        program_to_pb(&program),
+        Err(ConvertError::MessageDepth { max: 100 })
+    ));
+
+    let mut wire = program_to_pb(&DoNode::pure(nested))?;
+    for _ in 1..MAX_WIRE_DO_DEPTH {
+        wire.root = Some(pb::DoNode {
+            kind: Some(pb::do_node::Kind::AndThen(pb::AndThen {
+                d: wire.root.take().map(Box::new),
+                then: Some(pb::StepRef {
+                    name: "next".into(),
+                    arg: None,
+                }),
+            })),
+        });
+    }
+    ensure!(matches!(
+        program_from_pb(&wire),
+        Err(ConvertError::MessageDepth { max: 100 })
+    ));
     Ok(())
 }
 
@@ -557,7 +654,7 @@ fn program_explicit_unspecified_output_mode_fails_closed() -> anyhow::Result<()>
         "effect://x/post",
         OutputMode::Unary,
         None,
-    )?));
+    )?))?;
     let root = program.root.as_mut().context("missing program root")?;
     let crate::xolotl::v1::do_node::Kind::Op(op) =
         root.kind.as_mut().context("missing root kind")?
@@ -582,7 +679,7 @@ fn program_missing_output_mode_fails_closed() -> anyhow::Result<()> {
         "effect://x/post",
         OutputMode::Unary,
         None,
-    )?));
+    )?))?;
     let root = program.root.as_mut().context("missing program root")?;
     let crate::xolotl::v1::do_node::Kind::Op(op) =
         root.kind.as_mut().context("missing root kind")?
@@ -604,7 +701,7 @@ fn program_blank_operation_method_fails_closed() -> anyhow::Result<()> {
         "effect://x/post",
         OutputMode::Unary,
         None,
-    )?));
+    )?))?;
     let root = program.root.as_mut().context("missing program root")?;
     let crate::xolotl::v1::do_node::Kind::Op(op) =
         root.kind.as_mut().context("missing root kind")?
@@ -622,7 +719,7 @@ fn program_blank_operation_method_fails_closed() -> anyhow::Result<()> {
         "effect://x/post",
         OutputMode::Unary,
         None,
-    )?));
+    )?))?;
     let root = padded.root.as_mut().context("missing program root")?;
     let crate::xolotl::v1::do_node::Kind::Op(op) =
         root.kind.as_mut().context("missing root kind")?
@@ -641,7 +738,7 @@ fn program_blank_operation_method_fails_closed() -> anyhow::Result<()> {
 fn program_blank_step_and_binding_names_fail_closed() -> anyhow::Result<()> {
     let blank_step = DoNode::pure(Value::null()).and_then(StepRef::new(" "));
     ensure!(
-        program_from_pb(&program_to_pb(&blank_step)).is_err(),
+        program_from_pb(&program_to_pb(&blank_step)?).is_err(),
         "blank step name should fail closed"
     );
 
@@ -651,13 +748,13 @@ fn program_blank_step_and_binding_names_fail_closed() -> anyhow::Result<()> {
         body: Box::new(DoNode::Use("x".into())),
     };
     ensure!(
-        program_from_pb(&program_to_pb(&blank_let)).is_err(),
+        program_from_pb(&program_to_pb(&blank_let)?).is_err(),
         "blank let binding name should fail closed"
     );
 
     let blank_use = DoNode::Use("  ".into());
     ensure!(
-        program_from_pb(&program_to_pb(&blank_use)).is_err(),
+        program_from_pb(&program_to_pb(&blank_use)?).is_err(),
         "blank use name should fail closed"
     );
     Ok(())
@@ -669,7 +766,7 @@ fn named_steps_round_trip_through_protobuf_bytes() -> anyhow::Result<()> {
     let program = DoNode::pure(Value::integer(21))
         .and_then(StepRef::new("math/double").with_arg(composite_value()))
         .or_else(StepRef::new("recover"));
-    let bytes = program_to_pb(&program).encode_to_vec();
+    let bytes = program_to_pb(&program)?.encode_to_vec();
     let decoded = crate::xolotl::v1::Program::decode(bytes.as_slice())?;
     ensure!(program_from_pb(&decoded)? == program);
     Ok(())
@@ -677,7 +774,7 @@ fn named_steps_round_trip_through_protobuf_bytes() -> anyhow::Result<()> {
 
 #[test]
 fn program_missing_failure_kind_fails_closed() -> anyhow::Result<()> {
-    let mut program = program_to_pb(&DoNode::Fail(Failure::Timeout));
+    let mut program = program_to_pb(&DoNode::Fail(Failure::Timeout))?;
     let root = program.root.as_mut().context("missing program root")?;
     let crate::xolotl::v1::do_node::Kind::Fail(failure) =
         root.kind.as_mut().context("missing root kind")?
@@ -723,13 +820,40 @@ fn outcome_done_and_fail_map() -> anyhow::Result<()> {
 }
 
 #[test]
+fn outcome_unknown_failure_keeps_all_operation_identities() -> anyhow::Result<()> {
+    use crate::xolotl::v1 as pb;
+    use prost::Message;
+
+    let failure = Failure::OutcomeUnknown {
+        operation_ids: vec![
+            "process/7/execution/11/invocation/3".into(),
+            "process/7/execution/11/invocation/4".into(),
+        ],
+        reason: "source command acknowledgement missing".into(),
+    };
+    ensure!(failure_kind(&failure) == "outcome_unknown");
+    let encoded = failure_to_pb(&failure).encode_to_vec();
+    let wire = pb::Failure::decode(encoded.as_slice())?;
+    ensure!(matches!(
+        &wire.kind,
+        Some(pb::failure::Kind::OutcomeUnknown(detail))
+            if detail.operation_ids == [
+                "process/7/execution/11/invocation/3",
+                "process/7/execution/11/invocation/4",
+            ]
+    ));
+    ensure!(failure_from_pb(&wire)? == failure);
+    Ok(())
+}
+
+#[test]
 fn value_survives_protobuf_encode_decode() -> anyhow::Result<()> {
     use prost::Message;
     let pb = value_to_pb(&composite_value());
     let bytes = pb.encode_to_vec();
     let decoded = crate::xolotl::v1::Value::decode(&bytes[..])?;
     ensure!(pb == decoded, "protobuf value changed: {decoded:?}");
-    let value = value_from_pb(&decoded);
+    let value = value_from_pb(&decoded)?;
     ensure!(
         value == composite_value(),
         "decoded value changed: {value:?}"
@@ -772,6 +896,9 @@ fn external_handshake_frames_survive_wire() -> anyhow::Result<()> {
         presentation_config_generation: 7,
         alias_catalog_generation: 8,
         session_id: "session-1".into(),
+        scope_epoch: 9,
+        installation_epoch: 8,
+        key_epoch: 3,
     };
     let ready = ext::ExternalFrame {
         frame: Some(ext::external_frame::Frame::RoleReady(ext::RoleReady {
@@ -824,6 +951,9 @@ fn external_session_typed_frames_roundtrip() -> anyhow::Result<()> {
         presentation_config_generation: 5,
         alias_catalog_generation: 6,
         session_id: "session-1".into(),
+        scope_epoch: 9,
+        installation_epoch: 8,
+        key_epoch: 3,
     };
     let back = session_context_from_pb(&session_context_to_pb(&context))?;
     ensure!(back == context, "context changed: {back:?}");
@@ -841,6 +971,7 @@ fn external_session_typed_frames_roundtrip() -> anyhow::Result<()> {
         timestamp_ms: 1234,
         stream_id: Some("stream-1".into()),
         seq: Some(7),
+        stream_epoch: Some(9),
     };
     let back = inbound_event_from_pb(&inbound_event_to_pb(&event))?;
     ensure!(back == event, "event changed: {back:?}");
@@ -849,9 +980,22 @@ fn external_session_typed_frames_roundtrip() -> anyhow::Result<()> {
         id: "event-1".into(),
         status: AckStatus::Rejected,
         reject_reason: Some("schema".into()),
+        stream_epoch: Some(9),
     };
     let back = event_ack_from_pb(&event_ack_to_pb(&ack))?;
     ensure!(back == ack, "ack changed: {back:?}");
+    let unknown = EventAck {
+        id: "event-1".into(),
+        status: AckStatus::OutcomeUnknown,
+        reject_reason: None,
+        stream_epoch: Some(9),
+    };
+    let unknown_pb = event_ack_to_pb(&unknown);
+    ensure!(
+        unknown_pb.status == crate::xolotl::v1::external::AckStatus::OutcomeUnknown as i32,
+        "indeterminate commit must have a distinct wire status"
+    );
+    ensure!(event_ack_from_pb(&unknown_pb)? == unknown);
     Ok(())
 }
 
@@ -875,6 +1019,7 @@ fn external_secure_envelope_survives_wire() -> anyhow::Result<()> {
                     credential_generation: 7,
                     transcript_hash: vec![0x42; 32],
                     key_epoch: 2,
+                    direction: "client_to_daemon".into(),
                 }),
                 nonce_prefix: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
                 ciphertext: vec![0xaa, 0xbb, 0xcc],
@@ -970,6 +1115,7 @@ fn external_control_frames_roundtrip_through_pb() -> anyhow::Result<()> {
 }
 
 #[test]
+#[cfg(feature = "grpc")]
 fn service_names_and_method_paths_are_correct() {
     assert_eq!(
         crate::xolotl::v1::external::external_service_server::SERVICE_NAME,
@@ -1043,8 +1189,10 @@ fn malformed_wire_paths_and_capabilities_fail_closed() -> anyhow::Result<()> {
 
     let bad_capability = pb::Capability {
         verb: "effect".into(),
+        cluster: None,
         scheme: "x".into(),
         segments: vec!["post".into()],
+        method: None,
         predicate: None,
     };
     ensure!(
@@ -1053,8 +1201,10 @@ fn malformed_wire_paths_and_capabilities_fail_closed() -> anyhow::Result<()> {
     );
     let injected_capability_segment = pb::Capability {
         verb: "perform".into(),
+        cluster: None,
         scheme: "effect".into(),
         segments: vec!["x/post".into()],
+        method: None,
         predicate: None,
     };
     ensure!(
@@ -1063,13 +1213,27 @@ fn malformed_wire_paths_and_capabilities_fail_closed() -> anyhow::Result<()> {
     );
     let injected_capability_scheme = pb::Capability {
         verb: "perform".into(),
+        cluster: None,
         scheme: "effect/post".into(),
         segments: vec!["x".into()],
+        method: None,
         predicate: None,
     };
     ensure!(
         capability_from_pb(&injected_capability_scheme).is_err(),
         "capability scheme containing delimiter should fail"
+    );
+    let injected_capability_cluster = pb::Capability {
+        verb: "perform".into(),
+        cluster: Some("bad/cluster".into()),
+        scheme: "effect".into(),
+        segments: vec!["post".into()],
+        method: None,
+        predicate: None,
+    };
+    ensure!(
+        capability_from_pb(&injected_capability_cluster).is_err(),
+        "capability cluster containing delimiter should fail"
     );
 
     let missing_effect_path = ext::Invoke {
@@ -1106,6 +1270,39 @@ fn malformed_wire_paths_and_capabilities_fail_closed() -> anyhow::Result<()> {
         session_context_from_pb(&bad_context).is_err(),
         "bad context should fail"
     );
+    let missing_source_epoch = ext::SessionContext {
+        role: ext::ExternalRole::Source as i32,
+        session_id: "session-1".into(),
+        installation_epoch: 8,
+        scope_epoch: 0,
+        ..Default::default()
+    };
+    ensure!(
+        session_context_from_pb(&missing_source_epoch).is_err(),
+        "Source context without a storage-issued scope epoch should fail"
+    );
+    let provider_with_source_epoch = ext::SessionContext {
+        role: ext::ExternalRole::Provider as i32,
+        session_id: "session-1".into(),
+        installation_epoch: 8,
+        scope_epoch: 9,
+        ..Default::default()
+    };
+    ensure!(
+        session_context_from_pb(&provider_with_source_epoch).is_err(),
+        "Provider context must not claim a Source scope epoch"
+    );
+    let missing_installation_epoch = ext::SessionContext {
+        role: ext::ExternalRole::Provider as i32,
+        session_id: "session-1".into(),
+        installation_epoch: 0,
+        scope_epoch: 0,
+        ..Default::default()
+    };
+    ensure!(
+        session_context_from_pb(&missing_installation_epoch).is_err(),
+        "every role requires a storage-issued installation epoch"
+    );
 
     let missing_context = ext::RoleReady {
         accepted_context: None,
@@ -1135,6 +1332,7 @@ fn malformed_wire_paths_and_capabilities_fail_closed() -> anyhow::Result<()> {
         observed: None,
         stream_id: None,
         seq: None,
+        stream_epoch: None,
     };
     ensure!(
         inbound_event_from_pb(&missing_event_observed).is_err(),
@@ -1155,6 +1353,7 @@ fn malformed_wire_paths_and_capabilities_fail_closed() -> anyhow::Result<()> {
         id: "event-1".into(),
         status: ext::AckStatus::Unspecified as i32,
         reject_reason: None,
+        stream_epoch: None,
     };
     ensure!(event_ack_from_pb(&bad_ack).is_err(), "bad ack should fail");
 
@@ -1325,13 +1524,11 @@ fn console_frame_carries_action_call_with_kernel_value() -> anyhow::Result<()> {
         frame: Some(con::console_frame::Frame::Call(con::ActionCall {
             id: 42,
             action: "config.write_cas".into(),
-            action_code: Some(7),
             input: Some(value_to_pb(&input)),
             scope: Some("state://kernel/config".into()),
             justification: Some("rotating key".into()),
             ttl_ms: Some(5_000),
             registry_rev: Some(3),
-            idempotency_key: Some("k-1".into()),
         })),
     };
     let bytes = frame.encode_to_vec();
@@ -1346,8 +1543,7 @@ fn console_frame_carries_action_call_with_kernel_value() -> anyhow::Result<()> {
         other => bail!("expected Call frame, got {other:?}"),
     };
     ensure!(call.id == 42, "correlation id lost");
-    ensure!(call.action_code == Some(7), "action code lost");
-    let round = value_from_pb_checked(
+    let round = value_from_pb(
         call.input
             .as_ref()
             .ok_or_else(|| anyhow!("input value missing"))?,
@@ -1369,14 +1565,8 @@ fn console_error_codes_round_trip_every_variant() -> anyhow::Result<()> {
         con::ConsoleErrorCode::ValidationFailed,
         con::ConsoleErrorCode::AdmissionRejected,
         con::ConsoleErrorCode::VersionConflict,
-        con::ConsoleErrorCode::NotFound,
         con::ConsoleErrorCode::RegistryChanged,
-        con::ConsoleErrorCode::ReplayRequired,
-        con::ConsoleErrorCode::VisibilityRequired,
-        con::ConsoleErrorCode::IndexUnavailable,
-        con::ConsoleErrorCode::PayloadTooLarge,
-        con::ConsoleErrorCode::Backpressure,
-        con::ConsoleErrorCode::UnsupportedVersion,
+        con::ConsoleErrorCode::OutcomeUnknown,
         con::ConsoleErrorCode::Internal,
     ];
     for code in codes {
@@ -1394,7 +1584,51 @@ fn console_error_codes_round_trip_every_variant() -> anyhow::Result<()> {
             required_mfa_level: Some(2),
             current_version: Some(13),
             current_registry_rev: Some(5),
-            correlation_id: Some("appr-1".into()),
+            mfa: Some(con::MfaOptions {
+                factors: vec![
+                    con::MfaFactor {
+                        factor_id: "factor-phone".into(),
+                        provider_id: "totp".into(),
+                        label: "Phone".into(),
+                        created_at: 1_700_000_000_000,
+                        last_used_at: Some(1_700_000_030_000),
+                        availability: con::FactorAvailability::Available as i32,
+                    },
+                    con::MfaFactor {
+                        factor_id: "factor-device".into(),
+                        provider_id: "custom-device".into(),
+                        label: "Device".into(),
+                        created_at: 1_700_000_000_001,
+                        last_used_at: None,
+                        availability: con::FactorAvailability::ProviderNotInstalled as i32,
+                    },
+                    con::MfaFactor {
+                        factor_id: "factor-paused".into(),
+                        provider_id: "push".into(),
+                        label: "Paused by host".into(),
+                        created_at: 1_700_000_000_002,
+                        last_used_at: None,
+                        availability: con::FactorAvailability::AuthenticationDisabled as i32,
+                    },
+                ],
+                recovery_code_available: true,
+            }),
+            execution: Some(con::ExecutionReference {
+                execution_id: Some("execution-42".into()),
+                process_id: "456".into(),
+                program_id: "ab".repeat(32),
+            }),
+            outcome_unknown: (code == con::ConsoleErrorCode::OutcomeUnknown).then(|| {
+                con::OutcomeUnknownDetail {
+                    operation_ids: vec!["1/2/3/4/0".into(), "1/2/4/5/0".into()],
+                    reason: "delivery_or_session_lost".into(),
+                }
+            }),
+            unresolved_operations: Some(crate::xolotl::v1::UnresolvedOperations {
+                operation_ids: vec!["1/2/3/4/0".into()],
+                identities_incomplete: false,
+            }),
+            runtime_completion: Some(Box::new(value_to_pb(&Value::integer(37)))),
         };
         let bytes = err.encode_to_vec();
         let decoded = con::ConsoleError::decode(&bytes[..])?;
@@ -1420,6 +1654,8 @@ fn portable_program_wire_preserves_composition_identity_and_rejects_tampering() 
             }),
     );
     let wire = portable_program_to_pb(&source)?;
+    let source_document: serde_json::Value = serde_json::from_slice(&wire.json_source)?;
+    anyhow::ensure!(source_document.get("durable").is_none());
     let encoded = wire.encode_to_vec();
     let mut decoded = crate::xolotl::v1::PortableProgram::decode(encoded.as_slice())?;
     let back = portable_program_from_pb(&decoded)?;
@@ -1428,5 +1664,88 @@ fn portable_program_wire_preserves_composition_identity_and_rejects_tampering() 
     anyhow::ensure!(portable_program_from_pb(&decoded).is_err());
     decoded.json_source = vec![b' '; 1024 * 1024 + 1];
     anyhow::ensure!(portable_program_from_pb(&decoded).is_err());
+    Ok(())
+}
+
+#[test]
+fn source_stream_v1_roundtrip_and_rejects_missing_operation() -> anyhow::Result<()> {
+    use crate::xolotl::v1::external as ext;
+    use crate::{
+        source_stream_request_from_pb, source_stream_request_to_pb, source_stream_result_from_pb,
+        source_stream_result_to_pb,
+    };
+    use xolotl_types::external::{
+        SourceStreamOperation, SourceStreamOutcome, SourceStreamRejectCode, SourceStreamRejected,
+        SourceStreamRequest, SourceStreamResult, SourceStreamSnapshot, SourceStreamState,
+    };
+
+    for operation in [
+        SourceStreamOperation::Inspect,
+        SourceStreamOperation::Open {
+            expected_revision: 7,
+        },
+        SourceStreamOperation::Retire { stream_epoch: 11 },
+    ] {
+        let request = SourceStreamRequest {
+            request_id: "operation-1".into(),
+            stream_id: "records".into(),
+            operation,
+        };
+        ensure!(source_stream_request_from_pb(&source_stream_request_to_pb(&request))? == request);
+    }
+    ensure!(
+        source_stream_request_from_pb(&ext::SourceStreamRequest {
+            request_id: "missing".into(),
+            stream_id: "records".into(),
+            operation: None,
+        })
+        .is_err()
+    );
+
+    let active = SourceStreamState {
+        stream_epoch: 11,
+        last_seq: 4,
+        open_id: "operation-1".into(),
+        opened_at_revision: 7,
+    };
+    for outcome in [
+        SourceStreamOutcome::Inspected(SourceStreamSnapshot {
+            revision: 8,
+            active: Some(active.clone()),
+        }),
+        SourceStreamOutcome::Opened(SourceStreamSnapshot {
+            revision: 8,
+            active: Some(active),
+        }),
+        SourceStreamOutcome::Retired { revision: 9 },
+        SourceStreamOutcome::Rejected(SourceStreamRejected {
+            code: SourceStreamRejectCode::RevisionConflict,
+            current_revision: Some(9),
+            active_epoch: None,
+            current: None,
+        }),
+    ] {
+        let result = SourceStreamResult {
+            request_id: "operation-1".into(),
+            stream_id: "records".into(),
+            outcome,
+        };
+        ensure!(source_stream_result_from_pb(&source_stream_result_to_pb(&result))? == result);
+    }
+    ensure!(
+        source_stream_result_from_pb(&ext::SourceStreamResult {
+            request_id: "operation-1".into(),
+            stream_id: "records".into(),
+            outcome: Some(ext::source_stream_result::Outcome::Rejected(
+                ext::SourceStreamRejected {
+                    code: ext::SourceStreamRejectCode::Unspecified as i32,
+                    current_revision: None,
+                    active_epoch: None,
+                    current: None,
+                },
+            )),
+        })
+        .is_err()
+    );
     Ok(())
 }

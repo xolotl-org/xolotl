@@ -6,19 +6,30 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::runtime::{Builder, Runtime};
 use xolotl_kernel::{FactSink, FactStore};
+use xolotl_source::{
+    ExternalInstallationAuthority, ExternalInstallationMutation, SourceClaim, SourceClaimId,
+    SourceCommit, SourceCommitOutcome, SourceEventCommit,
+};
 use xolotl_state::{StateHistoryQuery, StateScan, prelude::*};
-use xolotl_storage_redb::RedbStore;
+use xolotl_storage_redb::{RedbHistory, RedbStore};
 use xolotl_types::{
     DecisionTag, ExecutionId, Fact, HandleId, IdentityRef, InvocationId, MethodId, NodeId,
-    OperationId, Path, ProcessId, ReplayClass, ResourceId, TaintSet, Timestamp, Value,
+    OperationId, Path, ProcessId, Purity, ReplayClass, ResourceId, TaintSet, Timestamp, Transport,
+    TrustLevel, Value,
+    external::{
+        EventSource, ExternalInstallationDef, ExternalProjectionDef, OverflowPolicy, Role,
+        StreamCapacity,
+    },
 };
 
 const FACTS_IN_SCAN_BENCH: u32 = 4_096;
 const STATE_ITEMS_IN_SEQUENCE: u32 = 1_024;
 const STATE_KEYS_IN_PREFIX_SCAN: u32 = 1_024;
 const STATE_WRITES_IN_RANGE_SCAN: u32 = 1_024;
+const SOURCE_SINK_CAPACITY: usize = 512;
+const SOURCE_PAYLOAD_BYTES: usize = 256;
 const BENCH_FACTS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("facts");
-const BENCH_FACT_INDEX_TABLE: TableDefinition<&[u8], u64> = TableDefinition::new("fact_index_v2");
+const BENCH_FACT_INDEX_TABLE: TableDefinition<&[u8], u64> = TableDefinition::new("fact_index_v1");
 const BENCH_FACT_PROCESS_INDEX_TABLE: TableDefinition<&str, u64> =
     TableDefinition::new("fact_process_index");
 const BENCH_FACT_META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("fact_meta");
@@ -41,21 +52,20 @@ fn bench_path(name: &str) -> Result<Path> {
     Path::parse(name).map_err(|error| anyhow!("benchmark path parse failed for {name}: {error}"))
 }
 
-fn bench_setup_failure(c: &mut Criterion, name: &'static str, error: anyhow::Error) {
-    let message = error.to_string();
-    c.bench_function(name, |b| b.iter(|| black_box(message.as_str())));
-}
-
+#[expect(
+    clippy::panic,
+    reason = "a failed benchmark must stop instead of timing an error path"
+)]
 fn observe<T>(result: Result<T>) {
     match result {
         Ok(value) => drop(black_box(value)),
-        Err(error) => observe_error(error),
+        Err(error) => panic!("benchmark operation failed: {error:#}"),
     }
 }
 
-fn observe_error(error: anyhow::Error) {
-    let message = error.to_string();
-    drop(black_box(message));
+#[expect(clippy::panic, reason = "an invalid fixture must stop the benchmark")]
+fn observe_error(error: anyhow::Error) -> ! {
+    panic!("benchmark setup failed: {error:#}");
 }
 
 fn fact(process: ProcessId, node: u32, complete: bool) -> Fact {
@@ -69,6 +79,7 @@ fn fact(process: ProcessId, node: u32, complete: bool) -> Fact {
         ),
         schema_version: Fact::SCHEMA_VERSION,
         caller: process,
+        caller_identity: Some(IdentityRef::ROOT),
         acting: IdentityRef::ROOT,
         handle: HandleId::new(0, 1),
         resource: ResourceId::new(1),
@@ -140,13 +151,153 @@ fn prepopulate_state_history(
     })
 }
 
+fn source_sink_fixture(
+    rt: &Runtime,
+    items: usize,
+) -> Result<(TempDir, xolotl_storage_redb::RedbStateBackend, Path)> {
+    let (dir, store) = redb_store()?;
+    let backend = store.state_backend();
+    let path = bench_path("state://bench/source-sink")?;
+    let definition = ExternalInstallationDef {
+        id: "bench".into(),
+        platform: "bench".into(),
+        transport: Transport::Grpc { endpoint: None },
+        trust: TrustLevel::Full,
+        config_schema: Value::map(Default::default()),
+        config: Value::null(),
+        projections: vec![ExternalProjectionDef {
+            id: "sink".into(),
+            role: Role::Source,
+            namespace: None,
+            provides: vec![],
+            emits: Some(EventSource {
+                sink: path.clone(),
+                purity: Purity::Effectful,
+                event_schema: None,
+                max_inline_payload_bytes: 1024,
+                capacity: StreamCapacity {
+                    max_events: SOURCE_SINK_CAPACITY as u32,
+                    on_overflow: OverflowPolicy::DropOldest,
+                },
+                rate_limit: None,
+                commands: false,
+                command_schema: None,
+                command_result_schema: None,
+            }),
+            version: 1,
+        }],
+        version: 0,
+    };
+    let installed = rt.block_on(backend.compare_install(definition, None))?;
+    anyhow::ensure!(
+        matches!(installed, ExternalInstallationMutation::Applied(Some(ref record)) if record.scope_epoch("sink") == Some(2))
+    );
+    if items > 0 {
+        let payload = Value::string("x".repeat(SOURCE_PAYLOAD_BYTES));
+        rt.block_on(async {
+            backend
+                .write_set(&path, Value::list(vec![payload; items]))
+                .await
+                .map_err(|error| anyhow!("Source sink setup failed: {error}"))
+        })?;
+    }
+    let actual = rt.block_on(async {
+        backend
+            .read(&path)
+            .await
+            .map_err(|error| anyhow!("Source sink setup read failed: {error}"))
+    })?;
+    let actual_items = actual
+        .as_ref()
+        .and_then(Value::as_list)
+        .map_or(0, |values| values.len());
+    anyhow::ensure!(
+        actual_items == items,
+        "Source sink setup has {actual_items} items, expected {items}"
+    );
+    Ok((dir, backend, path))
+}
+
+fn commit_source_sink(
+    rt: &Runtime,
+    backend: &xolotl_storage_redb::RedbStateBackend,
+    path: &Path,
+    capacity: &StreamCapacity,
+    payload: &Value,
+    taint: &TaintSet,
+) -> Result<()> {
+    let outcome = rt.block_on(backend.commit(SourceCommit {
+        claim: SourceClaim {
+            installation_id: "bench",
+            projection_id: "sink",
+            scope_epoch: 2,
+            stream_epoch: None,
+            event_id: "bench-event",
+            claim_id: SourceClaimId::from_bytes([1; 16]),
+        },
+        received_at_ms: 1_700_000_000_000,
+        decision_clock: std::sync::Arc::new(|| 1_700_000_000_000),
+        dedupe_window_ms: 60_000,
+        sink: path,
+        capacity,
+        max_inline_payload_bytes: 1_024,
+        payload,
+        taint,
+        stream: None,
+        rate_limit: None,
+    }))?;
+    anyhow::ensure!(
+        outcome == SourceCommitOutcome::Accepted,
+        "Source sink benchmark did not commit: {outcome:?}"
+    );
+    Ok(())
+}
+
+fn bench_source_sink(c: &mut Criterion) {
+    let rt = match runtime() {
+        Ok(rt) => rt,
+        Err(error) => observe_error(error),
+    };
+    let capacity = StreamCapacity {
+        max_events: SOURCE_SINK_CAPACITY as u32,
+        on_overflow: OverflowPolicy::DropOldest,
+    };
+    let payload = Value::string("y".repeat(SOURCE_PAYLOAD_BYTES));
+    let taint = TaintSet::pristine();
+    let mut group = c.benchmark_group("redb/source_sink");
+    group.sample_size(10);
+    for (name, items) in [
+        ("append_empty", 0),
+        ("append_near_capacity", SOURCE_SINK_CAPACITY - 1),
+        ("drop_oldest_full", SOURCE_SINK_CAPACITY),
+    ] {
+        group.bench_function(name, |b| {
+            b.iter_batched_ref(
+                || source_sink_fixture(&rt, items),
+                |setup| match setup {
+                    Ok((_dir, backend, path)) => {
+                        observe(commit_source_sink(
+                            &rt,
+                            backend,
+                            black_box(path),
+                            &capacity,
+                            &payload,
+                            &taint,
+                        ));
+                    }
+                    Err(error) => observe_error(anyhow!("{error:#}")),
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 fn bench_state(c: &mut Criterion) {
     let rt = match runtime() {
         Ok(rt) => rt,
-        Err(error) => {
-            bench_setup_failure(c, "redb/state/runtime_setup_failed", error);
-            return;
-        }
+        Err(error) => observe_error(error),
     };
     let mut group = c.benchmark_group("redb/state");
     group.sample_size(10);
@@ -318,7 +469,9 @@ fn bench_state(c: &mut Criterion) {
     group.bench_function("history_pages_1024_writes_same_path", |b| {
         b.iter_batched(
             || {
-                let (dir, store) = redb_store()?;
+                let dir = tempfile::tempdir()?;
+                let store =
+                    RedbStore::open_with_history(dir.path().join("bench.redb"), RedbHistory::Full)?;
                 let backend = store.state_backend();
                 let path = bench_path("state://bench/history")?;
                 prepopulate_state_history(&rt, &backend, &path, STATE_WRITES_IN_RANGE_SCAN)?;
@@ -363,6 +516,9 @@ fn process_key(process: ProcessId, slot: u64) -> String {
 fn prepopulated_fact_sink(count: u32) -> Result<(TempDir, FactSink)> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("bench.redb");
+    // The raw insert below bypasses adapter writes, but must use a complete
+    // first-format database. Reopening a partial schema is deliberately rejected.
+    drop(RedbStore::open(&path)?);
     let rows: Vec<_> = (0..count)
         .map(|i| {
             let process = if i % 2 == 0 {
@@ -409,7 +565,19 @@ fn prepopulated_fact_sink(count: u32) -> Result<(TempDir, FactSink)> {
 
     let store = RedbStore::open(&path)?;
     let fact_store = store.fact_store()?;
-    Ok((dir, FactSink::new(Arc::new(fact_store))))
+    let sink = FactSink::new(Arc::new(fact_store));
+    let actual = sink.all_facts()?.len();
+    anyhow::ensure!(
+        actual == count as usize,
+        "fact fixture has {actual} rows, expected {count}"
+    );
+    let indexed = sink.facts_of(ProcessId::new(1))?.len();
+    let expected = count.div_ceil(2) as usize;
+    anyhow::ensure!(
+        indexed == expected,
+        "fact fixture has {indexed} indexed rows, expected {expected}"
+    );
+    Ok((dir, sink))
 }
 
 fn bench_facts(c: &mut Criterion) {
@@ -446,10 +614,7 @@ fn bench_facts(c: &mut Criterion) {
                     );
                 });
             }
-            Err(error) => {
-                let message = error.to_string();
-                b.iter(|| black_box(message.as_str()));
-            }
+            Err(error) => observe_error(error),
         },
     );
 
@@ -464,10 +629,7 @@ fn bench_facts(c: &mut Criterion) {
                     );
                 });
             }
-            Err(error) => {
-                let message = error.to_string();
-                b.iter(|| black_box(message.as_str()));
-            }
+            Err(error) => observe_error(error),
         },
     );
 
@@ -492,5 +654,5 @@ fn bench_facts(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_state, bench_facts);
+criterion_group!(benches, bench_state, bench_facts, bench_source_sink);
 criterion_main!(benches);

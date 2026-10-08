@@ -19,7 +19,7 @@ pub(crate) struct HttpInferenceBackend {
 impl HttpInferenceBackend {
     /// Build a backend using a default HTTP client.
     pub(crate) fn new(config: HttpInferenceConfig) -> Result<Self, HttpInferenceError> {
-        let client = reqwest::Client::builder()
+        let client = crate::http_tls::client_builder()?
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Self::with_client(config, client)

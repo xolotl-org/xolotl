@@ -58,7 +58,7 @@ async fn incomplete_preflight_leaves_content_and_sources_open_until_publication(
     let expected = TaintSet::author().merged(&final_taint);
     let committed = store.commit_upload(&upload, &final_taint).await?;
     ensure!(committed.taint == expected);
-    ensure!(committed.blob.hash == blake3::hash(b"abcdef").to_hex().as_str());
+    ensure!(committed.blob.hash == content_digest(b"abcdef"));
     drop(upload);
     drop(store);
 
@@ -141,7 +141,7 @@ async fn failed_publication_freezes_bytes_and_effective_sources_for_retry() -> a
         committed.taint == expected,
         "retry changed the frozen source order"
     );
-    ensure!(committed.blob.hash == blake3::hash(b"frozen bytes").to_hex().as_str());
+    ensure!(committed.blob.hash == content_digest(b"frozen bytes"));
     ensure!(store.metadata(&committed.blob).await? == Some(committed.clone()));
     ensure!(store.pending_uploads() == 0 && staged(&store)? == 0);
     drop(upload);
@@ -174,7 +174,7 @@ async fn unstarted_and_cancelled_queued_commits_leave_the_upload_writable() -> a
     let accepted_sources = protected_sources()?;
     let metadata = store.commit_upload(&upload, &accepted_sources).await?;
     ensure!(metadata.taint == accepted_sources);
-    ensure!(metadata.blob.hash == blake3::hash(b"abcdef").to_hex().as_str());
+    ensure!(metadata.blob.hash == content_digest(b"abcdef"));
     ensure!(store.pending_uploads() == 0 && staged(&store)? == 0);
     Ok(())
 }
@@ -208,7 +208,7 @@ async fn lost_receipts_keep_the_original_request_and_never_delete_published_cont
             let final_taint = protected_sources()?.merged(&TaintSet::of(TaintSource::ModelOutput));
             lose_commit_receipt(&store, &upload, &final_taint).await?;
             let blob = BlobRef {
-                hash: blake3::hash(b"shared bytes").to_hex().to_string(),
+                hash: content_digest(b"shared bytes"),
                 size: 12,
                 mime: None,
             };

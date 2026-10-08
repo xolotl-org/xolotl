@@ -10,13 +10,19 @@ const WAIT: Duration = Duration::from_secs(2);
 
 async fn application() -> Result<ApplicationGateway> {
     let boot = Arc::new(Bootstrap::in_memory());
-    boot.kernel
-        .state
+    boot.kernel()
+        .state()
         .write_set(&profile::profile_path("app")?, value(1)?)
         .await?;
-    ApplicationGateway::start_at(&config(), Some("127.0.0.1:0"), boot, ObjectStore::new())
-        .await?
-        .context("application listener should start")
+    ApplicationGateway::start_at(
+        &config(),
+        Some("127.0.0.1:0"),
+        boot,
+        ObjectStore::new(),
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    )
+    .await?
+    .context("application listener should start")
 }
 
 async fn read_until_closed(socket: &mut TcpStream) -> Result<()> {
@@ -44,7 +50,7 @@ async fn read_until_closed(socket: &mut TcpStream) -> Result<()> {
 
 #[tokio::test]
 async fn shutdown_closes_connection_waiting_for_http2_preface() -> Result<()> {
-    let application = application().await?;
+    let mut application = application().await?;
     let address = application.listen_address;
     let mut socket = TcpStream::connect(address).await?;
     // The SETTINGS header proves tonic owns the accepted connection. The client
@@ -132,17 +138,22 @@ async fn wrapped_connections_preserve_peer_and_profile_authority_checks() -> Res
             "credential_id": "key", "principal_id": "client",
             "verifier": {"kind": "bearer", "token_hash": token_hash}
         }],
-        "identity_mappings": [{"principal_id": "client", "identity_path": "process://client"}],
+        "identity_mappings": [{"principal_id": "client", "identity_path": "identity://client"}],
         "registered_hosts": ["app.example:9445"]
     }))?;
-    boot.kernel
-        .state
+    boot.kernel()
+        .state()
         .write_set(&profile::profile_path("app")?, document)
         .await?;
-    let application =
-        ApplicationGateway::start_at(&config(), Some("127.0.0.1:0"), boot, ObjectStore::new())
-            .await?
-            .context("application listener should start")?;
+    let mut application = ApplicationGateway::start_at(
+        &config(),
+        Some("127.0.0.1:0"),
+        boot,
+        ObjectStore::new(),
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    )
+    .await?
+    .context("application listener should start")?;
     let endpoint =
         tonic::transport::Endpoint::from_shared(format!("http://{}", application.listen_address))?
             .connect_timeout(WAIT)

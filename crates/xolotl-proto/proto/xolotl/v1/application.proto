@@ -19,7 +19,22 @@ service ApplicationGateway {
   // Direct surface input. The current unary RPC supports Unary and Collect;
   // Stream, AsyncProcess and SinkOnly are rejected explicitly.
   rpc Submit(SubmitRequest) returns (SubmitResponse);
-  // Stream output only: Accepted, Chunk*, Completed, then successful gRPC EOF.
+  // Read-only original-request evidence, without payload disclosure or effects.
+  // Backend observation may decode the full original bounded record; this does
+  // not promise payload-independent storage I/O or working memory.
+  // Authenticate and authorize under the current profile and require the
+  // original request scope. Closed retry ranges remain queryable; this call
+  // never advances the retry epoch or authorizes retry in a new range.
+  rpc LookupRequest(LookupRequestRequest) returns (LookupRequestResponse);
+  // Explicit cached delivery under the original scope, epoch and identity.
+  // Never executes. Unproven, reserved and retired states fail precondition.
+  // Oversized results use only the host's configured externalizer, if present.
+  // Missing adapter or capacity rejects delivery, not the settled request.
+  // Indeterminate denotes an uncertain export/delivery commit, never a change
+  // to the original request settlement; Lookup remains payload-independent.
+  rpc DeliverRequestResult(LookupRequestRequest) returns (SubmitResponse);
+  // Stream output only: Accepted, Chunk*, Completed or Indeterminate, then
+  // successful gRPC EOF. Indeterminate retains bounded reconciliation evidence.
   // Cached outcomes are explicitly final-only; historical chunks are not replayed.
   rpc SubmitOutput(SubmitRequest) returns (stream SubmitOutputResponse);
 }
@@ -32,6 +47,13 @@ message DescribeResponse {
   repeated SurfaceDescriptor surfaces = 3;
   repeated PublicationDescriptor publications = 4;
   LimitProfile limits = 5;
+  // Store-wide open retry range, independent of profile_rev. A trusted host
+  // closes ranges explicitly, never by TTL. This may be stale at submission;
+  // clients MUST NOT advance uncertain requests automatically into a new range.
+  uint64 retry_epoch = 6;
+  // Maximum encoded protobuf envelope bytes for this transport, not HTTP/2
+  // headers, gRPC framing, cumulative stream bytes, object length or RSS.
+  uint64 max_frame_bytes = 7;
 }
 
 message SurfaceDescriptor {
@@ -40,6 +62,7 @@ message SurfaceDescriptor {
   optional xolotl.v1.Value input_schema = 3;
   optional xolotl.v1.Value output_schema = 4;
   optional xolotl.v1.Value output_stream_schema = 5;
+  string request_scope = 8;
 }
 
 message PublicationDescriptor {
@@ -67,6 +90,13 @@ message LimitProfile {
   uint64 max_stream_items = 9;
   uint64 max_stream_bytes = 10;
   uint64 max_stream_inline_item_bytes = 11;
+  uint64 max_recent_cancellations = 12;
+  // Maximum typed objects bound to one upload ticket.
+  uint64 max_ticket_objects = 13;
+  // Maximum aggregate bytes of distinct backing objects on one ticket.
+  uint64 max_ticket_total_bytes = 14;
+  // Maximum encoded State record bytes for one ticket.
+  uint64 max_ticket_record_bytes = 15;
 }
 
 message BudgetProfile {
@@ -98,16 +128,29 @@ message IssueUploadTicketRequest {
   optional string submission_token = 2;
   Modality modality = 3;
   optional uint64 expected_size = 4;
+  // Lowercase SHA-384 digest (96 hexadecimal characters), when known.
   optional string expected_digest = 5;
   repeated string allowed_media_types = 6;
   optional uint64 expires_in_ms = 7;
   bool single_use = 8;
+  // Requested maximum number of typed objects on this ticket.
+  optional uint64 max_objects = 9;
+  // Requested maximum aggregate bytes of distinct backing objects.
+  optional uint64 max_total_bytes = 10;
+  // Requested maximum encoded State record bytes.
+  optional uint64 max_record_bytes = 11;
 }
 
 message IssueUploadTicketResponse {
   string ticket_id = 1;
   int64 expires_at_ms = 2;
   bool single_use = 3;
+  // Maximum typed objects accepted on this ticket.
+  uint64 max_objects = 4;
+  // Maximum aggregate bytes of distinct backing objects.
+  uint64 max_total_bytes = 5;
+  // Maximum encoded State record bytes.
+  uint64 max_record_bytes = 6;
 }
 
 message UploadObjectRequest {
@@ -122,6 +165,10 @@ message BeginObjectUpload {
   string ticket_id = 1;
   optional string media_type = 2;
   optional string submission_token = 3;
+  // Optional expected byte size for this upload.
+  optional uint64 expected_size = 4;
+  // Optional lowercase SHA-384 digest for this upload.
+  optional string expected_digest = 5;
 }
 
 // Only interpretation metadata is supplied by the client. The Gateway derives
@@ -152,6 +199,7 @@ message FrameUpload {
 message UploadObjectResponse {
   xolotl.v1.Value item = 1;
   xolotl.v1.PayloadProvenance provenance = 2;
+  // Lowercase SHA-384 digest of committed bytes.
   string digest = 3;
   uint64 size = 4;
 }
@@ -204,11 +252,70 @@ message SubmitRequest {
 }
 
 message SubmitOptions {
+  // Literal identity material, at most 256 bytes. No special string prefixes.
   optional string idempotency_key = 1;
+  // Literal token material; neither field grants account or surface authority.
   optional string submission_token = 2;
   optional uint64 deadline_ms = 3;
-  optional string requested_encoding = 4;
+  reserved 4;
+  reserved "requested_encoding";
+  // Store-wide retry range, default zero and independent of profile_rev.
+  // Changing this creates a NEW request, not a retry guarantee. Existing closed
+  // pending/unknown evidence remains queryable without execution; reclaimed or
+  // never-accepted old identities reject before effects. Clients MUST NOT
+  // automatically advance an unknown request to the discovered epoch.
+  uint64 retry_epoch = 5;
+  optional string expected_request_scope = 6;
 }
+
+// Identify the original request, not a new submission. Scope and identity do
+// not grant authority. Exactly one nonempty literal identity is required.
+message LookupRequestRequest {
+  string surface_id = 1;
+  string expected_request_scope = 2;
+  uint64 retry_epoch = 3;
+  oneof identity {
+    string idempotency_key = 4;
+    string submission_token = 5;
+  }
+}
+
+// An absent evidence arm is invalid, not Unproven. Empty state messages retain
+// explicit presence so a zero/default response cannot imply a known verdict.
+message LookupRequestResponse {
+  oneof evidence {
+    RequestUnproven unproven = 1;
+    RequestReserved reserved = 2;
+    // Payload-independent original record summary. No export is created.
+    RequestSettled settled = 3;
+    RequestRetired retired = 4;
+  }
+}
+
+message RequestSettled {
+  GatewayAccepted accepted = 1;
+  RequestResultClass result_class = 2;
+  xolotl.v1.UnresolvedOperations unresolved_operations = 3;
+}
+
+enum RequestResultClass {
+  REQUEST_RESULT_CLASS_UNSPECIFIED = 0;
+  REQUEST_RESULT_CLASS_DONE = 1;
+  REQUEST_RESULT_CLASS_SHORT = 2;
+  REQUEST_RESULT_CLASS_FAIL = 3;
+}
+
+// No provable request evidence. This does NOT prove that execution never
+// happened or that retry is safe.
+message RequestUnproven {}
+
+// A retained reservation without a provable complete result. This does NOT
+// imply running execution, acceptance, or a known failure; no effect is started.
+message RequestReserved {}
+
+// The original retry range/identity is retired. It cannot be re-executed;
+// changing the epoch creates a new request, not a retry of the original.
+message RequestRetired {}
 
 message GatewayAccepted {
   string submission_id = 1;
@@ -219,7 +326,10 @@ message GatewayAccepted {
 
 message SubmitResponse {
   GatewayAccepted accepted = 1;
-  SubmissionCompletion completion = 2;
+  oneof terminal {
+    SubmissionCompletion completion = 2;
+    SubmissionIndeterminate indeterminate = 3;
+  }
 }
 
 message SubmitOutputResponse {
@@ -227,7 +337,17 @@ message SubmitOutputResponse {
     GatewayAccepted accepted = 1;
     OutputChunk chunk = 2;
     SubmissionCompletion completed = 3;
+    SubmissionIndeterminate indeterminate = 4;
   }
+}
+
+// The host observed execution, but could not commit or deliver its complete
+// result. This is not a known failure of the program or permission to retry.
+// The unary response's accepted field, or the stream's preceding Accepted
+// event, identifies the original submission. Omitted IDs set the flag below.
+message SubmissionIndeterminate {
+  string reason_code = 1;
+  xolotl.v1.UnresolvedOperations unresolved_operations = 2;
 }
 
 message OutputChunk {
@@ -283,4 +403,5 @@ message SubmissionCompletion {
   OutputOutcome outcome = 1;
   CompletionOrigin origin = 2;
   xolotl.v1.TaintSet taint = 3;
+  xolotl.v1.UnresolvedOperations unresolved_operations = 4;
 }

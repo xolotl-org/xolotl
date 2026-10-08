@@ -89,6 +89,27 @@ impl ValueList {
         Ok(())
     }
 
+    /// Remove an exact prefix, sharing every unaffected indexing subtree.
+    ///
+    /// This visits O(log n) index nodes and copies at most one leaf. Existing
+    /// snapshots are unchanged; this snapshot no longer owns removed members.
+    /// Releasing exclusively owned removed members has their destruction cost.
+    /// An out-of-bounds count leaves the sequence unchanged.
+    pub fn remove_prefix(&mut self, count: usize) -> Result<(), CollectionError> {
+        if count > self.len() {
+            return Err(CollectionError::PrefixOutOfBounds);
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        self.root = if count == self.len() {
+            None
+        } else {
+            self.root.as_ref().map(|root| prune_prefix(root, count))
+        };
+        Ok(())
+    }
+
     /// Replace one member and return its previous independently owned value.
     ///
     /// An out-of-bounds index returns `Ok(None)` and leaves the list unchanged.
@@ -214,6 +235,22 @@ fn copy_members(node: &Index<ListLeaf>) -> Arc<Index<ListLeaf>> {
     match node.data() {
         Data::Leaf(leaf) => Index::leaf(ListLeaf(leaf.0.to_vec().into_boxed_slice())),
         Data::Branch { left, right } => node::join(copy_members(left), copy_members(right)),
+    }
+}
+
+fn prune_prefix(node: &Arc<Index<ListLeaf>>, count: usize) -> Arc<Index<ListLeaf>> {
+    if count == 0 {
+        return node.clone();
+    }
+    match node.data() {
+        Data::Leaf(leaf) => Index::leaf(ListLeaf(leaf.0[count..].to_vec().into_boxed_slice())),
+        Data::Branch { left, right } => {
+            if count < left.len {
+                node::join(prune_prefix(left, count), right.clone())
+            } else {
+                prune_prefix(right, count - left.len)
+            }
+        }
     }
 }
 

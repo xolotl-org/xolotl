@@ -1,7 +1,7 @@
 //! Host-owned execution scopes, independent of interpreter request tickets.
 //!
 //! Sources reserve disjoint ranges before returning them. Persistent sources
-//! retain reservations even when execution checkpoints and facts are removed.
+//! retain reservations while externally visible operation identities may remain.
 
 use parking_lot::Mutex;
 use std::num::NonZeroU64;
@@ -68,9 +68,8 @@ impl ExecutionIdRange {
 
 /// Source of unique ranges within one retained identity namespace.
 ///
-/// All hosts sharing that namespace must use this source. Checkpoint restoration
-/// reuses the originally reserved identifier. An unrelated source cannot own
-/// the same retained checkpoints or externally visible effects.
+/// All hosts sharing that namespace must use this source. An unrelated source
+/// cannot own the same externally visible operation identities.
 pub trait ExecutionIdSource: Send + Sync + 'static {
     /// Reserve a nonempty range of at most `count` consecutive identifiers.
     /// A shorter range is allowed at exhaustion. Persistent adapters must durably
@@ -121,13 +120,24 @@ impl ExecutionIds {
             cached.next = Some(range.first());
             cached.last = range.last().get();
         }
-        let id = cached.next.ok_or(ExecutionIdError::InvalidRange)?;
+        Self::take_cached(&mut cached).ok_or(ExecutionIdError::InvalidRange)
+    }
+
+    /// Take an already reserved identifier without invoking the source. Async
+    /// hosts can keep the common path on their worker and schedule a refill only
+    /// when this cache is empty.
+    pub(crate) fn try_allocate_cached(&self) -> Option<ExecutionId> {
+        Self::take_cached(&mut self.inner.cached.lock())
+    }
+
+    fn take_cached(cached: &mut CachedRange) -> Option<ExecutionId> {
+        let id = cached.next?;
         cached.next = if id.get() == cached.last {
             None
         } else {
             id.get().checked_add(1).and_then(ExecutionId::new)
         };
-        Ok(id)
+        Some(id)
     }
 }
 

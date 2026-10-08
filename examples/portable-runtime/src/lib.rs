@@ -9,6 +9,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::{
     cell::RefCell,
+    convert::Infallible,
     future::{Future, Ready, ready},
     num::NonZeroU32,
     pin::Pin,
@@ -24,8 +25,9 @@ use xolotl_sdk::{
     runtime::{
         LinkedExecution, PendingCall, RequestDriver, Scope, ScopeFinalize,
         invocation::{
-            Account, AccountPermit, AccountRequest, CallContext, GrantedMethod, InvocationCall,
-            InvocationDriver, InvocationOptions, NoFacts, Settlement, invoke,
+            Account, AccountCompletion, AccountPermit, AccountRequest, CallContext,
+            CompletionError, GrantedMethod, InvocationCall, InvocationDriver, InvocationOptions,
+            NoFacts, Settlement, invoke,
         },
     },
     types::{
@@ -42,7 +44,19 @@ const MAX_IMPORTS: usize = 8;
 struct LocalAccount(RefCell<Scope>);
 struct LocalPermit<'a>(&'a LocalAccount);
 impl AccountPermit for LocalPermit<'_> {
-    fn settle(&mut self, settlement: Settlement) {
+    type Error = Infallible;
+    type Commit = Ready<Result<(), Self::Error>>;
+
+    fn dispatch(&mut self) -> Self::Commit {
+        ready(Ok(()))
+    }
+
+    fn settle(&mut self, completion: AccountCompletion<'_>) -> Self::Commit {
+        completion.settlement().apply(&mut self.0.0.borrow_mut());
+        ready(Ok(()))
+    }
+
+    fn abandon(&mut self, settlement: Settlement) {
         settlement.apply(&mut self.0.0.borrow_mut());
     }
 }
@@ -81,16 +95,27 @@ struct Call<'a> {
     invocation: Result<InvocationCall<'a, Transforms<'a>, NoFacts, LocalAccount>, Failure>,
 }
 impl Future for Call<'_> {
-    type Output = HostEvent<TaintedValue, TaintedFailure>;
+    type Output = xolotl_sdk::runtime::RequestCompletion;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let result = match &mut self.get_mut().invocation {
             Ok(invocation) => {
+                let operation = invocation.operation();
                 let result = core::task::ready!(Pin::new(invocation).poll(cx));
+                if let Some(error) = result.completion_error
+                    && (error.requires_interruption()
+                        || (matches!(&error, CompletionError::Dispatch(_))
+                            && result.effect_may_have_started))
+                {
+                    return Poll::Ready(Err(TaintedFailure::new(
+                        error.outcome_unknown(operation),
+                        result.output.taint,
+                    )));
+                }
                 result.output.into_result()
             }
             Err(failure) => Err(failure.clone().into()),
         };
-        Poll::Ready(HostEvent::Complete(result))
+        Poll::Ready(Ok(HostEvent::Complete(result)))
     }
 }
 
@@ -99,6 +124,13 @@ impl RequestDriver for Adapter<'_> {
         = Call<'a>
     where
         Self: 'a;
+    fn collect_evidence<'a>(
+        &'a self,
+        _call: &Self::Call<'a>,
+        _completion: Option<&xolotl_sdk::runtime::RequestCompletion>,
+        _unresolved: &mut xolotl_sdk::types::UnresolvedOperations,
+    ) {
+    }
     fn call<'a>(&'a self, resource: u32, request: Request<TaintedValue>) -> Self::Call<'a> {
         let invocation = (|| {
             if request.context != IdentityRef::ROOT.get() {
@@ -144,6 +176,7 @@ impl RequestDriver for Adapter<'_> {
                     ),
                 },
                 InvocationOptions {
+                    caller_identity: Some(IdentityRef::ROOT),
                     now_millis: 0,
                     record: false,
                 },
@@ -225,18 +258,19 @@ pub fn run(
             bindings_per_task: 0,
             max_steps: Some(1000),
             cleanup_steps: 64,
-            durable: false,
         },
         input,
         IdentityRef::ROOT.get(),
     )
     .map_err(machine_error)?;
+    let mut unresolved = xolotl_sdk::types::UnresolvedOperations::default();
     let mut execution = LinkedExecution::new(
         machine,
         &linked,
         &mut handles,
         &adapter,
         &mut pending,
+        &mut unresolved,
         NonZeroU32::MIN.saturating_add(15),
     )
     .map_err(machine_error)?;

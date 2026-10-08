@@ -2,19 +2,21 @@
 //! Mutation, history, and delivery policy live in `memory`.
 //! Every operation needing both locks takes the journal before a value shard.
 
-use super::{Journal, MemoryState};
+use super::{CurrentRecord, Journal, MemoryState};
 use crate::{
-    StateCursor, StateError, StateFailure, StatePage, StateResult, StateRowTooLarge, StateScan,
-    TaintedValue,
+    StateCursor, StateError, StateFailure, StateObservation, StatePage, StatePointTooLarge,
+    StateResult, StateRowTooLarge, StateScan,
 };
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::collections::{BTreeMap, hash_map::RandomState};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, hash_map::RandomState};
 use std::hash::BuildHasher;
+use std::io::Write;
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use xolotl_types::Path;
 
-type Values = BTreeMap<Path, TaintedValue>;
+type Values = BTreeMap<Path, CurrentRecord>;
 
 // Separate hot lock words, including adjacent-line prefetch on common hosts.
 #[repr(align(128))]
@@ -63,11 +65,35 @@ impl Storage {
         }))
     }
 
-    pub(super) fn get(&self, path: &Path) -> Option<TaintedValue> {
+    pub(super) fn observe(&self, path: &Path) -> StateObservation {
         match self {
-            Self::Compact(state) => state.read().values.get(path).cloned(),
-            Self::Sharded(state) => state.shard(path).read().get(path).cloned(),
+            Self::Compact(state) => state
+                .read()
+                .values
+                .get(path)
+                .map(CurrentRecord::observation)
+                .unwrap_or_default(),
+            Self::Sharded(state) => state
+                .shard(path)
+                .read()
+                .get(path)
+                .map(CurrentRecord::observation)
+                .unwrap_or_default(),
         }
+    }
+
+    pub(super) fn get_bounded(
+        &self,
+        path: &Path,
+        max_encoded_bytes: NonZeroUsize,
+    ) -> StateResult<StateObservation> {
+        let borrowed = match self {
+            Self::Compact(state) => {
+                return clone_if_bounded(state.read().values.get(path), path, max_encoded_bytes);
+            }
+            Self::Sharded(state) => state.shard(path).read(),
+        };
+        clone_if_bounded(borrowed.get(path), path, max_encoded_bytes)
     }
 
     pub(super) fn query(&self, query: &StateScan) -> StateResult<StatePage> {
@@ -108,15 +134,28 @@ impl Storage {
                     .iter()
                     .map(|values| values.range((from, Bound::Unbounded)).peekable())
                     .collect::<Vec<_>>();
+                // Keep only the next key from each shard in the heap. Scanning
+                // every shard for every returned row makes prefix reads scale
+                // with shard count even when the page is small.
+                let mut initial_heads = Vec::with_capacity(ranges.len());
+                for (index, range) in ranges.iter_mut().enumerate() {
+                    if let Some((path, _)) = range.peek()
+                        && (*path == &query.prefix || query.prefix.is_prefix_of(path))
+                    {
+                        initial_heads.push(Reverse((*path, index)));
+                    }
+                }
+                let mut heads = BinaryHeap::from(initial_heads);
+                let mut replenish: Option<usize> = None;
                 let rows = std::iter::from_fn(|| {
-                    let index = ranges
-                        .iter_mut()
-                        .enumerate()
-                        .filter_map(|(index, range)| {
-                            range.peek().map(|(path, _value)| (index, *path))
-                        })
-                        .min_by(|(_, a), (_, b)| a.cmp(b))
-                        .map(|(index, _path)| index)?;
+                    if let Some(index) = replenish.take()
+                        && let Some((path, _)) = ranges[index].peek()
+                        && (*path == &query.prefix || query.prefix.is_prefix_of(path))
+                    {
+                        heads.push(Reverse((*path, index)));
+                    }
+                    let Reverse((_, index)) = heads.pop()?;
+                    replenish = Some(index);
                     ranges[index].next()
                 });
                 collect_page(rows, query)
@@ -167,8 +206,31 @@ impl Storage {
     }
 }
 
+fn clone_if_bounded(
+    value: Option<&CurrentRecord>,
+    path: &Path,
+    max_encoded_bytes: NonZeroUsize,
+) -> StateResult<StateObservation> {
+    let Some(value) = value else {
+        return Ok(StateObservation::default());
+    };
+    let encoded_bytes = value.encoded_bytes(path)?;
+    if encoded_bytes > max_encoded_bytes.get() {
+        return Err(StateFailure::new(
+            StateError::PointTooLarge(Box::new(StatePointTooLarge {
+                path: path.clone(),
+                encoded_bytes,
+                limit_encoded_bytes: max_encoded_bytes,
+                provenance_observed: true,
+            })),
+            value.taint().clone(),
+        ));
+    }
+    Ok(value.observation())
+}
+
 fn collect_page<'a>(
-    mut rows: impl Iterator<Item = (&'a Path, &'a TaintedValue)>,
+    mut rows: impl Iterator<Item = (&'a Path, &'a CurrentRecord)>,
     query: &StateScan,
 ) -> StateResult<StatePage> {
     let mut page = StatePage::empty();
@@ -176,6 +238,7 @@ fn collect_page<'a>(
     loop {
         if page.entries.len() == query.limits.entries.get()
             || page.examined == query.limits.examined.get()
+            || page.encoded_bytes == query.limits.encoded_bytes.get()
         {
             page.next = previous;
             return Ok(page);
@@ -187,26 +250,37 @@ fn collect_page<'a>(
             break;
         }
         page.examined += 1;
-        page.taint.union(&value.taint);
-        let key = path.to_string();
-        let bytes = crate::host::encoded_size(value)
-            .map_err(|failure| failure.with_taint(&page.taint))?
-            .checked_add(key.len())
-            .ok_or_else(|| {
-                StateFailure::new(
-                    StateError::Backend("state record size overflow".into()),
-                    page.taint.clone(),
-                )
-            })?;
-        let cursor = StateCursor(key.into_bytes());
+        let metadata_bytes = super::record::provenance_size(path, value.taint())
+            .map_err(|failure| failure.with_taint(&page.taint))?;
+        if metadata_bytes > query.limits.encoded_bytes.get() {
+            if page.encoded_bytes != 0 {
+                page.next = previous;
+                return Ok(page);
+            }
+            return Err(StateFailure::new(
+                StateError::RowTooLarge(Box::new(StateRowTooLarge {
+                    path: path.clone(),
+                    encoded_bytes: metadata_bytes,
+                    provenance_observed: false,
+                    retry: previous,
+                    resume: StateCursor(path.to_string().into_bytes()),
+                })),
+                page.taint,
+            ));
+        }
+        page.taint.union(value.taint());
+        let bytes = value
+            .encoded_bytes(path)
+            .map_err(|failure| failure.with_taint(&page.taint))?;
         if bytes > query.limits.encoded_bytes.get() - page.encoded_bytes {
-            if page.entries.is_empty() {
+            if page.encoded_bytes == 0 {
                 return Err(StateFailure::new(
                     StateError::RowTooLarge(Box::new(StateRowTooLarge {
                         path: path.clone(),
                         encoded_bytes: bytes,
+                        provenance_observed: true,
                         retry: previous,
-                        resume: cursor,
+                        resume: StateCursor(path.to_string().into_bytes()),
                     })),
                     page.taint,
                 ));
@@ -214,9 +288,15 @@ fn collect_page<'a>(
             page.next = previous;
             return Ok(page);
         }
-        page.entries.push((path.clone(), value.clone()));
+        if let Some(value) = value.live() {
+            page.entries.push((path.clone(), value.clone()));
+        }
         page.encoded_bytes += bytes;
-        previous = Some(cursor);
+        let cursor = previous.get_or_insert_with(|| StateCursor(Vec::new()));
+        cursor.0.clear();
+        write!(cursor.0, "{path}").map_err(|error| {
+            StateFailure::new(StateError::Backend(error.to_string()), page.taint.clone())
+        })?;
     }
     Ok(page)
 }

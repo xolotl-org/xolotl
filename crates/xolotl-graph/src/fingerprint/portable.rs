@@ -8,7 +8,6 @@ pub(crate) fn image(
     imports: &[Import],
     entry: u32,
     bindings: usize,
-    durable: bool,
 ) -> Result<[u8; 32], serde_json::Error> {
     let mut digest = Fingerprint::new(b"xolotl-portable-image-v1");
     digest.integer(u64::from(IMAGE_VERSION));
@@ -16,7 +15,6 @@ pub(crate) fn image(
     for node in nodes {
         digest.instruction(&node.kind)?;
         digest.optional_index(node.next);
-        digest.optional_index(node.save);
         digest.integer(node.position);
     }
     digest.integer(imports.len() as u64);
@@ -46,7 +44,6 @@ pub(crate) fn image(
     }
     digest.integer(u64::from(entry));
     digest.integer(bindings as u64);
-    digest.tag(u8::from(durable));
     Ok(digest.finish())
 }
 

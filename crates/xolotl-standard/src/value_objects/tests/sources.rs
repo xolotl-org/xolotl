@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context;
 use core::pin::Pin;
 use std::sync::atomic::AtomicBool;
 use xolotl_state::{
@@ -114,12 +115,18 @@ async fn later_read_sources_block_outbound_success_and_failure_recovery() -> any
         let calls = Arc::new(AtomicUsize::new(0));
         boot.register_effect(
             "effect://test/outbound",
-            &[MethodSpec::unary_async("invoke", Purity::Effectful).unprotected_input()],
+            &[MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                Purity::Effectful,
+                MethodSpec::UNARY_ASYNC,
+            )
+            .unprotected_input()],
             Arc::new(Outbound {
                 calls: calls.clone(),
             }),
         )?;
-        let executor = boot.kernel.executor_for(boot.root);
+        let executor = boot.kernel().executor_for(boot.root());
         let value = Value::string("a completed model document".repeat(512));
         let roundtrip = Program::new(
             invoke(&boot, &executor, "effect://value/write")?.then(invoke(
@@ -178,12 +185,15 @@ async fn cancelling_a_call_keeps_async_factory_resources_owned_until_drop() -> a
     let boot = Bootstrap::in_memory();
     let dropped = Arc::new(AtomicUsize::new(0));
     let started = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
     let factory = {
         let dropped = dropped.clone();
         let started = started.clone();
+        let entered = entered.clone();
         move || {
             let dropped = dropped.clone();
             let started = started.clone();
+            let entered = entered.clone();
             async move {
                 let keys = TrackedKeys {
                     inner: MemoryKeyStore::new(memory_options()),
@@ -191,6 +201,7 @@ async fn cancelling_a_call_keeps_async_factory_resources_owned_until_drop() -> a
                     _local: Cell::new(()),
                 };
                 started.fetch_add(1, Ordering::SeqCst);
+                entered.notify_one();
                 core::future::pending::<()>().await;
                 Ok(keys)
             }
@@ -202,14 +213,22 @@ async fn cancelling_a_call_keeps_async_factory_resources_owned_until_drop() -> a
         config(64)?,
         factory,
     )?;
-    let executor = boot.kernel.executor_for(boot.root);
+    let executor = boot.kernel().executor_for(boot.root());
     let program = Program::new(invoke(&boot, &executor, "effect://value/write")?).compile()?;
     let original = Value::string("caller retains this shared value".repeat(1024));
     let identity = original.identity();
     let mut run =
         Box::pin(executor.eval_program(&program, TaintedValue::pristine(original.clone())));
-    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-    ensure!(run.as_mut().poll(&mut context).is_pending());
+    // Execution ID reservation may yield before the hosted factory is polled.
+    // Wait for its actual entry while continuing to drive the evaluation.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::select! {
+            output = &mut run => anyhow::bail!("value write finished before factory suspended: {output:?}"),
+            () = entered.notified() => Ok::<_, anyhow::Error>(()),
+        }
+    })
+    .await
+    .context("value write factory was not entered")??;
     ensure!(started.load(Ordering::SeqCst) == 1 && dropped.load(Ordering::SeqCst) == 0);
     drop(run);
     ensure!(dropped.load(Ordering::SeqCst) == 1);

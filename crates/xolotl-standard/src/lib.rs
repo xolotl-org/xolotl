@@ -6,6 +6,11 @@
 //! [`Driver`](xolotl_kernel::Driver) implementations behind `effect://...`
 //! Resources.
 //!
+//! Fetch and HTTP inference clients select their TLS provider explicitly:
+//! TLS 1.3, X25519MLKEM768, AES-256-GCM or ChaCha20-Poly1305, and ML-DSA-65
+//! authentication using platform trust roots. They reject incompatible HTTPS
+//! peers without classical fallback and never install a process-global provider.
+//!
 //! Method dispatch convention: each driver's methods are listed in a
 //! `*_METHODS` table in registration order; the method's index in that table
 //! is its `MethodId`, which the driver matches on.
@@ -37,6 +42,14 @@ mod fs;
     feature = "gemini-generate-content"
 ))]
 mod http_inference;
+#[cfg(any(
+    feature = "fetch",
+    feature = "openai-responses",
+    feature = "openai-chat",
+    feature = "anthropic-messages",
+    feature = "gemini-generate-content"
+))]
+mod http_tls;
 #[cfg(feature = "standard-core")]
 mod index;
 #[cfg(feature = "standard-core")]
@@ -74,6 +87,8 @@ mod state;
 mod tensor;
 #[cfg(feature = "terminal")]
 mod terminal;
+#[cfg(feature = "terminal")]
+pub use terminal::TerminalRuntime;
 #[cfg(feature = "standard-core")]
 mod time;
 #[cfg(feature = "value-objects")]
@@ -85,10 +100,9 @@ pub use inference::{
 };
 #[cfg(feature = "standard-core")]
 pub use install::{
-    IN_PROCESS_PROJECTION_CONFIG_PREFIX, InProcessProjectionInstallEntry,
-    InProcessProjectionInstallReport, InProcessProjectionInstalled, InstallError, StandardConfig,
-    StandardModule, StandardModules, install_declared_in_process_projections,
-    install_in_process_projection_value, install_standard,
+    InProcessProjectionInstallEntry, InProcessProjectionInstallReport,
+    InProcessProjectionInstalled, InstallError, StandardConfig, StandardModule, StandardModules,
+    install_declared_in_process_projections, install_in_process_projection_value, install_standard,
 };
 #[cfg(feature = "standard-core")]
 pub use pairing::PairingDisplayEdge;

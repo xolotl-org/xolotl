@@ -295,10 +295,8 @@ fn deepest_map_in_console_frame_decodes_with_prost_default_limit() -> Result<()>
                         segments: vec!["test".into()],
                     }),
                     value: Some(value_to_pb_bounded(&value, LIMITS)?),
+                    source: None,
                 })),
-                state_rev: 0,
-                fact_cursor: 0,
-                coalesced: false,
             }),
         })),
     };

@@ -4,7 +4,7 @@
 //! Only a Process can issue an [`Operation`](crate::operation::Operation);
 //! Resources are always passive. A Process is bound to one frozen compiled
 //! program (referenced here by hash; the live `ExecutionGraph` lives in
-//! `xolotl-graph`) and recovers against that same product.
+//! `xolotl-graph`) during its live host lifecycle.
 
 use crate::grant::Expiry;
 use crate::ids::{GrantId, IdentityRef, ProcessId};
@@ -23,22 +23,11 @@ pub struct ProgramRef {
 
 /// Reference to the frozen compiled program a Process is bound to. The
 /// live `ExecutionGraph` lives in `xolotl-graph`; here we carry its hash so the
-/// type stays wasm-safe and serializable. Recovery re-binds the same hash.
+/// type stays wasm-safe and serializable.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompiledProgramRef {
     /// Hash of the compiled execution graph bound to the process.
     pub graph_hash: [u8; 32],
-}
-
-/// Whether a Program satisfies the recoverability contract.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Recoverability {
-    /// Satisfies the contract; crash-recovers automatically.
-    #[default]
-    Recoverable,
-    /// Explicitly marked non-recoverable; not auto-resumed after a crash.
-    NonRecoverable,
 }
 
 /// Lifecycle status of a Process.
@@ -95,11 +84,11 @@ pub enum ExpireRule {
 /// here; the budget *spec* (limits) lives in [`StartRecord`].
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BudgetState {
-    /// Micro-USD already reserved or spent in the current accounting window.
+    /// Micro-USD already reserved or spent in this process's accounting scope.
     pub spent_micro_usd: u64,
     /// Number of operations currently reserved but not settled.
     pub inflight_ops: u32,
-    /// Inference tokens reserved or spent in the current accounting window.
+    /// Inference tokens reserved or spent in this process's accounting scope.
     pub inference_tokens: u64,
 }
 
@@ -107,9 +96,9 @@ impl BudgetState {
     /// Try to reserve one operation's estimated cost against `spec`:
     /// pre-debit `inflight_ops`, estimated USD, and estimated tokens, denying
     /// (without mutating) if any dimension would exceed its limit. The estimate
-    /// is deliberately conservative (high) so a side effect is never issued and
-    /// only then discovered to be over budget. Returns `Err(dim)` naming the
-    /// exhausted dimension, or `Ok(())` after reserving.
+    /// must conservatively cover the effect; measured usage can still exceed
+    /// estimates at settlement. Returns `Err(dim)` naming the exhausted
+    /// dimension, or `Ok(())` after reserving.
     pub fn try_reserve(
         &mut self,
         spec: &BudgetSpec,
@@ -125,21 +114,14 @@ impl BudgetState {
         {
             return Err("inflight_ops".into());
         }
-        // Daily and monthly USD share the single `spent_micro_usd` counter; the
-        // tighter limit binds.
         let projected_usd = self
             .spent_micro_usd
             .checked_add(est_micro_usd)
-            .ok_or_else(|| String::from("spent_micro_usd"))?;
-        if let Some(max) = spec.daily_micro_usd
+            .ok_or_else(|| String::from("micro_usd"))?;
+        if let Some(max) = spec.max_micro_usd
             && projected_usd > max
         {
-            return Err("daily_micro_usd".into());
-        }
-        if let Some(max) = spec.monthly_micro_usd
-            && projected_usd > max
-        {
-            return Err("monthly_micro_usd".into());
+            return Err("micro_usd".into());
         }
         let projected_tokens = self
             .inference_tokens
@@ -179,17 +161,37 @@ impl BudgetState {
     }
 }
 
-/// Per-dimension budget limits. `None` = unbounded on that dimension.
+/// Limits for one accounting scope, including its descendants in a hosted
+/// process tree. `None` is unbounded; zero denies any positive reservation on
+/// that dimension. Spending has no automatic calendar reset. Hosts implement
+/// daily or monthly account policies separately from process execution limits.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetSpec {
-    /// Maximum micro-USD allowed per day.
-    pub daily_micro_usd: Option<u64>,
-    /// Maximum micro-USD allowed per month.
-    pub monthly_micro_usd: Option<u64>,
+    /// Maximum micro-USD reserved or spent over this scope's lifetime.
+    pub max_micro_usd: Option<u64>,
     /// Maximum number of concurrent in-flight operations.
     pub max_inflight_ops: Option<u32>,
-    /// Maximum inference tokens allowed in the accounting window.
+    /// Maximum inference tokens reserved or spent over this scope's lifetime.
     pub max_inference_tokens: Option<u64>,
+}
+
+impl BudgetSpec {
+    /// Intersect two ceilings without resetting spending or widening either one.
+    /// An omitted limit never removes a limit supplied by the other party.
+    pub fn intersect(&self, other: &Self) -> Self {
+        fn limit<T: Copy + Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
+            match (a, b) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            }
+        }
+        Self {
+            max_micro_usd: limit(self.max_micro_usd, other.max_micro_usd),
+            max_inflight_ops: limit(self.max_inflight_ops, other.max_inflight_ops),
+            max_inference_tokens: limit(self.max_inference_tokens, other.max_inference_tokens),
+        }
+    }
 }
 
 /// Startup parameters for a Process: identity prefix, initial grants,
@@ -306,13 +308,13 @@ mod tests {
     #[test]
     fn budget_reserve_denies_over_usd_limit() {
         let spec = BudgetSpec {
-            daily_micro_usd: Some(1000),
+            max_micro_usd: Some(1000),
             ..Default::default()
         };
         let mut b = BudgetState::default();
         assert!(b.try_reserve(&spec, 600, 0).is_ok());
         assert_eq!(b.spent_micro_usd, 600);
-        assert_eq!(b.try_reserve(&spec, 600, 0), Err("daily_micro_usd".into()));
+        assert_eq!(b.try_reserve(&spec, 600, 0), Err("micro_usd".into()));
         assert_eq!(b.spent_micro_usd, 600);
         assert_eq!(b.inflight_ops, 1);
     }
@@ -331,7 +333,7 @@ mod tests {
     #[test]
     fn budget_settle_refunds_overestimate_and_releases_inflight() -> anyhow::Result<()> {
         let spec = BudgetSpec {
-            daily_micro_usd: Some(1000),
+            max_micro_usd: Some(1000),
             ..Default::default()
         };
         let mut b = BudgetState::default();

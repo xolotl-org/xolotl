@@ -29,18 +29,22 @@ use xolotl_kernel::RequestGrantTemplate;
 use xolotl_kernel::{
     Bootstrap, BootstrapError, Driver, DriverContext, DriverError, DriverOutput, MethodSpec,
 };
+use xolotl_source::ExternalInstallationAuthority;
+use xolotl_types::in_process_projection::{
+    IN_PROCESS_PROJECTION_CONFIG_PREFIX, in_process_projection_declaration_id,
+};
 use xolotl_types::{CostModel, InProcessProjectionDef, MethodId, OutputMode, Path, Role, Value};
 #[cfg(any(feature = "fetch", feature = "fs", feature = "terminal"))]
 use xolotl_types::{EffectCapability, Metadata, Purity};
 #[cfg(any(feature = "fetch", feature = "fs", feature = "terminal"))]
 use xolotl_types::{ValueMap, ValueView};
 
-/// Kernel-state prefix for in-process projection declarations.
-pub const IN_PROCESS_PROJECTION_CONFIG_PREFIX: &str = "state://kernel/projections/in-process";
-
 /// Configuration for the standard provider set.
 #[derive(Clone, Default)]
 pub struct StandardConfig {
+    /// Shared host-owned Terminal lifecycle; required for Terminal declarations.
+    #[cfg(feature = "terminal")]
+    terminal_runtime: Option<crate::TerminalRuntime>,
     /// Standard modules installed by [`install_standard`].
     modules: StandardModules,
     /// Host-provided inference backend.
@@ -54,6 +58,8 @@ pub struct StandardConfig {
     objects: xolotl_state::host::object::ObjectStore,
     /// Retrieval windows and its separately admitted tensor read capability.
     retrieval: crate::RetrievalConfig,
+    /// Per-call admission for memory namespace consolidation.
+    memory_consolidation: crate::memory::consolidation::ConsolidationLimits,
 }
 
 /// One standard-core module that can be installed.
@@ -182,6 +188,8 @@ struct StandardHostEdges {
     /// One-shot display edge for external pairing secrets. The secret does not
     /// enter Operation input/outcome, state, or Facts.
     pairing_display: PairingDisplayEdge,
+    /// Private installation catalog owned by the Source storage domain.
+    external_installations: Option<Arc<dyn ExternalInstallationAuthority>>,
 }
 
 /// Test-only effect override backed by one driver.
@@ -308,6 +316,41 @@ impl From<xolotl_state::StateFailure> for InstallError {
 }
 
 impl StandardConfig {
+    /// Share one admission and cleanup domain across all Terminal declarations.
+    /// The host must close and shut down this runtime before stopping Tokio.
+    #[cfg(feature = "terminal")]
+    pub fn with_terminal_runtime(mut self, runtime: crate::TerminalRuntime) -> Self {
+        self.terminal_runtime = Some(runtime);
+        self
+    }
+
+    /// Bound each memory consolidation call before any summary is written.
+    /// Defaults are 1024 namespace records, 16 MiB of cumulative lossless
+    /// encoded records (including provenance), and 4 MiB of projected UTF-8
+    /// text (including separators). All tiers count toward admission; these
+    /// are not RSS limits. Exceeding these exact admission limits returns
+    /// InvalidInput without summary writes. Retained input and counters are released on return or
+    /// cancellation; admitted summary writes remain individually committed.
+    /// Consolidation pages use remaining admission. Oversized-row fallback
+    /// requires the bounded State read port and caps backend envelope bytes
+    /// at the configured encoded-byte maximum before materializing the row;
+    /// the exact record encoding is still charged against remaining admission.
+    /// Backend envelope-limit or missing-capability failures retain the State
+    /// failure semantics and observed sources, also without summary writes.
+    pub fn with_memory_consolidation_limits(
+        mut self,
+        records: std::num::NonZeroUsize,
+        encoded_bytes: std::num::NonZeroUsize,
+        text_bytes: std::num::NonZeroUsize,
+    ) -> Self {
+        self.memory_consolidation = crate::memory::consolidation::ConsolidationLimits {
+            records,
+            encoded_bytes,
+            text_bytes,
+        };
+        self
+    }
+
     /// Configure retrieval's cooperative windows and explicit tensor reader.
     /// Installing general Blob object ports does not silently enable index reads.
     pub fn with_retrieval(mut self, retrieval: crate::RetrievalConfig) -> Self {
@@ -341,6 +384,16 @@ impl StandardConfig {
     /// Use a host-local pairing display edge.
     pub fn with_pairing_display(mut self, pairing_display: PairingDisplayEdge) -> Self {
         self.host_edges.pairing_display = pairing_display;
+        self
+    }
+
+    /// Bind external pairing and process launch to the Source storage owner's
+    /// typed installation catalog. Ordinary State declarations are not trusted.
+    pub fn with_external_installations(
+        mut self,
+        installations: Arc<dyn ExternalInstallationAuthority>,
+    ) -> Self {
+        self.host_edges.external_installations = Some(installations);
         self
     }
 
@@ -396,7 +449,7 @@ impl TestEffectResource {
 /// Install the core in-process providers on `boot`, sharing its kernel's
 /// state backend.
 pub fn install_standard(boot: &Bootstrap, config: &StandardConfig) -> Result<(), InstallError> {
-    let state = boot.kernel.state.clone();
+    let state = boot.kernel().state().clone();
     #[cfg(test)]
     let configured_paths = configured_override_paths(&config.effect_overrides);
     #[cfg(not(test))]
@@ -513,8 +566,8 @@ pub async fn install_declared_in_process_projections(
 ) -> Result<InProcessProjectionInstallReport, InstallError> {
     let prefix = parse_path(IN_PROCESS_PROJECTION_CONFIG_PREFIX)?;
     let mut pages = boot
-        .kernel
-        .state
+        .kernel()
+        .state()
         .pages(xolotl_state::StateScan::new(prefix));
     let mut entries = Vec::new();
     while let Some(page) = pages.next().await? {
@@ -673,7 +726,7 @@ fn install_decoded_in_process_projection(
             require_provider_role(def)?;
             #[cfg(feature = "terminal")]
             {
-                install_terminal_driver(_boot, def)
+                install_terminal_driver(_boot, def, _config)
             }
             #[cfg(not(feature = "terminal"))]
             {
@@ -729,7 +782,9 @@ fn install_core_standard(
         let memory: Arc<dyn Driver> = Arc::new(
             MemoryDriver::new(state.clone())
                 .with_retrieval_stack(index_for_memory, rank_for_memory)
-                .with_embedder(embedder),
+                .with_embedder(embedder)
+                .with_consolidation_limits(config.memory_consolidation)
+                .with_repair_attempts(config.retrieval.repair_attempts),
         );
         for path in [
             "effect://memory/store",
@@ -753,7 +808,7 @@ fn install_core_standard(
         }
     }
     if config.modules.contains(StandardModule::Time) {
-        let time: Arc<dyn Driver> = Arc::new(TimeDriver);
+        let time: Arc<dyn Driver> = Arc::new(TimeDriver::new(boot.kernel().host_runtime().clone()));
         for path in [
             "effect://time/now",
             "effect://time/sleep",
@@ -763,7 +818,10 @@ fn install_core_standard(
         }
     }
     if config.modules.contains(StandardModule::Approval) {
-        let approval: Arc<dyn Driver> = Arc::new(ApprovalDriver::new(state.clone()));
+        let approval: Arc<dyn Driver> = Arc::new(ApprovalDriver::new(
+            state.clone(),
+            boot.kernel().host_runtime().clone(),
+        ));
         for path in [
             "effect://approval/ask",
             "effect://approval/check",
@@ -823,17 +881,17 @@ fn install_core_standard(
             "read://state/fact/**",
             xolotl_types::InterfaceFamily::Sequence,
             FACT_METHODS,
-            Arc::new(FactDriver::new(boot.kernel.facts.store().clone())),
+            Arc::new(FactDriver::new(boot.kernel().facts().store().clone())),
         )?;
     }
     if config.modules.contains(StandardModule::Inspect) {
         register_standard_effect(
             boot,
-            "effect://kernel/process/inspect",
+            xolotl_types::effect_targets::KERNEL_PROCESS_INSPECT,
             INSPECT_METHODS,
             Arc::new(KernelInspectDriver::new(
-                boot.kernel.processes.clone(),
-                boot.kernel.facts.clone(),
+                boot.kernel().processes().clone(),
+                boot.kernel().facts().store().clone(),
             )),
             &configured_paths,
         )?;
@@ -896,14 +954,11 @@ fn install_core_standard(
         )?;
     }
     if config.modules.contains(StandardModule::Proc) {
-        let proc: Arc<dyn Driver> = Arc::new(crate::proc::ProcDriver::new(state.clone()));
-        for path in [
-            "effect://proc/spawn",
-            "effect://proc/kill",
-            "effect://proc/signal",
-            "effect://proc/status",
-            "effect://proc/heartbeat",
-        ] {
+        let proc: Arc<dyn Driver> = Arc::new(crate::proc::ProcDriver::with_installations(
+            state.clone(),
+            config.host_edges.external_installations.clone(),
+        ));
+        for path in xolotl_types::effect_targets::PROC_TARGETS {
             register_standard_effect(
                 boot,
                 path,
@@ -917,14 +972,9 @@ fn install_core_standard(
         let pairing: Arc<dyn Driver> = Arc::new(PairingDriver::with_display_edge(
             state.clone(),
             config.host_edges.pairing_display.clone(),
+            config.host_edges.external_installations.clone(),
         ));
-        for path in [
-            "effect://external/pairing/create",
-            "effect://external/pairing/approve",
-            "effect://external/pairing/deny",
-            "effect://external/pairing/replace",
-            "effect://external/revoke",
-        ] {
+        for path in xolotl_types::effect_targets::PAIRING_TARGETS {
             register_standard_effect(
                 boot,
                 path,
@@ -945,9 +995,9 @@ fn install_core_standard(
         )?;
     }
 
-    // Expose `state://**` as one Resource so a Process reads and writes durable
-    // state through Value/Sequence Operations, with taint persisted
-    // and capability checks applied uniformly.
+    // Install one Prefix Resource at `state://` so a Process reads and writes
+    // durable state through Value/Sequence Operations, with taint persisted
+    // and capability checks applied to each requested path.
     if config.modules.contains(StandardModule::State) {
         boot.register_subtree_resource(
             "state",
@@ -1056,10 +1106,11 @@ fn install_fs_driver(
 fn install_terminal_driver(
     boot: &Bootstrap,
     def: &InProcessProjectionDef,
+    standard: &StandardConfig,
 ) -> Result<(), InstallError> {
     require_expected_provides(def, &[("effect://terminal/run", Purity::Effectful)])?;
     let config = required_config_map(def)?;
-    reject_unknown_config_fields(def, config, &["allowlist", "denylist", "high_risk"])?;
+    reject_unknown_config_fields(def, config, &["allowlist", "denylist"])?;
     let allowlist = required_string_list(def, config, "allowlist")?;
     if allowlist.is_empty() {
         return Err(InstallError::InvalidConfig {
@@ -1067,12 +1118,15 @@ fn install_terminal_driver(
             message: "allowlist must not be empty".into(),
         });
     }
-    let mut terminal = crate::terminal::TerminalDriver::new(allowlist);
+    let runtime = standard
+        .terminal_runtime
+        .clone()
+        .ok_or_else(|| InstallError::Assembly {
+            message: "Terminal requires a host-owned TerminalRuntime".into(),
+        })?;
+    let mut terminal = crate::terminal::TerminalDriver::new(allowlist, runtime);
     if let Some(denylist) = optional_string_list(def, config, "denylist")? {
         terminal = terminal.with_denylist(denylist);
-    }
-    if let Some(high_risk) = optional_string_list(def, config, "high_risk")? {
-        terminal = terminal.with_high_risk(high_risk);
     }
     let driver: Arc<dyn Driver> = Arc::new(terminal);
     for capability in &def.provides {
@@ -1096,22 +1150,10 @@ fn parse_path(literal: &str) -> Result<Path, InstallError> {
 }
 
 fn in_process_projection_path_id(path: &Path) -> Result<&str, InstallError> {
-    let segs = path.segments();
-    match segs {
-        [kernel, projections, in_process, id]
-            if path.scheme() == "state"
-                && path.cluster().is_none()
-                && kernel.as_str() == "kernel"
-                && projections.as_str() == "projections"
-                && in_process.as_str() == "in-process" =>
-        {
-            Ok(id.as_str())
-        }
-        _ => Err(InstallError::Declaration {
-            id: path.to_string(),
-            message: "path must be state://kernel/projections/in-process/<id>".into(),
-        }),
-    }
+    in_process_projection_declaration_id(path).ok_or_else(|| InstallError::Declaration {
+        id: path.to_string(),
+        message: "path must be state://kernel/projections/in-process/<id>".into(),
+    })
 }
 
 fn decode_in_process_projection_def(
@@ -1426,16 +1468,18 @@ fn ensure_declared_effect_owner(
     effect_path: &str,
 ) -> Result<(), InstallError> {
     let name = xolotl_types::ResourceName::new(parse_path(effect_path)?);
-    let resource_id = match boot.kernel.registry.resolve_resource(&name) {
+    let resource_id = match boot.kernel().registry().resolve_resource(&name) {
         Ok(resource_id) => resource_id,
         Err(xolotl_kernel::ResolveError::NoSuchResource(_)) => return Ok(()),
     };
-    let resource = boot.kernel.registry.resource(resource_id).ok_or_else(|| {
-        InstallError::InvalidProvides {
+    let resource = boot
+        .kernel()
+        .registry()
+        .resource(resource_id)
+        .ok_or_else(|| InstallError::InvalidProvides {
             implementation: def.implementation.clone(),
             message: format!("effect path {effect_path:?} disappeared during ownership check"),
-        }
-    })?;
+        })?;
     match resource.descriptor.metadata.provider_id.as_deref() {
         Some(owner) if owner == def.id => Ok(()),
         Some(owner) => Err(InstallError::InvalidProvides {
@@ -1547,1011 +1591,4 @@ impl Driver for SingleMethodDriver {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::inference::{InferenceBackend, ModelCapabilities};
-    use crate::router::{ModelEntry, Router};
-    use anyhow::{Context, bail, ensure};
-    use xolotl_graph::{DoNode, OperationTemplate};
-    use xolotl_types::{
-        EffectCapability, InProcessProjectionDef, Outcome, OutputMode, Purity, Value,
-    };
-
-    struct StaticBackend;
-
-    #[async_trait::async_trait]
-    impl InferenceBackend for StaticBackend {
-        async fn infer(&self, _input: &Value) -> Result<Value, String> {
-            Ok(Value::string("configured-router".into()))
-        }
-
-        async fn embed(&self, _input: &Value) -> Result<Value, String> {
-            Err("not supported".into())
-        }
-
-        fn capabilities(&self) -> ModelCapabilities {
-            ModelCapabilities {
-                methods: crate::inference::InferenceMethodSupport {
-                    infer: true,
-                    embed: false,
-                    rerank: false,
-                    plan: true,
-                },
-                ..Default::default()
-            }
-        }
-    }
-
-    fn resource_name(path: &str) -> anyhow::Result<xolotl_types::ResourceName> {
-        xolotl_types::Path::parse(path)
-            .map(xolotl_types::ResourceName::new)
-            .with_context(|| format!("parse resource name {path}"))
-    }
-
-    fn install_default(boot: &Bootstrap) -> anyhow::Result<()> {
-        install_standard(boot, &StandardConfig::default()).context("install standard package")
-    }
-
-    fn fetch_projection_def() -> InProcessProjectionDef {
-        InProcessProjectionDef {
-            id: "fetch".into(),
-            role: Role::Provider,
-            implementation: "standard.fetch".into(),
-            provides: vec![EffectCapability::new(
-                "effect://fetch/get",
-                Purity::Effectful,
-            )],
-            emits: None,
-            config: Value::null(),
-            version: 1,
-        }
-    }
-
-    #[cfg(not(feature = "fetch"))]
-    #[test]
-    fn in_process_projection_declaration_fails_when_feature_is_absent() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        install_default(&boot)?;
-        let err = match install_decoded_in_process_projection(
-            &boot,
-            &fetch_projection_def(),
-            &StandardConfig::default(),
-        ) {
-            Ok(()) => bail!("fetch projection unexpectedly installed without fetch feature"),
-            Err(error) => error,
-        };
-        ensure!(
-            matches!(
-                err,
-                InstallError::FeatureNotEnabled {
-                    feature: "fetch",
-                    ..
-                }
-            ),
-            "unexpected error: {err:?}"
-        );
-        Ok(())
-    }
-
-    #[cfg(feature = "fetch")]
-    #[test]
-    fn in_process_projection_reinstall_relinks_existing_resource() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        install_default(&boot)?;
-        let def = fetch_projection_def();
-        install_decoded_in_process_projection(&boot, &def, &StandardConfig::default())
-            .context("install fetch projection")?;
-        let name = resource_name("effect://fetch/get")?;
-        let first = boot
-            .kernel
-            .registry
-            .resolve_resource(&name)
-            .map_err(|error| anyhow::anyhow!("{error:?}"))
-            .context("resolve first fetch resource")?;
-
-        install_decoded_in_process_projection(&boot, &def, &StandardConfig::default())
-            .context("reinstall fetch projection")?;
-        let second = boot
-            .kernel
-            .registry
-            .resolve_resource(&name)
-            .map_err(|error| anyhow::anyhow!("{error:?}"))
-            .context("resolve second fetch resource")?;
-
-        ensure!(first == second, "resource id changed on relink");
-        Ok(())
-    }
-
-    #[cfg(feature = "fetch")]
-    #[test]
-    fn in_process_projection_rejects_duplicate_effect_owner() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        install_default(&boot)?;
-        let def = fetch_projection_def();
-        install_decoded_in_process_projection(&boot, &def, &StandardConfig::default())
-            .context("install fetch projection")?;
-
-        let mut duplicate = fetch_projection_def();
-        duplicate.id = "other_fetch".into();
-        let err = match install_decoded_in_process_projection(
-            &boot,
-            &duplicate,
-            &StandardConfig::default(),
-        ) {
-            Ok(()) => bail!("duplicate projection unexpectedly relinked fetch effect"),
-            Err(error) => error,
-        };
-        match err {
-            InstallError::InvalidProvides { message, .. } => {
-                ensure!(
-                    message.contains("already owned by projection"),
-                    "unexpected duplicate error message: {message}"
-                );
-            }
-            other => bail!("unexpected duplicate error: {other:?}"),
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn in_process_projection_rejects_clustered_declaration_path() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        let err = match install_in_process_projection_value(
-            &boot,
-            &Path::parse("path://remote/state/kernel/projections/in-process/fetch")?,
-            Value::null(),
-            &StandardConfig::default(),
-        ) {
-            Ok(_) => bail!("clustered declaration path was unexpectedly accepted"),
-            Err(error) => error,
-        };
-        ensure!(
-            matches!(err, InstallError::Declaration { .. }),
-            "unexpected clustered path error: {err:?}"
-        );
-        Ok(())
-    }
-
-    async fn run_standard_inference(boot: &Bootstrap) -> anyhow::Result<Outcome> {
-        run_standard_effect(
-            boot,
-            "effect://inference/infer",
-            Value::string("hello".into()),
-        )
-        .await
-    }
-
-    async fn run_standard_effect(
-        boot: &Bootstrap,
-        path: &str,
-        input: Value,
-    ) -> anyhow::Result<Outcome> {
-        let name = resource_name(path)?;
-        boot.kernel
-            .registry
-            .resolve_resource(&name)
-            .map_err(|error| anyhow::anyhow!("{error:?}"))
-            .with_context(|| format!("resolve resource {path}"))?;
-        let handle = boot
-            .open_for(boot.root, &name, "perform")
-            .map_err(|error| anyhow::anyhow!("{error:?}"))
-            .with_context(|| format!("open resource {path}"))?;
-        let ex = boot.kernel.executor_for(boot.root);
-        ex.bind_handle(name.clone(), handle);
-
-        let prog = DoNode::Op(OperationTemplate {
-            target: name,
-            method: "invoke".into(),
-            method_id: None,
-            output: OutputMode::Unary,
-            literal_input: Some(input),
-        });
-        Ok(ex.eval(&prog).await.outcome)
-    }
-
-    #[cfg(not(any(
-        feature = "openai-responses",
-        feature = "openai-chat",
-        feature = "anthropic-messages",
-        feature = "gemini-generate-content"
-    )))]
-    #[tokio::test]
-    async fn standard_inference_runs_end_to_end() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        install_default(&boot)?;
-        let out = run_standard_inference(&boot).await?;
-        ensure!(
-            matches!(out, Outcome::Done(ref value) if value.as_str().is_some()),
-            "expected inference text output, got {out:?}"
-        );
-        Ok(())
-    }
-
-    #[cfg(any(
-        feature = "openai-responses",
-        feature = "openai-chat",
-        feature = "anthropic-messages",
-        feature = "gemini-generate-content"
-    ))]
-    #[tokio::test]
-    async fn standard_inference_requires_provider_state_when_http_inferences_are_enabled()
-    -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        install_default(&boot)?;
-        let out = run_standard_inference(&boot).await?;
-        ensure!(
-            matches!(out, Outcome::Fail(_)),
-            "expected failure, got {out:?}"
-        );
-        ensure!(
-            format!("{out:?}").contains("HTTP inference provider state config is not declared"),
-            "unexpected failure: {out:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn standard_inference_uses_configured_router() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        let router = Router::new(vec![ModelEntry::new(
-            "test/static",
-            Arc::new(StaticBackend),
-        )]);
-        let driver: Arc<dyn Driver> = Arc::new(InferenceDriver::with_router_arc(Arc::new(router)));
-        let config = StandardConfig::default().with_effect_override(
-            TestEffectOverride::new(driver)
-                .effect_with_cost(
-                    "effect://inference/infer",
-                    INFERENCE_METHODS,
-                    inference_cost_model(),
-                )
-                .effect_with_cost(
-                    "effect://inference/embed",
-                    INFERENCE_METHODS,
-                    inference_cost_model(),
-                )
-                .effect_with_cost(
-                    "effect://inference/rerank",
-                    INFERENCE_METHODS,
-                    inference_cost_model(),
-                )
-                .effect_with_cost(
-                    "effect://inference/plan",
-                    INFERENCE_METHODS,
-                    inference_cost_model(),
-                ),
-        );
-        install_standard(&boot, &config).map_err(anyhow::Error::msg)?;
-
-        let name = resource_name("effect://inference/infer")?;
-        let handle = boot
-            .open_for(boot.root, &name, "perform")
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let ex = boot.kernel.executor_for(boot.root);
-        ex.bind_handle(name.clone(), handle);
-        let out = ex
-            .eval(&DoNode::Op(OperationTemplate {
-                target: name,
-                method: "invoke".into(),
-                method_id: None,
-                output: OutputMode::Unary,
-                literal_input: Some(Value::string("hello".into())),
-            }))
-            .await;
-        ensure!(
-            matches!(out.outcome, Outcome::Done(ref value) if value.as_str() == Some("configured-router")),
-            "expected configured router output, got {out:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn standard_inference_uses_host_backend() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        let config = StandardConfig::default().with_inference_backend(Arc::new(StaticBackend));
-        install_standard(&boot, &config).map_err(anyhow::Error::msg)?;
-        let out = run_standard_inference(&boot).await?;
-        ensure!(
-            matches!(out, Outcome::Done(ref value) if value.as_str() == Some("configured-router")),
-            "expected host backend output, got {out:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn standard_model_backed_effects_use_host_backend() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        let config = StandardConfig::default().with_inference_backend(Arc::new(StaticBackend));
-        install_standard(&boot, &config).map_err(anyhow::Error::msg)?;
-
-        let mut deliberation_input = std::collections::BTreeMap::new();
-        deliberation_input.insert("question".into(), Value::string("choose".into()));
-        deliberation_input.insert("panelists".into(), Value::integer(1));
-        let deliberation = run_standard_effect(
-            &boot,
-            "effect://deliberation/run",
-            Value::map(deliberation_input),
-        )
-        .await?;
-        ensure!(
-            matches!(deliberation, Outcome::Done(ref value) if value.as_map().and_then(|map| map.get("answer"))
-                .and_then(Value::as_str)
-                == Some("configured-router")),
-            "expected deliberation to use host backend, got {deliberation:?}"
-        );
-
-        let mut compress_input = std::collections::BTreeMap::new();
-        compress_input.insert("text".into(), Value::string("word ".repeat(500)));
-        compress_input.insert("max_tokens".into(), Value::integer(1));
-        let compress = run_standard_effect(
-            &boot,
-            "effect://compress/summarize",
-            Value::map(compress_input),
-        )
-        .await?;
-        ensure!(
-            matches!(compress, Outcome::Done(ref value) if value.as_map().and_then(|map| map.get("summary"))
-                .and_then(Value::as_str)
-                == Some("configured-router")),
-            "expected compress to use host backend, got {compress:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn standard_modules_state_only_exposes_only_state_driver() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        let config = StandardConfig::default().with_modules(StandardModules::state_only());
-        install_standard(&boot, &config).map_err(anyhow::Error::msg)?;
-
-        boot.kernel
-            .registry
-            .resolve_resource(&resource_name("state://scratch/value")?)
-            .map_err(|error| anyhow::anyhow!("{error:?}"))
-            .context("state resource should resolve")?;
-        let time = boot
-            .kernel
-            .registry
-            .resolve_resource(&resource_name("effect://time/now")?);
-        ensure!(time.is_err(), "time resource should not be installed");
-        Ok(())
-    }
-
-    #[test]
-    fn standard_modules_default_installs_all_modules() -> anyhow::Result<()> {
-        ensure!(
-            StandardModules::default() == StandardModules::all(),
-            "default standard module set must match all modules"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn state_read_write_as_operations() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        install_default(&boot)?;
-
-        let target = resource_name("state://scratch/note")?;
-        let write_handle = boot
-            .open_for(boot.root, &target, "write")
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let ex = boot.kernel.executor_for(boot.root);
-        ex.bind_handle(target.clone(), write_handle);
-
-        let write = DoNode::Op(OperationTemplate {
-            target: target.clone(),
-            method: "write".into(),
-            method_id: None,
-            output: OutputMode::Unary,
-            literal_input: Some(Value::string("hello-state".into())),
-        });
-        let written = ex.eval(&write).await.outcome;
-        ensure!(
-            written == Outcome::Done(Value::boolean(true)),
-            "state write outcome: {written:?}"
-        );
-
-        let read_handle = boot
-            .open_for(boot.root, &target, "read")
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        ex.bind_handle(target.clone(), read_handle);
-
-        let read = DoNode::Op(OperationTemplate {
-            target,
-            method: "read".into(),
-            method_id: None,
-            output: OutputMode::Unary,
-            literal_input: Some(Value::null()),
-        });
-        let read_out = ex.eval(&read).await.outcome;
-        ensure!(
-            read_out == Outcome::Done(Value::string("hello-state".into())),
-            "state read outcome: {read_out:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn state_write_persists_taint() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        install_default(&boot)?;
-
-        let target = resource_name("state://scratch/tainted")?;
-        let handle = boot
-            .open_for(boot.root, &target, "write")
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let ex = boot.kernel.executor_for(boot.root);
-        ex.bind_handle(target.clone(), handle);
-
-        let write = DoNode::Op(OperationTemplate {
-            target: target.clone(),
-            method: "write".into(),
-            method_id: None,
-            output: OutputMode::Unary,
-            literal_input: Some(Value::string("from-the-web".into())),
-        });
-        let entry_taint = xolotl_types::TaintSet::of(xolotl_types::TaintSource::Fetched {
-            host: "evil.example".into(),
-        });
-        let outcome = ex.eval_tainted(&write, entry_taint).await.outcome;
-        ensure!(
-            outcome == Outcome::Done(Value::boolean(true)),
-            "tainted write outcome: {outcome:?}"
-        );
-
-        let tv = boot
-            .kernel
-            .state
-            .read_tainted(target.path())
-            .await
-            .map_err(anyhow::Error::msg)?
-            .context("expected tainted value to be present")?;
-        ensure!(
-            tv.taint.has_untrusted_content(),
-            "taint persisted with the value"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn root_can_lazy_open_write_after_cached_read_handle() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        install_default(&boot)?;
-
-        let target = resource_name("state://scratch/root-lazy-write")?;
-        let read_handle = boot
-            .open_for(boot.root, &target, "read")
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let ex = boot.kernel.executor_for(boot.root);
-        ex.bind_handle(target.clone(), read_handle);
-        let target_path = target.path().clone();
-
-        let write = DoNode::Op(OperationTemplate {
-            target,
-            method: "write".into(),
-            method_id: None,
-            output: OutputMode::Unary,
-            literal_input: Some(Value::string("lazy-write".into())),
-        });
-        let out = ex.eval(&write).await.outcome;
-        ensure!(
-            out == Outcome::Done(Value::boolean(true)),
-            "root should lazy-open a write handle when it has write grant: {out:?}"
-        );
-        let persisted = boot.kernel.state.read(&target_path).await?;
-        ensure!(
-            persisted == Some(Value::string("lazy-write".into())),
-            "lazy write did not persist: {persisted:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_only_request_process_cannot_write_state() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        install_default(&boot)?;
-
-        let target = resource_name("state://scratch/read-only")?;
-        let read_methods = boot
-            .request_method_bitmap(&target, "read")
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let child = boot.spawn_request_process_under_with_request_grants(
-            boot.root,
-            xolotl_types::IdentityRef::ROOT,
-            &[RequestGrantTemplate {
-                literal: "read://state/scratch/read-only",
-                methods: read_methods,
-            }],
-        )?;
-        let read_handle = boot
-            .open_for(child, &target, "read")
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let ex = boot.kernel.executor_for(child);
-        ex.bind_handle(target.clone(), read_handle);
-
-        let write = DoNode::Op(OperationTemplate {
-            target: target.clone(),
-            method: "write".into(),
-            method_id: None,
-            output: OutputMode::Unary,
-            literal_input: Some(Value::string("must-not-write".into())),
-        });
-        let out = ex.eval(&write).await.outcome;
-        ensure!(
-            matches!(
-                out,
-                Outcome::Fail(xolotl_types::Failure::PolicyViolation { .. })
-            ),
-            "read-only request process accepted write: {out:?}"
-        );
-        let persisted = boot.kernel.state.read(target.path()).await?;
-        ensure!(
-            persisted.is_none(),
-            "denied write should not persist state: {persisted:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn fact_read_side_is_state_projection_not_effect_alias() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        install_default(&boot)?;
-
-        let fact_effect = resource_name("effect://fact/read")?;
-        ensure!(
-            boot.kernel.registry.resolve_resource(&fact_effect).is_err(),
-            "Fact read side must not be exposed as effect://fact/read"
-        );
-
-        let fact_path = resource_name(&format!("state://fact/{}", boot.root.get()))?;
-        let handle = boot
-            .open_for(boot.root, &fact_path, "read")
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let ex = boot.kernel.executor_for(boot.root);
-        ex.bind_handle(fact_path.clone(), handle);
-        let read = DoNode::Op(OperationTemplate {
-            target: fact_path,
-            method: "read".into(),
-            method_id: None,
-            output: OutputMode::Unary,
-            literal_input: Some(Value::null()),
-        });
-        match ex.eval(&read).await.outcome {
-            Outcome::Done(value)
-                if value
-                    .as_map()
-                    .and_then(|page| page.get("items"))
-                    .and_then(Value::as_list)
-                    .is_some() => {}
-            other => bail!("expected fact projection page, got {other:?}"),
-        }
-
-        let global_fact_path = resource_name("state://fact")?;
-        let handle = boot
-            .open_for(boot.root, &global_fact_path, "read")
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let ex = boot.kernel.executor_for(boot.root);
-        ex.bind_handle(global_fact_path.clone(), handle);
-        let read_global = DoNode::Op(OperationTemplate {
-            target: global_fact_path,
-            method: "read".into(),
-            method_id: None,
-            output: OutputMode::Unary,
-            literal_input: Some(Value::null()),
-        });
-        match ex.eval(&read_global).await.outcome {
-            Outcome::Done(value)
-                if value
-                    .as_map()
-                    .and_then(|page| page.get("items"))
-                    .and_then(Value::as_list)
-                    .is_some() => {}
-            other => {
-                bail!("expected global fact projection page, got {other:?}");
-            }
-        }
-
-        let vault = resource_name("state://vault/console/root/password")?;
-        let err = boot
-            .open_for(boot.root, &vault, "read")
-            .err()
-            .context("vault path should be reserved")?;
-        ensure!(
-            matches!(err, xolotl_kernel::OpenError::ReservedPath(_)),
-            "unexpected vault open error: {err:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn batchable_methods_are_registered_as_metadata() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        install_default(&boot)?;
-
-        assert_method_batchable(&boot, "effect://inference/infer", "invoke", false)?;
-        assert_method_batchable(&boot, "effect://inference/embed", "invoke", true)?;
-        assert_method_batchable(&boot, "effect://inference/rerank", "invoke", true)?;
-        assert_method_batchable(&boot, "effect://index/upsert", "invoke", true)?;
-        Ok(())
-    }
-
-    #[test]
-    fn finalizer_allowed_methods_are_registered_as_metadata() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        install_default(&boot)?;
-
-        assert_method_finalize_allowed(&boot, "effect://events/publish", "invoke", true)?;
-        assert_method_finalize_allowed(&boot, "effect://lock/release", "invoke", true)?;
-        assert_method_finalize_allowed(&boot, "effect://proc/kill", "invoke", true)?;
-        assert_method_finalize_allowed(&boot, "effect://proc/signal", "invoke", true)?;
-        assert_method_finalize_allowed(&boot, "effect://proc/spawn", "invoke", false)?;
-        assert_method_finalize_allowed(&boot, "effect://inference/infer", "invoke", false)?;
-        assert_method_finalize_allowed(&boot, "state://scratch/finalizer", "write", false)?;
-        Ok(())
-    }
-
-    #[test]
-    fn external_observation_methods_are_registered_as_observation_replay() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        install_default(&boot)?;
-
-        assert_method_replay(
-            &boot,
-            "state://fact/1",
-            "read",
-            xolotl_types::ReplayClass::Observation,
-        )?;
-        assert_method_replay(
-            &boot,
-            "effect://time/now",
-            "invoke",
-            xolotl_types::ReplayClass::Observation,
-        )?;
-        assert_method_replay(
-            &boot,
-            "effect://approval/check",
-            "invoke",
-            xolotl_types::ReplayClass::Observation,
-        )?;
-        assert_method_replay(
-            &boot,
-            "effect://blob/read",
-            "invoke",
-            xolotl_types::ReplayClass::Observation,
-        )?;
-        assert_method_replay(
-            &boot,
-            "effect://memory/recall",
-            "invoke",
-            xolotl_types::ReplayClass::Observation,
-        )?;
-        assert_method_replay(
-            &boot,
-            "effect://rank/score",
-            "invoke",
-            xolotl_types::ReplayClass::Observation,
-        )?;
-        assert_method_replay(
-            &boot,
-            "effect://rank/fuse",
-            "invoke",
-            xolotl_types::ReplayClass::Deterministic,
-        )?;
-        Ok(())
-    }
-
-    #[test]
-    fn external_pairing_effects_are_registered_as_distinct_resources() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        install_default(&boot)?;
-
-        for path in [
-            "effect://external/pairing/create",
-            "effect://external/pairing/approve",
-            "effect://external/pairing/deny",
-            "effect://external/pairing/replace",
-            "effect://external/revoke",
-        ] {
-            let name = resource_name(path)?;
-            ensure!(
-                boot.kernel.registry.resolve_resource(&name).is_ok(),
-                "{path} should resolve"
-            );
-            assert_method_replay(
-                &boot,
-                path,
-                "invoke",
-                xolotl_types::ReplayClass::NonIdempotentEffect,
-            )?;
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn standard_effect_paths_do_not_accept_sibling_methods() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        install_default(&boot)?;
-
-        let name = resource_name("effect://approval/ask")?;
-        let handle = boot
-            .open_for(boot.root, &name, "perform")
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let ex = boot.kernel.executor_for(boot.root);
-        ex.bind_handle(name.clone(), handle);
-
-        let sibling_check_on_ask = DoNode::Op(OperationTemplate {
-            target: name,
-            method: "check".into(),
-            method_id: None,
-            output: OutputMode::Unary,
-            literal_input: Some(Value::null()),
-        });
-        let sibling_out = ex.eval(&sibling_check_on_ask).await.outcome;
-        ensure!(
-            matches!(
-                sibling_out,
-                Outcome::Fail(xolotl_types::Failure::NoHandler { .. })
-            ),
-            "sibling method was accepted: {sibling_out:?}"
-        );
-
-        let blob_unref = resource_name("effect://blob/unref")?;
-        ensure!(
-            boot.kernel.registry.resolve_resource(&blob_unref).is_err(),
-            "blob unref alias must not be registered"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn pairing_secret_is_not_an_operation_input() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        install_default(&boot)?;
-
-        let name = resource_name("effect://external/pairing/create")?;
-        let handle = boot
-            .open_for(boot.root, &name, "perform")
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let ex = boot.kernel.executor_for(boot.root);
-        ex.bind_handle(name.clone(), handle);
-
-        let prog = DoNode::Op(OperationTemplate {
-            target: name,
-            method: "invoke".into(),
-            method_id: None,
-            output: OutputMode::Unary,
-            literal_input: Some(Value::map(std::collections::BTreeMap::from([
-                ("pairing_id".into(), Value::string("pair-old".into())),
-                ("pairing_secret".into(), Value::string("old-secret".into())),
-            ]))),
-        });
-        let out = ex.eval(&prog).await.outcome;
-        ensure!(
-            matches!(
-                out,
-                Outcome::Fail(xolotl_types::Failure::InvalidInput { .. })
-            ),
-            "pairing secret input was accepted: {out:?}"
-        );
-
-        let facts = boot.kernel.facts.all_facts().map_err(anyhow::Error::msg)?;
-        ensure!(facts.len() == 1, "fact count: {}", facts.len());
-        let Some(input) = facts[0].input.as_map() else {
-            bail!("expected inline redacted input");
-        };
-        ensure!(
-            input.get("pairing_secret") == Some(&Value::string("<redacted>".into())),
-            "pairing_secret was not redacted"
-        );
-        ensure!(
-            !input
-                .values()
-                .any(|v| v == &Value::string("old-secret".into())),
-            "raw pairing secret leaked into facts"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn pairing_admission_follows_the_driver_when_mounted_at_another_path()
-    -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        let path = "effect://custom/onboarding";
-        boot.register_effect(
-            path,
-            &[MethodSpec::new(
-                "invoke",
-                Purity::Effectful,
-                MethodSpec::UNARY_ASYNC,
-            )],
-            Arc::new(SingleMethodDriver::new(
-                Arc::new(PairingDriver::new(boot.kernel.state.clone())),
-                3,
-            )),
-        )?;
-        let output = run_standard_effect(
-            &boot,
-            path,
-            Value::map(std::collections::BTreeMap::from([
-                ("pairing_id".into(), Value::string("pair-old".into())),
-                (
-                    "pairing_secret".into(),
-                    Value::string("secret-value".into()),
-                ),
-            ])),
-        )
-        .await?;
-        ensure!(matches!(
-            output,
-            Outcome::Fail(xolotl_types::Failure::InvalidInput { .. })
-        ));
-        let facts = boot.kernel.facts.all_facts().map_err(anyhow::Error::msg)?;
-        ensure!(facts.len() == 1);
-        let Some(input) = facts[0].input.as_map() else {
-            bail!("missing recorded input")
-        };
-        ensure!(input.get("pairing_secret") == Some(&Value::string("<redacted>".into())));
-        ensure!(input.get("pairing_id") == Some(&Value::string("pair-old".into())));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn remote_input_requirement_survives_standard_method_remapping() -> anyhow::Result<()> {
-        struct RemoteBackend;
-        #[async_trait::async_trait]
-        impl InferenceBackend for RemoteBackend {
-            fn requires_unprotected_input(&self) -> bool {
-                true
-            }
-            async fn infer(&self, _input: &Value) -> Result<Value, String> {
-                Err("backend was invoked".into())
-            }
-            async fn embed(&self, _input: &Value) -> Result<Value, String> {
-                Err("backend was invoked".into())
-            }
-        }
-        let boot = Bootstrap::in_memory();
-        install_standard(
-            &boot,
-            &StandardConfig::default().with_inference_backend(Arc::new(RemoteBackend)),
-        )?;
-        for path in [
-            "effect://inference/infer",
-            "effect://compress/summarize",
-            "effect://deliberation/run",
-            "effect://memory/store",
-        ] {
-            let name = resource_name(path)?;
-            let handle = boot
-                .open_for(boot.root, &name, "perform")
-                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-            let executor = boot.kernel.executor_for(boot.root);
-            executor.bind_handle(name.clone(), handle);
-            let operation = DoNode::Op(OperationTemplate {
-                target: name,
-                method: "invoke".into(),
-                method_id: None,
-                output: OutputMode::Unary,
-                literal_input: Some(Value::null()),
-            });
-            let taint = xolotl_types::TaintSet::of(xolotl_types::TaintSource::Protected {
-                path: Path::parse("state://vault/private")?,
-            });
-            let output = executor.eval_tainted(&operation, taint).await.outcome;
-            ensure!(
-                output
-                    == Outcome::Fail(xolotl_types::Failure::policy(
-                        "taint",
-                        "method requires unprotected input"
-                    )),
-                "{path}: {output:?}"
-            );
-        }
-        Ok(())
-    }
-
-    fn assert_method_batchable(
-        boot: &Bootstrap,
-        path: &str,
-        method: &str,
-        expected: bool,
-    ) -> anyhow::Result<()> {
-        let name = resource_name(path)?;
-        let rid = boot
-            .kernel
-            .registry
-            .resolve_resource(&name)
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let resource = boot
-            .kernel
-            .registry
-            .resource(rid)
-            .with_context(|| format!("resource {path} is not registered"))?;
-        let mut actual = None;
-        for iface_id in &resource.interfaces.interfaces {
-            let Some(iface) = boot.kernel.registry.interface(*iface_id) else {
-                continue;
-            };
-            if let Some(method) = iface.methods.iter().find(|m| m.name == method) {
-                actual = Some(method.batchable);
-                break;
-            }
-        }
-        let actual = actual.with_context(|| format!("method {method} not registered on {path}"))?;
-        ensure!(
-            actual == expected,
-            "{path}.{method}: expected {expected}, got {actual}"
-        );
-        Ok(())
-    }
-
-    fn assert_method_finalize_allowed(
-        boot: &Bootstrap,
-        path: &str,
-        method: &str,
-        expected: bool,
-    ) -> anyhow::Result<()> {
-        let name = resource_name(path)?;
-        let rid = boot
-            .kernel
-            .registry
-            .resolve_resource(&name)
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let resource = boot
-            .kernel
-            .registry
-            .resource(rid)
-            .with_context(|| format!("resource {path} is not registered"))?;
-        let mut actual = None;
-        for iface_id in &resource.interfaces.interfaces {
-            let Some(iface) = boot.kernel.registry.interface(*iface_id) else {
-                continue;
-            };
-            if let Some(method) = iface.methods.iter().find(|m| m.name == method) {
-                actual = Some(method.finalize_allowed);
-                break;
-            }
-        }
-        let actual = actual.with_context(|| format!("method {method} not registered on {path}"))?;
-        ensure!(
-            actual == expected,
-            "{path}.{method}: expected {expected}, got {actual}"
-        );
-        Ok(())
-    }
-
-    fn assert_method_replay(
-        boot: &Bootstrap,
-        path: &str,
-        method: &str,
-        expected: xolotl_types::ReplayClass,
-    ) -> anyhow::Result<()> {
-        let name = resource_name(path)?;
-        let rid = boot
-            .kernel
-            .registry
-            .resolve_resource(&name)
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let resource = boot
-            .kernel
-            .registry
-            .resource(rid)
-            .with_context(|| format!("resource {path} is not registered"))?;
-        let mut actual = None;
-        for iface_id in &resource.interfaces.interfaces {
-            let Some(iface) = boot.kernel.registry.interface(*iface_id) else {
-                continue;
-            };
-            if let Some(method) = iface.methods.iter().find(|m| m.name == method) {
-                actual = Some(method.replay);
-                break;
-            }
-        }
-        let actual = actual.with_context(|| format!("method {method} not registered on {path}"))?;
-        ensure!(
-            actual == expected,
-            "{path}.{method}: expected {expected:?}, got {actual:?}"
-        );
-        Ok(())
-    }
-}
+mod tests;

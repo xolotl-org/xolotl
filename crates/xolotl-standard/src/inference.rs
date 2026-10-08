@@ -29,10 +29,32 @@ pub use stream::InferenceStream;
 /// one as a separate `effect://inference/<method>` Resource with public method
 /// `invoke`.
 pub(crate) const INFERENCE_METHODS: &[MethodSpec] = &[
-    MethodSpec::new("infer", Purity::Effectful, MethodSpec::STREAM_ASYNC),
-    MethodSpec::new("embed", Purity::Idempotent, MethodSpec::UNARY_ASYNC).batchable(),
-    MethodSpec::new("rerank", Purity::Idempotent, MethodSpec::UNARY_ASYNC).batchable(),
-    MethodSpec::new("plan", Purity::Effectful, MethodSpec::STREAM_ASYNC),
+    MethodSpec::new(
+        "infer",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Effectful,
+        MethodSpec::STREAM_ASYNC,
+    ),
+    MethodSpec::new(
+        "embed",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Idempotent,
+        MethodSpec::UNARY_ASYNC,
+    )
+    .batchable(),
+    MethodSpec::new(
+        "rerank",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Idempotent,
+        MethodSpec::UNARY_ASYNC,
+    )
+    .batchable(),
+    MethodSpec::new(
+        "plan",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Effectful,
+        MethodSpec::STREAM_ASYNC,
+    ),
 ];
 
 /// A model backend used by the standard inference driver.

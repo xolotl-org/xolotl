@@ -42,11 +42,19 @@ where
             }
         }
     };
-    encoded.map_err(|failure| GatewayOutputExternalizationError {
-        error: GatewayError::Rejected(format!(
-            "structured output encoding failed: {}",
-            failure.error
-        )),
-        taint: failure.taint,
+    encoded.map_err(|failure| {
+        let detail = format!("structured output encoding failed: {}", failure.error);
+        let error = match failure.error {
+            xolotl_value_object::WriteError::Storage(
+                xolotl_state::StateError::CommitUncertain(_),
+            )
+            | xolotl_value_object::WriteError::Provenance
+            | xolotl_value_object::WriteError::Size { .. } => GatewayError::Indeterminate(detail),
+            _ => GatewayError::Rejected(detail),
+        };
+        GatewayOutputExternalizationError {
+            error,
+            taint: failure.taint,
+        }
     })
 }

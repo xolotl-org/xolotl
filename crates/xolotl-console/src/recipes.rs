@@ -1,17 +1,14 @@
 //! Console action recipes executed as capability-scoped request Processes.
 
 use xolotl_graph::{DoNode, OperationTemplate};
-use xolotl_kernel::{Bootstrap, CompiledRequestGrantTemplate, intern_identity};
+use xolotl_kernel::{Bootstrap, CompiledRequestGrantTemplate, RequestProcess};
 use xolotl_types::{
-    CapError, MethodBitmap, Outcome, OutputMode, Path, ProcessId, ProcessStatus, ResourceName,
-    ResourceSelector, TaintSet, Value,
+    CapError, ExecutionOutput, Failure, GrantMethods, GrantRights, Outcome, OutputMode, Path,
+    ResourceName, RightFlags, TaintSet, Value,
 };
 
-use crate::auth::{ConsolePrincipal, compile_principal_request_grant};
-use crate::ws::{
-    ConsoleError, WsSession, capability_target, capability_verb_for_state_method,
-    principal_identity_path,
-};
+use crate::auth::{ConsolePrincipal, compile_principal_request_grants};
+use crate::service::{ConsoleError, exact_resource_selector, principal_identity_path};
 
 /// State-plane method invoked by a state recipe.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,7 +32,10 @@ impl StateMethod {
     }
 
     pub fn verb(self) -> &'static str {
-        capability_verb_for_state_method(self.as_str())
+        match self {
+            Self::Read | Self::List => "read",
+            Self::Write | Self::Append | Self::Delete => "write",
+        }
     }
 }
 
@@ -53,8 +53,7 @@ impl CompiledRecipe {
     /// here so repeated calls avoid re-parsing.
     pub fn state(path: Path, method: StateMethod, input: Value) -> Result<Self, RecipeError> {
         let verb = method.verb();
-        let literal = format!("{verb}://{}", capability_target(&path));
-        let selector = ResourceSelector::parse(&literal)?;
+        let selector = exact_resource_selector(verb, &path)?;
         let target = ResourceName::new(path);
         Ok(Self {
             target,
@@ -63,15 +62,14 @@ impl CompiledRecipe {
             input,
             grant: CompiledRequestGrantTemplate {
                 selector,
-                methods: MethodBitmap::empty(),
+                rights: GrantRights::new(GrantMethods::none(), RightFlags::empty()),
             },
         })
     }
 
     /// Compile an effect-plane recipe (`effect://...` invocation).
     pub fn effect(path: Path, input: Value) -> Result<Self, RecipeError> {
-        let literal = format!("perform://{}", capability_target(&path));
-        let selector = ResourceSelector::parse(&literal)?;
+        let selector = exact_resource_selector("perform", &path)?;
         let target = ResourceName::new(path);
         Ok(Self {
             target,
@@ -80,7 +78,7 @@ impl CompiledRecipe {
             input,
             grant: CompiledRequestGrantTemplate {
                 selector,
-                methods: MethodBitmap::empty(),
+                rights: GrantRights::new(GrantMethods::none(), RightFlags::empty()),
             },
         })
     }
@@ -96,14 +94,19 @@ pub enum RecipeError {
 /// Execute a compiled recipe against the kernel: spawn a request Process under
 /// the console root with the recipe's grant, open a handle (the kernel
 /// authorizes here), evaluate the Operation, and finalize the Process so the
-/// outcome lands as a Fact.
+/// outcome lands as a Fact. Dropping the call cancels the request and revokes its
+/// handles; the kernel retains interrupted lifecycle cleanup for the host to drain.
 pub async fn execute(
-    sess: &WsSession,
+    state: &crate::state::ConsoleState,
     principal: &ConsolePrincipal,
     recipe: CompiledRecipe,
 ) -> Result<Value, ConsoleError> {
-    let boot = &sess.state.boot;
-    let identity = intern_identity(&principal_identity_path(principal)?);
+    let boot = &state.boot;
+    let identity = boot
+        .kernel()
+        .identities()
+        .resolve_or_register(&principal_identity_path(principal)?)
+        .map_err(|error| ConsoleError::Operation(error.to_string()))?;
     let CompiledRecipe {
         target,
         verb,
@@ -111,25 +114,23 @@ pub async fn execute(
         input,
         grant,
     } = recipe;
-    let compiled_grant =
-        compile_principal_request_grant(boot, principal, &target, verb, grant.selector)
+    let compiled_grants =
+        compile_principal_request_grants(boot, principal, &target, verb, &method, grant.selector)
             .map_err(ConsoleError::from)?;
-    let process = boot
-        .spawn_request_process_under_with_compiled_request_grants(
-            boot.root,
-            identity,
-            &[compiled_grant],
-        )
-        .map_err(|e| ConsoleError::Operation(e.to_string()))?;
-    let handle = match boot.open_for(process, &target, verb) {
+    let request = boot
+        .request_under(boot.root(), identity, &compiled_grants)
+        .map_err(|error| ConsoleError::Operation(error.to_string()))?;
+    let handle = match boot.open_for_method(request.id(), &target, verb, &method) {
         Ok(handle) => handle,
         Err(error) => {
-            return finish_as_failed(boot, process, ConsoleError::Operation(error.to_string()))
+            return finish_as_failed(boot, request, ConsoleError::Operation(error.to_string()))
                 .await;
         }
     };
-    let executor = boot.kernel.executor_for(process);
-    executor.bind_handle(target.clone(), handle);
+    let executor = request.executor();
+    if let Err(error) = executor.bind_handle(target.clone(), handle) {
+        return finish_as_failed(boot, request, ConsoleError::Operation(error.to_string())).await;
+    }
     let op = DoNode::Op(OperationTemplate {
         target,
         method,
@@ -137,27 +138,73 @@ pub async fn execute(
         output: OutputMode::Unary,
         literal_input: Some(input),
     });
-    let output = executor.eval_tainted(&op, TaintSet::author()).await;
-    let result = match &output.outcome {
-        Outcome::Done(value) | Outcome::Short(value) => Ok(value.clone()),
+    let mut output = executor.eval_tainted(&op, TaintSet::author()).await;
+    let ticket = request.cleanup_ticket();
+    let finished = request.finish(&output).await;
+    let report = ticket.finalization_report();
+    if let Some(unresolved) = ticket.unresolved_operations() {
+        output.unresolved_operations.merge(&unresolved);
+    }
+    if finished.is_err()
+        || report.as_ref().is_some_and(|report| {
+            !report.finalizer_failures.is_empty() || !report.unresolved_operations.is_empty()
+        })
+    {
+        use crate::runtime::executions::finalization::FinalizationProjection;
+        let projection = report
+            .as_ref()
+            .map_or(FinalizationProjection::Pending, |report| {
+                FinalizationProjection::encode(
+                    report,
+                    state.runtime.config.executions.max_finalization_bytes,
+                )
+            })
+            .value()?;
+        let error = finished
+            .err()
+            .map(ConsoleError::Finalization)
+            .unwrap_or_else(|| {
+                ConsoleError::Operation(
+                    "recipe finalization requires inspection; effects may have occurred".into(),
+                )
+            });
+        let retained =
+            crate::service::retained_runtime_completion(state, &output, projection, Some(&error))?;
+        let error = match &output.outcome {
+            Outcome::Fail(failure) => {
+                ConsoleError::Runtime(failure.clone()).with_cleanup_error(error)
+            }
+            _ => error,
+        };
+        return Err(error
+            .with_runtime_completion(retained)
+            .with_unresolved_operations(output.unresolved_operations));
+    }
+    match output.outcome {
+        Outcome::Done(value) | Outcome::Short(value) => Ok(value),
         Outcome::Fail(failure) => Err(ConsoleError::Operation(failure.to_string())),
-    };
-    boot.finish_request_process(process, &output)
-        .await
-        .map_err(|e| ConsoleError::Operation(e.to_string()))?;
-    result
+    }
 }
 
 async fn finish_as_failed(
-    boot: &Bootstrap,
-    process: ProcessId,
+    _boot: &Bootstrap,
+    request: RequestProcess<'_>,
     error: ConsoleError,
 ) -> Result<Value, ConsoleError> {
-    let original = error.to_string();
-    match boot.finish_process_as(process, ProcessStatus::Failed).await {
-        Ok(()) => Err(error),
-        Err(cleanup_error) => Err(ConsoleError::Operation(format!(
-            "{original}; request cleanup failed: {cleanup_error}"
-        ))),
+    let output = ExecutionOutput::new(
+        Outcome::Fail(Failure::Custom {
+            kind: "console_recipe_preparation".into(),
+            message: error.to_string(),
+        }),
+        TaintSet::pristine(),
+    );
+    match request.finish(&output).await {
+        Ok(_) => Err(error),
+        Err(cleanup_error) => {
+            Err(error.with_cleanup_error(ConsoleError::Finalization(cleanup_error)))
+        }
     }
 }
+
+#[cfg(test)]
+mod tests;

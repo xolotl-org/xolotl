@@ -13,17 +13,18 @@ workspace = true
 
 [features]
 default = []
-host = ["dep:async-trait", "dep:blake3", "dep:futures-util", "dep:xolotl-graph", "dep:xolotl-state", "dep:parking_lot", "dep:serde", "dep:serde_json", "dep:thiserror", "dep:tokio", "dep:tracing"]
+host = ["dep:async-trait", "dep:blake3", "dep:futures-util", "dep:hashbrown", "dep:xolotl-graph", "dep:xolotl-state", "dep:parking_lot", "dep:serde", "dep:serde_json", "dep:thiserror", "dep:tokio", "dep:tracing"]
+memory = ["host", "xolotl-state/memory"]
 multi-thread = ["host", "tokio/rt-multi-thread"]
-durable = ["host", "xolotl-core/serde", "serde/rc"]
 
 [dependencies]
 xolotl-core.workspace = true
 async-trait = { workspace = true, default-features = false, optional = true }
 blake3 = { workspace = true, default-features = false, features = ["std"], optional = true }
 futures-util = { workspace = true, default-features = false, features = ["std"], optional = true }
+hashbrown = { workspace = true, optional = true }
 xolotl-graph = { workspace = true, optional = true }
-xolotl-state = { workspace = true, features = ["memory"], optional = true }
+xolotl-state = { workspace = true, features = ["std"], optional = true }
 xolotl-types.workspace = true
 parking_lot = { workspace = true, default-features = false, optional = true }
 serde = { workspace = true, default-features = false, features = ["derive", "std"], optional = true }
@@ -36,8 +37,9 @@ tracing = { workspace = true, default-features = false, features = ["std"], opti
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 anyhow = { workspace = true, default-features = false, features = ["std"] }
 criterion = { workspace = true, default-features = false, features = ["cargo_bench_support"] }
+xolotl-state = { workspace = true, features = ["memory"] }
 
 [[bench]]
 name = "kernel_hot_paths"
 harness = false
-required-features = ["host"]
+required-features = ["memory"]

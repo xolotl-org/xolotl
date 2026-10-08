@@ -22,6 +22,7 @@
 //! - [`operation`] — `Operation`/`OperationId`/`Fact` data-plane records.
 //! - [`process`]   — `Process`/lifecycle/`Outcome`.
 //! - [`external`] — external installation/projection manifests and wire frames.
+//! - [`effect_targets`] — shared names for built-in effect resources.
 //! - [`chat`]      — chat message DTOs used by inference.
 //! - [`inference`] — inference backend and routing declarations.
 //! - [`in_process_projection`] — in-process projection declarations.
@@ -35,6 +36,7 @@ extern crate std;
 pub mod audit;
 pub mod cap;
 pub mod chat;
+pub mod effect_targets;
 pub mod execution;
 pub mod external;
 mod external_descriptor;
@@ -58,7 +60,7 @@ pub mod value;
 pub use audit::{AuditRules, AuditTag};
 pub use cap::{CapError, CapSet, Capability, PredOp, Predicate};
 pub use chat::{ChatMessage, ChatMetadata, ContentPart, MessageRole, estimate_tokens};
-pub use execution::ExecutionOutput;
+pub use execution::{ExecutionOutput, UnresolvedOperations};
 pub use external::{
     AckStatus, ApplyStatus, Backoff, CommandResult, ConfigAxis, ControlFrame, DaemonContact,
     DaemonContacts, ErrorInfo, EventAck, EventSource, ExternalInstallationDef,
@@ -66,12 +68,13 @@ pub use external::{
     JsonSchema, ManifestDef, ObservedGenerations, OutboundCommand, OverflowPolicy, PairingPayload,
     PairingPayloadError, ProcSpec, RejectReason, RestartPolicy, Role, RoleReady,
     RoleSessionClientHello, SessionContext, SourceRateLimit, StreamCapacity,
-    sandboxed_source_event_sink_path,
+    sandboxed_provider_namespace_path, sandboxed_source_event_sink_path,
 };
 pub use external_descriptor::{EffectCapability, Transport, TrustLevel};
 pub use failure::Failure;
 pub use grant::{
-    ConstraintSet, DeriveKind, Expiry, Grant, MethodBitmap, ResourceSelector, RightFlags, Rights,
+    ConstraintSet, DeriveKind, Expiry, Grant, GrantMethods, GrantRights, MethodBitmap,
+    ResourceSelector, RightFlags, Rights,
 };
 pub use ids::{
     BindingId, CausalPosition, DriverId, EndpointId, ExecutionId, GrantId, GraphId, HandleId,
@@ -93,16 +96,20 @@ pub use operation::{
 };
 #[cfg(test)]
 pub use path::p;
-pub use path::{Path, PathError};
+pub use path::{
+    BOOTSTRAP_PHASE_PATH, FACT_PREFIX, KERNEL_RESERVED_PREFIXES, Path, PathError,
+    QUARANTINE_PREFIX, STREAM_PREFIX, VAULT_PREFIX, is_fact_reserved, is_kernel_reserved,
+    is_vault_reserved,
+};
 pub use process::{
     BudgetSpec, BudgetState, CompiledProgramRef, ExpireRule, GrantAttenuation, Outcome, Process,
-    ProcessStatus, ProgramRef, Recoverability, SpawnRequest, StartRecord,
+    ProcessStatus, ProgramRef, SpawnRequest, StartRecord,
 };
 pub use replay::{Purity, ReplayClass};
 pub use resource::{
     Binding, CostModel, DriverRef, Interface, InterfaceFamily, InterfaceLaw, InterfaceSet,
-    Metadata, Method, ModalitySet, OutputMode, OutputModeSet, Resource, ResourceDescriptor,
-    ResourceKind, ResourceName,
+    Metadata, Method, MethodAuthority, ModalitySet, OutputMode, OutputModeSet, Resource,
+    ResourceAddressing, ResourceDescriptor, ResourceKind, ResourceName,
 };
 pub use taint::{TaintSet, TaintSource, TaintedFailure, TaintedValue};
 pub use trace::{Span, SpanId, TraceContext, TraceId};
@@ -112,47 +119,6 @@ pub use value::{
     TensorRef, Value, ValueBytes, ValueError, ValueIdentity, ValueList, ValueListBuilder, ValueMap,
     ValueMapBuilder, ValueText, ValueView,
 };
-
-/// Path prefixes reserved for the kernel. Non-kernel Processes cannot register
-/// handlers or write state under these even with a non-kernel Grant; admission
-/// and `open()` enforce it jointly.
-pub const KERNEL_RESERVED_PREFIXES: &[&str] = &["state://kernel/", "effect://kernel/"];
-
-/// Credential-reserved prefix: only the credential Driver opens these.
-pub const VAULT_PREFIX: &str = "state://vault/";
-
-/// Read-only history projection prefix.
-pub const FACT_PREFIX: &str = "state://fact/";
-
-/// Quarantine prefix: unsafe replays held for operator decision.
-pub const QUARANTINE_PREFIX: &str = "state://quarantine/";
-
-/// Streaming output prefix: `state://stream/<process>/<causal_pos>`.
-pub const STREAM_PREFIX: &str = "state://stream/";
-
-/// Bootstrap phase markers: `state://kernel/bootstrap/phase`.
-pub const BOOTSTRAP_PHASE_PATH: &str = "state://kernel/bootstrap/phase";
-
-/// Returns `true` if `path` is under a kernel-reserved prefix.
-pub fn is_kernel_reserved(path: &Path) -> bool {
-    path.cluster().is_none()
-        && matches!(path.scheme(), "state" | "effect")
-        && path.segments().first().map(|s| s.as_str()) == Some("kernel")
-}
-
-/// Returns `true` if `path` is under the credential-vault prefix.
-pub fn is_vault_reserved(path: &Path) -> bool {
-    path.cluster().is_none()
-        && path.scheme() == "state"
-        && path.segments().first().map(|s| s.as_str()) == Some("vault")
-}
-
-/// Returns `true` if `path` is under the read-only Fact projection prefix.
-pub fn is_fact_reserved(path: &Path) -> bool {
-    path.cluster().is_none()
-        && path.scheme() == "state"
-        && path.segments().first().map(|s| s.as_str()) == Some("fact")
-}
 
 #[cfg(test)]
 mod workspace_contract_guard_tests {

@@ -4,67 +4,47 @@
 //!
 //! An identifier reserves a protocol name; it does not guarantee that a host
 //! implements or authorizes that operation. Query the host's registry descriptors
-//! for implementation status, schemas, and admission requirements.
+//! for schemas and admission requirements.
 
 pub use xolotl_proto::xolotl::v1::console as pb;
 
 pub use pb::{
-    ActionCall, ActionDescriptor, ActionResult, Authenticated, ClientHello, ConsoleError,
-    ConsoleErrorCode, ConsoleEvent, ConsoleFrame, Event, FactEvent, FieldDescriptor, HelloAccepted,
-    PaginationSpec, PrincipalSummary, ProtocolMetadata, RecipeKind, Reply, SchemaDescriptor,
-    StateAppend, StateDelete, StateSet, StreamCall, StreamDescriptor, SubscriptionClosed, Summary,
+    ActionCall, ActionResult, Authenticated, ClientHello, ConsoleError, ConsoleErrorCode,
+    ConsoleEvent, ConsoleFrame, Event, ExecutionReference, FactEvent, HelloAccepted,
+    OutcomeUnknownDetail, PrincipalSummary, ProtocolGreeting, Reply, RuntimeEvent, StateAppend,
+    StateDelete, StateDropPrefixAppend, StateSet, StateSourceSummary, StreamCall,
+    SubscriptionClosed,
 };
 
 /// Protocol revision sent during the Console handshake.
 pub const CONSOLE_PROTOCOL_VERSION: u32 = 1;
 /// Server identifier advertised by the Console endpoint.
 pub const SERVER_NAME: &str = "xolotl-console";
-/// Payload encoding negotiated independently of the WebSocket transport.
+/// Payload encoding used by the Console v1 wire contract.
 pub const WIRE_ENCODING: &str = "protobuf+xolotl-console-v1";
 /// WebSocket subprotocol identifying the Console v1 transport.
 pub const SUBPROTOCOL: &str = "xolotl-console-v1";
 
-/// Encodings this protocol implementation accepts during negotiation.
-pub fn accepted_encodings() -> &'static [&'static str] {
-    &[WIRE_ENCODING]
-}
-
-/// Retrieve protocol metadata and negotiation capabilities.
+/// Retrieve protocol metadata and revisions.
 pub const ACTION_PROTOCOL_DESCRIBE: &str = "protocol.describe";
 /// Retrieve the registered action and stream descriptors.
 pub const ACTION_PROTOCOL_REGISTRY_SNAPSHOT: &str = "protocol.registry.snapshot";
 /// Retrieve the descriptor for one action identifier.
 pub const ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET: &str = "protocol.action_descriptor.get";
-/// Report implementation coverage grouped by registry domain.
-pub const ACTION_REGISTRY_COVERAGE_REPORT: &str = "registry.coverage.report";
 /// Enumerate resource types exposed by the management registry.
 pub const ACTION_RESOURCE_TYPE_LIST: &str = "resource.type.list";
 /// Describe one managed resource type and its schema.
 pub const ACTION_RESOURCE_TYPE_DESCRIBE: &str = "resource.type.describe";
 /// Describe the registered presentation of a managed resource.
 pub const ACTION_RESOURCE_VIEW_DESCRIBE: &str = "resource.view.describe";
-/// Create a staged management change set.
-pub const ACTION_CHANGE_SET_CREATE: &str = "change_set.create";
-/// Update the contents of a staged change set.
-pub const ACTION_CHANGE_SET_UPDATE: &str = "change_set.update";
-/// Validate a change set before application.
-pub const ACTION_CHANGE_SET_VALIDATE: &str = "change_set.validate";
-/// Compare a change set with its target configuration.
-pub const ACTION_CHANGE_SET_DIFF: &str = "change_set.diff";
-/// Evaluate a change set without committing its changes.
-pub const ACTION_CHANGE_SET_DRY_RUN: &str = "change_set.dry_run";
-/// Apply an admitted change set.
-pub const ACTION_CHANGE_SET_APPLY: &str = "change_set.apply";
-/// Discard a staged change set.
-pub const ACTION_CHANGE_SET_DISCARD: &str = "change_set.discard";
 /// Inspect the effective authority of a principal.
 pub const ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE: &str = "authority.principal.effective";
-/// Inspect which registered actions a principal may perform.
+/// Inspect advisory authority templates and known gates for registered actions.
 pub const ACTION_AUTHORITY_ACTION_MATRIX: &str = "authority.action.matrix";
 /// Inspect a principal's authority for a resource.
 pub const ACTION_AUTHORITY_RESOURCE_ACCESS: &str = "authority.resource.access";
-/// Explain an authority denial using the host's current rules.
-pub const ACTION_AUTHORITY_WHY_DENIED: &str = "authority.why_denied";
+/// Explain known gates for one action; input-dependent authority remains advisory.
+pub const ACTION_AUTHORITY_ACTION_EXPLAIN: &str = "authority.action.explain";
 /// Describe the caller's visibility boundary.
 pub const ACTION_VISIBILITY_AUTHORITY_DESCRIBE: &str = "visibility.authority.describe";
 /// Read state through the caller's visibility rules.
@@ -73,8 +53,6 @@ pub const ACTION_VISIBILITY_STATE_READ: &str = "visibility.state.read";
 pub const ACTION_VISIBILITY_STATE_LIST: &str = "visibility.state.list";
 /// Enumerate secret metadata without revealing secret values.
 pub const ACTION_SECRET_CATALOG: &str = "secret.catalog";
-/// Request secret disclosure through the configured custody boundary.
-pub const ACTION_SECRET_REVEAL: &str = "secret.reveal";
 /// Read a snapshot of authorized state.
 pub const ACTION_STATE_SNAPSHOT: &str = "state.snapshot";
 /// Read one runtime configuration value.
@@ -107,6 +85,32 @@ pub const ACTION_ACCESS_SESSION_REVOKE: &str = "access.session.revoke";
 pub const ACTION_ACCESS_SESSION_REVOKE_USER: &str = "access.session.revoke_user";
 /// Inspect the runtime state of a process.
 pub const ACTION_RUNTIME_PROCESS_INSPECT: &str = "runtime.process.inspect";
+/// Discover host runtime exposure and execution limits.
+pub const ACTION_RUNTIME_DESCRIBE: &str = "runtime.describe";
+/// Resolve installed resource method contracts visible to this caller.
+pub const ACTION_RUNTIME_RESOURCE_DESCRIBE: &str = "runtime.resource.describe";
+/// Invoke an installed resource through a request Process.
+pub const ACTION_RUNTIME_OPERATION_INVOKE: &str = "runtime.operation.invoke";
+/// Execute a bounded portable program through a request Process.
+pub const ACTION_RUNTIME_PROGRAM_RUN: &str = "runtime.program.run";
+/// Submit an independent operation.
+pub const ACTION_RUNTIME_OPERATION_SUBMIT: &str = "runtime.operation.submit";
+/// Submit an independent portable program.
+pub const ACTION_RUNTIME_PROGRAM_SUBMIT: &str = "runtime.program.submit";
+/// Read owned volatile evidence for an explicitly guarded root submission.
+pub const ACTION_RUNTIME_SUBMISSION_LOOKUP: &str = "runtime.submission.lookup";
+/// Read owned execution metadata.
+pub const ACTION_RUNTIME_EXECUTION_GET: &str = "runtime.execution.get";
+/// List owned execution metadata.
+pub const ACTION_RUNTIME_EXECUTION_LIST: &str = "runtime.execution.list";
+/// Read an owned execution result with current authority.
+pub const ACTION_RUNTIME_EXECUTION_RESULT: &str = "runtime.execution.result";
+/// Read or briefly wait for an owned volatile execution's bounded Stream output.
+pub const ACTION_RUNTIME_EXECUTION_OUTPUT_READ: &str = "runtime.execution.output.read";
+/// Request cancellation of an owned execution.
+pub const ACTION_RUNTIME_EXECUTION_CANCEL: &str = "runtime.execution.cancel";
+/// Forget an owned terminal execution record.
+pub const ACTION_RUNTIME_EXECUTION_FORGET: &str = "runtime.execution.forget";
 /// Query recently retained audit facts.
 pub const ACTION_AUDIT_FACTS_RECENT: &str = "audit.facts.recent";
 /// Read lineage information for a trace.
@@ -119,6 +123,8 @@ pub const ACTION_HEALTH_SUMMARY: &str = "health.summary";
 pub const ACTION_EXTERNAL_INSTALLATION_INSTALL: &str = "external.installation.install";
 /// Update an external installation declaration.
 pub const ACTION_EXTERNAL_INSTALLATION_UPDATE: &str = "external.installation.update";
+/// Retire an installation and all its Source scopes with an exact version precondition.
+pub const ACTION_EXTERNAL_INSTALLATION_UNINSTALL: &str = "external.installation.uninstall";
 /// Request startup of an external installation.
 pub const ACTION_EXTERNAL_INSTALLATION_START: &str = "external.installation.start";
 /// Request shutdown of an external installation.
@@ -129,6 +135,11 @@ pub const ACTION_EXTERNAL_INSTALLATION_REVOKE: &str = "external.installation.rev
 pub const ACTION_EXTERNAL_INSTALLATION_LIST: &str = "external.installation.list";
 /// Read one external installation record.
 pub const ACTION_EXTERNAL_INSTALLATION_READ: &str = "external.installation.read";
+/// Inspect one exact Source claim through a privileged, audited host port.
+pub const ACTION_EXTERNAL_SOURCE_CLAIM_INSPECT: &str = "external.source.claim.inspect";
+/// Inspect the retained decision for one Source event through the audited host port.
+pub const ACTION_EXTERNAL_SOURCE_EVENT_DECISION_INSPECT: &str =
+    "external.source.event.decision.inspect";
 /// List registered external program manifests.
 pub const ACTION_EXTERNAL_MANIFEST_LIST: &str = "external.manifest.list";
 /// Read one external program manifest.
@@ -167,398 +178,48 @@ pub const ACTION_PAIRING_CREATE: &str = "pairing.create";
 pub const ACTION_PAIRING_APPROVE: &str = "pairing.approve";
 /// Deny an external pairing request.
 pub const ACTION_PAIRING_DENY: &str = "pairing.deny";
-/// Replace an existing external pairing.
-pub const ACTION_PAIRING_REPLACE: &str = "pairing.replace";
-
-/// List the caller-authorized passkey credentials.
-pub const ACTION_ACCESS_CREDENTIAL_PASSKEY_LIST: &str = "access.credential.passkey.list";
-/// Start or complete passkey registration as defined by the action schema.
-pub const ACTION_ACCESS_CREDENTIAL_PASSKEY_REGISTER: &str = "access.credential.passkey.register";
-/// Change a passkey's display name.
-pub const ACTION_ACCESS_CREDENTIAL_PASSKEY_RENAME: &str = "access.credential.passkey.rename";
-/// Revoke a registered passkey credential.
-pub const ACTION_ACCESS_CREDENTIAL_PASSKEY_REVOKE: &str = "access.credential.passkey.revoke";
-/// Enroll a time-based one-time-password credential.
-pub const ACTION_ACCESS_CREDENTIAL_TOTP_ENROLL: &str = "access.credential.totp.enroll";
-/// Disable a time-based one-time-password credential.
-pub const ACTION_ACCESS_CREDENTIAL_TOTP_DISABLE: &str = "access.credential.totp.disable";
-/// Replace recovery codes through the credential management action.
-pub const ACTION_ACCESS_CREDENTIAL_RECOVERY_REGENERATE: &str =
-    "access.credential.recovery.regenerate";
-/// Set a password credential under the action's authorization rules.
-pub const ACTION_ACCESS_CREDENTIAL_PASSWORD_SET: &str = "access.credential.password.set";
-/// Change a password credential under the action's verification rules.
-pub const ACTION_ACCESS_CREDENTIAL_PASSWORD_CHANGE: &str = "access.credential.password.change";
-/// Disable password-based authentication for the selected account.
-pub const ACTION_ACCESS_CREDENTIAL_PASSWORD_DISABLE: &str = "access.credential.password.disable";
+/// Read one locally managed federation peer admission row.
+pub const ACTION_FEDERATION_PEER_READ: &str = "federation.peer.read";
+/// Enumerate locally managed federation peer admission rows.
+pub const ACTION_FEDERATION_PEER_LIST: &str = "federation.peer.list";
+/// Compare and replace one locally managed federation peer admission row.
+pub const ACTION_FEDERATION_PEER_WRITE_CAS: &str = "federation.peer.write_cas";
+/// Read one peer's accepted online-key generations and authorization digests.
+pub const ACTION_FEDERATION_PEER_ADMISSION_READ: &str = "federation.peer_admission.read";
+/// Compare and replace one peer's accepted online-key admission.
+pub const ACTION_FEDERATION_PEER_ADMISSION_WRITE_CAS: &str = "federation.peer_admission.write_cas";
+/// Read a peer's directional access to one local federation export.
+pub const ACTION_FEDERATION_EXPORT_READ: &str = "federation.export.read";
+/// Enumerate a peer's directional local export decisions.
+pub const ACTION_FEDERATION_EXPORT_LIST: &str = "federation.export.list";
+/// Compare and replace a peer's directional access to one local export.
+pub const ACTION_FEDERATION_EXPORT_WRITE_CAS: &str = "federation.export.write_cas";
 
 /// Subscribe to authorized state mutations.
 pub const STREAM_STATE_WATCH: &str = "state.watch";
-/// Subscribe to state differences for the requested scope.
-pub const STREAM_STATE_DIFF: &str = "state.diff";
 /// Subscribe to audit fact events.
 pub const STREAM_AUDIT_FACTS: &str = "audit.facts.stream";
-/// Subscribe to the audit tail selected by the stream schema.
-pub const STREAM_AUDIT_TAIL: &str = "audit.tail";
-/// Subscribe to fact lineage updates.
-pub const STREAM_LINEAGE_FACT: &str = "lineage.fact";
-/// Subscribe to process lifecycle observations.
-pub const STREAM_RUNTIME_PROCESS: &str = "runtime.process";
-/// Subscribe to Console session changes.
-pub const STREAM_ACCESS_SESSION: &str = "access.session";
-/// Subscribe to runtime configuration changes.
-pub const STREAM_CONFIG_DIFF: &str = "config.diff";
 /// Subscribe to runtime operation observations.
-pub const STREAM_RUNTIME_OPERATION: &str = "runtime.operation";
-/// Subscribe to runtime health observations.
-pub const STREAM_RUNTIME_HEALTH: &str = "runtime.health";
-/// Subscribe to pending approval requests.
-pub const STREAM_APPROVAL_PENDING: &str = "approval.pending";
-/// Subscribe to external installation lifecycle changes.
-pub const STREAM_EXTERNAL_LIFECYCLE: &str = "external.lifecycle";
-
-/// Returns the compact fast-path code for an action id, if registered.
-/// Codes are grouped by domain (high byte) so new actions in a domain do not
-/// shift existing codes.
-pub fn action_code(id: &str) -> Option<u32> {
-    Some(match id {
-        ACTION_PROTOCOL_DESCRIBE => 0x0101,
-        ACTION_PROTOCOL_REGISTRY_SNAPSHOT => 0x0102,
-        ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET => 0x0103,
-        ACTION_REGISTRY_COVERAGE_REPORT => 0x0201,
-        ACTION_RESOURCE_TYPE_LIST => 0x0301,
-        ACTION_RESOURCE_TYPE_DESCRIBE => 0x0302,
-        ACTION_RESOURCE_VIEW_DESCRIBE => 0x0303,
-        ACTION_CHANGE_SET_CREATE => 0x0401,
-        ACTION_CHANGE_SET_UPDATE => 0x0402,
-        ACTION_CHANGE_SET_VALIDATE => 0x0403,
-        ACTION_CHANGE_SET_DIFF => 0x0404,
-        ACTION_CHANGE_SET_DRY_RUN => 0x0405,
-        ACTION_CHANGE_SET_APPLY => 0x0406,
-        ACTION_CHANGE_SET_DISCARD => 0x0407,
-        ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE => 0x0501,
-        ACTION_AUTHORITY_ACTION_MATRIX => 0x0502,
-        ACTION_AUTHORITY_RESOURCE_ACCESS => 0x0503,
-        ACTION_AUTHORITY_WHY_DENIED => 0x0504,
-        ACTION_VISIBILITY_AUTHORITY_DESCRIBE => 0x0601,
-        ACTION_VISIBILITY_STATE_READ => 0x0602,
-        ACTION_VISIBILITY_STATE_LIST => 0x0603,
-        ACTION_SECRET_CATALOG => 0x0701,
-        ACTION_SECRET_REVEAL => 0x0702,
-        ACTION_STATE_SNAPSHOT => 0x0801,
-        ACTION_CONFIG_READ => 0x0901,
-        ACTION_CONFIG_LIST => 0x0902,
-        ACTION_CONFIG_WRITE_CAS => 0x0903,
-        ACTION_ACCESS_USER_READ => 0x0A01,
-        ACTION_ACCESS_USER_LIST => 0x0A02,
-        ACTION_ACCESS_USER_WRITE_CAS => 0x0A03,
-        ACTION_ACCESS_USER_DISABLE => 0x0A04,
-        ACTION_ACCESS_ROLE_READ => 0x0A05,
-        ACTION_ACCESS_ROLE_LIST => 0x0A06,
-        ACTION_ACCESS_ROLE_WRITE_CAS => 0x0A07,
-        ACTION_ACCESS_SESSION_CURRENT_LOGOUT => 0x0A08,
-        ACTION_ACCESS_SESSION_LIST => 0x0A09,
-        ACTION_ACCESS_SESSION_REVOKE => 0x0A0A,
-        ACTION_ACCESS_SESSION_REVOKE_USER => 0x0A0B,
-        ACTION_RUNTIME_PROCESS_INSPECT => 0x0B01,
-        ACTION_AUDIT_FACTS_RECENT => 0x0C01,
-        ACTION_LINEAGE_TRACE_READ => 0x0D01,
-        ACTION_LINEAGE_FACT_READ => 0x0D02,
-        ACTION_HEALTH_SUMMARY => 0x0E01,
-        ACTION_EXTERNAL_INSTALLATION_INSTALL => 0x0F01,
-        ACTION_EXTERNAL_INSTALLATION_UPDATE => 0x0F02,
-        ACTION_EXTERNAL_INSTALLATION_START => 0x0F03,
-        ACTION_EXTERNAL_INSTALLATION_STOP => 0x0F04,
-        ACTION_EXTERNAL_INSTALLATION_REVOKE => 0x0F05,
-        ACTION_EXTERNAL_INSTALLATION_LIST => 0x0F06,
-        ACTION_EXTERNAL_INSTALLATION_READ => 0x0F07,
-        ACTION_EXTERNAL_MANIFEST_LIST => 0x1001,
-        ACTION_EXTERNAL_MANIFEST_READ => 0x1002,
-        ACTION_EXTERNAL_MANIFEST_WRITE_CAS => 0x1003,
-        ACTION_PROJECTION_IN_PROCESS_STATUS_LIST => 0x1101,
-        ACTION_PROJECTION_IN_PROCESS_STATUS_READ => 0x1102,
-        ACTION_INFERENCE_BACKEND_LIST => 0x1201,
-        ACTION_INFERENCE_BACKEND_READ => 0x1202,
-        ACTION_INFERENCE_BACKEND_WRITE_CAS => 0x1203,
-        ACTION_INFERENCE_MODEL_LIST => 0x1204,
-        ACTION_INFERENCE_MODEL_READ => 0x1205,
-        ACTION_INFERENCE_MODEL_WRITE_CAS => 0x1206,
-        ACTION_INFERENCE_GROUP_LIST => 0x1207,
-        ACTION_INFERENCE_GROUP_READ => 0x1208,
-        ACTION_INFERENCE_GROUP_WRITE_CAS => 0x1209,
-        ACTION_INFERENCE_ROUTING_READ => 0x120A,
-        ACTION_INFERENCE_ROUTING_WRITE_CAS => 0x120B,
-        ACTION_PAIRING_CREATE => 0x1301,
-        ACTION_PAIRING_APPROVE => 0x1302,
-        ACTION_PAIRING_DENY => 0x1303,
-        ACTION_PAIRING_REPLACE => 0x1304,
-        ACTION_ACCESS_CREDENTIAL_PASSKEY_LIST => 0x1401,
-        ACTION_ACCESS_CREDENTIAL_PASSKEY_REGISTER => 0x1402,
-        ACTION_ACCESS_CREDENTIAL_PASSKEY_RENAME => 0x1403,
-        ACTION_ACCESS_CREDENTIAL_PASSKEY_REVOKE => 0x1404,
-        ACTION_ACCESS_CREDENTIAL_TOTP_ENROLL => 0x1405,
-        ACTION_ACCESS_CREDENTIAL_TOTP_DISABLE => 0x1406,
-        ACTION_ACCESS_CREDENTIAL_RECOVERY_REGENERATE => 0x1407,
-        ACTION_ACCESS_CREDENTIAL_PASSWORD_SET => 0x1408,
-        ACTION_ACCESS_CREDENTIAL_PASSWORD_CHANGE => 0x1409,
-        ACTION_ACCESS_CREDENTIAL_PASSWORD_DISABLE => 0x140A,
-        _ => return None,
-    })
-}
-
-/// Returns the action id for a compact code, if registered.
-pub fn action_id(code: u32) -> Option<&'static str> {
-    Some(match code {
-        0x0101 => ACTION_PROTOCOL_DESCRIBE,
-        0x0102 => ACTION_PROTOCOL_REGISTRY_SNAPSHOT,
-        0x0103 => ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET,
-        0x0201 => ACTION_REGISTRY_COVERAGE_REPORT,
-        0x0301 => ACTION_RESOURCE_TYPE_LIST,
-        0x0302 => ACTION_RESOURCE_TYPE_DESCRIBE,
-        0x0303 => ACTION_RESOURCE_VIEW_DESCRIBE,
-        0x0401 => ACTION_CHANGE_SET_CREATE,
-        0x0402 => ACTION_CHANGE_SET_UPDATE,
-        0x0403 => ACTION_CHANGE_SET_VALIDATE,
-        0x0404 => ACTION_CHANGE_SET_DIFF,
-        0x0405 => ACTION_CHANGE_SET_DRY_RUN,
-        0x0406 => ACTION_CHANGE_SET_APPLY,
-        0x0407 => ACTION_CHANGE_SET_DISCARD,
-        0x0501 => ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE,
-        0x0502 => ACTION_AUTHORITY_ACTION_MATRIX,
-        0x0503 => ACTION_AUTHORITY_RESOURCE_ACCESS,
-        0x0504 => ACTION_AUTHORITY_WHY_DENIED,
-        0x0601 => ACTION_VISIBILITY_AUTHORITY_DESCRIBE,
-        0x0602 => ACTION_VISIBILITY_STATE_READ,
-        0x0603 => ACTION_VISIBILITY_STATE_LIST,
-        0x0701 => ACTION_SECRET_CATALOG,
-        0x0702 => ACTION_SECRET_REVEAL,
-        0x0801 => ACTION_STATE_SNAPSHOT,
-        0x0901 => ACTION_CONFIG_READ,
-        0x0902 => ACTION_CONFIG_LIST,
-        0x0903 => ACTION_CONFIG_WRITE_CAS,
-        0x0A01 => ACTION_ACCESS_USER_READ,
-        0x0A02 => ACTION_ACCESS_USER_LIST,
-        0x0A03 => ACTION_ACCESS_USER_WRITE_CAS,
-        0x0A04 => ACTION_ACCESS_USER_DISABLE,
-        0x0A05 => ACTION_ACCESS_ROLE_READ,
-        0x0A06 => ACTION_ACCESS_ROLE_LIST,
-        0x0A07 => ACTION_ACCESS_ROLE_WRITE_CAS,
-        0x0A08 => ACTION_ACCESS_SESSION_CURRENT_LOGOUT,
-        0x0A09 => ACTION_ACCESS_SESSION_LIST,
-        0x0A0A => ACTION_ACCESS_SESSION_REVOKE,
-        0x0A0B => ACTION_ACCESS_SESSION_REVOKE_USER,
-        0x0B01 => ACTION_RUNTIME_PROCESS_INSPECT,
-        0x0C01 => ACTION_AUDIT_FACTS_RECENT,
-        0x0D01 => ACTION_LINEAGE_TRACE_READ,
-        0x0D02 => ACTION_LINEAGE_FACT_READ,
-        0x0E01 => ACTION_HEALTH_SUMMARY,
-        0x0F01 => ACTION_EXTERNAL_INSTALLATION_INSTALL,
-        0x0F02 => ACTION_EXTERNAL_INSTALLATION_UPDATE,
-        0x0F03 => ACTION_EXTERNAL_INSTALLATION_START,
-        0x0F04 => ACTION_EXTERNAL_INSTALLATION_STOP,
-        0x0F05 => ACTION_EXTERNAL_INSTALLATION_REVOKE,
-        0x0F06 => ACTION_EXTERNAL_INSTALLATION_LIST,
-        0x0F07 => ACTION_EXTERNAL_INSTALLATION_READ,
-        0x1001 => ACTION_EXTERNAL_MANIFEST_LIST,
-        0x1002 => ACTION_EXTERNAL_MANIFEST_READ,
-        0x1003 => ACTION_EXTERNAL_MANIFEST_WRITE_CAS,
-        0x1101 => ACTION_PROJECTION_IN_PROCESS_STATUS_LIST,
-        0x1102 => ACTION_PROJECTION_IN_PROCESS_STATUS_READ,
-        0x1201 => ACTION_INFERENCE_BACKEND_LIST,
-        0x1202 => ACTION_INFERENCE_BACKEND_READ,
-        0x1203 => ACTION_INFERENCE_BACKEND_WRITE_CAS,
-        0x1204 => ACTION_INFERENCE_MODEL_LIST,
-        0x1205 => ACTION_INFERENCE_MODEL_READ,
-        0x1206 => ACTION_INFERENCE_MODEL_WRITE_CAS,
-        0x1207 => ACTION_INFERENCE_GROUP_LIST,
-        0x1208 => ACTION_INFERENCE_GROUP_READ,
-        0x1209 => ACTION_INFERENCE_GROUP_WRITE_CAS,
-        0x120A => ACTION_INFERENCE_ROUTING_READ,
-        0x120B => ACTION_INFERENCE_ROUTING_WRITE_CAS,
-        0x1301 => ACTION_PAIRING_CREATE,
-        0x1302 => ACTION_PAIRING_APPROVE,
-        0x1303 => ACTION_PAIRING_DENY,
-        0x1304 => ACTION_PAIRING_REPLACE,
-        0x1401 => ACTION_ACCESS_CREDENTIAL_PASSKEY_LIST,
-        0x1402 => ACTION_ACCESS_CREDENTIAL_PASSKEY_REGISTER,
-        0x1403 => ACTION_ACCESS_CREDENTIAL_PASSKEY_RENAME,
-        0x1404 => ACTION_ACCESS_CREDENTIAL_PASSKEY_REVOKE,
-        0x1405 => ACTION_ACCESS_CREDENTIAL_TOTP_ENROLL,
-        0x1406 => ACTION_ACCESS_CREDENTIAL_TOTP_DISABLE,
-        0x1407 => ACTION_ACCESS_CREDENTIAL_RECOVERY_REGENERATE,
-        0x1408 => ACTION_ACCESS_CREDENTIAL_PASSWORD_SET,
-        0x1409 => ACTION_ACCESS_CREDENTIAL_PASSWORD_CHANGE,
-        0x140A => ACTION_ACCESS_CREDENTIAL_PASSWORD_DISABLE,
-        _ => return None,
-    })
-}
-
-/// Implementation coverage for a particular management registry revision.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CoverageReport {
-    /// Registry revision from which the coverage counts were derived.
-    pub registry_rev: u64,
-    /// Separate action and stream counts for each registry domain.
-    pub domains: Vec<CoverageDomain>,
-}
-
-/// Coverage of the descriptors grouped into one management domain.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CoverageDomain {
-    /// Domain name used by the registry descriptors.
-    pub domain: String,
-    /// Action descriptors grouped by implementation status.
-    pub actions: CoverageCounts,
-    /// Stream descriptors grouped by implementation status.
-    pub streams: CoverageCounts,
-}
-
-/// Descriptor counts by implementation status, independent of caller authority.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CoverageCounts {
-    /// Descriptors backed by a registered implementation.
-    pub implemented: u32,
-    /// Declared operations awaiting an implementation.
-    pub planned: u32,
-    /// Operations requiring a secret custody backend before implementation.
-    pub blocked_by_custody: u32,
-    /// Operations owned outside the Console management interface.
-    pub not_console_managed: u32,
-}
+pub const STREAM_RUNTIME_OPERATION: &str = "runtime.operation.stream";
+/// Execute a portable program and receive its live output and final result.
+pub const STREAM_RUNTIME_PROGRAM: &str = "runtime.program.stream";
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::{Context, ensure};
-
-    #[test]
-    fn action_code_mapping_is_bijective() -> anyhow::Result<()> {
-        let ids = [
-            ACTION_PROTOCOL_DESCRIBE,
-            ACTION_CONFIG_WRITE_CAS,
-            ACTION_ACCESS_CREDENTIAL_PASSWORD_CHANGE,
-            ACTION_PAIRING_REPLACE,
-            ACTION_INFERENCE_ROUTING_WRITE_CAS,
-        ];
-        for id in ids {
-            let code = action_code(id).with_context(|| format!("action {id} has no code"))?;
-            ensure!(
-                action_id(code) == Some(id),
-                "code {code:#x} must map back to {id}"
-            );
-        }
-        ensure!(
-            action_code("no.such.action").is_none(),
-            "unknown action must have no code"
-        );
-        ensure!(
-            action_id(0xFFFF).is_none(),
-            "unknown code must map to no action"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn action_codes_are_unique() -> anyhow::Result<()> {
-        let mut seen = std::collections::BTreeSet::new();
-        for id in known_action_ids() {
-            let code = action_code(id).with_context(|| format!("action {id} has no code"))?;
-            ensure!(seen.insert(code), "duplicate code {code:#x} for {id}");
-        }
-        Ok(())
-    }
 
     #[test]
     fn subprotocol_is_stable() {
+        assert_eq!(CONSOLE_PROTOCOL_VERSION, 1);
         assert_eq!(SUBPROTOCOL, "xolotl-console-v1");
         assert_eq!(WIRE_ENCODING, "protobuf+xolotl-console-v1");
-        assert_eq!(accepted_encodings(), &[WIRE_ENCODING]);
     }
 
-    fn known_action_ids() -> Vec<&'static str> {
-        [
-            ACTION_PROTOCOL_DESCRIBE,
-            ACTION_PROTOCOL_REGISTRY_SNAPSHOT,
-            ACTION_PROTOCOL_ACTION_DESCRIPTOR_GET,
-            ACTION_REGISTRY_COVERAGE_REPORT,
-            ACTION_RESOURCE_TYPE_LIST,
-            ACTION_RESOURCE_TYPE_DESCRIBE,
-            ACTION_RESOURCE_VIEW_DESCRIBE,
-            ACTION_CHANGE_SET_CREATE,
-            ACTION_CHANGE_SET_UPDATE,
-            ACTION_CHANGE_SET_VALIDATE,
-            ACTION_CHANGE_SET_DIFF,
-            ACTION_CHANGE_SET_DRY_RUN,
-            ACTION_CHANGE_SET_APPLY,
-            ACTION_CHANGE_SET_DISCARD,
-            ACTION_AUTHORITY_PRINCIPAL_EFFECTIVE,
-            ACTION_AUTHORITY_ACTION_MATRIX,
-            ACTION_AUTHORITY_RESOURCE_ACCESS,
-            ACTION_AUTHORITY_WHY_DENIED,
-            ACTION_VISIBILITY_AUTHORITY_DESCRIBE,
-            ACTION_VISIBILITY_STATE_READ,
-            ACTION_VISIBILITY_STATE_LIST,
-            ACTION_SECRET_CATALOG,
-            ACTION_SECRET_REVEAL,
-            ACTION_STATE_SNAPSHOT,
-            ACTION_CONFIG_READ,
-            ACTION_CONFIG_LIST,
-            ACTION_CONFIG_WRITE_CAS,
-            ACTION_ACCESS_USER_READ,
-            ACTION_ACCESS_USER_LIST,
-            ACTION_ACCESS_USER_WRITE_CAS,
-            ACTION_ACCESS_USER_DISABLE,
-            ACTION_ACCESS_ROLE_READ,
-            ACTION_ACCESS_ROLE_LIST,
-            ACTION_ACCESS_ROLE_WRITE_CAS,
-            ACTION_ACCESS_SESSION_CURRENT_LOGOUT,
-            ACTION_ACCESS_SESSION_LIST,
-            ACTION_ACCESS_SESSION_REVOKE,
-            ACTION_ACCESS_SESSION_REVOKE_USER,
-            ACTION_RUNTIME_PROCESS_INSPECT,
-            ACTION_AUDIT_FACTS_RECENT,
-            ACTION_LINEAGE_TRACE_READ,
-            ACTION_LINEAGE_FACT_READ,
-            ACTION_HEALTH_SUMMARY,
-            ACTION_EXTERNAL_INSTALLATION_INSTALL,
-            ACTION_EXTERNAL_INSTALLATION_UPDATE,
-            ACTION_EXTERNAL_INSTALLATION_START,
-            ACTION_EXTERNAL_INSTALLATION_STOP,
-            ACTION_EXTERNAL_INSTALLATION_REVOKE,
-            ACTION_EXTERNAL_INSTALLATION_LIST,
-            ACTION_EXTERNAL_INSTALLATION_READ,
-            ACTION_EXTERNAL_MANIFEST_LIST,
-            ACTION_EXTERNAL_MANIFEST_READ,
-            ACTION_EXTERNAL_MANIFEST_WRITE_CAS,
-            ACTION_PROJECTION_IN_PROCESS_STATUS_LIST,
-            ACTION_PROJECTION_IN_PROCESS_STATUS_READ,
-            ACTION_INFERENCE_BACKEND_LIST,
-            ACTION_INFERENCE_BACKEND_READ,
-            ACTION_INFERENCE_BACKEND_WRITE_CAS,
-            ACTION_INFERENCE_MODEL_LIST,
-            ACTION_INFERENCE_MODEL_READ,
-            ACTION_INFERENCE_MODEL_WRITE_CAS,
-            ACTION_INFERENCE_GROUP_LIST,
-            ACTION_INFERENCE_GROUP_READ,
-            ACTION_INFERENCE_GROUP_WRITE_CAS,
-            ACTION_INFERENCE_ROUTING_READ,
-            ACTION_INFERENCE_ROUTING_WRITE_CAS,
-            ACTION_PAIRING_CREATE,
-            ACTION_PAIRING_APPROVE,
-            ACTION_PAIRING_DENY,
-            ACTION_PAIRING_REPLACE,
-            ACTION_ACCESS_CREDENTIAL_PASSKEY_LIST,
-            ACTION_ACCESS_CREDENTIAL_PASSKEY_REGISTER,
-            ACTION_ACCESS_CREDENTIAL_PASSKEY_RENAME,
-            ACTION_ACCESS_CREDENTIAL_PASSKEY_REVOKE,
-            ACTION_ACCESS_CREDENTIAL_TOTP_ENROLL,
-            ACTION_ACCESS_CREDENTIAL_TOTP_DISABLE,
-            ACTION_ACCESS_CREDENTIAL_RECOVERY_REGENERATE,
-            ACTION_ACCESS_CREDENTIAL_PASSWORD_SET,
-            ACTION_ACCESS_CREDENTIAL_PASSWORD_CHANGE,
-            ACTION_ACCESS_CREDENTIAL_PASSWORD_DISABLE,
-        ]
-        .into_iter()
-        .collect()
+    #[test]
+    fn submission_lookup_identifier_is_stable() {
+        assert_eq!(
+            ACTION_RUNTIME_SUBMISSION_LOOKUP,
+            "runtime.submission.lookup"
+        );
     }
 }

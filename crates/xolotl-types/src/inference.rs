@@ -3,7 +3,7 @@
 //! These declarations are stored in Xolotl state. They describe HTTP inference
 //! providers and routing without storing HTTP clients or plaintext credentials.
 
-use crate::{ModalitySet, Path, Value, is_vault_reserved};
+use crate::{ModalitySet, Path, PathError, Value, is_vault_reserved};
 use alloc::collections::BTreeMap;
 use alloc::{
     string::{String, ToString},
@@ -14,6 +14,66 @@ use thiserror::Error;
 
 /// Maximum accepted retry count for one inference route attempt.
 pub const MAX_INFERENCE_ROUTING_RETRIES: u32 = 8;
+/// State prefix for HTTP inference backend declarations.
+pub const INFERENCE_BACKENDS_PREFIX: &str = "state://kernel/inference/backends";
+/// State prefix for HTTP inference model declarations.
+pub const INFERENCE_MODELS_PREFIX: &str = "state://kernel/inference/models";
+/// State prefix for HTTP inference group declarations.
+pub const INFERENCE_GROUPS_PREFIX: &str = "state://kernel/inference/groups";
+/// State address for the active inference routing declaration.
+pub const INFERENCE_ROUTING_PATH: &str = "state://kernel/routing/inference";
+
+/// One collection of named inference declarations in local kernel State.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InferenceDeclarationKind {
+    /// HTTP backend declarations.
+    Backend,
+    /// Model declarations.
+    Model,
+    /// Routing group declarations.
+    Group,
+}
+
+impl InferenceDeclarationKind {
+    /// State prefix to scan for declarations of this kind.
+    pub const fn prefix(self) -> &'static str {
+        match self {
+            Self::Backend => INFERENCE_BACKENDS_PREFIX,
+            Self::Model => INFERENCE_MODELS_PREFIX,
+            Self::Group => INFERENCE_GROUPS_PREFIX,
+        }
+    }
+
+    /// Construct one declaration address from a safe, single-segment id.
+    pub fn path(self, id: &str) -> Result<Path, PathError> {
+        if id.is_empty() {
+            return Err(PathError::EmptySegment);
+        }
+        if !crate::path::is_simple_id_segment(id) {
+            return Err(PathError::BadSegmentChar(id.into()));
+        }
+        Path::parse(self.prefix())?.try_push_literal(id)
+    }
+
+    /// Extract the id only from an exact, local, direct declaration address.
+    pub fn id(self, path: &Path) -> Option<&str> {
+        let [kernel, inference, kind, id] = path.segments() else {
+            return None;
+        };
+        let expected_kind = match self {
+            Self::Backend => "backends",
+            Self::Model => "models",
+            Self::Group => "groups",
+        };
+        (path.scheme() == "state"
+            && path.cluster().is_none()
+            && kernel.as_str() == "kernel"
+            && inference.as_str() == "inference"
+            && kind.as_str() == expected_kind
+            && crate::path::is_simple_id_segment(id.as_str()))
+        .then_some(id.as_str())
+    }
+}
 
 /// HTTP inference provider API shape.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -392,19 +452,10 @@ fn validate_id(field: &'static str, id: &str) -> Result<(), InferenceConfigError
     if id.trim().is_empty() {
         return Err(InferenceConfigError::EmptyField { field });
     }
-    if !is_safe_id_segment(id) {
+    if !crate::path::is_simple_id_segment(id) {
         return Err(InferenceConfigError::BadId { field });
     }
     Ok(())
-}
-
-fn is_safe_id_segment(id: &str) -> bool {
-    let mut chars = id.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphanumeric() => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn validate_base_url(url: &str) -> Result<(), InferenceConfigError> {
@@ -579,6 +630,35 @@ fn is_sensitive_request_field(field: &str) -> bool {
 mod tests {
     use super::*;
     use anyhow::{Context, Result, ensure};
+
+    #[test]
+    fn declaration_addresses_have_one_exact_local_namespace() -> Result<()> {
+        for (kind, expected) in [
+            (
+                InferenceDeclarationKind::Backend,
+                "state://kernel/inference/backends/primary",
+            ),
+            (
+                InferenceDeclarationKind::Model,
+                "state://kernel/inference/models/primary",
+            ),
+            (
+                InferenceDeclarationKind::Group,
+                "state://kernel/inference/groups/primary",
+            ),
+        ] {
+            let path = kind.path("primary")?;
+            ensure!(path.to_string() == expected);
+            ensure!(kind.id(&path) == Some("primary"));
+            ensure!(kind.path("bad.name").is_err());
+            ensure!(kind.path("nested/name").is_err());
+            ensure!(kind.id(&path.clone().try_push("child")?).is_none());
+            ensure!(kind.id(&path.try_with_cluster("remote")?).is_none());
+        }
+        let backend = InferenceDeclarationKind::Backend.path("primary")?;
+        ensure!(InferenceDeclarationKind::Model.id(&backend).is_none());
+        Ok(())
+    }
 
     fn vault(path: &str) -> Result<Path> {
         Path::parse(path).with_context(|| format!("parse {path}"))

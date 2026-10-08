@@ -3,13 +3,19 @@
 use xolotl_state::StateError;
 use xolotl_state::object::ObjectMetadata;
 use xolotl_types::TaintSet;
+use xolotl_types::Value;
 
 use super::read_grant::record::{self, ReadGrantScope};
 use super::read_grant::{StoredReadGrant, read_grant_path, state_error};
 use super::{GatewayObjectReadGrant, IssueObjectReadGrantRequest, object_store_error};
-use crate::{
-    GatewayError, GatewayRuntime, GatewaySession, now_millis, push_hex_byte, validate_content_hash,
-};
+use crate::{GatewayError, GatewayRuntime, GatewaySession, push_hex_byte, validate_content_hash};
+
+#[derive(serde::Serialize)]
+struct BorrowedGrantEnvelope<'a> {
+    #[serde(with = "xolotl_types::tagged_value")]
+    value: &'a Value,
+    taint: &'a TaintSet,
+}
 
 /// A host decision made against the same canonical source snapshot retained by
 /// the grant. The public delegation API already represents that decision.
@@ -82,6 +88,12 @@ impl GatewayRuntime {
         authorization: &dyn ExportAuthorization,
         observed_sources: &mut TaintSet,
     ) -> Result<GatewayObjectReadGrant, GatewayError> {
+        let state = self.boot.kernel().state();
+        if !state.has_bounded_read() || !state.has_bounded_write() {
+            return Err(GatewayError::Rejected(
+                "object read grants require bounded state reads and writes".into(),
+            ));
+        }
         let profile = self.profile_snapshot();
         let scope = ReadGrantScope::new(&profile, session, &request.surface_id)?;
         let requested = request.object.value.backing_blob().ok_or_else(|| {
@@ -101,9 +113,15 @@ impl GatewayRuntime {
                 "object read grant lifetime exceeds profile window".into(),
             ));
         }
-        let expires_at_ms = now_millis().checked_add(ttl_ms).ok_or_else(|| {
-            GatewayError::Rejected("object read grant expiry is out of range".into())
-        })?;
+        let expires_at_ms = self
+            .boot
+            .kernel()
+            .host_runtime()
+            .now_millis()
+            .checked_add(ttl_ms)
+            .ok_or_else(|| {
+                GatewayError::Rejected("object read grant expiry is out of range".into())
+            })?;
         let mut metadata = self
             .objects
             .metadata(requested)
@@ -137,7 +155,7 @@ impl GatewayRuntime {
         }
         authorization.authorize(&metadata, expires_at_ms).await?;
         scope.validate(&self.profile_snapshot(), session)?;
-        if expires_at_ms <= now_millis() {
+        if expires_at_ms <= self.boot.kernel().host_runtime().now_millis() {
             return Err(GatewayError::Rejected(
                 "object read grant expired before commit".into(),
             ));
@@ -151,17 +169,40 @@ impl GatewayRuntime {
         };
         let path = read_grant_path(grant.grant_id())?;
         let value = record::encode(scope, &grant)?;
+        let encoded_bytes = xolotl_state::host::encoded_size(&BorrowedGrantEnvelope {
+            value: &value,
+            taint: &grant.metadata.taint,
+        })
+        .map_err(state_error)?;
+        let path_bytes = path.canonical_len().ok_or_else(|| {
+            GatewayError::Rejected("object read grant path is out of range".into())
+        })?;
+        if encoded_bytes
+            .checked_add(path_bytes)
+            .and_then(|bytes| bytes.checked_add(4096))
+            .is_none_or(|bytes| bytes > super::maintenance::PAGE_BYTES)
+        {
+            return Err(GatewayError::Rejected(
+                "object read grant record exceeds maintenance page budget".into(),
+            ));
+        }
         self.boot
-            .kernel
-            .state
-            .write_cas_tainted(&path, None, value, grant.metadata.taint.clone())
+            .kernel()
+            .state()
+            .write_cas_tainted_bounded(
+                &path,
+                None,
+                value,
+                grant.metadata.taint.clone(),
+                super::maintenance::PAGE_BUDGET,
+            )
             .await
             .map_err(|failure| {
                 observed_sources.union(&failure.taint);
                 state_error(failure)
             })?;
         crate::validate_current_session(&self.profile_snapshot(), session)?;
-        if expires_at_ms <= now_millis() {
+        if expires_at_ms <= self.boot.kernel().host_runtime().now_millis() {
             return Err(GatewayError::Rejected(
                 "object read grant expired during commit".into(),
             ));
@@ -180,15 +221,21 @@ impl GatewayRuntime {
         grant_id: &str,
     ) -> Result<bool, GatewayError> {
         crate::validate_current_session(&self.profile_snapshot(), session)?;
-        let Some(stored) = StoredReadGrant::load(&self.boot.kernel.state, grant_id).await? else {
+        let Some(stored) = StoredReadGrant::load(self.boot.kernel().state(), grant_id).await?
+        else {
             return Ok(false);
         };
         stored.scope.validate(&self.profile_snapshot(), session)?;
         match self
             .boot
-            .kernel
-            .state
-            .write_compare_delete(&stored.path, Some(stored.value))
+            .kernel()
+            .state()
+            .write_compare_delete_tainted_bounded(
+                &stored.path,
+                Some(stored.value),
+                stored.grant.metadata.taint,
+                super::maintenance::PAGE_BUDGET,
+            )
             .await
         {
             Ok(_commit) => Ok(true),

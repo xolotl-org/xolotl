@@ -15,9 +15,25 @@ use xolotl_types::{
 };
 
 pub(crate) const BLOB_METHODS: &[MethodSpec] = &[
-    MethodSpec::new("write", Purity::Idempotent, MethodSpec::UNARY_ASYNC),
-    MethodSpec::new("read", Purity::Pure, MethodSpec::STREAM_ASYNC).observes_external(),
-    MethodSpec::new("delete", Purity::Effectful, MethodSpec::UNARY_ASYNC),
+    MethodSpec::new(
+        "write",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Idempotent,
+        MethodSpec::UNARY_ASYNC,
+    ),
+    MethodSpec::new(
+        "read",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Pure,
+        MethodSpec::STREAM_ASYNC,
+    )
+    .observes_external(),
+    MethodSpec::new(
+        "delete",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Effectful,
+        MethodSpec::UNARY_ASYNC,
+    ),
 ];
 
 pub(crate) struct BlobDriver {

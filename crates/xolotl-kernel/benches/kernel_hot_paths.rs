@@ -1,19 +1,20 @@
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow, bail, ensure};
 use async_trait::async_trait;
 use criterion::{BatchSize, BenchmarkId, Criterion};
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::{Builder, Runtime};
+use xolotl_graph::OperationTemplate;
 use xolotl_kernel::{
-    Bootstrap, DataPlane, Driver, DriverContext, DriverError, DriverPlan, EchoDriver, FastPath,
-    Handle, HandleState, HandleTable, InvocationOptions, MethodSpec, OpenRequest,
+    Bootstrap, DataPlane, Driver, DriverContext, DriverError, DriverPlan, EchoDriver, FactStore,
+    FastPath, Handle, HandleTable, InvocationOptions, KernelBuilder, MethodSpec, OpenRequest,
     RequestGrantTemplate,
 };
 use xolotl_types::{
     ConstraintSet, DecisionTag, DriverId, ExecutionId, Expiry, Fact, Grant, HandleId, IdentityRef,
-    InvocationId, MethodBitmap, MethodContract, MethodId, NodeId, Operation, OperationId, Outcome,
-    OutputMode, OutputModeSet, Path, ProcessId, Purity, ReplayClass, ResourceId, ResourceName,
-    ResourceSelector, RightFlags, Rights, TaintSet, Timestamp, Value,
+    InterfaceFamily, InvocationId, MethodBitmap, MethodContract, MethodId, NodeId, Operation,
+    OperationId, Outcome, OutputMode, OutputModeSet, Path, ProcessId, Purity, ReplayClass,
+    ResourceId, ResourceName, ResourceSelector, RightFlags, Rights, TaintSet, Timestamp, Value,
 };
 
 const FIXED_OPEN_MILLIS: i64 = 1_700_000_000_000;
@@ -77,11 +78,11 @@ impl OpenFixture {
         let boot = Bootstrap::in_memory();
         let name = register_echo_effect(&boot, effect_path, Purity::Pure)?;
         let resource = boot
-            .kernel
-            .registry
+            .kernel()
+            .registry()
             .resolve_resource(&name)
             .context("registered effect did not resolve")?;
-        let process = boot.root;
+        let process = boot.root();
         Ok(Self {
             boot,
             process,
@@ -94,29 +95,35 @@ impl OpenFixture {
         let boot = Bootstrap::in_memory();
         let name = register_echo_effect(&boot, effect_path, Purity::Pure)?;
         let resource = boot
-            .kernel
-            .registry
+            .kernel()
+            .registry()
             .resolve_resource(&name)
             .context("registered effect did not resolve")?;
         let process = ProcessId::new(99_001);
         for i in 0..grants {
             let selector = ResourceSelector::parse(&format!("perform://effect/irrelevant/g{i}"))
                 .with_context(|| format!("irrelevant grant selector {i} did not parse"))?;
-            boot.kernel.registry.register_grant(Grant {
-                id: boot.kernel.registry.next_grant_id(),
+            boot.kernel().registry().register_grant(Grant {
+                id: boot.kernel().registry().next_grant_id(),
                 holder: process,
                 selector,
-                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+                rights: xolotl_types::GrantRights::new(
+                    xolotl_types::GrantMethods::name("invoke"),
+                    RightFlags::empty(),
+                ),
                 constraints: ConstraintSet::empty(),
                 expires: Expiry::Never,
             });
         }
-        boot.kernel.registry.register_grant(Grant {
-            id: boot.kernel.registry.next_grant_id(),
+        boot.kernel().registry().register_grant(Grant {
+            id: boot.kernel().registry().next_grant_id(),
             holder: process,
             selector: ResourceSelector::parse("perform://effect/bench/open-many-grants")
                 .context("matching grant selector did not parse")?,
-            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            rights: xolotl_types::GrantRights::new(
+                xolotl_types::GrantMethods::name("invoke"),
+                RightFlags::empty(),
+            ),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
         });
@@ -128,9 +135,45 @@ impl OpenFixture {
         })
     }
 
-    fn open_at(&self, handles: &mut HandleTable, now_millis: i64) -> anyhow::Result<HandleId> {
+    fn with_many_wildcard_grants(effect_path: &str, grants: usize) -> anyhow::Result<Self> {
+        // A cold-open benchmark needs an explicit cache-disabled registry now
+        // that simple plans can be reused across different wall-clock millis.
+        let boot = Bootstrap::from_kernel(
+            KernelBuilder::in_memory()
+                .with_open_cache_capacity(0)
+                .build(),
+        );
+        let name = register_echo_effect(&boot, effect_path, Purity::Pure)?;
+        let resource = boot.kernel().registry().resolve_resource(&name)?;
+        let process = ProcessId::new(99_002);
+        for index in 0..grants {
+            boot.kernel().registry().register_grant(Grant {
+                id: boot.kernel().registry().next_grant_id(),
+                holder: process,
+                selector: ResourceSelector::parse("perform://effect/bench/**")?,
+                rights: xolotl_types::GrantRights::new(
+                    if index + 1 == grants {
+                        xolotl_types::GrantMethods::name("invoke")
+                    } else {
+                        xolotl_types::GrantMethods::none()
+                    },
+                    RightFlags::empty(),
+                ),
+                constraints: ConstraintSet::empty(),
+                expires: Expiry::Never,
+            });
+        }
+        Ok(Self {
+            boot,
+            process,
+            resource,
+            path: name.path().clone(),
+        })
+    }
+
+    fn open_at(&self, handles: &HandleTable, now_millis: i64) -> anyhow::Result<HandleId> {
         let handle = xolotl_kernel::open_resource(
-            &self.boot.kernel.registry,
+            self.boot.kernel().registry(),
             handles,
             OpenRequest {
                 process: self.process,
@@ -179,6 +222,7 @@ fn register_echo_effect(
             path,
             &[MethodSpec::new(
                 "invoke",
+                xolotl_types::MethodAuthority::Perform,
                 purity,
                 OutputModeSet::UNARY | OutputModeSet::ASYNC_PROCESS,
             )],
@@ -195,14 +239,19 @@ fn unconstrained_dataplane_fixture(
     let boot = Bootstrap::in_memory();
     let method = MethodSpec {
         observes_external,
-        ..MethodSpec::unary_async("invoke", Purity::Pure)
+        ..MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Pure,
+            MethodSpec::UNARY_ASYNC,
+        )
     };
     let name = boot.register_effect(effect_path, &[method], Arc::new(EchoDriver))?;
     let handle = boot
-        .open_for(boot.root, &name, "perform")
+        .open_for(boot.root(), &name, "perform")
         .context("root open failed")?;
-    let op = operation(boot.root, handle, 0, Value::integer(42));
-    Ok((boot.kernel.data_plane(), op))
+    let op = operation(boot.root(), handle, 0, Value::integer(42));
+    Ok((boot.kernel().data_plane(), op))
 }
 
 fn conditional_dataplane_fixture() -> anyhow::Result<(DataPlane, Operation)> {
@@ -226,22 +275,25 @@ fn conditional_dataplane_fixture_with_input(
     let boot = Bootstrap::in_memory();
     let name = register_echo_effect(&boot, effect_path, Purity::Pure)?;
     let resource = boot
-        .kernel
-        .registry
+        .kernel()
+        .registry()
         .resolve_resource(&name)
         .context("registered effect did not resolve")?;
     let child = boot
-        .spawn_request_process_under_with_request_grants(boot.root, IdentityRef::ROOT, &[])
+        .spawn_request_process_under_with_request_grants(boot.root(), IdentityRef::ROOT, &[])
         .context("child process did not spawn")?;
     let grant = Grant {
-        id: boot.kernel.registry.next_grant_id(),
+        id: boot.kernel().registry().next_grant_id(),
         holder: child,
         selector: ResourceSelector::parse(&format!(
             "perform://{}",
             effect_path.replacen("://", "/", 1)
         ))
         .context("conditional grant selector did not parse")?,
-        rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+        rights: xolotl_types::GrantRights::new(
+            xolotl_types::GrantMethods::name("invoke"),
+            RightFlags::empty(),
+        ),
         constraints: ConstraintSet {
             predicates: vec![
                 xolotl_types::Predicate::parse("tenant=acme")
@@ -250,12 +302,11 @@ fn conditional_dataplane_fixture_with_input(
         },
         expires: Expiry::Never,
     };
-    boot.kernel.registry.register_grant(grant);
+    boot.kernel().registry().register_grant(grant);
 
-    let mut handles = boot.kernel.handles.write();
     let handle = xolotl_kernel::open_resource(
-        &boot.kernel.registry,
-        &mut handles,
+        boot.kernel().registry(),
+        boot.kernel().handles(),
         OpenRequest {
             process: child,
             resource,
@@ -267,26 +318,25 @@ fn conditional_dataplane_fixture_with_input(
         },
     )
     .context("constrained open failed")?;
-    drop(handles);
 
     let input = Value::map([("tenant".into(), tenant)].into());
     let op = operation(child, handle, 0, input);
-    Ok((boot.kernel.data_plane(), op))
+    Ok((boot.kernel().data_plane(), op))
 }
 
 fn idempotent_dataplane_fixture() -> anyhow::Result<(DataPlane, Operation)> {
     let boot = Bootstrap::in_memory();
     let name = register_echo_effect(&boot, "effect://bench/idempotent", Purity::Idempotent)?;
     let handle = boot
-        .open_for(boot.root, &name, "perform")
+        .open_for(boot.root(), &name, "perform")
         .context("root open failed")?;
     let op = operation(
-        boot.root,
+        boot.root(),
         handle,
         0,
         Value::string("dedupe-keyed-input".into()),
     );
-    Ok((boot.kernel.data_plane(), op))
+    Ok((boot.kernel().data_plane(), op))
 }
 
 fn collect_dataplane_fixture(chunks: usize) -> anyhow::Result<(DataPlane, Operation)> {
@@ -296,6 +346,7 @@ fn collect_dataplane_fixture(chunks: usize) -> anyhow::Result<(DataPlane, Operat
             "effect://bench/collect",
             &[MethodSpec::new(
                 "invoke",
+                xolotl_types::MethodAuthority::Perform,
                 Purity::Pure,
                 MethodSpec::STREAM_ASYNC,
             )],
@@ -303,11 +354,11 @@ fn collect_dataplane_fixture(chunks: usize) -> anyhow::Result<(DataPlane, Operat
         )
         .context("streaming effect registration failed")?;
     let handle = boot
-        .open_for(boot.root, &name, "perform")
+        .open_for(boot.root(), &name, "perform")
         .context("root open failed")?;
-    let mut op = operation(boot.root, handle, 0, Value::null());
+    let mut op = operation(boot.root(), handle, 0, Value::null());
     op.output = OutputMode::Collect { limit: chunks };
-    Ok((boot.kernel.data_plane(), op))
+    Ok((boot.kernel().data_plane(), op))
 }
 
 fn bench_handle(process: ProcessId, resource: ResourceId) -> Handle {
@@ -318,6 +369,7 @@ fn bench_handle(process: ProcessId, resource: ResourceId) -> Handle {
         Arc::new(EchoDriver),
     );
     Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process,
         acting: IdentityRef::ROOT,
@@ -325,13 +377,12 @@ fn bench_handle(process: ProcessId, resource: ResourceId) -> Handle {
         rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
         driver_plan: plan,
         fast_path: FastPath::Unconditional,
-        state: HandleState::Active,
         bound_path: None,
     }
 }
 
 fn populated_handle_table(count: usize) -> anyhow::Result<(HandleTable, Vec<HandleId>)> {
-    let mut table = HandleTable::new();
+    let table = HandleTable::new();
     let ids = (0..count)
         .map(|i| {
             table.insert(bench_handle(
@@ -371,6 +422,7 @@ fn fact(process: ProcessId, node: u32, complete: bool) -> Fact {
         id: operation_id(process, node),
         schema_version: Fact::SCHEMA_VERSION,
         caller: process,
+        caller_identity: Some(IdentityRef::ROOT),
         acting: IdentityRef::ROOT,
         handle: HandleId::new(0, 1),
         resource: ResourceId::new(1),
@@ -424,11 +476,9 @@ fn bench_open(c: &mut Criterion) -> anyhow::Result<()> {
             || {
                 let fixture =
                     capture_result(&failure, OpenFixture::new("effect://bench/open-hit"))?;
-                let mut warm_handles = HandleTable::new();
-                let handle = capture_result(
-                    &failure,
-                    fixture.open_at(&mut warm_handles, FIXED_OPEN_MILLIS),
-                )?;
+                let warm_handles = HandleTable::new();
+                let handle =
+                    capture_result(&failure, fixture.open_at(&warm_handles, FIXED_OPEN_MILLIS))?;
                 black_box(handle);
                 Some((fixture, HandleTable::new()))
             },
@@ -443,16 +493,14 @@ fn bench_open(c: &mut Criterion) -> anyhow::Result<()> {
         );
     });
 
-    group.bench_function("open_resource_cache_miss_fresh_time", |b| {
+    group.bench_function("open_resource_cache_hit_fresh_time", |b| {
         b.iter_batched_ref(
             || {
                 let fixture =
                     capture_result(&failure, OpenFixture::new("effect://bench/open-fresh-time"))?;
-                let mut warm_handles = HandleTable::new();
-                let handle = capture_result(
-                    &failure,
-                    fixture.open_at(&mut warm_handles, FIXED_OPEN_MILLIS),
-                )?;
+                let warm_handles = HandleTable::new();
+                let handle =
+                    capture_result(&failure, fixture.open_at(&warm_handles, FIXED_OPEN_MILLIS))?;
                 black_box(handle);
                 Some((fixture, HandleTable::new()))
             },
@@ -487,6 +535,151 @@ fn bench_open(c: &mut Criterion) -> anyhow::Result<()> {
         );
     });
 
+    let wildcard_fixture =
+        OpenFixture::with_many_wildcard_grants("effect://bench/open-many-wildcards", 4_096)?;
+    group.bench_function("candidate_snapshot_many_wildcards_4096", |b| {
+        b.iter(|| {
+            black_box(wildcard_fixture.boot.kernel().registry().candidate_grants(
+                wildcard_fixture.process,
+                "perform",
+                &wildcard_fixture.path,
+            ));
+        });
+    });
+    group.bench_function("open_resource_cold_many_wildcards_4096", |b| {
+        b.iter(|| {
+            let handles = HandleTable::new();
+            if let Some(handle) = capture_result(
+                &failure,
+                wildcard_fixture.open_at(&handles, FIXED_OPEN_MILLIS),
+            ) {
+                black_box(handle);
+            }
+        });
+    });
+
+    group.finish();
+    failure.finish()
+}
+
+struct PrefixResolutionFixture {
+    boot: Bootstrap,
+    root: ResourceName,
+    concrete: ResourceName,
+}
+
+impl PrefixResolutionFixture {
+    fn new(unrelated: usize) -> anyhow::Result<Self> {
+        let boot = Bootstrap::in_memory();
+        let root = boot.register_subtree_resource_at(
+            "state://bench/target",
+            "read://state/bench/**",
+            InterfaceFamily::Value,
+            &[MethodSpec::new(
+                "read",
+                xolotl_types::MethodAuthority::Read,
+                Purity::Pure,
+                MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(EchoDriver),
+        )?;
+        let registry = boot.kernel().registry();
+        let expected = registry.resolve_resource(&root)?;
+        let template = registry
+            .resource(expected)
+            .context("subtree root missing")?;
+        for index in 0..unrelated {
+            let mut sibling = template.clone();
+            sibling.id = registry.next_resource_id();
+            sibling.descriptor.name =
+                ResourceName::new(Path::parse(&format!("state://bench/unrelated-{index}"))?);
+            registry.admit_resource(sibling, false)?;
+        }
+        let concrete = ResourceName::new(Path::parse("state://bench/target/tenant/item")?);
+        ensure!(registry.counts().names == unrelated + 1);
+        ensure!(registry.resolve_resource(&concrete)? == expected);
+        Ok(Self {
+            boot,
+            root,
+            concrete,
+        })
+    }
+}
+
+fn bench_resource_resolution(c: &mut Criterion) -> anyhow::Result<()> {
+    let mut group = c.benchmark_group("kernel/resource_resolution");
+    for unrelated in [64, 4_096] {
+        // Build once. The timed interval includes only a read-lock lookup; it
+        // excludes registration, path parsing and any per-Executor cache.
+        let fixture = PrefixResolutionFixture::new(unrelated)?;
+        let registry = fixture.boot.kernel().registry();
+        group.bench_function(BenchmarkId::new("dynamic_prefix", unrelated), |b| {
+            b.iter(|| black_box(registry.resolve_resource(black_box(&fixture.concrete))));
+        });
+        group.bench_function(BenchmarkId::new("exact_control", unrelated), |b| {
+            b.iter(|| black_box(registry.resolve_resource(black_box(&fixture.root))));
+        });
+    }
+    group.finish();
+    Ok(())
+}
+
+struct PrepareFixture {
+    _boot: Bootstrap,
+    executor: xolotl_kernel::Executor,
+    template: OperationTemplate,
+}
+
+impl PrepareFixture {
+    fn new() -> anyhow::Result<Self> {
+        let boot = Bootstrap::in_memory();
+        let target = register_echo_effect(&boot, "effect://bench/executor-prepare", Purity::Pure)?;
+        let executor = boot.kernel().executor_for(boot.root());
+        let template = OperationTemplate {
+            target,
+            method: "invoke".into(),
+            method_id: None,
+            output: OutputMode::Unary,
+            literal_input: None,
+        };
+        Ok(Self {
+            _boot: boot,
+            executor,
+            template,
+        })
+    }
+
+    fn prepare(&self) -> anyhow::Result<()> {
+        self.executor
+            .prepare_operation(black_box(&self.template))
+            .map_err(anyhow::Error::from)
+    }
+}
+
+fn bench_executor_prepare(c: &mut Criterion) -> anyhow::Result<()> {
+    let failure = BenchFailure::default();
+    let mut group = c.benchmark_group("kernel/executor_prepare");
+
+    group.bench_function("cold_method_and_handle", |b| {
+        b.iter_batched_ref(
+            || capture_result(&failure, PrepareFixture::new()),
+            |fixture| {
+                if let Some(fixture) = fixture.as_ref() {
+                    capture_result(&failure, fixture.prepare());
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    let warm = PrepareFixture::new()?;
+    warm.prepare().context("warm prepare did not succeed")?;
+    group.bench_function("warm_method_and_handle", |b| {
+        b.iter(|| {
+            capture_result(&failure, warm.prepare());
+        });
+    });
+
     group.finish();
     failure.finish()
 }
@@ -513,7 +706,7 @@ fn bench_handle_table(c: &mut Criterion) -> anyhow::Result<()> {
         b.iter_batched(
             || populated_handle_table(1),
             |fixture| {
-                let Some((mut table, ids)) = capture_result(&failure, fixture) else {
+                let Some((table, ids)) = capture_result(&failure, fixture) else {
                     return;
                 };
                 let old = ids[0];
@@ -530,6 +723,100 @@ fn bench_handle_table(c: &mut Criterion) -> anyhow::Result<()> {
             BatchSize::SmallInput,
         );
     });
+
+    // Process finalization calls these owner operations even when that process
+    // has no handles. A long-lived table keeps its high-water slot array.
+    for slots in [64usize, 4_096, 65_536] {
+        let (table, _background) = populated_handle_table(slots)?;
+        let absent = ProcessId::new(2);
+        // This packed owner array is a favorable lower bound for the old
+        // whole-Slot scan: real Slots have a much larger stride and the old
+        // cleanup also held the table's write lock throughout the scan.
+        let packed_owners = vec![ProcessId::new(1); slots];
+        group.bench_function(BenchmarkId::new("linear_owner_scan_floor", slots), |b| {
+            b.iter(|| {
+                let owner = black_box(absent);
+                black_box(
+                    packed_owners
+                        .iter()
+                        .filter(|&&candidate| candidate == owner)
+                        .count(),
+                );
+            });
+        });
+        group.bench_function(BenchmarkId::new("revoke_absent_owner", slots), |b| {
+            b.iter_custom(|iterations| {
+                let start = std::time::Instant::now();
+                for _ in 0..iterations {
+                    black_box(table.revoke_owned_by(black_box(absent)));
+                }
+                start.elapsed()
+            });
+        });
+
+        let target = bench_handle(absent, ResourceId::new(slots as u64 + 1));
+        group.bench_function(BenchmarkId::new("revoke_one_owner", slots), |b| {
+            b.iter_custom(|iterations| {
+                let mut elapsed = std::time::Duration::ZERO;
+                for _ in 0..iterations {
+                    if capture_result(
+                        &failure,
+                        table
+                            .insert(target.clone())
+                            .context("owner handle insertion failed"),
+                    )
+                    .is_none()
+                    {
+                        break;
+                    }
+                    let start = std::time::Instant::now();
+                    let revoked = black_box(table.revoke_owned_by(black_box(absent)));
+                    elapsed += start.elapsed();
+                    capture_condition(
+                        &failure,
+                        revoked == 1,
+                        "single owner cleanup missed its handle",
+                    );
+                }
+                elapsed
+            });
+        });
+    }
+
+    // A multi-handle owner exercises the release cursor and owner-index
+    // removal. Reinstallation is outside the measured interval; the table
+    // keeps the same high-water slot count across iterations.
+    for owned in [8usize, 128] {
+        let table = HandleTable::new();
+        let owner = ProcessId::new(2);
+        let target = bench_handle(owner, ResourceId::new(1));
+        for _ in 0..owned {
+            table.insert(target.clone())?;
+        }
+        group.bench_function(BenchmarkId::new("release_many_owner", owned), |b| {
+            b.iter_custom(|iterations| {
+                let mut elapsed = std::time::Duration::ZERO;
+                'iterations: for _ in 0..iterations {
+                    let start = std::time::Instant::now();
+                    let released = black_box(table.release_owned_by(black_box(owner)));
+                    elapsed += start.elapsed();
+                    if released != owned {
+                        failure.record(anyhow!(
+                            "multi-handle owner cleanup released {released} of {owned} handles"
+                        ));
+                        break;
+                    }
+                    for _ in 0..owned {
+                        if let Err(error) = table.insert(target.clone()) {
+                            failure.record(anyhow!(error));
+                            break 'iterations;
+                        }
+                    }
+                }
+                elapsed
+            });
+        });
+    }
 
     group.finish();
     failure.finish()
@@ -553,11 +840,16 @@ fn bench_dataplane(c: &mut Criterion) -> anyhow::Result<()> {
             let out = rt.block_on(plane.execute(
                 black_box(&op),
                 InvocationOptions {
+                    caller_identity: None,
                     now_millis: FIXED_OPEN_MILLIS,
                     record: false,
                 },
             ));
-            black_box(out.outcome);
+            if let Some(error) = out.completion_error {
+                failure.record(anyhow!("data plane completion failed: {error}"));
+                return;
+            }
+            black_box(out.output.outcome);
         });
     });
 
@@ -573,11 +865,16 @@ fn bench_dataplane(c: &mut Criterion) -> anyhow::Result<()> {
             let out = rt.block_on(plane.execute(
                 black_box(&op),
                 InvocationOptions {
+                    caller_identity: None,
                     now_millis: FIXED_OPEN_MILLIS,
                     record: false,
                 },
             ));
-            black_box(out.outcome);
+            if let Some(error) = out.completion_error {
+                failure.record(anyhow!("data plane completion failed: {error}"));
+                return;
+            }
+            black_box(out.output.outcome);
         });
     });
 
@@ -593,11 +890,16 @@ fn bench_dataplane(c: &mut Criterion) -> anyhow::Result<()> {
             let out = rt.block_on(plane.execute(
                 black_box(&op),
                 InvocationOptions {
+                    caller_identity: None,
                     now_millis: FIXED_OPEN_MILLIS,
                     record: false,
                 },
             ));
-            black_box(out.outcome);
+            if let Some(error) = out.completion_error {
+                failure.record(anyhow!("data plane completion failed: {error}"));
+                return;
+            }
+            black_box(out.output.outcome);
         });
     });
 
@@ -618,11 +920,16 @@ fn bench_dataplane(c: &mut Criterion) -> anyhow::Result<()> {
             let out = rt.block_on(plane.execute(
                 black_box(&op),
                 InvocationOptions {
+                    caller_identity: None,
                     now_millis: FIXED_OPEN_MILLIS,
                     record: true,
                 },
             ));
-            black_box(out.outcome);
+            if let Some(error) = out.completion_error {
+                failure.record(anyhow!("data plane completion failed: {error}"));
+                return;
+            }
+            black_box(out.output.outcome);
         });
     });
 
@@ -637,25 +944,76 @@ fn bench_dataplane(c: &mut Criterion) -> anyhow::Result<()> {
         let first = rt.block_on(plane.execute(
             &op,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: FIXED_OPEN_MILLIS,
                 record: false,
             },
         ));
-        if !first.outcome.is_success() {
-            failure.record(anyhow!("first idempotent run failed: {:?}", first.outcome));
+        if first.completion_error.is_some() || !first.output.outcome.is_success() {
+            failure.record(anyhow!("first idempotent run failed: {first:?}"));
             return;
         }
         b.iter(|| {
             let out = rt.block_on(plane.execute(
                 black_box(&op),
                 InvocationOptions {
+                    caller_identity: None,
                     now_millis: FIXED_OPEN_MILLIS,
                     record: false,
                 },
             ));
-            black_box(out.outcome);
+            if let Some(error) = out.completion_error {
+                failure.record(anyhow!("data plane completion failed: {error}"));
+                return;
+            }
+            black_box(out.output.outcome);
         });
     });
+
+    for source_count in [1, 64] {
+        group.bench_function(
+            BenchmarkId::new("execute_idempotent_effect_sourced_hit", source_count),
+            |bencher| {
+                let Some((plane, mut operation)) =
+                    capture_result(&failure, idempotent_dataplane_fixture())
+                else {
+                    return;
+                };
+                let sources = TaintSet::from_recorded_sources(
+                    (0..source_count)
+                        .map(|index| xolotl_types::TaintSource::Fetched {
+                            host: format!("cache-source-{index}").into(),
+                        })
+                        .collect(),
+                );
+                operation.taint = sources.clone();
+                let options = InvocationOptions {
+                    caller_identity: None,
+                    now_millis: FIXED_OPEN_MILLIS,
+                    record: false,
+                };
+                let first = rt.block_on(plane.execute(&operation, options));
+                if first.completion_error.is_some() || !first.output.outcome.is_success() {
+                    failure.record(anyhow!("cache seeding failed: {first:?}"));
+                    return;
+                }
+                operation.taint = TaintSet::pristine();
+                bencher.iter(|| {
+                    let result = rt.block_on(plane.execute(black_box(&operation), options));
+                    capture_condition(
+                        &failure,
+                        result.completion_error.is_none()
+                            && result.output.outcome.is_success()
+                            && result.output.origin
+                                == xolotl_types::CompletionOrigin::CachedOutcome
+                            && result.output.taint == sources,
+                        "cached hit lost observed sources",
+                    );
+                    drop(black_box(result));
+                });
+            },
+        );
+    }
 
     group.bench_function("execute_collect_stream_32_chunks", |b| {
         let (plane, base_op) = match collect_dataplane_fixture(32) {
@@ -673,11 +1031,16 @@ fn bench_dataplane(c: &mut Criterion) -> anyhow::Result<()> {
             let out = rt.block_on(plane.execute(
                 black_box(&op),
                 InvocationOptions {
+                    caller_identity: None,
                     now_millis: FIXED_OPEN_MILLIS,
                     record: false,
                 },
             ));
-            black_box(out.outcome);
+            if let Some(error) = out.completion_error {
+                failure.record(anyhow!("data plane completion failed: {error}"));
+                return;
+            }
+            black_box(out.output.outcome);
         });
     });
 
@@ -720,6 +1083,7 @@ async fn run_concurrent_echo(
                 .execute(
                     &op,
                     InvocationOptions {
+                        caller_identity: None,
                         now_millis: FIXED_OPEN_MILLIS,
                         record: false,
                     },
@@ -731,7 +1095,12 @@ async fn run_concurrent_echo(
         let out = task
             .await
             .context("concurrent dataplane task did not join")?;
-        match out.outcome {
+        ensure!(
+            out.completion_error.is_none(),
+            "data plane completion failed: {:?}",
+            out.completion_error
+        );
+        match out.output.outcome {
             Outcome::Done(value) => {
                 black_box(value);
             }
@@ -742,29 +1111,55 @@ async fn run_concurrent_echo(
 }
 
 fn bench_fact_sink(c: &mut Criterion) -> anyhow::Result<()> {
+    const FACTS_PER_BATCH: usize = 64;
     let mut group = c.benchmark_group("kernel/fact_sink");
+    group.throughput(criterion::Throughput::Elements(FACTS_PER_BATCH as u64));
     let failure = BenchFailure::default();
 
-    group.bench_function("in_memory_non_idempotent_begin_complete", |b| {
-        let (sink, _) = xolotl_kernel::FactSink::in_memory();
-        let process = ProcessId::new(1);
-        let mut node = 0u32;
-        b.iter(|| {
-            node = node.wrapping_add(1);
-            if let Err(err) = sink
-                .begin(fact(process, node, false))
-                .context("begin fact failed")
-            {
-                failure.record(err);
-            }
-            if let Err(err) = sink
-                .complete(fact(process, node, true))
-                .context("complete fact failed")
-            {
-                failure.record(err);
-            }
+    for subscribed in [false, true] {
+        let name = if subscribed {
+            "in_memory_begin_complete_subscribed_64"
+        } else {
+            "in_memory_begin_complete_unsubscribed_64"
+        };
+        group.bench_function(name, |b| {
+            b.iter_custom(|iterations| {
+                let mut elapsed = std::time::Duration::ZERO;
+                for _ in 0..iterations {
+                    let (sink, store) = xolotl_kernel::FactSink::in_memory();
+                    let _subscription = subscribed.then(|| store.subscribe_facts());
+                    let process = ProcessId::new(1);
+                    let facts: Vec<_> = (0..FACTS_PER_BATCH)
+                        .map(|node| {
+                            let completed = fact(process, node as u32, true);
+                            let mut pending = completed.clone();
+                            pending.outcome = None;
+                            (pending, completed)
+                        })
+                        .collect();
+                    let start = std::time::Instant::now();
+                    let mut result = Ok(());
+                    for (pending, completed) in facts {
+                        result = sink.begin(pending).and_then(|()| sink.complete(completed));
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                    elapsed += start.elapsed();
+                    if let Err(error) = result.context("Fact begin/complete failed") {
+                        failure.record(error);
+                        break;
+                    }
+                    capture_condition(
+                        &failure,
+                        store.len() == FACTS_PER_BATCH,
+                        "fact batch did not retain 64 records",
+                    );
+                }
+                elapsed
+            });
         });
-    });
+    }
 
     group.finish();
     failure.finish()
@@ -913,6 +1308,7 @@ fn bench_request_spawn(c: &mut Criterion) -> anyhow::Result<()> {
         "perform://effect/deliberation/run",
     ];
 
+    let runtime = runtime()?;
     let mut group = c.benchmark_group("request_spawn");
     let failure = BenchFailure::default();
     for &k in &[1usize, 4, 16] {
@@ -920,7 +1316,18 @@ fn bench_request_spawn(c: &mut Criterion) -> anyhow::Result<()> {
             .iter()
             .map(|literal| RequestGrantTemplate {
                 literal,
-                methods: MethodBitmap::method(0),
+                rights: xolotl_types::GrantRights::new(
+                    xolotl_types::GrantMethods::name(if literal.starts_with("perform://") {
+                        "invoke"
+                    } else if literal.starts_with("subscribe://") {
+                        "subscribe"
+                    } else if literal.starts_with("write://") {
+                        "write"
+                    } else {
+                        "read"
+                    }),
+                    xolotl_types::RightFlags::empty(),
+                ),
             })
             .collect();
         group.bench_function(format!("request_grants_{k}"), |b| {
@@ -930,7 +1337,7 @@ fn bench_request_spawn(c: &mut Criterion) -> anyhow::Result<()> {
                     if let Some(child) = capture_result(
                         &failure,
                         boot.spawn_request_process_under_with_request_grants(
-                            boot.root,
+                            boot.root(),
                             IdentityRef::ROOT,
                             black_box(&grants),
                         )
@@ -943,6 +1350,34 @@ fn bench_request_spawn(c: &mut Criterion) -> anyhow::Result<()> {
             );
         });
     }
+    group.bench_function("sequential_retirement_capacity_2", |bencher| {
+        let boot = Bootstrap::from_kernel(
+            KernelBuilder::new(xolotl_state::InMemoryBackend::new().into_backend())
+                .with_process_capacity(std::num::NonZeroUsize::MIN.saturating_add(1))
+                .build(),
+        );
+        let completed = xolotl_types::ExecutionOutput::new(
+            Outcome::Done(Value::integer(37)),
+            TaintSet::pristine(),
+        );
+        let mut previous = None;
+        bencher.iter(|| {
+            let result = runtime.block_on(async {
+                let request = boot.request_under(boot.root(), IdentityRef::ROOT, &[])?;
+                if let Some(previous) = previous {
+                    ensure!(boot.kernel().processes().status(previous).is_none());
+                }
+                previous = Some(request.id());
+                let report = request.finish(black_box(&completed)).await?;
+                ensure!(report.status == xolotl_types::ProcessStatus::Completed);
+                ensure!(boot.kernel().processes().len() == 2);
+                Ok(report)
+            });
+            if let Some(report) = capture_result(&failure, result) {
+                drop(black_box(report));
+            }
+        });
+    });
     group.finish();
     failure.finish()
 }
@@ -954,22 +1389,27 @@ fn bench_process_reaping(c: &mut Criterion) -> anyhow::Result<()> {
     let mut group = c.benchmark_group("process_reaping");
     group.throughput(criterion::Throughput::Elements(BATCH as u64));
     for live in [64usize, 4096, 65_536] {
-        let mut boot = Bootstrap::in_memory();
+        let state = xolotl_state::InMemoryBackend::with_options(xolotl_state::InMemoryOptions {
+            history: xolotl_state::MemoryHistory::Disabled,
+            ..Default::default()
+        })?
+        .into_backend();
+        let boot = Bootstrap::from_kernel(KernelBuilder::new(state).build());
         for _ in 0..live {
-            boot.request_under(boot.root, IdentityRef::ROOT, &[])?
+            boot.request_under(boot.root(), IdentityRef::ROOT, &[])?
                 .detach();
         }
         group.bench_function(BenchmarkId::new("batch_64", live), |b| {
             b.iter_custom(|iterations| {
                 let mut elapsed = std::time::Duration::ZERO;
                 for _ in 0..iterations {
-                    // Bound benchmark history between batches, while retaining the
-                    // same process table and identity source. Only reaping is timed.
-                    boot.kernel.facts = xolotl_kernel::FactSink::in_memory().0;
-                    boot.kernel.state = xolotl_state::InMemoryBackend::new().into_backend();
+                    // The installed ports and namespace are fixed for all samples.
+                    // Preparation and explicit retention cleanup are not timed.
                     let prepared: anyhow::Result<()> = runtime.block_on(async {
                         for _ in 0..BATCH {
-                            boot.request_under(boot.root, IdentityRef::ROOT, &[])?
+                            let request =
+                                boot.request_under(boot.root(), IdentityRef::ROOT, &[])?;
+                            request
                                 .finish(&xolotl_types::ExecutionOutput::new(
                                     Outcome::Done(Value::null()),
                                     xolotl_types::TaintSet::pristine(),
@@ -982,7 +1422,7 @@ fn bench_process_reaping(c: &mut Criterion) -> anyhow::Result<()> {
                         break;
                     }
                     let start = std::time::Instant::now();
-                    let reaped = black_box(boot.kernel.processes.reap_finalized(BATCH));
+                    let reaped = black_box(boot.kernel().processes().reap_finalized(BATCH));
                     elapsed += start.elapsed();
                     capture_condition(&failure, reaped == BATCH, "reaping missed completed leaves");
                 }
@@ -1001,7 +1441,7 @@ fn bench_prepared_program(c: &mut Criterion) -> anyhow::Result<()> {
 
     let runtime = Builder::new_current_thread().enable_all().build()?;
     let boot = Bootstrap::in_memory();
-    let executor = boot.kernel.executor_for(boot.root);
+    let executor = boot.kernel().executor_for(boot.root());
     let failure = BenchFailure::default();
     let mut group = c.benchmark_group("kernel/prepared");
     for (name, body, expected) in [
@@ -1078,7 +1518,7 @@ fn bench_payload_program(c: &mut Criterion) -> anyhow::Result<()> {
 
     let runtime = Builder::new_current_thread().enable_all().build()?;
     let boot = Bootstrap::in_memory();
-    let executor = boot.kernel.executor_for(boot.root);
+    let executor = boot.kernel().executor_for(boot.root());
     let failure = BenchFailure::default();
     let mut group = c.benchmark_group("kernel/payload");
     for size in [64 * 1024, 1024 * 1024] {
@@ -1142,7 +1582,7 @@ fn bench_native_admission(c: &mut Criterion) -> anyhow::Result<()> {
 
     let runtime = Builder::new_current_thread().enable_all().build()?;
     let boot = Bootstrap::in_memory();
-    let executor = boot.kernel.executor_for(boot.root);
+    let executor = boot.kernel().executor_for(boot.root());
     let failure = BenchFailure::default();
     let mut group = c.benchmark_group("kernel/native");
     for depth in [1, 64] {
@@ -1190,6 +1630,50 @@ fn bench_native_admission(c: &mut Criterion) -> anyhow::Result<()> {
             )?;
         }
     }
+    let lexical_boot = Bootstrap::from_kernel(
+        KernelBuilder::in_memory()
+            .with_execution_config(ExecutionConfig {
+                bindings_per_task: 1,
+                ..Default::default()
+            })
+            .build(),
+    );
+    let lexical_executor = lexical_boot.kernel().executor_for(lexical_boot.root());
+    for count in [1, 64] {
+        let local = |value| {
+            DoNode::r#let(
+                "local",
+                DoNode::pure(Value::integer(value)),
+                DoNode::use_("local"),
+            )
+        };
+        let body = (1..count).fold(local(0), |body, value| body.finally(local(value)));
+        let graph = compile_do(&body)?;
+        let mut buffers = ExecutionBuffers::default();
+        group.bench_function(
+            BenchmarkId::new("lexical_finally_reused", count),
+            |bencher| {
+                bencher.iter(|| {
+                    let output = runtime.block_on(
+                        lexical_executor.eval_graph_with_buffers(black_box(&graph), &mut buffers),
+                    );
+                    capture_condition(
+                        &failure,
+                        output.outcome == Outcome::Done(Value::integer(0)),
+                        "lexical binding output mismatch",
+                    );
+                    black_box(output);
+                });
+            },
+        );
+        if buffers.retained_bytes() != 0 {
+            writeln!(
+                std::io::stdout().lock(),
+                "native lexical scopes {count}: 1 binding slot; {} B retained execution containers (excluding code and payloads)",
+                buffers.retained_bytes()
+            )?;
+        }
+    }
     group.finish();
     failure.finish()
 }
@@ -1201,7 +1685,7 @@ fn bench_native_steps(c: &mut Criterion) -> anyhow::Result<()> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
     let boot = Bootstrap::in_memory();
     let actor = runtime.block_on(boot.spawn_actor_under_with_steps(
-        boot.root,
+        boot.root(),
         IdentityRef::ROOT,
         "root",
         &ActorSpec {
@@ -1216,7 +1700,7 @@ fn bench_native_steps(c: &mut Criterion) -> anyhow::Result<()> {
             }),
         })?,
     ))?;
-    let executor = boot.kernel.executor_for(actor.process);
+    let executor = boot.kernel().executor_for(actor.process);
     let failure = BenchFailure::default();
     let mut group = c.benchmark_group("kernel/native_steps");
     for depth in [1, 64] {
@@ -1268,6 +1752,8 @@ fn bench_execution_ids(c: &mut Criterion) -> anyhow::Result<()> {
 fn main() -> anyhow::Result<()> {
     let mut criterion = Criterion::default().configure_from_args();
     bench_open(&mut criterion).context("kernel/open benchmarks failed")?;
+    bench_resource_resolution(&mut criterion).context("resource resolution benchmarks failed")?;
+    bench_executor_prepare(&mut criterion).context("executor prepare benchmarks failed")?;
     bench_handle_table(&mut criterion).context("kernel/handle_table benchmarks failed")?;
     bench_dataplane(&mut criterion).context("kernel/dataplane benchmarks failed")?;
     bench_fact_sink(&mut criterion).context("kernel/fact_sink benchmarks failed")?;

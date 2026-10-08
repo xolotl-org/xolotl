@@ -1,6 +1,7 @@
 //! Owned incremental ingress and publication of profile-bound object receipts.
 
 use parking_lot::RwLock;
+use sha2::{Digest as _, Sha384};
 use std::sync::Arc;
 use xolotl_kernel::Bootstrap;
 use xolotl_state::host::object::ObjectStore;
@@ -8,15 +9,16 @@ use xolotl_state::object::{UploadId, UploadOptions};
 use xolotl_types::{BlobRef, DType, FrameKind, TaintSet, TaintSource, Value, ValueView};
 
 use super::ticket::{
-    StoredTicket, validate_media_type_pattern, validate_upload_ticket_media_type,
-    validate_upload_ticket_scope, validate_upload_ticket_values,
+    StoredTicket, new_append_id, validate_item_shape, validate_media_type_pattern,
+    validate_media_type_pattern_if_present, validate_ticket_inline_bytes,
+    validate_upload_ticket_media_type, validate_upload_ticket_scope, validate_upload_ticket_values,
 };
 use super::{
     CommitObjectUploadResponse, UPLOAD_CHUNK_BYTES, committed_object_provenance, object_store_error,
 };
 use crate::{
     GatewayError, GatewayRuntime, GatewayRuntimeState, GatewaySession, normalize_optional_string,
-    now_millis, validate_current_session, validate_submission_token,
+    validate_current_session, validate_submission_token,
 };
 
 /// Metadata admitting incremental input against an issued upload ticket.
@@ -29,6 +31,10 @@ pub struct BeginObjectUploadRequest {
     pub media_type: Option<String>,
     /// Optional submission token that must match a token-bound ticket.
     pub submission_token: Option<String>,
+    /// Expected size for this upload, independent of other ticket members.
+    pub expected_size: Option<u64>,
+    /// Expected lowercase SHA-384 digest for this upload.
+    pub expected_digest: Option<String>,
 }
 
 /// Interpretation supplied at end-of-input, without a caller-generated content reference.
@@ -66,7 +72,7 @@ impl GatewayObjectKind {
 
 struct UploadBody {
     lease: UploadId,
-    hasher: blake3::Hasher,
+    hasher: Sha384,
     size: u64,
 }
 
@@ -91,6 +97,8 @@ pub struct GatewayObjectUpload {
     stored: StoredTicket,
     submission_token: Option<String>,
     media_type: Option<String>,
+    expected_size: Option<u64>,
+    expected_digest: Option<String>,
     taint: TaintSet,
     body: Option<UploadBody>,
 }
@@ -122,12 +130,7 @@ impl GatewayObjectUpload {
             .and_then(|length| body.size.checked_add(length))
             .filter(|size| *size <= i64::MAX as u64)
             .ok_or_else(|| GatewayError::Rejected("object upload size is out of range".into()))?;
-        if self
-            .stored
-            .ticket
-            .expected_size
-            .is_some_and(|expected| size > expected)
-        {
+        if self.expected_size.is_some_and(|expected| size > expected) {
             return Err(GatewayError::Rejected("upload ticket size mismatch".into()));
         }
         let next = self
@@ -155,7 +158,7 @@ impl GatewayObjectUpload {
         kind: GatewayObjectKind,
     ) -> Result<CommitObjectUploadResponse, GatewayError> {
         let body = self.body.take().ok_or_else(closed_upload)?;
-        let digest = body.hasher.finalize().to_hex().to_string();
+        let digest = BlobRef::sha384_hex(&body.hasher.finalize().into());
         let size = body.size;
         let mut item = kind.into_value(BlobRef {
             hash: digest.clone(),
@@ -163,6 +166,19 @@ impl GatewayObjectUpload {
             mime: self.media_type.clone(),
         });
         self.validate(Some(&item))?;
+        if self.expected_size.is_some_and(|expected| expected != size)
+            || self
+                .expected_digest
+                .as_deref()
+                .is_some_and(|expected| expected != digest)
+        {
+            return Err(GatewayError::Rejected(
+                "upload content does not match per-upload binding".into(),
+            ));
+        }
+        validate_item_shape(&item)?;
+        validate_ticket_inline_bytes(&item)?;
+        let append_id = new_append_id()?;
         let metadata = self
             .objects
             .commit_upload(&body.lease, &TaintSet::pristine())
@@ -178,13 +194,29 @@ impl GatewayObjectUpload {
                 "committed object metadata lost upload provenance".into(),
             ));
         }
+        validate_media_type_pattern_if_present(metadata.blob.mime.as_deref())?;
         replace_backing_blob(&mut item, metadata.blob)?;
         self.validate(Some(&item))?;
-        self.stored.ticket.expected_size = Some(size);
-        self.stored.ticket.expected_digest = Some(digest.clone());
-        self.stored.ticket.committed = true;
         let provenance = committed_object_provenance(&self.stored.ticket.ticket_id);
-        self.stored.save(&self.boot.kernel.state).await?;
+        let profile = self.runtime_state.read().profile.clone();
+        let surface = profile
+            .surface_by_id(&self.stored.ticket.surface_id)
+            .ok_or_else(|| {
+                GatewayError::Rejected("upload ticket surface is no longer available".into())
+            })?;
+        self.stored
+            .append(
+                super::ticket::TicketContext {
+                    state: self.boot.kernel().state(),
+                    runtime: self.boot.kernel().host_runtime(),
+                },
+                &append_id,
+                &item,
+                &self.session,
+                surface,
+                self.submission_token.as_deref(),
+            )
+            .await?;
         Ok(CommitObjectUploadResponse {
             item,
             provenance,
@@ -227,7 +259,7 @@ impl GatewayObjectUpload {
                 &self.session,
                 surface,
                 self.submission_token.as_deref(),
-                now_millis(),
+                self.boot.kernel().host_runtime().now_millis(),
             )
         } else {
             validate_upload_ticket_scope(
@@ -236,7 +268,7 @@ impl GatewayObjectUpload {
                 &self.session,
                 surface,
                 self.submission_token.as_deref(),
-                now_millis(),
+                self.boot.kernel().host_runtime().now_millis(),
             )?;
             validate_upload_ticket_media_type(ticket, self.media_type.as_deref())
         }
@@ -267,12 +299,21 @@ impl GatewayRuntime {
         if let Some(mime) = media_type.as_deref() {
             validate_media_type_pattern(mime)?;
         }
-        let stored = StoredTicket::load(&self.boot.kernel.state, &request.ticket_id).await?;
-        if stored.ticket.committed {
+        let stored = StoredTicket::load(self.boot.kernel().state(), &request.ticket_id).await?;
+        if request
+            .expected_size
+            .is_some_and(|size| size > i64::MAX as u64)
+        {
             return Err(GatewayError::Rejected(
-                "upload ticket was already committed".into(),
+                "object upload expected_size is out of range".into(),
             ));
         }
+        let expected_digest = normalize_optional_string(request.expected_digest);
+        if let Some(digest) = expected_digest.as_deref() {
+            crate::validate_content_hash(digest)?;
+        }
+        let expected_size = request.expected_size.or(stored.ticket.expected_size);
+        let expected_digest = expected_digest.or_else(|| stored.ticket.expected_digest.clone());
         let mut upload = GatewayObjectUpload {
             boot: Arc::clone(&self.boot),
             objects: self.objects.clone(),
@@ -281,6 +322,8 @@ impl GatewayRuntime {
             stored,
             submission_token,
             media_type,
+            expected_size,
+            expected_digest,
             taint: TaintSet::of(TaintSource::Inbound {
                 source: source.into(),
                 channel: "object-upload".into(),
@@ -291,7 +334,7 @@ impl GatewayRuntime {
         let lease = upload
             .objects
             .begin_upload(UploadOptions {
-                expected_size: upload.stored.ticket.expected_size,
+                expected_size: upload.expected_size,
                 mime: upload.media_type.clone(),
                 taint: upload.taint.clone(),
             })
@@ -299,7 +342,7 @@ impl GatewayRuntime {
             .map_err(object_store_error)?;
         upload.body = Some(UploadBody {
             lease,
-            hasher: blake3::Hasher::new(),
+            hasher: Sha384::new(),
             size: 0,
         });
         upload.validate(None)?;

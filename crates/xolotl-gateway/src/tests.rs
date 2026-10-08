@@ -1,24 +1,44 @@
 use super::*;
 use crate::external::{
-    EnvelopeAad, ExternalFrameError, SecureEnvelope, external_role_slug,
-    secure_external_inner_frame_type, validate_secure_external_envelope_context,
+    EndpointSession, EnvelopeAad, ExternalFrameError, SecureEnvelope,
+    authenticated_external_inbound_frame_from_pb, secure_external_envelope_from_pb,
+    secure_external_envelope_to_pb, secure_external_inner_frame_type,
+    secure_external_outbound_frame_type, validate_secure_external_envelope_context,
+    validate_secure_external_envelope_session,
 };
 use anyhow::{Context, bail, ensure};
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use xolotl_proto::xolotl::v1::external as external_pb;
-use xolotl_types::external::{Role as ExternalRole, SessionContext as ExternalSessionContext};
+use xolotl_types::external::{
+    ObservedGenerations, Role as ExternalRole, RoleSessionClientHello,
+    SessionContext as ExternalSessionContext,
+};
 
 mod authority;
 mod output;
 mod surfaces;
 
-pub(super) const TEST_TOKEN: &str = "test-token-for-alice-0001";
+pub(super) const TEST_TOKEN: &str = "test-token-for-alice-0001-32-bytes";
+
+pub(super) fn test_request_scope(
+    gateway: &GatewayRuntime,
+    session: &GatewaySession,
+    surface_id: &str,
+) -> anyhow::Result<String> {
+    gateway
+        .describe(session)?
+        .surfaces
+        .into_iter()
+        .find(|surface| surface.surface_id == surface_id)
+        .map(|surface| surface.request_scope)
+        .context("test surface must be visible")
+}
 
 #[test]
 fn submission_hash_preserves_value_types_and_float_bits() -> anyhow::Result<()> {
     let blob = xolotl_types::BlobRef {
-        hash: "0123456789abcdef".repeat(4),
+        hash: "0123456789abcdef".repeat(6),
         size: 64,
         mime: None,
     };
@@ -78,6 +98,12 @@ fn submission_hash_preserves_value_types_and_float_bits() -> anyhow::Result<()> 
 #[test]
 fn secure_external_frame_types_are_canonical() -> anyhow::Result<()> {
     ensure!(
+        secure_external_inner_frame_type(&external_pb::external_frame::Frame::RoleReady(
+            external_pb::RoleReady::default()
+        ))? == "role_ready",
+        "unexpected authenticated ready frame type"
+    );
+    ensure!(
         secure_external_inner_frame_type(&external_pb::external_frame::Frame::InboundEvent(
             external_pb::InboundEvent::default()
         ))? == "inbound_event",
@@ -105,18 +131,36 @@ fn secure_external_frame_types_are_canonical() -> anyhow::Result<()> {
         ))? == "control.config_ack",
         "unexpected control frame type"
     );
+    ensure!(
+        secure_external_outbound_frame_type(&external_pb::external_frame::Frame::Invoke(
+            external_pb::Invoke::default()
+        ))? == "invoke"
+    );
+    ensure!(matches!(
+        secure_external_outbound_frame_type(&external_pb::external_frame::Frame::RoleReady(
+            external_pb::RoleReady::default()
+        )),
+        Err(ExternalFrameError::ExternalFrameDirectionRejected)
+    ));
     Ok(())
 }
 
 #[test]
-fn gateway_state_paths_are_structural() -> anyhow::Result<()> {
+fn authenticated_external_parser_rejects_wrong_direction() -> anyhow::Result<()> {
+    let frame = external_pb::external_frame::Frame::Invoke(external_pb::Invoke::default());
+    ensure!(matches!(
+        authenticated_external_inbound_frame_from_pb(frame),
+        Err(ExternalFrameError::SecureEnvelopePayloadRejected)
+    ));
+    Ok(())
+}
+
+#[test]
+fn gateway_request_keys_are_structural() -> anyhow::Result<()> {
     let hash = "a".repeat(64);
+    crate::GatewayIdempotencyRecord::validate_key(&hash)?;
     ensure!(
-        idempotency_path(&hash)?.to_string() == format!("state://gateway/idempotency/{hash}"),
-        "unexpected idempotency path"
-    );
-    ensure!(
-        idempotency_path(&format!("{hash}/tail")).is_err(),
+        crate::GatewayIdempotencyRecord::validate_key(&format!("{hash}/tail")).is_err(),
         "idempotency hash with path delimiter was accepted"
     );
     Ok(())
@@ -136,25 +180,110 @@ fn secure_external_envelope_context_must_match_session() -> anyhow::Result<()> {
         presentation_config_generation: 6,
         alias_catalog_generation: 7,
         session_id: "session".into(),
+        installation_epoch: 1,
+        scope_epoch: 2,
+        key_epoch: 1,
     };
+    let hello = RoleSessionClientHello {
+        installation_id: context.installation_id.clone(),
+        projection_id: context.projection_id.clone(),
+        role: context.role,
+        registry_hash: context.registry_hash.clone(),
+        observed: ObservedGenerations {
+            presentation_config_generation: context.presentation_config_generation,
+            alias_catalog_generation: context.alias_catalog_generation,
+        },
+        config_schema: None,
+    };
+    let mut session = EndpointSession::new();
+    session.on_hello(&hello, |_| context.clone())?;
+    let transcript = *session.transcript_hash().context("session transcript")?;
     let envelope = SecureEnvelope::from_parts(
         context.installation_id.clone(),
         context.credential_generation,
         EnvelopeAad {
             version: 1,
             projection_id: context.projection_id.clone(),
-            role: external_role_slug(context.role).into(),
+            role: context.role.as_str().into(),
             session_id: context.session_id.clone(),
             frame_type: "inbound_event".into(),
             binding_generation: context.binding_generation,
             credential_generation: context.credential_generation,
-            transcript_hash: vec![0; 32],
+            transcript_hash: transcript.to_vec(),
+            direction: "client_to_daemon".into(),
+            key_epoch: context.key_epoch,
             ..EnvelopeAad::default()
         },
         [0; 12],
         Vec::new(),
     );
     validate_secure_external_envelope_context(&envelope, &context)?;
+    validate_secure_external_envelope_session(&envelope, &session)?;
+    let wire = secure_external_envelope_to_pb(envelope.clone());
+    let round_trip = secure_external_envelope_from_pb(wire)?;
+    ensure!(round_trip == envelope);
+    for key_epoch in [0, 2] {
+        let mut wire = secure_external_envelope_to_pb(envelope.clone());
+        let Some(aad) = wire.aad.as_mut() else {
+            bail!("encoded envelope has no AAD");
+        };
+        aad.key_epoch = key_epoch;
+        let changed = secure_external_envelope_from_pb(wire)?;
+        ensure!(matches!(
+            validate_secure_external_envelope_session(&changed, &session),
+            Err(ExternalFrameError::SecureEnvelopeContextRejected)
+        ));
+    }
+
+    let mut changed_transcript = transcript.to_vec();
+    changed_transcript[0] ^= 1;
+    let changed_envelope = SecureEnvelope::from_parts(
+        context.installation_id.clone(),
+        context.credential_generation,
+        EnvelopeAad {
+            version: 1,
+            projection_id: context.projection_id.clone(),
+            role: context.role.as_str().into(),
+            session_id: context.session_id.clone(),
+            frame_type: "inbound_event".into(),
+            binding_generation: context.binding_generation,
+            credential_generation: context.credential_generation,
+            transcript_hash: changed_transcript,
+            direction: "client_to_daemon".into(),
+            key_epoch: context.key_epoch,
+            ..EnvelopeAad::default()
+        },
+        [0; 12],
+        Vec::new(),
+    );
+    ensure!(matches!(
+        validate_secure_external_envelope_session(&changed_envelope, &session),
+        Err(ExternalFrameError::SecureEnvelopeContextRejected)
+    ));
+
+    let reflected_envelope = SecureEnvelope::from_parts(
+        context.installation_id.clone(),
+        context.credential_generation,
+        EnvelopeAad {
+            version: 1,
+            projection_id: context.projection_id.clone(),
+            role: context.role.as_str().into(),
+            session_id: context.session_id.clone(),
+            frame_type: "control.heartbeat".into(),
+            binding_generation: context.binding_generation,
+            credential_generation: context.credential_generation,
+            transcript_hash: transcript.to_vec(),
+            direction: "daemon_to_client".into(),
+            key_epoch: context.key_epoch,
+            ..EnvelopeAad::default()
+        },
+        [0; 12],
+        Vec::new(),
+    );
+    ensure!(matches!(
+        validate_secure_external_envelope_session(&reflected_envelope, &session),
+        Err(ExternalFrameError::SecureEnvelopeContextRejected)
+    ));
 
     let rejected_envelope = SecureEnvelope::from_parts(
         context.installation_id.clone(),
@@ -168,6 +297,8 @@ fn secure_external_envelope_context_must_match_session() -> anyhow::Result<()> {
             binding_generation: context.binding_generation,
             credential_generation: context.credential_generation,
             transcript_hash: vec![0; 32],
+            direction: "client_to_daemon".into(),
+            key_epoch: context.key_epoch,
             ..EnvelopeAad::default()
         },
         [0; 12],
@@ -231,18 +362,18 @@ fn identity_profile() -> anyhow::Result<GatewayProfile> {
         "cred-alice",
         "alice",
         TEST_TOKEN,
-        "process://alice",
+        "identity://alice",
     )?)
 }
 
 fn client_certificate_profile() -> GatewayProfile {
     GatewayProfile::new("gateway-test")
-        .with_credential(GatewayCredential::client_certificate_der_sha256(
+        .with_credential(GatewayCredential::client_certificate_der_sha384(
             "cert-alice",
             "alice",
-            ClientCertificateDerSha256::from_der(b"alice-client-cert-der"),
+            ClientCertificateDerSha384::from_der(b"alice-client-cert-der"),
         ))
-        .with_identity_mapping(GatewayIdentityMapping::new("alice", "process://alice"))
+        .with_identity_mapping(GatewayIdentityMapping::new("alice", "identity://alice"))
 }
 
 #[test]
@@ -317,7 +448,11 @@ fn profile_rejects_duplicate_registered_origins() -> anyhow::Result<()> {
     let profile = GatewayProfile::new("gateway-test")
         .with_registered_origin("https://app.example.com")?
         .with_registered_origin("https://APP.example.com:443")?;
-    let err = match GatewayRuntime::new(Arc::new(Bootstrap::in_memory()), profile) {
+    let err = match GatewayRuntime::new(
+        Arc::new(Bootstrap::in_memory()),
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    ) {
         Ok(_) => bail!("duplicate origin should fail"),
         Err(err) => err,
     };
@@ -333,7 +468,11 @@ fn profile_rejects_duplicate_registered_hosts() -> anyhow::Result<()> {
     let profile = GatewayProfile::new("gateway-test")
         .with_registered_host("api.example.com")?
         .with_registered_host("API.example.com")?;
-    let err = match GatewayRuntime::new(Arc::new(Bootstrap::in_memory()), profile) {
+    let err = match GatewayRuntime::new(
+        Arc::new(Bootstrap::in_memory()),
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    ) {
         Ok(_) => bail!("duplicate host should fail"),
         Err(err) => err,
     };
@@ -371,7 +510,14 @@ pub(super) fn direct_input_with_provenance(
     payload: Value,
     provenance: GatewayPayloadProvenance,
 ) -> GatewaySubmission {
-    GatewaySubmission::direct_input(surface_id, payload).with_provenance(provenance)
+    static NEXT_OBJECT_KEY: AtomicUsize = AtomicUsize::new(1);
+    let key = NEXT_OBJECT_KEY.fetch_add(1, Ordering::Relaxed);
+    GatewaySubmission::direct_input(surface_id, payload)
+        .with_provenance(provenance)
+        .with_options(SubmitOptions {
+            idempotency_key: Some(format!("object-test-{key}")),
+            ..SubmitOptions::default()
+        })
 }
 
 pub(super) fn direct_input_with_ticket(
@@ -436,11 +582,14 @@ fn assert_limit_contains(err: GatewayError, needle: &str) -> anyhow::Result<()> 
 
 fn restricted_anchor(boot: &Bootstrap, selector: &str) -> anyhow::Result<ProcessId> {
     boot.spawn_request_process_under_with_request_grants(
-        boot.root,
+        boot.root(),
         xolotl_types::IdentityRef::ROOT,
         &[xolotl_kernel::RequestGrantTemplate {
             literal: selector,
-            methods: xolotl_types::MethodBitmap::ALL,
+            rights: xolotl_types::GrantRights::new(
+                xolotl_types::GrantMethods::all(),
+                xolotl_types::RightFlags::empty(),
+            ),
         }],
     )
     .map_err(Into::into)
@@ -461,20 +610,19 @@ fn expect_gateway_error<T>(result: Result<T, GatewayError>) -> anyhow::Result<Ga
 }
 
 fn expect_accepted_stream(
-    start: GatewayInputStreamStart,
+    start: Box<GatewayAcceptedInputStream>,
 ) -> anyhow::Result<Box<GatewayAcceptedInputStream>> {
-    match start {
-        GatewayInputStreamStart::Accepted(stream) => Ok(stream),
-        GatewayInputStreamStart::Replay(replay) => {
-            bail!("expected fresh stream admission, got replay: {replay:?}")
-        }
-    }
+    Ok(start)
 }
 
 #[tokio::test]
 async fn unknown_bearer_is_unauthenticated() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
-    let gw = GatewayRuntime::new(boot, identity_profile()?)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        identity_profile()?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     ensure!(
         matches!(
             gw.authenticate(PresentedCredential::bearer("unknown-token-for-test"))
@@ -489,7 +637,18 @@ async fn unknown_bearer_is_unauthenticated() -> anyhow::Result<()> {
 #[tokio::test]
 async fn bearer_maps_to_profile_identity() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
-    let gw = GatewayRuntime::new(boot, identity_profile()?)?;
+    let path = Path::parse("identity://alice")?;
+    ensure!(boot.kernel().identities().lookup(&path)?.is_none());
+    let gw = GatewayRuntime::new(
+        boot.clone(),
+        identity_profile()?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
+    let registered = boot
+        .kernel()
+        .identities()
+        .lookup(&path)?
+        .context("profile identity was not registered before publication")?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -499,17 +658,22 @@ async fn bearer_maps_to_profile_identity() -> anyhow::Result<()> {
         session.principal
     );
     ensure!(
-        session.identity_path == "process://alice",
+        session.identity_path == "identity://alice",
         "unexpected identity path: {}",
         session.identity_path
     );
+    ensure!(gw.profile_snapshot().session_identity_ref(&session)? == registered);
     Ok(())
 }
 
 #[tokio::test]
 async fn client_certificate_fingerprint_maps_to_profile_identity() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
-    let gw = GatewayRuntime::new(boot, client_certificate_profile())?;
+    let gw = GatewayRuntime::new(
+        boot,
+        client_certificate_profile(),
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     ensure!(gw.is_ready(), "gateway should be ready");
     let session = gw
         .authenticate(PresentedCredential::client_certificate_der(
@@ -527,7 +691,7 @@ async fn client_certificate_fingerprint_maps_to_profile_identity() -> anyhow::Re
         session.principal.auth_method
     );
     ensure!(
-        session.identity_path == "process://alice",
+        session.identity_path == "identity://alice",
         "unexpected identity path: {}",
         session.identity_path
     );
@@ -537,7 +701,11 @@ async fn client_certificate_fingerprint_maps_to_profile_identity() -> anyhow::Re
 #[tokio::test]
 async fn unknown_client_certificate_is_unauthenticated() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
-    let gw = GatewayRuntime::new(boot, client_certificate_profile())?;
+    let gw = GatewayRuntime::new(
+        boot,
+        client_certificate_profile(),
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     ensure!(
         matches!(
             gw.authenticate(PresentedCredential::client_certificate_der(
@@ -562,6 +730,30 @@ fn public_error_messages_are_redacted() -> anyhow::Result<()> {
             .public_message()
             == "request rejected",
         "rejected public message should be redacted"
+    );
+    ensure!(
+        GatewayError::Indeterminate("private commit detail".into()).public_message()
+            == "outcome unknown; reconcile before retrying",
+        "indeterminate result must stay redacted and distinct from rejection"
+    );
+    Ok(())
+}
+
+#[test]
+fn credential_verifier_rejects_short_bearer_and_legacy_certificate_hash() -> anyhow::Result<()> {
+    ensure!(
+        BearerTokenHash::from_token(&"x".repeat(31)).is_err(),
+        "bearer material shorter than 32 bytes must be rejected"
+    );
+    ensure!(BearerTokenHash::from_token(&"x".repeat(32)).is_ok());
+    ensure!(BearerTokenHash::from_token(&"x".repeat(1025)).is_err());
+
+    let certificate = ClientCertificateDerSha384::from_der(b"certificate DER");
+    ensure!(certificate.0.len() == 96);
+    ensure!(ClientCertificateDerSha384::from_hex(certificate.0).is_ok());
+    ensure!(
+        ClientCertificateDerSha384::from_hex("0".repeat(64)).is_err(),
+        "legacy SHA-256 certificate pin must be rejected"
     );
     Ok(())
 }
@@ -607,12 +799,17 @@ async fn submit_runs_direct_input_surface() -> anyhow::Result<()> {
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
         Arc::new(xolotl_kernel::EchoDriver),
     )?;
-    let gw = GatewayRuntime::new(boot, echo_profile(name)?)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        echo_profile(name)?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -649,12 +846,75 @@ async fn submit_runs_direct_input_surface() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn pure_token_only_submission_lookup_is_unproven_without_retention_or_reexecution()
+-> anyhow::Result<()> {
+    let boot = Arc::new(Bootstrap::in_memory());
+    let count = Arc::new(AtomicUsize::new(0));
+    let name = boot.register_effect(
+        "effect://echo/say",
+        &[xolotl_kernel::MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            xolotl_types::Purity::Pure,
+            xolotl_kernel::MethodSpec::UNARY_ASYNC,
+        )],
+        Arc::new(BlockingCountingDriver {
+            count: count.clone(),
+            released: Arc::new(AtomicBool::new(true)),
+            release: Arc::new(tokio::sync::Notify::new()),
+        }),
+    )?;
+    let requests: Arc<dyn crate::GatewayIdempotencyStore> =
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default());
+    let gateway = GatewayRuntime::new(boot, echo_profile(name)?, requests.clone())?;
+    let session = gateway
+        .authenticate(PresentedCredential::bearer(TEST_TOKEN))
+        .await?;
+    let request_scope = test_request_scope(&gateway, &session, "echo")?;
+    let before = requests.usage().await?;
+    ensure!(before.records == 0);
+    let result = gateway
+        .submit(
+            &session,
+            GatewaySubmission::direct_input("echo", Value::integer(7)).with_options(
+                SubmitOptions {
+                    expected_request_scope: Some(request_scope.clone()),
+                    submission_token: Some("pure-token-only".into()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await?;
+    ensure!(result.output.outcome == Outcome::Done(Value::integer(7)));
+    ensure!(count.load(Ordering::Acquire) == 1);
+    ensure!(requests.usage().await? == before);
+    ensure!(matches!(
+        gateway
+            .lookup_request(
+                &session,
+                GatewayRequestLookup {
+                    surface_id: "echo".into(),
+                    expected_request_scope: request_scope,
+                    retry_epoch: 0,
+                    identity: GatewayRequestIdentity::SubmissionToken("pure-token-only".into()),
+                },
+            )
+            .await?,
+        GatewayRequestEvidence::Unproven
+    ));
+    ensure!(requests.usage().await? == before);
+    ensure!(count.load(Ordering::Acquire) == 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancel_requires_owner_and_trace_root() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
     let name = boot.register_effect(
         "effect://slow/echo",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Effectful,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -671,7 +931,11 @@ async fn cancel_requires_owner_and_trace_root() -> anyhow::Result<()> {
             ["slow"],
             ["perform://effect/slow/echo"],
         ));
-    let gw = Arc::new(GatewayRuntime::new(boot.clone(), profile)?);
+    let gw = Arc::new(GatewayRuntime::new(
+        boot.clone(),
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?);
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -683,12 +947,16 @@ async fn cancel_requires_owner_and_trace_root() -> anyhow::Result<()> {
                 &session,
                 GatewaySubmission::direct_input("slow", Value::string("work".into())).with_options(
                     SubmitOptions {
+                        expected_request_scope: Some(crate::tests::test_request_scope(
+                            &gw, &session, "slow",
+                        )?),
                         idempotency_key: Some("slow-cancel".into()),
                         ..SubmitOptions::default()
                     },
                 ),
             )
             .await
+            .map_err(anyhow::Error::from)
         })
     };
     let entry = loop {
@@ -739,7 +1007,7 @@ async fn cancel_requires_owner_and_trace_root() -> anyhow::Result<()> {
         "owner with matching trace root should cancel request"
     );
     ensure!(
-        boot.kernel.processes.status(entry.request_process) == Some(ProcessStatus::Cancelled),
+        boot.kernel().processes().status(entry.request_process) == Some(ProcessStatus::Cancelled),
         "request process should be cancelled"
     );
     ensure!(
@@ -767,6 +1035,7 @@ async fn cancel_retains_admission_and_budget_until_request_owner_drops() -> anyh
         "effect://cancel/slow",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Effectful,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -780,6 +1049,7 @@ async fn cancel_retains_admission_and_budget_until_request_owner_drops() -> anyh
         "effect://cancel/fast",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -805,7 +1075,11 @@ async fn cancel_retains_admission_and_budget_until_request_owner_drops() -> anyh
                 "perform://effect/cancel/fast",
             ],
         ));
-    let gw = Arc::new(GatewayRuntime::new(boot.clone(), profile)?);
+    let gw = Arc::new(GatewayRuntime::new(
+        boot.clone(),
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?);
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -817,12 +1091,16 @@ async fn cancel_retains_admission_and_budget_until_request_owner_drops() -> anyh
                 &session,
                 GatewaySubmission::direct_input("slow", Value::string("work".into())).with_options(
                     SubmitOptions {
+                        expected_request_scope: Some(crate::tests::test_request_scope(
+                            &gw, &session, "slow",
+                        )?),
                         idempotency_key: Some("cancel-slow-once".into()),
                         ..SubmitOptions::default()
                     },
                 ),
             )
             .await
+            .map_err(anyhow::Error::from)
         })
     };
     while count.load(Ordering::Acquire) == 0 {
@@ -890,8 +1168,12 @@ async fn cancel_retains_admission_and_budget_until_request_owner_drops() -> anyh
 #[tokio::test]
 async fn request_runs_as_attenuated_child_not_root() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
-    let root = boot.root;
-    let gw = GatewayRuntime::new(boot.clone(), identity_profile()?)?;
+    let root = boot.root();
+    let gw = GatewayRuntime::new(
+        boot.clone(),
+        identity_profile()?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -915,6 +1197,7 @@ fn malformed_profile_rejects_unmapped_principal() -> anyhow::Result<()> {
     let err = expect_gateway_error(GatewayRuntime::new(
         Arc::new(Bootstrap::in_memory()),
         profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
     ))?;
     ensure!(
         matches!(err, GatewayError::InvalidProfile(_)),
@@ -925,20 +1208,28 @@ fn malformed_profile_rejects_unmapped_principal() -> anyhow::Result<()> {
 
 #[test]
 fn malformed_identity_path_rejects_profile() -> anyhow::Result<()> {
-    let profile = GatewayProfile::new("gateway-test").with_bearer_identity(
-        "cred-alice",
-        "alice",
-        TEST_TOKEN,
+    for identity in [
         "state://alice",
-    )?;
-    let err = expect_gateway_error(GatewayRuntime::new(
-        Arc::new(Bootstrap::in_memory()),
-        profile,
-    ))?;
-    ensure!(
-        matches!(err, GatewayError::InvalidProfile(_)),
-        "unexpected identity path error: {err:?}"
-    );
+        "identity://alice/*",
+        "process://alice",
+        "path://remote/identity/alice",
+    ] {
+        let profile = GatewayProfile::new("gateway-test").with_bearer_identity(
+            "cred-alice",
+            "alice",
+            TEST_TOKEN,
+            identity,
+        )?;
+        let err = expect_gateway_error(GatewayRuntime::new(
+            Arc::new(Bootstrap::in_memory()),
+            profile,
+            Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+        ))?;
+        ensure!(
+            matches!(err, GatewayError::InvalidProfile(_)),
+            "unexpected identity path error for {identity}: {err:?}"
+        );
+    }
     Ok(())
 }
 
@@ -948,6 +1239,7 @@ fn malformed_profile_rejects_zero_revision() -> anyhow::Result<()> {
     let err = expect_gateway_error(GatewayRuntime::new(
         Arc::new(Bootstrap::in_memory()),
         profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
     ))?;
     ensure!(
         matches!(err, GatewayError::InvalidProfile(_)),
@@ -958,8 +1250,10 @@ fn malformed_profile_rejects_zero_revision() -> anyhow::Result<()> {
 
 #[test]
 fn malformed_profile_rejects_duplicate_names() -> anyhow::Result<()> {
+    let requests: Arc<dyn crate::GatewayIdempotencyStore> =
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default());
     let duplicate_credential = GatewayProfile::new("gateway-test")
-        .with_identity_mapping(GatewayIdentityMapping::new("alice", "process://alice"))
+        .with_identity_mapping(GatewayIdentityMapping::new("alice", "identity://alice"))
         .with_credential(GatewayCredential::bearer_token(
             "cred-alice",
             "alice",
@@ -968,11 +1262,12 @@ fn malformed_profile_rejects_duplicate_names() -> anyhow::Result<()> {
         .with_credential(GatewayCredential::bearer_token(
             "cred-alice",
             "alice",
-            "other-token-for-alice-01",
+            "other-token-for-alice-01-32-bytes",
         )?);
     let err = expect_gateway_error(GatewayRuntime::new(
         Arc::new(Bootstrap::in_memory()),
         duplicate_credential,
+        requests.clone(),
     ))?;
     ensure!(
         matches!(err, GatewayError::InvalidProfile(_)),
@@ -986,6 +1281,7 @@ fn malformed_profile_rejects_duplicate_names() -> anyhow::Result<()> {
     let err = expect_gateway_error(GatewayRuntime::new(
         Arc::new(Bootstrap::in_memory()),
         duplicate_surface,
+        requests,
     ))?;
     ensure!(
         matches!(err, GatewayError::InvalidProfile(_)),
@@ -1001,6 +1297,7 @@ fn malformed_profile_rejects_surface_exceeding_authority_anchor() -> anyhow::Res
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -1008,10 +1305,711 @@ fn malformed_profile_rejects_surface_exceeding_authority_anchor() -> anyhow::Res
     )?;
     let anchor = restricted_anchor(&boot, "perform://effect/inference/**")?;
     let profile = echo_profile(name)?.with_authority_anchor(anchor);
-    let err = expect_gateway_error(GatewayRuntime::new(boot, profile))?;
+    let err = expect_gateway_error(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    ))?;
     ensure!(
         matches!(err, GatewayError::InvalidProfile(_)),
         "unexpected authority anchor error: {err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn authority_anchor_expiry_uses_the_kernel_host_clock() -> anyhow::Result<()> {
+    let requests: Arc<dyn crate::GatewayIdempotencyStore> =
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default());
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicI64;
+    use std::time::Instant;
+    use xolotl_kernel::host::{
+        AbortTask, HostClock, HostRuntime, TaskSpawnError, TaskSpawner, TokioBlockingSpawner,
+    };
+    use xolotl_types::{ConstraintSet, Expiry, Grant, IdentityRef, ResourceSelector, RightFlags};
+
+    struct Clock(AtomicI64);
+
+    impl HostClock for Clock {
+        fn monotonic_now(&self) -> Instant {
+            Instant::now()
+        }
+
+        fn unix_millis(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+
+        fn sleep_until(&self, _deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    struct NoTasks;
+
+    impl TaskSpawner for NoTasks {
+        fn spawn(
+            &self,
+            _future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+        ) -> Result<Arc<dyn AbortTask>, TaskSpawnError> {
+            Err(TaskSpawnError::Unavailable)
+        }
+    }
+
+    let clock = Arc::new(Clock(AtomicI64::new(1_000)));
+    let boot = Arc::new(Bootstrap::from_kernel(
+        xolotl_kernel::KernelBuilder::in_memory()
+            .with_host_runtime(HostRuntime::new(
+                clock.clone(),
+                Arc::new(NoTasks),
+                Arc::new(TokioBlockingSpawner::default()),
+            ))
+            .build(),
+    ));
+    let name = boot.register_effect(
+        "effect://echo/say",
+        &[xolotl_kernel::MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            xolotl_types::Purity::Pure,
+            xolotl_kernel::MethodSpec::UNARY_ASYNC,
+        )],
+        Arc::new(xolotl_kernel::EchoDriver),
+    )?;
+    let anchor =
+        boot.spawn_request_process_under_with_request_grants(boot.root(), IdentityRef::ROOT, &[])?;
+    boot.kernel().registry().register_grant(Grant {
+        id: boot.kernel().registry().next_grant_id(),
+        holder: anchor,
+        selector: ResourceSelector::parse("perform://effect/echo/**")?,
+        rights: xolotl_types::GrantRights::new(
+            xolotl_types::GrantMethods::name("invoke"),
+            RightFlags::empty(),
+        ),
+        constraints: ConstraintSet::default(),
+        expires: Expiry::At(1_500),
+    });
+    let profile = echo_profile(name)?.with_authority_anchor(anchor);
+    let no_scheduler = expect_gateway_error(GatewayRuntime::new(
+        boot.clone(),
+        profile.clone(),
+        requests.clone(),
+    ))?;
+    ensure!(
+        no_scheduler
+            .to_string()
+            .contains("request deadline maintenance requires host task scheduler"),
+        "automatic maintenance silently skipped its scheduler: {no_scheduler:?}"
+    );
+    let active = GatewayRuntime::new_manual(boot.clone(), profile.clone(), requests.clone())?;
+    active
+        .maintain_once(&mut GatewayMaintenanceCursor::default())
+        .await?;
+    clock.0.store(1_501, Ordering::SeqCst);
+    ensure!(matches!(
+        GatewayRuntime::new_manual(boot, profile, requests),
+        Err(GatewayError::InvalidProfile(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn transport_deadline_composes_with_client_deadline_in_one_clock_domain() -> anyhow::Result<()> {
+    use xolotl_kernel::host::HostRuntime;
+
+    let host = HostRuntime::tokio();
+    let server = host
+        .deadline_after(Duration::from_millis(40))
+        .context("server deadline overflow")?;
+    let options = SubmitOptions {
+        deadline_ms: Some(u64::try_from(host.now_millis().saturating_add(1_000))?),
+        ..SubmitOptions::default()
+    };
+    let submission = GatewaySubmission::direct_input("echo", Value::null())
+        .with_server_deadline(server)
+        .with_options(options.clone());
+    ensure!(submission.server_deadline == Some(server));
+    ensure!(
+        request_deadline(
+            &options,
+            submission.server_deadline,
+            host.now(),
+            host.now_millis()
+        )? == Some(server)
+    );
+    let limits = GatewayLimitProfile {
+        max_deadline_ms_from_now: 100,
+        ..GatewayLimitProfile::default()
+    };
+    let now = host.now();
+    let effective = request_deadline(&options, submission.server_deadline, now, host.now_millis())?;
+    validate_request_deadline(effective, now, &limits)?;
+    ensure!(request_wall_ms(effective, now)? <= 40);
+    let long = request_deadline(&options, None, now, host.now_millis())?;
+    ensure!(matches!(
+        validate_request_deadline(long, now, &limits),
+        Err(GatewayError::Rejected(_))
+    ));
+
+    let foreign = HostRuntime::tokio()
+        .deadline_after(Duration::from_millis(10))
+        .context("foreign deadline overflow")?;
+    ensure!(matches!(
+        request_deadline(&options, Some(foreign), host.now(), host.now_millis()),
+        Err(GatewayError::Rejected(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn manual_gateway_admits_and_expires_requests_without_tokio_runtime() -> anyhow::Result<()> {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicI64, AtomicU64};
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::time::Instant;
+    use xolotl_kernel::host::{
+        AbortTask, BlockingJob, BlockingSpawnError, BlockingSpawner, HostClock, HostRuntime,
+        TaskSpawnError, TaskSpawner,
+    };
+
+    struct Clock {
+        base: Instant,
+        monotonic_ms: AtomicU64,
+        wall_ms: AtomicI64,
+    }
+
+    impl HostClock for Clock {
+        fn monotonic_now(&self) -> Instant {
+            self.base + Duration::from_millis(self.monotonic_ms.load(Ordering::SeqCst))
+        }
+
+        fn unix_millis(&self) -> i64 {
+            self.wall_ms.load(Ordering::SeqCst)
+        }
+
+        fn sleep_until(&self, _deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    struct NoTasks;
+
+    impl TaskSpawner for NoTasks {
+        fn spawn(
+            &self,
+            _future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+        ) -> Result<Arc<dyn AbortTask>, TaskSpawnError> {
+            Err(TaskSpawnError::Unavailable)
+        }
+    }
+
+    struct PlainThreads;
+
+    impl BlockingSpawner for PlainThreads {
+        fn spawn(&self, job: BlockingJob) -> Result<(), BlockingSpawnError> {
+            std::thread::spawn(job);
+            Ok(())
+        }
+    }
+
+    struct ThreadWake(std::thread::Thread);
+
+    impl Wake for ThreadWake {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> anyhow::Result<F::Output> {
+        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+        let timeout = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+                return Ok(value);
+            }
+            let remaining = timeout.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("manual host future did not complete");
+            }
+            std::thread::park_timeout(remaining);
+        }
+    }
+
+    ensure!(tokio::runtime::Handle::try_current().is_err());
+    let clock = Arc::new(Clock {
+        base: Instant::now(),
+        monotonic_ms: AtomicU64::new(0),
+        wall_ms: AtomicI64::new(1_000),
+    });
+    let boot = Arc::new(Bootstrap::from_kernel(
+        xolotl_kernel::KernelBuilder::in_memory()
+            .with_host_runtime(HostRuntime::new(
+                clock.clone(),
+                Arc::new(NoTasks),
+                Arc::new(PlainThreads),
+            ))
+            .build(),
+    ));
+    let name = boot.register_effect(
+        "effect://echo/say",
+        &[xolotl_kernel::MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            xolotl_types::Purity::Pure,
+            xolotl_kernel::MethodSpec::UNARY_ASYNC,
+        )],
+        Arc::new(xolotl_kernel::EchoDriver),
+    )?;
+    let gateway = GatewayRuntime::new_manual(
+        boot.clone(),
+        echo_profile(name)?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
+    let before = gateway.status().maintenance;
+    ensure!(before.request_deadlines.state == GatewayMaintenanceState::Manual);
+    ensure!(before.object_records.state == GatewayMaintenanceState::Manual);
+    ensure!(before.request_deadlines.since_last_success.is_none());
+    ensure!(before.object_records.since_last_success.is_none());
+    let session = block_on(gateway.authenticate(PresentedCredential::bearer(TEST_TOKEN)))??;
+    let mut cursor = GatewayMaintenanceCursor::default();
+    let first = block_on(gateway.maintain_once(&mut cursor))??;
+    ensure!(first.object_scans_available);
+    let after = gateway.status().maintenance;
+    ensure!(after.request_deadlines.since_last_success == Some(Duration::ZERO));
+    ensure!(after.object_records.since_last_success == Some(Duration::ZERO));
+    let submission = input_stream_submission("echo").with_options(SubmitOptions {
+        deadline_ms: Some(1_025),
+        ..SubmitOptions::default()
+    });
+    let stream = block_on(gateway.accept_input_stream_submission(&session, submission))??;
+    let process = stream.request_process;
+    let cleanup_ticket = boot.cleanup_ticket(process)?;
+    ensure!(
+        boot.kernel().processes().status(process) == Some(ProcessStatus::Running),
+        "manual host did not admit the request"
+    );
+    clock.wall_ms.store(-100_000, Ordering::SeqCst);
+    clock.monotonic_ms.store(25, Ordering::SeqCst);
+    let report = block_on(gateway.maintain_once(&mut cursor))??;
+    ensure!(report.expired_requests == 1);
+    ensure!(report.failed_request_cancellations == 0);
+    let progress = gateway.status().maintenance;
+    ensure!(progress.request_deadlines.since_last_success == Some(Duration::ZERO));
+    ensure!(progress.object_records.since_last_success == Some(Duration::ZERO));
+    ensure!(
+        boot.kernel().processes().status(process) == Some(ProcessStatus::Cancelled),
+        "manual maintenance did not cancel the expired request"
+    );
+    drop(stream);
+    ensure!(gateway.requests.inner.lock().entries.is_empty());
+    let cleanup = block_on(boot.drain_cleanup())?;
+    ensure!(cleanup.failures.is_empty(), "{cleanup:?}");
+    ensure!(
+        cleanup_ticket.is_complete(),
+        "manual host left request cleanup pending"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn gateway_maintenance_tasks_abort_on_drop_and_partial_start_failure() -> anyhow::Result<()> {
+    let requests: Arc<dyn crate::GatewayIdempotencyStore> =
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default());
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::time::Instant;
+    use xolotl_kernel::host::{
+        AbortTask, HostClock, HostRuntime, TaskSpawnError, TaskSpawner, TokioBlockingSpawner,
+    };
+
+    struct FrozenClock(Instant);
+
+    impl HostClock for FrozenClock {
+        fn monotonic_now(&self) -> Instant {
+            self.0
+        }
+
+        fn unix_millis(&self) -> i64 {
+            xolotl_kernel::host::system_now_millis()
+        }
+
+        fn sleep_until(&self, _deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    struct CountingTasks {
+        attempts: AtomicUsize,
+        aborts: Arc<AtomicUsize>,
+        fail_on: Option<usize>,
+    }
+
+    struct CountedAbort {
+        handle: tokio::task::AbortHandle,
+        aborts: Arc<AtomicUsize>,
+    }
+
+    impl AbortTask for CountedAbort {
+        fn abort(&self) {
+            self.handle.abort();
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl TaskSpawner for CountingTasks {
+        fn spawn(
+            &self,
+            future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+        ) -> Result<Arc<dyn AbortTask>, TaskSpawnError> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_on == Some(attempt) {
+                return Err(TaskSpawnError::Unavailable);
+            }
+            let task = tokio::spawn(future);
+            Ok(Arc::new(CountedAbort {
+                handle: task.abort_handle(),
+                aborts: self.aborts.clone(),
+            }))
+        }
+    }
+
+    for fail_on in [None, Some(2)] {
+        let tasks = Arc::new(CountingTasks {
+            attempts: AtomicUsize::new(0),
+            aborts: Arc::new(AtomicUsize::new(0)),
+            fail_on,
+        });
+        let boot = Arc::new(Bootstrap::from_kernel(
+            xolotl_kernel::KernelBuilder::in_memory()
+                .with_host_runtime(HostRuntime::new(
+                    Arc::new(FrozenClock(Instant::now())),
+                    tasks.clone(),
+                    Arc::new(TokioBlockingSpawner::default()),
+                ))
+                .build(),
+        ));
+        ensure!(boot.kernel().state().has_query());
+        ensure!(boot.kernel().state().has_bounded_write());
+        let name = boot.register_effect(
+            "effect://echo/say",
+            &[xolotl_kernel::MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                xolotl_types::Purity::Pure,
+                xolotl_kernel::MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(xolotl_kernel::EchoDriver),
+        )?;
+        let profile = echo_profile(name)?;
+        if fail_on.is_some() {
+            let error = expect_gateway_error(GatewayRuntime::new(boot, profile, requests.clone()))?;
+            ensure!(error.to_string().contains("requires host task scheduler"));
+            ensure!(tasks.aborts.load(Ordering::SeqCst) == 1);
+        } else {
+            let runtime = GatewayRuntime::new(boot, profile, requests.clone())?;
+            ensure!(tasks.attempts.load(Ordering::SeqCst) == 2);
+            drop(runtime);
+            ensure!(tasks.aborts.load(Ordering::SeqCst) == 2);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn gateway_maintenance_status_tracks_lost_tasks_and_manual_ownership() -> anyhow::Result<()> {
+    let requests: Arc<dyn crate::GatewayIdempotencyStore> =
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default());
+    use parking_lot::Mutex;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::time::Instant;
+    use xolotl_kernel::host::{
+        AbortTask, HostClock, HostRuntime, TaskSpawnError, TaskSpawner, TokioBlockingSpawner,
+    };
+    use xolotl_state::Backend;
+
+    type HeldFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+    struct FrozenClock {
+        base: Instant,
+        millis: AtomicUsize,
+    }
+
+    impl FrozenClock {
+        fn new() -> Self {
+            Self {
+                base: Instant::now(),
+                millis: AtomicUsize::new(0),
+            }
+        }
+
+        fn advance_to(&self, millis: usize) {
+            self.millis.store(millis, Ordering::SeqCst);
+        }
+    }
+
+    impl HostClock for FrozenClock {
+        fn monotonic_now(&self) -> Instant {
+            self.base + Duration::from_millis(self.millis.load(Ordering::SeqCst) as u64)
+        }
+
+        fn unix_millis(&self) -> i64 {
+            xolotl_kernel::host::system_now_millis()
+        }
+
+        fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(std::future::poll_fn(move |_| {
+                if self.monotonic_now() >= deadline {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }))
+        }
+    }
+
+    #[derive(Default)]
+    struct HeldTasks {
+        slots: Arc<Mutex<Vec<Option<HeldFuture>>>>,
+    }
+
+    impl HeldTasks {
+        fn len(&self) -> usize {
+            self.slots.lock().len()
+        }
+
+        fn poll_once(&self, index: usize) -> anyhow::Result<()> {
+            let mut slots = self.slots.lock();
+            let task = slots
+                .get_mut(index)
+                .and_then(Option::as_mut)
+                .context("accepted maintenance task missing")?;
+            ensure!(matches!(
+                task.as_mut()
+                    .poll(&mut std::task::Context::from_waker(std::task::Waker::noop())),
+                std::task::Poll::Pending
+            ));
+            Ok(())
+        }
+
+        fn stop(&self, index: usize) -> bool {
+            let task = self.slots.lock().get_mut(index).and_then(Option::take);
+            let stopped = task.is_some();
+            drop(task);
+            stopped
+        }
+    }
+
+    struct HeldTaskHandle {
+        slots: Arc<Mutex<Vec<Option<HeldFuture>>>>,
+        index: usize,
+    }
+
+    impl AbortTask for HeldTaskHandle {
+        fn abort(&self) {
+            HeldTasks {
+                slots: Arc::clone(&self.slots),
+            }
+            .stop(self.index);
+        }
+    }
+
+    impl TaskSpawner for HeldTasks {
+        fn spawn(&self, future: HeldFuture) -> Result<Arc<dyn AbortTask>, TaskSpawnError> {
+            let mut slots = self.slots.lock();
+            let index = slots.len();
+            slots.push(Some(future));
+            Ok(Arc::new(HeldTaskHandle {
+                slots: Arc::clone(&self.slots),
+                index,
+            }))
+        }
+    }
+
+    let tasks = Arc::new(HeldTasks::default());
+    let clock = Arc::new(FrozenClock::new());
+    let runtime = HostRuntime::new(
+        clock.clone(),
+        tasks.clone(),
+        Arc::new(TokioBlockingSpawner::default()),
+    );
+    let boot = Arc::new(Bootstrap::from_kernel(
+        xolotl_kernel::KernelBuilder::in_memory()
+            .with_host_runtime(runtime)
+            .build(),
+    ));
+    let gateway = GatewayRuntime::new(Arc::clone(&boot), identity_profile()?, requests.clone())?;
+    ensure!(tasks.len() == 2);
+    let initial = gateway.status().maintenance;
+    ensure!(initial.request_deadlines.state == GatewayMaintenanceState::Active);
+    ensure!(initial.object_records.state == GatewayMaintenanceState::Active);
+    ensure!(initial.request_deadlines.since_last_success.is_none());
+    ensure!(initial.object_records.since_last_success.is_none());
+    tasks.poll_once(0)?;
+    clock.advance_to(50);
+    tasks.poll_once(0)?;
+    let progressed = gateway.status().maintenance;
+    ensure!(progressed.request_deadlines.since_last_success == Some(Duration::ZERO));
+    ensure!(progressed.request_deadlines.active_attempts == 0);
+    ensure!(progressed.object_records.since_last_success.is_none());
+    clock.advance_to(1_050);
+    let frozen = gateway.status().maintenance;
+    ensure!(frozen.request_deadlines.state == GatewayMaintenanceState::Overdue);
+    ensure!(frozen.request_deadlines.since_last_success == Some(Duration::from_secs(1)));
+    ensure!(frozen.object_records.state == GatewayMaintenanceState::Active);
+    clock.advance_to(5_000);
+    tasks.poll_once(1)?;
+    let object_progress = gateway.status().maintenance.object_records;
+    ensure!(object_progress.since_last_success == Some(Duration::ZERO));
+    ensure!(object_progress.active_attempts == 0);
+    clock.advance_to(25_000);
+    ensure!(gateway.status().maintenance.object_records.state == GatewayMaintenanceState::Overdue);
+    ensure!(tasks.stop(0), "request maintenance task missing");
+    ensure!(
+        gateway.status().maintenance.request_deadlines.state == GatewayMaintenanceState::Stopped
+    );
+    ensure!(gateway.status().readiness == GatewayReadiness::Ready);
+    ensure!(tasks.stop(1), "object maintenance task missing");
+    let stopped = gateway.status().maintenance;
+    ensure!(stopped.request_deadlines.state == GatewayMaintenanceState::Stopped);
+    ensure!(stopped.object_records.state == GatewayMaintenanceState::Stopped);
+    let manual = GatewayRuntime::new_manual(boot, identity_profile()?, requests.clone())?;
+    let manual = manual.status().maintenance;
+    ensure!(manual.request_deadlines.state == GatewayMaintenanceState::Manual);
+    ensure!(manual.object_records.state == GatewayMaintenanceState::Manual);
+
+    let tasks = Arc::new(HeldTasks::default());
+    let runtime = HostRuntime::new(
+        Arc::new(FrozenClock::new()),
+        tasks.clone(),
+        Arc::new(TokioBlockingSpawner::default()),
+    );
+    let boot = Arc::new(Bootstrap::from_kernel(
+        xolotl_kernel::KernelBuilder::new(Backend::new())
+            .with_host_runtime(runtime)
+            .build(),
+    ));
+    let gateway = GatewayRuntime::new(Arc::clone(&boot), identity_profile()?, requests.clone())?;
+    ensure!(tasks.len() == 1);
+    let unavailable = gateway.status().maintenance;
+    ensure!(unavailable.request_deadlines.state == GatewayMaintenanceState::Active);
+    ensure!(unavailable.object_records.state == GatewayMaintenanceState::Unavailable);
+    let manual = GatewayRuntime::new_manual(boot, identity_profile()?, requests)?;
+    ensure!(
+        manual.status().maintenance.object_records.state == GatewayMaintenanceState::Unavailable
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn manual_maintenance_reports_failed_object_pass_and_recovery() -> anyhow::Result<()> {
+    use std::{future::Future, pin::Pin};
+    use xolotl_state::{
+        Backend, InMemoryBackend, StateError, StateFailure, StatePage, StateQuery, StateResult,
+        StateScan,
+    };
+
+    struct FlakyQuery {
+        mode: AtomicUsize,
+        queries: AtomicUsize,
+    }
+
+    impl StateQuery for FlakyQuery {
+        type Query<'a> = Pin<Box<dyn Future<Output = StateResult<StatePage>> + Send + 'a>>;
+
+        fn query<'a>(&'a self, _query: &'a StateScan) -> Self::Query<'a> {
+            self.queries.fetch_add(1, Ordering::SeqCst);
+            let mode = self.mode.load(Ordering::SeqCst);
+            Box::pin(async move {
+                match mode {
+                    0 => Err(StateFailure::new(
+                        StateError::Backend("maintenance query failed".into()),
+                        TaintSet::pristine(),
+                    )),
+                    1 => Ok(StatePage::empty()),
+                    _ => std::future::pending().await,
+                }
+            })
+        }
+    }
+
+    let query = Arc::new(FlakyQuery {
+        mode: AtomicUsize::new(0),
+        queries: AtomicUsize::new(0),
+    });
+    let state = Backend::new()
+        .with_query(query.clone())
+        .with_bounded_write(Arc::new(InMemoryBackend::new()));
+    let boot = Arc::new(Bootstrap::from_kernel(
+        xolotl_kernel::KernelBuilder::new(state).build(),
+    ));
+    let gateway = GatewayRuntime::new_manual(
+        boot,
+        identity_profile()?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
+    let mut cursor = GatewayMaintenanceCursor::default();
+    let failure = gateway
+        .maintain_once(&mut cursor)
+        .await
+        .err()
+        .context("query should fail")?;
+    ensure!(failure.to_string().contains("maintenance query failed"));
+    ensure!(query.queries.load(Ordering::SeqCst) == 2);
+    let failed = gateway.status().maintenance;
+    ensure!(failed.request_deadlines.since_last_success.is_some());
+    ensure!(failed.object_records.state == GatewayMaintenanceState::Manual);
+    ensure!(failed.object_records.since_last_attempt.is_some());
+    ensure!(failed.object_records.since_last_success.is_none());
+    ensure!(failed.object_records.consecutive_failures == 1);
+    ensure!(failed.object_records.active_attempts == 0);
+
+    query.mode.store(1, Ordering::SeqCst);
+    let report = gateway.maintain_once(&mut cursor).await?;
+    ensure!(report.object_scans_available);
+    ensure!(query.queries.load(Ordering::SeqCst) == 4);
+    let recovered = gateway.status().maintenance;
+    ensure!(recovered.object_records.since_last_success.is_some());
+    ensure!(recovered.object_records.consecutive_failures == 0);
+
+    query.mode.store(2, Ordering::SeqCst);
+    let mut second_cursor = GatewayMaintenanceCursor::default();
+    let mut first = Box::pin(gateway.maintain_once(&mut cursor));
+    ensure!(
+        tokio::time::timeout(Duration::from_millis(10), &mut first)
+            .await
+            .is_err()
+    );
+    let pending = gateway.status().maintenance;
+    ensure!(pending.object_records.active_attempts == 1);
+    ensure!(pending.object_records.consecutive_failures == 0);
+    query.mode.store(1, Ordering::SeqCst);
+    gateway.maintain_once(&mut second_cursor).await?;
+    let overlapping = gateway.status().maintenance;
+    ensure!(overlapping.object_records.active_attempts == 1);
+    ensure!(overlapping.object_records.consecutive_failures == 0);
+    ensure!(overlapping.object_records.since_last_success.is_some());
+    drop(first);
+    let cancelled = gateway.status().maintenance;
+    ensure!(cancelled.object_records.active_attempts == 0);
+    ensure!(cancelled.object_records.consecutive_failures == 1);
+
+    gateway.maintain_once(&mut cursor).await?;
+    ensure!(
+        gateway
+            .status()
+            .maintenance
+            .object_records
+            .consecutive_failures
+            == 0
     );
     Ok(())
 }
@@ -1023,6 +2021,7 @@ fn malformed_profile_rejects_surface_exceeding_principal_ceiling() -> anyhow::Re
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -1035,7 +2034,11 @@ fn malformed_profile_rejects_surface_exceeding_principal_ceiling() -> anyhow::Re
             ["echo"],
             ["perform://effect/inference/**"],
         ));
-    let err = expect_gateway_error(GatewayRuntime::new(boot, profile))?;
+    let err = expect_gateway_error(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    ))?;
     ensure!(
         matches!(err, GatewayError::InvalidProfile(_)),
         "unexpected principal ceiling error: {err:?}"
@@ -1045,11 +2048,14 @@ fn malformed_profile_rejects_surface_exceeding_principal_ceiling() -> anyhow::Re
 
 #[test]
 fn malformed_profile_rejects_invalid_surface_schemas() -> anyhow::Result<()> {
+    let requests: Arc<dyn crate::GatewayIdempotencyStore> =
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default());
     let boot = Arc::new(Bootstrap::in_memory());
     let name = boot.register_effect(
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -1061,7 +2067,7 @@ fn malformed_profile_rejects_invalid_surface_schemas() -> anyhow::Result<()> {
                 .with_schema(Some(Value::from("not-a-schema-object")), None),
         ),
     );
-    let err = expect_gateway_error(GatewayRuntime::new(boot, profile))?;
+    let err = expect_gateway_error(GatewayRuntime::new(boot, profile, requests.clone()))?;
     ensure!(
         matches!(err, GatewayError::InvalidProfile(_)),
         "unexpected input schema error: {err:?}"
@@ -1072,6 +2078,7 @@ fn malformed_profile_rejects_invalid_surface_schemas() -> anyhow::Result<()> {
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -1083,7 +2090,7 @@ fn malformed_profile_rejects_invalid_surface_schemas() -> anyhow::Result<()> {
                 .with_schema(None, Some(Value::from("not-a-schema-object"))),
         ),
     );
-    let err = expect_gateway_error(GatewayRuntime::new(boot, profile))?;
+    let err = expect_gateway_error(GatewayRuntime::new(boot, profile, requests))?;
     ensure!(
         matches!(err, GatewayError::InvalidProfile(_)),
         "unexpected output schema error: {err:?}"
@@ -1093,7 +2100,6 @@ fn malformed_profile_rejects_invalid_surface_schemas() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn submit_uses_restricted_authority_anchor_when_configured() -> anyhow::Result<()> {
-    use std::task::Poll;
     let boot = Arc::new(Bootstrap::in_memory());
     let count = Arc::new(AtomicUsize::new(0));
     let released = Arc::new(AtomicBool::new(false));
@@ -1102,6 +2108,7 @@ async fn submit_uses_restricted_authority_anchor_when_configured() -> anyhow::Re
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -1113,7 +2120,11 @@ async fn submit_uses_restricted_authority_anchor_when_configured() -> anyhow::Re
     )?;
     let anchor = restricted_anchor(&boot, "perform://effect/echo/**")?;
     let profile = echo_profile(name.clone())?.with_authority_anchor(anchor);
-    let gw = GatewayRuntime::new(boot.clone(), profile)?;
+    let gw = Arc::new(GatewayRuntime::new(
+        boot.clone(),
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?);
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -1121,24 +2132,32 @@ async fn submit_uses_restricted_authority_anchor_when_configured() -> anyhow::Re
         &session,
         GatewaySubmission::direct_input("echo", Value::string("ok".into())),
     ));
-    ensure!(
-        std::future::poll_fn(|cx| Poll::Ready(running.as_mut().poll(cx)))
-            .await
-            .is_pending()
-    );
+    // Admission and Fact I/O may suspend before the driver starts. Keep
+    // driving the submission until the driver is actually held at its gate.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while count.load(Ordering::Acquire) == 0 {
+            tokio::select! {
+                result = &mut running => bail!("submission finished before driver entry: {result:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("driver did not start before timeout")??;
     ensure!(count.load(Ordering::Acquire) == 1);
 
-    let children = boot.kernel.processes.children_of(anchor);
+    let children = boot.kernel().processes().children_of(anchor);
     ensure!(
         children.len() == 1,
         "unexpected child count: {}",
         children.len()
     );
     ensure!(
-        boot.kernel.registry.grants_of(children[0]).is_empty(),
+        boot.kernel().registry().grants_of(children[0]).is_empty(),
         "child should not retain root grants"
     );
-    let grants = boot.kernel.processes.attached_grants(children[0]);
+    let grants = boot.kernel().processes().attached_grants(children[0]);
     ensure!(
         grants.len() == 1,
         "running child should have one attached grant"
@@ -1155,8 +2174,8 @@ async fn submit_uses_restricted_authority_anchor_when_configured() -> anyhow::Re
         "unexpected restricted authority output: {result:?}"
     );
     ensure!(
-        boot.kernel
-            .processes
+        boot.kernel()
+            .processes()
             .attached_grants(children[0])
             .is_empty(),
         "finished child should release attached grants"
@@ -1166,25 +2185,30 @@ async fn submit_uses_restricted_authority_anchor_when_configured() -> anyhow::Re
 
 #[tokio::test]
 async fn profile_replace_rejects_old_session_and_keeps_bad_reload_closed() -> anyhow::Result<()> {
-    const NEW_TOKEN: &str = "test-token-for-bob-000002";
+    const NEW_TOKEN: &str = "test-token-for-bob-000002-32-bytes";
     let boot = Arc::new(Bootstrap::in_memory());
     let name = boot.register_effect(
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
         Arc::new(xolotl_kernel::EchoDriver),
     )?;
-    let gw = GatewayRuntime::new(boot.clone(), echo_profile(name.clone())?)?;
+    let gw = GatewayRuntime::new(
+        boot.clone(),
+        echo_profile(name.clone())?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let old_session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
 
     let new_profile = GatewayProfile::new("gateway-test")
         .with_revision(2)
-        .with_bearer_identity("cred-bob", "bob", NEW_TOKEN, "process://bob")?
+        .with_bearer_identity("cred-bob", "bob", NEW_TOKEN, "identity://bob")?
         .with_surface(GatewaySurface::effect_invoke("echo", name))
         .with_principal_surface_binding(GatewayPrincipalSurfaceBinding::allow(
             "bob",
@@ -1224,7 +2248,7 @@ async fn profile_replace_rejects_old_session_and_keeps_bad_reload_closed() -> an
         .authenticate(PresentedCredential::bearer(NEW_TOKEN))
         .await?;
     ensure!(
-        new_session.identity_path == "process://bob",
+        new_session.identity_path == "identity://bob",
         "unexpected new identity path: {}",
         new_session.identity_path
     );
@@ -1234,7 +2258,7 @@ async fn profile_replace_rejects_old_session_and_keeps_bad_reload_closed() -> an
         .with_bearer_identity(
             "cred-eve",
             "eve",
-            "test-token-for-eve-000003",
+            "test-token-for-eve-000003-32-bytes",
             "state://eve",
         )?;
     ensure!(
@@ -1289,7 +2313,28 @@ async fn profile_replace_rejects_old_session_and_keeps_bad_reload_closed() -> an
 #[tokio::test]
 async fn profile_replace_requires_monotonic_revision() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
-    let gw = GatewayRuntime::new(boot, identity_profile()?.with_revision(2))?;
+    let gw = GatewayRuntime::new(
+        boot.clone(),
+        identity_profile()?.with_revision(2),
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
+    let unused = Path::parse("identity://unused-stale-profile")?;
+    let stale = GatewayProfile::new("gateway-test")
+        .with_revision(2)
+        .with_bearer_identity(
+            "cred-stale",
+            "stale",
+            "test-token-stale-000002-32-bytes",
+            unused.to_string(),
+        )?;
+    ensure!(
+        matches!(
+            gw.replace_profile(stale),
+            Err(GatewayError::InvalidProfile(_))
+        ),
+        "same revision should be rejected before identity registration"
+    );
+    ensure!(boot.kernel().identities().lookup(&unused)?.is_none());
     ensure!(
         matches!(
             gw.replace_profile(identity_profile()?.with_revision(2)),
@@ -1335,13 +2380,15 @@ async fn profile_replace_requires_monotonic_revision() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn disabled_credentials_and_principals_do_not_authenticate() -> anyhow::Result<()> {
+    let requests: Arc<dyn crate::GatewayIdempotencyStore> =
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default());
     let boot = Arc::new(Bootstrap::in_memory());
     let disabled_credential = GatewayProfile::new("gateway-test")
-        .with_identity_mapping(GatewayIdentityMapping::new("alice", "process://alice"))
+        .with_identity_mapping(GatewayIdentityMapping::new("alice", "identity://alice"))
         .with_credential(
             GatewayCredential::bearer_token("cred-alice", "alice", TEST_TOKEN)?.with_enabled(false),
         );
-    let gw = GatewayRuntime::new(boot.clone(), disabled_credential)?;
+    let gw = GatewayRuntime::new(boot.clone(), disabled_credential, requests.clone())?;
     ensure!(
         matches!(
             gw.authenticate(PresentedCredential::bearer(TEST_TOKEN))
@@ -1353,14 +2400,14 @@ async fn disabled_credentials_and_principals_do_not_authenticate() -> anyhow::Re
 
     let disabled_principal = GatewayProfile::new("gateway-test")
         .with_identity_mapping(
-            GatewayIdentityMapping::new("alice", "process://alice").with_enabled(false),
+            GatewayIdentityMapping::new("alice", "identity://alice").with_enabled(false),
         )
         .with_credential(GatewayCredential::bearer_token(
             "cred-alice",
             "alice",
             TEST_TOKEN,
         )?);
-    let gw = GatewayRuntime::new(boot, disabled_principal)?;
+    let gw = GatewayRuntime::new(boot, disabled_principal, requests)?;
     ensure!(
         matches!(
             gw.authenticate(PresentedCredential::bearer(TEST_TOKEN))
@@ -1374,9 +2421,11 @@ async fn disabled_credentials_and_principals_do_not_authenticate() -> anyhow::Re
 
 #[tokio::test]
 async fn credential_revocation_floor_blocks_revoked_generations() -> anyhow::Result<()> {
+    let requests: Arc<dyn crate::GatewayIdempotencyStore> =
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default());
     let boot = Arc::new(Bootstrap::in_memory());
     let revoked = identity_profile()?.with_credential_revocation_floor(1);
-    let gw = GatewayRuntime::new(boot.clone(), revoked)?;
+    let gw = GatewayRuntime::new(boot.clone(), revoked, requests.clone())?;
     ensure!(
         matches!(
             gw.authenticate(PresentedCredential::bearer(TEST_TOKEN))
@@ -1392,11 +2441,11 @@ async fn credential_revocation_floor_blocks_revoked_generations() -> anyhow::Res
 
     let rotated = GatewayProfile::new("gateway-test")
         .with_credential_revocation_floor(1)
-        .with_identity_mapping(GatewayIdentityMapping::new("alice", "process://alice"))
+        .with_identity_mapping(GatewayIdentityMapping::new("alice", "identity://alice"))
         .with_credential(
             GatewayCredential::bearer_token("cred-alice", "alice", TEST_TOKEN)?.with_generation(2),
         );
-    let gw = GatewayRuntime::new(boot, rotated)?;
+    let gw = GatewayRuntime::new(boot, rotated, requests)?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -1419,12 +2468,17 @@ async fn generation_bump_invalidates_existing_session() -> anyhow::Result<()> {
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
         Arc::new(xolotl_kernel::EchoDriver),
     )?;
-    let gw = GatewayRuntime::new(boot, echo_profile(name.clone())?)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        echo_profile(name.clone())?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let old_session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -1432,7 +2486,7 @@ async fn generation_bump_invalidates_existing_session() -> anyhow::Result<()> {
     let bumped = GatewayProfile::new("gateway-test")
         .with_revision(2)
         .with_identity_mapping(
-            GatewayIdentityMapping::new("alice", "process://alice").with_generation(2),
+            GatewayIdentityMapping::new("alice", "identity://alice").with_generation(2),
         )
         .with_credential(
             GatewayCredential::bearer_token("cred-alice", "alice", TEST_TOKEN)?.with_generation(2),
@@ -1488,6 +2542,7 @@ async fn direct_input_lowers_through_surface_not_client_target() -> anyhow::Resu
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -1496,7 +2551,11 @@ async fn direct_input_lowers_through_surface_not_client_target() -> anyhow::Resu
     let profile = bind_alice_to_echo(
         identity_profile()?.with_surface(GatewaySurface::effect_invoke("echo", name)),
     );
-    let gw = GatewayRuntime::new(boot, profile)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -1522,6 +2581,7 @@ async fn surface_input_schema_validates_direct_input() -> anyhow::Result<()> {
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -1530,7 +2590,11 @@ async fn surface_input_schema_validates_direct_input() -> anyhow::Result<()> {
     let profile = bind_alice_to_echo(identity_profile()?.with_surface(
         GatewaySurface::effect_invoke("echo", name).with_schema(Some(text_object_schema()), None),
     ));
-    let gw = GatewayRuntime::new(boot, profile)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -1574,6 +2638,7 @@ async fn surface_output_schema_rejects_success_payload_and_replays_failure() -> 
         "effect://payment/charge",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Effectful,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -1593,12 +2658,19 @@ async fn surface_output_schema_rejects_success_payload_and_replays_failure() -> 
             ["charge"],
             ["perform://effect/payment/charge"],
         ));
-    let gw = GatewayRuntime::new(boot, profile)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
     let submission =
         GatewaySubmission::direct_input("charge", Value::integer(42)).with_options(SubmitOptions {
+            expected_request_scope: Some(crate::tests::test_request_scope(
+                &gw, &session, "charge",
+            )?),
             idempotency_key: Some("charge-output-schema".into()),
             ..SubmitOptions::default()
         });
@@ -1637,6 +2709,7 @@ async fn surface_output_schema_does_not_validate_sink_only_delivery() -> anyhow:
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::SINK_ASYNC,
         )],
@@ -1648,7 +2721,11 @@ async fn surface_output_schema_does_not_validate_sink_only_delivery() -> anyhow:
                 .with_schema(Some(schema_type("any")), Some(schema_type("string"))),
         ),
     );
-    let gw = GatewayRuntime::new(boot, profile)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -1670,12 +2747,17 @@ async fn input_stream_open_registers_request_before_chunks() -> anyhow::Result<(
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
         Arc::new(xolotl_kernel::EchoDriver),
     )?;
-    let gw = GatewayRuntime::new(boot, echo_profile(name)?)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        echo_profile(name)?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -1706,6 +2788,15 @@ async fn input_stream_open_registers_request_before_chunks() -> anyhow::Result<(
         "unexpected stream id: {}",
         stream.open_request().stream_id
     );
+    ensure!(gw.requests.inner.lock().deadlines.is_empty());
+    ensure!(gw.sweep_deadline_expired_requests() == 0);
+    ensure!(
+        gw.requests
+            .inner
+            .lock()
+            .entries
+            .contains_key(&accepted.submission_id)
+    );
     let cancelled = gw.cancel(
         &session,
         GatewayCancelRequest {
@@ -1719,6 +2810,119 @@ async fn input_stream_open_registers_request_before_chunks() -> anyhow::Result<(
 }
 
 #[tokio::test]
+async fn recent_cancellations_are_bounded_and_preserve_identity() -> anyhow::Result<()> {
+    let boot = Arc::new(Bootstrap::in_memory());
+    let name = boot.register_effect(
+        "effect://echo/say",
+        &[xolotl_kernel::MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            xolotl_types::Purity::Pure,
+            xolotl_kernel::MethodSpec::UNARY_ASYNC,
+        )],
+        Arc::new(xolotl_kernel::EchoDriver),
+    )?;
+    let profile = echo_profile(name.clone())?.with_limits(GatewayLimitProfile {
+        max_recent_cancellations: 2,
+        ..GatewayLimitProfile::default()
+    });
+    let gw = GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
+    let session = gw
+        .authenticate(PresentedCredential::bearer(TEST_TOKEN))
+        .await?;
+    let mut requests = Vec::new();
+    for _ in 0..3 {
+        let stream = expect_accepted_stream(
+            gw.accept_input_stream_submission(&session, input_stream_submission("echo"))
+                .await?,
+        )?;
+        let accepted = stream.accepted().clone();
+        let request = GatewayCancelRequest {
+            submission_id: accepted.submission_id,
+            trace_root: accepted.trace_root,
+            reason: None,
+        };
+        ensure!(gw.cancel(&session, request.clone())?);
+        drop(stream);
+        requests.push(request);
+    }
+    {
+        let registry = gw.requests.inner.lock();
+        ensure!(registry.entries.is_empty());
+        ensure!(registry.deadlines.is_empty());
+        ensure!(registry.history.len() == 2);
+        ensure!(registry.history_expirations.len() == 2);
+        ensure!(!registry.history.contains_key(&requests[0].submission_id));
+    }
+    ensure!(!gw.cancel(&session, requests[0].clone())?);
+    ensure!(gw.cancel(&session, requests[1].clone())?);
+    ensure!(gw.cancel(&session, requests[2].clone())?);
+    let mut wrong_session = session.clone();
+    wrong_session.principal.principal_id = "bob".into();
+    ensure!(!gw.cancel(&wrong_session, requests[2].clone())?);
+    let mut wrong_trace = requests[2].clone();
+    wrong_trace.trace_root = "wrong-trace".into();
+    ensure!(!gw.cancel(&session, wrong_trace)?);
+
+    gw.replace_profile(echo_profile(name.clone())?.with_revision(2).with_limits(
+        GatewayLimitProfile {
+            max_recent_cancellations: 1,
+            ..GatewayLimitProfile::default()
+        },
+    ))?;
+    let session = gw
+        .authenticate(PresentedCredential::bearer(TEST_TOKEN))
+        .await?;
+    ensure!(gw.requests.inner.lock().history.len() == 1);
+    ensure!(!gw.cancel(&session, requests[1].clone())?);
+    ensure!(gw.cancel(&session, requests[2].clone())?);
+
+    {
+        let mut registry = gw.requests.inner.lock();
+        let after_retention = gw
+            .requests
+            .host
+            .deadline_after(COMPLETED_REQUEST_RETENTION)
+            .context("cancellation retention deadline overflow")?;
+        prune_request_history(&mut registry, after_retention, gw.requests.clock_epoch);
+        ensure!(registry.history.is_empty());
+        ensure!(registry.history_expirations.is_empty());
+    }
+    ensure!(!gw.cancel(&session, requests[2].clone())?);
+
+    gw.replace_profile(
+        echo_profile(name)?
+            .with_revision(3)
+            .with_limits(GatewayLimitProfile {
+                max_recent_cancellations: 0,
+                ..GatewayLimitProfile::default()
+            }),
+    )?;
+    ensure!(gw.requests.inner.lock().history.is_empty());
+    let session = gw
+        .authenticate(PresentedCredential::bearer(TEST_TOKEN))
+        .await?;
+    let stream = expect_accepted_stream(
+        gw.accept_input_stream_submission(&session, input_stream_submission("echo"))
+            .await?,
+    )?;
+    let accepted = stream.accepted().clone();
+    let request = GatewayCancelRequest {
+        submission_id: accepted.submission_id,
+        trace_root: accepted.trace_root,
+        reason: None,
+    };
+    ensure!(gw.cancel(&session, request.clone())?);
+    drop(stream);
+    ensure!(!gw.cancel(&session, request)?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn deadline_sweep_retains_admission_until_stream_owner_drops() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
     let count = Arc::new(AtomicUsize::new(0));
@@ -1728,6 +2932,7 @@ async fn deadline_sweep_retains_admission_until_stream_owner_drops() -> anyhow::
         "effect://deadline/slow",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -1741,6 +2946,7 @@ async fn deadline_sweep_retains_admission_until_stream_owner_drops() -> anyhow::
         "effect://deadline/fast",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -1766,7 +2972,11 @@ async fn deadline_sweep_retains_admission_until_stream_owner_drops() -> anyhow::
                 "perform://effect/deadline/fast",
             ],
         ));
-    let gw = Arc::new(GatewayRuntime::new(boot.clone(), profile)?);
+    let gw = Arc::new(GatewayRuntime::new(
+        boot.clone(),
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?);
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -1782,6 +2992,7 @@ async fn deadline_sweep_retains_admission_until_stream_owner_drops() -> anyhow::
         .await?,
     )?;
     let stream_process = stream.request_process;
+    ensure!(gw.requests.inner.lock().deadlines.len() == 1);
 
     ensure!(
         matches!(
@@ -1796,12 +3007,13 @@ async fn deadline_sweep_retains_admission_until_stream_owner_drops() -> anyhow::
     );
     tokio::time::sleep(std::time::Duration::from_millis(35)).await;
     let swept = gw.sweep_deadline_expired_requests();
+    ensure!(gw.requests.inner.lock().deadlines.is_empty());
     ensure!(
         swept > 0,
         "deadline sweep should cancel at least one request"
     );
     ensure!(
-        boot.kernel.processes.status(stream_process) == Some(ProcessStatus::Cancelled),
+        boot.kernel().processes().status(stream_process) == Some(ProcessStatus::Cancelled),
         "stream process should be cancelled"
     );
     ensure!(
@@ -1863,19 +3075,24 @@ async fn input_stream_open_rejects_client_item_schema_selection() -> anyhow::Res
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
         Arc::new(xolotl_kernel::EchoDriver),
     )?;
-    let gw = GatewayRuntime::new(boot.clone(), echo_profile(name)?)?;
+    let gw = GatewayRuntime::new(
+        boot.clone(),
+        echo_profile(name)?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
     let mut open = input_stream_open_request();
     open.item_schema_id = "client-schema".into();
     let submission = GatewaySubmission::input_stream("echo", open);
-    let before = boot.kernel.processes.all_ids().len();
+    let before = boot.kernel().processes().all_ids().len();
 
     ensure!(
         matches!(
@@ -1886,7 +3103,7 @@ async fn input_stream_open_rejects_client_item_schema_selection() -> anyhow::Res
         "client item schema selection should be rejected"
     );
     ensure!(
-        boot.kernel.processes.all_ids().len() == before,
+        boot.kernel().processes().all_ids().len() == before,
         "process count should not change"
     );
     Ok(())
@@ -1900,6 +3117,7 @@ async fn input_stream_open_rejects_profile_stream_budget_overrun_before_process_
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -1911,11 +3129,15 @@ async fn input_stream_open_rejects_profile_stream_budget_overrun_before_process_
         max_stream_inline_item_bytes: 8,
         ..GatewayLimitProfile::default()
     };
-    let gw = GatewayRuntime::new(boot.clone(), echo_profile(name)?.with_limits(limits))?;
+    let gw = GatewayRuntime::new(
+        boot.clone(),
+        echo_profile(name)?.with_limits(limits),
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
-    let before = boot.kernel.processes.all_ids().len();
+    let before = boot.kernel().processes().all_ids().len();
 
     ensure!(
         matches!(
@@ -1926,7 +3148,7 @@ async fn input_stream_open_rejects_profile_stream_budget_overrun_before_process_
         "profile stream budget overrun should be rejected"
     );
     ensure!(
-        boot.kernel.processes.all_ids().len() == before,
+        boot.kernel().processes().all_ids().len() == before,
         "process count should not change"
     );
     Ok(())
@@ -1939,6 +3161,7 @@ async fn input_stream_chunks_use_profile_item_schema() -> anyhow::Result<()> {
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -1954,7 +3177,11 @@ async fn input_stream_chunks_use_profile_item_schema() -> anyhow::Result<()> {
             ["echo"],
             ["perform://effect/echo/say"],
         ));
-    let gw = GatewayRuntime::new(boot, profile)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -1991,12 +3218,17 @@ async fn input_stream_completion_reuses_accepted_request() -> anyhow::Result<()>
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
         Arc::new(xolotl_kernel::EchoDriver),
     )?;
-    let gw = GatewayRuntime::new(boot, echo_profile(name)?)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        echo_profile(name)?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -2023,19 +3255,71 @@ async fn input_stream_completion_reuses_accepted_request() -> anyhow::Result<()>
 }
 
 #[tokio::test]
+async fn stream_idempotency_binds_folded_payload_before_replay() -> anyhow::Result<()> {
+    let boot = Arc::new(Bootstrap::in_memory());
+    let name = boot.register_effect(
+        "effect://echo/say",
+        &[xolotl_kernel::MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            xolotl_types::Purity::Pure,
+            xolotl_kernel::MethodSpec::UNARY_ASYNC,
+        )],
+        Arc::new(xolotl_kernel::EchoDriver),
+    )?;
+    let gw = GatewayRuntime::new(
+        boot,
+        echo_profile(name)?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
+    let session = gw
+        .authenticate(PresentedCredential::bearer(TEST_TOKEN))
+        .await?;
+    let original_submission = input_stream_submission("echo").with_options(SubmitOptions {
+        expected_request_scope: Some(test_request_scope(&gw, &session, "echo")?),
+        idempotency_key: Some("same-folded-stream".into()),
+        ..SubmitOptions::default()
+    });
+    let open = || original_submission.clone();
+    let first = expect_accepted_stream(gw.accept_input_stream_submission(&session, open()).await?)?;
+    let first = gw
+        .complete_input_stream_submission(*first, Value::string("one".into()), None)
+        .await?;
+    let retry = expect_accepted_stream(gw.accept_input_stream_submission(&session, open()).await?)?;
+    let retry = gw
+        .complete_input_stream_submission(*retry, Value::string("one".into()), None)
+        .await?;
+    ensure!(retry.origin == CompletionOrigin::CachedOutcome);
+    ensure!(retry.accepted == first.accepted && retry.output == first.output);
+    let changed =
+        expect_accepted_stream(gw.accept_input_stream_submission(&session, open()).await?)?;
+    ensure!(
+        gw.complete_input_stream_submission(*changed, Value::string("two".into()), None)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn surface_without_principal_binding_is_not_callable() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
     let name = boot.register_effect(
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
         Arc::new(xolotl_kernel::EchoDriver),
     )?;
     let profile = identity_profile()?.with_surface(GatewaySurface::effect_invoke("echo", name));
-    let gw = GatewayRuntime::new(boot, profile)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -2045,6 +3329,22 @@ async fn surface_without_principal_binding_is_not_callable() -> anyhow::Result<(
         descriptor.surfaces.is_empty(),
         "unbound surface should not be visible"
     );
+    for (surface_id, expected) in [
+        ("echo", "surface echo is not callable by principal"),
+        ("missing", "unknown gateway surface missing"),
+    ] {
+        ensure!(matches!(
+            gw.prepare_submission(&session, GatewaySubmissionHead::direct_input(surface_id), None),
+            Err(GatewayError::Rejected(message)) if message == expected
+        ));
+        let requests = gw.requests.inner.lock();
+        ensure!(requests.global_running == 0);
+        ensure!(requests.principal_running.is_empty());
+        ensure!(requests.surface_running.is_empty());
+        ensure!(requests.risk_running.is_empty());
+        ensure!(requests.entries.is_empty());
+        ensure!(requests.budget_running == GatewayBudgetCharge::default());
+    }
     ensure!(
         matches!(
             gw.submit(
@@ -2060,18 +3360,62 @@ async fn surface_without_principal_binding_is_not_callable() -> anyhow::Result<(
 }
 
 #[tokio::test]
+async fn visible_surface_without_submit_grant_cannot_disclose_submission_evidence()
+-> anyhow::Result<()> {
+    let boot = Arc::new(Bootstrap::in_memory());
+    let name = boot.register_effect(
+        "effect://echo/say",
+        &[xolotl_kernel::MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            xolotl_types::Purity::Pure,
+            xolotl_kernel::MethodSpec::UNARY_ASYNC,
+        )],
+        Arc::new(xolotl_kernel::EchoDriver),
+    )?;
+    let profile = identity_profile()?
+        .with_surface(GatewaySurface::effect_invoke("echo", name))
+        .with_principal_surface_binding(GatewayPrincipalSurfaceBinding::new(
+            "alice",
+            ["echo"],
+            std::iter::empty::<&str>(),
+            std::iter::empty::<&str>(),
+        ));
+    let gw = GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
+    let session = gw
+        .authenticate(PresentedCredential::bearer(TEST_TOKEN))
+        .await?;
+
+    ensure!(gw.describe(&session)?.surfaces.len() == 1);
+    ensure!(matches!(
+        gw.validate_submission_access(&session, "echo"),
+        Err(GatewayError::Unauthorized(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn submit_deadline_is_clamped_by_server_profile() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
     let name = boot.register_effect(
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
         Arc::new(xolotl_kernel::EchoDriver),
     )?;
-    let gw = GatewayRuntime::new(boot, echo_profile(name)?)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        echo_profile(name)?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -2107,12 +3451,17 @@ async fn submit_deadline_out_of_range_is_rejected_before_admission() -> anyhow::
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
         Arc::new(xolotl_kernel::EchoDriver),
     )?;
-    let gw = GatewayRuntime::new(boot, echo_profile(name)?)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        echo_profile(name)?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -2144,13 +3493,15 @@ async fn submit_deadline_out_of_range_is_rejected_before_admission() -> anyhow::
 }
 
 #[tokio::test]
-async fn submit_deadline_timeout_is_recorded_for_idempotency_replay() -> anyhow::Result<()> {
+async fn submit_deadline_preserves_unresolved_effect_for_idempotency_replay() -> anyhow::Result<()>
+{
     let boot = Arc::new(Bootstrap::in_memory());
     let count = Arc::new(AtomicUsize::new(0));
     let name = boot.register_effect(
         "effect://slow/charge",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Effectful,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -2167,41 +3518,89 @@ async fn submit_deadline_timeout_is_recorded_for_idempotency_replay() -> anyhow:
             ["charge"],
             ["perform://effect/slow/charge"],
         ));
-    let gw = GatewayRuntime::new(boot.clone(), profile)?;
+    let gw = Arc::new(GatewayRuntime::new(
+        boot.clone(),
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?);
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
     let submission = GatewaySubmission::direct_input("charge", Value::string("42".into()))
         .with_options(SubmitOptions {
+            expected_request_scope: Some(crate::tests::test_request_scope(
+                &gw, &session, "charge",
+            )?),
             idempotency_key: Some("charge-deadline-timeout".into()),
-            deadline_ms: Some(u64::try_from(now_millis().saturating_add(100))?),
+            deadline_ms: Some(u64::try_from(now_millis().saturating_add(2_000))?),
             ..SubmitOptions::default()
         });
 
-    let first = gw.submit(&session, submission.clone()).await?;
+    let first_attempt = {
+        let gw = gw.clone();
+        let session = session.clone();
+        let submission = submission.clone();
+        tokio::spawn(async move { gw.submit(&session, submission).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while count.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("slow effect did not start before Gateway deadline")?;
+    let process = gw
+        .requests
+        .inner
+        .lock()
+        .entries
+        .values()
+        .next()
+        .context("missing running request")?
+        .request_process;
+    let first = first_attempt.await??;
     ensure!(
         matches!(first.output.outcome, Outcome::Fail(Failure::Timeout)),
         "first outcome should be timeout: {:?}",
         first.output.outcome
     );
-    let entry = gw
-        .requests
-        .inner
-        .lock()
-        .entries
-        .get(&first.accepted.submission_id)
-        .cloned()
-        .context("missing retained request entry")?;
+    let unresolved = &first.output.unresolved_operations;
     ensure!(
-        boot.kernel.processes.status(entry.request_process) == Some(ProcessStatus::Cancelled),
+        unresolved.operation_ids.len() == 1 && !unresolved.identities_incomplete,
+        "deadline lost the in-flight Kernel operation: {unresolved:?}"
+    );
+    let pending_id: xolotl_types::OperationId = unresolved.operation_ids[0].parse()?;
+    ensure!(
+        pending_id.process == process,
+        "deadline retained an unrelated operation: {pending_id}"
+    );
+    ensure!(
+        boot.kernel().processes().status(process) == Some(ProcessStatus::Cancelled),
         "deadline timeout should cancel request process"
     );
     ensure!(count.load(Ordering::Acquire) == 1, "driver should run once");
 
-    let replay = gw.submit(&session, submission).await?;
+    // Retry carries a fresh request deadline; the idempotency identity is
+    // bound to the body and key, not the previous attempt's timeout.
+    let original_scope = submission.options.expected_request_scope.clone();
+    let replay = gw
+        .submit(
+            &session,
+            submission.with_options(SubmitOptions {
+                expected_request_scope: original_scope,
+                idempotency_key: Some("charge-deadline-timeout".into()),
+                deadline_ms: Some(u64::try_from(now_millis().saturating_add(2_000))?),
+                ..SubmitOptions::default()
+            }),
+        )
+        .await?;
     ensure!(
         replay.output.outcome == first.output.outcome,
         "replay should return retained outcome"
+    );
+    ensure!(
+        replay.output.unresolved_operations == *unresolved,
+        "idempotency replay lost the unresolved Kernel operation"
     );
     ensure!(
         count.load(Ordering::Acquire) == 1,
@@ -2217,6 +3616,7 @@ async fn non_idempotent_effect_requires_submission_idempotency() -> anyhow::Resu
         "effect://payment/charge",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Effectful,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -2229,7 +3629,11 @@ async fn non_idempotent_effect_requires_submission_idempotency() -> anyhow::Resu
             ["charge"],
             ["perform://effect/payment/charge"],
         ));
-    let gw = GatewayRuntime::new(boot, profile)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -2251,6 +3655,9 @@ async fn non_idempotent_effect_requires_submission_idempotency() -> anyhow::Resu
             &session,
             GatewaySubmission::direct_input("charge", Value::string("42".into())).with_options(
                 SubmitOptions {
+                    expected_request_scope: Some(crate::tests::test_request_scope(
+                        &gw, &session, "charge",
+                    )?),
                     idempotency_key: Some("charge-42".into()),
                     ..SubmitOptions::default()
                 },
@@ -2265,7 +3672,134 @@ async fn non_idempotent_effect_requires_submission_idempotency() -> anyhow::Resu
 }
 
 #[tokio::test]
+async fn original_request_scope_rejects_missing_and_replaced_identity_before_effects()
+-> anyhow::Result<()> {
+    let boot = Arc::new(Bootstrap::in_memory());
+    let count = Arc::new(AtomicUsize::new(0));
+    let target = boot.register_effect(
+        "effect://payment/charge",
+        &[xolotl_kernel::MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            xolotl_types::Purity::Effectful,
+            xolotl_kernel::MethodSpec::UNARY_ASYNC,
+        )],
+        Arc::new(BlockingCountingDriver {
+            count: count.clone(),
+            released: Arc::new(AtomicBool::new(true)),
+            release: Arc::new(tokio::sync::Notify::new()),
+        }),
+    )?;
+    let profile = identity_profile()?
+        .with_surface(GatewaySurface::effect_invoke("charge", target))
+        .with_principal_surface_binding(GatewayPrincipalSurfaceBinding::allow(
+            "alice",
+            ["charge"],
+            ["perform://effect/payment/charge"],
+        ));
+    let store: Arc<dyn crate::GatewayIdempotencyStore> =
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default());
+    let gateway = GatewayRuntime::new(boot.clone(), profile.clone(), store.clone())?;
+    let session = gateway
+        .authenticate(PresentedCredential::bearer(TEST_TOKEN))
+        .await?;
+    let initial_usage = store.usage().await?;
+    for options in [
+        SubmitOptions {
+            idempotency_key: Some("missing-key-scope".into()),
+            ..SubmitOptions::default()
+        },
+        SubmitOptions {
+            submission_token: Some("missing-token-scope".into()),
+            ..SubmitOptions::default()
+        },
+        SubmitOptions {
+            idempotency_key: Some(String::new()),
+            ..SubmitOptions::default()
+        },
+        SubmitOptions {
+            submission_token: Some(String::new()),
+            ..SubmitOptions::default()
+        },
+    ] {
+        let request =
+            GatewaySubmission::direct_input("charge", Value::integer(42)).with_options(options);
+        let error = expect_gateway_error(gateway.submit(&session, request).await)?;
+        ensure!(matches!(error, GatewayError::Rejected(_)));
+        ensure!(store.usage().await? == initial_usage);
+        ensure!(count.load(Ordering::Acquire) == 0);
+        ensure!(gateway.requests.inner.lock().entries.is_empty());
+    }
+
+    let request =
+        GatewaySubmission::direct_input("charge", Value::integer(42)).with_options(SubmitOptions {
+            expected_request_scope: Some(test_request_scope(&gateway, &session, "charge")?),
+            idempotency_key: Some("original-scope-once".into()),
+            ..SubmitOptions::default()
+        });
+    let first = gateway.submit(&session, request.clone()).await?;
+    ensure!(first.output.outcome == Outcome::Done(Value::integer(42)));
+    ensure!(count.load(Ordering::Acquire) == 1);
+    let committed_usage = store.usage().await?;
+
+    let replica = GatewayRuntime::new(boot.clone(), profile.clone(), store.clone())?;
+    let replica_session = replica
+        .authenticate(PresentedCredential::bearer(TEST_TOKEN))
+        .await?;
+    ensure!(
+        test_request_scope(&replica, &replica_session, "charge")?
+            == request
+                .options
+                .expected_request_scope
+                .clone()
+                .context("original scope missing")?
+    );
+    let replay = replica.submit(&replica_session, request.clone()).await?;
+    ensure!(replay.origin == CompletionOrigin::CachedOutcome);
+    ensure!(replay.accepted == first.accepted && replay.output == first.output);
+    ensure!(store.usage().await? == committed_usage);
+    ensure!(count.load(Ordering::Acquire) == 1);
+
+    let replacement_store: Arc<dyn crate::GatewayIdempotencyStore> =
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default());
+    let replacement = GatewayRuntime::new(boot, profile.clone(), replacement_store.clone())?;
+    let replacement_session = replacement
+        .authenticate(PresentedCredential::bearer(TEST_TOKEN))
+        .await?;
+    let replacement_usage = replacement_store.usage().await?;
+    let error = expect_gateway_error(
+        replacement
+            .submit(&replacement_session, request.clone())
+            .await,
+    )?;
+    ensure!(matches!(error, GatewayError::Rejected(_)));
+    ensure!(replacement_store.usage().await? == replacement_usage);
+    ensure!(count.load(Ordering::Acquire) == 1);
+    ensure!(replacement.requests.inner.lock().entries.is_empty());
+
+    gateway.replace_profile(profile.with_revision(2))?;
+    let current_session = gateway
+        .authenticate(PresentedCredential::bearer(TEST_TOKEN))
+        .await?;
+    let error = expect_gateway_error(gateway.submit(&current_session, request).await)?;
+    ensure!(matches!(error, GatewayError::Rejected(_)));
+    ensure!(store.usage().await? == committed_usage);
+    ensure!(count.load(Ordering::Acquire) == 1);
+    ensure!(gateway.requests.inner.lock().entries.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn idempotency_key_replays_without_reexecuting_non_idempotent_effect() -> anyhow::Result<()> {
+    for revision in [1, u64::MAX] {
+        assert_idempotency_key_replays_without_reexecuting_non_idempotent_effect(revision).await?;
+    }
+    Ok(())
+}
+
+async fn assert_idempotency_key_replays_without_reexecuting_non_idempotent_effect(
+    revision: GatewayProfileRev,
+) -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
     let count = Arc::new(AtomicUsize::new(0));
     let released = Arc::new(AtomicBool::new(false));
@@ -2274,6 +3808,7 @@ async fn idempotency_key_replays_without_reexecuting_non_idempotent_effect() -> 
         "effect://payment/charge",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Effectful,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -2284,18 +3819,32 @@ async fn idempotency_key_replays_without_reexecuting_non_idempotent_effect() -> 
         }),
     )?;
     let profile = identity_profile()?
+        .with_revision(revision)
+        .with_limits(GatewayLimitProfile {
+            max_in_flight_requests: 1,
+            ..Default::default()
+        })
         .with_surface(GatewaySurface::effect_invoke("charge", name))
         .with_principal_surface_binding(GatewayPrincipalSurfaceBinding::allow(
             "alice",
             ["charge"],
             ["perform://effect/payment/charge"],
         ));
-    let gw = Arc::new(GatewayRuntime::new(boot, profile)?);
+    let requests: Arc<dyn crate::GatewayIdempotencyStore> =
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default());
+    let replica = GatewayRuntime::new(boot.clone(), profile.clone(), requests.clone())?;
+    let replica_session = replica
+        .authenticate(PresentedCredential::bearer(TEST_TOKEN))
+        .await?;
+    let gw = Arc::new(GatewayRuntime::new(boot, profile, requests.clone())?);
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
     let submission = GatewaySubmission::direct_input("charge", Value::string("42".into()))
         .with_options(SubmitOptions {
+            expected_request_scope: Some(crate::tests::test_request_scope(
+                &gw, &session, "charge",
+            )?),
             idempotency_key: Some("charge-42-once".into()),
             ..SubmitOptions::default()
         });
@@ -2309,7 +3858,37 @@ async fn idempotency_key_replays_without_reexecuting_non_idempotent_effect() -> 
         tokio::task::yield_now().await;
     }
 
-    let second = expect_gateway_error(gw.submit(&session, submission.clone()).await)?;
+    let lookup = GatewayRequestLookup {
+        surface_id: "charge".into(),
+        expected_request_scope: submission
+            .options
+            .expected_request_scope
+            .clone()
+            .context("missing scope")?,
+        retry_epoch: 0,
+        identity: GatewayRequestIdentity::IdempotencyKey("charge-42-once".into()),
+    };
+    ensure!(matches!(
+        gw.prepare_submission(
+            &session,
+            GatewaySubmissionHead {
+                surface_id: submission.surface_id.clone(),
+                requested_output: submission.requested_output,
+                options: submission.options.clone(),
+                server_deadline: submission.server_deadline,
+            },
+            None
+        ),
+        Err(GatewayError::LimitExceeded(_))
+    ));
+    let before_lookup = requests.usage().await?;
+    ensure!(matches!(
+        gw.lookup_request(&session, lookup.clone()).await?,
+        GatewayRequestEvidence::Reserved
+    ));
+    ensure!(requests.usage().await? == before_lookup);
+
+    let second = expect_gateway_error(replica.submit(&replica_session, submission.clone()).await)?;
     ensure!(
         matches!(second, GatewayError::LimitExceeded(_)),
         "second in-flight submission should be limited: {second:?}"
@@ -2322,6 +3901,7 @@ async fn idempotency_key_replays_without_reexecuting_non_idempotent_effect() -> 
     released.store(true, Ordering::Release);
     release.notify_waiters();
     let first = first.await.context("first submission task join failed")??;
+    ensure!(first.accepted.profile_rev == revision);
     ensure!(
         first.output.outcome == Outcome::Done(Value::string("42".into())),
         "unexpected first output: {first:?}"
@@ -2331,7 +3911,24 @@ async fn idempotency_key_replays_without_reexecuting_non_idempotent_effect() -> 
         "driver should not rerun while completing first"
     );
 
-    let replay = gw.submit(&session, submission).await?;
+    let usage = requests.usage().await?;
+    let GatewayRequestEvidence::Settled(evidence) =
+        gw.lookup_request(&session, lookup.clone()).await?
+    else {
+        bail!("completed request did not provide settled evidence");
+    };
+    ensure!(evidence.accepted == first.accepted);
+    ensure!(evidence.result_class == crate::GatewayRequestResultClass::Done);
+    let crate::GatewayRetainedRequestResult::Available(retained) =
+        gw.read_retained_request_result(&session, lookup).await?
+    else {
+        bail!("retained delivery result unavailable");
+    };
+    ensure!(retained.output == first.output);
+    ensure!(retained.origin == xolotl_types::CompletionOrigin::CachedOutcome);
+    ensure!(count.load(Ordering::Acquire) == 1);
+    ensure!(requests.usage().await? == usage);
+    let replay = replica.submit(&replica_session, submission).await?;
     ensure!(
         replay.output.outcome == Outcome::Done(Value::string("42".into())),
         "unexpected replay output: {replay:?}"
@@ -2339,6 +3936,19 @@ async fn idempotency_key_replays_without_reexecuting_non_idempotent_effect() -> 
     ensure!(
         count.load(Ordering::Acquire) == 1,
         "driver should not rerun replay"
+    );
+    ensure!(
+        replay.accepted == first.accepted,
+        "replica changed acceptance identity"
+    );
+    ensure!(
+        replay.output == first.output,
+        "replica lost result or provenance"
+    );
+    ensure!(replay.origin == xolotl_types::CompletionOrigin::CachedOutcome);
+    ensure!(
+        requests.usage().await? == usage,
+        "replay changed storage accounting"
     );
     Ok(())
 }
@@ -2350,6 +3960,7 @@ async fn idempotency_key_replays_fail_outcome_variant() -> anyhow::Result<()> {
         "effect://fail/input",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -2362,12 +3973,17 @@ async fn idempotency_key_replays_fail_outcome_variant() -> anyhow::Result<()> {
             ["fail"],
             ["perform://effect/fail/input"],
         ));
-    let gw = GatewayRuntime::new(boot, profile)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
     let submission =
         GatewaySubmission::direct_input("fail", Value::null()).with_options(SubmitOptions {
+            expected_request_scope: Some(crate::tests::test_request_scope(&gw, &session, "fail")?),
             idempotency_key: Some("fail-once".into()),
             ..SubmitOptions::default()
         });
@@ -2403,6 +4019,7 @@ async fn idempotency_reservation_is_released_after_admission_rejection() -> anyh
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -2417,34 +4034,34 @@ async fn idempotency_reservation_is_released_after_admission_rejection() -> anyh
             .with_limits(limits)
             .with_surface(GatewaySurface::effect_invoke("echo", name)),
     );
-    let gw = GatewayRuntime::new(boot.clone(), profile)?;
+    let gw = GatewayRuntime::new(
+        boot.clone(),
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
     let submission = GatewaySubmission::direct_input("echo", Value::string("too-large".into()))
         .with_options(SubmitOptions {
+            expected_request_scope: Some(crate::tests::test_request_scope(&gw, &session, "echo")?),
             idempotency_key: Some("reject-and-release".into()),
             ..SubmitOptions::default()
         });
-    let prefix = Path::parse("state://gateway/idempotency")?;
-    let before = boot.kernel.processes.all_ids().len();
+    let before = boot.kernel().processes().all_ids().len();
 
     let rejected = expect_error(gw.submit(&session, submission.clone()).await)?;
     ensure!(
         matches!(&rejected, GatewayError::Rejected(_)),
         "oversized submission should be rejected"
     );
-    let released = boot
-        .kernel
-        .state
-        .query(&xolotl_state::StateScan::new(prefix.clone()))
-        .await?;
+    let released = gw.idempotency.usage().await?;
     ensure!(
-        released.entries.is_empty(),
+        released == crate::GatewayIdempotencyUsage::default(),
         "admission rejection must remove its idempotency reservation"
     );
     ensure!(
-        boot.kernel.processes.all_ids().len() == before,
+        boot.kernel().processes().all_ids().len() == before,
         "process count should not change"
     );
 
@@ -2453,13 +4070,9 @@ async fn idempotency_reservation_is_released_after_admission_rejection() -> anyh
         rejected.to_string() == retried.to_string(),
         "retry must reach the same admission check"
     );
-    let retried = boot
-        .kernel
-        .state
-        .query(&xolotl_state::StateScan::new(prefix))
-        .await?;
+    let retried = gw.idempotency.usage().await?;
     ensure!(
-        retried.entries.is_empty(),
+        retried == crate::GatewayIdempotencyUsage::default(),
         "retry rejection must remove its idempotency reservation"
     );
     Ok(())
@@ -2472,6 +4085,7 @@ async fn direct_input_large_ref_requires_provenance() -> anyhow::Result<()> {
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -2480,7 +4094,11 @@ async fn direct_input_large_ref_requires_provenance() -> anyhow::Result<()> {
     let profile = bind_alice_to_echo(
         identity_profile()?.with_surface(GatewaySurface::effect_invoke("echo", name)),
     );
-    let gw = GatewayRuntime::new(boot, profile)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -2522,6 +4140,7 @@ async fn describe_requires_current_session_and_returns_redacted_surface_catalog(
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -2533,7 +4152,11 @@ async fn describe_requires_current_session_and_returns_redacted_surface_catalog(
                 .with_schema(Some(schema_type("string")), Some(schema_type("string"))),
         ),
     );
-    let gw = GatewayRuntime::new(boot, profile)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -2575,6 +4198,7 @@ async fn describe_requires_current_session_and_returns_redacted_surface_catalog(
         descriptor.surfaces[0].output_schema == Some(schema_type("string")),
         "unexpected output schema"
     );
+    gw.validate_submission_access(&session, "echo")?;
     ensure!(
         descriptor.limits.max_literal_bytes == GatewayLimitProfile::default().max_literal_bytes,
         "unexpected literal byte limit"
@@ -2586,13 +4210,24 @@ async fn describe_requires_current_session_and_returns_redacted_surface_catalog(
         matches!(gw.describe(&stale), Err(GatewayError::Rejected(_))),
         "stale session should be rejected"
     );
+    ensure!(
+        matches!(
+            gw.validate_submission_access(&stale, "echo"),
+            Err(GatewayError::Rejected(_))
+        ),
+        "stale session must not receive submission evidence"
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn operation_not_exposed_by_profile_is_rejected() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
-    let gw = GatewayRuntime::new(boot, identity_profile()?)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        identity_profile()?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -2621,6 +4256,7 @@ async fn direct_input_large_literal_is_rejected_before_process_spawn() -> anyhow
         "effect://echo/say",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -2631,17 +4267,21 @@ async fn direct_input_large_literal_is_rejected_before_process_spawn() -> anyhow
             .with_limits(limits)
             .with_surface(GatewaySurface::effect_invoke("echo", name)),
     );
-    let gw = GatewayRuntime::new(boot.clone(), profile)?;
+    let gw = GatewayRuntime::new(
+        boot.clone(),
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
-    let before = boot.kernel.processes.all_ids().len();
-    let prefix = Path::parse("state://gateway/idempotency")?;
+    let before = boot.kernel().processes().all_ids().len();
     let submission = GatewaySubmission::direct_input(
         "echo",
         Value::string("this direct input is too large".into()),
     )
     .with_options(SubmitOptions {
+        expected_request_scope: Some(crate::tests::test_request_scope(&gw, &session, "echo")?),
         idempotency_key: Some("direct-input-too-large".into()),
         ..SubmitOptions::default()
     });
@@ -2657,16 +4297,12 @@ async fn direct_input_large_literal_is_rejected_before_process_spawn() -> anyhow
         "retry must reach the same literal limit"
     );
     ensure!(
-        boot.kernel.processes.all_ids().len() == before,
+        boot.kernel().processes().all_ids().len() == before,
         "process count should not change"
     );
-    let released = boot
-        .kernel
-        .state
-        .query(&xolotl_state::StateScan::new(prefix))
-        .await?;
+    let released = gw.idempotency.usage().await?;
     ensure!(
-        released.entries.is_empty(),
+        released == crate::GatewayIdempotencyUsage::default(),
         "direct input admission rejection must remove its idempotency reservation"
     );
     Ok(())
@@ -2682,6 +4318,7 @@ async fn gateway_budget_rejects_inflight_ops_and_releases() -> anyhow::Result<()
         "effect://budget/slow",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -2707,7 +4344,11 @@ async fn gateway_budget_rejects_inflight_ops_and_releases() -> anyhow::Result<()
             ["budget"],
             ["perform://effect/budget/slow"],
         ));
-    let gw = Arc::new(GatewayRuntime::new(boot, profile)?);
+    let gw = Arc::new(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?);
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -2760,6 +4401,7 @@ async fn gateway_budget_rejects_estimated_cost_before_dispatch() -> anyhow::Resu
         "effect://budget/costed",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -2789,7 +4431,11 @@ async fn gateway_budget_rejects_estimated_cost_before_dispatch() -> anyhow::Resu
             ["budget"],
             ["perform://effect/budget/costed"],
         ));
-    let gw = GatewayRuntime::new(boot, profile)?;
+    let gw = GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?;
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -2823,6 +4469,7 @@ async fn profile_replace_keeps_global_in_flight_limit() -> anyhow::Result<()> {
         "effect://profile/slow",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -2844,7 +4491,11 @@ async fn profile_replace_keeps_global_in_flight_limit() -> anyhow::Result<()> {
             ["slow"],
             ["perform://effect/profile/slow"],
         ));
-    let gw = Arc::new(GatewayRuntime::new(boot, profile)?);
+    let gw = Arc::new(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?);
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -2902,8 +4553,8 @@ async fn profile_replace_keeps_global_in_flight_limit() -> anyhow::Result<()> {
         .await
         .context("profile replacement submission task join failed")?;
     ensure!(
-        completed.is_ok(),
-        "running request should complete: {completed:?}"
+        matches!(completed, Err(GatewayError::Indeterminate(_))),
+        "running request must settle but withhold delivery to the stale session: {completed:?}"
     );
     ensure!(
         gw.submit(
@@ -2927,6 +4578,7 @@ async fn fair_admission_enforces_principal_limit() -> anyhow::Result<()> {
         "effect://slow/a",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -2940,6 +4592,7 @@ async fn fair_admission_enforces_principal_limit() -> anyhow::Result<()> {
         "effect://slow/b",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -2961,7 +4614,11 @@ async fn fair_admission_enforces_principal_limit() -> anyhow::Result<()> {
             ["slow-a", "slow-b"],
             ["perform://effect/slow/a", "perform://effect/slow/b"],
         ));
-    let gw = Arc::new(GatewayRuntime::new(boot, profile)?);
+    let gw = Arc::new(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?);
     let session = gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -3013,6 +4670,8 @@ async fn fair_admission_enforces_principal_limit() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn fair_admission_enforces_surface_and_risk_limits() -> anyhow::Result<()> {
+    let requests: Arc<dyn crate::GatewayIdempotencyStore> =
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default());
     let boot = Arc::new(Bootstrap::in_memory());
     let count = Arc::new(AtomicUsize::new(0));
     let released = Arc::new(AtomicBool::new(false));
@@ -3021,6 +4680,7 @@ async fn fair_admission_enforces_surface_and_risk_limits() -> anyhow::Result<()>
         "effect://fair/a",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -3034,6 +4694,7 @@ async fn fair_admission_enforces_surface_and_risk_limits() -> anyhow::Result<()>
         "effect://fair/b",
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -3055,7 +4716,11 @@ async fn fair_admission_enforces_surface_and_risk_limits() -> anyhow::Result<()>
             ["fair-a"],
             ["perform://effect/fair/a"],
         ));
-    let surface_gw = Arc::new(GatewayRuntime::new(boot.clone(), surface_profile)?);
+    let surface_gw = Arc::new(GatewayRuntime::new(
+        boot.clone(),
+        surface_profile,
+        requests.clone(),
+    )?);
     let surface_session = surface_gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -3110,7 +4775,7 @@ async fn fair_admission_enforces_surface_and_risk_limits() -> anyhow::Result<()>
             ["fair-a", "fair-b"],
             ["perform://effect/fair/a", "perform://effect/fair/b"],
         ));
-    let risk_gw = Arc::new(GatewayRuntime::new(boot, risk_profile)?);
+    let risk_gw = Arc::new(GatewayRuntime::new(boot, risk_profile, requests)?);
     let risk_session = risk_gw
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;

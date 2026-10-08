@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
         "execution layout: {:?}",
         buffers.reserve_for(&prepared, &ExecutionConfig::default())?
     )?;
-    let runtime = Xolotl::new();
+    let runtime = Xolotl::new(xolotl_state::InMemoryBackend::new().into_backend());
     for input in [0, 3] {
         let output = runtime
             .run_prepared_with_buffers(
@@ -41,7 +41,8 @@ async fn main() -> anyhow::Result<()> {
                 TaintedValue::pristine(Value::integer(input)),
                 &mut buffers,
             )
-            .await?;
+            .await?
+            .output;
         writeln!(std::io::stdout().lock(), "input={input}, output={output:?}")?;
     }
     Ok(())

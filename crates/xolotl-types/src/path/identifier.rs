@@ -1,7 +1,5 @@
 //! Shared identifier rules for resident and fragmented path fields.
 
-const STANDARD_SCHEMES: [&[u8]; 6] = [b"state", b"effect", b"process", b"proc", b"blob", b"tensor"];
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IdentifierKind {
     Scheme,
@@ -13,7 +11,6 @@ pub(crate) enum IdentifierKind {
 pub(crate) enum IdentifierError {
     Empty,
     Character,
-    ReservedCluster,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -21,7 +18,6 @@ pub(crate) struct Identifier {
     kind: IdentifierKind,
     position: u8,
     wildcards: u8,
-    reserved: u8,
     invalid: bool,
 }
 
@@ -31,7 +27,6 @@ impl Identifier {
             kind,
             position: 0,
             wildcards: 0,
-            reserved: 0b11_1111,
             invalid: false,
         }
     }
@@ -61,13 +56,6 @@ impl Identifier {
                 self.invalid = true;
                 return Err(IdentifierError::Character);
             }
-            if self.kind == IdentifierKind::Cluster {
-                for (index, scheme) in STANDARD_SCHEMES.iter().enumerate() {
-                    if scheme.get(usize::from(self.position)) != Some(&byte) {
-                        self.reserved &= !(1 << index);
-                    }
-                }
-            }
             // Eight distinguishes every reserved scheme from an arbitrary suffix.
             self.position = self.position.saturating_add(1).min(8);
         }
@@ -81,13 +69,6 @@ impl Identifier {
         if self.position == 0 {
             return Err(IdentifierError::Empty);
         }
-        if self.kind == IdentifierKind::Cluster
-            && STANDARD_SCHEMES.iter().enumerate().any(|(index, scheme)| {
-                self.reserved & (1 << index) != 0 && scheme.len() == usize::from(self.position)
-            })
-        {
-            return Err(IdentifierError::ReservedCluster);
-        }
         Ok(())
     }
 }
@@ -96,8 +77,4 @@ pub(super) fn validate(bytes: &[u8], kind: IdentifierKind) -> Result<(), Identif
     let mut identifier = Identifier::new(kind);
     identifier.push(bytes)?;
     identifier.finish()
-}
-
-pub(super) fn is_standard_scheme(bytes: &[u8]) -> bool {
-    STANDARD_SCHEMES.contains(&bytes)
 }

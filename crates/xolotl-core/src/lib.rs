@@ -18,11 +18,11 @@ mod stream;
 
 pub use analysis::{AnalysisSlot, ResourceRequirements};
 pub use authority::{AuthorityError, Handle, HandleKey, HandleSlot, HandleSlotChange, HandleTable};
-pub use frame::{Frame, FramePoolMeta};
+pub use frame::Frame;
 pub use link::{ImportBinding, LinkedProgram};
 pub use machine::{
-    Advance, CHECKPOINT_VERSION, Checkpoint, CheckpointMeta, Execution, ExecutionLimits, HostEvent,
-    Request, Task,
+    Advance, Execution, ExecutionLimits, ExecutionView, HostEvent, Request, SuspendedExecution,
+    Task,
 };
 pub use program::{Fault, IMAGE_VERSION, Join, Node, NodeKind, ProgramImage, Values};
 pub use stream::{Channel, Receive, SendError};

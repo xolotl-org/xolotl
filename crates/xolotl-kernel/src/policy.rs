@@ -14,7 +14,12 @@
 //! their residuals.
 
 use std::sync::Arc;
-use xolotl_types::{Capability, ConstraintSet, IdentityRef, Path, ResourceId, Rights, Value};
+use xolotl_types::{
+    Capability, ConstraintSet, Expiry, IdentityRef, Path, ResourceId, Rights, Value,
+};
+
+mod rate_limit;
+pub use rate_limit::RateLimitCheck;
 
 /// The verdict of a policy / one check.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,6 +82,9 @@ pub trait PolicySource: Send + Sync + 'static {
     /// Compile to a residual snapshot, partially evaluating. Returning an empty
     /// snapshot means "fully satisfied at open" (contributes nothing to the hot
     /// path); returning `Err(DeniedAtOpen)` rejects the open outright.
+    /// Hosted opens run this without holding the registry or handle-table locks.
+    /// A control-plane change during this call invalidates the prepared open;
+    /// installation never reruns the callback or evaluates its residual checks.
     fn compile(&self, ctx: &OpenContext) -> Result<PolicySnapshot, PolicyCompileError>;
 }
 
@@ -101,6 +109,12 @@ pub struct CheckCtx<'a> {
 pub trait CompiledCheck: Send + Sync + 'static {
     /// Evaluate this residual check against one operation.
     async fn evaluate(&self, ctx: &CheckCtx) -> PolicyDecision;
+    /// Whether this pure grant guard must be checked again before an awaited
+    /// child admission becomes a delegated handle. Stateful host policies run
+    /// only at invocation and must not be charged twice for one operation.
+    fn guards_derivation(&self) -> bool {
+        false
+    }
     /// Short name for trace/why-not projections.
     fn name(&self) -> &'static str;
 }
@@ -142,6 +156,12 @@ impl PolicySnapshot {
     /// Concatenate two residual snapshots, as `open()` does when merging the
     /// residuals of every matching source policy.
     pub fn merge(self, other: PolicySnapshot) -> PolicySnapshot {
+        if self.is_empty() {
+            return other;
+        }
+        if other.is_empty() {
+            return self;
+        }
         let mut checks: Vec<Arc<dyn CompiledCheck>> = (*self.checks).clone();
         checks.extend(other.checks.iter().cloned());
         PolicySnapshot::new(checks)
@@ -153,6 +173,19 @@ impl PolicySnapshot {
             let d = c.evaluate(ctx).await;
             if !d.is_allow() {
                 return d;
+            }
+        }
+        PolicyDecision::Allow
+    }
+
+    /// Recheck only immutable grant conditions after asynchronous host custody
+    /// and before creating a child. This uses the same operation input and a
+    /// fresh clock, without rerunning stateful source policies.
+    pub async fn check_derivation(&self, ctx: &CheckCtx<'_>) -> PolicyDecision {
+        for check in self.checks.iter().filter(|check| check.guards_derivation()) {
+            let decision = check.evaluate(ctx).await;
+            if !decision.is_allow() {
+                return decision;
             }
         }
         PolicyDecision::Allow
@@ -182,6 +215,44 @@ impl CompiledCheck for ConstraintCheck {
     }
     fn name(&self) -> &'static str {
         "constraint"
+    }
+}
+
+/// One grant's conjunction. Distinct matching grants are alternatives, never
+/// a conjunction: the operation may use any one grant that still covers it.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GrantCondition {
+    pub constraints: ConstraintSet,
+    pub expires: Expiry,
+}
+
+/// Residual authority for overlapping grants. Open cannot choose between
+/// input-dependent grants, so this check makes the choice per operation.
+pub(crate) struct GrantAlternativesCheck {
+    pub alternatives: Vec<GrantCondition>,
+}
+
+#[async_trait::async_trait]
+impl CompiledCheck for GrantAlternativesCheck {
+    async fn evaluate(&self, ctx: &CheckCtx) -> PolicyDecision {
+        if self.alternatives.iter().any(|grant| {
+            !grant.expires.is_expired(ctx.now_millis)
+                && grant.constraints.eval(ctx.input, ctx.now_millis)
+        }) {
+            PolicyDecision::Allow
+        } else {
+            PolicyDecision::Deny {
+                reason: "no matching grant constraint is satisfied".into(),
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "grant_alternatives"
+    }
+
+    fn guards_derivation(&self) -> bool {
+        true
     }
 }
 
@@ -285,158 +356,6 @@ impl ApprovalRegistry {
     }
 }
 
-/// A residual rate-limit check: allow at most `max_per_window`
-/// operations per `window_millis`, as a true **sliding window** keyed by
-/// `(target, acting)`. The window holds the timestamps of recent admissions;
-/// on each call, entries older than `window_millis` are evicted, then the
-/// request is admitted iff fewer than `max_per_window` remain.
-///
-/// Keying by `acting` means a delegated identity gets its own budget; Bob
-/// acting as Alice is limited per `(target, Alice)`. The window is stored in
-/// `state://kernel/ratelimit/resource:<target>/identity:<acting>`, so a
-/// crash/restart preserves the active sliding window.
-pub struct RateLimitCheck {
-    /// Maximum allowed admissions inside one sliding window.
-    pub max_per_window: u32,
-    /// Sliding window length in milliseconds.
-    pub window_millis: i64,
-    state: xolotl_state::Backend,
-}
-
-impl RateLimitCheck {
-    /// Create a rate-limit residual check backed by the state plane.
-    pub fn new(max_per_window: u32, window_millis: i64, state: xolotl_state::Backend) -> Self {
-        Self {
-            max_per_window,
-            window_millis: window_millis.max(1),
-            state,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl CompiledCheck for RateLimitCheck {
-    async fn evaluate(&self, ctx: &CheckCtx) -> PolicyDecision {
-        let path = match rate_limit_path(ctx.target, ctx.acting) {
-            Ok(path) => path,
-            Err(e) => {
-                return PolicyDecision::Deny {
-                    reason: format!("rate limit path invalid: {e}"),
-                };
-            }
-        };
-
-        for _ in 0..RATE_LIMIT_CAS_ATTEMPTS {
-            let current = match self.state.read(&path).await {
-                Ok(value) => value,
-                Err(e) => {
-                    return PolicyDecision::Deny {
-                        reason: format!("rate limit state read failed: {e}"),
-                    };
-                }
-            };
-            let mut hits = match decode_rate_hits(current.clone()) {
-                Ok(hits) => hits,
-                Err(reason) => {
-                    return PolicyDecision::Deny {
-                        reason: format!("rate limit state malformed: {reason}"),
-                    };
-                }
-            };
-
-            // Evict timestamps that have slid out of the window, then normalize
-            // storage order so the durable value remains deterministic.
-            let cutoff = ctx.now_millis - self.window_millis;
-            hits.retain(|&t| t > cutoff);
-            hits.sort_unstable();
-
-            if hits.len() as u32 >= self.max_per_window {
-                let new = encode_rate_hits(&hits);
-                if current.as_ref() == Some(&new) {
-                    return PolicyDecision::Deny {
-                        reason: "rate limit exceeded".into(),
-                    };
-                }
-                match self.state.write_cas(&path, current, new).await {
-                    Ok(_commit) => {
-                        return PolicyDecision::Deny {
-                            reason: "rate limit exceeded".into(),
-                        };
-                    }
-                    Err(xolotl_state::StateFailure {
-                        error: xolotl_state::StateError::CasFailed { .. },
-                        ..
-                    }) => continue,
-                    Err(e) => {
-                        return PolicyDecision::Deny {
-                            reason: format!("rate limit state write failed: {e}"),
-                        };
-                    }
-                }
-            }
-
-            hits.push(ctx.now_millis);
-            hits.sort_unstable();
-            let new = encode_rate_hits(&hits);
-            match self.state.write_cas(&path, current, new).await {
-                Ok(_commit) => return PolicyDecision::Allow,
-                Err(xolotl_state::StateFailure {
-                    error: xolotl_state::StateError::CasFailed { .. },
-                    ..
-                }) => continue,
-                Err(e) => {
-                    return PolicyDecision::Deny {
-                        reason: format!("rate limit state write failed: {e}"),
-                    };
-                }
-            }
-        }
-
-        PolicyDecision::Deny {
-            reason: "rate limit state contention".into(),
-        }
-    }
-    fn name(&self) -> &'static str {
-        "rate_limit"
-    }
-}
-
-const RATE_LIMIT_CAS_ATTEMPTS: usize = 16;
-
-fn rate_limit_path(
-    target: ResourceId,
-    acting: IdentityRef,
-) -> Result<Path, xolotl_types::PathError> {
-    Path::try_new("state")?
-        .try_push("kernel")?
-        .try_push("ratelimit")?
-        .try_push_literal(format!("resource:{}", target.get()))?
-        .try_push_literal(format!("identity:{}", acting.get()))
-}
-
-fn decode_rate_hits(value: Option<Value>) -> Result<Vec<i64>, String> {
-    match value {
-        None => Ok(Vec::new()),
-        Some(value) => {
-            let items = value
-                .as_list()
-                .ok_or_else(|| format!("expected timestamp list, found {value:?}"))?;
-            let mut hits = Vec::with_capacity(items.len());
-            for item in items {
-                match item.as_int() {
-                    Some(t) => hits.push(t),
-                    None => return Err(format!("expected integer timestamp, found {item:?}")),
-                }
-            }
-            Ok(hits)
-        }
-    }
-}
-
-fn encode_rate_hits(hits: &[i64]) -> Value {
-    Value::list(hits.iter().copied().map(Value::integer).collect())
-}
-
 /// A policy source that attaches a residual [`ConstraintCheck`] for a capability
 /// pattern when the open's path matches. The static parts (verb /
 /// scheme / segments) are decided at open and eliminated; only the predicate
@@ -450,8 +369,7 @@ pub struct CapabilityPolicy {
 
 impl PolicySource for CapabilityPolicy {
     fn applies_to(&self, ctx: &OpenContext) -> bool {
-        self.pattern
-            .verb_scheme_segments_match(ctx.verb, ctx.resource_path)
+        self.pattern.matches_structure(ctx.verb, ctx.resource_path)
     }
 
     fn compile(&self, _ctx: &OpenContext) -> Result<PolicySnapshot, PolicyCompileError> {
@@ -569,7 +487,12 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limit_denies_past_the_window_budget() -> anyhow::Result<()> {
-        let snap = PolicySnapshot::new(vec![Arc::new(RateLimitCheck::new(2, 1000, state()))]);
+        let snap = PolicySnapshot::new(vec![Arc::new(RateLimitCheck::new(
+            "tests",
+            2,
+            1000,
+            state(),
+        )?)]);
         // Two allowed in the window…
         let first = snap.check(&ctx(&Value::null())).await;
         ensure!(
@@ -603,9 +526,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_limit_is_keyed_by_target_and_acting() -> anyhow::Result<()> {
-        // Different targets and acting identities each get their own window.
-        let snap = PolicySnapshot::new(vec![Arc::new(RateLimitCheck::new(1, 1000, state()))]);
+    async fn rate_limit_is_keyed_by_scope_and_acting() -> anyhow::Result<()> {
+        let backend = state();
+        // Stable scopes and acting identities each get their own window.
+        let snap = PolicySnapshot::new(vec![Arc::new(RateLimitCheck::new(
+            "tests",
+            1,
+            1000,
+            backend.clone(),
+        )?)]);
         let alice = CheckCtx {
             input: &Value::null(),
             acting: xolotl_types::IdentityRef::new(10),
@@ -632,8 +561,12 @@ mod tests {
             matches!(alice_second, PolicyDecision::Deny { .. }),
             "alice second hit should deny, got {alice_second:?}"
         );
-        // …but the same acting identity on a different target has its own budget.
-        let other = snap.check(&other_target).await;
+        // A different scope has its own account in the same backend.
+        let other = PolicySnapshot::new(vec![Arc::new(RateLimitCheck::new(
+            "other", 1, 1000, backend,
+        )?)])
+        .check(&other_target)
+        .await;
         ensure!(other.is_allow(), "other target should allow, got {other:?}");
         // Bob (different acting) still has his own budget too.
         let bob = snap.check(&bob).await;
@@ -648,7 +581,7 @@ mod tests {
     async fn rate_limit_sliding_window_evicts_old_hits() -> anyhow::Result<()> {
         // A true sliding window: a hit at t=0 and one at t=600 with max=2,
         // window=1000. At t=1100 the t=0 hit has slid out, so one more fits.
-        let rl = RateLimitCheck::new(2, 1000, state());
+        let rl = RateLimitCheck::new("tests", 2, 1000, state())?;
         let input = Value::null();
         let mk = |t: i64| CheckCtx {
             input: &input,
@@ -678,8 +611,8 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_persists_window_across_check_instances() -> anyhow::Result<()> {
         let state = state();
-        let a = RateLimitCheck::new(1, 1000, state.clone());
-        let b = RateLimitCheck::new(1, 1000, state);
+        let a = RateLimitCheck::new("tests", 1, 1000, state.clone())?;
+        let b = RateLimitCheck::new("tests", 1, 1000, state)?;
         let input = Value::null();
         let mk = |t: i64| CheckCtx {
             input: &input,
@@ -701,7 +634,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_persists_evicted_window() -> anyhow::Result<()> {
         let state = state();
-        let rl = RateLimitCheck::new(2, 1000, state.clone());
+        let rl = RateLimitCheck::new("tests", 2, 1000, state.clone())?;
         let input = Value::null();
         let mk = |t: i64| CheckCtx {
             input: &input,
@@ -722,33 +655,34 @@ mod tests {
         let later = rl.evaluate(&mk(1100)).await;
         ensure!(later.is_allow(), "post-eviction hit should allow");
 
-        let path = rate_limit_path(ResourceId::new(1), xolotl_types::IdentityRef::ROOT)
+        let path = super::rate_limit::rate_limit_path("tests", xolotl_types::IdentityRef::ROOT)
             .context("rate limit path failed")?;
         let stored = state
             .read(&path)
             .await
             .context("rate limit state read failed")?;
         ensure!(
-            stored == Some(Value::list(vec![Value::integer(600), Value::integer(1100)])),
+            stored
+                .as_ref()
+                .and_then(Value::as_map)
+                .and_then(|fields| fields.get("hits"))
+                == Some(&Value::list(vec![
+                    Value::integer(600),
+                    Value::integer(1100)
+                ])),
             "stored rate-limit window mismatch: {stored:?}"
         );
         Ok(())
     }
 
     #[test]
-    fn rate_limit_uses_documented_state_path() -> anyhow::Result<()> {
-        let path = rate_limit_path(ResourceId::new(7), xolotl_types::IdentityRef::new(9))
-            .context("rate limit path failed")?;
-        ensure!(
-            path.to_string() == "state://kernel/ratelimit/resource:7/identity:9",
-            "rate-limit state path mismatch: {path}"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn snapshots_merge_residuals() -> anyhow::Result<()> {
-        let a = PolicySnapshot::new(vec![Arc::new(RateLimitCheck::new(5, 1000, state()))]);
+        let a = PolicySnapshot::new(vec![Arc::new(RateLimitCheck::new(
+            "tests",
+            5,
+            1000,
+            state(),
+        )?)]);
         let b = PolicySnapshot::new(vec![Arc::new(ApprovalCheck::always("k", "r"))]);
         let merged = a.merge(b);
         ensure!(merged.len() == 2, "merged snapshot length mismatch");

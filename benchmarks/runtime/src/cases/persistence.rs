@@ -17,9 +17,9 @@ pub async fn run(config: &Config, path: &Path) -> anyhow::Result<Work> {
     state
         .write_set_tainted(path, value, sources.clone())
         .await?;
-    let read = state.read_tainted(path).await?.context("state value")?;
-    ensure!(read.value.identity() == identity && read.taint == sources);
-    let input = read.value;
+    let read = state.read_tainted(path).await?;
+    let input = read.value.context("state value")?;
+    ensure!(input.identity() == identity && read.taint == sources);
     let fact = Fact {
         id: OperationId::new(
             ProcessId::new(2),
@@ -30,6 +30,7 @@ pub async fn run(config: &Config, path: &Path) -> anyhow::Result<Work> {
         ),
         schema_version: Fact::SCHEMA_VERSION,
         caller: ProcessId::new(2),
+        caller_identity: Some(IdentityRef::ROOT),
         acting: IdentityRef::ROOT,
         handle: HandleId::new(0, 1),
         resource: ResourceId::new(1),
@@ -50,10 +51,14 @@ pub async fn run(config: &Config, path: &Path) -> anyhow::Result<Work> {
     state
         .write_set_tainted(path, restored.input.clone(), restored.taint.clone())
         .await?;
-    let reread = state.read_tainted(path).await?.context("restored state")?;
-    ensure!(reread.value.identity() == restored.input.identity() && reread.taint == sources);
+    let reread = state.read_tainted(path).await?;
+    ensure!(
+        reread.value.as_ref().and_then(Value::identity) == restored.input.identity()
+            && reread.taint == sources
+    );
     state.write_delete(path).await?;
-    ensure!(state.read_tainted(path).await?.is_none());
+    let deleted = state.read_tainted(path).await?;
+    ensure!(deleted.value.is_none() && deleted.taint == sources);
     drop((reread, restored, encoded, fact, state));
     Ok(Work {
         units: 1,

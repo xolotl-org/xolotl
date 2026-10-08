@@ -84,9 +84,6 @@ impl FactStore for InvalidLookupStore {
     fn complete(&self, fact: Fact) -> Result<(), FactError> {
         self.inner.complete(fact)
     }
-    fn sync(&self) -> Result<(), FactError> {
-        self.inner.sync()
-    }
     fn scan(&self, query: FactQuery) -> Result<FactPage, FactError> {
         self.inner.scan(query)
     }

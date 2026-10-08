@@ -6,20 +6,25 @@ use xolotl_kernel::{Driver, DriverContext, DriverError, DriverOutput, MethodSpec
 use xolotl_types::{MethodId, Outcome, OutputMode, ProcessId, Purity, Value};
 
 /// `effect://kernel/process/inspect`.
-pub(crate) const INSPECT_METHODS: &[MethodSpec] =
-    &[MethodSpec::new("inspect", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external()];
+pub(crate) const INSPECT_METHODS: &[MethodSpec] = &[MethodSpec::new(
+    "inspect",
+    xolotl_types::MethodAuthority::Perform,
+    Purity::Pure,
+    MethodSpec::UNARY_ASYNC,
+)
+.observes_external()];
 
 /// Driver backing `effect://kernel/process/inspect`.
 pub(crate) struct KernelInspectDriver {
     processes: xolotl_kernel::ProcessTable,
-    facts: xolotl_kernel::FactSink,
+    facts: xolotl_kernel::SharedFactStore,
 }
 
 impl KernelInspectDriver {
     /// Create an inspect driver over process and fact state.
     pub(crate) fn new(
         processes: xolotl_kernel::ProcessTable,
-        facts: xolotl_kernel::FactSink,
+        facts: xolotl_kernel::SharedFactStore,
     ) -> Self {
         Self { processes, facts }
     }
@@ -94,7 +99,7 @@ impl Driver for KernelInspectDriver {
                 };
                 let page = self
                     .facts
-                    .scan(query)
+                    .scan_checked(query)
                     .map_err(|error| DriverError::Other(error.to_string()))?;
                 row.insert(
                     "recent_facts".into(),
@@ -114,48 +119,35 @@ mod tests {
     use xolotl_kernel::Bootstrap;
     use xolotl_types::IdentityRef;
 
-    #[derive(Default)]
-    struct RejectFactReads(xolotl_kernel::InMemoryExecutionIdSource);
-
-    impl xolotl_kernel::ExecutionIdSource for RejectFactReads {
-        fn reserve(
-            &self,
-            count: std::num::NonZeroU64,
-        ) -> Result<xolotl_kernel::ExecutionIdRange, xolotl_kernel::ExecutionIdError> {
-            self.0.reserve(count)
-        }
-    }
+    struct RejectFactReads;
 
     impl xolotl_kernel::FactStore for RejectFactReads {
         fn append(&self, _fact: xolotl_types::Fact) -> Result<u64, xolotl_kernel::FactError> {
-            Err(xolotl_kernel::FactError("unexpected append".into()))
+            Err(xolotl_kernel::FactError::new("unexpected append".into()))
         }
         fn complete(&self, _fact: xolotl_types::Fact) -> Result<(), xolotl_kernel::FactError> {
-            Err(xolotl_kernel::FactError("unexpected complete".into()))
-        }
-        fn sync(&self) -> Result<(), xolotl_kernel::FactError> {
-            Ok(())
+            Err(xolotl_kernel::FactError::new("unexpected complete".into()))
         }
         fn scan(
             &self,
             _query: xolotl_kernel::FactQuery,
         ) -> Result<xolotl_kernel::FactPage, xolotl_kernel::FactError> {
-            Err(xolotl_kernel::FactError("unexpected fact read".into()))
+            Err(xolotl_kernel::FactError::new("unexpected fact read".into()))
         }
         fn lookup(
             &self,
             _query: xolotl_kernel::FactLookup,
         ) -> Result<xolotl_kernel::FactLookupResult, xolotl_kernel::FactError> {
-            Err(xolotl_kernel::FactError("unexpected fact read".into()))
+            Err(xolotl_kernel::FactError::new("unexpected fact read".into()))
         }
         fn facts_of(
             &self,
             _process: ProcessId,
         ) -> Result<Vec<xolotl_types::Fact>, xolotl_kernel::FactError> {
-            Err(xolotl_kernel::FactError("unexpected fact read".into()))
+            Err(xolotl_kernel::FactError::new("unexpected fact read".into()))
         }
         fn all_facts(&self) -> Result<Vec<xolotl_types::Fact>, xolotl_kernel::FactError> {
-            Err(xolotl_kernel::FactError("unexpected fact read".into()))
+            Err(xolotl_kernel::FactError::new("unexpected fact read".into()))
         }
         fn cursor(&self) -> u64 {
             0
@@ -166,10 +158,10 @@ mod tests {
     async fn process_metadata_does_not_require_fact_storage() -> Result<()> {
         let boot = Bootstrap::in_memory();
         let driver = KernelInspectDriver::new(
-            boot.kernel.processes.clone(),
-            xolotl_kernel::FactSink::new(std::sync::Arc::new(RejectFactReads::default())),
+            boot.kernel().processes().clone(),
+            std::sync::Arc::new(RejectFactReads),
         );
-        let ctx = DriverContext::new(IdentityRef::ROOT, boot.root);
+        let ctx = DriverContext::new(IdentityRef::ROOT, boot.root());
         let Outcome::Done(rows_value) = driver
             .call(MethodId::new(0), Value::null(), OutputMode::Unary, &ctx)
             .await?
@@ -203,7 +195,10 @@ mod tests {
                 MethodId::new(0),
                 Value::map(BTreeMap::from([
                     ("include_recent_facts".into(), Value::boolean(true)),
-                    ("process".into(), Value::string(boot.root.get().to_string())),
+                    (
+                        "process".into(),
+                        Value::string(boot.root().get().to_string()),
+                    ),
                 ])),
                 OutputMode::Unary,
                 &ctx,
@@ -219,13 +214,16 @@ mod tests {
     #[tokio::test]
     async fn inspect_lists_processes() -> Result<()> {
         let boot = Bootstrap::in_memory();
-        let d = KernelInspectDriver::new(boot.kernel.processes.clone(), boot.kernel.facts.clone());
+        let d = KernelInspectDriver::new(
+            boot.kernel().processes().clone(),
+            boot.kernel().facts().store().clone(),
+        );
         let out = d
             .call(
                 MethodId::new(0),
                 Value::null(),
                 OutputMode::Unary,
-                &DriverContext::new(IdentityRef::ROOT, boot.root),
+                &DriverContext::new(IdentityRef::ROOT, boot.root()),
             )
             .await
             .context("inspect processes")?;
@@ -239,27 +237,36 @@ mod tests {
 
     #[tokio::test]
     async fn inspect_can_include_recent_facts() -> Result<()> {
-        let boot = Bootstrap::in_memory();
+        let boot = Bootstrap::from_kernel(
+            xolotl_kernel::KernelBuilder::in_memory()
+                .with_fact_sink(xolotl_kernel::FactSink::in_memory().0)
+                .build(),
+        );
         boot.record_gateway_audit(xolotl_kernel::GatewayAudit {
             event: "test",
             username: None,
             source_addr: None,
             outcome: "ok",
-            mfa_level: None,
             details: None,
         })
         .context("record gateway audit")?;
-        let d = KernelInspectDriver::new(boot.kernel.processes.clone(), boot.kernel.facts.clone());
+        let d = KernelInspectDriver::new(
+            boot.kernel().processes().clone(),
+            boot.kernel().facts().store().clone(),
+        );
         let mut input = BTreeMap::new();
         input.insert("include_recent_facts".into(), Value::boolean(true));
-        input.insert("process".into(), Value::string(boot.root.get().to_string()));
+        input.insert(
+            "process".into(),
+            Value::string(boot.root().get().to_string()),
+        );
         input.insert("limit".into(), Value::integer(8));
         let out = d
             .call(
                 MethodId::new(0),
                 Value::map(input),
                 OutputMode::Unary,
-                &DriverContext::new(IdentityRef::ROOT, boot.root),
+                &DriverContext::new(IdentityRef::ROOT, boot.root()),
             )
             .await
             .context("inspect recent facts")?;
@@ -272,7 +279,10 @@ mod tests {
     #[tokio::test]
     async fn inspect_rejects_malformed_include_recent_facts() -> Result<()> {
         let boot = Bootstrap::in_memory();
-        let d = KernelInspectDriver::new(boot.kernel.processes.clone(), boot.kernel.facts.clone());
+        let d = KernelInspectDriver::new(
+            boot.kernel().processes().clone(),
+            boot.kernel().facts().store().clone(),
+        );
         let mut input = BTreeMap::new();
         input.insert("include_recent_facts".into(), Value::string("yes".into()));
         let out = d
@@ -280,7 +290,7 @@ mod tests {
                 MethodId::new(0),
                 Value::map(input),
                 OutputMode::Unary,
-                &DriverContext::new(IdentityRef::ROOT, boot.root),
+                &DriverContext::new(IdentityRef::ROOT, boot.root()),
             )
             .await;
         ensure!(

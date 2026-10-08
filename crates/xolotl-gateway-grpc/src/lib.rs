@@ -17,12 +17,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::sync::oneshot;
+use tokio::task::AbortHandle;
 use tonic::codegen::tokio_stream::Stream;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use xolotl_gateway::GatewayTransportSecurityConfig;
-use xolotl_gateway::external::ExternalSessionHandler;
+use xolotl_gateway::external::{ExternalSessionHandler, ExternalSessionScope};
 use xolotl_proto::xolotl::v1::external as ext;
 use xolotl_proto::xolotl::v1::external::external_service_server::{
     ExternalService as ExternalGrpc, ExternalServiceServer,
@@ -35,14 +36,19 @@ pub use application::{
     ApplicationGrpcConfig, ApplicationGrpcService, ApplicationIngress,
     ApplicationObjectDownloadStream, ApplicationOutputStream,
 };
-use session::drive_external_session;
-use transport::{validate_grpc_transport, verified_grpc_source_addr};
+use session::drive_external_session_scoped;
+pub use transport::{GrpcConnectionInfo, GrpcTlsConnectionInfo};
+use transport::{
+    grpc_remote_addr, validate_grpc_transport, verified_grpc_source_addr,
+    verified_grpc_tls_boundary,
+};
 
 /// gRPC adapter for `xolotl.v1.external.ExternalService.Session`.
 #[derive(Clone)]
 pub struct ExternalGrpcService<H> {
     handler: Arc<H>,
     transport_security: GatewayTransportSecurityConfig,
+    scope: Arc<ExternalSessionScope>,
 }
 
 impl<H> ExternalGrpcService<H>
@@ -70,17 +76,28 @@ where
         Self {
             handler,
             transport_security: config.transport_security,
+            scope: Arc::new(ExternalSessionScope::default()),
         }
+    }
+
+    /// Share aggregate admission and task ownership with other External adapters.
+    pub fn with_session_scope(mut self, scope: Arc<ExternalSessionScope>) -> Self {
+        self.scope = scope;
+        self
     }
 
     /// Wrap into a tonic server service.
     pub fn into_server(self) -> ExternalServiceServer<Self> {
         ExternalServiceServer::new(self)
+            .max_decoding_message_size(1024 * 1024)
+            .max_encoding_message_size(1024 * 1024)
     }
 
     fn source_addr_for_request<T>(&self, request: &Request<T>) -> Result<Option<String>, Status> {
-        let peer = request.remote_addr().map(|addr| addr.ip());
-        if validate_grpc_transport(request.metadata(), peer, &self.transport_security).is_some() {
+        let peer = grpc_remote_addr(request).map(|addr| addr.ip());
+        if !verified_grpc_tls_boundary(request, self.transport_security.mode)
+            || validate_grpc_transport(request.metadata(), peer, &self.transport_security).is_some()
+        {
             return Err(Status::permission_denied("request rejected"));
         }
         verified_grpc_source_addr(request.metadata(), peer, &self.transport_security)
@@ -88,6 +105,9 @@ where
 }
 
 /// External gRPC transport hardening config.
+/// Encoded frames are limited to 1 MiB, the first frame to ten seconds and
+/// subsequent idle waits to 300 seconds. Services default to a 256-session
+/// scope; hosts share that scope across adapters for aggregate admission.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExternalGrpcConfig {
     /// Transport security and trusted-proxy policy.
@@ -124,30 +144,53 @@ where
         request: Request<tonic::Streaming<ext::ExternalFrame>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
         let _source_addr = self.source_addr_for_request(&request)?;
+        let permit = self
+            .scope
+            .try_admit()
+            .ok_or_else(|| Status::resource_exhausted("External session capacity exhausted"))?;
         let (tx, rx) = mpsc::channel(32);
+        let (done_tx, done) = oneshot::channel();
         let handler = self.handler.clone();
-        let task = tokio::spawn(async move {
-            drive_external_session(request.into_inner(), tx, handler).await;
-        });
+        let scope = Arc::downgrade(&self.scope);
+        let abort = self
+            .scope
+            .spawn(async move {
+                let _permit = permit;
+                drive_external_session_scoped(request.into_inner(), tx, handler, scope).await;
+                done_tx.send(()).unwrap_or(());
+            })
+            .ok_or_else(|| Status::unavailable("External scope closed"))?;
         Ok(Response::new(Box::pin(SessionResponseStream::new(
-            rx, task,
+            rx, done, abort,
         ))))
     }
 }
 
 struct SessionResponseStream {
     rx: ReceiverStream<Result<ext::ExternalFrame, Status>>,
-    task: JoinHandle<()>,
+    done: oneshot::Receiver<()>,
+    abort: AbortHandle,
     task_joined: bool,
 }
 
 impl SessionResponseStream {
-    fn new(rx: mpsc::Receiver<Result<ext::ExternalFrame, Status>>, task: JoinHandle<()>) -> Self {
+    fn new(
+        rx: mpsc::Receiver<Result<ext::ExternalFrame, Status>>,
+        done: oneshot::Receiver<()>,
+        abort: AbortHandle,
+    ) -> Self {
         Self {
             rx: ReceiverStream::new(rx),
-            task,
+            done,
+            abort,
             task_joined: false,
         }
+    }
+}
+
+impl Drop for SessionResponseStream {
+    fn drop(&mut self) {
+        self.abort.abort();
     }
 }
 
@@ -163,23 +206,15 @@ impl Stream for SessionResponseStream {
         if self.task_joined {
             return Poll::Ready(None);
         }
-        match Pin::new(&mut self.task).poll(cx) {
+        match Pin::new(&mut self.done).poll(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(())) => {
+            Poll::Ready(result) => {
                 self.task_joined = true;
-                Poll::Ready(None)
-            }
-            Poll::Ready(Err(error)) if error.is_cancelled() => {
-                self.task_joined = true;
-                tracing::debug!("external gRPC session task cancelled");
-                Poll::Ready(None)
-            }
-            Poll::Ready(Err(error)) => {
-                self.task_joined = true;
-                tracing::warn!(?error, "external gRPC session task failed");
-                Poll::Ready(Some(Err(Status::internal(
-                    "external gRPC session task failed",
-                ))))
+                Poll::Ready(
+                    result
+                        .err()
+                        .map(|_| Err(Status::internal("external gRPC session task failed"))),
+                )
             }
         }
     }

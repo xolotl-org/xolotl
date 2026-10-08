@@ -208,7 +208,13 @@ async fn install(
     });
     let capture = runtime.bootstrap().register_effect(
         "effect://scenario/media/capture",
-        &[MethodSpec::stream_async("invoke", Purity::Effectful).observes_external()],
+        &[MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Effectful,
+            MethodSpec::STREAM_ASYNC,
+        )
+        .observes_external()],
         Arc::new(MediaDriver {
             device: device.clone(),
             direction: Direction::Capture,
@@ -216,7 +222,12 @@ async fn install(
     )?;
     let play = runtime.bootstrap().register_effect(
         "effect://scenario/media/play",
-        &[MethodSpec::unary_async("invoke", Purity::Effectful)],
+        &[MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Effectful,
+            MethodSpec::UNARY_ASYNC,
+        )],
         Arc::new(MediaDriver {
             device: device.clone(),
             direction: Direction::Play,
@@ -233,7 +244,7 @@ async fn install(
 #[tokio::test]
 async fn media_directions_share_authority_with_bounded_backpressure() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(15), async {
-        let runtime = Xolotl::new();
+        let runtime = Xolotl::new(xolotl_state::InMemoryBackend::new().into_backend());
         let (_directory, device, capture, play) = install(&runtime).await?;
         let request = request(runtime.bootstrap(), &[CAPTURE, PLAY])?;
         let playback = request.executor();
@@ -308,7 +319,7 @@ async fn request_cancellation_and_receiver_disconnect_release_device_leases() ->
 {
     tokio::time::timeout(Duration::from_secs(15), async {
         for disconnect in [false, true] {
-            let runtime = Xolotl::new();
+            let runtime = Xolotl::new(xolotl_state::InMemoryBackend::new().into_backend());
             let (_directory, device, capture, _play) = install(&runtime).await?;
             let request = request(runtime.bootstrap(), &[CAPTURE])?;
             let (route, mut receiver) = stream();

@@ -13,32 +13,47 @@ workspace = true
 
 [features]
 default = []
-durable = ["xolotl-kernel/durable"]
+gateway = ["dep:xolotl-gateway"]
+console = ["dep:xolotl-console"]
+federation = ["dep:xolotl-federation", "dep:sha2", "dep:getrandom", "dep:subtle"]
 
 [dependencies]
+xolotl-federation = { workspace = true, optional = true }
+xolotl-gateway = { workspace = true, optional = true }
+xolotl-console = { workspace = true, optional = true }
 async-trait = { workspace = true, default-features = false }
 xolotl-kernel = { workspace = true, features = ["host"] }
 xolotl-state = { workspace = true, features = ["std", "tokio"] }
+xolotl-source.workspace = true
 xolotl-types.workspace = true
 parking_lot = { workspace = true, default-features = false }
 redb = { workspace = true, default-features = false }
+getrandom = { workspace = true, optional = true }
 serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
 serde_json = { workspace = true, default-features = false, features = ["std"] }
+sha2 = { workspace = true, default-features = false, optional = true }
+subtle = { workspace = true, default-features = false, optional = true }
 tokio = { workspace = true, default-features = false, features = ["sync"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true, features = ["std"] }
+
 [dev-dependencies]
+xolotl-gateway = { workspace = true, features = ["test-support"] }
+xolotl-storage-fs.workspace = true
+xolotl-kernel = { workspace = true, features = ["memory"] }
+data-encoding = { workspace = true, features = ["alloc"] }
+hmac = { workspace = true, default-features = false }
+sha1 = { workspace = true, default-features = false }
+sha2 = { workspace = true, default-features = false }
+xolotl-standard = { workspace = true, features = ["standard-core"] }
 xolotl-state = { workspace = true, features = ["test-support", "memory"] }
 xolotl-graph.workspace = true
 anyhow = { workspace = true, default-features = false, features = ["std"] }
 criterion = { workspace = true, default-features = false, features = ["cargo_bench_support"] }
 tempfile = { workspace = true, default-features = false, features = ["getrandom"] }
-tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros", "time", "test-util"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "test-util"] }
 
 [[bench]]
 name = "redb_storage"
 harness = false
-
-[[bench]]
-name = "checkpoint_catalog"
-harness = false
-required-features = ["durable"]

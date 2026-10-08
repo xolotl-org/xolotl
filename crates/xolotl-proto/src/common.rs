@@ -1,10 +1,11 @@
 // @generated — hand-maintained to match `tonic-prost-build` output for
 // `proto/xolotl/v1/common.proto`. This file is `include!`d into the `xolotl::v1`
-// module so the crate builds without `protoc`. Keep it in sync with the
-// `.proto` spec if either changes.
+// module so the crate builds without `protoc`. Regeneration must configure
+// `MapValue.entries` as a BTreeMap for stable persisted Value bytes.
 
 /// Universal addressing type.
-/// String form: `path://[cluster/]<scheme>/<seg>[/<seg>...]`.
+/// String form: local `<scheme>://[<seg>[/<seg>...]]` or clustered
+/// `path://<cluster>/<scheme>[/<seg>[/<seg>...]]`.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Path {
     /// Optional routing cluster; absent when the path has no cluster qualifier.
@@ -84,7 +85,7 @@ pub mod value {
     /// Typed protobuf alternatives preserving scalar, collection, and media distinctions.
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Kind {
-        /// Explicit null singleton; checked conversion rejects unknown enum numbers.
+        /// Explicit null singleton; conversion rejects unknown enum numbers.
         #[prost(enumeration = "super::NullValue", tag = "1")]
         NullVal(i32),
         /// Boolean scalar, distinct from numeric zero and one.
@@ -153,15 +154,16 @@ pub struct ListValue {
 /// Protobuf wrapper for a string-keyed value collection.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MapValue {
-    /// Key/value associations; conversion to domain values restores ordered map storage.
-    #[prost(map = "string, message", tag = "1")]
-    pub entries: ::std::collections::HashMap<::prost::alloc::string::String, Value>,
+    /// Ordered associations keep persisted Value encodings replay-stable.
+    #[prost(btree_map = "string, message", tag = "1")]
+    pub entries: ::std::collections::BTreeMap<::prost::alloc::string::String, Value>,
 }
 /// Pointer to large opaque content in blob storage.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BlobRef {
     /// Content hash identifying stored bytes. Wire conversion does not verify
-    /// storage ownership, provenance, or the existence of this object.
+    /// storage ownership, provenance, or the existence of this object. Bundled
+    /// stores use lowercase SHA-384 (96 hexadecimal characters).
     #[prost(string, tag = "1")]
     pub hash: ::prost::alloc::string::String,
     /// Declared payload length in bytes, without carrying the payload itself.
@@ -200,13 +202,24 @@ pub struct FrameRef {
     #[prost(string, tag = "3")]
     pub kind: ::prost::alloc::string::String,
 }
+/// Host-trusted reconciliation state independent of the final program outcome.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UnresolvedOperations {
+    /// Opaque operation or outbound command identities to reconcile.
+    #[prost(string, repeated, tag = "1")]
+    pub operation_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Some identities are unavailable; an empty ID list does not prove safety.
+    #[prost(bool, tag = "2")]
+    pub identities_incomplete: bool,
+}
+
 /// Lossless domain failure retaining its selected variant and every field.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Failure {
     /// Required domain variant. Missing or unknown alternatives are rejected.
     #[prost(
         oneof = "failure::Kind",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14"
+        tags = "1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15"
     )]
     pub kind: ::core::option::Option<failure::Kind>,
 }
@@ -235,13 +248,13 @@ pub mod failure {
         #[prost(string, tag = "2")]
         pub reason: ::prost::alloc::string::String,
     }
-    /// Operation retained for explicit recovery review.
+    /// An effect may have started but its outcome cannot be established.
     #[derive(Clone, PartialEq, ::prost::Message)]
-    pub struct Quarantined {
-        /// Identity of the uncertain operation.
-        #[prost(string, tag = "1")]
-        pub op_id: ::prost::alloc::string::String,
-        /// Quarantine diagnostic.
+    pub struct OutcomeUnknown {
+        /// Stable identities of logical operations or outbound commands.
+        #[prost(string, repeated, tag = "1")]
+        pub operation_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+        /// Host-classified cause, independent of untrusted handler error text.
         #[prost(string, tag = "2")]
         pub reason: ::prost::alloc::string::String,
     }
@@ -299,9 +312,6 @@ pub mod failure {
         /// Execution was cancelled.
         #[prost(message, tag = "7")]
         Cancelled(Marker),
-        /// Uncertain operation held for recovery review.
-        #[prost(message, tag = "8")]
-        Quarantined(Quarantined),
         /// Input validation detail.
         #[prost(string, tag = "9")]
         InvalidInput(::prost::alloc::string::String),
@@ -320,6 +330,9 @@ pub mod failure {
         /// Application-defined error class and diagnostic.
         #[prost(message, tag = "14")]
         Custom(ClassifiedError),
+        /// The original operation requires external reconciliation before replay.
+        #[prost(message, tag = "15")]
+        OutcomeUnknown(OutcomeUnknown),
     }
 }
 /// Outcome of evaluating an Operation / program node.
@@ -345,7 +358,8 @@ pub mod outcome {
         Short(super::Value),
     }
 }
-/// Capability literal: `<verb>://<scheme>/<segs>[@<predicate>]`.
+/// Capability literal: local `<verb>://<scheme>/<segs>[#<method>][@<predicate>]` or
+/// cluster-qualified `<verb>://path://<cluster>/<scheme>/<segs>[#<method>][@<predicate>]`.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Capability {
     /// Requested operation verb, validated when constructing a domain capability.
@@ -360,6 +374,13 @@ pub struct Capability {
     /// Optional predicate expression in the domain predicate parser's canonical syntax.
     #[prost(string, optional, tag = "4")]
     pub predicate: ::core::option::Option<::prost::alloc::string::String>,
+    /// Absent selects local paths, `*` selects all clustered paths, and any
+    /// other value selects one cluster.
+    #[prost(string, optional, tag = "5")]
+    pub cluster: ::core::option::Option<::prost::alloc::string::String>,
+    /// Stable method name. Absent permits every matching method.
+    #[prost(string, optional, tag = "6")]
+    pub method: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Wire collection of capability declarations; transport alone grants no authority.
 #[derive(Clone, PartialEq, ::prost::Message)]

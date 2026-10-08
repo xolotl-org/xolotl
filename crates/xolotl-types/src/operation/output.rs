@@ -2,7 +2,7 @@
 
 use alloc::{borrow::Cow, collections::BTreeMap, string::String};
 
-use crate::{ExecutionOutput, Outcome, TaintSet, TaintedFailure, TaintedValue};
+use crate::{Outcome, TaintSet, TaintedFailure, TaintedValue};
 
 /// A named usage unit independent of provider or pricing model.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -91,7 +91,12 @@ impl DriverOutput {
     /// Invocation usage and cache origin remain properties of this call; they
     /// do not propagate as metadata of intermediate program values.
     pub fn into_result(self) -> Result<TaintedValue, TaintedFailure> {
-        ExecutionOutput::new(self.outcome, self.taint).into_result()
+        match self.outcome {
+            Outcome::Done(value) | Outcome::Short(value) => {
+                Ok(TaintedValue::new(value, self.taint))
+            }
+            Outcome::Fail(failure) => Err(TaintedFailure::new(failure, self.taint)),
+        }
     }
 }
 

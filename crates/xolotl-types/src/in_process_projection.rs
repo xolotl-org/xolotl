@@ -1,7 +1,7 @@
 //! Runtime declarations for in-process Provider and Source projections.
 
 use crate::external::{EventSource, OverflowPolicy, Role};
-use crate::{EffectCapability, Path, Value};
+use crate::{EffectCapability, Path, PathError, Value};
 use alloc::collections::BTreeSet;
 use alloc::{
     string::{String, ToString},
@@ -9,6 +9,57 @@ use alloc::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Kernel-state prefix for in-process projection declarations.
+pub const IN_PROCESS_PROJECTION_CONFIG_PREFIX: &str = "state://kernel/projections/in-process";
+/// Kernel-state prefix for daemon reconcile status.
+pub const IN_PROCESS_PROJECTION_STATUS_PREFIX: &str = "state://kernel/projection-status/in-process";
+
+/// Return the id of a direct in-process projection declaration.
+///
+/// Invalid names and paths outside the exact local declaration namespace have
+/// no id that can be used for a reconcile status entry.
+pub fn in_process_projection_declaration_id(path: &Path) -> Option<&str> {
+    in_process_projection_id(path, "projections")
+}
+
+/// Return the id of a direct in-process projection status entry.
+pub fn in_process_projection_status_id(path: &Path) -> Option<&str> {
+    in_process_projection_id(path, "projection-status")
+}
+
+fn in_process_projection_id<'a>(path: &'a Path, namespace: &str) -> Option<&'a str> {
+    let [kernel, actual_namespace, in_process, id] = path.segments() else {
+        return None;
+    };
+    (path.scheme() == "state"
+        && path.cluster().is_none()
+        && kernel.as_str() == "kernel"
+        && actual_namespace.as_str() == namespace
+        && in_process.as_str() == "in-process"
+        && crate::path::is_simple_id_segment(id.as_str()))
+    .then_some(id.as_str())
+}
+
+/// Declaration address shared by declaration writers and readers.
+pub fn in_process_projection_declaration_path(id: &str) -> Result<Path, PathError> {
+    in_process_projection_path(IN_PROCESS_PROJECTION_CONFIG_PREFIX, id)
+}
+
+/// Status address shared by the daemon writer and Console reader.
+pub fn in_process_projection_status_path(id: &str) -> Result<Path, PathError> {
+    in_process_projection_path(IN_PROCESS_PROJECTION_STATUS_PREFIX, id)
+}
+
+fn in_process_projection_path(prefix: &str, id: &str) -> Result<Path, PathError> {
+    if id.is_empty() {
+        return Err(PathError::EmptySegment);
+    }
+    if !crate::path::is_simple_id_segment(id) {
+        return Err(PathError::BadSegmentChar(id.into()));
+    }
+    Path::parse(prefix)?.try_push_literal(id)
+}
 
 /// In-process projection declaration stored under
 /// `state://kernel/projections/in-process/<id>`.
@@ -271,23 +322,14 @@ fn validate_id(field: &'static str, id: &str) -> Result<(), InProcessProjectionC
     if id.trim().is_empty() {
         return Err(InProcessProjectionConfigError::EmptyField { field });
     }
-    if !is_safe_id_segment(id) {
+    if !crate::path::is_simple_id_segment(id) {
         return Err(InProcessProjectionConfigError::BadId { field });
     }
     Ok(())
 }
 
-fn is_safe_id_segment(id: &str) -> bool {
-    let mut chars = id.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphanumeric() => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
 fn is_safe_dotted_id(id: &str) -> bool {
-    id.split('.').all(is_safe_id_segment)
+    id.split('.').all(crate::path::is_simple_id_segment)
 }
 
 fn validate_source_event_sink(path: &Path) -> Result<(), InProcessProjectionConfigError> {
@@ -327,6 +369,46 @@ mod tests {
     use super::*;
     use crate::{OverflowPolicy, Purity, StreamCapacity};
     use anyhow::{Context, Result, ensure};
+
+    #[test]
+    fn status_path_uses_the_projection_id_contract() -> Result<()> {
+        ensure!(
+            in_process_projection_status_path("fetch_1")?.to_string()
+                == "state://kernel/projection-status/in-process/fetch_1"
+        );
+        ensure!(in_process_projection_status_path("_fetch").is_err());
+        ensure!(in_process_projection_declaration_path("_fetch").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn projection_path_ids_check_the_complete_local_namespace() -> Result<()> {
+        let declaration = in_process_projection_declaration_path("fetch_1")?;
+        let status = in_process_projection_status_path("fetch_1")?;
+        ensure!(in_process_projection_declaration_id(&declaration) == Some("fetch_1"));
+        ensure!(in_process_projection_status_id(&status) == Some("fetch_1"));
+        ensure!(in_process_projection_declaration_id(&status).is_none());
+        ensure!(in_process_projection_status_id(&declaration).is_none());
+        ensure!(
+            in_process_projection_declaration_id(&Path::parse(
+                "state://kernel/projections/in-process/fetch_1/child"
+            )?)
+            .is_none()
+        );
+        ensure!(
+            in_process_projection_declaration_id(&Path::parse(
+                "state://kernel/projections/in-process/fetch.bad"
+            )?)
+            .is_none()
+        );
+        ensure!(
+            in_process_projection_declaration_id(&Path::parse(
+                "path://remote/state/kernel/projections/in-process/fetch_1"
+            )?)
+            .is_none()
+        );
+        Ok(())
+    }
 
     fn provider_def(id: &str) -> InProcessProjectionDef {
         InProcessProjectionDef {

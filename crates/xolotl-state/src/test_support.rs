@@ -11,7 +11,9 @@ use xolotl_types::{Path, Value};
 /// entry and candidate limits, but total allocation and work are unbounded and
 /// the encoded-byte limit is raised to the platform maximum.
 pub trait CollectState: StateQuery {
-    /// Collect every matching page in backend order, preserving provenance.
+    /// Collect every matching record in backend order, preserving its provenance.
+    /// This fixture projection discards page-level observations such as absence
+    /// sources; use StatePager when asserting complete collection provenance.
     /// Pages observe live state rather than one snapshot of the entire prefix.
     fn read_prefix_tainted<'a>(
         &'a self,
@@ -51,6 +53,8 @@ pub trait CollectHistory: StateHistory {
     /// Collect the path and descendant history in `from_millis..to_millis`, then
     /// stably sort by timestamp. The encoded-byte limit is raised to the platform
     /// maximum; entry and candidate limits still apply to each underlying request.
+    /// This fixture projection retains event provenance, not page-level sources
+    /// from time-filtered records. Use StateHistoryPager for observation assertions.
     fn read_range<'a>(
         &'a self,
         path: &'a Path,

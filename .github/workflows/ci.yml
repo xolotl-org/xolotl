@@ -1,4 +1,4 @@
-name: Rust
+name: CI
 
 on:
   push:
@@ -7,13 +7,43 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  docs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.14.8'
+      - name: Install pinned mdBook without Cargo
+        run: |
+          archive="$RUNNER_TEMP/mdbook.tar.gz"
+          curl --fail --location --retry 3 --output "$archive" \
+            https://github.com/rust-lang/mdBook/releases/download/v0.5.2/mdbook-v0.5.2-x86_64-unknown-linux-gnu.tar.gz
+          printf '%s  %s\n' \
+            084e4342ba564db270108763e404a7d1f309d932651a22484e93c0dc1a071f6d \
+            "$archive" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/mdbook-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/mdbook-bin" mdbook
+          printf '%s\n' "$RUNNER_TEMP/mdbook-bin" >> "$GITHUB_PATH"
+      - name: Build both manuals
+        run: |
+          mdbook build docs
+          mdbook build docs/zh-CN
+      - name: Validate source and generated documentation links
+        run: python3 .github/check-doc-links.py
   workspace:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
+          toolchain: 1.98.1
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --all-features --locked
@@ -24,99 +54,216 @@ jobs:
         run: cargo doc --workspace --all-features --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings -W missing-docs
-      - run: cargo run -p xolotl-sdk --features host --example portable --locked
-      - run: cargo run -p xolotl-sdk --features host --example native_modules --locked
-  minimal:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        features: ["", "serde", "program", "program,serde", "runtime", "runtime,serde"]
+      - run: cargo run -p xolotl-sdk --features memory --example portable --locked
+      - run: cargo run -p xolotl-sdk --features memory --example native_modules --locked
+  federation-interop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          targets: thumbv7em-none-eabi
-      - run: cargo check -p xolotl-sdk --no-default-features --features "${{ matrix.features }}" --target thumbv7em-none-eabi --lib --locked
-      - run: cargo tree -p xolotl-sdk --no-default-features --features "${{ matrix.features }}" --edges normal --locked
-      - name: Enforce the allocator-free SDK dependency boundary
-        if: matrix.features == ''
+          toolchain: 1.98.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.14.8'
+      - name: Build the pinned independent OpenSSL CLI
         run: |
-          python3 - <<'PY'
-          import subprocess
-          tree = subprocess.check_output([
-              "cargo", "tree", "-p", "xolotl-sdk", "--no-default-features",
-              "--edges", "normal", "--prefix", "none", "--format", "{p}", "--locked",
-          ], text=True)
-          packages = {line.split()[0] for line in tree.splitlines() if line.strip()}
-          assert packages == {"xolotl-sdk", "xolotl-core"}, tree
-          PY
-  portable-runtime:
+          archive="$RUNNER_TEMP/openssl-3.6.5.tar.gz"
+          prefix="$RUNNER_TEMP/xolotl-interop-openssl"
+          curl --fail --location --retry 3 --output "$archive" \
+            https://github.com/openssl/openssl/releases/download/openssl-3.6.5/openssl-3.6.5.tar.gz
+          printf '%s  %s\n' \
+            a2157c2830efdec3788939b00c9b0638306d3f0bbb76dc4832ee503bb397df98 \
+            "$archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/openssl-3.6.5"
+          ./Configure no-shared no-tests --prefix="$prefix" --openssldir="$prefix/ssl"
+          make -j2 build_sw
+          make install_sw
+          printf '%s\n' "$prefix/bin" >> "$GITHUB_PATH"
+      - name: Install the pinned independent Python peer
+        run: |
+          python3 -m pip install --only-binary=:all: --no-deps \
+            cffi==2.1.1 cryptography==50.0.2 h2==4.4.1 hpack==4.2.0 \
+            hyperframe==6.1.0 pycparser==3.0 pyOpenSSL==26.4.0
+          python3 -m pip check
+      - name: Verify identity files and the cross-language TLS Session
+        run: |
+          openssl version
+          python3 --version
+          python3 - <<'PYTHON'
+          from OpenSSL import SSL
+          print(f"Python TLS: {SSL.SSLeay_version(SSL.SSLEAY_VERSION).decode()}")
+          PYTHON
+          cargo build -p xolotl-federation-key --locked
+          python3 crates/xolotl-federation-key/tests/openssl_interop.py \
+            "${CARGO_TARGET_DIR:-target}/debug/xolotl-federation-key"
+          test_name=python_openssl_h2_peer_opens_and_reads
+          listing="$(cargo test -p xolotl-federation-grpc --test independent_peer --locked -- --ignored --list)"
+          printf '%s\n' "$listing" | grep -Fx -- "$test_name: test"
+          cargo test -p xolotl-federation-grpc --test independent_peer --locked \
+            "$test_name" -- --ignored --exact --nocapture
+  portable:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
+          toolchain: 1.98.1
           targets: thumbv7em-none-eabi
           components: rustfmt, clippy
-      - run: cargo test -p xolotl-kernel --no-default-features --locked
-      - run: cargo test -p xolotl-state --no-default-features --lib --locked
-      - run: cargo test -p xolotl-state --no-default-features --features std --lib --test object_write --locked
-      - name: Document portable APIs without host features
-        run: cargo doc -p xolotl-core -p xolotl-kernel -p xolotl-state -p xolotl-sdk --no-default-features --no-deps --locked
+      - name: Check portable feature compositions
+        run: |
+          for features in "" serde program program,serde runtime runtime,serde; do
+            cargo check -p xolotl-sdk --no-default-features --features "$features" --target thumbv7em-none-eabi --lib --locked
+          done
+          cargo check -p xolotl-source --no-default-features --target thumbv7em-none-eabi --lib --locked
+          for package in xolotl-value-codec xolotl-value-object; do
+            for features in "" cbor; do
+              cargo check -p "$package" --no-default-features --features "$features" --target thumbv7em-none-eabi --lib --locked
+              cargo test -p "$package" --no-default-features --features "$features" --locked
+            done
+          done
+      - name: Validate portable execution and APIs
+        run: |
+          cargo test -p xolotl-kernel --no-default-features --locked
+          cargo test -p xolotl-state --no-default-features --lib --locked
+          cargo test -p xolotl-state --no-default-features --features std --lib --test object_write --locked
+          cargo doc -p xolotl-core -p xolotl-kernel -p xolotl-state -p xolotl-sdk --no-default-features --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings -W missing-docs
-      - run: cargo fmt --manifest-path examples/portable-runtime/Cargo.toml -- --check
-      - run: cargo run --manifest-path examples/portable-runtime/Cargo.toml --locked
-      - run: cargo test --manifest-path examples/portable-runtime/Cargo.toml --locked
-      - run: cargo check --manifest-path examples/portable-runtime/Cargo.toml --no-default-features --target thumbv7em-none-eabi --lib --locked
-      - run: cargo clippy --manifest-path examples/portable-runtime/Cargo.toml --all-targets --locked -- -D warnings
-  host-features:
+      - name: Validate the standalone portable example
+        run: |
+          cargo fmt --manifest-path examples/portable-runtime/Cargo.toml -- --check
+          cargo run --manifest-path examples/portable-runtime/Cargo.toml --locked
+          cargo test --manifest-path examples/portable-runtime/Cargo.toml --locked
+          cargo check --manifest-path examples/portable-runtime/Cargo.toml --no-default-features --target thumbv7em-none-eabi --lib --locked
+          cargo clippy --manifest-path examples/portable-runtime/Cargo.toml --all-targets --locked -- -D warnings
+  features:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     strategy:
+      fail-fast: false
       matrix:
-        features: [host, "host,plan", "host,durable", "host,multi-thread", standard]
+        group: [sdk, protocol, console, storage, websocket, standard, structured-output, daemon]
+    env:
+      FEATURE_GROUP: ${{ matrix.group }}
+      RUSTDOCFLAGS: -D warnings -W missing-docs
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.98.1
-      - run: cargo check -p xolotl-sdk --no-default-features --features "${{ matrix.features }}" --locked
-  standard-features:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        features: ["", standard-core, value-objects, http-stream, openai-responses, openai-chat, anthropic-messages, gemini-generate-content]
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.98.1
-      - run: cargo test -p xolotl-standard --no-default-features --features "${{ matrix.features }}" --lib --locked
-      - run: cargo tree -p xolotl-standard --no-default-features --features "${{ matrix.features }}" --edges normal --locked
-  portable-values:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        package: [xolotl-value-codec, xolotl-value-object]
-        features: ["", cbor]
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          targets: thumbv7em-none-eabi
-      - run: cargo check -p "${{ matrix.package }}" --no-default-features --features "${{ matrix.features }}" --target thumbv7em-none-eabi --lib --locked
-      - run: cargo test -p "${{ matrix.package }}" --no-default-features --features "${{ matrix.features }}" --locked
-  structured-output:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        package: [xolotl-gateway, xolotl-gateway-grpc]
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.98.1
-      - run: cargo check -p "${{ matrix.package }}" --no-default-features --features structured-output --lib --locked
-  daemon-features:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        features: ["", application-grpc, external-grpc, external-websocket]
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@1.98.1
-      - run: cargo check -p xolotl-daemon --no-default-features --features "${{ matrix.features }}" --locked
+          toolchain: 1.98.1
+          components: clippy
+      - name: Validate isolated feature compositions
+        run: |
+          case "$FEATURE_GROUP" in
+            sdk)
+              for features in host memory host,plan host,multi-thread standard; do
+                cargo check -p xolotl-sdk --no-default-features --features "$features" --locked
+              done
+              ;;
+            protocol)
+              for features in "" grpc transport; do
+                cargo test -p xolotl-proto --no-default-features --features "$features" --locked
+              done
+              ;;
+            console)
+              for features in "" http; do
+                cargo check -p xolotl-console --no-default-features --features "$features" --lib --locked
+                cargo test -p xolotl-console --no-default-features --features "$features" --tests --locked
+                cargo clippy -p xolotl-console --no-default-features --features "$features" --all-targets --locked -- -D warnings
+                cargo doc -p xolotl-console --no-default-features --features "$features" --no-deps --locked
+              done
+              ;;
+            storage)
+              for features in "" gateway federation console gateway,federation gateway,console federation,console gateway,federation,console; do
+                cargo check -p xolotl-storage-redb --no-default-features --features "$features" --lib --locked
+                cargo test -p xolotl-storage-redb --no-default-features --features "$features" --locked
+                cargo clippy -p xolotl-storage-redb --no-default-features --features "$features" --all-targets --locked -- -D warnings
+                cargo doc -p xolotl-storage-redb --no-default-features --features "$features" --no-deps --locked
+              done
+              ;;
+            websocket)
+              cargo test -p xolotl-gateway-websocket --no-default-features --locked
+              cargo clippy -p xolotl-gateway-websocket --no-default-features --all-targets --locked -- -D warnings
+              cargo doc -p xolotl-gateway-websocket --no-default-features --no-deps --locked
+              ;;
+            standard)
+              for features in "" standard-core value-objects http-stream openai-responses openai-chat anthropic-messages gemini-generate-content; do
+                cargo test -p xolotl-standard --no-default-features --features "$features" --lib --locked
+              done
+              ;;
+            structured-output)
+              for package in xolotl-gateway xolotl-gateway-grpc; do
+                cargo check -p "$package" --no-default-features --features structured-output --lib --locked
+              done
+              ;;
+            daemon)
+              for features in "" application-grpc external-grpc external-websocket federation-grpc; do
+                cargo check -p xolotl-daemon --no-default-features --features "$features" --bin xolotld --locked
+                cargo test -p xolotl-daemon --no-default-features --features "$features" --locked -- --test-threads=4
+                cargo clippy -p xolotl-daemon --no-default-features --features "$features" --all-targets --locked -- -D warnings
+              done
+              ;;
+            *) exit 1 ;;
+          esac
+      - name: Enforce dependency boundaries
+        if: matrix.group == 'sdk' || matrix.group == 'protocol' || matrix.group == 'console' || matrix.group == 'storage' || matrix.group == 'websocket'
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+
+          def packages(package, features=""):
+              tree = subprocess.check_output([
+                  "cargo", "tree", "-p", package, "--no-default-features",
+                  "--features", features, "--edges", "normal", "--prefix", "none",
+                  "--format", "{p}", "--locked",
+              ], text=True)
+              return {line.split()[0] for line in tree.splitlines() if line.strip()}
+
+          group = os.environ["FEATURE_GROUP"]
+          if group == "sdk":
+              assert packages("xolotl-sdk") == {"xolotl-sdk", "xolotl-core"}
+              for package in ("xolotl-kernel", "xolotl-sdk"):
+                  tree = subprocess.check_output([
+                      "cargo", "tree", "-p", package, "--no-default-features",
+                      "--features", "host", "--edges", "normal,features", "--locked",
+                  ], text=True)
+                  assert 'xolotl-state feature "memory"' not in tree, package
+          elif group == "protocol":
+              protocol = packages("xolotl-proto")
+              assert not protocol.intersection({"tonic", "tonic-prost", "tokio", "hyper", "axum"}), protocol
+              console = packages("xolotl-console-protocol")
+              assert not console.intersection({"tonic", "tonic-prost", "tokio", "hyper", "axum"}), console
+              gateway = packages("xolotl-gateway")
+              assert not gateway.intersection({"tonic", "tonic-prost", "hyper", "axum"}), gateway
+              protocol = packages("xolotl-proto", "grpc")
+              assert "tonic" in protocol, protocol
+              assert not protocol.intersection({"hyper", "h2", "axum"}), protocol
+              assert {"tonic", "hyper", "tokio"}.issubset(packages("xolotl-proto", "transport"))
+          elif group == "console":
+              for features in ("", "http"):
+                  console = packages("xolotl-console", features)
+                  assert not console.intersection({"tonic", "tonic-prost"}), console
+                  if features:
+                      assert "axum" in console, console
+                  else:
+                      assert not console.intersection({"axum", "tower-http", "hyper"}), console
+              storage = packages("xolotl-storage-redb")
+              assert not storage.intersection({"xolotl-console", "axum", "tower-http", "hyper", "tonic", "tonic-prost"}), storage
+          elif group == "storage":
+              for features in ("", "gateway", "federation", "console", "gateway,federation", "gateway,console", "federation,console", "gateway,federation,console"):
+                  storage = packages("xolotl-storage-redb", features)
+                  selected = set(features.split(","))
+                  assert ("xolotl-gateway" in storage) == ("gateway" in selected), storage
+                  assert ("xolotl-federation" in storage) == bool(selected.intersection({"federation", "console"})), storage
+                  assert ("xolotl-console" in storage) == ("console" in selected), storage
+                  assert not storage.intersection({"xolotl-gateway-grpc", "xolotl-federation-grpc", "axum", "hyper", "tonic", "tonic-prost"}), storage
+          elif group == "websocket":
+              websocket = packages("xolotl-gateway-websocket")
+              assert not websocket.intersection({"tonic", "tonic-prost"}), websocket
+          PY

@@ -31,7 +31,6 @@ pub type ProgramLoader =
 /// verifies this declaration; it cannot detect an undeclared implementation change.
 /// This is independent of the identities of the programs returned by the loader.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "durable", derive(serde::Serialize, serde::Deserialize))]
 pub struct LoaderRevision([u8; 32]);
 
 impl LoaderRevision {
@@ -130,9 +129,7 @@ impl StepModule {
     ///
     /// The returned image enters the current execution with unchanged input,
     /// provenance and acting identity. Code is reclaimed when the call exits.
-    /// A durable caller freezes the loader's revision in its imports, and the host
-    /// must supply that revision again during recovery. Input and constant arguments
-    /// are checkpointed; closures are not. Perform external reads as Operations.
+    /// Perform external reads as Operations.
     pub fn program<F>(
         name: impl Into<String>,
         revision: LoaderRevision,

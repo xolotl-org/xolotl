@@ -27,6 +27,16 @@ pub(crate) fn graph(graph: &ExecutionGraph) -> Result<[u8; 32], serde_json::Erro
                 digest.tag(4);
                 digest.step(recover);
             }
+            NodeKind::Finally => digest.tag(8),
+            NodeKind::Sequence => digest.tag(11),
+            NodeKind::Let { slot } => {
+                digest.tag(9);
+                digest.integer(u64::from(*slot));
+            }
+            NodeKind::Load { slot } => {
+                digest.tag(10);
+                digest.integer(u64::from(*slot));
+            }
             NodeKind::Join(join) => {
                 digest.tag(5);
                 digest.metadata(join)?;

@@ -9,7 +9,7 @@
 //! This format preserves sharing but does not canonicalize it. Hashes of its
 //! encoded bytes are not semantic Value hashes. Use [`Value::semantic_digest`]
 //! for sharing-independent identity. A [`ValueTableEncoder`] can intern roots
-//! from every field of a checkpoint; serialize that table once and store the
+//! from every field of a data record; serialize that table once and store the
 //! returned [`ValueRoot`] IDs in the owning record. [`ValueTableDecoder`]
 //! restores those roots with their shared resident descendants.
 
@@ -37,6 +37,9 @@ pub struct ValueRoot(u64);
 /// failure behavior; this error type does not promise fallible allocation.
 #[derive(Debug, thiserror::Error)]
 pub enum ValueTableEncodeError {
+    /// The conservative predescent node/edge/leaf-byte budget was exhausted.
+    #[error("value table traversal budget exhausted")]
+    BudgetExceeded,
     /// The table has more nodes than its u64 references can address.
     #[error("value table node identifier exceeds u64")]
     NodeIdOverflow,

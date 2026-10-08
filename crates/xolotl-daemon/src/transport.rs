@@ -1,15 +1,46 @@
 //! Host listener security and TLS construction shared by Gateway transports.
 
 use anyhow::{Context, Result};
+#[cfg(any(
+    feature = "external-grpc",
+    feature = "application-grpc",
+    feature = "federation-grpc"
+))]
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 use serde::Deserialize;
-#[cfg(any(feature = "external-grpc", feature = "application-grpc"))]
+#[cfg(any(
+    feature = "external-grpc",
+    feature = "application-grpc",
+    feature = "federation-grpc"
+))]
 use std::fs;
+#[cfg(any(
+    feature = "external-grpc",
+    feature = "application-grpc",
+    feature = "federation-grpc"
+))]
+use std::io::Cursor;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+#[cfg(any(
+    feature = "external-grpc",
+    feature = "application-grpc",
+    feature = "federation-grpc"
+))]
+use std::sync::Arc;
 use xolotl_gateway::{
     GatewayTransportSecurityConfig, GatewayTransportSecurityMode, GatewayTrustedProxyConfig,
     GatewayUnsafeTransportRelaxation,
 };
+#[cfg(any(
+    feature = "external-grpc",
+    feature = "application-grpc",
+    feature = "federation-grpc"
+))]
+use zeroize::Zeroizing;
+
+#[cfg(any(feature = "external-grpc", feature = "application-grpc"))]
+pub(crate) mod incoming;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,16 +83,42 @@ impl Default for GatewayTransportSecurityTuning {
 pub struct GatewayListenerSecurity {
     pub listen_addr: SocketAddr,
     pub config: GatewayTransportSecurityConfig,
-    #[cfg(any(feature = "external-grpc", feature = "application-grpc"))]
+    #[cfg(any(
+        feature = "external-grpc",
+        feature = "application-grpc",
+        feature = "federation-grpc"
+    ))]
     pub tls: Option<GatewayListenerTlsMaterial>,
 }
 
-#[cfg(any(feature = "external-grpc", feature = "application-grpc"))]
-#[derive(Debug, Clone)]
+#[cfg(any(
+    feature = "external-grpc",
+    feature = "application-grpc",
+    feature = "federation-grpc"
+))]
+#[derive(Clone)]
 pub struct GatewayListenerTlsMaterial {
     pub certificate_chain_pem: Vec<u8>,
-    pub private_key_pem: Vec<u8>,
+    pub private_key_pem: Zeroizing<Vec<u8>>,
     pub client_trust_roots_pem: Vec<u8>,
+}
+
+#[cfg(any(
+    feature = "external-grpc",
+    feature = "application-grpc",
+    feature = "federation-grpc"
+))]
+impl std::fmt::Debug for GatewayListenerTlsMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayListenerTlsMaterial")
+            .field("certificate_chain_bytes", &self.certificate_chain_pem.len())
+            .field("private_key_pem", &"<redacted>")
+            .field(
+                "client_trust_roots_bytes",
+                &self.client_trust_roots_pem.len(),
+            )
+            .finish()
+    }
 }
 
 impl GatewayTransportSecurityTuning {
@@ -74,7 +131,11 @@ impl GatewayTransportSecurityTuning {
         self.validate_plain_listener_inner(label, listen_addr, cfg!(test))
     }
 
-    #[cfg(any(feature = "external-grpc", feature = "application-grpc"))]
+    #[cfg(any(
+        feature = "external-grpc",
+        feature = "application-grpc",
+        feature = "federation-grpc"
+    ))]
     pub fn validate_grpc_listener(
         &self,
         label: &str,
@@ -131,12 +192,20 @@ impl GatewayTransportSecurityTuning {
         Ok(GatewayListenerSecurity {
             listen_addr,
             config,
-            #[cfg(any(feature = "external-grpc", feature = "application-grpc"))]
+            #[cfg(any(
+                feature = "external-grpc",
+                feature = "application-grpc",
+                feature = "federation-grpc"
+            ))]
             tls: None,
         })
     }
 
-    #[cfg(any(feature = "external-grpc", feature = "application-grpc"))]
+    #[cfg(any(
+        feature = "external-grpc",
+        feature = "application-grpc",
+        feature = "federation-grpc"
+    ))]
     pub(crate) fn validate_grpc_listener_inner(
         &self,
         label: &str,
@@ -247,7 +316,11 @@ impl GatewayTransportSecurityTuning {
         Ok(())
     }
 
-    #[cfg(any(feature = "external-grpc", feature = "application-grpc"))]
+    #[cfg(any(
+        feature = "external-grpc",
+        feature = "application-grpc",
+        feature = "federation-grpc"
+    ))]
     fn load_tls_material(
         &self,
         label: &str,
@@ -261,7 +334,7 @@ impl GatewayTransportSecurityTuning {
         let certificate_chain_pem = fs::read(cert)
             .with_context(|| format!("read {label} certificate_chain_path '{cert}'"))?;
         let private_key_pem =
-            fs::read(key).with_context(|| format!("read {label} private_key_path '{key}'"))?;
+            crate::config::read_private_pem_file(key, &format!("{label} private_key_path"))?;
         let mut client_trust_roots_pem = Vec::new();
         for root in &self.client_trust_roots {
             let root = non_empty_path(Some(root.as_str()))
@@ -296,36 +369,139 @@ fn ensure_file(path: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "external-grpc", feature = "application-grpc"))]
-pub(crate) fn grpc_server_builder(
+#[cfg(any(
+    feature = "external-grpc",
+    feature = "application-grpc",
+    feature = "federation-grpc"
+))]
+pub(crate) fn grpc_tls_server_config(
     security: &GatewayListenerSecurity,
-) -> Result<tonic::transport::Server> {
-    let server = tonic::transport::Server::builder();
-    if let Some(tls) = security.tls.as_ref() {
-        return server
-            .tls_config(tonic_server_tls_config(tls)?)
-            .map_err(|error| anyhow::anyhow!("configure gRPC TLS listener: {error}"));
-    }
-    Ok(server)
-}
-
-#[cfg(any(feature = "external-grpc", feature = "application-grpc"))]
-fn tonic_server_tls_config(
-    tls: &GatewayListenerTlsMaterial,
-) -> Result<tonic::transport::ServerTlsConfig> {
-    let identity = tonic::transport::Identity::from_pem(
-        tls.certificate_chain_pem.clone(),
-        tls.private_key_pem.clone(),
+) -> Result<Option<Arc<rustls::ServerConfig>>> {
+    let Some(tls) = security.tls.as_ref() else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        matches!(
+            security.config.mode,
+            GatewayTransportSecurityMode::ProductionTls | GatewayTransportSecurityMode::MutualTls
+        ),
+        "gRPC TLS material requires a TLS security mode"
     );
-    let mut config = tonic::transport::ServerTlsConfig::new().identity(identity);
-    if !tls.client_trust_roots_pem.is_empty() {
-        config = config.client_ca_root(tonic::transport::Certificate::from_pem(
-            tls.client_trust_roots_pem.clone(),
-        ));
-    }
-    Ok(config)
+    let certificates =
+        parse_ml_dsa_certificates(&tls.certificate_chain_pem, "gRPC server certificate chain")?;
+    let private_key = PrivateKeyDer::from_pem_reader(&mut Cursor::new(&tls.private_key_pem))
+        .context("parse gRPC server private key")?;
+    validate_server_identity(&certificates, &private_key)?;
+
+    let provider = Arc::new(crate::pqc_tls_crypto_provider()?);
+    let builder = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("configure TLS 1.3 only")?;
+    let builder = if security.config.mode == GatewayTransportSecurityMode::MutualTls {
+        anyhow::ensure!(
+            !tls.client_trust_roots_pem.is_empty(),
+            "gRPC mutual TLS requires client trust roots"
+        );
+        let roots =
+            parse_ml_dsa_certificates(&tls.client_trust_roots_pem, "gRPC client trust roots")?;
+        let mut store = rustls::RootCertStore::empty();
+        for root in roots {
+            store
+                .add(root)
+                .context("load ML-DSA-65 client trust root")?;
+        }
+        let verifier =
+            rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(store), provider)
+                .build()
+                .context("configure ML-DSA-65 client certificate verification")?;
+        builder.with_client_cert_verifier(verifier)
+    } else {
+        anyhow::ensure!(
+            tls.client_trust_roots_pem.is_empty(),
+            "gRPC client trust roots require mutual TLS mode"
+        );
+        builder.with_no_client_auth()
+    };
+    let mut config = builder
+        .with_single_cert(certificates, private_key)
+        .context("configure ML-DSA-65 gRPC server identity")?;
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
+    config.max_tls13_tickets = 0;
+    config.max_early_data_size = 0;
+    config.send_half_rtt_data = false;
+    anyhow::ensure!(
+        !config.ticketer.enabled(),
+        "gRPC TLS ticket producer must be disabled"
+    );
+    Ok(Some(Arc::new(config)))
 }
 
+#[cfg(any(
+    feature = "external-grpc",
+    feature = "application-grpc",
+    feature = "federation-grpc"
+))]
+fn validate_server_identity(
+    certificates: &[CertificateDer<'static>],
+    private_key: &PrivateKeyDer<'static>,
+) -> Result<()> {
+    let certified = rustls::sign::CertifiedKey::from_der(
+        certificates.to_vec(),
+        private_key.clone_key(),
+        &crate::pqc_tls_crypto_provider()?,
+    )
+    .context("validate gRPC server certificate and private key")?;
+    certified
+        .keys_match()
+        .context("gRPC server certificate must match its private key")?;
+    anyhow::ensure!(
+        certified
+            .key
+            .choose_scheme(&[rustls::SignatureScheme::ML_DSA_65])
+            .is_some(),
+        "gRPC server private key must sign with ML-DSA-65"
+    );
+    Ok(())
+}
+
+#[cfg(any(
+    feature = "external-grpc",
+    feature = "application-grpc",
+    feature = "federation-grpc"
+))]
+fn parse_ml_dsa_certificates(pem: &[u8], label: &str) -> Result<Vec<CertificateDer<'static>>> {
+    const ML_DSA_65_OID: &str = "2.16.840.1.101.3.4.3.18";
+    let certificates = CertificateDer::pem_reader_iter(&mut Cursor::new(pem))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("parse {label}"))?;
+    anyhow::ensure!(
+        !certificates.is_empty(),
+        "{label} must contain a certificate"
+    );
+    for (index, certificate) in certificates.iter().enumerate() {
+        let (remaining, parsed) = x509_parser::parse_x509_certificate(certificate.as_ref())
+            .map_err(|error| anyhow::anyhow!("parse {label} certificate {index}: {error}"))?;
+        anyhow::ensure!(
+            remaining.is_empty(),
+            "{label} certificate {index} has trailing data"
+        );
+        anyhow::ensure!(
+            parsed.public_key().algorithm.algorithm.to_id_string() == ML_DSA_65_OID
+                && parsed.signature_algorithm.algorithm.to_id_string() == ML_DSA_65_OID
+                && parsed.tbs_certificate.signature.algorithm.to_id_string() == ML_DSA_65_OID,
+            "{label} certificate {index} must use ML-DSA-65 for its public key and signature"
+        );
+    }
+    Ok(certificates)
+}
+
+#[cfg(any(
+    feature = "external-grpc",
+    feature = "application-grpc",
+    feature = "external-websocket"
+))]
 pub(crate) fn log_transport_security(
     label: &'static str,
     addr: &str,

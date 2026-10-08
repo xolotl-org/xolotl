@@ -8,8 +8,24 @@ fn image(nodes: &[Node<i64, Fault>], entry: u32) -> ProgramImage<'_, i64, Fault>
         entry,
         bindings: 1,
         imports: 1,
-        durable: false,
     }
+}
+
+#[test]
+fn image_admission_and_analysis_accept_only_version_one() -> anyhow::Result<()> {
+    let nodes = [Node::new(N::Load(0), 0)];
+    let mut program = image(&nodes, 0);
+    let mut scratch = [AnalysisSlot::default(); 1];
+    anyhow::ensure!(IMAGE_VERSION == 1);
+    program.version = 1;
+    program.validate()?;
+    program.resource_requirements(&mut scratch)?;
+    for version in [0, 2] {
+        program.version = version;
+        anyhow::ensure!(program.validate() == Err(Fault::Version));
+        anyhow::ensure!(program.resource_requirements(&mut scratch) == Err(Fault::Version));
+    }
+    Ok(())
 }
 
 #[test]

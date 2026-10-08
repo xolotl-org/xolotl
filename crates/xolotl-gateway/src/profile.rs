@@ -3,16 +3,20 @@ use crate::{
     DEFAULT_BUDGET_MAX_INLINE_VALUE_BYTES, DEFAULT_BUDGET_MAX_STREAM_ITEMS,
     DEFAULT_MAX_COLLECT_LIMIT, DEFAULT_MAX_DEADLINE_MS_FROM_NOW, DEFAULT_MAX_IN_FLIGHT_REQUESTS,
     DEFAULT_MAX_LITERAL_BYTES, DEFAULT_MAX_PRINCIPAL_IN_FLIGHT_REQUESTS,
-    DEFAULT_MAX_RISK_CLASS_IN_FLIGHT_REQUESTS, DEFAULT_MAX_STREAM_BYTES,
-    DEFAULT_MAX_STREAM_INLINE_ITEM_BYTES, DEFAULT_MAX_STREAM_ITEMS,
+    DEFAULT_MAX_RECENT_CANCELLATIONS, DEFAULT_MAX_RISK_CLASS_IN_FLIGHT_REQUESTS,
+    DEFAULT_MAX_STREAM_BYTES, DEFAULT_MAX_STREAM_INLINE_ITEM_BYTES, DEFAULT_MAX_STREAM_ITEMS,
     DEFAULT_MAX_SURFACE_IN_FLIGHT_REQUESTS, GatewayAllowedHost, GatewayAllowedOrigin,
     GatewayCredential, GatewayError, GatewayGeneration, GatewayIdentityMapping, GatewayProfileRev,
 };
 use std::collections::BTreeMap;
 use xolotl_types::{Path, ProcessId, ResourceName, Value};
 
+mod compiled;
 mod document;
-pub use document::GatewayProfileDocument;
+pub(crate) use compiled::{CompiledGatewayProfile, CompiledSurfaceDescriptor};
+pub use document::{
+    GATEWAY_PROFILES_PREFIX, GatewayProfileDocument, gateway_profile_id, gateway_profile_path,
+};
 
 /// One resource surface exposed by a gateway profile.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -233,6 +237,9 @@ pub struct GatewayLimitProfile {
     pub max_surface_in_flight_requests: usize,
     /// Maximum concurrently executing submissions for one risk class.
     pub max_risk_class_in_flight_requests: usize,
+    /// Maximum recent cancellations retained for idempotent cancel requests.
+    /// Zero disables history without affecting live requests.
+    pub max_recent_cancellations: usize,
     /// Aggregate request budget reserved before request Process creation.
     pub budget: GatewayBudgetProfile,
     /// Maximum items accepted in one client-to-kernel input stream.
@@ -241,6 +248,12 @@ pub struct GatewayLimitProfile {
     pub max_stream_bytes: usize,
     /// Maximum inline bytes accepted for one input stream item.
     pub max_stream_inline_item_bytes: usize,
+    /// Maximum distinct typed objects authorized by one upload ticket.
+    pub max_ticket_objects: usize,
+    /// Maximum aggregate canonical bytes of distinct backing blobs in a ticket.
+    pub max_ticket_total_bytes: u64,
+    /// Maximum encoded State row occupied by one ticket, including provenance.
+    pub max_ticket_record_bytes: usize,
 }
 
 impl Default for GatewayLimitProfile {
@@ -253,10 +266,14 @@ impl Default for GatewayLimitProfile {
             max_principal_in_flight_requests: DEFAULT_MAX_PRINCIPAL_IN_FLIGHT_REQUESTS,
             max_surface_in_flight_requests: DEFAULT_MAX_SURFACE_IN_FLIGHT_REQUESTS,
             max_risk_class_in_flight_requests: DEFAULT_MAX_RISK_CLASS_IN_FLIGHT_REQUESTS,
+            max_recent_cancellations: DEFAULT_MAX_RECENT_CANCELLATIONS,
             budget: GatewayBudgetProfile::default(),
             max_stream_items: DEFAULT_MAX_STREAM_ITEMS,
             max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
             max_stream_inline_item_bytes: DEFAULT_MAX_STREAM_INLINE_ITEM_BYTES,
+            max_ticket_objects: 16,
+            max_ticket_total_bytes: 1024 * 1024 * 1024,
+            max_ticket_record_bytes: 256 * 1024,
         }
     }
 }

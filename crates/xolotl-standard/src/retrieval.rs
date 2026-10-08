@@ -10,13 +10,16 @@ use xolotl_types::{TensorRef, Value, ValueList, ValueMap, ValueText};
 
 pub(crate) mod admission;
 
-/// Host-selected retrieval work windows and object read capability. The
-/// settings bound one I/O or cooperative work window, not total vector size.
+pub(crate) const DEFAULT_REPAIR_ATTEMPTS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(7);
+
+/// Host-selected retrieval work windows, Memory repair attempts and object read
+/// capability. Windows do not bound total vector size or resident index memory.
 #[derive(Clone)]
 pub struct RetrievalConfig {
     pub(crate) objects: ObjectStore,
     pub(crate) io_window: NonZeroUsize,
     pub(crate) work_quantum: NonZeroUsize,
+    pub(crate) repair_attempts: NonZeroUsize,
 }
 
 impl Default for RetrievalConfig {
@@ -25,6 +28,7 @@ impl Default for RetrievalConfig {
             objects: ObjectStore::new(),
             io_window: NonZeroUsize::MIN.saturating_add(16 * 1024 - 1),
             work_quantum: NonZeroUsize::MIN.saturating_add(4095),
+            repair_attempts: DEFAULT_REPAIR_ATTEMPTS,
         }
     }
 }
@@ -47,6 +51,15 @@ impl RetrievalConfig {
     /// Select how many scalar operations run before yielding to the executor.
     pub fn with_work_quantum(mut self, operations: NonZeroUsize) -> Self {
         self.work_quantum = operations;
+        self
+    }
+
+    /// Bound Memory recall search rounds and each rebuilt record's projection
+    /// attempts, including the initial attempt. Defaults to eight. Exhaustion
+    /// retains observed sources and returns `memory_repair_exhausted`; it does
+    /// not bound the namespace size or replace a host call deadline.
+    pub fn with_repair_attempts(mut self, attempts: NonZeroUsize) -> Self {
+        self.repair_attempts = attempts;
         self
     }
 }

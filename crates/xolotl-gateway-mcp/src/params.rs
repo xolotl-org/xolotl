@@ -1,6 +1,5 @@
 use crate::validation::{is_mcp_name_segment, is_mcp_uri};
 use serde::Deserialize;
-use xolotl_types::Value;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum McpCompletionReference {
@@ -99,7 +98,7 @@ pub(crate) fn parse_list_params(params: Option<serde_json::Value>) -> Result<usi
 
 pub(crate) fn parse_tools_call_params(
     params: Option<serde_json::Value>,
-) -> Result<(String, Value), McpParamError> {
+) -> Result<(String, serde_json::Value), McpParamError> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct ToolCallParams {
@@ -132,9 +131,7 @@ pub(crate) fn parse_tools_call_params(
     if !arguments.is_object() {
         return Err(McpParamError::BadArguments);
     }
-    let args =
-        serde_json::from_value::<Value>(arguments).map_err(|_error| McpParamError::BadArguments)?;
-    Ok((params.name, args))
+    Ok((params.name, arguments))
 }
 
 pub(crate) fn parse_resources_read_params(
@@ -163,7 +160,7 @@ pub(crate) fn parse_resources_read_params(
 
 pub(crate) fn parse_prompts_get_params(
     params: Option<serde_json::Value>,
-) -> Result<(String, Value), McpParamError> {
+) -> Result<(String, serde_json::Value), McpParamError> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct PromptGetParams {
@@ -191,9 +188,7 @@ pub(crate) fn parse_prompts_get_params(
     if !arguments.is_object() {
         return Err(McpParamError::BadArguments);
     }
-    let args =
-        serde_json::from_value::<Value>(arguments).map_err(|_error| McpParamError::BadArguments)?;
-    Ok((params.name, args))
+    Ok((params.name, arguments))
 }
 
 pub(crate) fn parse_completion_complete_params(

@@ -3,14 +3,13 @@ use crate::driver::StreamSendError;
 use crate::fact::FactSink;
 use crate::handle::HandleTable;
 use crate::host::stream::ChannelSink;
-use crate::stream::StreamSink;
+use crate::stream::{StreamError, StreamSendRequest, StreamSink};
 use anyhow::ensure;
-use parking_lot::RwLock;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::Poll;
+use std::task::{Context, Poll};
 use xolotl_state::{Backend, InMemoryBackend};
 use xolotl_types::{IdentityRef, ProcessId, TaintSource, TaintedValue};
 
@@ -24,7 +23,7 @@ impl Drop for DropFlag {
 
 fn data_plane(state: Backend) -> DataPlane {
     let (facts, _) = FactSink::in_memory();
-    DataPlane::new(Arc::new(RwLock::new(HandleTable::new())), facts, state)
+    DataPlane::new(HandleTable::new(), facts, state)
 }
 
 fn one_chunk_channel() -> (Arc<ChannelSink>, StreamReceiver) {
@@ -44,12 +43,12 @@ async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
     poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
 }
 
-async fn driver_stream(
+async fn driver_stream_result(
     _dp: &DataPlane,
     call: impl Future<Output = Result<DriverOutput, DriverError>>,
     sink: DynStreamSink,
     taint: &TaintSet,
-) -> anyhow::Result<DriverOutput> {
+) -> InvocationResult {
     let output = async {
         match call.await {
             Ok(output) => output,
@@ -59,7 +58,312 @@ async fn driver_stream(
             }
         }
     };
-    Ok(run_streamed_invocation(output, sink.clone(), taint).await)
+    let operation = xolotl_types::OperationId::new(
+        ProcessId::new(1),
+        xolotl_types::ExecutionId::FIRST,
+        xolotl_types::InvocationId::new(1),
+        xolotl_types::CausalPosition::new(0),
+        0,
+    );
+    run_streamed_invocation(
+        output.map(InvocationResult::new),
+        sink,
+        operation,
+        taint,
+        None,
+        &AtomicBool::new(false),
+    )
+    .await
+}
+
+async fn driver_stream(
+    dp: &DataPlane,
+    call: impl Future<Output = Result<DriverOutput, DriverError>>,
+    sink: DynStreamSink,
+    taint: &TaintSet,
+) -> anyhow::Result<DriverOutput> {
+    let result = driver_stream_result(dp, call, sink, taint).await;
+    ensure!(result.completion_error.is_none());
+    Ok(result.output)
+}
+
+struct TerminalProbe {
+    finish: Poll<Result<(), StreamError>>,
+    closed: Arc<parking_lot::Mutex<Option<StreamEnd>>>,
+}
+
+impl StreamSink for TerminalProbe {
+    fn poll_send(
+        &self,
+        _: &mut Context<'_>,
+        request: &mut StreamSendRequest,
+    ) -> Poll<Result<(), StreamSendError<TaintedValue>>> {
+        Poll::Ready(match request.take_chunk() {
+            Some(value) => Err(StreamSendError::Closed(value)),
+            None => Ok(()),
+        })
+    }
+
+    fn cancel_send(&self, _: &mut StreamSendRequest) {}
+
+    fn poll_finish(
+        &self,
+        _: &mut Context<'_>,
+        end: &mut Option<StreamEnd>,
+    ) -> Poll<Result<(), StreamError>> {
+        assert!(end.is_some());
+        if matches!(self.finish, Poll::Ready(Ok(()))) {
+            *self.closed.lock() = end.take();
+        }
+        self.finish.clone()
+    }
+
+    fn close(&self, end: StreamEnd) {
+        assert!(!matches!(self.finish, Poll::Ready(Ok(()))));
+        self.closed.lock().get_or_insert(end);
+    }
+
+    fn poll_closed(&self, _: &mut Context<'_>) -> Poll<()> {
+        Poll::Pending
+    }
+}
+
+#[tokio::test]
+async fn rejected_stream_terminal_preserves_driver_result_and_reports_completion_error()
+-> anyhow::Result<()> {
+    let closed = Arc::new(parking_lot::Mutex::new(None));
+    let sink: DynStreamSink = Arc::new(TerminalProbe {
+        finish: Poll::Ready(Err(StreamError::Failed(Failure::Timeout))),
+        closed: closed.clone(),
+    });
+    let operation = xolotl_types::OperationId::new(
+        ProcessId::new(1),
+        xolotl_types::ExecutionId::FIRST,
+        xolotl_types::InvocationId::new(1),
+        xolotl_types::CausalPosition::new(0),
+        0,
+    );
+    let original = DriverOutput::new(Outcome::Done(Value::integer(7)));
+    let result = run_streamed_invocation(
+        std::future::ready(InvocationResult::new(original.clone())),
+        sink,
+        operation,
+        &TaintSet::pristine(),
+        None,
+        &AtomicBool::new(false),
+    )
+    .await;
+    ensure!(result.output == original);
+    ensure!(matches!(
+        result.completion_error,
+        Some(CompletionError::Output(Failure::Timeout))
+    ));
+    ensure!(
+        *closed.lock()
+            == Some(StreamEnd {
+                outcome: Ok(()),
+                taint: TaintSet::pristine(),
+                origin: CompletionOrigin::CurrentAttempt,
+            })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_rejection_is_not_hidden_by_optional_fact_error() -> anyhow::Result<()> {
+    let closed = Arc::new(parking_lot::Mutex::new(None));
+    let sink: DynStreamSink = Arc::new(TerminalProbe {
+        finish: Poll::Ready(Err(StreamError::Closed)),
+        closed: closed.clone(),
+    });
+    let operation = xolotl_types::OperationId::new(
+        ProcessId::new(1),
+        xolotl_types::ExecutionId::FIRST,
+        xolotl_types::InvocationId::new(2),
+        xolotl_types::CausalPosition::new(0),
+        0,
+    );
+    let original = DriverOutput::new(Outcome::Done(Value::integer(8)));
+    let result = run_streamed_invocation(
+        std::future::ready(InvocationResult {
+            output: original.clone(),
+            completion_error: Some(CompletionError::Fact(Failure::Timeout)),
+            effect_may_have_started: true,
+        }),
+        sink,
+        operation,
+        &TaintSet::pristine(),
+        None,
+        &AtomicBool::new(false),
+    )
+    .await;
+    ensure!(result.output == original);
+    ensure!(matches!(
+        result.completion_error,
+        Some(CompletionError::Output(_))
+    ));
+    ensure!(
+        result
+            .completion_error
+            .as_ref()
+            .is_some_and(CompletionError::requires_interruption)
+    );
+    ensure!(
+        *closed.lock()
+            == Some(StreamEnd {
+                outcome: Ok(()),
+                taint: TaintSet::pristine(),
+                origin: CompletionOrigin::CurrentAttempt,
+            })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn accepted_terminal_transfers_ownership_without_a_second_close() -> anyhow::Result<()> {
+    let closed = Arc::new(parking_lot::Mutex::new(None));
+    let sink: DynStreamSink = Arc::new(TerminalProbe {
+        finish: Poll::Ready(Ok(())),
+        closed: closed.clone(),
+    });
+    let operation = xolotl_types::OperationId::new(
+        ProcessId::new(1),
+        xolotl_types::ExecutionId::FIRST,
+        xolotl_types::InvocationId::new(4),
+        xolotl_types::CausalPosition::new(0),
+        0,
+    );
+    let taint = TaintSet::author();
+    let output = DriverOutput::new(Outcome::Fail(Failure::Timeout))
+        .with_taint(taint.clone())
+        .with_origin(CompletionOrigin::CachedOutcome);
+    let result = run_streamed_invocation(
+        std::future::ready(InvocationResult::new(output.clone())),
+        sink,
+        operation,
+        &taint,
+        None,
+        &AtomicBool::new(false),
+    )
+    .await;
+    ensure!(result.output == output && result.completion_error.is_none());
+    ensure!(
+        *closed.lock()
+            == Some(StreamEnd {
+                outcome: Err(Failure::Timeout),
+                taint,
+                origin: CompletionOrigin::CachedOutcome,
+            })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_rejection_preserves_a_required_completion_error() -> anyhow::Result<()> {
+    let operation = xolotl_types::OperationId::new(
+        ProcessId::new(1),
+        xolotl_types::ExecutionId::FIRST,
+        xolotl_types::InvocationId::new(5),
+        xolotl_types::CausalPosition::new(0),
+        0,
+    );
+    for error in [
+        CompletionError::Settlement(Failure::Timeout),
+        CompletionError::Dispatch(Failure::Timeout),
+    ] {
+        let closed = Arc::new(parking_lot::Mutex::new(None));
+        let sink: DynStreamSink = Arc::new(TerminalProbe {
+            finish: Poll::Ready(Err(StreamError::Closed)),
+            closed: closed.clone(),
+        });
+        let original = DriverOutput::new(Outcome::Done(Value::integer(8)));
+        let expected = error.outcome_unknown(operation);
+        let result = run_streamed_invocation(
+            std::future::ready(InvocationResult {
+                output: original.clone(),
+                completion_error: Some(error.clone()),
+                effect_may_have_started: true,
+            }),
+            sink,
+            operation,
+            &TaintSet::pristine(),
+            None,
+            &AtomicBool::new(true),
+        )
+        .await;
+        ensure!(result.output == original && result.completion_error == Some(error));
+        ensure!(
+            closed
+                .lock()
+                .as_ref()
+                .is_some_and(|end| end.outcome == Err(expected))
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelling_terminal_delivery_preserves_the_acquired_conclusion() -> anyhow::Result<()> {
+    let operation = xolotl_types::OperationId::new(
+        ProcessId::new(1),
+        xolotl_types::ExecutionId::FIRST,
+        xolotl_types::InvocationId::new(3),
+        xolotl_types::CausalPosition::new(0),
+        0,
+    );
+    let input_taint = TaintSet::author();
+    let output_taint = TaintSet::of(TaintSource::Protected {
+        path: Path::parse("state://terminal/source")?,
+    });
+    let origin = CompletionOrigin::CachedOutcome;
+    for (outcome, completion_error, expected) in [
+        (Outcome::Done(Value::integer(7)), None, Ok(())),
+        (Outcome::Fail(Failure::Timeout), None, Err(Failure::Timeout)),
+        (
+            Outcome::Done(Value::integer(7)),
+            Some(CompletionError::Fact(Failure::Timeout)),
+            Ok(()),
+        ),
+        (
+            Outcome::Done(Value::integer(7)),
+            Some(CompletionError::Settlement(Failure::Timeout)),
+            Err(CompletionError::Settlement(Failure::Timeout).outcome_unknown(operation)),
+        ),
+    ] {
+        let closed = Arc::new(parking_lot::Mutex::new(None));
+        let sink: DynStreamSink = Arc::new(TerminalProbe {
+            finish: Poll::Pending,
+            closed: closed.clone(),
+        });
+        let dispatched = AtomicBool::new(true);
+        let result = InvocationResult {
+            output: DriverOutput::new(outcome)
+                .with_taint(output_taint.clone())
+                .with_origin(origin),
+            completion_error,
+            effect_may_have_started: true,
+        };
+        let mut execution = Box::pin(run_streamed_invocation(
+            std::future::ready(result),
+            sink,
+            operation,
+            &input_taint,
+            None,
+            &dispatched,
+        ));
+        ensure!(poll_once(execution.as_mut()).await.is_pending());
+        ensure!(closed.lock().is_none());
+        drop(execution);
+        ensure!(
+            *closed.lock()
+                == Some(StreamEnd {
+                    outcome: expected,
+                    taint: input_taint.clone().merged(&output_taint),
+                    origin,
+                })
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -182,10 +486,15 @@ async fn receiver_failure_cancels_a_producer_waiting_outside_emit() -> anyhow::R
         std::future::pending::<Result<DriverOutput, DriverError>>().await
     };
     let taint = TaintSet::pristine();
-    let mut execution = Box::pin(driver_stream(&dp, producer, sink, &taint));
+    let mut execution = Box::pin(driver_stream_result(&dp, producer, sink, &taint));
     ensure!(poll_once(execution.as_mut()).await.is_pending());
     drop(receiver);
-    ensure!(matches!(execution.await?.outcome, Outcome::Fail(_)));
+    let result = execution.await;
+    ensure!(matches!(result.output.outcome, Outcome::Fail(_)));
+    ensure!(matches!(
+        result.completion_error,
+        Some(CompletionError::Output(_))
+    ));
     ensure!(dropped.load(Ordering::SeqCst));
     Ok(())
 }
@@ -359,7 +668,7 @@ async fn collect_driver_failure_preserves_buffered_and_collected_provenance() ->
 async fn collect_interrupted_effect_remains_pending_uncached_and_reserved() -> anyhow::Result<()> {
     use crate::driver::{Driver, DriverPlan};
     use crate::fact::FactStore;
-    use crate::handle::{FastPath, Handle, HandleState};
+    use crate::handle::{FastPath, Handle};
     use crate::invocation::{Billing, InvocationOptions};
     use crate::process::{ProcessEntry, ProcessTable};
     use anyhow::Context;
@@ -398,8 +707,9 @@ async fn collect_interrupted_effect_remains_pending_uncached_and_reserved() -> a
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
     plan.insert(MethodId::new(7), contract, driver.clone());
     let process = ProcessId::new(1);
-    let mut handles = HandleTable::new();
+    let handles = HandleTable::new();
     let handle = handles.insert(Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process,
         acting: IdentityRef::ROOT,
@@ -407,7 +717,6 @@ async fn collect_interrupted_effect_remains_pending_uncached_and_reserved() -> a
         rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
         driver_plan: plan,
         fast_path: FastPath::Unconditional,
-        state: HandleState::Active,
         bound_path: None,
     })?;
     let mut entry = ProcessEntry::new(process, None, IdentityRef::ROOT);
@@ -416,8 +725,9 @@ async fn collect_interrupted_effect_remains_pending_uncached_and_reserved() -> a
     processes.insert(entry);
     let state = InMemoryBackend::new().into_backend();
     let (facts, store) = FactSink::in_memory();
-    let dp = DataPlane::new(Arc::new(RwLock::new(handles)), facts, state.clone())
-        .with_processes(processes.clone());
+    let dp = DataPlane::new(handles, facts, state.clone())
+        .with_host_runtime(processes.host_runtime().clone())?
+        .with_processes(processes.clone())?;
     let mut operation = Operation {
         id: OperationId::new(
             process,
@@ -444,13 +754,14 @@ async fn collect_interrupted_effect_remains_pending_uncached_and_reserved() -> a
             .execute(
                 &operation,
                 InvocationOptions {
+                    caller_identity: None,
                     now_millis: 0,
-                    record: false,
+                    record: true,
                 },
             )
             .await;
         ensure!(
-            output.outcome
+            output.output.outcome
                 == Outcome::Short(Value::list(vec![Value::integer(i64::from(attempt) + 1)]))
         );
         ensure!(driver.0.load(Ordering::SeqCst) == attempt as usize + 1);

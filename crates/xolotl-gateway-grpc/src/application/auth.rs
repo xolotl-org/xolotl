@@ -1,11 +1,13 @@
 use std::borrow::Cow;
 use tonic::metadata::MetadataMap;
-use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use tonic::{Request, Status};
 use xolotl_gateway::{GatewaySession, GatewayTransportSecurityMode, PresentedCredential};
 
 use super::{ApplicationGrpcService, RequestEvidence};
-use crate::transport::{first_forwarded_value, forwarded_header_param, validate_grpc_transport};
+use crate::transport::{
+    forwarded_header_param, grpc_peer_certificates, grpc_remote_addr, single_forwarded_value,
+    validate_grpc_transport, verified_grpc_tls_boundary,
+};
 
 impl ApplicationGrpcService {
     pub(super) async fn authenticate<T>(
@@ -27,13 +29,12 @@ impl ApplicationGrpcService {
             None if self.config.transport_security.mode
                 == GatewayTransportSecurityMode::MutualTls =>
             {
-                let certificates = request
-                    .peer_certs()
+                let certificates = grpc_peer_certificates(request)
                     .ok_or_else(|| Status::unauthenticated("authentication failed"))?;
                 let leaf = certificates
                     .first()
                     .ok_or_else(|| Status::unauthenticated("authentication failed"))?;
-                PresentedCredential::client_certificate_der(leaf.as_ref())
+                PresentedCredential::client_certificate_der(leaf)
             }
             None => return Err(Status::unauthenticated("authentication failed")),
         };
@@ -46,7 +47,7 @@ impl ApplicationGrpcService {
 
     fn validate_transport<T>(&self, request: &Request<T>) -> Result<(), Status> {
         let transport = &self.config.transport_security;
-        let peer = request.remote_addr().map(|address| address.ip());
+        let peer = grpc_remote_addr(request).map(|address| address.ip());
         if transport.trusts_peer(peer) && transport.trusted_proxy.honor_x_forwarded_proto {
             let header = if request.metadata().contains_key("x-forwarded-proto") {
                 "x-forwarded-proto"
@@ -56,13 +57,10 @@ impl ApplicationGrpcService {
             let _unambiguous_proto = single_header(request.metadata(), header)?;
         }
         let actual_boundary = match transport.mode {
-            GatewayTransportSecurityMode::ProductionTls => request
-                .extensions()
-                .get::<TlsConnectInfo<TcpConnectInfo>>()
-                .is_some(),
-            GatewayTransportSecurityMode::MutualTls => request
-                .peer_certs()
-                .is_some_and(|certificates| !certificates.is_empty()),
+            GatewayTransportSecurityMode::ProductionTls
+            | GatewayTransportSecurityMode::MutualTls => {
+                verified_grpc_tls_boundary(request, transport.mode)
+            }
             GatewayTransportSecurityMode::TrustedReverseProxy => transport.trusts_peer(peer),
             GatewayTransportSecurityMode::LocalTrusted => peer.is_some_and(|ip| ip.is_loopback()),
             GatewayTransportSecurityMode::UnsafePlaintext
@@ -82,19 +80,20 @@ impl ApplicationGrpcService {
         evidence: &'a RequestEvidence,
     ) -> Result<Option<Cow<'a, str>>, Status> {
         let transport = &self.config.transport_security;
-        let peer = request.remote_addr().map(|address| address.ip());
+        let peer = grpc_remote_addr(request).map(|address| address.ip());
         if transport.trusts_peer(peer) && transport.trusted_proxy.honor_x_forwarded_host {
             let forwarded =
                 if let Some(value) = single_header(request.metadata(), "x-forwarded-host")? {
-                    Some(first_forwarded_value(value))
+                    Some(single_forwarded_value(value))
                 } else {
                     single_header(request.metadata(), "forwarded")?
                         .map(|value| forwarded_header_param(value, "host"))
                 };
             if let Some(forwarded) = forwarded {
-                return forwarded
-                    .map(|authority| Some(Cow::Owned(authority)))
-                    .ok_or_else(|| Status::permission_denied("request authority rejected"));
+                let authority = forwarded
+                    .map_err(|_error| Status::permission_denied("request authority rejected"))?
+                    .ok_or_else(|| Status::permission_denied("request authority rejected"))?;
+                return Ok(Some(Cow::Owned(authority)));
             }
         }
         // Host metadata can be forged independently of HTTP/2 :authority.

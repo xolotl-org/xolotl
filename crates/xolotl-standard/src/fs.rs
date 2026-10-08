@@ -23,11 +23,39 @@ use xolotl_types::{ValueMap, ValueView};
 /// one as a separate `effect://fs/<method>` Resource with public method
 /// `invoke`.
 pub(crate) const FS_METHODS: &[MethodSpec] = &[
-    MethodSpec::new("read", Purity::Pure, MethodSpec::STREAM_ASYNC).observes_external(),
-    MethodSpec::new("write", Purity::Effectful, MethodSpec::UNARY_ASYNC),
-    MethodSpec::new("list", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external(),
-    MethodSpec::new("delete", Purity::Effectful, MethodSpec::UNARY_ASYNC),
-    MethodSpec::new("glob", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external(),
+    MethodSpec::new(
+        "read",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Pure,
+        MethodSpec::STREAM_ASYNC,
+    )
+    .observes_external(),
+    MethodSpec::new(
+        "write",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Effectful,
+        MethodSpec::UNARY_ASYNC,
+    ),
+    MethodSpec::new(
+        "list",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Pure,
+        MethodSpec::UNARY_ASYNC,
+    )
+    .observes_external(),
+    MethodSpec::new(
+        "delete",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Effectful,
+        MethodSpec::UNARY_ASYNC,
+    ),
+    MethodSpec::new(
+        "glob",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Pure,
+        MethodSpec::UNARY_ASYNC,
+    )
+    .observes_external(),
 ];
 
 /// Reads at or below this size inline into the returned `Value`; larger files
@@ -319,8 +347,13 @@ fn mime_for(p: &FsPath) -> Option<String> {
 mod tests {
     use super::*;
     use anyhow::{Context, Result, bail, ensure};
+    use sha2::{Digest as _, Sha384};
     use std::collections::BTreeMap;
     use xolotl_types::{IdentityRef, ProcessId};
+
+    fn content_digest(bytes: &[u8]) -> String {
+        xolotl_types::BlobRef::sha384_hex(&Sha384::digest(bytes).into())
+    }
 
     fn write_input(path: &str, content: &str) -> Value {
         let mut m = BTreeMap::new();
@@ -556,7 +589,7 @@ mod tests {
                     b.size
                 );
                 ensure!(
-                    b.hash == blake3::hash(big.as_bytes()).to_hex().to_string(),
+                    b.hash == content_digest(big.as_bytes()),
                     "large read blob hash: {}",
                     b.hash
                 );

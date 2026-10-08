@@ -2,14 +2,18 @@ use super::ports::{Gate, ProbeStore};
 use super::*;
 use crate::object::read_grant::{ReadAuthorization, read_grant_path, record};
 use crate::{
-    ClientCertificateDerSha256, GatewayCredential, GatewayIdentityMapping,
+    ClientCertificateDerSha384, GatewayCredential, GatewayIdentityMapping,
     GatewayPrincipalSurfaceBinding, GatewayProfile, GatewaySurface, OpenObjectReadRequest,
 };
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
-use xolotl_kernel::{FactSink, Kernel};
+use xolotl_kernel::{FactSink, KernelBuilder};
 use xolotl_state::object::ObjectRead;
-use xolotl_state::{Backend, InMemoryBackend, StateMutation, StateRead, StateResult, StateWrite};
+use xolotl_state::{
+    Backend, InMemoryBackend, StateBoundedRead, StateBoundedWrite, StateMutation, StateRead,
+    StateResult, StateWrite,
+};
 use xolotl_types::{BlobRef, DType, FrameKind, Path, ResourceName, TaintedValue};
 
 mod read_audience;
@@ -33,13 +37,16 @@ fn open(grant: &GatewayObjectReadGrant) -> OpenObjectReadRequest {
 }
 
 async fn stored(fixture: &Fixture, grant: &GatewayObjectReadGrant) -> anyhow::Result<TaintedValue> {
-    fixture
+    let observation = fixture
         .boot
-        .kernel
-        .state
+        .kernel()
+        .state()
         .read_tainted(&read_grant_path(grant.grant_id())?)
-        .await?
-        .context("missing read grant")
+        .await?;
+    Ok(TaintedValue::new(
+        observation.value.context("missing read grant")?,
+        observation.taint,
+    ))
 }
 
 #[tokio::test]
@@ -88,6 +95,45 @@ async fn direct_object_exports_preserve_typed_identity_and_sources_in_state() ->
 }
 
 #[tokio::test]
+async fn oversized_read_grant_record_is_rejected_before_authority_decode() -> anyhow::Result<()> {
+    let fixture = Fixture::new().await?;
+    let metadata = fixture
+        .seed(b"data", "text/plain", TaintSet::pristine())
+        .await?;
+    let grant = fixture
+        .gateway
+        .issue_object_read_grant(
+            &fixture.session,
+            request(TaintedValue::pristine(Value::blob(metadata.blob))),
+        )
+        .await?;
+    let authorization =
+        ReadAuthorization::load(&fixture.gateway, &fixture.session, grant.grant_id()).await?;
+    let path = read_grant_path(grant.grant_id())?;
+    fixture
+        .boot
+        .kernel()
+        .state()
+        .write_set(
+            &path,
+            Value::string("x".repeat(crate::object::maintenance::PAGE_BYTES + 1)),
+        )
+        .await?;
+
+    let verify = authorization.verify().await;
+    ensure!(matches!(
+        verify,
+        Err(GatewayError::Rejected(ref message)) if message.contains("exceeds encoded byte budget")
+    ));
+    let load = ReadAuthorization::load(&fixture.gateway, &fixture.session, grant.grant_id()).await;
+    ensure!(matches!(
+        load,
+        Err(GatewayError::Rejected(ref message)) if message.contains("exceeds encoded byte budget")
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn read_grants_require_exact_committed_references_and_bounded_ranges() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
     let metadata = fixture
@@ -101,7 +147,7 @@ async fn read_grants_require_exact_committed_references_and_bounded_ranges() -> 
         Value::blob(wrong_size),
         Value::blob(wrong_mime),
         Value::blob(BlobRef {
-            hash: "a".repeat(64),
+            hash: "a".repeat(96),
             ..metadata.blob.clone()
         }),
         Value::blob(BlobRef {
@@ -165,8 +211,12 @@ async fn grant_audience_and_replica_scope_are_explicit() -> anyhow::Result<()> {
         )
         .await?;
     let target = ResourceName::new(Path::parse("effect://echo/say")?);
-    let replica = GatewayRuntime::new(fixture.boot.clone(), echo_profile(target.clone())?)?
-        .with_object_store(fixture.files.clone().into_object_store());
+    let replica = GatewayRuntime::new(
+        fixture.boot.clone(),
+        echo_profile(target.clone())?,
+        fixture.gateway.idempotency.clone(),
+    )?
+    .with_object_store(fixture.files.clone().into_object_store());
     let replica_session = replica
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -176,16 +226,20 @@ async fn grant_audience_and_replica_scope_are_explicit() -> anyhow::Result<()> {
     ensure!(read.metadata().blob == metadata.blob);
     drop(read);
 
-    let bob_token = "read-grant-bob-token-0001";
+    let bob_token = "read-grant-bob-token-0001-32-bytes";
     let with_bob = echo_profile(target.clone())?
-        .with_bearer_identity("cred-bob", "bob", bob_token, "process://bob")?
+        .with_bearer_identity("cred-bob", "bob", bob_token, "identity://bob")?
         .with_principal_surface_binding(GatewayPrincipalSurfaceBinding::allow(
             "bob",
             ["echo"],
             ["perform://effect/echo/say"],
         ));
-    let same_profile = GatewayRuntime::new(fixture.boot.clone(), with_bob)?
-        .with_object_store(fixture.files.clone().into_object_store());
+    let same_profile = GatewayRuntime::new(
+        fixture.boot.clone(),
+        with_bob,
+        fixture.gateway.idempotency.clone(),
+    )?
+    .with_object_store(fixture.files.clone().into_object_store());
     let bob = same_profile
         .authenticate(PresentedCredential::bearer(bob_token))
         .await?;
@@ -203,15 +257,19 @@ async fn grant_audience_and_replica_scope_are_explicit() -> anyhow::Result<()> {
     );
 
     let other_profile = GatewayProfile::new("other-profile")
-        .with_bearer_identity("cred-alice", "alice", TEST_TOKEN, "process://alice")?
+        .with_bearer_identity("cred-alice", "alice", TEST_TOKEN, "identity://alice")?
         .with_surface(GatewaySurface::effect_invoke("echo", target.clone()))
         .with_principal_surface_binding(GatewayPrincipalSurfaceBinding::allow(
             "alice",
             ["echo"],
             ["perform://effect/echo/say"],
         ));
-    let other = GatewayRuntime::new(fixture.boot.clone(), other_profile)?
-        .with_object_store(fixture.files.clone().into_object_store());
+    let other = GatewayRuntime::new(
+        fixture.boot.clone(),
+        other_profile,
+        fixture.gateway.idempotency.clone(),
+    )?
+    .with_object_store(fixture.files.clone().into_object_store());
     let other_session = other
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -270,9 +328,11 @@ async fn same_principal_cannot_reuse_grants_under_changed_authority() -> anyhow:
     let original_target = ResourceName::new(Path::parse("effect://echo/say")?);
     let other_target = fixture.boot.register_effect(
         "effect://echo/other",
-        &[xolotl_kernel::MethodSpec::unary_async(
+        &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
+            xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
         Arc::new(xolotl_kernel::EchoDriver),
     )?;
@@ -295,10 +355,10 @@ async fn same_principal_cannot_reuse_grants_under_changed_authority() -> anyhow:
             TEST_TOKEN,
         )?;
         let presented = if change == "auth_method" {
-            credential = GatewayCredential::client_certificate_der_sha256(
+            credential = GatewayCredential::client_certificate_der_sha384(
                 "cred-alice",
                 "alice",
-                ClientCertificateDerSha256::from_der(b"read-grant-certificate"),
+                ClientCertificateDerSha384::from_der(b"read-grant-certificate"),
             );
             PresentedCredential::client_certificate_der(b"read-grant-certificate")
         } else {
@@ -310,9 +370,9 @@ async fn same_principal_cannot_reuse_grants_under_changed_authority() -> anyhow:
         let mut identity = GatewayIdentityMapping::new(
             "alice",
             if change == "identity" {
-                "process://other-alice"
+                "identity://other-alice"
             } else {
-                "process://alice"
+                "identity://alice"
             },
         );
         if change == "identity_generation" {
@@ -336,8 +396,12 @@ async fn same_principal_cannot_reuse_grants_under_changed_authority() -> anyhow:
                 ));
         }
         let probe = Arc::new(ProbeStore::new(fixture.files.clone()));
-        let other = GatewayRuntime::new(fixture.boot.clone(), profile)?
-            .with_object_store(ObjectStore::new().with_read(probe.clone()));
+        let other = GatewayRuntime::new(
+            fixture.boot.clone(),
+            profile,
+            fixture.gateway.idempotency.clone(),
+        )?
+        .with_object_store(ObjectStore::new().with_read(probe.clone()));
         let session = other.authenticate(presented).await?;
         ensure!(session.principal().principal_id() == "alice");
         ensure!(
@@ -403,8 +467,8 @@ async fn malformed_or_changed_grants_fail_without_deleting_authority() -> anyhow
         let changed = Value::string(serde_json::to_string(&document)?);
         fixture
             .boot
-            .kernel
-            .state
+            .kernel()
+            .state()
             .write_set_tainted(&path, changed.clone(), saved.taint.clone())
             .await?;
         ensure!(
@@ -415,12 +479,12 @@ async fn malformed_or_changed_grants_fail_without_deleting_authority() -> anyhow
                 .is_err(),
             "accepted changed {field}"
         );
-        ensure!(fixture.boot.kernel.state.read(&path).await? == Some(changed));
+        ensure!(fixture.boot.kernel().state().read(&path).await? == Some(changed));
     }
     fixture
         .boot
-        .kernel
-        .state
+        .kernel()
+        .state()
         .write_set_tainted(&path, saved.value.clone(), saved.taint.clone())
         .await?;
     let authorization =
@@ -460,7 +524,7 @@ async fn grant_codec_preserves_full_width_object_ranges() -> anyhow::Result<()> 
         grant_id: format!("org_{}", "1".repeat(32)),
         metadata: xolotl_state::object::ObjectMetadata {
             blob: BlobRef {
-                hash: "a".repeat(64),
+                hash: "a".repeat(96),
                 size: u64::MAX,
                 mime: None,
             },
@@ -489,6 +553,18 @@ impl StateRead for CommitState {
     type Read<'a> = <InMemoryBackend as StateRead>::Read<'a>;
     fn read_tainted<'a>(&'a self, path: &'a Path) -> Self::Read<'a> {
         self.inner.read_tainted(path)
+    }
+}
+
+impl StateBoundedRead for CommitState {
+    type BoundedRead<'a> = <InMemoryBackend as StateBoundedRead>::BoundedRead<'a>;
+
+    fn read_tainted_bounded<'a>(
+        &'a self,
+        path: &'a Path,
+        max_encoded_bytes: NonZeroUsize,
+    ) -> Self::BoundedRead<'a> {
+        self.inner.read_tainted_bounded(path, max_encoded_bytes)
     }
 }
 
@@ -541,6 +617,78 @@ impl StateWrite for CommitState {
     }
 }
 
+impl StateBoundedWrite for CommitState {
+    type BoundedWrite<'a> =
+        Pin<Box<dyn Future<Output = StateResult<xolotl_state::StateCommit>> + Send + 'a>>;
+
+    fn compare_set_bounded<'a>(
+        &'a self,
+        path: &'a Path,
+        expected: Option<Value>,
+        value: TaintedValue,
+        max_current_encoded_bytes: NonZeroUsize,
+    ) -> Self::BoundedWrite<'a> {
+        Box::pin(async move {
+            if expected.is_some() {
+                return self
+                    .inner
+                    .compare_set_bounded(path, expected, value, max_current_encoded_bytes)
+                    .await;
+            }
+            *self.grant_path.lock() = Some(path.clone());
+            let mut commit = xolotl_state::StateCommit {
+                taint: value.taint.clone(),
+            };
+            if self.after_commit {
+                commit = self
+                    .inner
+                    .compare_set_bounded(path, expected, value, max_current_encoded_bytes)
+                    .await?;
+                if let Some(gate) = &self.gate {
+                    gate.enter()
+                        .await
+                        .map_err(|failure| failure.with_taint(&commit.taint))?;
+                }
+            } else {
+                if let Some(gate) = &self.gate {
+                    gate.enter().await?;
+                }
+                if !self.fail {
+                    commit = self
+                        .inner
+                        .compare_set_bounded(path, expected, value, max_current_encoded_bytes)
+                        .await?;
+                }
+            }
+            if self.fail {
+                Err(xolotl_state::StateFailure::new(
+                    xolotl_state::StateError::Backend("grant commit failed".into()),
+                    commit.taint,
+                ))
+            } else {
+                Ok(commit)
+            }
+        })
+    }
+
+    fn compare_delete_bounded<'a>(
+        &'a self,
+        path: &'a Path,
+        expected: Option<Value>,
+        taint: TaintSet,
+        max_current_encoded_bytes: NonZeroUsize,
+    ) -> Self::BoundedWrite<'a> {
+        Box::pin(async move {
+            if let Some(gate) = &self.revoke_gate {
+                gate.enter().await?;
+            }
+            self.inner
+                .compare_delete_bounded(path, expected, taint, max_current_encoded_bytes)
+                .await
+        })
+    }
+}
+
 #[tokio::test]
 async fn failed_grant_commit_does_not_publish_a_response_or_delete_shared_content()
 -> anyhow::Result<()> {
@@ -553,15 +701,25 @@ async fn failed_grant_commit_does_not_publish_a_response_or_delete_shared_conten
             revoke_gate: None,
             fail: true,
         });
-        let boot = Arc::new(Bootstrap::from_kernel(Kernel::with_backends(
-            Backend::new()
-                .with_read(state.clone())
-                .with_write(state.clone()),
-            FactSink::in_memory().0,
-        )));
+        let boot = Arc::new(Bootstrap::from_kernel(
+            KernelBuilder::new(
+                Backend::new()
+                    .with_read(state.clone())
+                    .with_bounded_read(state.clone())
+                    .with_write(state.clone())
+                    .with_bounded_write(state.clone()),
+            )
+            .with_fact_sink(FactSink::in_memory().0)
+            .build(),
+        ));
         let fixture = Fixture::with_boot(
             boot,
-            xolotl_kernel::MethodSpec::unary_async("invoke", xolotl_types::Purity::Pure),
+            xolotl_kernel::MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                xolotl_types::Purity::Pure,
+                xolotl_kernel::MethodSpec::UNARY_ASYNC,
+            ),
             Arc::new(xolotl_kernel::EchoDriver),
         )
         .await?;
@@ -583,20 +741,32 @@ async fn failed_grant_commit_does_not_publish_a_response_or_delete_shared_conten
             .lock()
             .clone()
             .context("grant commit was not attempted")?;
-        ensure!(fixture.boot.kernel.state.read(&path).await?.is_some() == after_commit);
+        ensure!(fixture.boot.kernel().state().read(&path).await?.is_some() == after_commit);
         ensure!(fixture.files.metadata(&metadata.blob).await?.is_some());
     }
     Ok(())
 }
 
 async fn gated_fixture(state: Arc<CommitState>) -> anyhow::Result<Fixture> {
-    let boot = Arc::new(Bootstrap::from_kernel(Kernel::with_backends(
-        Backend::new().with_read(state.clone()).with_write(state),
-        FactSink::in_memory().0,
-    )));
+    let boot = Arc::new(Bootstrap::from_kernel(
+        KernelBuilder::new(
+            Backend::new()
+                .with_read(state.clone())
+                .with_bounded_read(state.clone())
+                .with_write(state.clone())
+                .with_bounded_write(state),
+        )
+        .with_fact_sink(FactSink::in_memory().0)
+        .build(),
+    ));
     Fixture::with_boot(
         boot,
-        xolotl_kernel::MethodSpec::unary_async("invoke", xolotl_types::Purity::Pure),
+        xolotl_kernel::MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            xolotl_types::Purity::Pure,
+            xolotl_kernel::MethodSpec::UNARY_ASYNC,
+        ),
         Arc::new(xolotl_kernel::EchoDriver),
     )
     .await
@@ -633,7 +803,7 @@ async fn cancelled_grant_commit_keeps_its_actual_persistence_state() -> anyhow::
             .lock()
             .clone()
             .context("grant commit was not attempted")?;
-        ensure!(fixture.boot.kernel.state.read(&path).await?.is_some() == after_commit);
+        ensure!(fixture.boot.kernel().state().read(&path).await?.is_some() == after_commit);
         ensure!(fixture.files.metadata(&metadata.blob).await?.is_some());
     }
     Ok(())
@@ -672,7 +842,7 @@ async fn profile_change_during_grant_commit_does_not_return_live_authority() -> 
         .lock()
         .clone()
         .context("grant commit was not attempted")?;
-    ensure!(fixture.boot.kernel.state.read(&path).await?.is_some());
+    ensure!(fixture.boot.kernel().state().read(&path).await?.is_some());
     ensure!(fixture.files.metadata(&metadata.blob).await?.is_some());
     Ok(())
 }
@@ -716,12 +886,67 @@ async fn delayed_revocation_cannot_delete_a_changed_grant() -> anyhow::Result<()
     let path = read_grant_path(grant.grant_id())?;
     fixture
         .boot
-        .kernel
-        .state
+        .kernel()
+        .state()
         .write_set_tainted(&path, replacement.clone(), saved.taint)
         .await?;
     gate.release();
     ensure!(pending.await.is_err());
-    ensure!(fixture.boot.kernel.state.read(&path).await? == Some(replacement));
+    ensure!(fixture.boot.kernel().state().read(&path).await? == Some(replacement));
+    Ok(())
+}
+
+#[tokio::test]
+async fn delayed_revocation_retains_observed_provenance_after_same_value_set() -> anyhow::Result<()>
+{
+    let gate = Gate::new();
+    let state = Arc::new(CommitState {
+        inner: InMemoryBackend::new(),
+        after_commit: false,
+        grant_path: parking_lot::Mutex::new(None),
+        gate: None,
+        revoke_gate: Some(gate.clone()),
+        fail: false,
+    });
+    let fixture = gated_fixture(state).await?;
+    let observed = TaintSet::of(TaintSource::ModelOutput);
+    let replacement = TaintSet::of(TaintSource::Fetched {
+        host: "replacement".into(),
+    });
+    let metadata = fixture
+        .seed(b"shared content", "text/plain", observed.clone())
+        .await?;
+    let grant = fixture
+        .gateway
+        .issue_object_read_grant(
+            &fixture.session,
+            request(TaintedValue::pristine(Value::blob(metadata.blob.clone()))),
+        )
+        .await?;
+    let mut pending = Box::pin(
+        fixture
+            .gateway
+            .revoke_object_read_grant(&fixture.session, grant.grant_id()),
+    );
+    tokio::select! {
+        result = &mut pending => bail!("grant revocation completed before release: {result:?}"),
+        entered = gate.wait() => entered?,
+    }
+    let saved = stored(&fixture, &grant).await?;
+    ensure!(saved.taint == observed);
+    let path = read_grant_path(grant.grant_id())?;
+    let backend = fixture.boot.kernel().state();
+    backend
+        .write_set_tainted(&path, saved.value, replacement.clone())
+        .await?;
+    ensure!(backend.read_tainted(&path).await?.taint == replacement);
+    gate.release();
+    ensure!(pending.await?);
+    let absence = backend.read_tainted(&path).await?;
+    ensure!(absence.value.is_none());
+    let expected = observed.merged(&replacement);
+    ensure!(absence.taint.contains_all(&expected));
+    ensure!(expected.contains_all(&absence.taint));
+    ensure!(fixture.files.metadata(&metadata.blob).await?.is_some());
     Ok(())
 }

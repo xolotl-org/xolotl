@@ -8,29 +8,45 @@
 //! Protocol adapters stay thin. They parse transport frames and credentials,
 //! then call this crate so authentication, profile mapping, exposed surfaces,
 //! limits, taint, audit, and Handle ownership remain one shared boundary.
+//! Request authority is rechecked before each resource dispatch and before
+//! protected delivery. Revocation rejects undispatched work without rolling
+//! back accepted effects or erasing their reconciliation evidence.
 
 use async_trait::async_trait;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use subtle::ConstantTimeEq;
+use std::time::Duration;
 use thiserror::Error;
-use tokio::time::Instant;
 use xolotl_graph::{DoNode, OperationTemplate, WaitSpec};
+use xolotl_kernel::host::AbortTask;
 use xolotl_kernel::{
     Bootstrap, CompiledRequestGrantTemplate, Executor, GatewayAudit, RequestProcess,
-    intern_identity,
 };
+use xolotl_state::StateCursor;
 use xolotl_state::host::object::ObjectStore;
 use xolotl_types::{
-    Capability, CompletionOrigin, CostModel, ExecutionOutput, Failure, MethodBitmap, Outcome,
-    OutputMode, Path, ProcessId, ProcessStatus, ReplayClass, ResourceName, ResourceSelector,
-    StreamMarker, TaintSet, Value, ValueMap, ValueView,
+    BlobRef, Capability, CompletionOrigin, CostModel, ExecutionOutput, Failure, GrantMethods,
+    GrantRights, OutputMode, Path, ProcessId, ReplayClass, ResourceName, ResourceSelector,
+    StreamMarker, UnresolvedOperations, Value, ValueMap, ValueView,
 };
+#[cfg(test)]
+use xolotl_types::{Outcome, ProcessStatus, TaintSet};
 
 mod auth;
+mod idempotency_store;
+#[cfg(feature = "test-support")]
+pub use idempotency_store::tests::gateway_idempotency_acceptance;
+pub use idempotency_store::{
+    GatewayEvidenceNamespace, GatewayIdempotencyLimits, GatewayIdempotencyRecord,
+    GatewayIdempotencyStore, GatewayIdempotencyUsage, MemoryGatewayIdempotencyStore,
+};
+mod maintenance_health;
 mod object;
+mod paths;
 mod profile;
+mod request_registry;
+mod request_scope;
 mod schema;
 mod submission;
 mod transport;
@@ -38,29 +54,37 @@ pub mod value_inspection;
 
 pub mod external;
 
-use submission::idempotency::{
-    GatewayIdempotencyReservation, SubmissionIdempotency, finish_request_and_release_idempotency,
-    finish_request_without_idempotency_and_fail, initial_idempotency_material,
-    release_submission_idempotency_reservation_and_fail, required_idempotency_material,
-    reserve_submission_idempotency_if_present,
+use maintenance_health::MaintenanceHealth;
+pub use maintenance_health::{
+    GatewayMaintenanceProgress, GatewayMaintenanceState, GatewayMaintenanceStatus,
 };
 #[cfg(test)]
-use submission::idempotency::{idempotency_path, submission_hash};
-pub use submission::{GatewayOutputChunk, GatewayOutputEvent, GatewayOutputStream};
+use submission::idempotency::submission_hash;
+use submission::idempotency::{
+    finish_request_without_idempotency_and_fail, required_idempotency_material,
+};
+pub use submission::{
+    GatewayOutputChunk, GatewayOutputEvent, GatewayOutputStream, GatewayPreparation,
+};
+pub use xolotl_kernel::host::HostDeadline;
 pub use xolotl_kernel::stream::StreamWindow;
 
-/// Gateway profile revision bound to sessions and submissions.
+/// Positive Gateway profile revision bound to sessions and submissions.
+///
+/// The complete inclusive range `1..=u64::MAX` is valid; zero is invalid.
+/// Sessions, acceptance and retained request evidence preserve this range
+/// without narrowing it to a signed integer. The retained acceptance encoding
+/// and validation contract is defined by [`GatewayAccepted::profile_rev`].
 pub type GatewayProfileRev = u64;
 /// Monotonic generation for credential and principal state.
 pub type GatewayGeneration = u64;
 
 pub use auth::{
-    BearerToken, BearerTokenHash, ClientCertificateCredential, ClientCertificateDerSha256,
+    BearerToken, BearerTokenHash, ClientCertificateCredential, ClientCertificateDerSha384,
     GatewayAuthMethod, GatewayCredential, GatewayIdentityMapping, GatewaySession,
     PresentedCredential, VerifiedPrincipal,
 };
 use auth::{GatewayCredentialKind, hash_bearer_token};
-use object::collect_large_value_refs;
 pub use object::{
     BeginObjectUploadRequest, CommitObjectUploadResponse, GatewayObjectDownload, GatewayObjectKind,
     GatewayObjectReadGrant, GatewayObjectUpload, GatewayObjectUploadTicket,
@@ -73,14 +97,19 @@ pub use object::{
     GatewayOutputExternalizationError, GatewayOutputExternalizer, GatewayOutputKind,
     GatewayOutputObjectOptions,
 };
-use profile::perform_capability_for_effect;
+use profile::{CompiledGatewayProfile, CompiledSurfaceDescriptor};
 pub use profile::{
-    GatewayBudgetProfile, GatewayLimitProfile, GatewayPrincipalSurfaceBinding, GatewayProfile,
-    GatewayProfileDocument, GatewayPublication, GatewaySurface,
+    GATEWAY_PROFILES_PREFIX, GatewayBudgetProfile, GatewayLimitProfile,
+    GatewayPrincipalSurfaceBinding, GatewayProfile, GatewayProfileDocument, GatewayPublication,
+    GatewaySurface, gateway_profile_id, gateway_profile_path,
 };
-use schema::{
-    CompiledValueSchema, compile_value_schema, validate_surface_input, validate_surface_stream_item,
+#[cfg(test)]
+use request_registry::{COMPLETED_REQUEST_RETENTION, prune_request_history};
+use request_registry::{
+    GatewayBudgetCharge, GatewayRequestEntry, GatewayRequestGuard, GatewayRequestLease,
+    GatewayRequestRegistry, GatewayRequestState, spawn_deadline_sweeper, sweep_expired_requests,
 };
+use schema::{validate_surface_input, validate_surface_stream_item};
 pub use transport::{
     GatewayAllowedHost, GatewayAllowedOrigin, GatewayTransportSecurityConfig,
     GatewayTransportSecurityMode, GatewayTrustedProxyConfig, GatewayUnsafeTransportRelaxation,
@@ -96,6 +125,7 @@ const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 1024;
 const DEFAULT_MAX_PRINCIPAL_IN_FLIGHT_REQUESTS: usize = 512;
 const DEFAULT_MAX_SURFACE_IN_FLIGHT_REQUESTS: usize = 512;
 const DEFAULT_MAX_RISK_CLASS_IN_FLIGHT_REQUESTS: usize = 512;
+const DEFAULT_MAX_RECENT_CANCELLATIONS: usize = 4096;
 const DEFAULT_MAX_STREAM_ITEMS: usize = 4096;
 const DEFAULT_MAX_STREAM_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_STREAM_INLINE_ITEM_BYTES: usize = 1024 * 1024;
@@ -103,10 +133,9 @@ const DEFAULT_BUDGET_MAX_INFLIGHT_OPS: u64 = 8192;
 const DEFAULT_BUDGET_MAX_BYTES_IN: u64 = 64 * 1024 * 1024;
 const DEFAULT_BUDGET_MAX_INLINE_VALUE_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_BUDGET_MAX_STREAM_ITEMS: u64 = 64 * 1024;
-const MIN_BEARER_TOKEN_BYTES: usize = 16;
+const MIN_BEARER_TOKEN_BYTES: usize = 32;
+const MAX_BEARER_TOKEN_BYTES: usize = 1024;
 const GATEWAY_REQUEST_ID_RANDOM_BYTES: usize = 16;
-const COMPLETED_REQUEST_RETENTION_MS: i64 = 60_000;
-const DEADLINE_SWEEP_INTERVAL_MS: u64 = 50;
 const GATEWAY_EFFECT_METHOD: &str = "invoke";
 const GATEWAY_EFFECT_HANDLE_VERB: &str = "perform";
 
@@ -129,9 +158,66 @@ pub enum GatewayError {
     /// The request could not start because a bounded gateway resource is full.
     #[error("gateway limit exceeded: {0}")]
     LimitExceeded(String),
+    /// A mutation or execution may have taken effect, but the gateway cannot
+    /// prove the final verdict. Reconcile the original identity before retrying.
+    #[error("gateway operation outcome unknown: {0}")]
+    Indeterminate(String),
+    /// Execution was observed, but its complete result could not be settled or
+    /// delivered. The original acceptance and known effect identities survive.
+    #[error("gateway submission outcome unknown: {}", .0.detail)]
+    SubmissionIndeterminate(Box<GatewaySubmissionIndeterminate>),
+}
+
+/// Evidence retained when an accepted submission cannot deliver a complete result.
+#[derive(Debug)]
+pub struct GatewaySubmissionIndeterminate {
+    /// Original server acceptance; it never authorizes a fresh execution.
+    pub accepted: GatewayAccepted,
+    /// Bounded host-observed effect identities for external reconciliation.
+    pub unresolved_operations: UnresolvedOperations,
+    /// Stable, redacted explanation for protocol clients.
+    pub reason_code: &'static str,
+    detail: String,
 }
 
 impl GatewayError {
+    pub(crate) fn is_indeterminate(&self) -> bool {
+        matches!(
+            self,
+            Self::Indeterminate(_) | Self::SubmissionIndeterminate(_)
+        )
+    }
+
+    pub(crate) fn with_request_cleanup_failure(self, reason: String) -> Self {
+        match self {
+            Self::Indeterminate(detail) => {
+                Self::Indeterminate(format!("{detail}; request cleanup failed: {reason}"))
+            }
+            Self::SubmissionIndeterminate(mut evidence) => {
+                evidence.detail = format!("{}; request cleanup failed: {reason}", evidence.detail);
+                evidence.unresolved_operations.identities_incomplete = true;
+                Self::SubmissionIndeterminate(evidence)
+            }
+            other => Self::Indeterminate(format!("{other}; request cleanup failed: {reason}")),
+        }
+    }
+
+    /// Preserve host-observed acceptance and effect evidence after settlement
+    /// or delivery fails. This record never authorizes a new execution.
+    pub fn submission_indeterminate(
+        accepted: GatewayAccepted,
+        unresolved_operations: UnresolvedOperations,
+        reason_code: &'static str,
+        detail: String,
+    ) -> Self {
+        Self::SubmissionIndeterminate(Box::new(GatewaySubmissionIndeterminate {
+            accepted,
+            unresolved_operations,
+            reason_code,
+            detail,
+        }))
+    }
+
     /// Redacted message suitable for returning to an external client.
     pub fn public_message(&self) -> &'static str {
         match self {
@@ -140,6 +226,9 @@ impl GatewayError {
             GatewayError::InvalidProfile(_)
             | GatewayError::Rejected(_)
             | GatewayError::LimitExceeded(_) => "request rejected",
+            GatewayError::Indeterminate(_) | GatewayError::SubmissionIndeterminate(_) => {
+                "outcome unknown; reconcile before retrying"
+            }
         }
     }
 
@@ -151,6 +240,9 @@ impl GatewayError {
             GatewayError::InvalidProfile(_) => "profile_invalid",
             GatewayError::Rejected(_) => "request_rejected",
             GatewayError::LimitExceeded(_) => "limit_exceeded",
+            GatewayError::Indeterminate(_) | GatewayError::SubmissionIndeterminate(_) => {
+                "outcome_unknown"
+            }
         }
     }
 
@@ -162,733 +254,11 @@ impl GatewayError {
             GatewayError::InvalidProfile(_) => "profile_invalid",
             GatewayError::Rejected(_) => "request_rejected",
             GatewayError::LimitExceeded(_) => "limit_exceeded",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct CompiledSurfaceDescriptor {
-    surface_id: String,
-    target: ResourceName,
-    method_bitmap: MethodBitmap,
-    grant_template: String,
-    grant_capability: Capability,
-    grant_selector: ResourceSelector,
-    publish_capability: Option<String>,
-    input_schema: Option<Value>,
-    input_schema_validator: Option<CompiledValueSchema>,
-    output_schema: Option<Value>,
-    output_schema_validator: Option<CompiledValueSchema>,
-    output_stream_schema: Option<Value>,
-    output_stream_schema_validator: Option<CompiledValueSchema>,
-}
-
-#[derive(Clone, Debug)]
-struct CompiledIdentityMapping {
-    identity_path: String,
-    enabled: bool,
-    generation: GatewayGeneration,
-}
-
-#[derive(Clone, Debug, Default)]
-struct CompiledPrincipalSurfaceBinding {
-    visible: BTreeSet<String>,
-    submit: BTreeSet<String>,
-    capability_ceiling: Vec<Capability>,
-    request_grants_by_surface: BTreeMap<String, CompiledRequestGrantTemplate>,
-}
-
-#[derive(Clone, Debug)]
-struct CompiledGatewayProfile {
-    profile_name: String,
-    revision: GatewayProfileRev,
-    credential_revocation_floor: GatewayGeneration,
-    bearer_credentials: Vec<(BearerTokenHash, VerifiedPrincipal)>,
-    client_certificate_credentials: Vec<(ClientCertificateDerSha256, VerifiedPrincipal)>,
-    identity_by_principal: BTreeMap<String, CompiledIdentityMapping>,
-    surfaces_by_id: BTreeMap<String, CompiledSurfaceDescriptor>,
-    surface_bindings_by_principal: BTreeMap<String, CompiledPrincipalSurfaceBinding>,
-    authority_anchor: Option<ProcessId>,
-    surface_descriptors: Vec<CompiledSurfaceDescriptor>,
-    publication_descriptors: Vec<GatewayPublicationDescriptor>,
-    registered_hosts: Vec<GatewayAllowedHost>,
-    registered_origins: Vec<GatewayAllowedOrigin>,
-    limits: GatewayLimitProfile,
-}
-
-fn collect_binding_surface_ids(
-    surfaces_by_id: &BTreeMap<String, CompiledSurfaceDescriptor>,
-    ids: &[String],
-    field: &'static str,
-) -> Result<BTreeSet<String>, GatewayError> {
-    let mut set = BTreeSet::new();
-    for id in ids {
-        if id.trim().is_empty() {
-            return Err(GatewayError::InvalidProfile(format!(
-                "{field} must not contain an empty surface id"
-            )));
-        }
-        if !surfaces_by_id.contains_key(id) {
-            return Err(GatewayError::InvalidProfile(format!(
-                "{field} references unknown surface {id}"
-            )));
-        }
-        set.insert(id.clone());
-    }
-    Ok(set)
-}
-
-fn validate_gateway_budget_profile(budget: &GatewayBudgetProfile) -> Result<(), GatewayError> {
-    validate_optional_budget_limit(budget.max_inflight_ops, "budget.max_inflight_ops")?;
-    validate_optional_budget_limit(budget.max_wall_ms, "budget.max_wall_ms")?;
-    validate_optional_budget_limit(budget.max_bytes_in, "budget.max_bytes_in")?;
-    validate_optional_budget_limit(budget.max_bytes_out, "budget.max_bytes_out")?;
-    validate_optional_budget_limit(
-        budget.max_inline_value_bytes,
-        "budget.max_inline_value_bytes",
-    )?;
-    validate_optional_budget_limit(budget.max_stream_items, "budget.max_stream_items")?;
-    validate_optional_budget_limit(
-        budget.max_estimated_cost_micro_usd,
-        "budget.max_estimated_cost_micro_usd",
-    )?;
-    Ok(())
-}
-
-fn validate_optional_budget_limit(value: Option<u64>, name: &str) -> Result<(), GatewayError> {
-    if value == Some(0) {
-        return Err(GatewayError::InvalidProfile(format!(
-            "{name} must be positive"
-        )));
-    }
-    Ok(())
-}
-
-impl CompiledGatewayProfile {
-    fn compile(profile: GatewayProfile) -> Result<Self, GatewayError> {
-        if profile.profile_name.trim().is_empty() {
-            return Err(GatewayError::InvalidProfile(
-                "profile_name must not be empty".into(),
-            ));
-        }
-        if profile.revision == 0 {
-            return Err(GatewayError::InvalidProfile(
-                "profile revision must be positive".into(),
-            ));
-        }
-        if profile.limits.max_in_flight_requests == 0
-            || profile.limits.max_principal_in_flight_requests == 0
-            || profile.limits.max_surface_in_flight_requests == 0
-            || profile.limits.max_risk_class_in_flight_requests == 0
-            || profile.limits.max_stream_items == 0
-            || profile.limits.max_stream_bytes == 0
-            || profile.limits.max_stream_inline_item_bytes == 0
-        {
-            return Err(GatewayError::InvalidProfile(
-                "in-flight, fair-queue, and stream limits must be positive".into(),
-            ));
-        }
-        validate_gateway_budget_profile(&profile.limits.budget)?;
-        if profile.limits.max_deadline_ms_from_now < 0 {
-            return Err(GatewayError::InvalidProfile(
-                "max_deadline_ms_from_now must not be negative".into(),
-            ));
-        }
-        let mut registered_host_set = BTreeSet::new();
-        for host in profile.registered_hosts {
-            if !registered_host_set.insert(host.clone()) {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "duplicate registered host {}",
-                    host.as_str()
-                )));
+            GatewayError::Indeterminate(_) | GatewayError::SubmissionIndeterminate(_) => {
+                "outcome_unknown"
             }
         }
-        let registered_hosts = registered_host_set.into_iter().collect();
-
-        let mut registered_origin_set = BTreeSet::new();
-        for origin in profile.registered_origins {
-            if !registered_origin_set.insert(origin.clone()) {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "duplicate registered origin {}",
-                    origin.as_str()
-                )));
-            }
-        }
-        let registered_origins = registered_origin_set.into_iter().collect();
-
-        let credential_revocation_floor = profile.credential_revocation_floor;
-        let mut identity_by_principal = BTreeMap::new();
-        for mapping in profile.identity_mappings {
-            if mapping.principal_id.trim().is_empty() {
-                return Err(GatewayError::InvalidProfile(
-                    "principal_id in identity mapping must not be empty".into(),
-                ));
-            }
-            if mapping.generation == 0 {
-                return Err(GatewayError::InvalidProfile(
-                    "principal generation must be positive".into(),
-                ));
-            }
-            parse_identity_path(&mapping.identity_path)?;
-            if identity_by_principal
-                .insert(
-                    mapping.principal_id.clone(),
-                    CompiledIdentityMapping {
-                        identity_path: mapping.identity_path.clone(),
-                        enabled: mapping.enabled,
-                        generation: mapping.generation,
-                    },
-                )
-                .is_some()
-            {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "duplicate identity mapping for principal {}",
-                    mapping.principal_id
-                )));
-            }
-        }
-
-        let mut credential_ids = BTreeSet::new();
-        let mut bearer_hashes = BTreeSet::new();
-        let mut bearer_credentials = Vec::new();
-        let mut client_certificate_hashes = BTreeSet::new();
-        let mut client_certificate_credentials = Vec::new();
-        for credential in profile.credentials {
-            if credential.credential_id.trim().is_empty() {
-                return Err(GatewayError::InvalidProfile(
-                    "credential_id must not be empty".into(),
-                ));
-            }
-            if !credential_ids.insert(credential.credential_id.clone()) {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "duplicate credential_id {}",
-                    credential.credential_id
-                )));
-            }
-            if credential.principal_id.trim().is_empty() {
-                return Err(GatewayError::InvalidProfile(
-                    "credential principal_id must not be empty".into(),
-                ));
-            }
-            if credential.generation == 0 {
-                return Err(GatewayError::InvalidProfile(
-                    "credential generation must be positive".into(),
-                ));
-            }
-            if !identity_by_principal.contains_key(&credential.principal_id) {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "credential {} references unmapped principal {}",
-                    credential.credential_id, credential.principal_id
-                )));
-            }
-            match credential.kind {
-                GatewayCredentialKind::Bearer { token_hash } => {
-                    let principal = VerifiedPrincipal {
-                        principal_id: credential.principal_id,
-                        credential_id: credential.credential_id,
-                        credential_generation: credential.generation,
-                        principal_generation: 0,
-                        auth_method: GatewayAuthMethod::Bearer,
-                    };
-                    if !bearer_hashes.insert(token_hash.clone()) {
-                        return Err(GatewayError::InvalidProfile(
-                            "duplicate bearer token hash".into(),
-                        ));
-                    }
-                    if credential.enabled && credential.generation > credential_revocation_floor {
-                        bearer_credentials.push((token_hash, principal));
-                    }
-                }
-                GatewayCredentialKind::ClientCertificate { der_sha256 } => {
-                    let principal = VerifiedPrincipal {
-                        principal_id: credential.principal_id,
-                        credential_id: credential.credential_id,
-                        credential_generation: credential.generation,
-                        principal_generation: 0,
-                        auth_method: GatewayAuthMethod::ClientCertificate,
-                    };
-                    if !client_certificate_hashes.insert(der_sha256.clone()) {
-                        return Err(GatewayError::InvalidProfile(
-                            "duplicate client certificate DER SHA-256".into(),
-                        ));
-                    }
-                    if credential.enabled && credential.generation > credential_revocation_floor {
-                        client_certificate_credentials.push((der_sha256, principal));
-                    }
-                }
-            }
-        }
-
-        let mut surface_ids = BTreeSet::new();
-        let mut surface_descriptors = Vec::new();
-        for surface in profile.surfaces {
-            if surface.surface_id.trim().is_empty() {
-                return Err(GatewayError::InvalidProfile(
-                    "surface id must not be empty".into(),
-                ));
-            }
-            if !surface_ids.insert(surface.surface_id.clone()) {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "duplicate surface_id {}",
-                    surface.surface_id
-                )));
-            }
-            validate_surface_shape(&surface)?;
-            let grant_template_literal = perform_capability_for_effect(surface.target.path());
-            let grant_template = Capability::parse(&grant_template_literal)
-                .map_err(|e| GatewayError::InvalidProfile(e.to_string()))?;
-            if !grant_template.covers(GATEWAY_EFFECT_HANDLE_VERB, surface.target.path()) {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "surface {} grant template does not cover {} on {}",
-                    surface.surface_id,
-                    GATEWAY_EFFECT_HANDLE_VERB,
-                    surface.target.path()
-                )));
-            }
-            if let Some(publish_capability) = &surface.publish_capability {
-                if publish_capability.trim().is_empty() {
-                    return Err(GatewayError::InvalidProfile(format!(
-                        "surface {} publish_capability must not be empty",
-                        surface.surface_id
-                    )));
-                }
-                let publish_capability = Capability::parse(publish_capability)
-                    .map_err(|e| GatewayError::InvalidProfile(e.to_string()))?;
-                if !publish_capability.covers("publish", surface.target.path()) {
-                    return Err(GatewayError::InvalidProfile(format!(
-                        "surface {} publish_capability does not cover publish on {}",
-                        surface.surface_id,
-                        surface.target.path()
-                    )));
-                }
-            }
-
-            let descriptor = CompiledSurfaceDescriptor {
-                surface_id: surface.surface_id.clone(),
-                target: surface.target.clone(),
-                method_bitmap: MethodBitmap::empty(),
-                grant_template: grant_template_literal,
-                grant_capability: grant_template.clone(),
-                grant_selector: ResourceSelector {
-                    pattern: grant_template,
-                },
-                publish_capability: surface.publish_capability.clone(),
-                input_schema: surface.input_schema.clone(),
-                input_schema_validator: match &surface.input_schema {
-                    Some(schema) => Some(compile_value_schema(
-                        schema,
-                        &format!("surface {} input_schema", surface.surface_id),
-                    )?),
-                    None => None,
-                },
-                output_schema: surface.output_schema.clone(),
-                output_schema_validator: match &surface.output_schema {
-                    Some(schema) => Some(compile_value_schema(
-                        schema,
-                        &format!("surface {} output_schema", surface.surface_id),
-                    )?),
-                    None => None,
-                },
-                output_stream_schema: surface.output_stream_schema.clone(),
-                output_stream_schema_validator: match &surface.output_stream_schema {
-                    Some(schema) => Some(compile_value_schema(
-                        schema,
-                        &format!("surface {} output_stream_schema", surface.surface_id),
-                    )?),
-                    None => None,
-                },
-            };
-            surface_descriptors.push(descriptor.clone());
-        }
-        let surfaces_by_id: BTreeMap<String, CompiledSurfaceDescriptor> = surface_descriptors
-            .iter()
-            .map(|surface| (surface.surface_id.clone(), surface.clone()))
-            .collect();
-
-        let mut publication_keys = BTreeSet::new();
-        let mut publication_descriptors = Vec::new();
-        for publication in profile.publications {
-            validate_publication_shape(&publication)?;
-            let Some(surface) = surfaces_by_id.get(&publication.surface_id) else {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "publication {}:{}:{} references unknown surface {}",
-                    publication.protocol,
-                    publication.kind,
-                    publication.name,
-                    publication.surface_id
-                )));
-            };
-            if surface.publish_capability.is_none() {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "publication {}:{}:{} references surface {} without publish_capability",
-                    publication.protocol,
-                    publication.kind,
-                    publication.name,
-                    publication.surface_id
-                )));
-            }
-            if let Some(title) = &publication.title
-                && title.trim().is_empty()
-            {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "publication {}:{}:{} title must not be empty",
-                    publication.protocol, publication.kind, publication.name
-                )));
-            }
-            if let Some(description) = &publication.description
-                && description.trim().is_empty()
-            {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "publication {}:{}:{} description must not be empty",
-                    publication.protocol, publication.kind, publication.name
-                )));
-            }
-            if let Some(annotations) = &publication.annotations
-                && !matches!(annotations.view(), ValueView::Map(_))
-            {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "publication {}:{}:{} annotations must be a map",
-                    publication.protocol, publication.kind, publication.name
-                )));
-            }
-            if let Some(metadata) = &publication.metadata
-                && !matches!(metadata.view(), ValueView::Map(_))
-            {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "publication {}:{}:{} metadata must be a map",
-                    publication.protocol, publication.kind, publication.name
-                )));
-            }
-            let key = (
-                publication.protocol.clone(),
-                publication.kind.clone(),
-                publication_identity(&publication),
-            );
-            if !publication_keys.insert(key) {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "duplicate publication {}:{}:{}",
-                    publication.protocol, publication.kind, publication.name
-                )));
-            }
-            if publication.enabled {
-                publication_descriptors.push(GatewayPublicationDescriptor {
-                    protocol: publication.protocol,
-                    kind: publication.kind,
-                    name: publication.name,
-                    address: publication.address,
-                    surface_id: publication.surface_id,
-                    title: publication.title,
-                    description: publication.description,
-                    properties: publication.properties,
-                    annotations: publication.annotations,
-                    metadata: publication.metadata,
-                });
-            }
-        }
-
-        let mut surface_bindings_by_principal = BTreeMap::new();
-        for binding in profile.principal_surface_bindings {
-            if binding.principal_id.trim().is_empty() {
-                return Err(GatewayError::InvalidProfile(
-                    "principal surface binding principal_id must not be empty".into(),
-                ));
-            }
-            if !identity_by_principal.contains_key(&binding.principal_id) {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "surface binding references unmapped principal {}",
-                    binding.principal_id
-                )));
-            }
-            if surface_bindings_by_principal.contains_key(&binding.principal_id) {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "duplicate surface binding for principal {}",
-                    binding.principal_id
-                )));
-            }
-
-            let visible = collect_binding_surface_ids(
-                &surfaces_by_id,
-                &binding.visible_surfaces,
-                "visible_surfaces",
-            )?;
-            let submit = collect_binding_surface_ids(
-                &surfaces_by_id,
-                &binding.submit_surfaces,
-                "submit_surfaces",
-            )?;
-            if !submit.is_subset(&visible) {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "submit_surfaces for principal {} must be a subset of visible_surfaces",
-                    binding.principal_id
-                )));
-            }
-            if !submit.is_empty() && binding.capability_ceiling.is_empty() {
-                return Err(GatewayError::InvalidProfile(format!(
-                    "capability_ceiling for principal {} must not be empty when submit_surfaces is not empty",
-                    binding.principal_id
-                )));
-            }
-            let mut capability_ceiling = Vec::new();
-            for literal in &binding.capability_ceiling {
-                if literal.trim().is_empty() {
-                    return Err(GatewayError::InvalidProfile(format!(
-                        "capability_ceiling for principal {} must not contain an empty capability",
-                        binding.principal_id
-                    )));
-                }
-                capability_ceiling.push(Capability::parse(literal).map_err(|e| {
-                    GatewayError::InvalidProfile(format!(
-                        "capability_ceiling for principal {} contains invalid capability: {e}",
-                        binding.principal_id
-                    ))
-                })?);
-            }
-            for surface_id in &submit {
-                let Some(surface) = surfaces_by_id.get(surface_id) else {
-                    continue;
-                };
-                if !capability_ceiling
-                    .iter()
-                    .any(|ceiling| ceiling.covers_cap(&surface.grant_capability))
-                {
-                    return Err(GatewayError::InvalidProfile(format!(
-                        "capability_ceiling for principal {} does not cover surface {} grant template {}",
-                        binding.principal_id, surface.surface_id, surface.grant_template
-                    )));
-                }
-            }
-            surface_bindings_by_principal.insert(
-                binding.principal_id,
-                CompiledPrincipalSurfaceBinding {
-                    visible,
-                    submit,
-                    capability_ceiling,
-                    request_grants_by_surface: BTreeMap::new(),
-                },
-            );
-        }
-
-        Ok(Self {
-            profile_name: profile.profile_name,
-            revision: profile.revision,
-            credential_revocation_floor,
-            bearer_credentials,
-            client_certificate_credentials,
-            identity_by_principal,
-            surfaces_by_id,
-            surface_bindings_by_principal,
-            authority_anchor: profile.authority_anchor,
-            surface_descriptors,
-            registered_hosts,
-            registered_origins,
-            limits: profile.limits,
-            publication_descriptors,
-        })
     }
-
-    fn binding_for_principal(&self, principal_id: &str) -> CompiledPrincipalSurfaceBinding {
-        self.surface_bindings_by_principal
-            .get(principal_id)
-            .cloned()
-            .unwrap_or_else(CompiledPrincipalSurfaceBinding::default)
-    }
-
-    fn principal_can_submit(&self, principal_id: &str, surface_id: &str) -> bool {
-        self.surface_bindings_by_principal
-            .get(principal_id)
-            .is_some_and(|binding| binding.submit.contains(surface_id))
-    }
-
-    fn surface_by_id(&self, surface_id: &str) -> Option<&CompiledSurfaceDescriptor> {
-        self.surfaces_by_id.get(surface_id)
-    }
-
-    fn surface_descriptors_for_ids<'a>(
-        &'a self,
-        surface_ids: &BTreeSet<String>,
-    ) -> Result<Vec<&'a CompiledSurfaceDescriptor>, GatewayError> {
-        let mut surfaces = Vec::new();
-        for surface_id in surface_ids {
-            let Some(surface) = self.surface_by_id(surface_id) else {
-                return Err(GatewayError::Rejected(format!(
-                    "unknown gateway surface {surface_id}"
-                )));
-            };
-            surfaces.push(surface);
-        }
-        Ok(surfaces)
-    }
-
-    fn verify_bearer(&self, token: &BearerToken) -> Result<VerifiedPrincipal, GatewayError> {
-        let hash = hash_bearer_token(token.as_str());
-        let mut verified = None;
-        for (stored_hash, principal) in &self.bearer_credentials {
-            if stored_hash.0.as_bytes().ct_eq(hash.as_bytes()).into() {
-                let Some(mapping) = self.identity_by_principal.get(&principal.principal_id) else {
-                    continue;
-                };
-                if mapping.enabled {
-                    let mut principal = principal.clone();
-                    principal.principal_generation = mapping.generation;
-                    verified = Some(principal);
-                }
-            }
-        }
-        verified.ok_or(GatewayError::Unauthenticated)
-    }
-
-    fn verify_client_certificate(
-        &self,
-        credential: &ClientCertificateCredential,
-    ) -> Result<VerifiedPrincipal, GatewayError> {
-        let mut verified = None;
-        for (stored_hash, principal) in &self.client_certificate_credentials {
-            if stored_hash
-                .0
-                .as_bytes()
-                .ct_eq(credential.der_sha256.0.as_bytes())
-                .into()
-            {
-                let Some(mapping) = self.identity_by_principal.get(&principal.principal_id) else {
-                    continue;
-                };
-                if mapping.enabled {
-                    let mut principal = principal.clone();
-                    principal.principal_generation = mapping.generation;
-                    verified = Some(principal);
-                }
-            }
-        }
-        verified.ok_or(GatewayError::Unauthenticated)
-    }
-
-    fn has_authenticating_credentials(&self) -> bool {
-        !self.bearer_credentials.is_empty() || !self.client_certificate_credentials.is_empty()
-    }
-
-    fn session_identity_path(&self, session: &GatewaySession) -> Result<&str, GatewayError> {
-        let mapping = self
-            .identity_by_principal
-            .get(&session.principal.principal_id)
-            .ok_or_else(|| GatewayError::Unauthorized(session.principal.principal_id.clone()))?;
-        if !mapping.enabled
-            || session.principal.principal_generation != mapping.generation
-            || session.identity_path != mapping.identity_path
-        {
-            return Err(GatewayError::Rejected(
-                "gateway session principal generation is stale".into(),
-            ));
-        }
-        if session.principal.credential_generation <= self.credential_revocation_floor {
-            return Err(GatewayError::Rejected(
-                "gateway session credential generation is revoked".into(),
-            ));
-        }
-        let credential_still_active = match session.principal.auth_method {
-            GatewayAuthMethod::Bearer => self.bearer_credentials.iter().any(|(_, principal)| {
-                principal.credential_id == session.principal.credential_id
-                    && principal.credential_generation == session.principal.credential_generation
-                    && principal.principal_id == session.principal.principal_id
-            }),
-            GatewayAuthMethod::ClientCertificate => {
-                self.client_certificate_credentials
-                    .iter()
-                    .any(|(_, principal)| {
-                        principal.credential_id == session.principal.credential_id
-                            && principal.credential_generation
-                                == session.principal.credential_generation
-                            && principal.principal_id == session.principal.principal_id
-                    })
-            }
-        };
-        if !credential_still_active {
-            return Err(GatewayError::Rejected(
-                "gateway session credential generation is stale".into(),
-            ));
-        }
-        Ok(mapping.identity_path.as_str())
-    }
-}
-
-fn validate_surface_shape(surface: &GatewaySurface) -> Result<(), GatewayError> {
-    if surface.target.path().scheme() != "effect" {
-        return Err(GatewayError::InvalidProfile(format!(
-            "effect_invoke surface {} must target effect://",
-            surface.surface_id
-        )));
-    }
-    if surface.target.path().cluster().is_some() {
-        return Err(GatewayError::InvalidProfile(format!(
-            "effect_invoke surface {} must target a local effect path",
-            surface.surface_id
-        )));
-    }
-    if surface.target.path().segments().is_empty() {
-        return Err(GatewayError::InvalidProfile(format!(
-            "effect_invoke surface {} must name an effect path",
-            surface.surface_id
-        )));
-    }
-    Ok(())
-}
-
-fn validate_publication_shape(publication: &GatewayPublication) -> Result<(), GatewayError> {
-    validate_publication_segment(&publication.protocol, "publication protocol")?;
-    validate_publication_segment(&publication.kind, "publication kind")?;
-    validate_publication_segment(&publication.name, "publication name")?;
-    if let Some(address) = &publication.address {
-        validate_publication_address(address)?;
-    }
-    if publication.surface_id.trim().is_empty() {
-        return Err(GatewayError::InvalidProfile(
-            "publication surface_id must not be empty".into(),
-        ));
-    }
-    for key in publication.properties.keys() {
-        validate_publication_segment(key, "publication property name")?;
-    }
-    Ok(())
-}
-
-fn publication_identity(publication: &GatewayPublication) -> String {
-    match &publication.address {
-        Some(address) => address.clone(),
-        None => publication.name.clone(),
-    }
-}
-
-fn validate_publication_address(address: &str) -> Result<(), GatewayError> {
-    if address.trim().is_empty()
-        || address
-            .chars()
-            .any(|ch| ch.is_ascii_control() || ch.is_ascii_whitespace())
-    {
-        return Err(GatewayError::InvalidProfile(
-            "publication address must be non-empty and contain no whitespace".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_publication_segment(value: &str, label: &'static str) -> Result<(), GatewayError> {
-    if !is_gateway_publication_segment(value) {
-        return Err(GatewayError::InvalidProfile(format!(
-            "{label} must be one stable ASCII segment"
-        )));
-    }
-    Ok(())
-}
-
-fn is_gateway_publication_segment(value: &str) -> bool {
-    if value == "*" || value == "**" {
-        return false;
-    }
-    let mut chars = value.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphanumeric() => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == ':')
 }
 
 /// Authenticated, redacted profile descriptor returned by gateway discovery.
@@ -906,7 +276,7 @@ pub struct GatewayDescriptor {
     pub limits: GatewayLimitProfile,
 }
 
-/// Readiness state for a gateway runtime.
+/// Profile authentication readiness, independent of maintenance task health.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GatewayReadiness {
     /// The active profile can authenticate clients.
@@ -956,6 +326,9 @@ pub struct GatewayRuntimeStatus {
     pub consecutive_failed_reloads: u64,
     /// Most recent redacted reload failure, if any.
     pub last_reload_failure: Option<GatewayProfileReloadFailure>,
+    /// Request and object maintenance progress or the host's manual responsibility.
+    /// Profile readiness is independent of this status.
+    pub maintenance: GatewayMaintenanceStatus,
 }
 
 /// One profile surface visible through authenticated discovery.
@@ -963,6 +336,10 @@ pub struct GatewayRuntimeStatus {
 pub struct GatewaySurfaceDescriptor {
     /// Stable surface id within the profile.
     pub surface_id: String,
+    /// Original ledger, Profile, subject and surface binding for guarded retries.
+    /// Retain this before submitting; never replace it for an uncertain request.
+    /// This fingerprint is not authority or an execution-liveness guarantee.
+    pub request_scope: String,
     /// Resource target exposed through this surface.
     pub target: ResourceName,
     /// Capability literal required before this surface may be published.
@@ -1019,16 +396,24 @@ pub struct GatewayPublicationDescriptor {
 /// Client options attached to one Gateway submission.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SubmitOptions {
+    /// Original scope advertised for this authenticated surface. Required when
+    /// supplying an idempotency key or submission token. Preparation rejects a
+    /// mismatch before reservation or effects; retry never refreshes this value.
+    pub expected_request_scope: Option<String>,
     /// Client supplied idempotency key for non-idempotent retry boundaries.
+    /// Literal material; no prefix syntax or account/surface authority.
     pub idempotency_key: Option<String>,
     /// Server-issued token for retry-safe non-idempotent submission.
+    /// Literal material; carrying a token does not grant authority.
     pub submission_token: Option<String>,
-    /// Client requested deadline in milliseconds since unix epoch. The server
-    /// clamps this against the profile; clients cannot extend server limits.
+    /// Store-wide retry range, default zero. Changing the epoch starts a new
+    /// request and never inherits a prior result; clients must not advance an
+    /// uncertain request automatically. Closed identities may query retained
+    /// evidence but cannot execute anew. Discover the range via Gateway.
+    pub retry_epoch: u64,
+    /// Client requested deadline in milliseconds since Unix epoch. A request
+    /// whose effective deadline exceeds the profile ceiling is rejected.
     pub deadline_ms: Option<u64>,
-    /// Requested transport encoding. Runtime admission records it but does not
-    /// trust it as an authorization input.
-    pub requested_encoding: Option<String>,
 }
 
 /// A typed submission accepted by the gateway runtime.
@@ -1038,6 +423,32 @@ pub struct GatewaySubmission {
     body: GatewaySubmissionBody,
     requested_output: OutputMode,
     options: SubmitOptions,
+    server_deadline: Option<HostDeadline>,
+}
+
+/// Payload-independent submission fields frozen before preparation work.
+#[derive(Clone, Debug)]
+pub struct GatewaySubmissionHead {
+    /// Profile surface selected for submission, not a resource authority grant.
+    pub surface_id: String,
+    /// Output port to reserve before materializing or inspecting the payload.
+    pub requested_output: OutputMode,
+    /// Client timeout and optional request-idempotency identity.
+    pub options: SubmitOptions,
+    /// Additional host or transport deadline in this runtime's clock domain.
+    pub server_deadline: Option<HostDeadline>,
+}
+
+impl GatewaySubmissionHead {
+    /// Select a surface for ordinary unary input preparation.
+    pub fn direct_input(surface_id: impl Into<String>) -> Self {
+        Self {
+            surface_id: surface_id.into(),
+            requested_output: OutputMode::Unary,
+            options: SubmitOptions::default(),
+            server_deadline: None,
+        }
+    }
 }
 
 impl GatewaySubmission {
@@ -1051,6 +462,7 @@ impl GatewaySubmission {
             }),
             requested_output: OutputMode::Unary,
             options: SubmitOptions::default(),
+            server_deadline: None,
         }
     }
 
@@ -1061,6 +473,7 @@ impl GatewaySubmission {
             body: GatewaySubmissionBody::InputStream(open),
             requested_output: OutputMode::Unary,
             options: SubmitOptions::default(),
+            server_deadline: None,
         }
     }
 
@@ -1082,6 +495,13 @@ impl GatewaySubmission {
     /// Replace submission options.
     pub fn with_options(mut self, options: SubmitOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Bound this submission by a transport-owned monotonic deadline from
+    /// [`Gateway::deadline_after`]. Client options cannot extend this bound.
+    pub fn with_server_deadline(mut self, deadline: HostDeadline) -> Self {
+        self.server_deadline = Some(deadline);
         self
     }
 
@@ -1108,7 +528,19 @@ pub struct GatewayAccepted {
     pub submission_id: String,
     /// Trace identity generated independently from `submission_id`.
     pub trace_root: String,
-    /// Profile revision that admitted the request.
+    /// Positive full-width u64 profile revision that admitted the request.
+    ///
+    /// Retained records encode `accepted_profile_rev` as a positive integer
+    /// through `i64::MAX`; larger values through `u64::MAX` use a canonical
+    /// unsigned decimal string without a sign or leading zeros. Small values
+    /// must use the integer representation, not a string.
+    ///
+    /// Encoding rejects zero or a revision inconsistent with the original
+    /// request fingerprint before serializing acceptance for settlement.
+    /// Decoding rejects negative integers, zero, floats, signs, leading zeros,
+    /// nondecimal characters, string overflow and noncanonical representations.
+    /// It validates the complete original request fingerprint and requires this
+    /// revision to match that binding without truncation or loss of precision.
     pub profile_rev: GatewayProfileRev,
     /// Surface boundary used for admission, if one was selected.
     pub surface_id: String,
@@ -1126,14 +558,6 @@ pub struct GatewaySubmitResult {
     pub origin: CompletionOrigin,
 }
 
-/// Result of admitting the first `SubmitStream` frame.
-pub enum GatewayInputStreamStart {
-    /// A new stream request was admitted and chunks may now be delivered.
-    Accepted(Box<GatewayAcceptedInputStream>),
-    /// The idempotency record was already completed; no chunks are needed.
-    Replay(Box<GatewaySubmitResult>),
-}
-
 /// Runtime-owned admission context for one accepted client input stream.
 pub struct GatewayAcceptedInputStream {
     accepted: GatewayAccepted,
@@ -1144,8 +568,7 @@ pub struct GatewayAcceptedInputStream {
     surface_id: String,
     requested_output: OutputMode,
     options: SubmitOptions,
-    deadline: Option<Instant>,
-    idempotency: Option<Box<GatewayIdempotencyReservation>>,
+    deadline: Option<HostDeadline>,
     request_guard: GatewayRequestGuard,
     request_process: ProcessId,
     executor: Executor,
@@ -1153,8 +576,15 @@ pub struct GatewayAcceptedInputStream {
 
 impl GatewayAcceptedInputStream {
     /// Return the server acceptance metadata bound to this stream.
+    /// Reauthorize with [`Self::validate_delivery`] at actual disclosure.
     pub fn accepted(&self) -> &GatewayAccepted {
         &self.accepted
+    }
+
+    /// Check the original session and surface against the current runtime
+    /// profile before disclosing cached acceptance metadata.
+    pub fn validate_delivery(&self) -> Result<(), GatewayError> {
+        self.request_guard.lease.delivery.validate()
     }
 
     /// Return the admitted stream declaration.
@@ -1188,40 +618,6 @@ pub struct GatewayCancelRequest {
     pub trace_root: String,
     /// Optional caller-visible reason for audit or transport delivery.
     pub reason: Option<String>,
-}
-
-/// Runtime state tracked for a Gateway request registry entry.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GatewayRequestState {
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
-    Expired,
-}
-
-/// Large-value metadata retained by the request registry.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GatewayLargeValueRefSummary {
-    hash: String,
-    size: u64,
-    mime: Option<String>,
-}
-
-/// In-memory request registry entry used for cancellation and short retention.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GatewayRequestEntry {
-    accepted: GatewayAccepted,
-    request_process: ProcessId,
-    gateway_id: String,
-    principal_id: String,
-    state: GatewayRequestState,
-    deadline: Option<Instant>,
-    retained_until_ms: i64,
-    risk_class: String,
-    surface_ids: Vec<String>,
-    large_value_refs: Vec<GatewayLargeValueRefSummary>,
-    admission_released: bool,
 }
 
 /// The body of a Gateway submission.
@@ -1336,10 +732,87 @@ struct LoweredSubmissionInspection {
     wait_deadline_count: usize,
 }
 
+/// Literal retry material, normalized and validated exactly as for submission.
+/// Neither variant grants authority or identifies a request across profiles.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GatewayRequestIdentity {
+    /// Caller-provided idempotency key.
+    IdempotencyKey(String),
+    /// Caller-provided submission token.
+    SubmissionToken(String),
+}
+
+/// Point lookup bound to the original scope and retry epoch, without a payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatewayRequestLookup {
+    /// Original surface identifier.
+    pub surface_id: String,
+    /// Original descriptor's request scope; a changed scope rejects disclosure.
+    pub expected_request_scope: String,
+    /// Original retry epoch, including a closed epoch with retained evidence.
+    pub retry_epoch: u64,
+    /// Original retry identity, not authorization.
+    pub identity: GatewayRequestIdentity,
+}
+
+/// Retained request evidence, not an execution-liveness assertion.
+#[derive(Clone, Debug)]
+pub enum GatewayRequestEvidence {
+    /// No retained record was observed; this does not prove non-execution.
+    Unproven,
+    /// A reservation exists; this proves neither running nor acceptance.
+    Reserved,
+    /// Bounded original acceptance, result class and unresolved-effect evidence.
+    /// No result payload or failure details are disclosed and no export is created.
+    /// Backend read/decode is bounded by the store's existing `max_record_bytes`,
+    /// not independent of the retained payload's size.
+    Settled(Box<GatewayRequestSummary>),
+    /// Result retired; the original request must not execute again.
+    Retired,
+}
+
+/// Payload-independent projection of the original settled record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatewayRequestSummary {
+    /// Original acceptance, not a newly accepted attempt.
+    pub accepted: GatewayAccepted,
+    /// Original terminal class without value or error details.
+    pub result_class: GatewayRequestResultClass,
+    /// Bounded unresolved operation identities; omissions remain explicit.
+    pub unresolved_operations: xolotl_types::UnresolvedOperations,
+}
+
+/// Terminal classification that does not disclose result contents.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatewayRequestResultClass {
+    /// Normal completion.
+    Done,
+    /// Short-circuit completion.
+    Short,
+    /// Known program failure.
+    Fail,
+}
+
+/// Read-only retained-result availability, without authorizing execution.
+#[derive(Clone, Debug)]
+pub enum GatewayRetainedRequestResult {
+    /// Original cached result, ready for adapter-controlled delivery.
+    Available(Box<GatewaySubmitResult>),
+    /// No retained result was observed; execution is not disproven.
+    Unproven,
+    /// Only a reservation was observed; execution liveness is not proven.
+    Reserved,
+    /// The result was retired and the original identity cannot execute again.
+    Retired,
+}
+
 /// The shared gateway contract. Implementors verify credentials, map them to a
 /// session, and run typed submissions through a profile-bound runtime.
 #[async_trait]
 pub trait Gateway: Send + Sync {
+    /// Project a transport timeout into this Gateway's host clock domain.
+    fn deadline_after(&self, duration: Duration) -> Result<HostDeadline, GatewayError>;
+
     /// Return redacted runtime status for transport handshakes and health.
     fn status(&self) -> GatewayRuntimeStatus;
 
@@ -1372,6 +845,75 @@ pub trait Gateway: Send + Sync {
     /// expose resource paths, effect names, capability literals, or limits.
     fn describe(&self, session: &GatewaySession) -> Result<GatewayDescriptor, GatewayError>;
 
+    /// Discover the current request retry range under existing session authority.
+    /// Closure is a trusted storage-owner action, not application authority.
+    async fn retry_epoch(&self, session: &GatewaySession) -> Result<u64, GatewayError>;
+
+    /// Read one original request's evidence under current session, principal,
+    /// surface and scope authority, rechecked after the store await. This uses
+    /// no Process, execution slot, reservation, settlement, audit write or scan,
+    /// and neither requires an open epoch nor advances it. Corrupt records are
+    /// errors, never absence. No historical profile is searched or inferred.
+    /// Transports must still check access at actual emission after later awaits.
+    /// Backend observation still reads/decodes the original record, bounded by
+    /// the store's existing `max_record_bytes`; this is not payload-independent
+    /// allocation or I/O. No result payload is disclosed or exported.
+    /// Settled projection validates record metadata and required payload shape,
+    /// not the complete payload codec. In particular, failure JSON is not parsed;
+    /// delivery/replay rejects corrupt payloads without changing settled evidence.
+    async fn lookup_request(
+        &self,
+        session: &GatewaySession,
+        lookup: GatewayRequestLookup,
+    ) -> Result<GatewayRequestEvidence, GatewayError>;
+
+    /// Read only the original retained result under the same scope, epoch and
+    /// identity checks as lookup, including closed epochs. Never executes,
+    /// reserves, settles or creates an export. Unproven, reserved and retired
+    /// records are explicitly unavailable states. A successful result has
+    /// cached origin; adapters own bounded inline delivery or configured export
+    /// and must recheck current delivery authority after all awaits.
+    async fn read_retained_request_result(
+        &self,
+        session: &GatewaySession,
+        lookup: GatewayRequestLookup,
+    ) -> Result<GatewayRetainedRequestResult, GatewayError>;
+
+    /// Authorize delivery of acceptance, output, and reconciliation evidence
+    /// for the original session and surface under the current profile snapshot.
+    /// Adapters must check after their last await, at actual emission (including
+    /// cached acceptance and structured fallbacks). Denial withholds disclosure;
+    /// it must not erase committed effects or re-execute the submission.
+    fn validate_submission_access(
+        &self,
+        session: &GatewaySession,
+        surface_id: &str,
+    ) -> Result<(), GatewayError>;
+
+    /// Reserve shared capacity before materializing or inspecting the payload.
+    fn prepare_submission(
+        &self,
+        session: &GatewaySession,
+        head: GatewaySubmissionHead,
+        output_window: Option<StreamWindow>,
+    ) -> Result<GatewayPreparation, GatewayError>;
+
+    /// Consume preparation ownership without acquiring another admission slot.
+    async fn submit_prepared(
+        &self,
+        preparation: GatewayPreparation,
+        payload: Value,
+        provenance: Option<GatewayPayloadProvenance>,
+    ) -> Result<GatewaySubmitResult, GatewayError>;
+
+    /// Transfer preparation ownership into incremental output execution.
+    async fn submit_output_stream_prepared(
+        &self,
+        preparation: GatewayPreparation,
+        payload: Value,
+        provenance: Option<GatewayPayloadProvenance>,
+    ) -> Result<GatewayOutputStream, GatewayError>;
+
     /// Admit and run one Gateway submission as the session identity.
     async fn submit(
         &self,
@@ -1393,7 +935,7 @@ pub trait Gateway: Send + Sync {
         &self,
         session: &GatewaySession,
         submission: GatewaySubmission,
-    ) -> Result<GatewayInputStreamStart, GatewayError>;
+    ) -> Result<Box<GatewayAcceptedInputStream>, GatewayError>;
 
     /// Complete an admitted input stream with the folded payload.
     async fn complete_input_stream_submission(
@@ -1440,8 +982,16 @@ pub trait Gateway: Send + Sync {
         request: OpenObjectReadRequest,
     ) -> Result<GatewayObjectDownload, GatewayError>;
 
-    /// Record gateway-local audit metadata for an inbound request.
+    /// Record required gateway-local audit metadata for an inbound request.
+    /// Missing observation storage is an error.
     fn record_gateway_audit(&self, audit: GatewayAudit<'_>) -> Result<(), String>;
+
+    /// Record an observation when the host installed observation storage.
+    /// Selected storage failures remain errors. Implementations without an
+    /// explicit storage-availability contract conservatively require recording.
+    fn record_optional_gateway_audit(&self, audit: GatewayAudit<'_>) -> Result<(), String> {
+        self.record_gateway_audit(audit)
+    }
 }
 
 /// Profile-driven in-process Gateway runtime over a [`Bootstrap`].
@@ -1451,9 +1001,62 @@ pub trait Gateway: Send + Sync {
 /// Process from profile surfaces.
 pub struct GatewayRuntime {
     boot: Arc<Bootstrap>,
+    idempotency: Arc<dyn GatewayIdempotencyStore>,
     objects: ObjectStore,
     state: Arc<RwLock<GatewayRuntimeState>>,
     requests: Arc<GatewayRequestRegistry>,
+    request_maintenance: Option<Arc<dyn AbortTask>>,
+    object_maintenance: Option<Arc<dyn AbortTask>>,
+    maintenance_health: MaintenanceHealth,
+}
+
+impl Drop for GatewayRuntime {
+    fn drop(&mut self) {
+        if let Some(task) = &self.request_maintenance {
+            task.abort();
+        }
+        if let Some(task) = &self.object_maintenance {
+            task.abort();
+        }
+    }
+}
+
+/// Position of the bounded Gateway maintenance pass. Keep one cursor per
+/// manually driven runtime and reuse it across calls to [`GatewayRuntime::maintain_once`].
+#[derive(Debug, Default)]
+pub struct GatewayMaintenanceCursor {
+    ticket_cursor: Option<StateCursor>,
+    grant_cursor: Option<StateCursor>,
+}
+
+/// Work completed by one bounded Gateway maintenance pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GatewayMaintenanceReport {
+    /// Running requests whose monotonic deadline elapsed.
+    pub expired_requests: usize,
+    /// Expired request processes whose cancellation could not be confirmed.
+    pub failed_request_cancellations: usize,
+    /// Whether the State host exposed both query and bounded-write ports for
+    /// Gateway object record scans. Otherwise the host owns record cleanup.
+    pub object_scans_available: bool,
+    /// Upload-ticket records examined in this pass.
+    pub upload_tickets_examined: usize,
+    /// Expired upload tickets removed in this pass.
+    pub upload_tickets_removed: usize,
+    /// Upload-ticket records too large for a bounded maintenance page.
+    pub upload_tickets_skipped_oversized: usize,
+    /// Object read-grant records examined in this pass.
+    pub read_grants_examined: usize,
+    /// Expired object read grants removed in this pass.
+    pub read_grants_removed: usize,
+    /// Read-grant records too large for a bounded maintenance page.
+    pub read_grants_skipped_oversized: usize,
+}
+
+#[derive(Clone, Copy)]
+enum GatewayMaintenanceMode {
+    Automatic,
+    Manual,
 }
 
 struct GatewayRuntimeState {
@@ -1463,674 +1066,126 @@ struct GatewayRuntimeState {
     last_reload_failure: Option<GatewayProfileReloadFailure>,
 }
 
-#[derive(Debug, Default)]
-struct GatewayRequestRegistry {
-    inner: Mutex<GatewayRequestRegistryInner>,
+struct GatewaySubmissionAuthority {
+    state: Arc<RwLock<GatewayRuntimeState>>,
+    session: GatewaySession,
+    surface_id: String,
 }
 
-#[derive(Debug, Default)]
-struct GatewayRequestRegistryInner {
-    entries: BTreeMap<String, GatewayRequestEntry>,
-    global_running: usize,
-    principal_running: BTreeMap<String, usize>,
-    surface_running: BTreeMap<String, usize>,
-    risk_running: BTreeMap<String, usize>,
-    budget_running: GatewayBudgetCharge,
-    budget_reservations: BTreeMap<u64, GatewayBudgetCharge>,
-    next_budget_reservation_id: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct GatewayExpiredRequest {
-    request_process: ProcessId,
-}
-
-#[derive(Debug)]
-struct GatewayAdmissionGuard {
-    registry: Arc<GatewayRequestRegistry>,
-    principal_id: String,
-    surface_ids: Vec<String>,
-    risk_class: String,
-    released: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct GatewayBudgetCharge {
-    inflight_ops: u64,
-    wall_ms: u64,
-    bytes_in: u64,
-    bytes_out: u64,
-    inline_value_bytes: u64,
-    stream_items: u64,
-    estimated_cost_micro_usd: u64,
-}
-
-#[derive(Debug)]
-struct GatewayBudgetGuard {
-    registry: Arc<GatewayRequestRegistry>,
-    reservation_id: u64,
-    released: bool,
-}
-
-#[derive(Debug)]
-struct GatewayRequestLease {
-    registry: Arc<GatewayRequestRegistry>,
-    submission_id: String,
-    admission: GatewayAdmissionGuard,
-    budget: GatewayBudgetGuard,
-}
-
-#[derive(Debug)]
-struct GatewayRequestGuard {
-    lease: Arc<GatewayRequestLease>,
-    process: Option<RequestProcess<'static>>,
-    finished: bool,
-}
-
-impl GatewayRequestRegistry {
-    fn new() -> Self {
-        Self::default()
+impl std::fmt::Debug for GatewaySubmissionAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewaySubmissionAuthority")
+            .finish_non_exhaustive()
     }
+}
 
-    fn new_acceptance(
-        &self,
-        profile_rev: GatewayProfileRev,
-        surface_id: String,
-    ) -> Result<GatewayAccepted, GatewayError> {
-        for _ in 0..8 {
-            let accepted = GatewayAccepted {
-                submission_id: random_gateway_id("gw-submission", profile_rev)?,
-                trace_root: random_gateway_id("gw-trace", profile_rev)?,
-                profile_rev,
-                surface_id: surface_id.clone(),
-            };
-            if !self
-                .inner
-                .lock()
-                .entries
-                .contains_key(&accepted.submission_id)
-            {
-                return Ok(accepted);
-            }
-        }
-        Err(GatewayError::LimitExceeded(
-            "submission id collision retry limit exceeded".into(),
-        ))
-    }
-
-    fn try_reserve_budget(
-        self: &Arc<Self>,
-        budget: &GatewayBudgetProfile,
-        charge: GatewayBudgetCharge,
-    ) -> Result<GatewayBudgetGuard, GatewayError> {
-        let mut inner = self.inner.lock();
-        ensure_budget_capacity(
-            budget.max_inflight_ops,
-            inner.budget_running.inflight_ops,
-            charge.inflight_ops,
-            "gateway budget in-flight ops",
-        )?;
-        ensure_budget_capacity(
-            budget.max_wall_ms,
-            inner.budget_running.wall_ms,
-            charge.wall_ms,
-            "gateway budget wall-ms",
-        )?;
-        ensure_budget_capacity(
-            budget.max_bytes_in,
-            inner.budget_running.bytes_in,
-            charge.bytes_in,
-            "gateway budget bytes-in",
-        )?;
-        ensure_budget_capacity(
-            budget.max_bytes_out,
-            inner.budget_running.bytes_out,
-            charge.bytes_out,
-            "gateway budget bytes-out",
-        )?;
-        ensure_budget_capacity(
-            budget.max_inline_value_bytes,
-            inner.budget_running.inline_value_bytes,
-            charge.inline_value_bytes,
-            "gateway budget inline value bytes",
-        )?;
-        ensure_budget_capacity(
-            budget.max_stream_items,
-            inner.budget_running.stream_items,
-            charge.stream_items,
-            "gateway budget stream items",
-        )?;
-        ensure_budget_capacity(
-            budget.max_estimated_cost_micro_usd,
-            inner.budget_running.estimated_cost_micro_usd,
-            charge.estimated_cost_micro_usd,
-            "gateway budget estimated cost",
-        )?;
-
-        inner.next_budget_reservation_id = inner.next_budget_reservation_id.saturating_add(1);
-        let reservation_id = inner.next_budget_reservation_id;
-        inner.budget_running = add_budget_charge(inner.budget_running, charge);
-        inner.budget_reservations.insert(reservation_id, charge);
-        Ok(GatewayBudgetGuard {
-            registry: self.clone(),
-            reservation_id,
-            released: false,
+impl GatewaySubmissionAuthority {
+    fn new(runtime: &GatewayRuntime, session: &GatewaySession, surface_id: &str) -> Arc<Self> {
+        Arc::new(Self {
+            state: runtime.state.clone(),
+            session: session.clone(),
+            surface_id: surface_id.into(),
         })
     }
 
-    fn try_admit(
-        self: &Arc<Self>,
-        limits: &GatewayLimitProfile,
-        principal_id: String,
-        surface_ids: Vec<String>,
-        risk_class: String,
-    ) -> Result<GatewayAdmissionGuard, GatewayError> {
-        let mut inner = self.inner.lock();
-        if inner.global_running >= limits.max_in_flight_requests {
-            return Err(GatewayError::LimitExceeded(
-                "global in-flight request limit".into(),
-            ));
-        }
-        let principal_limit = effective_fair_counter_limit(
-            limits.max_principal_in_flight_requests,
-            limits.max_in_flight_requests,
-        );
-        if counter_value(&inner.principal_running, &principal_id) >= principal_limit {
-            return Err(GatewayError::LimitExceeded(
-                "principal in-flight request limit".into(),
-            ));
-        }
-        let surface_limit = effective_fair_counter_limit(
-            limits.max_surface_in_flight_requests,
-            limits.max_in_flight_requests,
-        );
-        for surface_id in &surface_ids {
-            if counter_value(&inner.surface_running, surface_id) >= surface_limit {
-                return Err(GatewayError::LimitExceeded(
-                    "surface in-flight request limit".into(),
-                ));
-            }
-        }
-        let risk_limit = effective_fair_counter_limit(
-            limits.max_risk_class_in_flight_requests,
-            limits.max_in_flight_requests,
-        );
-        if counter_value(&inner.risk_running, &risk_class) >= risk_limit {
-            return Err(GatewayError::LimitExceeded(
-                "risk-class in-flight request limit".into(),
-            ));
-        }
-
-        inner.global_running = inner.global_running.saturating_add(1);
-        increment_counter(&mut inner.principal_running, &principal_id);
-        for surface_id in &surface_ids {
-            increment_counter(&mut inner.surface_running, surface_id);
-        }
-        increment_counter(&mut inner.risk_running, &risk_class);
-
-        Ok(GatewayAdmissionGuard {
-            registry: self.clone(),
-            principal_id,
-            surface_ids,
-            risk_class,
-            released: false,
+    fn validate(&self) -> Result<(), GatewayError> {
+        let profile = self.state.read().profile.clone();
+        GatewayRuntime::validate_submission_profile_access(
+            &profile,
+            &self.session,
+            &self.surface_id,
+        )
+        .map_err(|_access_error| {
+            GatewayError::Indeterminate("submission delivery access unavailable".into())
         })
     }
+}
 
-    fn insert_running(
-        self: &Arc<Self>,
-        entry: GatewayRequestEntry,
-        admission: GatewayAdmissionGuard,
-        budget: GatewayBudgetGuard,
-        process: RequestProcess<'static>,
-    ) -> Result<GatewayRequestGuard, GatewayError> {
-        let submission_id = entry.accepted.submission_id.clone();
-        let mut inner = self.inner.lock();
-        prune_completed_requests(&mut inner, now_millis());
-        if inner.entries.contains_key(&submission_id) {
-            return Err(GatewayError::LimitExceeded(
-                "submission id collision".into(),
-            ));
-        }
-        inner.entries.insert(submission_id.clone(), entry);
-        Ok(GatewayRequestGuard {
-            lease: Arc::new(GatewayRequestLease {
-                registry: self.clone(),
-                submission_id,
-                admission,
-                budget,
-            }),
-            process: Some(process),
-            finished: false,
+#[async_trait]
+impl xolotl_kernel::RequestAuthorizer for GatewaySubmissionAuthority {
+    async fn authorize(&self) -> Result<(), Failure> {
+        self.validate().map_err(|_access_error| Failure::Custom {
+            kind: "gateway.request.authorization".into(),
+            message: "gateway request authority unavailable".into(),
         })
     }
-
-    fn finish(&self, submission_id: &str, state: GatewayRequestState, now_ms: i64) {
-        let mut inner = self.inner.lock();
-        if let Some(entry) = inner.entries.get_mut(submission_id) {
-            if entry.state == GatewayRequestState::Running {
-                entry.state = state;
-            }
-            entry.retained_until_ms = now_ms.saturating_add(COMPLETED_REQUEST_RETENTION_MS);
-        }
-        prune_completed_requests(&mut inner, now_ms);
-    }
-
-    fn cancel(
-        &self,
-        session: &GatewaySession,
-        request: &GatewayCancelRequest,
-        boot: &Bootstrap,
-    ) -> Result<bool, GatewayError> {
-        if request.submission_id.trim().is_empty() || request.trace_root.trim().is_empty() {
-            return Ok(false);
-        }
-        let process = {
-            let mut inner = self.inner.lock();
-            let Some(entry) = inner.entries.get_mut(&request.submission_id) else {
-                return Ok(false);
-            };
-            if entry.principal_id != session.principal.principal_id
-                || entry.gateway_id != session.profile_name
-                || entry.accepted.trace_root != request.trace_root
-            {
-                return Ok(false);
-            }
-            if entry.state != GatewayRequestState::Running {
-                return Ok(matches!(entry.state, GatewayRequestState::Cancelled));
-            }
-            entry.state = GatewayRequestState::Cancelled;
-            entry.retained_until_ms = now_millis().saturating_add(COMPLETED_REQUEST_RETENTION_MS);
-            entry.request_process
-        };
-        boot.cancel_process(process)
-            .map_err(|error| GatewayError::Rejected(error.to_string()))?;
-        Ok(true)
-    }
-
-    fn release_admission(&self, admission: &GatewayAdmissionGuard) {
-        let mut inner = self.inner.lock();
-        decrement_admission_counters(
-            &mut inner,
-            &admission.principal_id,
-            &admission.surface_ids,
-            &admission.risk_class,
-        );
-    }
-
-    fn release_entry_admission(&self, submission_id: &str, _admission: &GatewayAdmissionGuard) {
-        let mut inner = self.inner.lock();
-        release_entry_admission(&mut inner, submission_id);
-    }
-
-    fn release_budget(&self, reservation_id: u64) {
-        let mut inner = self.inner.lock();
-        release_budget_reservation(&mut inner, reservation_id);
-    }
-
-    fn expire_deadlines(&self, now: Instant) -> Vec<GatewayExpiredRequest> {
-        let now_ms = now_millis();
-        let mut inner = self.inner.lock();
-        let mut expired = Vec::new();
-        for entry in inner.entries.values_mut() {
-            if entry.state != GatewayRequestState::Running {
-                continue;
-            }
-            let Some(deadline) = entry.deadline else {
-                continue;
-            };
-            if deadline > now {
-                continue;
-            }
-            entry.state = GatewayRequestState::Expired;
-            entry.retained_until_ms = now_ms.saturating_add(COMPLETED_REQUEST_RETENTION_MS);
-            expired.push(GatewayExpiredRequest {
-                request_process: entry.request_process,
-            });
-        }
-        prune_completed_requests(&mut inner, now_ms);
-        expired
-    }
-}
-
-impl GatewayAdmissionGuard {
-    fn release(&mut self) {
-        if self.released {
-            return;
-        }
-        self.registry.release_admission(self);
-        self.released = true;
-    }
-
-    fn release_for_submission(&mut self, submission_id: &str) {
-        if self.released {
-            return;
-        }
-        self.registry.release_entry_admission(submission_id, self);
-        self.released = true;
-    }
-}
-
-impl Drop for GatewayAdmissionGuard {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
-
-impl GatewayBudgetGuard {
-    fn release(&mut self) {
-        if self.released {
-            return;
-        }
-        self.registry.release_budget(self.reservation_id);
-        self.released = true;
-    }
-}
-
-impl Drop for GatewayBudgetGuard {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
-
-impl GatewayRequestLease {
-    fn output_interruption(&self) -> Option<Failure> {
-        let inner = self.registry.inner.lock();
-        match inner
-            .entries
-            .get(&self.submission_id)
-            .map(|entry| entry.state)
-        {
-            Some(GatewayRequestState::Cancelled) | None => Some(Failure::Cancelled),
-            Some(GatewayRequestState::Expired) => Some(Failure::Timeout),
-            Some(
-                GatewayRequestState::Running
-                | GatewayRequestState::Completed
-                | GatewayRequestState::Failed,
-            ) => None,
-        }
-    }
-
-    /// Freeze execution's result before asynchronous persistence and cleanup.
-    fn finish_execution(&self, output: &mut ExecutionOutput, boot: &Bootstrap) {
-        let expired_process = {
-            let mut inner = self.registry.inner.lock();
-            let Some(entry) = inner.entries.get_mut(&self.submission_id) else {
-                output.outcome = Outcome::Fail(Failure::Cancelled);
-                return;
-            };
-            if entry.state == GatewayRequestState::Running {
-                entry.state = if entry
-                    .deadline
-                    .is_some_and(|deadline| deadline <= Instant::now())
-                {
-                    GatewayRequestState::Expired
-                } else {
-                    match output.outcome {
-                        Outcome::Done(_) | Outcome::Short(_) => GatewayRequestState::Completed,
-                        Outcome::Fail(_) => GatewayRequestState::Failed,
-                    }
-                };
-            }
-            let expired_process = match entry.state {
-                GatewayRequestState::Cancelled => {
-                    output.outcome = Outcome::Fail(Failure::Cancelled);
-                    None
-                }
-                GatewayRequestState::Expired => {
-                    output.outcome = Outcome::Fail(Failure::Timeout);
-                    Some(entry.request_process)
-                }
-                GatewayRequestState::Running
-                | GatewayRequestState::Completed
-                | GatewayRequestState::Failed => None,
-            };
-            let now_ms = now_millis();
-            entry.retained_until_ms = now_ms.saturating_add(COMPLETED_REQUEST_RETENTION_MS);
-            prune_completed_requests(&mut inner, now_ms);
-            expired_process
-        };
-        if let Some(process) = expired_process
-            && let Err(error) = boot.cancel_process(process)
-        {
-            tracing::error!(
-                process = process.get(),
-                error = %error,
-                "request deadline cancellation failed"
-            );
-        }
-    }
-}
-
-impl Drop for GatewayRequestLease {
-    fn drop(&mut self) {
-        self.admission.release_for_submission(&self.submission_id);
-        self.budget.release();
-    }
-}
-
-impl GatewayRequestGuard {
-    async fn commit_objects(
-        &self,
-        runtime: &GatewayRuntime,
-        session: &GatewaySession,
-        objects: object::ObjectAdmission,
-        deadline: Option<Instant>,
-    ) -> Result<TaintSet, GatewayError> {
-        let process = self
-            .process
-            .as_ref()
-            .ok_or_else(|| GatewayError::Rejected("gateway request is already finished".into()))?;
-        if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
-            return Err(GatewayError::Rejected(
-                "gateway request deadline expired".into(),
-            ));
-        }
-        if runtime.boot.kernel.processes.status(process.id()) != Some(ProcessStatus::Running) {
-            return Err(GatewayError::Rejected(
-                "gateway request is no longer running".into(),
-            ));
-        }
-        objects.commit(runtime, session).await
-    }
-
-    fn finish(&mut self) {
-        self.finished = true;
-        if let Some(process) = self.process.take() {
-            process.detach();
-        }
-    }
-
-    fn fail(&mut self) {
-        self.lease.registry.finish(
-            &self.lease.submission_id,
-            GatewayRequestState::Failed,
-            now_millis(),
-        );
-        self.finished = true;
-        drop(self.process.take());
-    }
-}
-
-impl Drop for GatewayRequestGuard {
-    fn drop(&mut self) {
-        if !self.finished {
-            // Abandoning execution interrupts borrowed output too. A driver's
-            // ordinary failure is still deliverable, so it is a different state.
-            // `finish` preserves results already frozen before persistence.
-            self.lease.registry.finish(
-                &self.lease.submission_id,
-                GatewayRequestState::Cancelled,
-                now_millis(),
-            );
-        }
-        drop(self.process.take());
-    }
-}
-
-fn effective_fair_counter_limit(configured_limit: usize, global_limit: usize) -> usize {
-    configured_limit.min(fair_counter_limit(global_limit))
-}
-
-fn fair_counter_limit(global_limit: usize) -> usize {
-    match global_limit {
-        0 | 1 => global_limit,
-        n => n.saturating_sub(1).max(1),
-    }
-}
-
-fn counter_value(map: &BTreeMap<String, usize>, key: &str) -> usize {
-    map.get(key).copied().unwrap_or(0)
-}
-
-fn increment_counter(map: &mut BTreeMap<String, usize>, key: &str) {
-    *map.entry(key.to_string()).or_insert(0) += 1;
-}
-
-fn decrement_counter(map: &mut BTreeMap<String, usize>, key: &str) {
-    let Some(count) = map.get_mut(key) else {
-        return;
-    };
-    *count = count.saturating_sub(1);
-    if *count == 0 {
-        map.remove(key);
-    }
-}
-
-fn decrement_admission_counters(
-    inner: &mut GatewayRequestRegistryInner,
-    principal_id: &str,
-    surface_ids: &[String],
-    risk_class: &str,
-) {
-    inner.global_running = inner.global_running.saturating_sub(1);
-    decrement_counter(&mut inner.principal_running, principal_id);
-    for surface_id in surface_ids {
-        decrement_counter(&mut inner.surface_running, surface_id);
-    }
-    decrement_counter(&mut inner.risk_running, risk_class);
-}
-
-fn release_entry_admission(inner: &mut GatewayRequestRegistryInner, submission_id: &str) -> bool {
-    let Some(entry) = inner.entries.get_mut(submission_id) else {
-        return false;
-    };
-    if entry.admission_released {
-        return false;
-    }
-    entry.admission_released = true;
-    let principal_id = entry.principal_id.clone();
-    let surface_ids = entry.surface_ids.clone();
-    let risk_class = entry.risk_class.clone();
-    decrement_admission_counters(inner, &principal_id, &surface_ids, &risk_class);
-    true
-}
-
-fn release_budget_reservation(
-    inner: &mut GatewayRequestRegistryInner,
-    reservation_id: u64,
-) -> bool {
-    let Some(charge) = inner.budget_reservations.remove(&reservation_id) else {
-        return false;
-    };
-    inner.budget_running = subtract_budget_charge(inner.budget_running, charge);
-    true
-}
-
-fn ensure_budget_capacity(
-    limit: Option<u64>,
-    current: u64,
-    charge: u64,
-    label: &'static str,
-) -> Result<(), GatewayError> {
-    let Some(limit) = limit else {
-        return Ok(());
-    };
-    if current.saturating_add(charge) > limit {
-        return Err(GatewayError::LimitExceeded(format!("{label} limit")));
-    }
-    Ok(())
-}
-
-fn add_budget_charge(left: GatewayBudgetCharge, right: GatewayBudgetCharge) -> GatewayBudgetCharge {
-    GatewayBudgetCharge {
-        inflight_ops: left.inflight_ops.saturating_add(right.inflight_ops),
-        wall_ms: left.wall_ms.saturating_add(right.wall_ms),
-        bytes_in: left.bytes_in.saturating_add(right.bytes_in),
-        bytes_out: left.bytes_out.saturating_add(right.bytes_out),
-        inline_value_bytes: left
-            .inline_value_bytes
-            .saturating_add(right.inline_value_bytes),
-        stream_items: left.stream_items.saturating_add(right.stream_items),
-        estimated_cost_micro_usd: left
-            .estimated_cost_micro_usd
-            .saturating_add(right.estimated_cost_micro_usd),
-    }
-}
-
-fn subtract_budget_charge(
-    left: GatewayBudgetCharge,
-    right: GatewayBudgetCharge,
-) -> GatewayBudgetCharge {
-    GatewayBudgetCharge {
-        inflight_ops: left.inflight_ops.saturating_sub(right.inflight_ops),
-        wall_ms: left.wall_ms.saturating_sub(right.wall_ms),
-        bytes_in: left.bytes_in.saturating_sub(right.bytes_in),
-        bytes_out: left.bytes_out.saturating_sub(right.bytes_out),
-        inline_value_bytes: left
-            .inline_value_bytes
-            .saturating_sub(right.inline_value_bytes),
-        stream_items: left.stream_items.saturating_sub(right.stream_items),
-        estimated_cost_micro_usd: left
-            .estimated_cost_micro_usd
-            .saturating_sub(right.estimated_cost_micro_usd),
-    }
-}
-
-fn prune_completed_requests(inner: &mut GatewayRequestRegistryInner, now_ms: i64) {
-    inner.entries.retain(|_, entry| {
-        !entry.admission_released
-            || entry.state == GatewayRequestState::Running
-            || entry.retained_until_ms > now_ms
-    });
-}
-
-fn spawn_deadline_sweeper(boot: &Arc<Bootstrap>, registry: &Arc<GatewayRequestRegistry>) {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    let boot = Arc::downgrade(boot);
-    let registry = Arc::downgrade(registry);
-    handle.spawn(async move {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_millis(DEADLINE_SWEEP_INTERVAL_MS));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            let (Some(boot), Some(registry)) = (boot.upgrade(), registry.upgrade()) else {
-                break;
-            };
-            for expired in registry.expire_deadlines(Instant::now()) {
-                if let Err(error) = boot.cancel_process(expired.request_process) {
-                    tracing::error!(
-                        process = expired.request_process.get(),
-                        error = %error,
-                        "deadline sweeper failed to cancel request process"
-                    );
-                }
-            }
-        }
-    });
 }
 
 impl GatewayRuntime {
     /// Create a runtime backed by `boot` and an explicit profile.
-    pub fn new(boot: Arc<Bootstrap>, profile: GatewayProfile) -> Result<Self, GatewayError> {
+    pub fn new(
+        boot: Arc<Bootstrap>,
+        profile: GatewayProfile,
+        idempotency: Arc<dyn GatewayIdempotencyStore>,
+    ) -> Result<Self, GatewayError> {
+        Self::new_with_maintenance(
+            boot,
+            profile,
+            idempotency,
+            GatewayMaintenanceMode::Automatic,
+        )
+    }
+
+    /// Create a Gateway for hosts that drive maintenance themselves.
+    /// The host must call [`Self::maintain_once`] repeatedly while this Gateway
+    /// is live, including while requests are idle, so deadlines and expired
+    /// object authority are reclaimed. The host controls its own cadence.
+    /// It must also call [`Bootstrap::drain_cleanup`] when abandoned request
+    /// scopes need finalization. That call may wait for detached cleanup owners,
+    /// so schedule it separately from a short maintenance tick.
+    pub fn new_manual(
+        boot: Arc<Bootstrap>,
+        profile: GatewayProfile,
+        idempotency: Arc<dyn GatewayIdempotencyStore>,
+    ) -> Result<Self, GatewayError> {
+        Self::new_with_maintenance(boot, profile, idempotency, GatewayMaintenanceMode::Manual)
+    }
+
+    fn new_with_maintenance(
+        boot: Arc<Bootstrap>,
+        profile: GatewayProfile,
+        idempotency: Arc<dyn GatewayIdempotencyStore>,
+        maintenance: GatewayMaintenanceMode,
+    ) -> Result<Self, GatewayError> {
+        idempotency.limits().validate()?;
         let profile = Arc::new(Self::compile_profile(&boot, profile)?);
-        let requests = Arc::new(GatewayRequestRegistry::new());
-        spawn_deadline_sweeper(&boot, &requests);
+        let requests = Arc::new(GatewayRequestRegistry::new(
+            profile.limits.max_recent_cancellations,
+            boot.kernel().host_runtime().clone(),
+        ));
+        let maintenance_started = boot.kernel().host_runtime().now();
+        let object_scans_available =
+            boot.kernel().state().has_query() && boot.kernel().state().has_bounded_write();
+        let (request_maintenance, object_maintenance, maintenance_health) =
+            if matches!(maintenance, GatewayMaintenanceMode::Automatic) {
+                let (request, request_life) = spawn_deadline_sweeper(&boot, &requests)?;
+                let object = match object::spawn_object_maintenance(&boot, &requests) {
+                    Ok(object) => object,
+                    Err(error) => {
+                        request.abort();
+                        return Err(error);
+                    }
+                };
+                let (object_maintenance, object_records) = match object {
+                    Some((task, life)) => (Some(task), Some(life)),
+                    None => (None, None),
+                };
+                (
+                    Some(request),
+                    object_maintenance,
+                    MaintenanceHealth::automatic(maintenance_started, request_life, object_records),
+                )
+            } else {
+                (
+                    None,
+                    None,
+                    MaintenanceHealth::manual(maintenance_started, object_scans_available),
+                )
+            };
         Ok(Self {
             boot,
+            idempotency,
             objects: ObjectStore::new(),
             state: Arc::new(RwLock::new(GatewayRuntimeState {
                 profile,
@@ -2139,6 +1194,9 @@ impl GatewayRuntime {
                 last_reload_failure: None,
             })),
             requests,
+            request_maintenance,
+            object_maintenance,
+            maintenance_health,
         })
     }
 
@@ -2152,6 +1210,13 @@ impl GatewayRuntime {
         profile: GatewayProfile,
     ) -> Result<GatewayProfileRev, GatewayError> {
         let attempted_rev = profile.revision;
+        let active_rev = self.profile_rev();
+        if attempted_rev <= active_rev {
+            self.record_reload_failure(attempted_rev, "stale_revision");
+            return Err(GatewayError::InvalidProfile(format!(
+                "profile revision must increase above active revision {active_rev}"
+            )));
+        }
         let profile = match Self::compile_profile(&self.boot, profile) {
             Ok(profile) => Arc::new(profile),
             Err(error) => {
@@ -2160,6 +1225,7 @@ impl GatewayRuntime {
             }
         };
         let revision = profile.revision;
+        let max_recent_cancellations = profile.limits.max_recent_cancellations;
         let mut state = self.state.write();
         if revision <= state.profile.revision {
             state.record_reload_failure(attempted_rev, "stale_revision");
@@ -2174,6 +1240,8 @@ impl GatewayRuntime {
             consecutive_failed_reloads: 0,
             last_reload_failure: None,
         };
+        // Serialize the history limit with profile revisions.
+        self.requests.set_history_limit(max_recent_cancellations);
         Ok(revision)
     }
 
@@ -2197,23 +1265,77 @@ impl GatewayRuntime {
 
     /// Return redacted runtime status.
     pub fn status(&self) -> GatewayRuntimeStatus {
-        self.state.read().status()
+        let maintenance = self
+            .maintenance_health
+            .status(self.boot.kernel().host_runtime().now());
+        self.state.read().status(maintenance)
     }
 
     /// Reclaim running request registry entries whose server deadline expired.
     pub fn sweep_deadline_expired_requests(&self) -> usize {
-        let expired = self.requests.expire_deadlines(Instant::now());
-        let count = expired.len();
-        for request in expired {
-            if let Err(error) = self.boot.cancel_process(request.request_process) {
-                tracing::error!(
-                    process = request.request_process.get(),
-                    error = %error,
-                    "deadline sweep failed to cancel request process"
-                );
-            }
+        sweep_expired_requests(&self.boot, &self.requests).expired_requests
+    }
+
+    /// Advance all Gateway maintenance once. Each object scan is bounded to
+    /// one page; callers of [`Self::new_manual`] must schedule this repeatedly.
+    /// If the State host lacks query or bounded-write ports, object scans are
+    /// skipped; that host owns record cleanup, while expired grants and tickets
+    /// remain unusable at authorization time.
+    /// Ticket and grant scans run independently. If either fails, the other is
+    /// still attempted; earlier cleanup may already be committed. Retain the
+    /// cursor and retry after an error.
+    /// This does not drain Kernel request cleanup. Manual hosts should call
+    /// [`Bootstrap::drain_cleanup`] separately when abandoned scopes need
+    /// finalization; it may wait for detached cleanup owners.
+    pub async fn maintain_once(
+        &self,
+        cursor: &mut GatewayMaintenanceCursor,
+    ) -> Result<GatewayMaintenanceReport, GatewayError> {
+        let host = self.boot.kernel().host_runtime();
+        let request_pass = self
+            .maintenance_health
+            .manual_request()
+            .map(|tracker| tracker.begin(host.now()));
+        let sweep = sweep_expired_requests(&self.boot, &self.requests);
+        if let Some(pass) = request_pass {
+            pass.complete(host.now(), sweep.failed_cancellations == 0);
         }
-        count
+        let mut report = GatewayMaintenanceReport {
+            expired_requests: sweep.expired_requests,
+            failed_request_cancellations: sweep.failed_cancellations,
+            ..GatewayMaintenanceReport::default()
+        };
+        if self.boot.kernel().state().has_query() && self.boot.kernel().state().has_bounded_write()
+        {
+            report.object_scans_available = true;
+            let object_pass = self
+                .maintenance_health
+                .manual_object()
+                .map(|tracker| tracker.begin(host.now()));
+            let tickets =
+                object::maintain_upload_tickets_once(&self.boot, &mut cursor.ticket_cursor).await;
+            let grants =
+                object::maintain_read_grants_once(&self.boot, &mut cursor.grant_cursor).await;
+            if let Some(pass) = object_pass {
+                pass.complete(host.now(), tickets.is_ok() && grants.is_ok());
+            }
+            let (tickets, grants) = match (tickets, grants) {
+                (Ok(tickets), Ok(grants)) => (tickets, grants),
+                (Err(ticket), Err(grant)) => {
+                    return Err(GatewayError::Rejected(format!(
+                        "gateway object maintenance failed: {ticket}; {grant}"
+                    )));
+                }
+                (Err(error), _) | (_, Err(error)) => return Err(error),
+            };
+            report.upload_tickets_examined = tickets.examined;
+            report.upload_tickets_removed = tickets.removed;
+            report.upload_tickets_skipped_oversized = tickets.skipped_oversized;
+            report.read_grants_examined = grants.examined;
+            report.read_grants_removed = grants.removed;
+            report.read_grants_skipped_oversized = grants.skipped_oversized;
+        }
+        Ok(report)
     }
 
     /// Describe the active profile for an authenticated session.
@@ -2228,11 +1350,14 @@ impl GatewayRuntime {
             ));
         }
         profile.session_identity_path(session)?;
-        let binding = profile.binding_for_principal(&session.principal.principal_id);
+        let evidence_namespace = self.idempotency.evidence_namespace()?;
+        let visible = profile.visible_surfaces_for_principal(&session.principal.principal_id);
         let visible_publications = profile
             .publication_descriptors
             .iter()
-            .filter(|publication| binding.visible.contains(&publication.surface_id))
+            .filter(|publication| {
+                visible.is_some_and(|surfaces| surfaces.contains(&publication.surface_id))
+            })
             .cloned()
             .collect();
         Ok(GatewayDescriptor {
@@ -2241,19 +1366,54 @@ impl GatewayRuntime {
             surfaces: profile
                 .surface_descriptors
                 .iter()
-                .filter(|surface| binding.visible.contains(&surface.surface_id))
-                .map(|surface| GatewaySurfaceDescriptor {
-                    surface_id: surface.surface_id.clone(),
-                    target: surface.target.clone(),
-                    publish_capability: surface.publish_capability.clone(),
-                    input_schema: surface.input_schema.clone(),
-                    output_schema: surface.output_schema.clone(),
-                    output_stream_schema: surface.output_stream_schema.clone(),
+                .filter(|surface| {
+                    visible.is_some_and(|surfaces| surfaces.contains(&surface.surface_id))
                 })
-                .collect(),
+                .map(|surface| {
+                    Ok(GatewaySurfaceDescriptor {
+                        surface_id: surface.surface_id.clone(),
+                        request_scope: request_scope::fingerprint(
+                            &profile,
+                            session,
+                            surface,
+                            evidence_namespace,
+                        ),
+                        target: surface.target.clone(),
+                        publish_capability: surface.publish_capability.clone(),
+                        input_schema: surface.input_schema.clone(),
+                        output_schema: surface.output_schema.clone(),
+                        output_stream_schema: surface.output_stream_schema.clone(),
+                    })
+                })
+                .collect::<Result<_, GatewayError>>()?,
             publications: visible_publications,
             limits: profile.limits.clone(),
         })
+    }
+
+    /// Check the original session and submit binding before disclosing an
+    /// accepted request's identity, output, or unresolved effects.
+    pub fn validate_submission_access(
+        &self,
+        session: &GatewaySession,
+        surface_id: &str,
+    ) -> Result<(), GatewayError> {
+        let profile = self.profile_snapshot();
+        Self::validate_submission_profile_access(&profile, session, surface_id)
+    }
+
+    fn validate_submission_profile_access(
+        profile: &CompiledGatewayProfile,
+        session: &GatewaySession,
+        surface_id: &str,
+    ) -> Result<(), GatewayError> {
+        validate_current_session(profile, session)?;
+        if !profile.principal_can_submit(&session.principal.principal_id, surface_id) {
+            return Err(GatewayError::Unauthorized(
+                "submission evidence access revoked".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Admit a `SubmitStream` stream-open request before any input chunk is
@@ -2262,194 +1422,84 @@ impl GatewayRuntime {
         &self,
         session: &GatewaySession,
         submission: GatewaySubmission,
-    ) -> Result<GatewayInputStreamStart, GatewayError> {
+    ) -> Result<Box<GatewayAcceptedInputStream>, GatewayError> {
         submission::validate_output_port(submission.requested_output, false)?;
         let profile = self.profile_snapshot();
         validate_current_session(&profile, session)?;
-        let now_ms = now_millis();
-        let mut idempotency = match reserve_submission_idempotency_if_present(
-            &self.boot.kernel.state,
-            &profile,
-            session,
-            &submission,
-            initial_idempotency_material(&self.boot, &profile, session, &submission)?,
-            now_ms,
-        )
-        .await?
-        {
-            Some(SubmissionIdempotency::Replay(result)) => {
-                return Ok(GatewayInputStreamStart::Replay(result));
-            }
-            Some(SubmissionIdempotency::Reserved(reservation)) => Some(reservation),
-            None => None,
-        };
-        if let Err(e) = validate_submit_options(&submission.options, &profile.limits, now_ms) {
-            return release_submission_idempotency_reservation_and_fail(
-                &self.boot.kernel.state,
-                idempotency.as_deref(),
-                e,
-            )
-            .await;
-        }
-        let deadline = match request_deadline(&submission.options) {
-            Ok(deadline) => deadline,
-            Err(e) => {
-                return release_submission_idempotency_reservation_and_fail(
-                    &self.boot.kernel.state,
-                    idempotency.as_deref(),
-                    e,
-                )
-                .await;
-            }
-        };
+        let host = self.boot.kernel().host_runtime();
+        let now = host.now();
+        let now_ms = host.now_millis();
+        // Stream-open has no payload fingerprint. Reservation or replay waits
+        // until completion has folded the entire input.
+        let deadline =
+            request_deadline(&submission.options, submission.server_deadline, now, now_ms)?;
+        validate_request_deadline(deadline, now, &profile.limits)?;
+        validate_submit_options(&submission.options)?;
+        let has_idempotency_material = required_idempotency_material(&submission)?.is_some();
 
         let GatewaySubmission {
             surface_id,
             body,
             requested_output,
             options,
-        } = submission.clone();
+            server_deadline: _,
+        } = submission;
         let GatewaySubmissionBody::InputStream(open) = body else {
-            return release_submission_idempotency_reservation_and_fail(
-                &self.boot.kernel.state,
-                idempotency.as_deref(),
-                GatewayError::Rejected("stream admission requires a stream_open body".into()),
-            )
-            .await;
+            return Err(GatewayError::Rejected(
+                "stream admission requires a stream_open body".into(),
+            ));
         };
-        let surface =
-            match validate_input_stream_open_request(&profile, session, &surface_id, &open) {
-                Ok(surface) => surface,
-                Err(e) => {
-                    return release_submission_idempotency_reservation_and_fail(
-                        &self.boot.kernel.state,
-                        idempotency.as_deref(),
-                        e,
-                    )
-                    .await;
-                }
-            };
+        let surface = validate_input_stream_open_request(&profile, session, &surface_id, &open)?;
+        request_scope::validate(
+            &profile,
+            session,
+            surface,
+            self.idempotency.as_ref(),
+            &options,
+        )?;
         let mut surface_ids = BTreeSet::new();
         surface_ids.insert(surface.surface_id.clone());
         let program = stream_open_admission_program(surface, requested_output);
-        let admission = match inspect_lowered_submission(
+        let admission = inspect_lowered_submission(
             &program,
             &profile,
             &session.principal.principal_id,
             surface,
             &self.boot,
             false,
-        ) {
-            Ok(admission) => admission,
-            Err(e) => {
-                return release_submission_idempotency_reservation_and_fail(
-                    &self.boot.kernel.state,
-                    idempotency.as_deref(),
-                    e,
-                )
-                .await;
-            }
-        };
-        if admission.requires_idempotency && idempotency.is_none() {
-            idempotency = match reserve_submission_idempotency_if_present(
-                &self.boot.kernel.state,
-                &profile,
-                session,
-                &submission,
-                required_idempotency_material(&submission)?,
-                now_ms,
-            )
-            .await?
-            {
-                Some(SubmissionIdempotency::Replay(result)) => {
-                    return Ok(GatewayInputStreamStart::Replay(result));
-                }
-                Some(SubmissionIdempotency::Reserved(reservation)) => Some(reservation),
-                None => {
-                    return Err(GatewayError::Rejected(
-                        "idempotency_key or submission_token is required for non-idempotent effects"
-                            .into(),
-                    ));
-                }
-            };
+        )?;
+        if admission.requires_idempotency && !has_idempotency_material {
+            return Err(GatewayError::Rejected(
+                "idempotency_key or submission_token is required for non-idempotent effects".into(),
+            ));
         }
         let risk_class = request_risk_class(&admission);
         let fair_surface_ids = vec![surface.surface_id.clone()];
-        let budget_charge = match gateway_budget_charge_for_stream_open(
+        let budget_charge = gateway_budget_charge_for_stream_open(
             &admission,
             surface,
             &self.boot,
             &open,
             &profile.limits,
-            &options,
-            now_ms,
-        ) {
-            Ok(charge) => charge,
-            Err(e) => {
-                return release_submission_idempotency_reservation_and_fail(
-                    &self.boot.kernel.state,
-                    idempotency.as_deref(),
-                    e,
-                )
-                .await;
-            }
-        };
-        let budget_guard = match self
+            deadline,
+            now,
+        )?;
+        let budget_guard = self
             .requests
-            .try_reserve_budget(&profile.limits.budget, budget_charge)
-        {
-            Ok(guard) => guard,
-            Err(e) => {
-                return release_submission_idempotency_reservation_and_fail(
-                    &self.boot.kernel.state,
-                    idempotency.as_deref(),
-                    e,
-                )
-                .await;
-            }
-        };
-        let admission_guard = match self.requests.try_admit(
+            .try_reserve_budget(&profile.limits.budget, budget_charge)?;
+        let admission_guard = self.requests.try_admit(
             &profile.limits,
             session.principal.principal_id.clone(),
             fair_surface_ids.clone(),
             risk_class.clone(),
-        ) {
-            Ok(guard) => guard,
-            Err(e) => {
-                return release_submission_idempotency_reservation_and_fail(
-                    &self.boot.kernel.state,
-                    idempotency.as_deref(),
-                    e,
-                )
-                .await;
-            }
-        };
-        let accepted = match self
+        )?;
+        let accepted = self
             .requests
-            .new_acceptance(profile.revision, surface.surface_id.clone())
-        {
-            Ok(accepted) => accepted,
-            Err(e) => {
-                return release_submission_idempotency_reservation_and_fail(
-                    &self.boot.kernel.state,
-                    idempotency.as_deref(),
-                    e,
-                )
-                .await;
-            }
-        };
-        let (request_owner, executor) =
-            match self.executor_for(&profile, session, &surface_ids).await {
-                Ok(ex) => ex,
-                Err(e) => {
-                    return release_submission_idempotency_reservation_and_fail(
-                        &self.boot.kernel.state,
-                        idempotency.as_deref(),
-                        e,
-                    )
-                    .await;
-                }
-            };
+            .new_acceptance(profile.revision, surface.surface_id.clone())?;
+        let authority = GatewaySubmissionAuthority::new(self, session, &surface_id);
+        let (request_owner, executor) = self
+            .executor_for(&profile, session, &surface_ids, authority.clone())
+            .await?;
         let request_process = request_owner.id();
         let entry = GatewayRequestEntry {
             accepted: accepted.clone(),
@@ -2458,44 +1508,29 @@ impl GatewayRuntime {
             principal_id: session.principal.principal_id.clone(),
             state: GatewayRequestState::Running,
             deadline,
-            retained_until_ms: i64::MAX,
-            risk_class,
-            surface_ids: fair_surface_ids,
-            large_value_refs: Vec::new(),
-            admission_released: false,
+            cancelled_until: None,
         };
-        let request_guard =
-            match self
-                .requests
-                .insert_running(entry, admission_guard, budget_guard, request_owner)
-            {
-                Ok(guard) => guard,
-                Err(e) => {
-                    return release_submission_idempotency_reservation_and_fail(
-                        &self.boot.kernel.state,
-                        idempotency.as_deref(),
-                        e,
-                    )
-                    .await;
-                }
-            };
-        Ok(GatewayInputStreamStart::Accepted(Box::new(
-            GatewayAcceptedInputStream {
-                accepted,
-                open,
-                limits: profile.limits.clone(),
-                profile,
-                session: session.clone(),
-                surface_id,
-                requested_output,
-                options,
-                deadline,
-                idempotency,
-                request_guard,
-                request_process,
-                executor,
-            },
-        )))
+        let request_guard = self.requests.insert_running(
+            entry,
+            admission_guard,
+            budget_guard,
+            request_owner,
+            authority,
+        )?;
+        Ok(Box::new(GatewayAcceptedInputStream {
+            accepted,
+            open,
+            limits: profile.limits.clone(),
+            profile,
+            session: session.clone(),
+            surface_id,
+            requested_output,
+            options,
+            deadline,
+            request_guard,
+            request_process,
+            executor,
+        }))
     }
 
     /// Complete an accepted input stream and run it through the same request
@@ -2520,12 +1555,10 @@ impl GatewayRuntime {
         _reason: &str,
     ) -> Result<(), GatewayError> {
         self.validate_input_stream_owner(&stream)?;
-        finish_request_and_release_idempotency(
-            &self.boot,
-            stream.request_process,
-            stream.idempotency.as_deref(),
-        )
-        .await
+        self.boot
+            .finish_process_as(stream.request_process, xolotl_types::ProcessStatus::Failed)
+            .await
+            .map_err(|error| GatewayError::Rejected(error.to_string()))
     }
 
     fn validate_input_stream_owner(
@@ -2545,32 +1578,27 @@ impl GatewayRuntime {
         profile: GatewayProfile,
     ) -> Result<CompiledGatewayProfile, GatewayError> {
         let mut profile = CompiledGatewayProfile::compile(profile)?;
-        for surface in &mut profile.surface_descriptors {
-            surface.method_bitmap =
-                surface_method_bitmap(boot, &surface.target, GATEWAY_EFFECT_METHOD).map_err(
-                    |e| {
-                        GatewayError::InvalidProfile(format!(
-                            "surface {} references missing method {} on {}: {e}",
-                            surface.surface_id,
-                            GATEWAY_EFFECT_METHOD,
-                            surface.target.path()
-                        ))
-                    },
-                )?;
+        for surface in &profile.surface_descriptors {
+            validate_surface_method(boot, &surface.target, GATEWAY_EFFECT_METHOD).map_err(|e| {
+                GatewayError::InvalidProfile(format!(
+                    "surface {} references missing method {} on {}: {e}",
+                    surface.surface_id,
+                    GATEWAY_EFFECT_METHOD,
+                    surface.target.path()
+                ))
+            })?;
         }
-        profile.surfaces_by_id = profile
-            .surface_descriptors
-            .iter()
-            .map(|surface| (surface.surface_id.clone(), surface.clone()))
-            .collect();
+        let surface_descriptors = &profile.surface_descriptors;
+        let surfaces_by_id = &profile.surfaces_by_id;
         for (principal_id, binding) in &mut profile.surface_bindings_by_principal {
             binding.request_grants_by_surface.clear();
             for surface_id in &binding.submit {
-                let Some(surface) = profile.surfaces_by_id.get(surface_id) else {
+                let Some(&surface_index) = surfaces_by_id.get(surface_id) else {
                     return Err(GatewayError::InvalidProfile(format!(
                         "submit surface {surface_id} for principal {principal_id} is unavailable"
                     )));
                 };
+                let surface = &surface_descriptors[surface_index];
                 if !binding
                     .capability_ceiling
                     .iter()
@@ -2585,24 +1613,27 @@ impl GatewayRuntime {
                     surface.surface_id.clone(),
                     CompiledRequestGrantTemplate {
                         selector: surface.grant_selector.clone(),
-                        methods: surface.method_bitmap,
+                        rights: GrantRights::new(
+                            GrantMethods::name(GATEWAY_EFFECT_METHOD),
+                            xolotl_types::RightFlags::empty(),
+                        ),
                     },
                 );
             }
         }
         if let Some(anchor) = profile.authority_anchor {
-            if boot.kernel.processes.identity(anchor).is_none() {
+            if boot.kernel().processes().identity(anchor).is_none() {
                 return Err(GatewayError::InvalidProfile(format!(
                     "authority anchor process {anchor} does not exist"
                 )));
             }
-            let now_millis = xolotl_kernel::now_millis();
-            let mut anchor_grants = boot.kernel.registry.grants_of(anchor);
-            anchor_grants.extend(boot.kernel.processes.attached_grants(anchor));
+            let now_millis = boot.kernel().host_runtime().now_millis();
+            let mut anchor_grants = boot.kernel().registry().grants_of(anchor);
+            anchor_grants.extend(boot.kernel().processes().attached_grants(anchor));
             for surface in &profile.surface_descriptors {
                 if !anchor_grants.iter().any(|grant| {
                     !grant.expires.is_expired(now_millis)
-                        && surface.method_bitmap.is_subset_of(grant.rights.methods)
+                        && grant.rights.methods.allows(GATEWAY_EFFECT_METHOD)
                         && grant.selector.pattern.covers_cap(&surface.grant_capability)
                 }) {
                     return Err(GatewayError::InvalidProfile(format!(
@@ -2612,6 +1643,7 @@ impl GatewayRuntime {
                 }
             }
         }
+        profile.bind_identities(boot.kernel().identities())?;
         Ok(profile)
     }
 
@@ -2632,9 +1664,7 @@ impl GatewayRuntime {
         session: &GatewaySession,
         surface_ids: &BTreeSet<String>,
     ) -> Result<RequestProcess<'static>, GatewayError> {
-        let identity_path = profile.session_identity_path(session)?;
-        let id_path = parse_identity_path(identity_path)?;
-        let id_ref = intern_identity(&id_path);
+        let id_ref = profile.session_identity_ref(session)?;
         let surfaces = profile.surface_descriptors_for_ids(surface_ids)?;
         let binding = if surface_ids.is_empty() {
             None
@@ -2648,7 +1678,7 @@ impl GatewayRuntime {
                     })?,
             )
         };
-        let mut grant_templates = BTreeMap::<String, (ResourceSelector, MethodBitmap)>::new();
+        let mut grant_templates = BTreeMap::<String, ResourceSelector>::new();
         for surface in surfaces {
             let Some(binding) = binding else {
                 continue;
@@ -2668,17 +1698,19 @@ impl GatewayRuntime {
             };
             grant_templates
                 .entry(surface.grant_template.clone())
-                .and_modify(|(_, methods)| *methods |= request_grant.methods)
-                .or_insert((request_grant.selector.clone(), request_grant.methods));
+                .or_insert_with(|| request_grant.selector.clone());
         }
         let declared: Vec<CompiledRequestGrantTemplate> = grant_templates
-            .iter()
-            .map(|(_, (selector, methods))| CompiledRequestGrantTemplate {
+            .values()
+            .map(|selector| CompiledRequestGrantTemplate {
                 selector: selector.clone(),
-                methods: *methods,
+                rights: GrantRights::new(
+                    GrantMethods::name(GATEWAY_EFFECT_METHOD),
+                    xolotl_types::RightFlags::empty(),
+                ),
             })
             .collect();
-        let anchor = profile.authority_anchor.unwrap_or(self.boot.root);
+        let anchor = profile.authority_anchor.unwrap_or(self.boot.root());
         self.boot
             .request_under_owned(anchor, id_ref, &declared)
             .map_err(|e| GatewayError::Rejected(e.to_string()))
@@ -2689,11 +1721,12 @@ impl GatewayRuntime {
         profile: &CompiledGatewayProfile,
         session: &GatewaySession,
         surface_ids: &BTreeSet<String>,
+        authority: Arc<GatewaySubmissionAuthority>,
     ) -> Result<(RequestProcess<'static>, Executor), GatewayError> {
         let surfaces = profile.surface_descriptors_for_ids(surface_ids)?;
         let request = self.spawn_gateway_request_process(profile, session, surface_ids)?;
         let proc = request.id();
-        let ex = request.executor();
+        let ex = request.executor().with_request_authorizer(authority);
         let mut opened = BTreeSet::new();
         for surface in surfaces {
             let key = format!("{}\0{}", surface.target.path(), GATEWAY_EFFECT_HANDLE_VERB);
@@ -2702,7 +1735,12 @@ impl GatewayRuntime {
             }
             let opened = self
                 .boot
-                .open_for(proc, &surface.target, GATEWAY_EFFECT_HANDLE_VERB)
+                .open_for_method(
+                    proc,
+                    &surface.target,
+                    GATEWAY_EFFECT_HANDLE_VERB,
+                    GATEWAY_EFFECT_METHOD,
+                )
                 .map_err(|e| GatewayError::Rejected(e.to_string()));
             let opened = match opened {
                 Ok(opened) => opened,
@@ -2711,7 +1749,14 @@ impl GatewayRuntime {
                         .await;
                 }
             };
-            ex.bind_handle(surface.target.clone(), opened);
+            if let Err(error) = ex.bind_handle(surface.target.clone(), opened) {
+                return finish_request_without_idempotency_and_fail(
+                    &self.boot,
+                    proc,
+                    GatewayError::Rejected(error.to_string()),
+                )
+                .await;
+            }
         }
         Ok((request, ex))
     }
@@ -2732,7 +1777,7 @@ impl GatewayRuntimeState {
         });
     }
 
-    fn status(&self) -> GatewayRuntimeStatus {
+    fn status(&self, maintenance: GatewayMaintenanceStatus) -> GatewayRuntimeStatus {
         let ready = self.profile.has_authenticating_credentials();
         let readiness = if self.lkg_active && ready {
             GatewayReadiness::DegradedLastKnownGood
@@ -2749,6 +1794,7 @@ impl GatewayRuntimeState {
             lkg_active: self.lkg_active,
             consecutive_failed_reloads: self.consecutive_failed_reloads,
             last_reload_failure: self.last_reload_failure.clone(),
+            maintenance,
         }
     }
 }
@@ -2760,11 +1806,22 @@ fn reload_failure_code(error: &GatewayError) -> &'static str {
         GatewayError::Unauthorized(_) => "permission_denied",
         GatewayError::Rejected(_) => "request_rejected",
         GatewayError::LimitExceeded(_) => "limit_exceeded",
+        GatewayError::Indeterminate(_) | GatewayError::SubmissionIndeterminate(_) => {
+            "outcome_unknown"
+        }
     }
 }
 
 #[async_trait]
 impl Gateway for GatewayRuntime {
+    fn deadline_after(&self, duration: Duration) -> Result<HostDeadline, GatewayError> {
+        self.boot
+            .kernel()
+            .host_runtime()
+            .deadline_after(duration)
+            .ok_or_else(|| GatewayError::Rejected("transport deadline is out of range".into()))
+    }
+
     fn status(&self) -> GatewayRuntimeStatus {
         GatewayRuntime::status(self)
     }
@@ -2803,23 +1860,69 @@ impl Gateway for GatewayRuntime {
                 profile.verify_client_certificate(&credential)?
             }
         };
-        let mapping = profile
-            .identity_by_principal
-            .get(&principal.principal_id)
-            .ok_or_else(|| GatewayError::Unauthorized(principal.principal_id.clone()))?;
-        if !mapping.enabled || principal.principal_generation != mapping.generation {
-            return Err(GatewayError::Unauthenticated);
-        }
-        Ok(GatewaySession {
-            principal,
-            identity_path: mapping.identity_path.clone(),
-            profile_name: profile.profile_name.clone(),
-            profile_rev: profile.revision,
-        })
+        profile.session_for_principal(principal)
     }
 
     fn describe(&self, session: &GatewaySession) -> Result<GatewayDescriptor, GatewayError> {
         GatewayRuntime::describe(self, session)
+    }
+
+    async fn retry_epoch(&self, session: &GatewaySession) -> Result<u64, GatewayError> {
+        validate_current_session(&self.profile_snapshot(), session)?;
+        let epoch = self.idempotency.retry_epoch().await?;
+        validate_current_session(&self.profile_snapshot(), session)?;
+        Ok(epoch)
+    }
+
+    async fn lookup_request(
+        &self,
+        session: &GatewaySession,
+        lookup: GatewayRequestLookup,
+    ) -> Result<GatewayRequestEvidence, GatewayError> {
+        submission::idempotency::lookup_request(self, session, lookup).await
+    }
+
+    async fn read_retained_request_result(
+        &self,
+        session: &GatewaySession,
+        lookup: GatewayRequestLookup,
+    ) -> Result<GatewayRetainedRequestResult, GatewayError> {
+        submission::idempotency::read_retained_request_result(self, session, lookup).await
+    }
+
+    fn validate_submission_access(
+        &self,
+        session: &GatewaySession,
+        surface_id: &str,
+    ) -> Result<(), GatewayError> {
+        GatewayRuntime::validate_submission_access(self, session, surface_id)
+    }
+
+    fn prepare_submission(
+        &self,
+        session: &GatewaySession,
+        head: GatewaySubmissionHead,
+        output_window: Option<StreamWindow>,
+    ) -> Result<GatewayPreparation, GatewayError> {
+        submission::prepare_submission(self, session, head, output_window)
+    }
+
+    async fn submit_prepared(
+        &self,
+        preparation: GatewayPreparation,
+        payload: Value,
+        provenance: Option<GatewayPayloadProvenance>,
+    ) -> Result<GatewaySubmitResult, GatewayError> {
+        submission::submit_prepared(self, preparation, payload, provenance).await
+    }
+
+    async fn submit_output_stream_prepared(
+        &self,
+        preparation: GatewayPreparation,
+        payload: Value,
+        provenance: Option<GatewayPayloadProvenance>,
+    ) -> Result<GatewayOutputStream, GatewayError> {
+        submission::submit_output_stream_prepared(self, preparation, payload, provenance).await
     }
 
     async fn submit(
@@ -2843,7 +1946,7 @@ impl Gateway for GatewayRuntime {
         &self,
         session: &GatewaySession,
         submission: GatewaySubmission,
-    ) -> Result<GatewayInputStreamStart, GatewayError> {
+    ) -> Result<Box<GatewayAcceptedInputStream>, GatewayError> {
         GatewayRuntime::accept_input_stream_submission(self, session, submission).await
     }
 
@@ -2901,47 +2004,46 @@ impl Gateway for GatewayRuntime {
             .record_gateway_audit(audit)
             .map_err(|e| e.to_string())
     }
+
+    fn record_optional_gateway_audit(&self, audit: GatewayAudit<'_>) -> Result<(), String> {
+        self.boot
+            .record_optional_gateway_audit(audit)
+            .map_err(|error| error.to_string())
+    }
 }
 
 fn parse_identity_path(identity: &str) -> Result<Path, GatewayError> {
     let path = Path::parse(identity)
         .map_err(|e| GatewayError::InvalidProfile(format!("invalid identity path: {e}")))?;
-    if path.scheme() != "process" {
-        return Err(GatewayError::InvalidProfile(
-            "identity path must use the process:// scheme".into(),
-        ));
-    }
-    if path.segments().is_empty() {
-        return Err(GatewayError::InvalidProfile(
-            "identity path must include at least one segment".into(),
-        ));
-    }
+    xolotl_kernel::identity::validate_path(&path)
+        .map_err(|error| GatewayError::InvalidProfile(error.to_string()))?;
     Ok(path)
 }
 
-fn surface_method_bitmap(
+fn validate_surface_method(
     boot: &Bootstrap,
     target: &ResourceName,
     method: &str,
-) -> Result<MethodBitmap, GatewayError> {
+) -> Result<(), GatewayError> {
     let resource_id = boot
-        .kernel
-        .registry
+        .kernel()
+        .registry()
         .resolve_resource(target)
         .map_err(|e| GatewayError::InvalidProfile(e.to_string()))?;
-    let Some(resource) = boot.kernel.registry.resource(resource_id) else {
-        return Err(GatewayError::InvalidProfile("resource missing".into()));
-    };
-    let mut methods = MethodBitmap::empty();
-    for interface in &resource.interfaces.interfaces {
-        if let Some((index, _)) = boot.kernel.registry.method_index(*interface, method) {
-            methods |= MethodBitmap::method(index);
-        }
+    let (_, descriptor) = boot
+        .kernel()
+        .registry()
+        .resource_method(resource_id, method)
+        .ok_or_else(|| GatewayError::InvalidProfile("method missing".into()))?;
+    if descriptor.authority.verb() != GATEWAY_EFFECT_HANDLE_VERB {
+        return Err(GatewayError::InvalidProfile(format!(
+            "method {method} on {} requires {} authority, expected {}",
+            target.path(),
+            descriptor.authority.verb(),
+            GATEWAY_EFFECT_HANDLE_VERB
+        )));
     }
-    if methods.is_empty() {
-        return Err(GatewayError::InvalidProfile("method missing".into()));
-    }
-    Ok(methods)
+    Ok(())
 }
 
 fn operation_replay_class(
@@ -2965,33 +2067,25 @@ fn operation_method_metadata(
     method: &str,
 ) -> Result<GatewayMethodMetadata, GatewayError> {
     let resource_id = boot
-        .kernel
-        .registry
+        .kernel()
+        .registry()
         .resolve_resource(target)
         .map_err(|e| GatewayError::Rejected(e.to_string()))?;
-    let Some(resource) = boot.kernel.registry.resource(resource_id) else {
-        return Err(GatewayError::Rejected(format!(
-            "operation target {} is unavailable",
-            target.path()
-        )));
-    };
-    for interface_id in &resource.interfaces.interfaces {
-        let Some(interface) = boot.kernel.registry.interface(*interface_id) else {
-            continue;
-        };
-        if let Some((_, method)) = interface.method_index(method) {
-            return Ok(GatewayMethodMetadata {
-                replay: method.replay,
-                cost: method.cost,
-                batchable: method.batchable,
-            });
-        }
-    }
-    Err(GatewayError::Rejected(format!(
-        "operation method {} is unavailable on {}",
-        method,
-        target.path()
-    )))
+    let (_, descriptor) = boot
+        .kernel()
+        .registry()
+        .resource_method(resource_id, method)
+        .ok_or_else(|| {
+            GatewayError::Rejected(format!(
+                "operation method {method} is unavailable on {}",
+                target.path()
+            ))
+        })?;
+    Ok(GatewayMethodMetadata {
+        replay: descriptor.replay,
+        cost: descriptor.cost,
+        batchable: descriptor.batchable,
+    })
 }
 
 fn estimate_gateway_operation_cost(
@@ -3191,18 +2285,36 @@ struct LoweredSubmission<'profile> {
     objects: object::ObjectAdmission,
 }
 
-fn request_deadline(options: &SubmitOptions) -> Result<Option<Instant>, GatewayError> {
-    options
+fn request_deadline(
+    options: &SubmitOptions,
+    server_deadline: Option<HostDeadline>,
+    now: HostDeadline,
+    now_ms: i64,
+) -> Result<Option<HostDeadline>, GatewayError> {
+    // Even with no client deadline, reject a foreign transport clock before
+    // any request owner is admitted.
+    if let Some(server_deadline) = server_deadline {
+        server_deadline
+            .elapsed_at(now)
+            .map_err(|error| GatewayError::Rejected(error.to_string()))?;
+    }
+    let client_deadline = options
         .deadline_ms
         .map(|deadline| {
             let deadline = i64::try_from(deadline)
                 .map_err(|_error| GatewayError::Rejected("deadline_ms is out of range".into()))?;
-            let now = Instant::now();
-            let remaining_ms = deadline.saturating_sub(now_millis()).max(0) as u64;
+            let remaining_ms = deadline.saturating_sub(now_ms).max(0) as u64;
             now.checked_add(std::time::Duration::from_millis(remaining_ms))
                 .ok_or_else(|| GatewayError::Rejected("deadline_ms is out of range".into()))
         })
-        .transpose()
+        .transpose()?;
+    match (client_deadline, server_deadline) {
+        (Some(client), Some(server)) => client
+            .earliest(server)
+            .map(Some)
+            .map_err(|error| GatewayError::Rejected(error.to_string())),
+        (client, server) => Ok(client.or(server)),
+    }
 }
 
 fn request_risk_class(admission: &LoweredSubmissionAdmission) -> String {
@@ -3221,13 +2333,13 @@ fn request_risk_class(admission: &LoweredSubmissionAdmission) -> String {
 
 fn gateway_budget_charge_for_submit(
     admission: &LoweredSubmissionAdmission,
-    options: &SubmitOptions,
-    now_ms: i64,
+    deadline: Option<HostDeadline>,
+    now: HostDeadline,
 ) -> Result<GatewayBudgetCharge, GatewayError> {
     let literal_bytes = admission.inspection.literal_bytes as u64;
     Ok(GatewayBudgetCharge {
         inflight_ops: admission.inspection.operation_count as u64,
-        wall_ms: request_wall_ms(options, now_ms)?,
+        wall_ms: request_wall_ms(deadline, now)?,
         bytes_in: literal_bytes,
         bytes_out: 0,
         inline_value_bytes: literal_bytes,
@@ -3242,8 +2354,8 @@ fn gateway_budget_charge_for_stream_open(
     boot: &Bootstrap,
     open: &GatewayStreamOpenRequest,
     limits: &GatewayLimitProfile,
-    options: &SubmitOptions,
-    now_ms: i64,
+    deadline: Option<HostDeadline>,
+    now: HostDeadline,
 ) -> Result<GatewayBudgetCharge, GatewayError> {
     let stream_items = open.max_items.unwrap_or(limits.max_stream_items as u64);
     let bytes_in = open.max_bytes.unwrap_or(limits.max_stream_bytes as u64);
@@ -3252,7 +2364,7 @@ fn gateway_budget_charge_for_stream_open(
         estimate_gateway_stream_cost(boot, surface, bytes_in, stream_items)?;
     Ok(GatewayBudgetCharge {
         inflight_ops: admission.inspection.operation_count as u64,
-        wall_ms: request_wall_ms(options, now_ms)?,
+        wall_ms: request_wall_ms(deadline, now)?,
         bytes_in,
         bytes_out: 0,
         inline_value_bytes: declared_inline.min(bytes_in),
@@ -3285,96 +2397,51 @@ fn estimate_gateway_stream_cost(
     Ok(metadata.cost.estimate_micro_usd(in_tokens, out_tokens))
 }
 
-fn request_wall_ms(options: &SubmitOptions, now_ms: i64) -> Result<u64, GatewayError> {
-    let Some(deadline) = options.deadline_ms else {
+fn request_wall_ms(deadline: Option<HostDeadline>, now: HostDeadline) -> Result<u64, GatewayError> {
+    let Some(deadline) = deadline else {
         return Ok(0);
     };
-    let deadline = i64::try_from(deadline)
-        .map_err(|_error| GatewayError::Rejected("deadline_ms is out of range".into()))?;
-    Ok(deadline.saturating_sub(now_ms) as u64)
+    let remaining = deadline
+        .saturating_duration_since(now)
+        .map_err(|error| GatewayError::Rejected(error.to_string()))?;
+    let milliseconds = remaining
+        .as_millis()
+        .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0));
+    Ok(u64::try_from(milliseconds).unwrap_or(u64::MAX))
 }
 
-fn lowered_large_value_ref_summaries(program: &DoNode) -> Vec<GatewayLargeValueRefSummary> {
-    let mut summaries = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut stack = vec![program];
-    while let Some(node) = stack.pop() {
-        match node {
-            DoNode::Pure(value) => push_large_value_summaries(value, &mut seen, &mut summaries),
-            DoNode::AndThen { d, then } => {
-                if let Some(arg) = &then.arg {
-                    push_large_value_summaries(arg, &mut seen, &mut summaries);
-                }
-                stack.push(d);
-            }
-            DoNode::OrElse { d, or } => {
-                if let Some(arg) = &or.arg {
-                    push_large_value_summaries(arg, &mut seen, &mut summaries);
-                }
-                stack.push(d);
-            }
-            DoNode::Both(left, right) | DoNode::Race(left, right) => {
-                stack.push(left);
-                stack.push(right);
-            }
-            DoNode::Let { value, body, .. } => {
-                stack.push(value);
-                stack.push(body);
-            }
-            DoNode::Acting { body, .. } => stack.push(body),
-            DoNode::Op(tmpl) => {
-                if let Some(input) = &tmpl.literal_input {
-                    push_large_value_summaries(input, &mut seen, &mut summaries);
-                }
-            }
-            DoNode::Use(_) | DoNode::Fail(_) | DoNode::Wait(_) => {}
-        }
-    }
-    summaries
-}
-
-fn push_large_value_summaries(
-    value: &Value,
-    seen: &mut BTreeSet<(String, u64, Option<String>)>,
-    summaries: &mut Vec<GatewayLargeValueRefSummary>,
-) {
-    for blob in collect_large_value_refs(value) {
-        let key = (blob.hash.clone(), blob.size, blob.mime.clone());
-        if seen.insert(key.clone()) {
-            summaries.push(GatewayLargeValueRefSummary {
-                hash: key.0,
-                size: key.1,
-                mime: key.2,
-            });
-        }
-    }
-}
-
-fn validate_submit_options(
-    options: &SubmitOptions,
+fn validate_request_deadline(
+    deadline: Option<HostDeadline>,
+    now: HostDeadline,
     limits: &GatewayLimitProfile,
-    now_ms: i64,
 ) -> Result<(), GatewayError> {
+    let Some(deadline) = deadline else {
+        return Ok(());
+    };
+    let remaining = deadline
+        .saturating_duration_since(now)
+        .map_err(|error| GatewayError::Rejected(error.to_string()))?;
+    if remaining.is_zero() {
+        return Err(GatewayError::Rejected(
+            "request deadline has already expired".into(),
+        ));
+    }
+    let max_ms = u64::try_from(limits.max_deadline_ms_from_now).unwrap_or(0);
+    if remaining > Duration::from_millis(max_ms) {
+        return Err(GatewayError::Rejected(format!(
+            "request deadline exceeds max_deadline_ms_from_now ({})",
+            limits.max_deadline_ms_from_now
+        )));
+    }
+    Ok(())
+}
+
+fn validate_submit_options(options: &SubmitOptions) -> Result<(), GatewayError> {
     if let Some(key) = normalize_optional_string(options.idempotency_key.clone()) {
         validate_idempotency_key(&key)?;
     }
     if let Some(token) = normalize_optional_string(options.submission_token.clone()) {
         validate_submission_token(&token)?;
-    }
-    if let Some(deadline_ms) = options.deadline_ms {
-        let deadline_ms = i64::try_from(deadline_ms)
-            .map_err(|_error| GatewayError::Rejected("deadline_ms is out of range".into()))?;
-        if deadline_ms <= now_ms {
-            return Err(GatewayError::Rejected(
-                "deadline_ms has already expired".into(),
-            ));
-        }
-        if deadline_ms.saturating_sub(now_ms) > limits.max_deadline_ms_from_now {
-            return Err(GatewayError::Rejected(format!(
-                "deadline_ms exceeds max_deadline_ms_from_now ({})",
-                limits.max_deadline_ms_from_now
-            )));
-        }
     }
     Ok(())
 }
@@ -3419,6 +2486,17 @@ fn validate_idempotency_key(key: &str) -> Result<(), GatewayError> {
 }
 
 fn validate_content_hash(hash: &str) -> Result<(), GatewayError> {
+    let ok = BlobRef::is_valid_hash(hash);
+    if ok {
+        Ok(())
+    } else {
+        Err(GatewayError::Rejected(
+            "large object reference hash must be lowercase hex SHA-384".into(),
+        ))
+    }
+}
+
+fn validate_internal_hash(hash: &str) -> Result<(), GatewayError> {
     let ok = hash.len() == 64
         && hash
             .bytes()
@@ -3427,17 +2505,9 @@ fn validate_content_hash(hash: &str) -> Result<(), GatewayError> {
         Ok(())
     } else {
         Err(GatewayError::Rejected(
-            "large object reference hash must be lowercase hex blake3".into(),
+            "internal hash must be 64 lowercase hexadecimal characters".into(),
         ))
     }
-}
-
-fn state_path(segments: &[&str]) -> Result<Path, xolotl_types::PathError> {
-    let mut path = Path::try_new("state")?;
-    for segment in segments {
-        path = path.try_push_literal(segment)?;
-    }
-    Ok(path)
 }
 
 fn random_gateway_id(prefix: &str, profile_rev: GatewayProfileRev) -> Result<String, GatewayError> {
@@ -3568,6 +2638,10 @@ fn inspect_lowered_submission(
             DoNode::OrElse { d, .. } => {
                 inspect_step_ref(&mut admission.inspection)?;
                 stack.push((d, depth.saturating_add(1)));
+            }
+            DoNode::Finally { body, cleanup } => {
+                stack.push((cleanup, depth.saturating_add(1)));
+                stack.push((body, depth.saturating_add(1)));
             }
             DoNode::Both(a, b) | DoNode::Race(a, b) => {
                 stack.push((a, depth.saturating_add(1)));
@@ -3749,14 +2823,9 @@ fn failure_literal_bytes(failure: &Failure) -> usize {
     failure.to_string().len()
 }
 
+#[cfg(test)]
 fn now_millis() -> i64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(now) => i64::try_from(now.as_millis()).unwrap_or(i64::MAX),
-        Err(error) => {
-            let before_epoch = i64::try_from(error.duration().as_millis()).unwrap_or(i64::MAX);
-            before_epoch.saturating_neg()
-        }
-    }
+    xolotl_kernel::host::system_now_millis()
 }
 
 #[cfg(test)]

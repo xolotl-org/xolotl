@@ -5,12 +5,34 @@ use super::{
     GatewaySurface,
 };
 use crate::{
-    BearerTokenHash, ClientCertificateDerSha256, CompiledGatewayProfile, GatewayCredential,
+    BearerTokenHash, ClientCertificateDerSha384, CompiledGatewayProfile, GatewayCredential,
     GatewayError, GatewayGeneration, GatewayIdentityMapping, GatewayProfileRev,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use xolotl_types::{Path, ProcessId, ResourceName, Value};
+use xolotl_types::{Path, PathError, ProcessId, ResourceName, Value};
+
+/// Kernel-state prefix for application Gateway profile declarations.
+pub const GATEWAY_PROFILES_PREFIX: &str = "state://kernel/gateway/profiles";
+
+/// Address one application Gateway profile declaration.
+pub fn gateway_profile_path(name: &str) -> Result<Path, PathError> {
+    Path::parse(GATEWAY_PROFILES_PREFIX)?.try_push_literal(name)
+}
+
+/// Extract a profile name only from an exact, local declaration address.
+pub fn gateway_profile_id(path: &Path) -> Option<&str> {
+    let [kernel, gateway, profiles, name] = path.segments() else {
+        return None;
+    };
+    (path.scheme() == "state"
+        && path.cluster().is_none()
+        && kernel.as_str() == "kernel"
+        && gateway.as_str() == "gateway"
+        && profiles.as_str() == "profiles"
+        && path.is_concrete())
+    .then_some(name.as_str())
+}
 
 /// State declaration at `state://kernel/gateway/profiles/<profile_name>`.
 ///
@@ -59,8 +81,7 @@ impl GatewayProfileDocument {
     /// Check path identity and all profile rules that do not need a live kernel.
     /// Resource registration and anchor grants are checked at runtime installation.
     pub fn validate_admission(&self, path_name: &str) -> Result<(), GatewayError> {
-        Path::try_new("state")
-            .and_then(|path| path.try_push_literal(path_name))
+        gateway_profile_path(path_name)
             .map_err(|error| GatewayError::InvalidProfile(error.to_string()))?;
         if self.profile_name != path_name {
             return Err(GatewayError::InvalidProfile(
@@ -86,11 +107,11 @@ impl GatewayProfileDocument {
                         BearerTokenHash::from_hex(token_hash)?,
                     )
                 }
-                CredentialVerifierDocument::ClientCertificate { der_sha256 } => {
-                    GatewayCredential::client_certificate_der_sha256(
+                CredentialVerifierDocument::ClientCertificate { der_sha384 } => {
+                    GatewayCredential::client_certificate_der_sha384(
                         credential.credential_id,
                         credential.principal_id,
-                        ClientCertificateDerSha256::from_hex(der_sha256)?,
+                        ClientCertificateDerSha384::from_hex(der_sha384)?,
                     )
                 }
             };
@@ -174,7 +195,7 @@ struct CredentialDocument {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum CredentialVerifierDocument {
     Bearer { token_hash: String },
-    ClientCertificate { der_sha256: String },
+    ClientCertificate { der_sha384: String },
 }
 
 impl std::fmt::Debug for CredentialVerifierDocument {

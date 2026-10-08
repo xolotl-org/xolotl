@@ -10,10 +10,9 @@
 //! process; Grpc/WebSocket/Http specs are connection targets for the endpoint
 //! supervisor and are tracked as `starting` until that layer reports readiness.
 //!
-//! The manager is a supervision routine: it compares
-//! the desired set of external installations
-//! (`state://kernel/external-installations/*`) against the live process states
-//! and drives them toward the desired phase.
+//! The manager is a supervision routine: it compares the private Source-owned
+//! installation catalog against live process states and drives them toward the
+//! desired phase. Ordinary State values cannot authorize a process launch.
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -22,6 +21,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::{Child, Command};
 use xolotl_kernel::{Driver, DriverContext, DriverError, DriverOutput, MethodSpec};
+use xolotl_source::ExternalInstallationAuthority;
 use xolotl_state::Backend;
 use xolotl_types::{MethodId, Outcome, OutputMode, Path, ProcSpec, Purity, Transport, Value};
 use xolotl_types::{ValueMap, ValueView};
@@ -31,11 +31,39 @@ use xolotl_types::{ValueMap, ValueView};
 /// `invoke`. All lifecycle mutations are Effectful; `status` is a
 /// pure read of external process state.
 pub(crate) const PROC_METHODS: &[MethodSpec] = &[
-    MethodSpec::new("spawn", Purity::Effectful, MethodSpec::UNARY_ASYNC),
-    MethodSpec::new("kill", Purity::Effectful, MethodSpec::UNARY_ASYNC).finalize_allowed(),
-    MethodSpec::new("signal", Purity::Effectful, MethodSpec::UNARY_ASYNC).finalize_allowed(),
-    MethodSpec::new("status", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external(),
-    MethodSpec::new("heartbeat", Purity::Effectful, MethodSpec::UNARY_ASYNC),
+    MethodSpec::new(
+        "spawn",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Effectful,
+        MethodSpec::UNARY_ASYNC,
+    ),
+    MethodSpec::new(
+        "kill",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Effectful,
+        MethodSpec::UNARY_ASYNC,
+    )
+    .finalize_allowed(),
+    MethodSpec::new(
+        "signal",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Effectful,
+        MethodSpec::UNARY_ASYNC,
+    )
+    .finalize_allowed(),
+    MethodSpec::new(
+        "status",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Pure,
+        MethodSpec::UNARY_ASYNC,
+    )
+    .observes_external(),
+    MethodSpec::new(
+        "heartbeat",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Effectful,
+        MethodSpec::UNARY_ASYNC,
+    ),
 ];
 
 /// Process lifecycle phases.
@@ -50,6 +78,7 @@ pub(crate) const PHASE_DEAD: &str = "dead";
 /// The privileged Driver that manages external processes.
 pub(crate) struct ProcDriver {
     state: Backend,
+    installations: Option<Arc<dyn ExternalInstallationAuthority>>,
     children: Arc<Mutex<BTreeMap<String, LiveChild>>>,
 }
 
@@ -60,12 +89,47 @@ struct LiveChild {
 }
 
 impl ProcDriver {
-    /// Create a process driver backed by the state plane.
+    /// Create a process driver backed by the state plane for tests.
+    #[cfg(test)]
     pub(crate) fn new(state: Backend) -> Self {
+        Self::with_installations(state, None)
+    }
+
+    /// Bind process launch to the private installation authority.
+    pub(crate) fn with_installations(
+        state: Backend,
+        installations: Option<Arc<dyn ExternalInstallationAuthority>>,
+    ) -> Self {
         Self {
             state,
+            installations,
             children: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    async fn ensure_installed(&self, spec: &ProcSpec) -> Result<(), DriverError> {
+        let authority = self.installations.as_ref().ok_or_else(|| {
+            DriverError::Other("external installation authority is not installed".into())
+        })?;
+        let record = authority
+            .load_installation(&spec.id)
+            .await
+            .map_err(|error| DriverError::Other(format!("installation lookup failed: {error}")))?
+            .ok_or_else(|| {
+                DriverError::Other(format!(
+                    "proc.spawn requires installed external {:?}",
+                    spec.id
+                ))
+            })?;
+        if record.definition.id != spec.id || record.definition.transport != spec.transport {
+            return Err(DriverError::Other(
+                "ProcSpec identity or transport differs from the installed external".into(),
+            ));
+        }
+        record.definition.validate_admission().map_err(|error| {
+            DriverError::Other(format!("ExternalInstallationDef admission failed: {error}"))
+        })?;
+        Ok(())
     }
 
     /// Build a process's status path. `id` arrives from Operation input, so an
@@ -93,7 +157,7 @@ impl ProcDriver {
         m.insert("restarts".into(), Value::integer(restarts));
         m.insert(
             "started_at".into(),
-            Value::integer(xolotl_kernel::now_millis()),
+            Value::integer(xolotl_kernel::host::system_now_millis()),
         );
         if let Some(transport) = transport {
             m.insert(
@@ -182,12 +246,14 @@ impl ProcDriver {
             .first()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| DriverError::Other("stdio proc.spawn command argv is empty".into()))?;
+        if !std::path::Path::new(program).is_absolute() {
+            return Err(DriverError::Other(
+                "stdio proc.spawn requires an absolute executable path".into(),
+            ));
+        }
         let mut cmd = Command::new(program);
         cmd.args(argv.iter().skip(1));
-        cmd.envs(spec.env.iter());
-        if let Some(cwd) = &spec.cwd {
-            cmd.current_dir(cwd);
-        }
+        cmd.env_clear();
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -243,6 +309,7 @@ impl Driver for ProcDriver {
                 };
                 let spec = parse_proc_spec(input)?;
                 self.ensure_not_running(&spec.id).await?;
+                self.ensure_installed(&spec).await?;
                 let pid = match &spec.transport {
                     Transport::Stdio { .. } => {
                         let (pid, live) = self.spawn_stdio_child(&spec)?;
@@ -320,7 +387,7 @@ impl Driver for ProcDriver {
                 let mut health = BTreeMap::new();
                 health.insert(
                     "last_heartbeat".into(),
-                    Value::integer(xolotl_kernel::now_millis()),
+                    Value::integer(xolotl_kernel::host::system_now_millis()),
                 );
                 health.insert("rtt_ms".into(), Value::integer(rtt));
                 health.insert("inflight".into(), Value::integer(inflight));
@@ -357,8 +424,19 @@ fn parse_proc_spec(input: Value) -> Result<ProcSpec, DriverError> {
     let spec: ProcSpec = serde_json::from_value(json)
         .map_err(|e| DriverError::Other(format!("proc.spawn requires ProcSpec input: {e}")))?;
     validate_proc_id(&spec.id)?;
+    if spec.transport == Transport::HostSession {
+        return Err(DriverError::InvalidInput(
+            "host-session transport is managed by the daemon".into(),
+        ));
+    }
     match &spec.transport {
         Transport::Stdio { command, args } => {
+            if !spec.env.is_empty() || spec.cwd.is_some() {
+                return Err(DriverError::Other(
+                    "stdio proc.spawn does not accept environment or working-directory overrides"
+                        .into(),
+                ));
+            }
             let argv = spec.command.as_ref().ok_or_else(|| {
                 DriverError::Other("stdio proc.spawn requires ProcSpec.command argv".into())
             })?;
@@ -542,6 +620,7 @@ fn optional_signal(m: &ValueMap) -> Result<&str, DriverError> {
 fn transport_name(t: &Transport) -> &'static str {
     match t {
         Transport::InProcess => "in_process",
+        Transport::HostSession => "host_session",
         Transport::Grpc { .. } => "grpc",
         Transport::Stdio { .. } => "stdio",
         Transport::WebSocket { .. } => "websocket",
@@ -554,9 +633,10 @@ async fn send_signal(pid: u32, sig: &str) -> Result<(), DriverError> {
     if sig.is_empty() || !sig.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err(DriverError::Other(format!("invalid signal name {sig:?}")));
     }
-    let status = Command::new("kill")
+    let status = Command::new("/bin/kill")
         .arg(format!("-{sig}"))
         .arg(pid.to_string())
+        .env_clear()
         .status()
         .await
         .map_err(|e| DriverError::Other(format!("signal {sig} to pid {pid} failed: {e}")))?;
@@ -648,11 +728,63 @@ fn supervise(
 mod tests {
     use super::*;
     use anyhow::{Context, bail, ensure};
+    use xolotl_source::ExternalInstallationMutation;
     use xolotl_state::InMemoryBackend;
-    use xolotl_types::{IdentityRef, ProcessId};
+    use xolotl_types::{
+        EffectCapability, ExternalInstallationDef, ExternalProjectionDef, IdentityRef, ProcessId,
+        Role, TrustLevel,
+    };
 
     fn ctx() -> DriverContext {
         DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
+    }
+
+    fn authorized_driver() -> ProcDriver {
+        let (state, owner) = InMemoryBackend::new().into_source_parts();
+        ProcDriver::with_installations(state, Some(owner))
+    }
+
+    async fn install_for_spec(driver: &ProcDriver, value: &Value) -> anyhow::Result<()> {
+        let spec: ProcSpec = serde_json::from_value(serde_json::to_value(value)?)?;
+        let namespace = xolotl_types::sandboxed_provider_namespace_path(&spec.id)?;
+        let invoke_effect = namespace.clone().try_push_literal("invoke")?.to_string();
+        let definition = ExternalInstallationDef {
+            id: spec.id.clone(),
+            platform: spec.id.clone(),
+            transport: spec.transport,
+            trust: TrustLevel::Sandboxed,
+            config_schema: Value::null(),
+            config: Value::null(),
+            projections: vec![ExternalProjectionDef {
+                id: "provider".into(),
+                role: Role::Provider,
+                namespace: Some(namespace),
+                provides: vec![EffectCapability::new(invoke_effect, Purity::Effectful)],
+                emits: None,
+                version: 1,
+            }],
+            version: 1,
+        };
+        let authority = driver
+            .installations
+            .as_ref()
+            .context("installation authority missing")?;
+        let result = authority.compare_install(definition, None).await?;
+        ensure!(
+            matches!(result, ExternalInstallationMutation::Applied(Some(_))),
+            "installation did not commit"
+        );
+        Ok(())
+    }
+
+    async fn installed_stdio_spec_input(
+        driver: &ProcDriver,
+        id: &str,
+        command: Vec<&str>,
+    ) -> anyhow::Result<Value> {
+        let input = stdio_spec_input(id, command)?;
+        install_for_spec(driver, &input).await?;
+        Ok(input)
     }
 
     fn id_input(id: &str) -> Value {
@@ -706,6 +838,132 @@ mod tests {
             )
             .await;
         ensure!(out.is_err(), "id shorthand spawn was accepted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spawn_without_installation_authority_fails_closed() -> anyhow::Result<()> {
+        let state: Backend = InMemoryBackend::new().into_backend();
+        let driver = ProcDriver::new(state);
+        let result = driver
+            .call(
+                MethodId::new(0),
+                websocket_spec_input("ext-no-authority")?,
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await;
+        ensure!(
+            matches!(result, Err(DriverError::Other(ref message)) if message.contains("authority is not installed")),
+            "spawn without authority succeeded: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn state_installation_mirror_cannot_authorize_spawn() -> anyhow::Result<()> {
+        let (state, owner) = InMemoryBackend::new().into_source_parts();
+        let driver = ProcDriver::with_installations(state.clone(), Some(owner));
+        let path = Path::parse("state://kernel/external-installations/forged-proc")?;
+        state
+            .write_set(&path, Value::string("forged installation".into()))
+            .await?;
+        let result = driver
+            .call(
+                MethodId::new(0),
+                websocket_spec_input("forged-proc")?,
+                OutputMode::Unary,
+                &ctx(),
+            )
+            .await;
+        ensure!(
+            matches!(result, Err(DriverError::Other(ref message)) if message.contains("requires installed")),
+            "State mirror authorized proc.spawn: {result:?}"
+        );
+        ensure!(
+            state
+                .read(&ProcDriver::status_path("forged-proc")?)
+                .await?
+                .is_none(),
+            "rejected spawn wrote a status"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_transport_changed_from_installation() -> anyhow::Result<()> {
+        let driver = authorized_driver();
+        let installed = websocket_spec_input("ext-transport")?;
+        install_for_spec(&driver, &installed).await?;
+        let mut changed: ProcSpec = serde_json::from_value(serde_json::to_value(installed)?)?;
+        changed.transport = Transport::WebSocket {
+            endpoint: Some("wss://evil.example/ext".into()),
+        };
+        let input = serde_json::from_value(serde_json::to_value(changed)?)?;
+        let result = driver
+            .call(MethodId::new(0), input, OutputMode::Unary, &ctx())
+            .await;
+        ensure!(
+            matches!(result, Err(DriverError::Other(ref message)) if message.contains("differs")),
+            "changed transport authorized proc.spawn: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stdio_spawn_rejects_environment_and_directory_overrides() -> anyhow::Result<()> {
+        let driver = authorized_driver();
+        let installed = stdio_spec_input("ext-stdio-overrides", vec!["/bin/sh", "-c", "exit 0"])?;
+        install_for_spec(&driver, &installed).await?;
+        let spec: ProcSpec = serde_json::from_value(serde_json::to_value(installed)?)?;
+        for changed in [
+            ProcSpec {
+                env: BTreeMap::from([("LD_PRELOAD".into(), "/tmp/injected.so".into())]),
+                ..spec.clone()
+            },
+            ProcSpec {
+                cwd: Some("/tmp".into()),
+                ..spec.clone()
+            },
+        ] {
+            let input = serde_json::from_value(serde_json::to_value(changed)?)?;
+            let result = driver
+                .call(MethodId::new(0), input, OutputMode::Unary, &ctx())
+                .await;
+            ensure!(
+                matches!(result, Err(DriverError::Other(ref message)) if message.contains("does not accept environment")),
+                "stdio override authorized spawn: {result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retired_installation_cannot_spawn() -> anyhow::Result<()> {
+        let driver = authorized_driver();
+        let input = websocket_spec_input("ext-retired")?;
+        install_for_spec(&driver, &input).await?;
+        let authority = driver
+            .installations
+            .as_ref()
+            .context("installation authority missing")?;
+        let revision = authority
+            .load_installation("ext-retired")
+            .await?
+            .context("installation missing")?
+            .revision();
+        let retired = authority.compare_retire("ext-retired", revision).await?;
+        ensure!(
+            matches!(retired, ExternalInstallationMutation::Applied(None)),
+            "retirement failed"
+        );
+        let result = driver
+            .call(MethodId::new(0), input, OutputMode::Unary, &ctx())
+            .await;
+        ensure!(
+            matches!(result, Err(DriverError::Other(ref message)) if message.contains("requires installed")),
+            "retired installation authorized proc.spawn: {result:?}"
+        );
         Ok(())
     }
 
@@ -808,12 +1066,11 @@ mod tests {
 
     #[tokio::test]
     async fn stdio_spawn_then_status_reports_starting_with_pid() -> anyhow::Result<()> {
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let d = ProcDriver::new(state);
+        let d = authorized_driver();
         let out = d
             .call(
                 MethodId::new(0),
-                stdio_spec_input("ext-a", vec!["/bin/sh", "-c", "sleep 1"])?,
+                installed_stdio_spec_input(&d, "ext-a", vec!["/bin/sh", "-c", "sleep 1"]).await?,
                 OutputMode::Unary,
                 &ctx(),
             )
@@ -872,11 +1129,10 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_promotes_starting_child_to_ready() -> anyhow::Result<()> {
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let d = ProcDriver::new(state);
+        let d = authorized_driver();
         d.call(
             MethodId::new(0),
-            stdio_spec_input("ext-ready", vec!["/bin/sh", "-c", "sleep 1"])?,
+            installed_stdio_spec_input(&d, "ext-ready", vec!["/bin/sh", "-c", "sleep 1"]).await?,
             OutputMode::Unary,
             &ctx(),
         )
@@ -916,11 +1172,10 @@ mod tests {
 
     #[tokio::test]
     async fn kill_marks_dead() -> anyhow::Result<()> {
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let d = ProcDriver::new(state);
+        let d = authorized_driver();
         d.call(
             MethodId::new(0),
-            stdio_spec_input("ext-b", vec!["/bin/sh", "-c", "sleep 10"])?,
+            installed_stdio_spec_input(&d, "ext-b", vec!["/bin/sh", "-c", "sleep 10"]).await?,
             OutputMode::Unary,
             &ctx(),
         )
@@ -997,24 +1252,37 @@ mod tests {
 
     #[tokio::test]
     async fn status_terminalizes_exited_stdio_child() -> anyhow::Result<()> {
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let d = ProcDriver::new(state);
+        let d = authorized_driver();
         d.call(
             MethodId::new(0),
-            stdio_spec_input("ext-exit", vec!["/bin/sh", "-c", "exit 7"])?,
+            installed_stdio_spec_input(&d, "ext-exit", vec!["/bin/sh", "-c", "exit 7"]).await?,
             OutputMode::Unary,
             &ctx(),
         )
         .await?;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let out = d
-            .call(
-                MethodId::new(3),
-                id_input("ext-exit"),
-                OutputMode::Unary,
-                &ctx(),
-            )
-            .await?;
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let out = d
+                    .call(
+                        MethodId::new(3),
+                        id_input("ext-exit"),
+                        OutputMode::Unary,
+                        &ctx(),
+                    )
+                    .await?;
+                if matches!(&out.outcome, Outcome::Done(value) if value
+                    .as_map()
+                    .and_then(|map| map.get("phase"))
+                    .and_then(Value::as_str)
+                    == Some(PHASE_DEAD))
+                {
+                    return Ok::<_, DriverError>(out);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("exited stdio child did not become dead")??;
         match out.outcome {
             Outcome::Done(m_value) => {
                 let m = m_value.as_map().context("expected map")?;
@@ -1174,8 +1442,10 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_rejects_malformed_persisted_status() -> anyhow::Result<()> {
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let d = ProcDriver::new(state.clone());
+        let (state, owner) = InMemoryBackend::new().into_source_parts();
+        let d = ProcDriver::with_installations(state.clone(), Some(owner));
+        let input = websocket_spec_input("ext-corrupt-spawn")?;
+        install_for_spec(&d, &input).await?;
         let mut status = BTreeMap::new();
         status.insert("phase".into(), Value::integer(1));
         status.insert("restarts".into(), Value::integer(0));
@@ -1187,12 +1457,7 @@ mod tests {
             .await?;
 
         let out = d
-            .call(
-                MethodId::new(0),
-                websocket_spec_input("ext-corrupt-spawn")?,
-                OutputMode::Unary,
-                &ctx(),
-            )
+            .call(MethodId::new(0), input, OutputMode::Unary, &ctx())
             .await;
         ensure!(
             matches!(out, Err(DriverError::Other(ref message)) if message.contains("malformed proc status")),

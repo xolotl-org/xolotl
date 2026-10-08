@@ -24,6 +24,20 @@ pub enum StateEvent {
         /// Sources observed while appending, including the existing sequence.
         taint: TaintSet,
     },
+    /// Remove a prefix of a sequence and append one item atomically.
+    /// `removed` is the actual number removed, not a capacity hint, so the
+    /// event can replay a Source capacity change without reading that policy.
+    DropPrefixAppend {
+        /// Path of the sequence being advanced.
+        path: Path,
+        /// Number of existing items removed from the front.
+        removed: u64,
+        /// Item appended after the prefix is removed.
+        #[cfg_attr(feature = "std", serde(with = "xolotl_types::tagged_value"))]
+        item: Value,
+        /// Provenance of the resulting sequence, including removed items.
+        taint: TaintSet,
+    },
     /// Delete a path.
     Delete {
         /// Path whose stored value was removed.
@@ -37,16 +51,20 @@ impl StateEvent {
     /// Provenance retained by this mutation, including deletion observations.
     pub fn taint(&self) -> &TaintSet {
         match self {
-            Self::Set { taint, .. } | Self::Append { taint, .. } | Self::Delete { taint, .. } => {
-                taint
-            }
+            Self::Set { taint, .. }
+            | Self::Append { taint, .. }
+            | Self::DropPrefixAppend { taint, .. }
+            | Self::Delete { taint, .. } => taint,
         }
     }
 
     /// Path changed by this event.
     pub fn path(&self) -> &Path {
         match self {
-            Self::Set { path, .. } | Self::Append { path, .. } | Self::Delete { path, .. } => path,
+            Self::Set { path, .. }
+            | Self::Append { path, .. }
+            | Self::DropPrefixAppend { path, .. }
+            | Self::Delete { path, .. } => path,
         }
     }
 }

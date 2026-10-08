@@ -1,5 +1,6 @@
-use crate::{StateResult, TaintedValue};
-use core::future::Future;
+use crate::{StateError, StateEvent, StateResult, TaintedValue};
+use alloc::{boxed::Box, string::ToString};
+use core::{future::Future, num::NonZeroUsize};
 use xolotl_types::{MergeRule, Path, TaintSet, Value};
 
 /// A committed mutation and every source observed while deciding its outcome.
@@ -26,13 +27,15 @@ pub enum StateMutation {
         /// atomically retain the current value's sources in the replacement.
         value: TaintedValue,
     },
-    /// Remove the value.
-    Delete,
+    /// Remove the value, retaining deletion input and control provenance.
+    Delete(TaintSet),
     /// Compare the value only, then remove it in the same atomic commit.
     CompareDelete {
         /// `None` matches absence and succeeds without a mutation or notification;
         /// `Some(Value::null())` matches a stored null. Provenance is not compared.
         expected: Option<Value>,
+        /// Sources of the comparison and deletion input or control decision.
+        taint: TaintSet,
     },
     /// Merge data and union existing and incoming provenance.
     Merge {
@@ -43,6 +46,121 @@ pub enum StateMutation {
     },
 }
 
+impl StateMutation {
+    /// Known input and control sources, before observing any current record.
+    pub fn input_taint(&self) -> &TaintSet {
+        match self {
+            Self::Set(value)
+            | Self::Append(value)
+            | Self::CompareSet { value, .. }
+            | Self::Merge { value, .. } => &value.taint,
+            Self::Delete(taint) | Self::CompareDelete { taint, .. } => taint,
+        }
+    }
+
+    /// Prepare an Append from same-domain shape metadata and observed sources.
+    ///
+    /// None means absence, Some(true) a List, and Some(false) a non-List.
+    /// This is the same event preparation used by resident mutations; storage
+    /// backends need not materialize a List just to validate an incremental call.
+    pub fn prepare_append_event(
+        path: &Path,
+        value: TaintedValue,
+        current_is_list: Option<bool>,
+        mut observed: TaintSet,
+    ) -> StateResult<StateEvent> {
+        observed.union(&value.taint);
+        if current_is_list == Some(false) {
+            return Err(crate::StateFailure::new(
+                StateError::Backend(alloc::format!("append on non-list at {path}")),
+                observed,
+            ));
+        }
+        Ok(StateEvent::Append {
+            path: path.clone(),
+            item: value.value,
+            taint: observed,
+        })
+    }
+
+    /// Prepare an event against a borrowed value and already observed sources
+    /// inside the backend's commit domain, retaining known mutation inputs.
+    /// Absence may carry sources independently of a value. A backend can share
+    /// its accumulated sources without constructing a second equivalent set.
+    /// Encoding, capacity checks, current-record construction and publication
+    /// remain backend responsibilities. Append stays an incremental event.
+    pub fn prepare_event(
+        self,
+        path: &Path,
+        current: Option<&Value>,
+        mut observed: TaintSet,
+    ) -> StateResult<Option<StateEvent>> {
+        observed.union(self.input_taint());
+        let result = (|| {
+            let event = match self {
+                Self::Set(value) => StateEvent::Set {
+                    path: path.clone(),
+                    value: value.value,
+                    taint: value.taint,
+                },
+                Self::Append(value) => Self::prepare_append_event(
+                    path,
+                    value,
+                    current.map(|value| value.as_list().is_some()),
+                    observed.clone(),
+                )?,
+                Self::CompareSet { expected, value } => {
+                    compare_observation(path, expected, current)?;
+                    StateEvent::Set {
+                        path: path.clone(),
+                        value: value.value,
+                        taint: observed.clone(),
+                    }
+                }
+                Self::Delete(_) => {
+                    return Ok(current.map(|_| StateEvent::Delete {
+                        path: path.clone(),
+                        taint: observed.clone(),
+                    }));
+                }
+                Self::CompareDelete { expected, .. } => {
+                    compare_observation(path, expected, current)?;
+                    return Ok(current.map(|_| StateEvent::Delete {
+                        path: path.clone(),
+                        taint: observed.clone(),
+                    }));
+                }
+                Self::Merge { value, rule } => StateEvent::Set {
+                    path: path.clone(),
+                    value: crate::merge_values(current.cloned(), value.value, rule)?,
+                    taint: observed.clone(),
+                },
+            };
+            Ok(Some(event))
+        })();
+        result.map_err(|failure: crate::StateFailure| failure.with_taint(&observed))
+    }
+}
+
+fn compare_observation(
+    path: &Path,
+    expected: Option<Value>,
+    current: Option<&Value>,
+) -> StateResult<()> {
+    if current == expected.as_ref() {
+        return Ok(());
+    }
+    Err(StateError::CasFailed {
+        path: path.to_string(),
+        expected: expected.map(Box::new),
+        actual: current.cloned().map(Box::new),
+    }
+    .into())
+}
+
+#[cfg(test)]
+mod tests;
+
 /// Atomic writes independent of read and query capabilities.
 pub trait StateWrite {
     /// Backend-owned write request.
@@ -51,9 +169,98 @@ pub trait StateWrite {
         Self: 'a;
 
     /// Complete only after the mutation is visible; publish notifications after
-    /// commit. Return all observed sources on both success and failure.
+    /// commit. Return all observed sources on both success and failure. A
+    /// backend may report [`crate::StateError::CommitUncertain`] when a commit
+    /// acknowledgement is lost; callers must reconcile before repeating a
+    /// non-idempotent mutation.
     fn mutate<'a>(&'a self, path: &'a Path, mutation: StateMutation) -> Self::Write<'a>;
 }
+
+/// Atomic conditional writes that bound the current record observed inside the
+/// same commit. This capability is independent of unrestricted [`StateWrite`]
+/// and bounded point reads; a preceding bounded read cannot limit a concurrent
+/// replacement seen by a later comparison.
+pub trait StateBoundedWrite {
+    /// Backend-owned conditional write request.
+    type BoundedWrite<'a>: Future<Output = StateResult<StateCommit>>
+    where
+        Self: 'a;
+
+    /// Compare the current value and replace it, unioning current and incoming
+    /// provenance. Reject an over-budget current record before copying or
+    /// decoding it. Absence has no encoded row to measure.
+    ///
+    /// The byte limit uses the backend's lossless encoding, including the key
+    /// and provenance. It bounds only the observed current record, not the
+    /// incoming replacement, retained history, or resident heap. On a
+    /// size-only rejection, `PointTooLarge` reports that
+    /// provenance was not observed and the actual value is unavailable. A
+    /// comparison within budget retains the ordinary `CasFailed` actual value
+    /// and the sources observed inside this commit.
+    fn compare_set_bounded<'a>(
+        &'a self,
+        path: &'a Path,
+        expected: Option<Value>,
+        value: TaintedValue,
+        max_current_encoded_bytes: NonZeroUsize,
+    ) -> Self::BoundedWrite<'a>;
+
+    /// Compare and delete the current value with the same observation bound.
+    /// `None` matches absence and succeeds without a mutation or notification.
+    fn compare_delete_bounded<'a>(
+        &'a self,
+        path: &'a Path,
+        expected: Option<Value>,
+        taint: TaintSet,
+        max_current_encoded_bytes: NonZeroUsize,
+    ) -> Self::BoundedWrite<'a>;
+}
+
+/// Pristine-data constructors for bounded conditional writes.
+pub trait StateBoundedWriteExt: StateBoundedWrite {
+    /// Atomically compare and replace with a pristine incoming value.
+    fn write_cas_bounded<'a>(
+        &'a self,
+        path: &'a Path,
+        expected: Option<Value>,
+        value: Value,
+        max_current_encoded_bytes: NonZeroUsize,
+    ) -> Self::BoundedWrite<'a> {
+        self.compare_set_bounded(
+            path,
+            expected,
+            TaintedValue::pristine(value),
+            max_current_encoded_bytes,
+        )
+    }
+
+    /// Atomically compare and delete within the current-record byte budget.
+    fn write_compare_delete_bounded<'a>(
+        &'a self,
+        path: &'a Path,
+        expected: Option<Value>,
+        max_current_encoded_bytes: NonZeroUsize,
+    ) -> Self::BoundedWrite<'a> {
+        self.write_compare_delete_tainted_bounded(
+            path,
+            expected,
+            TaintSet::pristine(),
+            max_current_encoded_bytes,
+        )
+    }
+
+    /// Compare and delete while retaining input and control provenance.
+    fn write_compare_delete_tainted_bounded<'a>(
+        &'a self,
+        path: &'a Path,
+        expected: Option<Value>,
+        taint: TaintSet,
+        max_current_encoded_bytes: NonZeroUsize,
+    ) -> Self::BoundedWrite<'a> {
+        self.compare_delete_bounded(path, expected, taint, max_current_encoded_bytes)
+    }
+}
+impl<T: StateBoundedWrite + ?Sized> StateBoundedWriteExt for T {}
 
 /// Typed mutation constructors. Every helper delegates to the same commit path.
 pub trait StateWriteExt: StateWrite {
@@ -121,7 +328,11 @@ pub trait StateWriteExt: StateWrite {
     }
     /// Remove a path's current value; deleting an absent path succeeds unchanged.
     fn write_delete<'a>(&'a self, path: &'a Path) -> Self::Write<'a> {
-        self.mutate(path, StateMutation::Delete)
+        self.write_delete_tainted(path, TaintSet::pristine())
+    }
+    /// Remove a value while retaining deletion input and control provenance.
+    fn write_delete_tainted<'a>(&'a self, path: &'a Path, taint: TaintSet) -> Self::Write<'a> {
+        self.mutate(path, StateMutation::Delete(taint))
     }
     /// Atomically remove a path only when its current value matches `expected`.
     /// `None` matches absence and succeeds unchanged; `Some(Value::null())` matches
@@ -132,7 +343,16 @@ pub trait StateWriteExt: StateWrite {
         path: &'a Path,
         expected: Option<Value>,
     ) -> Self::Write<'a> {
-        self.mutate(path, StateMutation::CompareDelete { expected })
+        self.write_compare_delete_tainted(path, expected, TaintSet::pristine())
+    }
+    /// Compare and remove a value with explicit input and control provenance.
+    fn write_compare_delete_tainted<'a>(
+        &'a self,
+        path: &'a Path,
+        expected: Option<Value>,
+        taint: TaintSet,
+    ) -> Self::Write<'a> {
+        self.mutate(path, StateMutation::CompareDelete { expected, taint })
     }
     /// Merge pristine incoming data while retaining existing provenance.
     fn write_merge<'a>(&'a self, path: &'a Path, value: Value, rule: MergeRule) -> Self::Write<'a> {

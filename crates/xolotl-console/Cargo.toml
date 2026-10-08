@@ -11,19 +11,28 @@ description = "Management-domain Gateway (Web Console backend) for Xolotl"
 [lints]
 workspace = true
 
+[features]
+default = []
+# HTTP routes, WebSocket upgrade and the optional listener helper.
+http = ["dep:axum", "dep:tower-http", "dep:xolotl-gateway", "futures-util/sink", "tokio/net", "tokio/io-util"]
+
 [dependencies]
+async-trait.workspace = true
 anyhow = { workspace = true, default-features = false, features = ["std"] }
 argon2 = { workspace = true, default-features = false, features = ["alloc", "password-hash"] }
-axum = { workspace = true, default-features = false, features = ["http1", "json", "tokio", "ws"] }
+axum = { workspace = true, default-features = false, features = ["http1", "json", "tokio", "ws"], optional = true }
 base64 = { workspace = true, default-features = false, features = ["alloc"] }
-ed25519-dalek = { workspace = true, default-features = false, features = ["alloc", "fast", "zeroize"] }
-futures-util = { workspace = true, default-features = false, features = ["sink", "std"] }
+data-encoding = { workspace = true, features = ["alloc"] }
+aws-lc-rs = { workspace = true, default-features = false, features = ["non-fips"] }
+futures-util = { workspace = true, default-features = false, features = ["std"] }
 getrandom = { workspace = true, default-features = false }
 hmac = { workspace = true, default-features = false }
 xolotl-graph.workspace = true
-xolotl-gateway.workspace = true
+xolotl-gateway = { workspace = true, optional = true }
 xolotl-kernel = { workspace = true, features = ["host"] }
 xolotl-state.workspace = true
+xolotl-source.workspace = true
+xolotl-federation.workspace = true
 xolotl-types.workspace = true
 xolotl-proto.workspace = true
 xolotl-console-protocol.workspace = true
@@ -35,14 +44,27 @@ sha2 = { workspace = true, default-features = false }
 subtle = { workspace = true, default-features = false }
 thiserror = { workspace = true, default-features = false, features = ["std"] }
 tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros", "rt-multi-thread", "signal", "time"] }
-tower-http = { workspace = true, default-features = false, features = ["trace", "cors"] }
+tower-http = { workspace = true, default-features = false, features = ["trace"], optional = true }
 tracing = { workspace = true, default-features = false, features = ["std"] }
 webauthn-rs = { workspace = true, default-features = false }
+zeroize = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]
+ed25519-dalek = { workspace = true, default-features = false, features = ["alloc", "fast", "zeroize"] }
+xolotl-kernel = { workspace = true, features = ["memory"] }
+xolotl-state = { workspace = true, features = ["memory"] }
+xolotl-storage-redb = { workspace = true, features = ["federation", "console"] }
+redb = { workspace = true, default-features = false }
+tempfile = { workspace = true, default-features = false, features = ["getrandom"] }
+openssl.workspace = true
+tower = { workspace = true, features = ["util"] }
 criterion = { workspace = true, default-features = false, features = ["cargo_bench_support"] }
 xolotl-standard = { workspace = true, default-features = false, features = ["standard"] }
 
 [[bench]]
 name = "console_protocol"
 harness = false
+
+[[test]]
+name = "http"
+required-features = ["http"]

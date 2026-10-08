@@ -1,23 +1,31 @@
 use super::harness::{
-    EffectOptions, Fixture, OUTPUT_PATH, TEST_WAIT, begin, decode_frames, encode_frames, finish,
-    inline_value, output_outcome as outcome_to_pb, output_value, request,
+    EffectOptions, Fixture, OUTPUT_PATH, TEST_WAIT, TOKEN, begin, decode_frames, encode_frames,
+    finish, inline_value, output_outcome as outcome_to_pb, output_value, request,
 };
 use super::ports::{Gate, Pause, ResponseProbe, Signal};
 use anyhow::{Context, bail, ensure};
 use pb::application_gateway_client::ApplicationGatewayClient;
 use pb::submit_output_response::Event;
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use tonic::codegen::tokio_stream;
 use tonic::transport::Channel;
 use tonic::{Code, Streaming};
+use xolotl_gateway::{
+    Gateway, GatewayPrincipalSurfaceBinding, GatewayProfile, GatewaySurface, PresentedCredential,
+};
 use xolotl_gateway_grpc::ApplicationGrpcConfig;
+use xolotl_kernel::host::{
+    AbortTask, HostClock, HostRuntime, TaskSpawnError, TaskSpawner, TokioBlockingSpawner,
+};
 use xolotl_kernel::{Driver, DriverContext, DriverError};
 use xolotl_proto::xolotl::v1::{self as common, application as pb};
-use xolotl_proto::{output_mode_to_pb, path_to_pb, value_from_pb_checked, value_to_pb};
+use xolotl_proto::{output_mode_to_pb, path_to_pb, value_from_pb, value_to_pb};
 use xolotl_types::{
     DriverOutput, MethodId, Outcome, OutputMode, Path, Purity, TaintSet, TaintSource, TaintedValue,
     Value,
@@ -25,6 +33,44 @@ use xolotl_types::{
 
 const CHUNKS: usize = 193;
 const CHUNK_BYTES: usize = 16 * 1024 + 7;
+
+struct PausedHostClock(Instant);
+
+impl HostClock for PausedHostClock {
+    fn monotonic_now(&self) -> Instant {
+        self.0
+    }
+
+    fn unix_millis(&self) -> i64 {
+        1_000
+    }
+
+    fn sleep_until(&self, _deadline: Instant) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+struct TokioTestTask(tokio::task::AbortHandle);
+
+impl AbortTask for TokioTestTask {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+struct TokioTestTasks;
+
+impl TaskSpawner for TokioTestTasks {
+    fn spawn(
+        &self,
+        future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    ) -> Result<Arc<dyn AbortTask>, TaskSpawnError> {
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|_error| TaskSpawnError::Unavailable)?;
+        let task = runtime.spawn(future);
+        Ok(Arc::new(TokioTestTask(task.abort_handle())))
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum Plan {
@@ -288,7 +334,7 @@ async fn cumulative_output_preserves_order_taint_and_distinct_final_schema() -> 
         let Some(Event::Chunk(chunk)) = next(&mut output).await? else {
             bail!("missing chunk {index}");
         };
-        let value = value_from_pb_checked(inline_value(
+        let value = value_from_pb(inline_value(
             chunk.item.as_ref().context("chunk item missing")?,
         )?)?;
         let Some(bytes) = value.as_bytes() else {
@@ -350,6 +396,11 @@ async fn zero_and_small_http2_windows_bound_emit_progress_until_credit_returns()
             .await?;
         let (send, response) = pending.streaming_response().await?;
         ensure!(response.headers().get("grpc-status").is_none());
+        // Accepted is admission evidence; with no HTTP/2 credit the response
+        // body need not be polled far enough to start the attached execution.
+        if initial_window == 0 {
+            raw.set_receive_window(1024).await?;
+        }
         driver.probe.entered.wait().await?;
         let plateau = driver.probe.plateau().await?;
         // Hyper's 400 KiB send buffer and tonic's 32 KiB batching are additional
@@ -408,6 +459,7 @@ async fn reset_of_a_flow_control_blocked_response_releases_driver_and_output_per
         )
         .await?;
     let (mut send, response) = pending.streaming_response().await?;
+    raw.set_receive_window(1024).await?;
     driver.probe.entered.wait().await?;
     ensure!(driver.probe.plateau().await? < CHUNKS);
     full(&fixture).await?;
@@ -424,8 +476,7 @@ async fn reset_of_a_flow_control_blocked_response_releases_driver_and_output_per
 }
 
 #[tokio::test]
-async fn completed_short_output_keeps_its_quota_until_the_encoded_body_drops() -> anyhow::Result<()>
-{
+async fn completed_short_output_keeps_its_quota_until_the_response_drops() -> anyhow::Result<()> {
     for count in [0, 1] {
         let driver = OutputDriver::new(Plan::Bytes { count, size: 13 })?;
         let response_probe = ResponseProbe::new();
@@ -440,7 +491,7 @@ async fn completed_short_output_keeps_its_quota_until_the_encoded_body_drops() -
             None,
         )
         .await?;
-        let raw = fixture.raw_with_window(0).await?;
+        let raw = fixture.raw_with_window(128).await?;
         let pending = raw
             .request(
                 OUTPUT_PATH,
@@ -450,19 +501,34 @@ async fn completed_short_output_keeps_its_quota_until_the_encoded_body_drops() -
             .await?;
         let (mut send, response) = pending.streaming_response().await?;
         ensure!(response.headers().get("grpc-status").is_none());
-        driver.probe.exited.wait().await?;
-        response_probe.completed.wait().await?;
+        driver
+            .probe
+            .exited
+            .wait()
+            .await
+            .context("driver did not exit")?;
         ensure!(driver.probe.live.load(Ordering::Acquire) == 0);
         ensure!(driver.probe.calls() == 1 && driver.probe.emitted() == count);
-        // Both complete streams fit below tonic's 32 KiB batching threshold:
-        // source EOF is consumed while Hyper still holds the encoded DATA.
-        full(&fixture).await?;
+        // The source has completed, but the small HTTP/2 receive window can
+        // keep the encoded response and its permit alive until reset.
+        full(&fixture)
+            .await
+            .context("second response was not rejected")?;
         send.send_reset(h2::Reason::CANCEL);
         drop(response);
         drop(send);
-        response_probe.dropped.wait().await?;
-        response_probe.wait_data_released().await?;
-        healthy(&fixture).await?;
+        response_probe
+            .dropped
+            .wait()
+            .await
+            .context("encoded response body was not dropped after reset")?;
+        response_probe
+            .wait_data_released()
+            .await
+            .context("encoded response DATA was not released after reset")?;
+        healthy(&fixture)
+            .await
+            .context("replacement response could not start after reset")?;
         ensure!(driver.probe.calls() == 2);
         drop(raw);
         fixture.close().await?;
@@ -471,8 +537,7 @@ async fn completed_short_output_keeps_its_quota_until_the_encoded_body_drops() -
 }
 
 #[tokio::test]
-async fn completed_short_output_keeps_its_quota_while_h2_retains_data_after_body_drop()
--> anyhow::Result<()> {
+async fn completed_short_output_keeps_its_quota_while_h2_retains_data() -> anyhow::Result<()> {
     let driver = OutputDriver::new(Plan::Bytes { count: 1, size: 13 })?;
     let response_probe = ResponseProbe::new();
     let mut effect = EffectOptions::stream(driver.clone(), Purity::Pure);
@@ -486,7 +551,7 @@ async fn completed_short_output_keeps_its_quota_while_h2_retains_data_after_body
         None,
     )
     .await?;
-    let raw = fixture.raw_with_window(1).await?;
+    let raw = fixture.raw_with_window(128).await?;
     let pending = raw
         .request(
             OUTPUT_PATH,
@@ -496,24 +561,44 @@ async fn completed_short_output_keeps_its_quota_while_h2_retains_data_after_body
         .await?;
     let (mut send, response) = pending.streaming_response().await?;
     ensure!(response.headers().get("grpc-status").is_none());
-    driver.probe.exited.wait().await?;
-    response_probe.completed.wait().await?;
-    response_probe.dropped.wait().await?;
+    driver
+        .probe
+        .exited
+        .wait()
+        .await
+        .context("driver did not exit")?;
+    response_probe
+        .completed
+        .wait()
+        .await
+        .context("encoded response did not include completion")?;
     ensure!(driver.probe.live.load(Ordering::Acquire) == 0);
     ensure!(response_probe.retained_data() > 0);
     let mut body = response.into_body();
     let prefix = tokio::time::timeout(TEST_WAIT, body.data())
         .await?
-        .context("one-byte response prefix missing")??;
-    ensure!(prefix.len() == 1);
-    full(&fixture).await?;
+        .context("response prefix missing")??;
+    ensure!(!prefix.is_empty() && prefix.len() <= 128);
+    full(&fixture)
+        .await
+        .context("second response was not rejected")?;
     ensure!(driver.probe.calls() == 1 && response_probe.retained_data() > 0);
     send.send_reset(h2::Reason::CANCEL);
     drop(prefix);
     drop(body);
     drop(send);
-    response_probe.wait_data_released().await?;
-    healthy(&fixture).await?;
+    response_probe
+        .dropped
+        .wait()
+        .await
+        .context("encoded response body was not dropped after reset")?;
+    response_probe
+        .wait_data_released()
+        .await
+        .context("encoded response DATA was not released after reset")?;
+    healthy(&fixture)
+        .await
+        .context("replacement response could not start after reset")?;
     ensure!(driver.probe.calls() == 2);
     drop(raw);
     fixture.close().await
@@ -564,7 +649,9 @@ async fn grpc_timeout_remains_active_after_output_response_headers() -> anyhow::
                         ensure!(chunk.item == Some(output_value(&Value::integer(7))));
                         chunks += 1;
                     }
-                    Event::Completed(_) => bail!("pending driver completed before grpc-timeout"),
+                    Event::Completed(_) | Event::Indeterminate(_) => {
+                        bail!("pending driver settled before grpc-timeout")
+                    }
                 }
             }
         }
@@ -588,6 +675,46 @@ async fn grpc_timeout_remains_active_after_output_response_headers() -> anyhow::
     drop(send);
     healthy(&fixture).await?;
     ensure!(driver.probe.calls() == 2);
+    drop(raw);
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn grpc_timeout_uses_the_gateway_clock_domain_and_keeps_ingress_expiry() -> anyhow::Result<()>
+{
+    let driver = OutputDriver::new(Plan::Wait)?;
+    let host = HostRuntime::new(
+        Arc::new(PausedHostClock(Instant::now())),
+        Arc::new(TokioTestTasks),
+        Arc::new(TokioBlockingSpawner::default()),
+    );
+    let fixture = Fixture::with_effect_and_host_runtime(
+        ApplicationGrpcConfig::default(),
+        EffectOptions::stream(driver.clone(), Purity::Pure),
+        host,
+    )
+    .await?;
+    let raw = fixture.raw().await?;
+    let response = raw
+        .request_with_headers(
+            OUTPUT_PATH,
+            encode_frames(&[submission(Value::null())])?,
+            true,
+            &[("grpc-timeout", "1S")],
+        )
+        .await?
+        .response()
+        .await?;
+    ensure!(response.code == Code::DeadlineExceeded);
+    let mut events = response.frames::<pb::SubmitOutputResponse>()?.into_iter();
+    accepted(events.next().and_then(|message| message.event))?;
+    let Some(Event::Chunk(chunk)) = events.next().and_then(|message| message.event) else {
+        bail!("custom-clock submission did not start before RPC expiry");
+    };
+    ensure!(chunk.item == Some(output_value(&Value::integer(7))));
+    ensure!(events.next().is_none());
+    driver.probe.exited.wait().await?;
+    ensure!(driver.probe.live.load(Ordering::Acquire) == 0);
     drop(raw);
     fixture.close().await
 }
@@ -779,6 +906,13 @@ async fn gateway_and_kernel_idempotency_replay_only_cached_final_outcomes() -> a
             });
         }
         let mut client = fixture.client().await?;
+        if gateway_key {
+            submitted
+                .options
+                .as_mut()
+                .context("options missing")?
+                .expected_request_scope = Some(fixture.request_scope(&mut client).await?);
+        }
         let mut first = start(&mut client, submitted.clone()).await?;
         let original = accepted(next(&mut first).await?)?;
         ensure!(matches!(next(&mut first).await?, Some(Event::Chunk(_))));
@@ -811,6 +945,88 @@ async fn gateway_and_kernel_idempotency_replay_only_cached_final_outcomes() -> a
         }
         ensure!(next(&mut replay).await?.is_none());
         ensure!(driver.probe.calls() == 1);
+        fixture.close().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn original_request_scope_rejects_retries_after_profile_replacement_before_effects()
+-> anyhow::Result<()> {
+    for token in [false, true] {
+        let driver = OutputDriver::new(Plan::Bytes { count: 1, size: 13 })?;
+        let fixture = Fixture::with_effect(
+            ApplicationGrpcConfig::default(),
+            EffectOptions::stream(driver.clone(), Purity::Pure),
+            None,
+        )
+        .await?;
+        let mut client = fixture.client().await?;
+        let original_scope = fixture.request_scope(&mut client).await?;
+        let mut submitted = submission(Value::null());
+        submitted.options = Some(pb::SubmitOptions {
+            idempotency_key: (!token).then(|| "scope-bound-key".into()),
+            submission_token: token.then(|| "scope-bound-token".into()),
+            expected_request_scope: Some(original_scope.clone()),
+            ..Default::default()
+        });
+        let mut first = start(&mut client, submitted.clone()).await?;
+        ensure!(matches!(next(&mut first).await?, Some(Event::Accepted(_))));
+        ensure!(matches!(next(&mut first).await?, Some(Event::Chunk(_))));
+        ensure!(matches!(next(&mut first).await?, Some(Event::Completed(_))));
+        ensure!(next(&mut first).await?.is_none());
+        ensure!(driver.probe.calls() == 1);
+        drop(first);
+
+        let session = fixture
+            .gateway
+            .authenticate(PresentedCredential::bearer(TOKEN))
+            .await?;
+        let original = fixture.gateway.describe(&session)?;
+        let target = original
+            .surfaces
+            .first()
+            .context("surface missing")?
+            .target
+            .clone();
+        let replacement = GatewayProfile::new("application-test")
+            .with_revision(original.profile_rev + 1)
+            .with_bearer_identity("alice-credential", "alice", TOKEN, "identity://alice")?
+            .with_registered_host(&fixture.authority())?
+            .with_surface(GatewaySurface::effect_invoke("echo", target))
+            .with_principal_surface_binding(GatewayPrincipalSurfaceBinding::allow(
+                "alice",
+                ["echo"],
+                ["perform://effect/echo/say"],
+            ));
+        fixture.gateway.replace_profile(replacement)?;
+        ensure!(fixture.request_scope(&mut client).await? != original_scope);
+
+        let error = start(&mut client, submitted)
+            .await
+            .err()
+            .context("stale request scope was accepted")?;
+        ensure!(
+            error
+                .downcast_ref::<tonic::Status>()
+                .is_some_and(|status| { status.code() == Code::InvalidArgument }),
+            "stale request scope rejection: {error:?}"
+        );
+        ensure!(driver.probe.calls() == 1);
+
+        let mut ordinary = start(&mut client, submission(Value::null())).await?;
+        ensure!(matches!(
+            next(&mut ordinary).await?,
+            Some(Event::Accepted(_))
+        ));
+        ensure!(matches!(next(&mut ordinary).await?, Some(Event::Chunk(_))));
+        ensure!(matches!(
+            next(&mut ordinary).await?,
+            Some(Event::Completed(_))
+        ));
+        ensure!(next(&mut ordinary).await?.is_none());
+        ensure!(driver.probe.calls() == 2);
+        drop(ordinary);
         fixture.close().await?;
     }
     Ok(())
@@ -864,6 +1080,9 @@ async fn swallowed_schema_rejection_cannot_leak_invalid_output_or_report_success
                     ));
                     failed = true;
                 }
+                Event::Indeterminate(terminal) => {
+                    bail!("schema rejection lost a determinate outcome: {terminal:?}")
+                }
             },
             Ok(None) => break,
             Err(status) => {
@@ -904,20 +1123,22 @@ async fn oversized_output_value_or_taint_fails_conversion_and_releases_response_
         let mut output = start(&mut client, submission(Value::null())).await?;
         loop {
             match tokio::time::timeout(TEST_WAIT, output.message()).await? {
-                Ok(Some(message)) => ensure!(
-                    matches!(message.event, Some(Event::Accepted(_))),
-                    "{plan:?} escaped its encoding bound"
-                ),
-                Ok(None) => bail!("{plan:?} completed without an encoding error"),
+                Ok(Some(message)) => match message.event {
+                    Some(Event::Accepted(_)) => {}
+                    Some(Event::Indeterminate(terminal)) => {
+                        ensure!(terminal.reason_code == "response_encoding_failed");
+                        ensure!(terminal.unresolved_operations.is_some());
+                        break;
+                    }
+                    other => bail!("{plan:?} escaped its encoding bound: {other:?}"),
+                },
+                Ok(None) => bail!("{plan:?} completed without an indeterminate terminal"),
                 Err(status) => {
-                    ensure!(
-                        status.code() == Code::ResourceExhausted,
-                        "{plan:?}: {status}"
-                    );
-                    break;
+                    bail!("{plan:?} lost reconciliation evidence: {status}");
                 }
             }
         }
+        ensure!(output.message().await?.is_none());
         driver.probe.exited.wait().await?;
         ensure!(driver.probe.live.load(Ordering::Acquire) == 0);
         drop(output);
@@ -957,6 +1178,11 @@ async fn reset_during_receipt_consumption_cannot_start_output_driver() -> anyhow
         let submitted = pb::SubmitRequest {
             payload: uploaded.item,
             provenance: uploaded.provenance,
+            options: Some(pb::SubmitOptions {
+                idempotency_key: Some("receipt-consumption-reset".into()),
+                expected_request_scope: Some(fixture.request_scope(&mut client).await?),
+                ..Default::default()
+            }),
             ..submission(Value::null())
         };
         let raw = fixture.raw().await?;

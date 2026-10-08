@@ -9,7 +9,9 @@ use xolotl_core::{
     LinkedProgram, Request, Task,
 };
 use xolotl_graph::portable::{CompiledProgram, Expression as E, Import, Program, Transform};
-use xolotl_kernel::{Bootstrap, LinkedExecution, PendingCall, PreparedProgram, RequestDriver};
+use xolotl_kernel::{
+    Bootstrap, KernelBuilder, LinkedExecution, PendingCall, PreparedProgram, RequestDriver,
+};
 use xolotl_types::{
     ExecutionOutput, IdentityRef, Outcome, TaintedFailure, TaintedValue, ValueIdentity,
 };
@@ -29,7 +31,9 @@ impl ProgramCase {
         Ok(Self {
             hosted: PreparedProgram::new(&compiled)?,
             portable: compiled.with_provenance(),
-            boot: Bootstrap::in_memory(),
+            boot: Bootstrap::from_kernel(
+                KernelBuilder::new(xolotl_state::InMemoryBackend::new().into_backend()).build(),
+            ),
         })
     }
 
@@ -37,8 +41,8 @@ impl ProgramCase {
         let (input, identity) = input(config)?;
         let output = self
             .boot
-            .kernel
-            .executor_for(self.boot.root)
+            .kernel()
+            .executor_for(self.boot.root())
             .eval_prepared(&self.hosted, input)
             .await;
         complete(output, identity)
@@ -73,17 +77,18 @@ impl ProgramCase {
                     bindings_per_task: 0,
                     max_steps: None,
                     cleanup_steps: 64,
-                    durable: false,
                 },
                 input,
                 IdentityRef::ROOT.get(),
             )?;
+            let mut unresolved = xolotl_types::UnresolvedOperations::default();
             let output = LinkedExecution::new(
                 machine,
                 &linked,
                 &mut handles,
                 &driver,
                 &mut pending,
+                &mut unresolved,
                 NonZeroU32::MIN.saturating_add(63),
             )?
             .await;
@@ -120,9 +125,16 @@ fn complete(output: ExecutionOutput, identity: ValueIdentity) -> anyhow::Result<
 struct Transforms<'a>(&'a [Import]);
 impl RequestDriver for Transforms<'_> {
     type Call<'a>
-        = Ready<HostEvent<TaintedValue, TaintedFailure>>
+        = Ready<xolotl_kernel::RequestCompletion>
     where
         Self: 'a;
+    fn collect_evidence<'a>(
+        &'a self,
+        _call: &Self::Call<'a>,
+        _completion: Option<&xolotl_kernel::RequestCompletion>,
+        _unresolved: &mut xolotl_types::UnresolvedOperations,
+    ) {
+    }
     fn call(&self, resource: u32, request: Request<TaintedValue>) -> Self::Call<'_> {
         let result = match self.0.get(resource as usize) {
             Some(Import::Transform(transform)) => transform.apply(request.input.value),
@@ -131,9 +143,9 @@ impl RequestDriver for Transforms<'_> {
                 "unexpected portable import",
             )),
         };
-        ready(HostEvent::Complete(match result {
+        ready(Ok(HostEvent::Complete(match result {
             Ok(value) => Ok(TaintedValue::new(value, request.input.taint)),
             Err(error) => Err(TaintedFailure::new(error, request.input.taint)),
-        }))
+        })))
     }
 }

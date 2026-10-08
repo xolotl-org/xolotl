@@ -18,11 +18,19 @@ pub const SOURCE_VERSION: u32 = 1;
 /// Hosts may raise these for larger modules; instruction addresses still use `u32`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompileLimits {
-    /// Maximum bytes accepted by [`Program::from_json_with_limits`].
+    /// Maximum raw JSON source bytes on decode. Structural validation also
+    /// rejects a resident program whose node, reference edge, and resident
+    /// payload/metadata byte lower bound
+    /// exceeds this limit; hosts admitting a Rust-built program must measure
+    /// its compact JSON size separately before execution.
     pub source_bytes: usize,
-    /// Maximum resident instructions in the compiled module.
+    /// Maximum resident instructions in the compiled module, including
+    /// compiler-emitted instructions. Capacity is reserved before converting
+    /// constants, copying instruction payloads, or registering their imports.
+    /// Rejection discards the compiler and its reservations and emits no image.
     pub instructions: usize,
-    /// Maximum nesting of the Rust expression tree during lowering.
+    /// Maximum admitted nesting of the Rust expression tree. Lowering uses
+    /// explicit frames rather than native recursion.
     /// The JSON parser independently enforces its decode recursion limit.
     pub expression_depth: usize,
 }
@@ -48,19 +56,15 @@ pub struct Program {
     /// Named subprograms, sharing input and output conventions with the entry.
     #[serde(default)]
     pub functions: BTreeMap<String, Expression>,
-    /// Require a host with persistent execution barriers.
-    #[serde(default)]
-    pub durable: bool,
 }
 
 impl Program {
-    /// Construct a volatile program with no named functions.
+    /// Construct a program with no named functions.
     pub fn new(body: Expression) -> Self {
         Self {
             version: SOURCE_VERSION,
             body,
             functions: BTreeMap::new(),
-            durable: false,
         }
     }
 
@@ -77,7 +81,10 @@ impl Program {
         if source.len() > limits.source_bytes {
             return Err(CompileError::Capacity);
         }
-        serde_json::from_slice(source).map_err(|error| CompileError::Encoding(error.to_string()))
+        let program: Self = serde_json::from_slice(source)
+            .map_err(|error| CompileError::Encoding(error.to_string()))?;
+        program.validate_structure_with_limits(limits)?;
+        Ok(program)
     }
 
     /// Resolve lexical slots and functions into an immutable instruction image.
@@ -94,9 +101,11 @@ impl Program {
         if self.version != SOURCE_VERSION {
             return Err(CompileError::Version(self.version));
         }
+        self.validate_structure_with_limits(limits)?;
         let mut compiler = Compiler {
             limits,
             nodes: Vec::new(),
+            reserved: 0,
             imports: Vec::new(),
             bindings: 0,
             live_bindings: 0,
@@ -108,33 +117,29 @@ impl Program {
         for (name, body) in &self.functions {
             compiler.names.clear();
             let address = compiler.lower(body, 0)?;
-            compiler.functions.insert(name.clone(), address);
+            compiler.functions.insert(name.as_str(), address);
         }
         for (node, name) in &compiler.calls {
             let entry = *compiler
                 .functions
                 .get(name)
-                .ok_or_else(|| CompileError::Function(name.clone()))?;
+                .ok_or_else(|| CompileError::Function(name.to_string()))?;
             compiler.nodes[*node as usize].kind = NodeKind::Call(entry);
         }
-        let hash = crate::fingerprint::image(
-            &compiler.nodes,
-            &compiler.imports,
-            entry,
-            compiler.bindings,
-            self.durable,
-        )
-        .map_err(|error| CompileError::Encoding(error.to_string()))?;
+        let hash =
+            crate::fingerprint::image(&compiler.nodes, &compiler.imports, entry, compiler.bindings)
+                .map_err(|error| CompileError::Encoding(error.to_string()))?;
         Ok(CompiledProgram {
             nodes: compiler.nodes,
             imports: compiler.imports,
             entry,
             bindings: compiler.bindings,
             hash,
-            durable: self.durable,
         })
     }
 }
+
+mod shape;
 
 /// Minimal portable source algebra. Higher-level agent patterns compose these.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -258,6 +263,100 @@ pub enum Expression {
     },
 }
 
+impl crate::source_release::SourceTree for Expression {
+    fn has_children(&self) -> bool {
+        match self {
+            Self::Sequence { steps } => !steps.is_empty(),
+            Self::Let { .. }
+            | Self::If { .. }
+            | Self::While { .. }
+            | Self::Parallel { .. }
+            | Self::Race { .. }
+            | Self::Catch { .. }
+            | Self::Finally { .. }
+            | Self::Acting { .. } => true,
+            Self::Literal { .. }
+            | Self::Constant { .. }
+            | Self::Input
+            | Self::Use { .. }
+            | Self::Invoke { .. }
+            | Self::Transform { .. }
+            | Self::Call { .. }
+            | Self::Module { .. }
+            | Self::Wait { .. }
+            | Self::Fail { .. } => false,
+        }
+    }
+
+    fn empty() -> Self {
+        Self::Input
+    }
+
+    fn detach_children(&mut self, pending: &mut Vec<Self>) {
+        use crate::source_release::detach;
+        match self {
+            Self::Literal { value } => crate::source_release::release_json(value),
+            Self::Sequence { .. } => {}
+            Self::Let { value, body, .. } => {
+                detach(value.as_mut(), pending);
+                detach(body.as_mut(), pending);
+            }
+            Self::If { condition, yes, no } => {
+                detach(condition.as_mut(), pending);
+                detach(yes.as_mut(), pending);
+                detach(no.as_mut(), pending);
+            }
+            Self::While {
+                condition, body, ..
+            } => {
+                detach(condition.as_mut(), pending);
+                detach(body.as_mut(), pending);
+            }
+            Self::Parallel { left, right } | Self::Race { left, right } => {
+                detach(left.as_mut(), pending);
+                detach(right.as_mut(), pending);
+            }
+            Self::Catch { body, recover } => {
+                detach(body.as_mut(), pending);
+                detach(recover.as_mut(), pending);
+            }
+            Self::Finally { body, cleanup } => {
+                detach(body.as_mut(), pending);
+                detach(cleanup.as_mut(), pending);
+            }
+            Self::Acting { body, .. } => detach(body.as_mut(), pending),
+            Self::Constant { .. }
+            | Self::Input
+            | Self::Use { .. }
+            | Self::Invoke { .. }
+            | Self::Transform { .. }
+            | Self::Call { .. }
+            | Self::Module { .. }
+            | Self::Wait { .. }
+            | Self::Fail { .. } => {}
+        }
+    }
+
+    fn take_children(&mut self) -> Option<alloc::vec::IntoIter<Self>> {
+        let Self::Sequence { steps } = self else {
+            return None;
+        };
+        let mut children = core::mem::take(steps);
+        children.retain(crate::source_release::SourceTree::has_children);
+        if children.is_empty() {
+            None
+        } else {
+            Some(children.into_iter())
+        }
+    }
+}
+
+impl Drop for Expression {
+    fn drop(&mut self) {
+        crate::source_release::release(self);
+    }
+}
+
 impl Expression {
     /// Construct a plain JSON constant.
     pub fn literal(value: impl Into<serde_json::Value>) -> Self {
@@ -266,15 +365,14 @@ impl Expression {
         }
     }
     /// Append a stage, keeping fluent sequences flat in the source representation.
-    pub fn then(self, next: Self) -> Self {
-        match self {
-            Self::Sequence { mut steps } => {
-                steps.push(next);
-                Self::Sequence { steps }
+    pub fn then(mut self, next: Self) -> Self {
+        if let Self::Sequence { steps } = &mut self {
+            steps.push(next);
+            self
+        } else {
+            Self::Sequence {
+                steps: vec![self, next],
             }
-            first => Self::Sequence {
-                steps: vec![first, next],
-            },
         }
     }
     /// Pair this expression's result with another concurrent branch.
@@ -397,10 +495,37 @@ pub struct CompiledProgram<V = Value, E = Failure> {
     entry: u32,
     bindings: usize,
     hash: [u8; 32],
-    durable: bool,
 }
 
 impl CompiledProgram<Value> {
+    /// Bind host imports without changing instruction positions or lexical slots.
+    /// Request imports can be replaced by other requests, and identity scopes by
+    /// other scopes. Crossing that boundary is rejected. The resulting artifact
+    /// receives a fingerprint of its effective imports, so dispatch and caches
+    /// cannot confuse different host bindings of the same source.
+    pub fn map_imports(
+        mut self,
+        mut map: impl FnMut(Import) -> Import,
+    ) -> Result<Self, CompileError> {
+        self.imports = self
+            .imports
+            .into_iter()
+            .map(|import| {
+                let scope = matches!(import, Import::Scope(_));
+                let replacement = map(import);
+                if scope != matches!(replacement, Import::Scope(_)) {
+                    Err(CompileError::ImportKind)
+                } else {
+                    Ok(replacement)
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        self.hash =
+            crate::fingerprint::image(&self.nodes, &self.imports, self.entry, self.bindings)
+                .map_err(|error| CompileError::Encoding(error.to_string()))?;
+        Ok(self)
+    }
+
     /// Move authored constants into the shared runtime provenance model.
     /// Payload buffers, imports, positions and artifact identity are preserved.
     /// The returned image can be executed with `kernel::RuntimeValues` on any host.
@@ -424,7 +549,6 @@ impl CompiledProgram<Value> {
             entry: self.entry,
             bindings: self.bindings,
             hash: self.hash,
-            durable: self.durable,
         }
     }
 }
@@ -450,7 +574,6 @@ impl<V, E> CompiledProgram<V, E> {
             entry: self.entry,
             bindings: self.bindings,
             imports: self.imports.len(),
-            durable: self.durable,
         }
     }
 
@@ -464,6 +587,9 @@ impl<V, E> CompiledProgram<V, E> {
 /// Source validation or compilation failure, before any host effects are dispatched.
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
+    /// A host import rewrite crossed the request/identity-scope boundary.
+    #[error("host import rewrite changed request/scope semantics")]
+    ImportKind,
     /// Unsupported source version.
     #[error("unsupported portable program version {0}")]
     Version(u32),
@@ -481,20 +607,77 @@ pub enum CompileError {
     Encoding(String),
 }
 
-struct Compiler {
+struct Compiler<'source> {
     limits: CompileLimits,
     nodes: Vec<Node<Value, Failure>>,
+    reserved: usize,
     imports: Vec<Import>,
     bindings: usize,
     live_bindings: usize,
-    names: BTreeMap<String, u32>,
-    functions: BTreeMap<String, u32>,
-    calls: Vec<(u32, String)>,
+    names: BTreeMap<&'source str, u32>,
+    functions: BTreeMap<&'source str, u32>,
+    calls: Vec<(u32, &'source str)>,
 }
 
-impl Compiler {
+#[derive(Clone, Copy)]
+struct Lowered {
+    entry: u32,
+    tail: u32,
+}
+
+enum LowerFrame<'a> {
+    Visit(&'a Expression, usize),
+    LetValue {
+        name: &'a str,
+        body: &'a Expression,
+        depth: usize,
+    },
+    LetBody {
+        name: &'a str,
+        slot: u32,
+        value: u32,
+        previous: Option<u32>,
+    },
+    Sequence {
+        remaining: core::iter::Rev<core::slice::Iter<'a, Expression>>,
+        suffix: Option<Lowered>,
+        depth: usize,
+    },
+    Composite {
+        expression: &'a Expression,
+        entries: [u32; 3],
+        completed: usize,
+        depth: usize,
+    },
+    Scope(u32),
+}
+
+fn lower_children(expression: &Expression) -> [Option<&Expression>; 3] {
+    match expression {
+        Expression::If { condition, yes, no } => [Some(condition), Some(yes), Some(no)],
+        Expression::While {
+            condition, body, ..
+        } => [Some(condition), Some(body), None],
+        Expression::Parallel { left, right } | Expression::Race { left, right } => {
+            [Some(left), Some(right), None]
+        }
+        Expression::Catch { body, recover } => [Some(body), Some(recover), None],
+        Expression::Finally { body, cleanup } => [Some(body), Some(cleanup), None],
+        _ => [None; 3],
+    }
+}
+
+impl<'source> Compiler<'source> {
+    fn reserve_instruction(&mut self) -> Result<(), CompileError> {
+        if self.reserved >= self.limits.instructions {
+            return Err(CompileError::Capacity);
+        }
+        u32::try_from(self.reserved).map_err(|_error| CompileError::Capacity)?;
+        self.reserved = self.reserved.checked_add(1).ok_or(CompileError::Capacity)?;
+        Ok(())
+    }
     fn push(&mut self, kind: NodeKind<Value, Failure>) -> Result<u32, CompileError> {
-        if self.nodes.len() >= self.limits.instructions {
+        if self.nodes.len() >= self.reserved {
             return Err(CompileError::Capacity);
         }
         let index = u32::try_from(self.nodes.len()).map_err(|_error| CompileError::Capacity)?;
@@ -502,16 +685,204 @@ impl Compiler {
         Ok(index)
     }
     fn import(&mut self, import: Import) -> Result<u32, CompileError> {
+        #[cfg(test)]
+        tests::record_import();
         let index = u32::try_from(self.imports.len()).map_err(|_error| CompileError::Capacity)?;
         self.imports.push(import);
         Ok(index)
     }
-    fn lower(&mut self, expression: &Expression, depth: usize) -> Result<u32, CompileError> {
-        if depth > self.limits.expression_depth {
-            return Err(CompileError::Capacity);
+    fn lower(
+        &mut self,
+        expression: &'source Expression,
+        depth: usize,
+    ) -> Result<u32, CompileError> {
+        let mut frames = Vec::new();
+        let mut current = Some((expression, depth));
+        let mut result = Lowered { entry: 0, tail: 0 };
+        while let Some(frame) = current
+            .take()
+            .map(|(expression, depth)| LowerFrame::Visit(expression, depth))
+            .or_else(|| frames.pop())
+        {
+            let kind = match frame {
+                LowerFrame::Visit(expression, depth) => {
+                    if depth > self.limits.expression_depth {
+                        return Err(CompileError::Capacity);
+                    }
+                    let depth = depth.checked_add(1).ok_or(CompileError::Capacity)?;
+                    if !matches!(expression, Expression::Sequence { steps } if !steps.is_empty()) {
+                        self.reserve_instruction()?;
+                    }
+                    match expression {
+                        Expression::Let { name, value, body } => {
+                            frames.push(LowerFrame::LetValue { name, body, depth });
+                            current = Some((value.as_ref(), depth));
+                            continue;
+                        }
+                        Expression::Sequence { steps } => {
+                            let mut remaining = steps.iter().rev();
+                            if let Some(step) = remaining.next() {
+                                if remaining.len() != 0 {
+                                    frames.push(LowerFrame::Sequence {
+                                        remaining,
+                                        suffix: None,
+                                        depth,
+                                    });
+                                }
+                                current = Some((step, depth));
+                                continue;
+                            }
+                            NodeKind::Input
+                        }
+                        Expression::Acting { identity, body } => {
+                            let import = self.import(Import::Scope(identity.clone()))?;
+                            frames.push(LowerFrame::Scope(import));
+                            current = Some((body.as_ref(), depth));
+                            continue;
+                        }
+                        Expression::If { .. }
+                        | Expression::While { .. }
+                        | Expression::Parallel { .. }
+                        | Expression::Race { .. }
+                        | Expression::Catch { .. }
+                        | Expression::Finally { .. } => {
+                            let Some(child) = lower_children(expression)[0] else {
+                                return Err(CompileError::Capacity);
+                            };
+                            frames.push(LowerFrame::Composite {
+                                expression,
+                                entries: [0; 3],
+                                completed: 0,
+                                depth,
+                            });
+                            current = Some((child, depth));
+                            continue;
+                        }
+                        _ => self.lower_leaf(expression)?,
+                    }
+                }
+                LowerFrame::LetValue { name, body, depth } => {
+                    let slot = u32::try_from(self.live_bindings)
+                        .map_err(|_error| CompileError::Capacity)?;
+                    self.live_bindings += 1;
+                    self.bindings = self.bindings.max(self.live_bindings);
+                    let previous = self.names.insert(name, slot);
+                    frames.push(LowerFrame::LetBody {
+                        name,
+                        slot,
+                        value: result.entry,
+                        previous,
+                    });
+                    current = Some((body, depth));
+                    continue;
+                }
+                LowerFrame::LetBody {
+                    name,
+                    slot,
+                    value,
+                    previous,
+                } => {
+                    self.live_bindings -= 1;
+                    match previous {
+                        Some(old) => {
+                            self.names.insert(name, old);
+                        }
+                        None => {
+                            self.names.remove(name);
+                        }
+                    }
+                    NodeKind::Let {
+                        slot,
+                        value,
+                        body: result.entry,
+                    }
+                }
+                LowerFrame::Sequence {
+                    mut remaining,
+                    suffix,
+                    depth,
+                } => {
+                    if let Some(suffix) = suffix {
+                        self.nodes[result.tail as usize].next = Some(suffix.entry);
+                        result.tail = suffix.tail;
+                    }
+                    if let Some(step) = remaining.next() {
+                        frames.push(LowerFrame::Sequence {
+                            remaining,
+                            suffix: Some(result),
+                            depth,
+                        });
+                        current = Some((step, depth));
+                    }
+                    continue;
+                }
+                LowerFrame::Composite {
+                    expression,
+                    mut entries,
+                    completed,
+                    depth,
+                } => {
+                    entries[completed] = result.entry;
+                    let completed = completed + 1;
+                    if let Some(Some(child)) = lower_children(expression).get(completed) {
+                        frames.push(LowerFrame::Composite {
+                            expression,
+                            entries,
+                            completed,
+                            depth,
+                        });
+                        current = Some((*child, depth));
+                        continue;
+                    }
+                    match expression {
+                        Expression::If { .. } => NodeKind::Branch {
+                            condition: entries[0],
+                            yes: entries[1],
+                            no: entries[2],
+                        },
+                        Expression::While { max_iterations, .. } => NodeKind::While {
+                            condition: entries[0],
+                            body: entries[1],
+                            max: *max_iterations,
+                        },
+                        Expression::Parallel { .. } | Expression::Race { .. } => NodeKind::Fork {
+                            left: entries[0],
+                            right: entries[1],
+                            join: if matches!(expression, Expression::Parallel { .. }) {
+                                xolotl_core::Join::All
+                            } else {
+                                xolotl_core::Join::Race
+                            },
+                        },
+                        Expression::Catch { .. } => NodeKind::Catch {
+                            body: entries[0],
+                            recover: entries[1],
+                        },
+                        Expression::Finally { .. } => NodeKind::Finally {
+                            body: entries[0],
+                            cleanup: entries[1],
+                        },
+                        _ => return Err(CompileError::Capacity),
+                    }
+                }
+                LowerFrame::Scope(import) => NodeKind::Scope {
+                    import,
+                    body: result.entry,
+                },
+            };
+            let entry = self.push(kind)?;
+            result = Lowered { entry, tail: entry };
         }
-        let depth = depth + 1;
-        let kind = match expression {
+        Ok(result.entry)
+    }
+
+    fn lower_leaf(
+        &mut self,
+        expression: &'source Expression,
+    ) -> Result<NodeKind<Value, Failure>, CompileError> {
+        #[cfg(test)]
+        tests::record_leaf();
+        Ok(match expression {
             Expression::Literal { value } => NodeKind::Literal(
                 json_value(value).map_err(|error| CompileError::Encoding(error.to_string()))?,
             ),
@@ -520,7 +891,7 @@ impl Compiler {
             Expression::Use { name } => NodeKind::Load(
                 *self
                     .names
-                    .get(name)
+                    .get(name.as_str())
                     .ok_or_else(|| CompileError::Variable(name.clone()))?,
             ),
             Expression::Invoke { operation } => {
@@ -534,95 +905,26 @@ impl Compiler {
             }
             Expression::Fail { message } => NodeKind::Fail(Failure::policy("program", message)),
             Expression::Call { function } => {
-                let index = self.push(NodeKind::Input)?;
-                self.calls.push((index, function.clone()));
-                return Ok(index);
+                let index =
+                    u32::try_from(self.nodes.len()).map_err(|_error| CompileError::Capacity)?;
+                self.calls.push((index, function.as_str()));
+                NodeKind::Input
             }
             Expression::Module { module } => {
                 NodeKind::Request(self.import(Import::Module(module.clone()))?)
             }
-            Expression::Let { name, value, body } => {
-                let value = self.lower(value, depth)?;
-                let slot =
-                    u32::try_from(self.live_bindings).map_err(|_error| CompileError::Capacity)?;
-                self.live_bindings += 1;
-                self.bindings = self.bindings.max(self.live_bindings);
-                let previous = self.names.insert(name.clone(), slot);
-                let body = self.lower(body, depth)?;
-                self.live_bindings -= 1;
-                match previous {
-                    Some(old) => {
-                        self.names.insert(name.clone(), old);
-                    }
-                    None => {
-                        self.names.remove(name);
-                    }
-                }
-                NodeKind::Let { slot, value, body }
+            Expression::Let { .. }
+            | Expression::Sequence { .. }
+            | Expression::If { .. }
+            | Expression::While { .. }
+            | Expression::Parallel { .. }
+            | Expression::Race { .. }
+            | Expression::Catch { .. }
+            | Expression::Finally { .. }
+            | Expression::Acting { .. } => {
+                return Err(CompileError::Capacity);
             }
-            Expression::Sequence { steps } => {
-                let mut result = None;
-                // Each child's lexical environment is restored by lower().
-                for step in steps.iter().rev() {
-                    let first = self.lower(step, depth)?;
-                    if let Some(then) = result {
-                        let mut last = first;
-                        while let Some(next) = self.nodes[last as usize].next {
-                            last = next;
-                        }
-                        self.nodes[last as usize].next = Some(then);
-                    }
-                    result = Some(first);
-                }
-                return match result {
-                    Some(entry) => Ok(entry),
-                    None => self.push(NodeKind::Input),
-                };
-            }
-            Expression::If { condition, yes, no } => {
-                let first = self.lower(condition, depth)?;
-                let yes = self.lower(yes, depth)?;
-                let no = self.lower(no, depth)?;
-                NodeKind::Branch {
-                    condition: first,
-                    yes,
-                    no,
-                }
-            }
-            Expression::While {
-                condition,
-                body,
-                max_iterations,
-            } => NodeKind::While {
-                condition: self.lower(condition, depth)?,
-                body: self.lower(body, depth)?,
-                max: *max_iterations,
-            },
-            Expression::Parallel { left, right } | Expression::Race { left, right } => {
-                NodeKind::Fork {
-                    left: self.lower(left, depth)?,
-                    right: self.lower(right, depth)?,
-                    join: if matches!(expression, Expression::Parallel { .. }) {
-                        xolotl_core::Join::All
-                    } else {
-                        xolotl_core::Join::Race
-                    },
-                }
-            }
-            Expression::Catch { body, recover } => NodeKind::Catch {
-                body: self.lower(body, depth)?,
-                recover: self.lower(recover, depth)?,
-            },
-            Expression::Finally { body, cleanup } => NodeKind::Finally {
-                body: self.lower(body, depth)?,
-                cleanup: self.lower(cleanup, depth)?,
-            },
-            Expression::Acting { identity, body } => NodeKind::Scope {
-                import: self.import(Import::Scope(identity.clone()))?,
-                body: self.lower(body, depth)?,
-            },
-        };
-        self.push(kind)
+        })
     }
 }
 

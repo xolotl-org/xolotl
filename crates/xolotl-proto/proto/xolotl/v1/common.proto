@@ -2,7 +2,8 @@ syntax = "proto3";
 package xolotl.v1;
 
 // Universal addressing type.
-// String form: path://[cluster/]<scheme>/<seg>[/<seg>...]
+// String form: <scheme>://[<seg>[/<seg>...]] for local paths, or
+// path://<cluster>/<scheme>[/<seg>[/<seg>...]] for clustered paths.
 message Path {
   optional string cluster = 1;
   string scheme = 2;
@@ -64,11 +65,13 @@ message ListValue {
 }
 
 message MapValue {
+  // Host code generation must use an ordered map for replay-stable encoding.
   map<string, Value> entries = 1;
 }
 
 // Pointer to large opaque content in blob storage.
 message BlobRef {
+  // Bundled stores use lowercase SHA-384 (96 hexadecimal characters).
   string hash = 1;
   uint64 size = 2;
   optional string mime = 3;
@@ -96,8 +99,16 @@ enum Purity {
   PURITY_EFFECTFUL = 3;
 }
 
+// Host-trusted reconciliation state for an evaluation, independent of whether
+// its final program outcome succeeded. Empty IDs with identities_incomplete
+// still mean an effect may have occurred.
+message UnresolvedOperations {
+  repeated string operation_ids = 1;
+  bool identities_incomplete = 2;
+}
+
 // Lossless domain failure. The selected variant and all its fields are required
-// to preserve recovery decisions; a display string is not its representation.
+// to preserve call semantics; a display string is not its representation.
 message Failure {
   message Marker {}
   message PermissionDenied {
@@ -108,8 +119,8 @@ message Failure {
     string approval_key = 1;
     string reason = 2;
   }
-  message Quarantined {
-    string op_id = 1;
+  message OutcomeUnknown {
+    repeated string operation_ids = 1;
     string reason = 2;
   }
   message ClassifiedError {
@@ -132,13 +143,13 @@ message Failure {
     ApprovalPending approval_pending = 5;
     Marker timeout = 6;
     Marker cancelled = 7;
-    Quarantined quarantined = 8;
     string invalid_input = 9;
     ClassifiedError handler_error = 10;
     Marker kernel_namespace_protected = 11;
     PolicyViolation policy_violation = 12;
     PathInvalid path_invalid = 13;
     ClassifiedError custom = 14;
+    OutcomeUnknown outcome_unknown = 15;
   }
 }
 
@@ -151,12 +162,18 @@ message Outcome {
   }
 }
 
-// Capability literal: <verb>://<scheme>/<segs>[@<predicate>].
+// Capability literal: <verb>://<scheme>/<segs>[#<method>][@<predicate>]
+// for local paths, or <verb>://path://<cluster>/<scheme>/<segs>
+// [#<method>][@<predicate>] for clustered paths.
 message Capability {
   string verb = 1;
   string scheme = 2;
   repeated string segments = 3;
   optional string predicate = 4;
+  // Absent means local, "*" means any clustered path, otherwise exact cluster.
+  optional string cluster = 5;
+  // Stable method name. Absent permits every matching method.
+  optional string method = 6;
 }
 
 message CapSet {

@@ -54,11 +54,11 @@ impl FactLookupResult {
                 if fact.id != query.id
                     || query.process.is_some_and(|process| fact.caller != process) =>
             {
-                Err(FactError(
+                Err(FactError::new(
                     "fact lookup returned a nonmatching record".into(),
                 ))
             }
-            Self::FilteredOut if query.process.is_none() => Err(FactError(
+            Self::FilteredOut if query.process.is_none() => Err(FactError::new(
                 "unfiltered fact lookup returned a filtered result".into(),
             )),
             _ => Ok(()),
@@ -70,7 +70,7 @@ impl FactLookupResult {
         match self {
             Self::Found(fact) => Ok(Some(fact)),
             Self::Missing => Ok(None),
-            Self::FilteredOut => Err(FactError(
+            Self::FilteredOut => Err(FactError::new(
                 "unfiltered fact lookup returned a filtered result".into(),
             )),
         }

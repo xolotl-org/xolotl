@@ -5,7 +5,7 @@ use xolotl_kernel::{FactLookup, FactLookupResult, FactQuery, FactStore};
 use xolotl_state::prelude::*;
 use xolotl_state::test_support::{CollectHistory, CollectState};
 use xolotl_state::{StateEvent, TaintedValue};
-use xolotl_storage_redb::RedbStore;
+use xolotl_storage_redb::{RedbHistory, RedbStore};
 use xolotl_types::{
     BlobRef, DType, DecisionTag, ExecutionId, Fact, FloatBits, FrameKind, HandleId, IdentityRef,
     InvocationId, MethodId, NodeId, OperationId, Path, ProcessId, ReplayClass, ResourceId,
@@ -14,7 +14,7 @@ use xolotl_types::{
 
 fn values() -> Vec<Value> {
     let blob = BlobRef {
-        hash: "0123456789abcdef".repeat(4),
+        hash: "0123456789abcdef".repeat(6),
         size: u64::MAX,
         mime: Some("application/octet-stream".into()),
     };
@@ -97,6 +97,11 @@ fn fact(index: usize, value: Value, taint: TaintSet) -> anyhow::Result<Fact> {
         ),
         schema_version: Fact::SCHEMA_VERSION,
         caller: ProcessId::new(1),
+        caller_identity: match index % 3 {
+            0 => None,
+            1 => Some(IdentityRef::ROOT),
+            _ => Some(IdentityRef::new(u64::MAX)),
+        },
         acting: IdentityRef::ROOT,
         handle: HandleId::new(0, 1),
         resource: ResourceId::new(1),
@@ -120,7 +125,7 @@ async fn state_values_and_history_preserve_every_value_type_after_reopen() -> an
     let prefix = Path::parse("state://codec/values")?;
     let sequence = Path::parse("state://codec/sequence")?;
     {
-        let store = RedbStore::open(&file)?;
+        let store = RedbStore::open_with_history(&file, RedbHistory::Full)?;
         let state = store.state_backend();
         for (index, value) in values.iter().enumerate() {
             state
@@ -131,7 +136,7 @@ async fn state_values_and_history_preserve_every_value_type_after_reopen() -> an
                 .await?;
         }
     }
-    let store = RedbStore::open(&file)?;
+    let store = RedbStore::open_with_history(&file, RedbHistory::Full)?;
     let state = store.state_backend();
     let rows = state.read_prefix_tainted(&prefix).await?;
     ensure!(rows.len() == values.len());
@@ -141,7 +146,10 @@ async fn state_values_and_history_preserve_every_value_type_after_reopen() -> an
     for (index, value) in values.iter().enumerate() {
         let path = value_path(index)?;
         let expected = TaintedValue::new(value.clone(), taint.clone());
-        ensure!(state.read_tainted(&path).await?.as_ref() == Some(&expected));
+        ensure!(
+            state.read_tainted(&path).await?
+                == xolotl_state::StateObservation::from(expected.clone())
+        );
         ensure!(rows[index] == (path.clone(), expected));
         ensure!(matches!(
             &history[index].event,
@@ -155,7 +163,8 @@ async fn state_values_and_history_preserve_every_value_type_after_reopen() -> an
         ));
     }
     ensure!(
-        state.read_tainted(&sequence).await? == Some(TaintedValue::new(Value::list(values), taint))
+        state.read_tainted(&sequence).await?
+            == xolotl_state::StateObservation::from(TaintedValue::new(Value::list(values), taint))
     );
     state.write_delete(&sequence).await?;
     let history = state.read_range(&sequence, 0, i64::MAX).await?;
@@ -197,7 +206,10 @@ async fn compare_and_set_distinguishes_bytes_from_lists_after_reopen() -> anyhow
     state
         .write_cas_tainted(&path, Some(bytes), replacement.clone(), taint.clone())
         .await?;
-    ensure!(state.read_tainted(&path).await? == Some(TaintedValue::new(replacement, taint)));
+    ensure!(
+        state.read_tainted(&path).await?
+            == xolotl_state::StateObservation::from(TaintedValue::new(replacement, taint))
+    );
     Ok(())
 }
 

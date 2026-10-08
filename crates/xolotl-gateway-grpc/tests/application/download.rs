@@ -193,7 +193,7 @@ async fn cumulative_download_and_resumed_ranges_preserve_bytes_and_provenance() 
 async fn high_u64_ranges_and_small_frames_keep_exact_offsets() -> anyhow::Result<()> {
     let metadata = ObjectMetadata {
         blob: BlobRef {
-            hash: "a".repeat(64),
+            hash: "a".repeat(96),
             size: u64::MAX,
             mime: None,
         },

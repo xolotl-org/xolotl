@@ -1,5 +1,6 @@
 use super::{TensorDriver, encode::Encoding};
 use anyhow::{Context, Result, bail, ensure};
+use sha2::{Digest as _, Sha384};
 use std::collections::BTreeMap;
 use std::future::{Ready, ready};
 use std::sync::{
@@ -16,6 +17,10 @@ use xolotl_types::{
     DType, FloatBits, IdentityRef, MethodId, Outcome, OutputMode, ProcessId, TaintSet, TaintSource,
     TensorRef, Value,
 };
+
+fn content_digest(bytes: &[u8]) -> String {
+    xolotl_types::BlobRef::sha384_hex(&Sha384::digest(bytes).into())
+}
 
 fn context() -> DriverContext {
     DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
@@ -92,7 +97,7 @@ impl Fixture {
     }
 
     async fn check_bytes(&self, tensor: &TensorRef, expected: &[u8]) -> Result<()> {
-        ensure!(tensor.blob.hash == blake3::hash(expected).to_hex().as_str());
+        ensure!(tensor.blob.hash == content_digest(expected));
         ensure!(tensor.blob.size == expected.len() as u64);
         ensure!(tensor.blob.mime.as_deref() == Some("application/x-xolotl-tensor"));
         let metadata = self
@@ -121,16 +126,21 @@ impl Fixture {
             }
         }
         ensure!(offset == expected.len());
-        self.check_no_staging()
+        self.check_no_staging().await
     }
 
-    fn check_no_staging(&self) -> Result<()> {
+    async fn check_no_staging(&self) -> Result<()> {
         ensure!(self.files.pending_uploads() == 0);
-        ensure!(
-            std::fs::read_dir(self.directory.path().join("staging"))?
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while std::fs::read_dir(self.directory.path().join("staging"))?
                 .next()
-                .is_none()
-        );
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
         Ok(())
     }
 }
@@ -743,7 +753,7 @@ async fn invalid_later_chunk_releases_unpublished_staging() -> Result<()> {
         )
         .await;
     failure_message(result)?;
-    fixture.check_no_staging()?;
+    fixture.check_no_staging().await?;
     ensure!(
         std::fs::read_dir(fixture.directory.path().join("objects"))?
             .next()

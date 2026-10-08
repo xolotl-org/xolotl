@@ -1,0 +1,20 @@
+[package]
+name = "xolotl-source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Source event atomic commit and private evidence contracts"
+
+[lints]
+workspace = true
+
+[dependencies]
+xolotl-types.workspace = true
+serde = { workspace = true, default-features = false, features = ["derive", "alloc"] }
+
+[dev-dependencies]
+anyhow.workspace = true
+serde_json.workspace = true

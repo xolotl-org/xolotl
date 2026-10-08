@@ -1,24 +1,17 @@
-//! Terminal provider: `effect://terminal/run`.
-//!
-//! Safety: **never** goes through a shell — input is `command +
-//! Vec<String>` args, executed directly. These checks gate every run:
-//!
-//! - the kernel must have granted `effect://terminal/run` before the driver is
-//!   reached;
-//! - the command must be on the allowlist and off the denylist;
-//! - known destructive commands require `approved: true`.
-//!
-//! `run` is `Effectful` → `NonIdempotentEffect`. Process finalize sends SIGTERM
-//! then SIGKILL; this one-shot run records the command result.
+//! Shell-free `effect://terminal/run`, authorized by Kernel grants and host allow/deny lists.
+//! Cancellation is not rollback: a spawned command may already have performed effects.
+//! The host owns admission and cleanup through [`TerminalRuntime`], independently of Proc State.
 
 use async_trait::async_trait;
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Child;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use xolotl_kernel::{Driver, DriverContext, DriverError, DriverOutput, MethodSpec};
-use xolotl_types::{MethodId, Outcome, OutputMode, Purity, Value};
+use xolotl_types::{MethodId, OperationId, Outcome, OutputMode, Purity, Value};
 use xolotl_types::{ValueMap, ValueView};
 
 const DEFAULT_TERMINAL_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -30,6 +23,7 @@ const HARD_TERMINAL_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 /// after standard installation.
 pub(crate) const TERMINAL_METHODS: &[MethodSpec] = &[MethodSpec::new(
     "run",
+    xolotl_types::MethodAuthority::Perform,
     Purity::Effectful,
     MethodSpec::UNARY_ASYNC,
 )];
@@ -39,70 +33,184 @@ pub(crate) const TERMINAL_METHODS: &[MethodSpec] = &[MethodSpec::new(
 pub(crate) const DEFAULT_DENYLIST: &[&str] =
     &["sudo", "su", "doas", "chroot", "nc", "ncat", "telnet"];
 
-/// Known-destructive commands that require explicit approval.
-pub(crate) const DEFAULT_HIGH_RISK: &[&str] = &[
-    "rm", "rmdir", "dd", "mkfs", "fdisk", "shutdown", "reboot", "halt", "poweroff", "kill",
-    "killall", "chmod", "chown", "mount", "umount",
-];
-
-/// Drives `effect://terminal/run`. A command must be on the allowlist and off the
-/// denylist; high-risk commands additionally require `approved: true`. Args are
-/// passed verbatim (no shell, no glob/var expansion).
-pub(crate) struct TerminalDriver {
-    allowlist: Vec<String>,
-    denylist: Vec<String>,
-    high_risk: Vec<String>,
+/// Host-owned admission and cleanup domain shared by all installed Terminal drivers.
+///
+/// The default admits 16 concurrent calls. A slot charges one supervisor, its direct
+/// child, and two bounded output buffers (default 1 MiB each, maximum 16 MiB each;
+/// these are not RSS limits). Full admission rejects immediately before spawning.
+/// Slots remain charged through pipe closure and direct-child reaping, even when
+/// callers disappear. One supervisor polls both pipes and the child; there are no
+/// detached reader tasks. The call deadline covers child exit AND pipe EOF.
+/// Timeout results are delivered only after cleanup, so cleanup can exceed that deadline.
+/// Every invocation must supply its originating typed OperationId before spawning.
+/// Admission and spawn rejection are known failures. After successful spawn, timeout,
+/// I/O failure, or close returns OutcomeUnknown with that original identity: killing
+/// and reaping cannot prove absence of command effects. Handled errors still require
+/// reconciliation and never grant replay permission (NonIdempotentEffect).
+///
+/// [`Self::close`] permanently rejects admission and signals cancellation of accepted
+/// calls. [`Self::shutdown`] also waits for their cleanup; concurrent or interrupted
+/// shutdown waiters do not lose ownership. Hosts must keep Tokio running until it
+/// completes. Cancellation, deadline, and close drop pipes, kill and reap the direct
+/// child; `kill_on_drop` is only a runtime-teardown fallback, not a reaping guarantee.
+/// Descendants are not tracked or killed. External effects are never rolled back.
+/// OS reaping failures retain capacity and leave shutdown incomplete until reaping
+/// succeeds; retries back off to one second. The first kill and wait failures are
+/// appended to the call error if cleanup eventually completes. There is no repeated
+/// error logging; a cancelled caller cannot receive these diagnostics.
+#[derive(Clone)]
+pub struct TerminalRuntime {
+    inner: Arc<TerminalRuntimeInner>,
 }
 
-impl TerminalDriver {
-    /// Construct with an allowlist and the built-in denylist / high-risk sets.
-    pub(crate) fn new(allowlist: Vec<String>) -> Self {
+struct TerminalRuntimeInner {
+    admission: parking_lot::Mutex<bool>,
+    slots: Arc<Semaphore>,
+    closed: watch::Sender<bool>,
+    active: watch::Sender<usize>,
+    #[cfg(test)]
+    cleanup_gate: parking_lot::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+}
+
+impl Default for TerminalRuntime {
+    fn default() -> Self {
+        Self::new(NonZeroUsize::MIN.saturating_add(15))
+    }
+}
+
+impl TerminalRuntime {
+    /// Choose a finite host-wide concurrent-call limit. Exhaustion rejects, not queues.
+    ///
+    /// # Panics
+    /// Panics if the limit exceeds [`Semaphore::MAX_PERMITS`].
+    pub fn new(max_concurrent_calls: NonZeroUsize) -> Self {
         Self {
-            allowlist,
-            denylist: DEFAULT_DENYLIST.iter().map(|s| s.to_string()).collect(),
-            high_risk: DEFAULT_HIGH_RISK.iter().map(|s| s.to_string()).collect(),
+            inner: Arc::new(TerminalRuntimeInner {
+                admission: parking_lot::Mutex::new(false),
+                slots: Arc::new(Semaphore::new(max_concurrent_calls.get())),
+                closed: watch::channel(false).0,
+                active: watch::channel(0).0,
+                #[cfg(test)]
+                cleanup_gate: parking_lot::Mutex::new(None),
+            }),
         }
     }
 
-    /// Add commands to the built-in denylist.
+    /// Reject new calls and cancel accepted calls. Idempotent and nonblocking.
+    pub fn close(&self) {
+        let mut closed = self.inner.admission.lock();
+        *closed = true;
+        self.inner.closed.send_replace(true);
+    }
+
+    /// Close admission, then wait for all direct children and supervisors to finish.
+    pub async fn shutdown(&self) {
+        self.close();
+        let mut active = self.inner.active.subscribe();
+        let _finished = active.wait_for(|count| *count == 0).await;
+    }
+
+    fn admit(&self) -> Result<TerminalSlot, DriverError> {
+        let closed = self.inner.admission.lock();
+        if *closed {
+            return Err(DriverError::Other("terminal runtime is closed".into()));
+        }
+        let permit = self
+            .inner
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_error| {
+                DriverError::Other("terminal concurrent call capacity exhausted".into())
+            })?;
+        self.inner.active.send_modify(|count| *count += 1);
+        Ok(TerminalSlot {
+            inner: self.inner.clone(),
+            permit: Some(permit),
+        })
+    }
+
+    async fn run(
+        &self,
+        operation_id: OperationId,
+        cmd: String,
+        args: Vec<String>,
+        max_output_bytes: usize,
+        timeout_ms: u64,
+    ) -> Result<TerminalOutput, DriverError> {
+        let slot = self.admit()?;
+        let closed = self.inner.closed.subscribe();
+        let (mut result, received) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let request = TerminalRequest {
+            operation_id,
+            cmd,
+            args,
+            max_output_bytes,
+            timeout_ms,
+            deadline,
+        };
+        tokio::spawn(async move {
+            let output = supervise_terminal(request, closed, &mut result, &slot).await;
+            drop(slot);
+            let _sent = result.send(output);
+        });
+        received
+            .await
+            .map_err(|_error| DriverError::OutcomeUnknown {
+                operation_id: operation_id.to_string(),
+                reason: "terminal supervisor stopped without a spawn verdict".into(),
+            })?
+    }
+}
+
+struct TerminalSlot {
+    inner: Arc<TerminalRuntimeInner>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for TerminalSlot {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.inner.active.send_modify(|count| *count -= 1);
+    }
+}
+
+/// Drives shell-free commands. Host policy, not caller-provided approval, gates spawn.
+pub(crate) struct TerminalDriver {
+    allowlist: Vec<String>,
+    denylist: Vec<String>,
+    runtime: TerminalRuntime,
+}
+
+impl TerminalDriver {
+    pub(crate) fn new(allowlist: Vec<String>, runtime: TerminalRuntime) -> Self {
+        Self {
+            allowlist,
+            denylist: DEFAULT_DENYLIST
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+            runtime,
+        }
+    }
+
     pub(crate) fn with_denylist(mut self, denylist: Vec<String>) -> Self {
         extend_unique(&mut self.denylist, denylist);
         self
     }
 
-    /// Add commands to the built-in high-risk set.
-    pub(crate) fn with_high_risk(mut self, high_risk: Vec<String>) -> Self {
-        extend_unique(&mut self.high_risk, high_risk);
-        self
-    }
-
-    fn allowed(&self, cmd: &str) -> bool {
-        self.allowlist.iter().any(|c| c == cmd)
-    }
-
-    fn denied(&self, cmd: &str) -> bool {
-        self.denylist.iter().any(|c| command_matches(cmd, c))
-    }
-
-    fn high_risk(&self, cmd: &str) -> bool {
-        self.high_risk.iter().any(|c| command_matches(cmd, c))
-    }
-
-    /// Check whether the command may proceed to spawn.
-    fn gate(&self, cmd: &str, approved: bool) -> Result<(), DriverError> {
-        if self.denied(cmd) {
+    fn gate(&self, cmd: &str) -> Result<(), DriverError> {
+        if self
+            .denylist
+            .iter()
+            .any(|listed| command_matches(cmd, listed))
+        {
             return Err(DriverError::Other(format!("command is denylisted: {cmd}")));
         }
-        // Allowlist check: the command must be explicitly allowed.
-        if !self.allowed(cmd) {
+        if !self.allowlist.iter().any(|listed| listed == cmd) {
             return Err(DriverError::Other(format!(
                 "command not on allowlist: {cmd}"
-            )));
-        }
-        // Approval check: high-risk commands need explicit approval.
-        if self.high_risk(cmd) && !approved {
-            return Err(DriverError::Other(format!(
-                "command `{cmd}` is high-risk and requires approval (set `approved: true`)"
             )));
         }
         Ok(())
@@ -136,19 +244,24 @@ impl Driver for TerminalDriver {
         method: MethodId,
         input: Value,
         _output: OutputMode,
-        _ctx: &DriverContext,
+        ctx: &DriverContext,
     ) -> Result<DriverOutput, DriverError> {
         if method.get() != 0 {
             return Err(DriverError::NoSuchMethod(method));
         }
         let m = crate::input::map(input, "terminal.run")?;
+        if m.get("approved").is_some() {
+            return Err(DriverError::InvalidInput(
+                "terminal.run no longer accepts `approved`; command authorization is host policy"
+                    .into(),
+            ));
+        }
         let cmd = m
             .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| DriverError::Other("terminal.run requires `command`".into()))?
             .to_string();
-        let approved = optional_bool(&m, "approved", "terminal.run")?;
-        self.gate(&cmd, approved)?;
+        self.gate(&cmd)?;
         let max_output_bytes = optional_bounded_usize(
             &m,
             "max_output_bytes",
@@ -181,7 +294,20 @@ impl Driver for TerminalDriver {
             }
             None => Vec::new(),
         };
-        let output = run_terminal_command(&cmd, &args, max_output_bytes, timeout_ms).await?;
+        let output = self
+            .runtime
+            .run(
+                ctx.operation_id.ok_or_else(|| {
+                    DriverError::InvalidInput(
+                        "terminal.run requires an originating OperationId before spawning".into(),
+                    )
+                })?,
+                cmd,
+                args,
+                max_output_bytes,
+                timeout_ms,
+            )
+            .await?;
 
         let mut result = BTreeMap::new();
         result.insert(
@@ -221,68 +347,112 @@ struct LimitedOutput {
     truncated: bool,
 }
 
-async fn run_terminal_command(
-    cmd: &str,
-    args: &[String],
+struct TerminalRequest {
+    operation_id: OperationId,
+    cmd: String,
+    args: Vec<String>,
     max_output_bytes: usize,
     timeout_ms: u64,
+    deadline: tokio::time::Instant,
+}
+
+async fn supervise_terminal(
+    request: TerminalRequest,
+    mut closed: watch::Receiver<bool>,
+    result: &mut oneshot::Sender<Result<TerminalOutput, DriverError>>,
+    _slot: &TerminalSlot,
 ) -> Result<TerminalOutput, DriverError> {
-    let mut child = tokio::process::Command::new(cmd)
+    let TerminalRequest {
+        operation_id,
+        cmd,
+        args,
+        max_output_bytes,
+        timeout_ms,
+        deadline,
+    } = request;
+    if *closed.borrow() || result.is_closed() {
+        return Err(DriverError::Other(
+            "terminal call closed before spawn".into(),
+        ));
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err(DriverError::Other(format!(
+            "terminal command exceeded timeout_ms {timeout_ms}"
+        )));
+    }
+    let mut child = tokio::process::Command::new(&cmd)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
-        .map_err(|e| DriverError::Other(format!("terminal command {cmd:?} failed: {e}")))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| DriverError::Other("terminal stdout pipe was not available".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| DriverError::Other("terminal stderr pipe was not available".into()))?;
-    let stdout_task = tokio::spawn(read_limited_output(stdout, max_output_bytes));
-    let stderr_task = tokio::spawn(read_limited_output(stderr, max_output_bytes));
-    let status = match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
-        Ok(status) => {
-            status.map_err(|e| DriverError::Other(format!("terminal command wait failed: {e}")))?
-        }
-        Err(_elapsed) => {
-            return terminal_timeout_error(child, stdout_task, stderr_task, timeout_ms).await;
-        }
+        .map_err(|error| DriverError::Other(format!("terminal command {cmd:?} failed: {error}")))?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let diagnostics = kill_and_reap(&mut child).await;
+        return Err(DriverError::OutcomeUnknown {
+            operation_id: operation_id.to_string(),
+            reason: format!("terminal output pipes unavailable{diagnostics}"),
+        });
     };
-    let stdout = join_limited_output(stdout_task, "stdout").await?;
-    let stderr = join_limited_output(stderr_task, "stderr").await?;
-    Ok(TerminalOutput {
-        status,
-        stdout: stdout.bytes,
-        stderr: stderr.bytes,
-        stdout_truncated: stdout.truncated,
-        stderr_truncated: stderr.truncated,
+    let mut output = tokio::select! {
+        biased;
+        _ = closed.wait_for(|value| *value) => Err(DriverError::Other("terminal runtime closed".into())),
+        _ = result.closed() => Err(DriverError::Other("terminal call cancelled".into())),
+        _ = tokio::time::sleep_until(deadline) => Err(DriverError::Other(format!("terminal command exceeded timeout_ms {timeout_ms}"))),
+        output = async {
+            let (status, stdout, stderr) = tokio::try_join!(
+                child.wait(),
+                read_limited_output(stdout, max_output_bytes),
+                read_limited_output(stderr, max_output_bytes),
+            ).map_err(|error| DriverError::Other(format!("terminal command I/O failed: {error}")))?;
+            Ok(TerminalOutput {
+                status,
+                stdout: stdout.bytes,
+                stderr: stderr.bytes,
+                stdout_truncated: stdout.truncated,
+                stderr_truncated: stderr.truncated,
+            })
+        } => output,
+    };
+    if output.is_err() {
+        #[cfg(test)]
+        {
+            let gate = _slot.inner.cleanup_gate.lock().take();
+            if let Some((entered, release)) = gate {
+                let _entered = entered.send(());
+                let _released = release.await;
+            }
+        }
+        let diagnostics = kill_and_reap(&mut child).await;
+        if !diagnostics.is_empty()
+            && let Err(error) = output
+        {
+            output = Err(DriverError::Other(format!("{error}{diagnostics}")));
+        }
+    }
+    output.map_err(|error| DriverError::OutcomeUnknown {
+        operation_id: operation_id.to_string(),
+        reason: error.to_string(),
     })
 }
 
-async fn terminal_timeout_error(
-    mut child: Child,
-    stdout_task: tokio::task::JoinHandle<Result<LimitedOutput, std::io::Error>>,
-    stderr_task: tokio::task::JoinHandle<Result<LimitedOutput, std::io::Error>>,
-    timeout_ms: u64,
-) -> Result<TerminalOutput, DriverError> {
-    let mut details = vec![format!("terminal command exceeded timeout_ms {timeout_ms}")];
-    if let Err(error) = child.kill().await {
-        details.push(format!("kill failed: {error}"));
+async fn kill_and_reap(child: &mut tokio::process::Child) -> String {
+    let mut diagnostics = String::new();
+    if let Err(error) = child.start_kill() {
+        diagnostics.push_str(&format!("; kill failed: {error}"));
     }
-    if let Err(error) = child.wait().await {
-        details.push(format!("wait after kill failed: {error}"));
+    let mut first_wait_error = true;
+    let mut delay = Duration::from_millis(100);
+    while let Err(error) = child.wait().await {
+        if first_wait_error {
+            diagnostics.push_str(&format!("; reap failed before retry: {error}"));
+            first_wait_error = false;
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(1));
     }
-    if let Err(error) = join_limited_output(stdout_task, "stdout").await {
-        details.push(error.to_string());
-    }
-    if let Err(error) = join_limited_output(stderr_task, "stderr").await {
-        details.push(error.to_string());
-    }
-    Err(DriverError::Other(details.join("; ")))
+    diagnostics
 }
 
 async fn read_limited_output<R>(
@@ -310,31 +480,6 @@ where
         }
     }
     Ok(LimitedOutput { bytes, truncated })
-}
-
-async fn join_limited_output(
-    task: tokio::task::JoinHandle<Result<LimitedOutput, std::io::Error>>,
-    label: &'static str,
-) -> Result<LimitedOutput, DriverError> {
-    match task.await {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(error)) => Err(DriverError::Other(format!(
-            "terminal {label} read failed: {error}"
-        ))),
-        Err(error) => Err(DriverError::Other(format!(
-            "terminal {label} reader task failed: {error}"
-        ))),
-    }
-}
-
-fn optional_bool(m: &ValueMap, field: &'static str, op: &'static str) -> Result<bool, DriverError> {
-    match m.get(field).map(Value::view) {
-        None => Ok(false),
-        Some(ValueView::Bool(value)) => Ok(value),
-        Some(_) => Err(DriverError::InvalidInput(format!(
-            "{op} `{field}` must be a boolean"
-        ))),
-    }
 }
 
 fn optional_bounded_usize(
@@ -403,6 +548,36 @@ mod tests {
     use anyhow::{Context, Result, bail, ensure};
     use xolotl_types::{IdentityRef, ProcessId};
 
+    fn test_operation_id() -> OperationId {
+        OperationId::new(
+            ProcessId::new(1),
+            xolotl_types::ExecutionId::FIRST,
+            xolotl_types::InvocationId::new(1),
+            xolotl_types::NodeId::ROOT,
+            0,
+        )
+    }
+
+    #[tokio::test]
+    async fn missing_operation_identity_is_rejected_before_admission() -> Result<()> {
+        let runtime = TerminalRuntime::default();
+        let driver = TerminalDriver::new(vec!["echo".into()], runtime.clone());
+        let result = driver
+            .call(
+                MethodId::new(0),
+                run_input("echo", &[]),
+                OutputMode::Unary,
+                &DriverContext::new(IdentityRef::ROOT, ProcessId::new(1)),
+            )
+            .await;
+        ensure!(
+            matches!(result, Err(DriverError::InvalidInput(message)) if message.contains("OperationId"))
+        );
+        ensure!(*runtime.inner.active.borrow() == 0);
+        runtime.shutdown().await;
+        Ok(())
+    }
+
     fn run_input(command: &str, args: &[&str]) -> Value {
         let mut m = BTreeMap::new();
         m.insert("command".into(), Value::string(command.into()));
@@ -415,8 +590,9 @@ mod tests {
 
     #[tokio::test]
     async fn disallowed_command_rejected() -> Result<()> {
-        let d = TerminalDriver::new(vec!["echo".into()]);
-        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+        let d = TerminalDriver::new(vec!["echo".into()], TerminalRuntime::default());
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
+            .with_operation_id(test_operation_id());
         let out = d
             .call(
                 MethodId::new(0),
@@ -431,8 +607,9 @@ mod tests {
 
     #[tokio::test]
     async fn allowed_echo_runs_without_shell() -> Result<()> {
-        let d = TerminalDriver::new(vec!["echo".into()]);
-        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+        let d = TerminalDriver::new(vec!["echo".into()], TerminalRuntime::default());
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
+            .with_operation_id(test_operation_id());
         let out = d
             .call(
                 MethodId::new(0),
@@ -458,8 +635,9 @@ mod tests {
 
     #[tokio::test]
     async fn output_is_bounded_and_marked_when_truncated() -> Result<()> {
-        let d = TerminalDriver::new(vec!["echo".into()]);
-        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+        let d = TerminalDriver::new(vec!["echo".into()], TerminalRuntime::default());
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
+            .with_operation_id(test_operation_id());
         let mut input = run_input("echo", &["abcdef"])
             .into_map()
             .context("expected map input")?;
@@ -490,8 +668,9 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_bounds_are_rejected() -> Result<()> {
-        let d = TerminalDriver::new(vec!["echo".into()]);
-        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+        let d = TerminalDriver::new(vec!["echo".into()], TerminalRuntime::default());
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
+            .with_operation_id(test_operation_id());
         for (field, value) in [
             ("max_output_bytes", Value::integer(-1)),
             ("timeout_ms", Value::integer(0)),
@@ -516,8 +695,12 @@ mod tests {
 
     #[tokio::test]
     async fn denylisted_command_refused_even_if_allowlisted() -> Result<()> {
-        let d = TerminalDriver::new(vec!["sudo".into(), "echo".into()]);
-        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
+        let d = TerminalDriver::new(
+            vec!["sudo".into(), "echo".into()],
+            TerminalRuntime::default(),
+        );
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
+            .with_operation_id(test_operation_id());
         let out = d
             .call(
                 MethodId::new(0),
@@ -532,109 +715,337 @@ mod tests {
         }
     }
 
+    #[test]
+    fn host_policy_is_the_only_command_gate() -> Result<()> {
+        let driver = TerminalDriver::new(
+            vec!["rm".into(), "echo".into(), "/usr/bin/sudo".into()],
+            TerminalRuntime::default(),
+        )
+        .with_denylist(vec!["/bin/echo".into()]);
+        ensure!(driver.gate("rm").is_ok());
+        ensure!(driver.gate("echo").is_err());
+        ensure!(driver.gate("/usr/bin/sudo").is_err());
+        ensure!(driver.gate("cat").is_err());
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn high_risk_command_requires_approval() -> Result<()> {
-        let d = TerminalDriver::new(vec!["rm".into()]);
-        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
-        let out = d
-            .call(
-                MethodId::new(0),
-                run_input("rm", &["-rf", "/tmp/x"]),
-                OutputMode::Unary,
-                &ctx,
-            )
-            .await;
-        match out {
-            Err(DriverError::Other(msg)) if msg.contains("approval") => Ok(()),
-            other => bail!("high-risk command must require approval, got {other:?}"),
+    async fn retired_approval_input_is_rejected_not_verified() -> Result<()> {
+        let driver = TerminalDriver::new(vec!["echo".into()], TerminalRuntime::default());
+        for approved in [
+            Value::boolean(true),
+            Value::boolean(false),
+            Value::string("true".into()),
+        ] {
+            let mut input = run_input("echo", &[]).into_map().context("input map")?;
+            input.insert("approved".into(), approved)?;
+            let result = driver
+                .call(
+                    MethodId::new(0),
+                    Value::from(input),
+                    OutputMode::Unary,
+                    &DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
+                        .with_operation_id(test_operation_id()),
+                )
+                .await;
+            ensure!(
+                matches!(result, Err(DriverError::InvalidInput(message)) if message.contains("no longer accepts"))
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_and_cancellation_plateau_workload() -> Result<()> {
+        let runtime = TerminalRuntime::new(NonZeroUsize::MIN);
+        for _iteration in 0..64 {
+            let output = runtime
+                .run(
+                    test_operation_id(),
+                    "seq".into(),
+                    vec!["1".into(), "100000".into()],
+                    64 * 1024,
+                    5000,
+                )
+                .await?;
+            ensure!(output.stdout.len() == 64 * 1024 && output.stdout_truncated);
+            drop(output);
+            let call_runtime = runtime.clone();
+            let call = tokio::spawn(async move {
+                call_runtime
+                    .run(test_operation_id(), "yes".into(), vec![], 64 * 1024, 5000)
+                    .await
+            });
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            call.abort();
+            ensure!(call.await.is_err_and(|error| error.is_cancelled()));
+            let mut active = runtime.inner.active.subscribe();
+            tokio::time::timeout(Duration::from_secs(5), active.wait_for(|count| *count == 0))
+                .await??;
+        }
+        runtime.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_rejects_and_shutdown_supports_concurrent_waiters() -> Result<()> {
+        let runtime = TerminalRuntime::default();
+        let mut slots = Vec::new();
+        for _index in 0..16 {
+            slots.push(runtime.admit()?);
+        }
+        ensure!(runtime.admit().is_err(), "default capacity was not finite");
+        runtime.close();
+        runtime.close();
+        ensure!(runtime.admit().is_err());
+        let mut interrupted = Box::pin(runtime.shutdown());
+        ensure!(
+            std::future::poll_fn(|context| std::task::Poll::Ready(
+                interrupted.as_mut().poll(context)
+            ))
+            .await
+            .is_pending()
+        );
+        drop(interrupted);
+        drop(slots);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(runtime.shutdown(), runtime.shutdown());
+        })
+        .await?;
+        ensure!(runtime.admit().is_err(), "shutdown reopened admission");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    struct ProcessFixture {
+        directory: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl ProcessFixture {
+        fn new() -> Result<Self> {
+            Ok(Self {
+                directory: tempfile::tempdir()?,
+            })
+        }
+
+        fn args(&self, parent_waits: bool) -> Vec<String> {
+            vec![
+                "-c".into(),
+                format!(
+                    "sleep 30 & printf '%s %s' \"$$\" \"$!\" > \"$1\"; {}",
+                    if parent_waits { "wait" } else { "exit 0" },
+                ),
+                "terminal-test".into(),
+                self.directory.path().join("pids").display().to_string(),
+            ]
+        }
+
+        async fn ready(&self) -> Result<Vec<String>> {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(contents) =
+                        std::fs::read_to_string(self.directory.path().join("pids"))
+                    {
+                        let pids: Vec<String> =
+                            contents.split_whitespace().map(str::to_owned).collect();
+                        if pids.len() == 2 {
+                            return pids;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .context("child did not start")
         }
     }
 
+    #[cfg(unix)]
+    impl Drop for ProcessFixture {
+        fn drop(&mut self) {
+            if let Ok(contents) = std::fs::read_to_string(self.directory.path().join("pids")) {
+                let _killed = std::process::Command::new("kill")
+                    .arg("-KILL")
+                    .args(contents.split_whitespace().skip(1))
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
-    async fn malformed_approval_flag_is_rejected() -> Result<()> {
-        let d = TerminalDriver::new(vec!["echo".into()]);
-        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1));
-        let mut input = BTreeMap::new();
-        input.insert("command".into(), Value::string("echo".into()));
-        input.insert("approved".into(), Value::string("true".into()));
-        let out = d
-            .call(MethodId::new(0), Value::map(input), OutputMode::Unary, &ctx)
+    async fn cancellation_keeps_capacity_until_cleanup_and_reaps_direct_child() -> Result<()> {
+        let runtime = TerminalRuntime::new(NonZeroUsize::new(1).context("nonzero")?);
+        let fixture = ProcessFixture::new()?;
+        let (entered, cleanup_started) = oneshot::channel();
+        let (release, gate) = oneshot::channel();
+        *runtime.inner.cleanup_gate.lock() = Some((entered, gate));
+        let call_runtime = runtime.clone();
+        let args = fixture.args(true);
+        let call = tokio::spawn(async move {
+            call_runtime
+                .run(test_operation_id(), "sh".into(), args, 1024, 10_000)
+                .await
+        });
+        let pids = fixture.ready().await?;
+        call.abort();
+        ensure!(call.await.is_err_and(|error| error.is_cancelled()));
+        tokio::time::timeout(Duration::from_secs(5), cleanup_started).await??;
+        ensure!(
+            runtime.admit().is_err(),
+            "caller cancellation released cleanup capacity"
+        );
+        let rejected = runtime
+            .run(test_operation_id(), "echo".into(), vec![], 1024, 100)
             .await;
         ensure!(
-            matches!(out, Err(DriverError::InvalidInput(ref message)) if message.contains("approved")),
-            "terminal accepted malformed approved flag: {out:?}"
+            matches!(rejected, Err(DriverError::Other(message)) if message.contains("capacity"))
         );
+        let mut drain = Box::pin(runtime.shutdown());
+        ensure!(
+            std::future::poll_fn(|context| std::task::Poll::Ready(drain.as_mut().poll(context)))
+                .await
+                .is_pending()
+        );
+        drop(drain);
+        release
+            .send(())
+            .map_err(|()| anyhow::anyhow!("cleanup supervisor lost"))?;
+        tokio::time::timeout(Duration::from_secs(5), runtime.shutdown()).await?;
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pids[0]])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?
+            .success();
+        ensure!(!alive, "direct child not reaped");
+        ensure!(*runtime.inner.active.borrow() == 0);
         Ok(())
     }
 
-    #[test]
-    fn gate_layers_compose() -> Result<()> {
-        let d = TerminalDriver::new(vec!["echo".into(), "rm".into(), "sudo".into()]);
-        ensure!(d.gate("echo", false).is_ok(), "allowlisted command failed");
-        ensure!(d.gate("cat", false).is_err(), "unlisted command passed");
-        ensure!(d.gate("sudo", true).is_err(), "denylisted command passed");
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deadline_includes_pipes_held_by_descendants_after_child_exit() -> Result<()> {
+        let runtime = TerminalRuntime::default();
+        let fixture = ProcessFixture::new()?;
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.run(
+                test_operation_id(),
+                "sh".into(),
+                fixture.args(false),
+                1024,
+                100,
+            ),
+        )
+        .await?;
         ensure!(
-            d.gate("rm", false).is_err(),
-            "high-risk command passed without approval"
+            matches!(output, Err(DriverError::OutcomeUnknown { operation_id, reason })
+                if operation_id == test_operation_id().to_string() && reason.contains("timeout_ms"))
         );
-        ensure!(
-            d.gate("rm", true).is_ok(),
-            "approved high-risk command failed"
-        );
+        ensure!(*runtime.inner.active.borrow() == 0);
+        runtime.shutdown().await;
         Ok(())
     }
 
-    #[test]
-    fn custom_denylist_and_high_risk_extend_defaults() -> Result<()> {
-        let d = TerminalDriver::new(vec!["git".into(), "echo".into()])
-            .with_denylist(vec!["git".into()])
-            .with_high_risk(vec!["echo".into()]);
-        ensure!(d.gate("git", true).is_err(), "custom denylist refuses git");
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_cancels_pipes_held_by_descendants() -> Result<()> {
+        let runtime = TerminalRuntime::default();
+        let fixture = ProcessFixture::new()?;
+        let call_runtime = runtime.clone();
+        let args = fixture.args(false);
+        let call = tokio::spawn(async move {
+            call_runtime
+                .run(test_operation_id(), "sh".into(), args, 1024, 10_000)
+                .await
+        });
+        fixture.ready().await?;
+        tokio::time::timeout(Duration::from_secs(5), runtime.shutdown()).await?;
         ensure!(
-            d.gate("echo", false).is_err(),
-            "custom high-risk gates echo"
+            matches!(call.await?, Err(DriverError::OutcomeUnknown { operation_id, reason })
+            if operation_id == test_operation_id().to_string() && reason.contains("closed"))
         );
-        ensure!(
-            d.gate("echo", true).is_ok(),
-            "approval clears custom high-risk"
-        );
+        ensure!(*runtime.inner.active.borrow() == 0);
         Ok(())
     }
 
-    #[test]
-    fn basename_is_checked_for_denylist_and_high_risk() -> Result<()> {
-        let d = TerminalDriver::new(vec!["/usr/bin/sudo".into(), "/bin/rm".into()]);
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn caller_cancellation_finishes_without_descendant_pipe_eof() -> Result<()> {
+        let runtime = TerminalRuntime::default();
+        let fixture = ProcessFixture::new()?;
+        let call_runtime = runtime.clone();
+        let args = fixture.args(false);
+        let call = tokio::spawn(async move {
+            call_runtime
+                .run(test_operation_id(), "sh".into(), args, 1024, 10_000)
+                .await
+        });
+        let pids = fixture.ready().await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let alive = std::process::Command::new("kill")
+                    .args(["-0", &pids[0]])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()?;
+                if !alive.success() {
+                    return Ok::<(), std::io::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await??;
         ensure!(
-            d.gate("/usr/bin/sudo", true).is_err(),
-            "denylist must match command basename"
+            !call.is_finished(),
+            "call finished before inherited pipes closed"
         );
+        call.abort();
+        ensure!(call.await.is_err_and(|error| error.is_cancelled()));
+        let mut active = runtime.inner.active.subscribe();
+        tokio::time::timeout(Duration::from_secs(5), active.wait_for(|count| *count == 0))
+            .await??;
         ensure!(
-            d.gate("/bin/rm", false).is_err(),
-            "high-risk list must match command basename"
+            runtime
+                .run(test_operation_id(), "echo".into(), vec![], 1024, 1000)
+                .await
+                .is_ok(),
+            "cleanup did not return capacity"
         );
-        ensure!(
-            d.gate("/bin/rm", true).is_ok(),
-            "approved high-risk basename should pass when allowlisted"
-        );
+        runtime.shutdown().await;
         Ok(())
     }
 
-    #[test]
-    fn listed_absolute_paths_match_command_basename_for_safety_sets() -> Result<()> {
-        let d = TerminalDriver::new(vec!["sudo".into(), "rm".into()])
-            .with_denylist(vec!["/usr/bin/sudo".into()])
-            .with_high_risk(vec!["/bin/rm".into()]);
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_before_supervisor_starts_prevents_spawn() -> Result<()> {
+        let runtime = TerminalRuntime::default();
+        let fixture = ProcessFixture::new()?;
+        let mut call = Box::pin(runtime.run(
+            test_operation_id(),
+            "sh".into(),
+            fixture.args(true),
+            1024,
+            1000,
+        ));
         ensure!(
-            d.gate("sudo", true).is_err(),
-            "absolute denylist entry must match command basename"
+            std::future::poll_fn(|context| std::task::Poll::Ready(call.as_mut().poll(context)))
+                .await
+                .is_pending()
         );
+        runtime.close();
         ensure!(
-            d.gate("rm", false).is_err(),
-            "absolute high-risk entry must match command basename"
+            matches!(call.await, Err(DriverError::Other(message)) if message.contains("before spawn"))
         );
+        runtime.shutdown().await;
         ensure!(
-            d.gate("rm", true).is_ok(),
-            "approval clears absolute high-risk match"
+            !fixture.directory.path().join("pids").exists(),
+            "closed runtime spawned a child"
         );
         Ok(())
     }

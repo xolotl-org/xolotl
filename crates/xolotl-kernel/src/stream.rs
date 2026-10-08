@@ -195,8 +195,10 @@ pub trait StreamSink {
         end: &mut Option<StreamEnd>,
     ) -> Poll<Result<(), StreamError>>;
 
-    /// Record cancellation synchronously. The first terminal wins; this cannot
-    /// replace a terminal already accepted by `poll_finish` or another close.
+    /// Close synchronously with the owner's latest terminal conclusion.
+    /// Cancellation is appropriate only before a conclusion is acquired.
+    /// The first terminal wins; this cannot replace a terminal already accepted
+    /// by `poll_finish` or another close, or guarantee delivery to a closed reader.
     fn close(&self, end: StreamEnd);
 
     /// Observe receiver closure even while a driver waits outside a send.

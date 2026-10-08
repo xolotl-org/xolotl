@@ -23,5 +23,6 @@ thiserror = { workspace = true, default-features = false, features = ["std"] }
 tracing = { workspace = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
+xolotl-kernel = { workspace = true, features = ["memory"] }
 anyhow = { workspace = true, default-features = false, features = ["std"] }
 tokio = { workspace = true, default-features = false, features = ["rt", "macros"] }

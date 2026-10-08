@@ -43,8 +43,14 @@ pub fn failure_to_pb_bounded(
             payload.text(approval_key)?;
             payload.text(reason)?;
         }
-        Failure::Quarantined { op_id, reason } => {
-            payload.text(op_id)?;
+        Failure::OutcomeUnknown {
+            operation_ids,
+            reason,
+        } => {
+            for operation_id in operation_ids {
+                // Repeated strings encode an entry even when its value is empty.
+                payload.field(operation_id.len())?;
+            }
             payload.text(reason)?;
         }
         Failure::InvalidInput { reason } => payload.add(reason.len())?,

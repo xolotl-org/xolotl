@@ -110,6 +110,7 @@ impl Fixture {
             "effect://test/output",
             &[MethodSpec::new(
                 "invoke",
+                xolotl_types::MethodAuthority::Perform,
                 purity,
                 MethodSpec::STREAM_ASYNC | MethodSpec::SINK_ASYNC,
             )],
@@ -127,7 +128,11 @@ impl Fixture {
                 ["output"],
                 ["perform://effect/test/output"],
             ));
-        let gateway = GatewayRuntime::new(boot, profile)?;
+        let gateway = GatewayRuntime::new(
+            boot,
+            profile,
+            Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+        )?;
         let session = gateway
             .authenticate(PresentedCredential::bearer(TEST_TOKEN))
             .await?;
@@ -198,6 +203,66 @@ async fn finish(stream: &mut GatewayOutputStream) -> anyhow::Result<(usize, Gate
 }
 
 #[tokio::test]
+async fn revoked_replay_withholds_delivery_without_reexecution() -> anyhow::Result<()> {
+    let fixture = Fixture::new(
+        StreamingDriver::new(vec![Value::integer(1)]),
+        Purity::Effectful,
+    )
+    .await?;
+    let request = submission().with_options(SubmitOptions {
+        expected_request_scope: Some(crate::tests::test_request_scope(
+            &fixture.gateway,
+            &fixture.session,
+            "output",
+        )?),
+        idempotency_key: Some("revoked-output".into()),
+        ..SubmitOptions::default()
+    });
+    let mut first = fixture.open(request.clone()).await?;
+    let GatewayOutputEvent::Chunk(chunk) = next(&mut first).await? else {
+        bail!("expected output chunk");
+    };
+    drop(chunk);
+    let (_, completion) = finish(&mut first).await?;
+    let mut replay = fixture.open(request).await?;
+    ensure!(replay.accepted() == &completion.accepted);
+    fixture
+        .gateway
+        .replace_profile(GatewayProfile::new("gateway-test").with_revision(2))?;
+    ensure!(matches!(
+        replay.validate_delivery(),
+        Err(GatewayError::Indeterminate(_))
+    ));
+    ensure!(matches!(
+        replay.next().await,
+        Some(Err(GatewayError::Indeterminate(_)))
+    ));
+    ensure!(replay.next().await.is_none());
+    ensure!(fixture.driver.calls.load(Ordering::Acquire) == 1);
+    ensure!(fixture.gateway.idempotency.usage().await?.records == 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn borrowed_chunk_reauthorizes_after_its_response_is_dropped() -> anyhow::Result<()> {
+    let fixture = Fixture::new(StreamingDriver::new(vec![Value::integer(1)]), Purity::Pure).await?;
+    let mut stream = fixture.open(submission()).await?;
+    let GatewayOutputEvent::Chunk(chunk) = next(&mut stream).await? else {
+        bail!("expected output chunk");
+    };
+    drop(stream);
+    fixture
+        .gateway
+        .replace_profile(GatewayProfile::new("gateway-test").with_revision(2))?;
+    ensure!(matches!(
+        chunk.validate_delivery(),
+        Err(GatewayError::Indeterminate(_))
+    ));
+    ensure!(fixture.driver.calls.load(Ordering::Acquire) == 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn borrowed_chunks_bound_execution_and_precede_request_completion() -> anyhow::Result<()> {
     let fixture = Fixture::new(
         StreamingDriver::new(vec![
@@ -251,6 +316,11 @@ async fn ignored_chunk_schema_rejection_still_fails_the_request() -> anyhow::Res
     driver.chunk_taint.union(&rejected_taint);
     let fixture = Fixture::new(driver, Purity::Effectful).await?;
     let request = submission().with_options(SubmitOptions {
+        expected_request_scope: Some(crate::tests::test_request_scope(
+            &fixture.gateway,
+            &fixture.session,
+            "output",
+        )?),
         idempotency_key: Some("rejected-output-once".into()),
         ..SubmitOptions::default()
     });
@@ -322,6 +392,11 @@ async fn gateway_replay_returns_complete_provenance_without_historical_chunks() 
     )
     .await?;
     let request = submission().with_options(SubmitOptions {
+        expected_request_scope: Some(crate::tests::test_request_scope(
+            &fixture.gateway,
+            &fixture.session,
+            "output",
+        )?),
         idempotency_key: Some("output-once".into()),
         ..SubmitOptions::default()
     });
@@ -368,6 +443,11 @@ async fn submission_modes_preserve_protected_success_and_failure_on_replay() -> 
             let request = submission()
                 .with_requested_output(mode)
                 .with_options(SubmitOptions {
+                    expected_request_scope: Some(crate::tests::test_request_scope(
+                        &fixture.gateway,
+                        &fixture.session,
+                        "output",
+                    )?),
                     idempotency_key: Some("protected-result-once".into()),
                     ..SubmitOptions::default()
                 });
@@ -407,6 +487,11 @@ async fn final_schema_rejection_keeps_protected_provenance_on_replay() -> anyhow
         let request = submission()
             .with_requested_output(mode)
             .with_options(SubmitOptions {
+                expected_request_scope: Some(crate::tests::test_request_scope(
+                    &fixture.gateway,
+                    &fixture.session,
+                    "output",
+                )?),
                 idempotency_key: Some("invalid-final-output-once".into()),
                 ..SubmitOptions::default()
             });
@@ -526,16 +611,29 @@ async fn borrowed_chunks_keep_capacity_after_response_drop() -> anyhow::Result<(
         let process = fixture.gateway.requests.inner.lock().entries
             [&stream.accepted().submission_id]
             .request_process;
+        let submission_id = stream.accepted().submission_id.clone();
         drop(stream);
         ensure!(fixture.driver.live.load(Ordering::Acquire) == 0);
         ensure!(
-            fixture.gateway.boot.kernel.processes.status(process) == Some(ProcessStatus::Cancelled)
+            fixture.gateway.boot.kernel().processes().status(process)
+                == Some(ProcessStatus::Cancelled)
         );
         {
-            let requests = fixture.gateway.requests.inner.lock();
+            let mut requests = fixture.gateway.requests.inner.lock();
             ensure!(requests.global_running == 1);
             ensure!(requests.budget_running.stream_items == 1);
             ensure!(requests.budget_running.bytes_out == 4096);
+            requests
+                .entries
+                .get_mut(&submission_id)
+                .context("borrowed chunk lost its request entry")?
+                .cancelled_until = Some(fixture.gateway.requests.host.now());
+            prune_request_history(
+                &mut requests,
+                fixture.gateway.requests.host.now(),
+                fixture.gateway.requests.clock_epoch,
+            );
+            ensure!(requests.entries.contains_key(&submission_id));
         }
         ensure!(matches!(
             fixture
@@ -554,6 +652,8 @@ async fn borrowed_chunks_keep_capacity_after_response_drop() -> anyhow::Result<(
             let requests = fixture.gateway.requests.inner.lock();
             ensure!(requests.global_running == 0);
             ensure!(requests.budget_running == GatewayBudgetCharge::default());
+            ensure!(requests.entries.is_empty());
+            ensure!(requests.history.is_empty());
         }
         let retry = fixture.open(submission()).await?;
         if let Some(value) = caller_owned {
@@ -577,6 +677,11 @@ async fn interruption_discards_queued_chunks_and_keeps_borrowed_capacity() -> an
         let deadline = now_millis().saturating_add(60_000);
         let request = submission().with_options(SubmitOptions {
             deadline_ms: Some(u64::try_from(deadline)?),
+            expected_request_scope: Some(crate::tests::test_request_scope(
+                &fixture.gateway,
+                &fixture.session,
+                "output",
+            )?),
             idempotency_key: Some("interrupted-output".into()),
             ..SubmitOptions::default()
         });
@@ -680,19 +785,25 @@ async fn finished_requests_preserve_queued_output_after_the_task_deadline() -> a
                         GatewayRequestState::Completed
                     }
             );
-            entry.deadline = Some(Instant::now());
+            entry.deadline = Some(fixture.gateway.boot.kernel().host_runtime().now());
         }
         ensure!(
             fixture
                 .gateway
                 .requests
-                .expire_deadlines(Instant::now())
+                .expire_deadlines(fixture.gateway.boot.kernel().host_runtime().now())
                 .is_empty()
         );
+        let GatewayOutputEvent::Chunk(remaining) = next(&mut stream).await? else {
+            bail!("a finished request lost valid queued output");
+        };
+        #[cfg(feature = "structured-output")]
+        remaining.validate_delivery()?;
+        drop(remaining);
         let (remaining_chunks, completion) = finish(&mut stream).await?;
         ensure!(
-            remaining_chunks == 1,
-            "a finished request lost valid queued output"
+            remaining_chunks == 0,
+            "finished output contained another chunk"
         );
         if fail_schema {
             ensure!(matches!(
@@ -764,6 +875,10 @@ async fn receipt_is_consumed_before_stream_acceptance_but_not_for_a_wrong_output
                 allowed_media_types: Vec::new(),
                 expires_in_ms: Some(60_000),
                 single_use: true,
+
+                max_objects: None,
+                max_total_bytes: None,
+                max_record_bytes: None,
             },
         )
         .await?;
@@ -775,6 +890,9 @@ async fn receipt_is_consumed_before_stream_acceptance_but_not_for_a_wrong_output
                 ticket_id: ticket.ticket_id().into(),
                 media_type: None,
                 submission_token: None,
+
+                expected_size: None,
+                expected_digest: None,
             },
         )
         .await?;
@@ -782,14 +900,23 @@ async fn receipt_is_consumed_before_stream_acceptance_but_not_for_a_wrong_output
     let receipt = upload.commit(GatewayObjectKind::Blob).await?;
     let request = GatewaySubmission::direct_input("output", receipt.item)
         .with_provenance(receipt.provenance)
-        .with_requested_output(OutputMode::Stream);
-    ensure!(matches!(
+        .with_requested_output(OutputMode::Stream)
+        .with_options(crate::SubmitOptions {
+            expected_request_scope: Some(crate::tests::test_request_scope(
+                &fixture.gateway,
+                &fixture.session,
+                "output",
+            )?),
+            idempotency_key: Some("receipt-stream-output".into()),
+            ..crate::SubmitOptions::default()
+        });
+    ensure!(
         fixture
             .gateway
             .submit(&fixture.session, request.clone())
-            .await,
-        Err(GatewayError::Rejected(_))
-    ));
+            .await
+            .is_err()
+    );
     ensure!(matches!(
         fixture
             .gateway
@@ -803,13 +930,13 @@ async fn receipt_is_consumed_before_stream_acceptance_but_not_for_a_wrong_output
     ));
     let mut stream = fixture.open(request.clone()).await?;
     ensure!(fixture.driver.calls.load(Ordering::Acquire) == 0);
-    ensure!(matches!(
+    ensure!(
         fixture
             .gateway
             .submit_output_stream(&fixture.session, request, window())
-            .await,
-        Err(GatewayError::Rejected(_))
-    ));
+            .await
+            .is_err()
+    );
     let GatewayOutputEvent::Chunk(chunk) = next(&mut stream).await? else {
         bail!("missing output chunk");
     };

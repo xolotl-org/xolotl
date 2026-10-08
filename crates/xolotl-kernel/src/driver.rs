@@ -40,6 +40,15 @@ pub enum DriverError {
     /// Transport or endpoint failure while reaching the driver.
     #[error("transport error: {0}")]
     Transport(String),
+    /// Effect dispatch may have started; a caller must reconcile this identity
+    /// before attempting another effectful invocation.
+    #[error("outcome unknown for {operation_id}: {reason}")]
+    OutcomeUnknown {
+        /// Stable operation or outbound command id.
+        operation_id: String,
+        /// Host-classified cause, not an untrusted endpoint diagnostic.
+        reason: String,
+    },
     /// A stream rejected a chunk, retaining ownership for an explicit retry.
     #[error("stream sink rejected an output chunk")]
     Stream(StreamSendError<TaintedValue>),
@@ -76,6 +85,10 @@ pub struct DriverContext {
     /// Resources like `state://**`, the driver needs the actual path it was
     /// invoked against (the registered Resource name is just the pattern).
     pub target_path: Option<xolotl_types::Path>,
+    /// Absolute Unix millisecond ceiling for a remote invocation. The data
+    /// plane projects its host-clock deadline at dispatch; a remote endpoint
+    /// must not extend it while waiting for the provider.
+    pub deadline_ms: Option<i64>,
     /// Sink for streaming chunks; the driver pushes incremental values here.
     stream_sink: Option<DynStreamSink>,
 }
@@ -90,6 +103,7 @@ impl DriverContext {
             stream_to: None,
             taint: xolotl_types::TaintSet::pristine(),
             target_path: None,
+            deadline_ms: None,
             stream_sink: None,
         }
     }
@@ -110,6 +124,12 @@ impl DriverContext {
     /// Attach the concrete target path.
     pub fn with_target_path(mut self, path: xolotl_types::Path) -> Self {
         self.target_path = Some(path);
+        self
+    }
+
+    /// Attach the current execution's absolute wall-clock ceiling.
+    pub fn with_deadline_ms(mut self, deadline_ms: i64) -> Self {
+        self.deadline_ms = Some(deadline_ms);
         self
     }
 
@@ -207,12 +227,13 @@ pub struct InputRejection {
 /// Pure, method-specific input admission. Only rejection allocates its envelope.
 pub type InputAdmission = fn(&Value) -> Result<(), Box<InputRejection>>;
 
-/// Transport edge for a remote endpoint. Concrete gRPC,
-/// WebSocket, stdio, or test transports implement this; `DriverPlan` compiles
-/// endpoint bindings to a [`RemoteDriver`] that calls this interface.
+/// Transport edge for a remote endpoint. Concrete gRPC, WebSocket, stdio, or
+/// test transports implement this; `DriverPlan` compiles endpoint bindings to
+/// a [`RemoteDriver`] that calls this interface. The endpoint need not be an
+/// external Provider projection.
 #[async_trait]
 pub trait RemoteEndpoint: Send + Sync + 'static {
-    /// Send an invoke request to a remote provider endpoint.
+    /// Send an invoke request to the selected remote endpoint.
     async fn invoke(
         &self,
         dispatch: RemoteInvokeDispatch,
@@ -236,10 +257,13 @@ pub struct RemoteInvokeDispatch {
     pub binding_generation: u64,
     /// Acting identity captured from the originating operation.
     pub acting: IdentityRef,
+    /// Exact output shape requested by the opened Kernel operation. The
+    /// endpoint must not infer Stream from an optional routing path.
+    pub output_mode: OutputMode,
 }
 
 /// RPC stub compiled into a [`DriverPlan`] for `Binding.endpoint = Some(_)`.
-/// It turns a local data-plane call into a provider `Invoke` frame while keeping
+/// It turns a local data-plane call into an endpoint `Invoke` while keeping
 /// the same authorization, policy, budget, taint, and Fact path around it.
 pub struct RemoteDriver {
     endpoint_id: EndpointId,
@@ -288,7 +312,7 @@ impl Driver for RemoteDriver {
             effect_path: self.effect_path.clone(),
             method_id: method,
             input,
-            deadline_ms: None,
+            deadline_ms: ctx.deadline_ms,
             output_stream_to: matches!(output, OutputMode::Stream)
                 .then(|| ctx.stream_to.clone())
                 .flatten(),
@@ -299,27 +323,29 @@ impl Driver for RemoteDriver {
             method_id: method,
             binding_generation: self.binding_generation,
             acting: ctx.acting,
+            output_mode: output,
         };
         let result = self.endpoint.invoke(dispatch, invoke).await?;
+        // Both values and remote error details are data supplied by the
+        // endpoint. A failed remote operation must not shed its provenance.
+        let taint = TaintSet::of(TaintSource::Inbound {
+            source: format!(
+                "remote/endpoint/{}/resource/{}/method/{}/binding/{}",
+                self.endpoint_id.get(),
+                self.resource_id.get(),
+                method.get(),
+                self.binding_generation
+            )
+            .into(),
+            channel: self.effect_path.to_string().into(),
+        });
         match result.outcome {
-            Ok(v) => {
-                let taint = TaintSet::of(TaintSource::Inbound {
-                    source: format!(
-                        "provider/endpoint/{}/resource/{}/method/{}/binding/{}",
-                        self.endpoint_id.get(),
-                        self.resource_id.get(),
-                        method.get(),
-                        self.binding_generation
-                    )
-                    .into(),
-                    channel: self.effect_path.to_string().into(),
-                });
-                Ok(DriverOutput::new(Outcome::Done(v)).with_taint(taint))
-            }
+            Ok(v) => Ok(DriverOutput::new(Outcome::Done(v)).with_taint(taint)),
             Err(e) => Ok(DriverOutput::new(Outcome::Fail(Failure::HandlerError {
                 kind: e.kind,
                 message: e.message,
-            }))),
+            }))
+            .with_taint(taint)),
         }
     }
 }
@@ -348,6 +374,17 @@ pub struct DispatchEntry {
     pub driver: DynDriver,
     /// Optional input admission selected once when this method was opened.
     pub input_admission: Option<InputAdmission>,
+    // Low-level native plans may omit discovery metadata. A portable authority
+    // capture requires a complete declaration for every entry.
+    declaration: Option<xolotl_types::Method>,
+}
+
+impl DispatchEntry {
+    /// Complete method declaration frozen at open time. An entry installed with
+    /// [`DriverPlan::insert`] has only local dispatch rules and returns `None`.
+    pub fn declaration(&self) -> Option<&xolotl_types::Method> {
+        self.declaration.as_ref()
+    }
 }
 
 /// A compiled dispatch table for one opened Resource. Produced at
@@ -385,8 +422,35 @@ impl DriverPlan {
         }
     }
 
-    /// Add or replace a per-method driver entry.
+    /// Add or replace a native dispatch entry without a portable declaration.
+    /// This supports local hosts that do not use named resource interfaces.
+    /// Replacing a declared entry deliberately discards its old declaration.
     pub fn insert(&mut self, method: MethodId, contract: MethodContract, driver: DynDriver) {
+        self.insert_entry(method, contract, driver, None);
+    }
+
+    /// Freeze a complete interface method and derive its dispatch rules. The
+    /// resource-wide index and trusted cleanup owner belong to this binding;
+    /// method names, schemas, replay, output and billing come from the declaration.
+    pub fn insert_declared(
+        &mut self,
+        index: u32,
+        method: xolotl_types::Method,
+        cleanup_owner: Option<xolotl_types::ProcessId>,
+        driver: DynDriver,
+    ) {
+        let mut contract = MethodContract::from_method(index, &method);
+        contract.cleanup_owner = cleanup_owner;
+        self.insert_entry(method.id, contract, driver, Some(method));
+    }
+
+    fn insert_entry(
+        &mut self,
+        method: MethodId,
+        contract: MethodContract,
+        driver: DynDriver,
+        declaration: Option<xolotl_types::Method>,
+    ) {
         let input_admission = driver.input_admission(method);
         Arc::make_mut(&mut self.table).insert(
             method,
@@ -394,12 +458,20 @@ impl DriverPlan {
                 contract,
                 driver,
                 input_admission,
+                declaration,
             },
         );
     }
 
-    pub(crate) fn entry(&self, method: MethodId) -> Option<&DispatchEntry> {
+    /// Inspect one frozen dispatch entry without resolving the current registry.
+    pub fn entry(&self, method: MethodId) -> Option<&DispatchEntry> {
         self.table.get(&method)
+    }
+
+    /// Inspect all frozen entries. Iteration order is unspecified; method rights
+    /// use each entry's resource-wide `contract.method_index`.
+    pub fn methods(&self) -> impl ExactSizeIterator<Item = (MethodId, &DispatchEntry)> {
+        self.table.iter().map(|(id, entry)| (*id, entry))
     }
 
     /// Read the execution contract frozen into this plan for the selected method.
@@ -559,6 +631,7 @@ mod tests {
         let (tx, _rx) = channel(StreamWindow::default());
         let stream = Path::parse("state://stream/1/9").context("stream path did not parse")?;
         let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
+            .with_deadline_ms(1_900_000_000_123)
             .with_operation_id(OperationId::new(
                 ProcessId::new(1),
                 ExecutionId::FIRST,
@@ -587,7 +660,7 @@ mod tests {
                     TaintSource::Inbound {
                         source,
                         channel
-                    } if source.as_str() == "provider/endpoint/7/resource/11/method/0/binding/3"
+                    } if source.as_str() == "remote/endpoint/7/resource/11/method/0/binding/3"
                         && channel.as_str() == "effect://external-provider/acme/search"
                 )
             }),
@@ -634,6 +707,51 @@ mod tests {
             invoke.output_stream_to == Some(stream),
             "invoke stream target mismatch"
         );
+        ensure!(
+            invoke.deadline_ms == Some(1_900_000_000_123),
+            "invoke deadline mismatch"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_error_details_keep_endpoint_provenance() -> anyhow::Result<()> {
+        let driver = RemoteDriver::new(
+            EndpointId::new(7),
+            xolotl_types::ResourceId::new(11),
+            3,
+            Path::parse("effect://external-source/acme/events/command")?,
+            Arc::new(RecordingEndpoint {
+                seen: Arc::new(Mutex::new(Vec::new())),
+                result: Err(ErrorInfo {
+                    kind: "remote_failure".into(),
+                    message: "untrusted detail".into(),
+                }),
+            }),
+        );
+        let ctx = DriverContext::new(IdentityRef::ROOT, ProcessId::new(1)).with_operation_id(
+            OperationId::new(
+                ProcessId::new(1),
+                ExecutionId::FIRST,
+                InvocationId::new(10),
+                NodeId::new(9),
+                0,
+            ),
+        );
+        let output = driver
+            .call(MethodId::new(0), Value::null(), OutputMode::Unary, &ctx)
+            .await?;
+        ensure!(matches!(
+            output.outcome,
+            Outcome::Fail(Failure::HandlerError { ref kind, ref message })
+                if kind == "remote_failure" && message == "untrusted detail"
+        ));
+        ensure!(output.taint.sources().iter().any(|source| matches!(
+            source,
+            TaintSource::Inbound { source, channel }
+                if source.as_str() == "remote/endpoint/7/resource/11/method/0/binding/3"
+                    && channel.as_str() == "effect://external-source/acme/events/command"
+        )));
         Ok(())
     }
 

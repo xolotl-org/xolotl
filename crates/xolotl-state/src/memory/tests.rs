@@ -8,6 +8,7 @@ use std::sync::{
 use std::task::{Context as TaskContext, Poll, Wake, Waker};
 use xolotl_types::{Path, TaintSource};
 
+mod absence;
 mod failures;
 
 const HISTORY_MODES: [MemoryHistory; 2] = [MemoryHistory::Full, MemoryHistory::Disabled];
@@ -104,11 +105,54 @@ fn same_event(left: &StateEvent, right: &StateEvent) -> bool {
                 taint: bt,
             },
         ) => a == b && av == bv && at == bt,
+        (
+            StateEvent::DropPrefixAppend {
+                path: a,
+                removed: ar,
+                item: av,
+                taint: at,
+            },
+            StateEvent::DropPrefixAppend {
+                path: b,
+                removed: br,
+                item: bv,
+                taint: bt,
+            },
+        ) => a == b && ar == br && av == bv && at == bt,
         (StateEvent::Delete { path: a, taint: at }, StateEvent::Delete { path: b, taint: bt }) => {
             a == b && at == bt
         }
         _ => false,
     }
+}
+
+#[test]
+fn current_snapshot_preserves_deletion_sources_independently_of_history() -> anyhow::Result<()> {
+    for_backends(&HISTORY_MODES, |options| async move {
+        let backend = InMemoryBackend::with_options(options)?;
+        let path = p("state://current-absence/item")?;
+        let protected = TaintSet::of(TaintSource::Protected {
+            path: p("state://private/delete-control")?,
+        });
+        let incoming = TaintSet::of(TaintSource::ModelOutput);
+        let expected = protected.clone().merged(&incoming);
+        backend
+            .write_set_tainted(&path, Value::integer(1), protected)
+            .await?;
+        let committed = backend.write_delete_tainted(&path, incoming).await?;
+        ensure!(committed.taint.contains_all(&expected));
+        let current = backend.read_at(&path, 0).await?;
+        ensure!(current.value.is_none());
+        ensure!(current.taint.contains_all(&expected) && expected.contains_all(&current.taint));
+        ensure!(backend.read_tainted(&path).await? == current);
+        ensure!(
+            backend
+                .read_tainted_bounded(&path, NonZeroUsize::MAX)
+                .await?
+                == current
+        );
+        Ok(())
+    })
 }
 
 #[test]
@@ -160,7 +204,7 @@ fn concurrent_writes_have_one_history_and_notification_order() -> anyhow::Result
         })?;
 
         let history = ready(backend.read_range(&p("state://race")?, 0, i64::MAX))??;
-        let mut reconstructed = BTreeMap::<Path, TaintedValue>::new();
+        let mut reconstructed = BTreeMap::<Path, StateObservation>::new();
         let mut previous = 0;
         for entry in history {
             ensure!(
@@ -177,14 +221,13 @@ fn concurrent_writes_have_one_history_and_notification_order() -> anyhow::Result
                 StateEvent::Set { path, value, taint } => {
                     reconstructed.insert(
                         path.clone(),
-                        TaintedValue::new(value.clone(), taint.clone()),
+                        StateObservation::from(TaintedValue::new(value.clone(), taint.clone())),
                     );
                 }
                 StateEvent::Append { path, item, taint } => {
                     let current = reconstructed.get(path);
-                    let mut items = match current {
+                    let mut items = match current.and_then(|current| current.value.as_ref()) {
                         Some(current) => current
-                            .value
                             .as_list()
                             .context("history appended to a non-list")?
                             .iter()
@@ -199,22 +242,66 @@ fn concurrent_writes_have_one_history_and_notification_order() -> anyhow::Result
                     combined.union(taint);
                     reconstructed.insert(
                         path.clone(),
-                        TaintedValue::new(Value::list(items), combined),
+                        StateObservation::from(TaintedValue::new(Value::list(items), combined)),
                     );
                 }
-                StateEvent::Delete { path, .. } => {
-                    reconstructed.remove(path);
+                StateEvent::DropPrefixAppend {
+                    path,
+                    removed,
+                    item,
+                    taint,
+                } => {
+                    let current = reconstructed
+                        .get(path)
+                        .context("prefix drop without list")?;
+                    let list = current
+                        .value
+                        .as_ref()
+                        .context("prefix drop on absence")?
+                        .as_list()
+                        .context("prefix drop on non-list")?;
+                    let removed = usize::try_from(*removed)?;
+                    ensure!(removed <= list.len());
+                    let mut items = list.iter().skip(removed).cloned().collect::<Vec<_>>();
+                    items.push(item.clone());
+                    let mut combined = current.taint.clone();
+                    combined.union(taint);
+                    reconstructed.insert(
+                        path.clone(),
+                        StateObservation::from(TaintedValue::new(Value::list(items), combined)),
+                    );
+                }
+                StateEvent::Delete { path, taint } => {
+                    let mut observed = reconstructed
+                        .get(path)
+                        .map(|current| current.taint.clone())
+                        .unwrap_or_default();
+                    observed.union(taint);
+                    reconstructed.insert(
+                        path.clone(),
+                        StateObservation {
+                            value: None,
+                            taint: observed,
+                        },
+                    );
                 }
             }
             let historical = ready(backend.read_at(entry.event.path(), entry.at_millis))??;
-            ensure!(historical.as_ref() == reconstructed.get(entry.event.path()));
+            ensure!(
+                historical
+                    == reconstructed
+                        .get(entry.event.path())
+                        .cloned()
+                        .unwrap_or_default()
+            );
         }
         ensure!(matches!(
             events.try_recv(),
             Err(crate::StateWatchError::Empty)
         ));
         for path in paths {
-            ensure!(ready(backend.read_tainted(&path))??.as_ref() == reconstructed.get(&path));
+            let current = ready(backend.read_at(&path, 0))??;
+            ensure!(current == reconstructed.get(&path).cloned().unwrap_or_default());
         }
         Ok(())
     })
@@ -238,10 +325,10 @@ fn concurrent_merges_keep_every_update_and_existing_provenance() -> anyhow::Resu
             ))
             .map_err(|error| StateError::Backend(error.to_string()))?
         })?;
-        let current = ready(backend.read_tainted(&path))??.context("missing merged value")?;
+        let current = ready(backend.read_tainted(&path))??;
+        let current_value = current.value.clone().context("missing merged value")?;
         ensure!(
-            current
-                .value
+            current_value
                 .as_map()
                 .context("merged value is not a map")?
                 .len()
@@ -262,7 +349,7 @@ fn concurrent_merges_keep_every_update_and_existing_provenance() -> anyhow::Resu
         ready(backend.write_merge(&path, Value::integer(9), MergeRule::Deep))??;
         ensure!(
             ready(backend.read_tainted(&path))??
-                == Some(TaintedValue::new(Value::integer(9), taint))
+                == crate::StateObservation::from(TaintedValue::new(Value::integer(9), taint))
         );
         Ok(())
     })
@@ -280,18 +367,20 @@ fn exhausted_history_rejects_all_mutations_without_partial_commit() -> anyhow::R
             Value::list(vec![Value::integer(1)]),
             taint.clone(),
         ))??;
-        backend
-            .inner
-            .write()
-            .history
-            .last_mut()
-            .context("missing history")?
-            .at_millis = i64::MAX - 1;
+        {
+            let mut journal = backend.inner.write();
+            journal
+                .history
+                .back_mut()
+                .context("missing history")?
+                .at_millis = i64::MAX - 1;
+            journal.last_history_millis = i64::MAX - 1;
+        }
         ready(backend.write_append(&path, Value::integer(2)))??;
         let expected = Value::list(vec![Value::integer(1), Value::integer(2)]);
         ensure!(
             ready(backend.read_at(&path, i64::MAX))??
-                == Some(TaintedValue::new(expected.clone(), taint.clone()))
+                == StateObservation::from(TaintedValue::new(expected.clone(), taint.clone()))
         );
         let mut events = ready(backend.subscribe(&p("state://**")?))??;
         for path in [&path, &missing] {
@@ -318,7 +407,10 @@ fn exhausted_history_rejects_all_mutations_without_partial_commit() -> anyhow::R
         ));
         ready(backend.write_delete(&missing))??;
         ready(backend.write_compare_delete(&missing, None))??;
-        ensure!(ready(backend.read_tainted(&path))?? == Some(TaintedValue::new(expected, taint)));
+        ensure!(
+            ready(backend.read_tainted(&path))??
+                == crate::StateObservation::from(TaintedValue::new(expected, taint))
+        );
         ensure!(ready(backend.read(&missing))??.is_none());
         ensure!(backend.inner.read().history.len() == 2);
         ensure!(matches!(
@@ -593,6 +685,7 @@ fn default_options_keep_compact_storage_unallocated() -> anyhow::Result<()> {
         InMemoryBackend::with_options(InMemoryOptions::default())?,
     ] {
         ensure!(backend.options == InMemoryOptions::default());
+        ensure!(backend.options.history == MemoryHistory::Disabled);
         let Storage::Compact(state) = &backend.inner else {
             bail!("default backend allocated read shards");
         };
@@ -602,7 +695,29 @@ fn default_options_keep_compact_storage_unallocated() -> anyhow::Result<()> {
         ensure!(!state.journal.subscribers.is_initialized());
         ensure!(state.journal.notifications.capacity() == 0);
         ensure!(!state.journal.notifying);
+        drop(state);
+        ensure!(!backend.into_backend().has_history());
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_overwrites_do_not_accumulate_history() -> anyhow::Result<()> {
+    let backend = InMemoryBackend::new();
+    let path = p("state://default/current")?;
+    for value in 0..128 {
+        backend.write_set(&path, Value::integer(value)).await?;
+    }
+    let state = backend.inner.read();
+    ensure!(state.history.is_empty() && state.history.capacity() == 0);
+    drop(state);
+    ensure!(
+        backend
+            .read_tainted(&path)
+            .await?
+            .value
+            .is_some_and(|current| current == Value::integer(127))
+    );
     Ok(())
 }
 
@@ -612,7 +727,7 @@ fn disabled_history_rejects_historical_queries_but_reads_current_values() -> any
         let backend = InMemoryBackend::with_options(options)?;
         let path = p("state://current")?;
         let missing = p("state://missing")?;
-        ensure!(backend.read_at(&path, 0).await?.is_none());
+        ensure!(backend.read_at(&path, 0).await?.value.is_none());
         backend.write_set(&path, Value::integer(1)).await?;
         backend.write_set(&path, Value::integer(2)).await?;
 
@@ -636,10 +751,11 @@ fn disabled_history_rejects_historical_queries_but_reads_current_values() -> any
             ensure!(backend.read_at(candidate, 0).await? == backend.read_tainted(candidate).await?);
         }
         ensure!(
-            backend.read_at(&path, 0).await? == Some(TaintedValue::pristine(Value::integer(2)))
+            backend.read_at(&path, 0).await?
+                == StateObservation::from(TaintedValue::pristine(Value::integer(2)))
         );
         backend.write_delete(&path).await?;
-        ensure!(backend.read_at(&path, 0).await?.is_none());
+        ensure!(backend.read_at(&path, 0).await?.value.is_none());
         ensure!(backend.inner.read().history.capacity() == 0);
         Ok(())
     })
@@ -751,7 +867,7 @@ fn rejected_append_and_cas_preserve_value_taint_history_and_notifications() -> a
             if expected.as_deref() == Some(&Value::integer(99)) && actual.as_deref() == Some(&original.value))
         );
 
-        ensure!(b.read_tainted(&path).await? == Some(original));
+        ensure!(b.read_tainted(&path).await? == crate::StateObservation::from(original));
         {
             let state = b.inner.read();
             ensure!(state.history.len() == history.len());
@@ -868,7 +984,7 @@ fn concurrent_cas_none_commits_one_value_and_lineage() -> anyhow::Result<()> {
                 let winner = &contenders[winners[0]];
                 let actual = backend.read_tainted(path).await?;
                 ensure!(
-                    actual.as_ref() == Some(winner),
+                    actual == StateObservation::from(winner.clone()),
                     "committed value or lineage differs from winner at {path}: {actual:?}"
                 );
                 if options.history == MemoryHistory::Full {
@@ -1013,7 +1129,7 @@ fn notifications_and_prefix_reads_preserve_append_merge_and_cas_provenance() -> 
             .await?;
         ensure!(
             backend.read_tainted(&path).await?
-                == Some(TaintedValue::new(
+                == crate::StateObservation::from(TaintedValue::new(
                     Value::list(vec![Value::integer(1), Value::integer(2)]),
                     combined.clone()
                 ))
@@ -1063,7 +1179,10 @@ fn notifications_and_prefix_reads_preserve_append_merge_and_cas_provenance() -> 
             .await?;
         let replacement =
             TaintedValue::new(Value::integer(4), TaintSet::author().merged(&combined));
-        ensure!(backend.read_tainted(&path).await? == Some(replacement.clone()));
+        ensure!(
+            backend.read_tainted(&path).await?
+                == crate::StateObservation::from(replacement.clone())
+        );
         ensure!(same_event(
             &events.try_recv()?,
             &StateEvent::Set {
@@ -1128,6 +1247,7 @@ fn read_range_includes_direct_and_descendant_paths() -> anyhow::Result<()> {
             .map(|entry| match entry.event {
                 StateEvent::Set { path, .. } => path.to_string(),
                 StateEvent::Append { path, .. } => path.to_string(),
+                StateEvent::DropPrefixAppend { path, .. } => path.to_string(),
                 StateEvent::Delete { path, .. } => path.to_string(),
             })
             .collect();
@@ -1149,7 +1269,7 @@ fn read_at_reconstructs_list_before_delete() -> anyhow::Result<()> {
             .inner
             .read()
             .history
-            .first()
+            .front()
             .context("missing first history entry")?
             .at_millis;
         b.write_append(&path, Value::integer(2)).await?;
@@ -1167,12 +1287,15 @@ fn read_at_reconstructs_list_before_delete() -> anyhow::Result<()> {
         let current = b.read(&path).await?;
 
         ensure!(
-            before_value == Some(TaintedValue::pristine(Value::list(vec![Value::integer(1)]))),
+            before_value
+                == StateObservation::from(TaintedValue::pristine(Value::list(vec![
+                    Value::integer(1)
+                ]))),
             "unexpected first historical value: {before_value:?}"
         );
         ensure!(
             mid_value
-                == Some(TaintedValue::pristine(Value::list(vec![
+                == StateObservation::from(TaintedValue::pristine(Value::list(vec![
                     Value::integer(1),
                     Value::integer(2)
                 ]))),
@@ -1219,6 +1342,171 @@ fn history_timestamps_are_strictly_increasing() -> anyhow::Result<()> {
             }
             other => bail!("expected 3 timestamps, got {other:?}"),
         }
+        Ok(())
+    })
+}
+
+#[test]
+fn rolling_history_trims_preserve_replay_and_page_positions() -> anyhow::Result<()> {
+    for_backends(&[MemoryHistory::Full], |options| async move {
+        let backend = InMemoryBackend::with_options(options)?;
+        let path = p("state://rolling/history")?;
+        for value in 0..16 {
+            backend.write_set(&path, Value::integer(value)).await?;
+        }
+
+        let mut wrapped = false;
+        for value in 16..96 {
+            let floor = backend
+                .inner
+                .read()
+                .history
+                .get(1)
+                .context("missing next retained event")?
+                .at_millis;
+            let trimmed = backend
+                .trim_before(floor, crate::StateHistoryTrimLimits::default())
+                .await?;
+            ensure!(trimmed.removed_events == 1);
+            backend.write_set(&path, Value::integer(value)).await?;
+            let state = backend.inner.read();
+            ensure!(state.history.len() == 16);
+            wrapped |= !state.history.as_slices().1.is_empty();
+        }
+        ensure!(wrapped, "rolling trims did not exercise a wrapped journal");
+
+        let floor = backend.retained_from().await?;
+        ensure!(matches!(
+            backend.read_at(&path, floor - 1).await,
+            Err(crate::StateFailure {
+                error: StateError::HistoryTrimmed { .. },
+                ..
+            })
+        ));
+        ensure!(
+            backend.read_at(&path, floor).await?
+                == StateObservation::from(TaintedValue::pristine(Value::integer(80)))
+        );
+        let mut query = StateHistoryQuery::new(path.clone(), floor, i64::MAX);
+        query.limits.entries = NonZeroUsize::MIN.saturating_add(2);
+        let mut values = Vec::new();
+        let mut stale_cursor = None;
+        loop {
+            let page = backend.history(&query).await?;
+            if stale_cursor.is_none() {
+                stale_cursor = page.next.clone();
+            }
+            for entry in page.entries {
+                match entry.event {
+                    StateEvent::Set { value, .. } => values.push(value),
+                    other => bail!("unexpected rolling history event: {other:?}"),
+                }
+            }
+            let Some(cursor) = page.next else {
+                break;
+            };
+            query.cursor = Some(cursor);
+        }
+        ensure!(values == (80..96).map(Value::integer).collect::<Vec<_>>());
+
+        let next_floor = backend
+            .inner
+            .read()
+            .history
+            .get(1)
+            .context("missing next history entry")?
+            .at_millis;
+        backend
+            .trim_before(next_floor, crate::StateHistoryTrimLimits::default())
+            .await?;
+        query.from_millis = next_floor;
+        query.cursor = stale_cursor;
+        ensure!(matches!(
+            backend.history(&query).await,
+            Err(crate::StateFailure {
+                error: StateError::InvalidQuery(_),
+                ..
+            })
+        ));
+        Ok(())
+    })
+}
+
+#[test]
+fn history_trim_reclaims_large_slack_and_empty_capacity() -> anyhow::Result<()> {
+    for_backends(&[MemoryHistory::Full], |options| async move {
+        let backend = InMemoryBackend::with_options(options)?;
+        let path = p("state://retention/size")?;
+        for value in 0..512 {
+            backend.write_set(&path, Value::integer(value)).await?;
+        }
+        let (floor, initial_capacity) = {
+            let state = backend.inner.read();
+            (state.history[448].at_millis, state.history.capacity())
+        };
+        let too_few_events = crate::StateHistoryTrimLimits {
+            events: NonZeroUsize::MIN.saturating_add(446),
+            ..crate::StateHistoryTrimLimits::default()
+        };
+        ensure!(matches!(
+            backend.trim_before(floor, too_few_events).await,
+            Err(crate::StateFailure {
+                error: StateError::HistoryTrimLimit { .. },
+                ..
+            })
+        ));
+        {
+            let state = backend.inner.read();
+            ensure!(state.history_floor == i64::MIN && state.history.len() == 512);
+        }
+        let trimmed = backend
+            .trim_before(floor, crate::StateHistoryTrimLimits::default())
+            .await?;
+        ensure!(trimmed.removed_events == 448);
+        let compacted_capacity = backend.inner.read().history.capacity();
+        ensure!(
+            compacted_capacity < initial_capacity,
+            "history capacity did not shrink after a large trim"
+        );
+        ensure!(
+            backend.read_at(&path, floor).await?
+                == StateObservation::from(TaintedValue::pristine(Value::integer(448)))
+        );
+
+        let end = backend
+            .inner
+            .read()
+            .history
+            .back()
+            .context("missing last history entry")?
+            .at_millis;
+        let empty_floor = end.checked_add(1).context("history clock exhausted")?;
+        backend
+            .trim_before(empty_floor, crate::StateHistoryTrimLimits::default())
+            .await?;
+        {
+            let state = backend.inner.read();
+            ensure!(state.history.is_empty() && state.history.capacity() == 0);
+        }
+        ensure!(
+            backend.read_at(&path, empty_floor).await?
+                == StateObservation::from(TaintedValue::pristine(Value::integer(511)))
+        );
+        backend.write_set(&path, Value::integer(512)).await?;
+        ensure!(
+            backend
+                .inner
+                .read()
+                .history
+                .front()
+                .context("missing new event")?
+                .at_millis
+                >= empty_floor
+        );
+        ensure!(
+            backend.read_at(&path, i64::MAX).await?
+                == StateObservation::from(TaintedValue::pristine(Value::integer(512)))
+        );
         Ok(())
     })
 }

@@ -4,6 +4,11 @@
 //! in-memory index is a rebuildable projection; no asynchronous rollback can
 //! delete a newer record. Recall validates generations before attaching scores
 //! to records and repairs observed stale hits before repeating the search.
+//! Consolidation admits the entire namespace against record, encoded-record
+//! and projected-text limits before writing summaries. Word sets borrow the
+//! admitted text and cooperative work yields every 1024 inspected tokens,
+//! including within a single comparison. Admission rejection writes nothing;
+//! later storage failures do not roll back independently committed summaries.
 
 use crate::error::ObservedFailure;
 use crate::index::IndexDriver;
@@ -12,19 +17,20 @@ use crate::rank::RankerDriver;
 use crate::retrieval::{Embedding, EmbeddingRepresentation, admission::invalid};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use xolotl_kernel::{Driver, DriverContext, DriverError, DriverOutput, MethodSpec};
 use xolotl_state::{Backend, StateError, StateFailure, TaintedValue};
 use xolotl_types::{
-    FloatBits, MethodId, Outcome, OutputMode, Path, Purity, TaintSet, TaintSource, Value, ValueMap,
-    ValueText, ValueView,
+    Failure, FloatBits, MethodId, Outcome, OutputMode, Path, Purity, TaintSet, TaintSource, Value,
+    ValueMap, ValueText, ValueView,
 };
 
 mod text;
 use text::entry_text;
 mod entry;
 use entry::*;
-mod consolidation;
+pub(crate) mod consolidation;
 use consolidation::consolidate;
 mod projection;
 mod recall;
@@ -52,12 +58,44 @@ impl Tier {
 }
 
 pub(crate) const MEMORY_METHODS: &[MethodSpec] = &[
-    MethodSpec::new("store", Purity::Idempotent, MethodSpec::UNARY_ASYNC),
-    MethodSpec::new("recall", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external(),
-    MethodSpec::new("forget", Purity::Effectful, MethodSpec::UNARY_ASYNC),
-    MethodSpec::new("commit", Purity::Idempotent, MethodSpec::UNARY_ASYNC),
-    MethodSpec::new("consolidate", Purity::Effectful, MethodSpec::UNARY_ASYNC),
-    MethodSpec::new("rebuild", Purity::Idempotent, MethodSpec::UNARY_ASYNC).observes_external(),
+    MethodSpec::new(
+        "store",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Idempotent,
+        MethodSpec::UNARY_ASYNC,
+    ),
+    MethodSpec::new(
+        "recall",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Pure,
+        MethodSpec::UNARY_ASYNC,
+    )
+    .observes_external(),
+    MethodSpec::new(
+        "forget",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Effectful,
+        MethodSpec::UNARY_ASYNC,
+    ),
+    MethodSpec::new(
+        "commit",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Idempotent,
+        MethodSpec::UNARY_ASYNC,
+    ),
+    MethodSpec::new(
+        "consolidate",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Effectful,
+        MethodSpec::UNARY_ASYNC,
+    ),
+    MethodSpec::new(
+        "rebuild",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Idempotent,
+        MethodSpec::UNARY_ASYNC,
+    )
+    .observes_external(),
 ];
 
 pub(crate) struct MemoryDriver {
@@ -65,6 +103,8 @@ pub(crate) struct MemoryDriver {
     index: Arc<IndexDriver>,
     ranker: Arc<RankerDriver>,
     embedder: Arc<dyn InferenceBackend>,
+    repair_attempts: NonZeroUsize,
+    consolidation_limits: consolidation::ConsolidationLimits,
 }
 
 #[derive(Clone)]
@@ -81,6 +121,8 @@ impl MemoryDriver {
             index: Arc::new(IndexDriver::new()),
             ranker: Arc::new(RankerDriver::new()),
             embedder: Arc::new(EchoBackend),
+            repair_attempts: crate::retrieval::DEFAULT_REPAIR_ATTEMPTS,
+            consolidation_limits: consolidation::ConsolidationLimits::default(),
         }
     }
 
@@ -96,6 +138,19 @@ impl MemoryDriver {
 
     pub(crate) fn with_embedder(mut self, embedder: Arc<dyn InferenceBackend>) -> Self {
         self.embedder = embedder;
+        self
+    }
+
+    pub(crate) fn with_repair_attempts(mut self, attempts: NonZeroUsize) -> Self {
+        self.repair_attempts = attempts;
+        self
+    }
+
+    pub(crate) fn with_consolidation_limits(
+        mut self,
+        limits: consolidation::ConsolidationLimits,
+    ) -> Self {
+        self.consolidation_limits = limits;
         self
     }
 
@@ -151,13 +206,17 @@ impl MemoryDriver {
         )
     }
 
-    async fn forget_from_input(&self, input: &ValueMap) -> Result<DriverOutput, ObservedFailure> {
+    async fn forget_from_input(
+        &self,
+        input: &ValueMap,
+        input_taint: &TaintSet,
+    ) -> Result<DriverOutput, ObservedFailure> {
         let owner = required_segment(input, "owner")?;
         let namespace = namespace_from_input(input)?;
         if optional_bool(input, "confirm_all", false)? {
             let mut pages =
                 scan::NamespaceScan::new(&self.state, namespace_path(&owner, &namespace)?);
-            let mut taint = TaintSet::pristine();
+            let mut taint = input_taint.clone();
             let mut count = 0_i64;
             while let Some(page) = pages
                 .next()
@@ -170,7 +229,7 @@ impl MemoryDriver {
                     validate_stored_entry(&path, &owner, &namespace, &entry.value)
                         .map_err(|error| ObservedFailure::from(error).with_taint(&taint))?;
                     let (removed, observed) = self
-                        .delete_entry_with_index(&entry)
+                        .delete_entry_with_index(&entry, &taint)
                         .await
                         .map_err(|error| error.with_taint(&taint))?;
                     taint.union(&observed);
@@ -183,42 +242,56 @@ impl MemoryDriver {
         }
         let id = required_segment(input, "id")?;
         let path = memory_path(&owner, &namespace, &id)?;
-        let Some(entry) = self.state.read_tainted(&path).await.map_err(state_error)? else {
-            return Ok(DriverOutput::new(Outcome::Done(Value::boolean(false))));
+        let entry = self
+            .state
+            .read_tainted(&path)
+            .await
+            .map_err(|error| state_error(error).with_taint(input_taint))?;
+        let mut observed = input_taint.clone();
+        observed.union(&entry.taint);
+        let Some(value) = entry.value else {
+            return Ok(DriverOutput::new(Outcome::Done(Value::boolean(false))).with_taint(observed));
         };
-        validate_stored_entry(&path, &owner, &namespace, &entry.value)
-            .map_err(|error| ObservedFailure::from(error).with_taint(&entry.taint))?;
-        let (removed, observed) = self.delete_entry_with_index(&entry).await?;
+        let entry = TaintedValue::new(value, entry.taint);
+        validate_stored_entry(&path, &owner, &namespace, &entry.value).map_err(|error| {
+            ObservedFailure::from(error)
+                .with_taint(&entry.taint)
+                .with_taint(input_taint)
+        })?;
+        let (removed, observed) = self.delete_entry_with_index(&entry, input_taint).await?;
         Ok(DriverOutput::new(Outcome::Done(Value::boolean(removed))).with_taint(observed))
     }
 
     async fn delete_entry_with_index(
         &self,
         entry: &TaintedValue,
+        input_taint: &TaintSet,
     ) -> Result<(bool, TaintSet), ObservedFailure> {
+        let mut observed = input_taint.clone().merged(&entry.taint);
         let path = entry_path(&entry.value)
-            .map_err(|error| ObservedFailure::from(error).with_taint(&entry.taint))?;
+            .map_err(|error| ObservedFailure::from(error).with_taint(&observed))?;
         match self
             .state
-            .write_compare_delete(&path, Some(entry.value.clone()))
+            .write_compare_delete_tainted(&path, Some(entry.value.clone()), observed.clone())
             .await
         {
             Ok(commit) => {
+                observed.union(&commit.taint);
                 let indexed = indexed_entry(&entry.value)
-                    .map_err(|error| ObservedFailure::from(error).with_taint(&entry.taint))?;
+                    .map_err(|error| ObservedFailure::from(error).with_taint(&observed))?;
                 self.index
                     .delete_generation(&indexed.space_id, &indexed.id, Some(&indexed.generation))
-                    .map_err(|error| ObservedFailure::from(error).with_taint(&entry.taint))?;
-                Ok((true, entry.taint.clone().merged(&commit.taint)))
+                    .map_err(|error| ObservedFailure::from(error).with_taint(&observed))?;
+                Ok((true, observed))
             }
             Err(StateFailure {
                 error: StateError::CasFailed { .. },
                 mut taint,
             }) => {
-                taint.union(&entry.taint);
+                taint.union(&observed);
                 Ok((false, taint))
             }
-            Err(error) => Err(state_error(error).with_taint(&entry.taint)),
+            Err(error) => Err(state_error(error).with_taint(&observed)),
         }
     }
 
@@ -229,10 +302,14 @@ impl MemoryDriver {
     ) -> Result<DriverOutput, ObservedFailure> {
         let owner = required_segment(input, "owner")?;
         let namespace = namespace_from_input(input)?;
-        let (entries, observed) = self.load_namespace_entries(&owner, &namespace).await?;
+        let (entries, observed) = self
+            .load_namespace_entries_with_limits(&owner, &namespace, Some(self.consolidation_limits))
+            .await
+            .map_err(|error| error.with_taint(&ctx.taint))?;
         let mut taint = ctx.taint.clone();
         taint.union(&observed);
-        let summaries = consolidate(&entries, &owner, &namespace, ctx)
+        let summaries = consolidate(&entries, &owner, &namespace, ctx, self.consolidation_limits)
+            .await
             .map_err(|error| ObservedFailure::from(error).with_taint(&taint))?;
         let count = summaries.len();
         for (path, mut summary) in summaries {
@@ -245,22 +322,74 @@ impl MemoryDriver {
         Ok(DriverOutput::new(Outcome::Done(Value::integer(count as i64))).with_taint(taint))
     }
 
+    #[cfg(test)]
     async fn load_namespace_entries(
         &self,
         owner: &str,
         namespace: &str,
     ) -> Result<(Vec<(Path, TaintedValue)>, TaintSet), ObservedFailure> {
+        self.load_namespace_entries_with_limits(owner, namespace, None)
+            .await
+    }
+
+    async fn load_namespace_entries_with_limits(
+        &self,
+        owner: &str,
+        namespace: &str,
+        limits: Option<consolidation::ConsolidationLimits>,
+    ) -> Result<(Vec<(Path, TaintedValue)>, TaintSet), ObservedFailure> {
         let mut pages = scan::NamespaceScan::new(&self.state, namespace_path(owner, namespace)?);
         let mut entries = Vec::new();
         let mut taint = TaintSet::pristine();
-        while let Some(page) = pages
-            .next()
-            .await
-            .map_err(|error| state_error(error).with_taint(&taint))?
-        {
+        let mut remaining = limits.map_or(usize::MAX, |limits| limits.encoded_bytes.get());
+        loop {
+            let remaining_records =
+                limits.map_or(usize::MAX, |limits| limits.records.get() - entries.len());
+            let page = if let Some(limits) = limits {
+                pages
+                    .next_bounded(remaining_records, remaining, limits.encoded_bytes)
+                    .await
+            } else {
+                pages.next().await
+            }
+            .map_err(|error| {
+                if limits.is_some()
+                    && matches!(error.error, StateError::RowTooLarge(_))
+                    && (remaining_records == 0 || remaining == 0)
+                {
+                    ObservedFailure::from(invalid(if remaining_records == 0 {
+                        "memory consolidation record limit exceeded"
+                    } else {
+                        "memory consolidation encoded byte limit exceeded"
+                    }))
+                    .with_taint(&error.taint)
+                    .with_taint(&taint)
+                } else {
+                    state_error(error).with_taint(&taint)
+                }
+            })?;
+            let Some(page) = page else {
+                break;
+            };
             taint.union(&page.taint);
             for (path, entry) in page.entries {
                 taint.union(&entry.taint);
+                if let Some(limits) = limits {
+                    if entries.len() == limits.records.get() {
+                        return Err(ObservedFailure::from(invalid(
+                            "memory consolidation record limit exceeded",
+                        ))
+                        .with_taint(&taint));
+                    }
+                    let bytes = xolotl_state::host::encoded_size(&entry)
+                        .map_err(|error| state_error(error).with_taint(&taint))?;
+                    remaining = remaining.checked_sub(bytes).ok_or_else(|| {
+                        ObservedFailure::from(invalid(
+                            "memory consolidation encoded byte limit exceeded",
+                        ))
+                        .with_taint(&taint)
+                    })?;
+                }
                 validate_stored_entry(&path, owner, namespace, &entry.value)
                     .map_err(|error| ObservedFailure::from(error).with_taint(&taint))?;
                 entries.push((path, entry));
@@ -283,7 +412,7 @@ impl Driver for MemoryDriver {
         let result = match method.get() {
             0 => self.store_or_commit(&fields, Tier::Working, ctx).await,
             1 => self.recall_from_input(&fields, &ctx.taint).await,
-            2 => self.forget_from_input(&fields).await,
+            2 => self.forget_from_input(&fields, &ctx.taint).await,
             3 => {
                 self.store_or_commit(&fields, tier_from_input(&fields)?, ctx)
                     .await
@@ -294,7 +423,9 @@ impl Driver for MemoryDriver {
                 let namespace = namespace_from_input(&fields)?;
                 self.rebuild_namespace(&owner, &namespace)
                     .await
-                    .map(|(count, taint)| {
+                    .map_err(|error| error.with_taint(&ctx.taint))
+                    .map(|(count, observed)| {
+                        let taint = ctx.taint.clone().merged(&observed);
                         DriverOutput::new(Outcome::Done(Value::integer(count))).with_taint(taint)
                     })
             }
@@ -308,10 +439,15 @@ impl Driver for MemoryDriver {
 }
 
 fn state_error(failure: StateFailure) -> ObservedFailure {
-    ObservedFailure {
-        error: DriverError::Other(format!("memory state operation failed: {}", failure.error)),
-        taint: failure.taint,
-    }
+    ObservedFailure::from(failure)
+}
+
+fn repair_exhausted(taint: &TaintSet) -> ObservedFailure {
+    ObservedFailure::from(Failure::HandlerError {
+        kind: "memory_repair_exhausted".into(),
+        message: "memory projection did not stabilize within the configured repair attempts".into(),
+    })
+    .with_taint(taint)
 }
 fn internal_ctx(taint: &TaintSet) -> DriverContext {
     DriverContext::new(

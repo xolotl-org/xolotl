@@ -55,6 +55,9 @@ fn secure_envelope_context_must_match_session() -> Result<()> {
         presentation_config_generation: 6,
         alias_catalog_generation: 7,
         session_id: "session".into(),
+        scope_epoch: 1,
+        installation_epoch: 1,
+        key_epoch: 0,
     };
     let credential = ExternalCredential::new("install", 2, [0x52; 32]);
     let envelope = credential

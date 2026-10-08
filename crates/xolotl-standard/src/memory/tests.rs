@@ -7,6 +7,7 @@ use xolotl_types::{
 };
 
 mod consistency;
+mod consolidation;
 
 fn dense(values: Value) -> Value {
     Value::map(BTreeMap::from([
@@ -132,6 +133,29 @@ impl InferenceBackend for OtherSpaceEmbedder {
 
 fn driver(state: Backend) -> MemoryDriver {
     MemoryDriver::new(state).with_embedder(Arc::new(BagOfWordsEmbedder))
+}
+
+#[tokio::test]
+async fn forgetting_an_absent_entry_preserves_deletion_evidence() -> anyhow::Result<()> {
+    let state = InMemoryBackend::new().into_backend();
+    let path = memory_path("alice", DEFAULT_NAMESPACE, "deleted")?;
+    let sources = TaintSet::of(TaintSource::Protected { path: path.clone() });
+    state
+        .write_set_tainted(&path, Value::null(), sources.clone())
+        .await?;
+    state.write_delete(&path).await?;
+    let context = tainted_ctx(2);
+    let output = driver(state)
+        .call(
+            MethodId::new(2),
+            forget_input("alice", DEFAULT_NAMESPACE, "deleted"),
+            OutputMode::Unary,
+            &context,
+        )
+        .await?;
+    ensure!(output.outcome == Outcome::Done(Value::boolean(false)));
+    ensure!(output.taint == context.taint.merged(&sources));
+    Ok(())
 }
 
 #[tokio::test]
@@ -299,7 +323,7 @@ fn embedding_envelope() -> BTreeMap<String, Value> {
 fn tensor_sidecar() -> Value {
     Value::from(TensorRef {
         blob: BlobRef {
-            hash: "a".repeat(64),
+            hash: "a".repeat(96),
             size: 8,
             mime: None,
         },
@@ -458,7 +482,7 @@ async fn malformed_embeddings_leave_existing_memory_and_index_unchanged() -> any
         "representation".into(),
         EmbeddingRepresentation::Tensor(TensorRef {
             blob: BlobRef {
-                hash: "a".repeat(64),
+                hash: "a".repeat(96),
                 size: 8,
                 mime: None,
             },
@@ -868,47 +892,69 @@ async fn same_id_different_content_is_rejected() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn forget_deletes_state_and_index_for_one_entry() -> anyhow::Result<()> {
-    let state: Backend = InMemoryBackend::new().into_backend();
-    let index = Arc::new(IndexDriver::new());
-    let rank = Arc::new(RankerDriver::new());
-    let d = MemoryDriver::new(state)
-        .with_retrieval_stack(index.clone(), rank)
-        .with_embedder(Arc::new(BagOfWordsEmbedder));
-    d.call(
-        MethodId::new(0),
-        store_with_id(
-            "bob",
-            DEFAULT_NAMESPACE,
-            "coffee",
-            Value::string("coffee".into()),
-        ),
-        OutputMode::Unary,
-        &ctx(1),
-    )
-    .await
-    .map_err(anyhow::Error::msg)?;
-    d.call(
-        MethodId::new(2),
-        forget_input("bob", DEFAULT_NAMESPACE, "coffee"),
-        OutputMode::Unary,
-        &ctx(2),
-    )
-    .await
-    .map_err(anyhow::Error::msg)?;
+    for confirm_all in [false, true] {
+        let state: Backend = InMemoryBackend::new().into_backend();
+        let index = Arc::new(IndexDriver::new());
+        let rank = Arc::new(RankerDriver::new());
+        let d = MemoryDriver::new(state.clone())
+            .with_retrieval_stack(index.clone(), rank)
+            .with_embedder(Arc::new(BagOfWordsEmbedder));
+        d.call(
+            MethodId::new(0),
+            store_with_id(
+                "bob",
+                DEFAULT_NAMESPACE,
+                "coffee",
+                Value::string("coffee".into()),
+            ),
+            OutputMode::Unary,
+            &ctx(1),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let path = memory_path("bob", DEFAULT_NAMESPACE, "coffee")?;
+        let mut events = state.subscribe(&path).await?;
+        let deletion_ctx = tainted_ctx(2);
+        let current = state.read_tainted(&path).await?.taint;
+        let expected = deletion_ctx.taint.clone().merged(&current);
+        let mut input = forget_input("bob", DEFAULT_NAMESPACE, "coffee")
+            .as_map()
+            .context("forget input is not a map")?
+            .clone();
+        input.insert("confirm_all".into(), Value::boolean(confirm_all))?;
+        let output = d
+            .call(
+                MethodId::new(2),
+                Value::from(input),
+                OutputMode::Unary,
+                &deletion_ctx,
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+        ensure!(output.taint == expected);
+        ensure!(
+            events.try_recv()?
+                == xolotl_state::StateEvent::Delete {
+                    path: path.clone(),
+                    taint: expected
+                }
+        );
+        ensure!(state.read_tainted(&path).await?.value.is_none());
 
-    let mut q = BTreeMap::new();
-    q.insert(
-        "space_id".into(),
-        Value::string("memory/bob/general/test-bow".into()),
-    );
-    q.insert(
-        "representation".into(),
-        dense(Value::list(vec![Value::float(FloatBits(1.0)); 11])),
-    );
-    let search = index
-        .call(MethodId::new(1), Value::map(q), OutputMode::Unary, &ctx(3))
-        .await;
-    ensure!(search.is_err(), "forgotten entry should not remain indexed");
+        let mut q = BTreeMap::new();
+        q.insert(
+            "space_id".into(),
+            Value::string("memory/bob/general/test-bow".into()),
+        );
+        q.insert(
+            "representation".into(),
+            dense(Value::list(vec![Value::float(FloatBits(1.0)); 11])),
+        );
+        let search = index
+            .call(MethodId::new(1), Value::map(q), OutputMode::Unary, &ctx(3))
+            .await;
+        ensure!(search.is_err(), "forgotten entry should not remain indexed");
+    }
     Ok(())
 }
 

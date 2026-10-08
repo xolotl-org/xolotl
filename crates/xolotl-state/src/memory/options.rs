@@ -5,11 +5,12 @@ use std::num::NonZeroUsize;
 pub enum MemoryHistory {
     /// Retain every mutation for history pages and historical `read_at` queries.
     /// This is unbounded and retains shared value snapshots in the history.
-    #[default]
     Full,
-    /// Retain current values and provenance only. Historical queries return
-    /// `Unsupported`; `read_at(path, 0)` still reads the current value.
+    /// Retain current values and provenance only. The assembled [`crate::Backend`]
+    /// omits its history capability; historical queries return `MissingCapability`.
+    /// Direct `read_at(path, 0)` still reads the current value.
     /// Notifications remain ordered, but no historical timestamps are produced.
+    #[default]
     Disabled,
 }
 
@@ -28,6 +29,16 @@ pub struct InMemoryOptions {
     /// This counts events, not payload bytes; slow receivers can still lag.
     /// Must not exceed [`Self::MAX_NOTIFICATION_CAPACITY`].
     pub notification_capacity: NonZeroUsize,
+    /// Maximum retained ordered Source stream positions across this storage
+    /// owner. Existing streams may advance when the limit is reached; new
+    /// identities are refused before their first event is committed.
+    pub source_stream_limit: NonZeroUsize,
+    /// Maximum retained Source event/receipt pairs plus rate records across
+    /// all scopes. Replacements reuse slots; maintenance returns them.
+    /// Per-record bounds remain separate; this is not an RSS limit.
+    pub source_retention_limit: NonZeroUsize,
+    /// Transactional retained current absence limits, independent of history.
+    pub absence_limits: crate::AbsenceLimits,
 }
 
 impl InMemoryOptions {
@@ -35,14 +46,19 @@ impl InMemoryOptions {
     /// This keeps broadcast buffer sizes representable independently of Tokio's
     /// private slot layout. It is not a payload byte limit or an allocation guarantee.
     pub const MAX_NOTIFICATION_CAPACITY: usize = 1 << 20;
+    /// Largest selectable retained Source stream position limit.
+    pub const MAX_SOURCE_STREAM_LIMIT: usize = 65_536;
 }
 
 impl Default for InMemoryOptions {
     fn default() -> Self {
         Self {
             read_shards: NonZeroUsize::MIN,
-            history: MemoryHistory::Full,
+            history: MemoryHistory::Disabled,
             notification_capacity: NonZeroUsize::MIN.saturating_add(255),
+            source_stream_limit: NonZeroUsize::MIN.saturating_add(4095),
+            source_retention_limit: NonZeroUsize::MIN.saturating_add(65_535),
+            absence_limits: crate::AbsenceLimits::default(),
         }
     }
 }

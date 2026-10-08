@@ -1,5 +1,6 @@
 use anyhow::{Context, ensure};
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,10 +10,11 @@ use xolotl_state::object::{
     UploadOptions,
 };
 use xolotl_state::{
-    InMemoryBackend, StateError, StateMutation, StateRead, StateResult, StateWrite,
+    InMemoryBackend, StateBoundedRead, StateBoundedWrite, StateError, StateMutation, StateRead,
+    StateResult, StateWrite,
 };
 use xolotl_storage_fs::FileObjectStore;
-use xolotl_types::{BlobRef, Path, TaintSet, Value};
+use xolotl_types::{BlobRef, Path, TaintSet, TaintedValue, Value};
 
 type Operation<'a, T> = Pin<Box<dyn Future<Output = StateResult<T>> + Send + 'a>>;
 
@@ -142,6 +144,7 @@ pub struct ProbeOptions {
     pub write: Option<Pause>,
     pub commit: Option<Pause>,
     pub commit_barrier: Option<Arc<Barrier>>,
+    pub uncertain_commit: bool,
 }
 
 pub struct ProbeStore {
@@ -321,6 +324,12 @@ impl ObjectWrite for ProbeStore {
             {
                 pause.gate.block().await?;
             }
+            if self.options.uncertain_commit {
+                return Err(xolotl_state::StateFailure::new(
+                    StateError::CommitUncertain("test lost export commit verdict".into()),
+                    final_taint.clone(),
+                ));
+            }
             Ok(metadata)
         })
     }
@@ -358,13 +367,26 @@ impl StateRead for ReceiptState {
     }
 }
 
+impl StateBoundedRead for ReceiptState {
+    type BoundedRead<'a> = <InMemoryBackend as StateBoundedRead>::BoundedRead<'a>;
+
+    fn read_tainted_bounded<'a>(
+        &'a self,
+        path: &'a Path,
+        max_encoded_bytes: NonZeroUsize,
+    ) -> Self::BoundedRead<'a> {
+        self.inner.read_tainted_bounded(path, max_encoded_bytes)
+    }
+}
+
 impl StateWrite for ReceiptState {
     type Write<'a> = Operation<'a, xolotl_state::StateCommit>;
     fn mutate<'a>(&'a self, path: &'a Path, mutation: StateMutation) -> Self::Write<'a> {
         Box::pin(async move {
             let changes_receipt = matches!(&mutation, StateMutation::CompareSet { value, .. }
                 if value.value.as_map().is_some_and(|map|
-                    map.get("committed") == Some(&Value::boolean(true)) && map.get("used") == Some(&Value::boolean(self.used))));
+                    map.get("committed_items").and_then(Value::as_list).is_some_and(|items| !items.is_empty())
+                        && map.get("used_by").is_some() == self.used));
             if changes_receipt && !self.pause.after {
                 self.pause.gate.block().await?;
             }
@@ -378,6 +400,55 @@ impl StateWrite for ReceiptState {
             }
             Ok(commit)
         })
+    }
+}
+
+impl StateBoundedWrite for ReceiptState {
+    type BoundedWrite<'a> = Operation<'a, xolotl_state::StateCommit>;
+
+    fn compare_set_bounded<'a>(
+        &'a self,
+        path: &'a Path,
+        expected: Option<Value>,
+        value: TaintedValue,
+        limit: NonZeroUsize,
+    ) -> Self::BoundedWrite<'a> {
+        Box::pin(async move {
+            let changes_receipt = value.value.as_map().is_some_and(|map| {
+                map.get("committed_items")
+                    .and_then(Value::as_list)
+                    .is_some_and(|items| !items.is_empty())
+                    && map.get("used_by").is_some() == self.used
+            });
+            if changes_receipt && !self.pause.after {
+                self.pause.gate.block().await?;
+            }
+            let commit = self
+                .inner
+                .compare_set_bounded(path, expected, value, limit)
+                .await?;
+            if changes_receipt && self.pause.after {
+                self.pause
+                    .gate
+                    .block()
+                    .await
+                    .map_err(|failure| failure.with_taint(&commit.taint))?;
+            }
+            Ok(commit)
+        })
+    }
+
+    fn compare_delete_bounded<'a>(
+        &'a self,
+        path: &'a Path,
+        expected: Option<Value>,
+        taint: TaintSet,
+        limit: NonZeroUsize,
+    ) -> Self::BoundedWrite<'a> {
+        Box::pin(
+            self.inner
+                .compare_delete_bounded(path, expected, taint, limit),
+        )
     }
 }
 

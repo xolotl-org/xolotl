@@ -21,7 +21,7 @@ pub enum Receive<T, E> {
 }
 
 /// Single-owner channel backed by caller-provided slots. Thread synchronization,
-/// wakeups and durable logging belong to the host adapter.
+/// wakeups belong to the host adapter.
 pub struct Channel<'a, T, E> {
     slots: &'a mut [Option<T>],
     head: usize,

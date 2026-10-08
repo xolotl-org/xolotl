@@ -3,8 +3,8 @@
 //! An [`Operation`] is the *only* way a side effect happens. Its identity,
 //! [`OperationId`], combines its process, execution scope, dynamic invocation,
 //! source position, and retry attempt. A [`Fact`] records one operation attempt;
-//! stores complete its pending record in place. Recovery diagnostics, audit,
-//! billing and trace projections read Facts. Blob, tensor and frame payloads use
+//! stores complete its pending record in place. Optional diagnostics, audit,
+//! and trace projections read Facts. Blob, tensor and frame payloads use
 //! external references; other inline values and retained history need host limits.
 
 use crate::ids::{
@@ -25,7 +25,7 @@ pub use output::{CompletionOrigin, DriverOutput, DriverUsage, UsageDimension};
 ///
 /// Source positions remain stable when a node is visited again. Invocation
 /// tickets distinguish those visits; execution scopes distinguish independent
-/// evaluations. Checkpoint restoration preserves every coordinate.
+/// evaluations. Observations of the same attempt retain every coordinate.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct OperationId {
     /// Process that owns this causal position.
@@ -36,7 +36,7 @@ pub struct OperationId {
     pub invocation: InvocationId,
     /// Stable position in the compiled graph = `NodeId`.
     pub position: CausalPosition,
-    /// Incremented only on explicit retry; crash-replay reuses the same value.
+    /// Incremented only on explicit retry.
     pub attempt: u32,
 }
 
@@ -183,8 +183,6 @@ pub enum DecisionTag {
     Timeout,
     /// Operation was cancelled.
     Cancelled,
-    /// Held in quarantine (unsafe replay).
-    Quarantined,
 }
 
 impl DecisionTag {
@@ -195,8 +193,7 @@ impl DecisionTag {
 }
 
 /// Compact shape/cost metadata for one explicit batchable Operation.
-/// Recovery still uses the complete outcome, so summarizing a batch preserves the
-/// completed result.
+/// Summarizing a batch preserves its complete outcome and completed result.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BatchSummary {
     /// Number of elements in the batch input list.

@@ -1,15 +1,10 @@
 use crate::frame::{Frame, FrameKind, FramePool, FramePoolMeta, Stack};
 use crate::{Fault, Join, NodeKind, ProgramImage, Values};
 
-mod mapping;
 mod references;
-
-/// Current execution checkpoint format, independent of the instruction format.
-pub const CHECKPOINT_VERSION: u32 = 1;
 
 /// Host-selected bounds. All limits apply independently of source language.
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ExecutionLimits {
     /// Maximum simultaneous continuations held by each task.
     pub frames_per_task: usize,
@@ -20,8 +15,6 @@ pub struct ExecutionLimits {
     pub max_steps: Option<u64>,
     /// Additional transitions available for cancellation and cleanup.
     pub cleanup_steps: u64,
-    /// Host assertion that durable journal barriers are available.
-    pub durable: bool,
 }
 
 impl Default for ExecutionLimits {
@@ -31,13 +24,11 @@ impl Default for ExecutionLimits {
             bindings_per_task: 64,
             max_steps: None,
             cleanup_steps: 4096,
-            durable: false,
         }
     }
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 enum State<V, E> {
     Free,
     Ready,
@@ -45,19 +36,44 @@ enum State<V, E> {
         ticket: u64,
         node: u32,
     },
-    Joining {
-        left: usize,
-        right: usize,
-        join: Join,
-        node: u32,
-    },
+    Joining(JoinState),
     Returning(Result<V, E>),
     Done(Result<V, E>),
+    Halted {
+        outcome: Result<V, E>,
+        join: Option<JoinState>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct JoinState {
+    left: usize,
+    right: usize,
+    join: Join,
+    node: u32,
+}
+
+impl<V, E> State<V, E> {
+    fn terminal_result(&self) -> Option<&Result<V, E>> {
+        match self {
+            Self::Done(outcome) | Self::Halted { outcome, .. } => Some(outcome),
+            _ => None,
+        }
+    }
+
+    fn join(&self) -> Option<&JoinState> {
+        match self {
+            Self::Joining(join)
+            | Self::Halted {
+                join: Some(join), ..
+            } => Some(join),
+            _ => None,
+        }
+    }
 }
 
 /// One task slot. Values and frame storage are bounded by the host's slices.
 #[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Task<V, E> {
     state: State<V, E>,
     pc: u32,
@@ -107,7 +123,7 @@ pub struct Request<V> {
 /// Result of bounded cooperative execution.
 #[derive(Clone, Debug)]
 pub enum Advance<V, E> {
-    /// Dispatch only after the host checks the import's authority and journal.
+    /// Dispatch only after the host checks the import's authority and admission.
     Request(Request<V>),
     /// Host must cancel the pending request before delivering its cancellation.
     Cancel {
@@ -154,37 +170,35 @@ pub struct Execution<'a, V, E> {
     image_id: [u8; 32],
 }
 
-/// Scalar checkpoint metadata. Storage backends must persist this and all three
-/// accompanying slices together, before acknowledging a durable checkpoint.
+/// Live controller state retained while the host grows its storage.
+/// Resume with the same values, slots and pending I/O; this is not a persisted image.
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct CheckpointMeta {
-    /// Checkpoint format version.
-    pub version: u32,
-    /// Compiler-generated identity of the immutable image.
+pub struct SuspendedExecution {
+    task_count: usize,
+    frame_count: usize,
+    /// Compiler-generated identity of the active image.
     pub image_id: [u8; 32],
-    /// Storage layout and execution bounds used by this checkpoint.
+    /// Storage layout and execution bounds; the host may increase capacities.
     pub limits: ExecutionLimits,
     /// Shared frame-pool allocation state.
-    pub frame_pool: FramePoolMeta,
+    frame_pool: FramePoolMeta,
     /// Ordinary transitions already consumed.
     pub steps: u64,
     /// Cancellation transitions already consumed.
-    pub cleanup_steps: u64,
-    /// Highest request token issued before checkpointing.
-    pub ticket: u64,
+    cleanup_steps: u64,
+    /// Highest request token issued before suspension.
+    ticket: u64,
     /// Next scheduler slot, preserving cooperative ordering.
-    pub cursor: usize,
+    cursor: usize,
     /// Whether cancellation has started.
-    pub aborting: bool,
+    aborting: bool,
 }
 
-/// Borrowed checkpoint view. A host may copy it into fixed buffers or encode it
-/// using its own storage adapter. Values must remain valid across restoration.
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
-pub struct Checkpoint<'a, V, E> {
-    /// Metadata persisted atomically with the storage slices.
-    pub meta: CheckpointMeta,
+/// Allocation-free inspection of the current live machine.
+/// Borrowed values and slot indices remain owned by the host.
+pub struct ExecutionView<'a, V, E> {
+    /// Live counters and storage bounds.
+    pub meta: SuspendedExecution,
     /// Task slots, including pending requests and completed branch results.
     pub tasks: &'a [Task<V, E>],
     /// Shared continuation storage, with per-task stacks and validated free links.
@@ -193,17 +207,14 @@ pub struct Checkpoint<'a, V, E> {
     pub bindings: &'a [Option<V>],
 }
 
-impl<V, E> Checkpoint<'_, V, E> {
-    /// Borrow the terminal root result without restoring or copying task storage.
-    /// Validate the checkpoint before treating this result as recovery evidence.
+impl<V, E> ExecutionView<'_, V, E> {
+    /// Borrow the terminal root result without copying task storage.
     pub fn result(&self) -> Option<&Result<V, E>> {
-        match &self.tasks.first()?.state {
-            State::Done(result) => Some(result),
-            _ => None,
-        }
+        self.tasks.first()?.state.terminal_result()
     }
 
-    /// Tickets awaiting host completions, without cloning their input payloads.
+    /// Tickets with outstanding host evidence, without cloning input payloads.
+    /// A halted machine retains these for reconciliation, not event delivery.
     pub fn pending_tickets(&self) -> impl Iterator<Item = u64> + '_ {
         self.tasks.iter().filter_map(|task| match task.state {
             State::Waiting { ticket, .. } => Some(ticket),
@@ -211,8 +222,23 @@ impl<V, E> Checkpoint<'_, V, E> {
         })
     }
 
-    /// Inspect pending imports, identities and borrowed inputs before allocating
-    /// restored storage. Validate the checkpoint before relying on this view.
+    /// Opaque contexts held by live task slots and lexical frames.
+    /// Zero is the host's root context.
+    pub fn contexts(&self) -> impl Iterator<Item = u64> + '_ {
+        self.tasks
+            .iter()
+            .filter(|task| !matches!(task.state, State::Free))
+            .map(|task| task.context)
+            .chain(
+                self.frames
+                    .iter()
+                    .flatten()
+                    .filter_map(Frame::saved_context),
+            )
+    }
+
+    /// Inspect pending imports, identities and borrowed inputs without cloning.
+    /// Halted requests retain effect identities, not event-delivery eligibility.
     pub fn pending_requests<'b>(
         &'b self,
         image: &'b ProgramImage<'_, V, E>,
@@ -258,9 +284,6 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
         context: u64,
     ) -> Result<Self, Fault> {
         image.validate()?;
-        if image.durable && !limits.durable {
-            return Err(Fault::DurableUnavailable);
-        }
         if tasks.is_empty() || tasks.len() > u32::MAX as usize {
             return Err(Fault::Tasks);
         }
@@ -292,12 +315,12 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
         })
     }
 
-    /// Capture state without allocating. The image and imports are immutable
-    /// artifacts owned by the host and must be restored with the same identity.
-    pub fn checkpoint(&self) -> Checkpoint<'_, V, E> {
-        Checkpoint {
-            meta: CheckpointMeta {
-                version: CHECKPOINT_VERSION,
+    /// Borrow live tasks, frames, bindings and counters without allocating.
+    pub fn view(&self) -> ExecutionView<'_, V, E> {
+        ExecutionView {
+            meta: SuspendedExecution {
+                task_count: self.tasks.len(),
+                frame_count: self.frames.slots.len(),
                 image_id: self.image_id,
                 limits: self.limits,
                 frame_pool: self.frames.meta,
@@ -315,69 +338,41 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
 
     /// Release the controller's storage borrows and return its resume metadata.
     /// Values remain in the caller's arrays. This is an in-memory handoff, not a
-    /// durable commit or cancellation; hosts must keep pending I/O and its tickets.
-    pub fn suspend(self) -> CheckpointMeta {
-        self.checkpoint().meta
+    /// data commit or cancellation; hosts must keep pending I/O and its tickets.
+    pub fn suspend(self) -> SuspendedExecution {
+        self.view().meta
     }
 
-    /// Restore a host-trusted checkpoint. External effects require separate
-    /// journal reconciliation; a pending request is not permission to retry it.
-    pub fn restore(
-        image: &ProgramImage<'_, V, E>,
-        checkpoint: &Checkpoint<'_, V, E>,
-        tasks: &'a mut [Task<V, E>],
-        frames: &'a mut [Option<Frame<V, E>>],
-        bindings: &'a mut [Option<V>],
-        durability_available: bool,
-    ) -> Result<Self, Fault> {
-        if tasks.len() != checkpoint.tasks.len()
-            || frames.len() != checkpoint.frames.len()
-            || bindings.len() != checkpoint.bindings.len()
-        {
-            return Err(Fault::InvalidCheckpoint);
-        }
-        Self::validate_checkpoint(image, checkpoint, durability_available)?;
-        tasks.clone_from_slice(checkpoint.tasks);
-        frames.clone_from_slice(checkpoint.frames);
-        bindings.clone_from_slice(checkpoint.bindings);
-        Ok(Self::from_checkpoint(
-            checkpoint.meta,
-            tasks,
-            frames,
-            bindings,
-        ))
-    }
-
-    /// Validate and resume checkpoint storage in place, without cloning values.
-    ///
-    /// Hosts may [`Self::suspend`] the controller, grow their arrays, remap binding
-    /// rows to a larger stride, and update the metadata's capacity limits before
-    /// resuming. New task slots must be default-initialized, and new frame/binding
-    /// slots must be empty. Existing indices, values, counters and tickets retain
-    /// their meaning. External effects still require host journal reconciliation.
+    /// Resume live storage in place without cloning values or replaying requests.
+    /// The host preserves existing slots and may grow task/frame arrays and remap
+    /// binding rows to a larger `meta.limits.bindings_per_task` stride.
+    /// New task slots are default-initialized; new frame/binding slots are empty.
     pub fn resume(
         image: &ProgramImage<'_, V, E>,
-        meta: CheckpointMeta,
+        meta: SuspendedExecution,
         tasks: &'a mut [Task<V, E>],
         frames: &'a mut [Option<Frame<V, E>>],
         bindings: &'a mut [Option<V>],
-        durability_available: bool,
     ) -> Result<Self, Fault> {
-        Self::validate_checkpoint(
-            image,
-            &Checkpoint {
-                meta,
-                tasks,
-                frames,
-                bindings,
-            },
-            durability_available,
-        )?;
-        Ok(Self::from_checkpoint(meta, tasks, frames, bindings))
+        if image.id != meta.image_id {
+            return Err(Fault::ImageMismatch);
+        }
+        if tasks.len() < meta.task_count || tasks.len() > u32::MAX as usize {
+            return Err(Fault::Tasks);
+        }
+        if frames.len() < meta.frame_count || frames.len() > u32::MAX as usize {
+            return Err(Fault::Frames);
+        }
+        if meta.limits.bindings_per_task < image.bindings
+            || bindings.len() / tasks.len() < meta.limits.bindings_per_task
+        {
+            return Err(Fault::InvalidBinding);
+        }
+        Ok(Self::from_view(meta, tasks, frames, bindings))
     }
 
-    fn from_checkpoint(
-        meta: CheckpointMeta,
+    fn from_view(
+        meta: SuspendedExecution,
         tasks: &'a mut [Task<V, E>],
         frames: &'a mut [Option<Frame<V, E>>],
         bindings: &'a mut [Option<V>],
@@ -397,162 +392,6 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
             aborting: meta.aborting,
             image_id: meta.image_id,
         }
-    }
-
-    /// Validate persisted state before allocating destination storage or admitting
-    /// a host process. This borrows all values and leaves the checkpoint unchanged.
-    pub fn validate_checkpoint(
-        image: &ProgramImage<'_, V, E>,
-        checkpoint: &Checkpoint<'_, V, E>,
-        durability_available: bool,
-    ) -> Result<(), Fault> {
-        image.validate()?;
-        let meta = checkpoint.meta;
-        if meta.version != CHECKPOINT_VERSION {
-            return Err(Fault::Version);
-        }
-        if meta.image_id != image.id {
-            return Err(Fault::ImageMismatch);
-        }
-        if image.durable && !durability_available {
-            return Err(Fault::DurableUnavailable);
-        }
-        let count = checkpoint.tasks.len();
-        if count == 0
-            || count > u32::MAX as usize
-            || checkpoint.bindings.len() / count < meta.limits.bindings_per_task
-            || image.bindings > meta.limits.bindings_per_task
-            || meta.cursor >= count
-        {
-            return Err(Fault::InvalidCheckpoint);
-        }
-        crate::frame::validate(
-            checkpoint.frames,
-            meta.frame_pool,
-            checkpoint.tasks.iter().map(|task| &task.stack),
-            meta.limits.frames_per_task,
-        )?;
-        for (index, task) in checkpoint.tasks.iter().enumerate() {
-            if index == 0 && task.parent.is_some() {
-                return Err(Fault::InvalidCheckpoint);
-            }
-            if index != 0 && !matches!(task.state, State::Free) {
-                let owner = task.parent.ok_or(Fault::InvalidCheckpoint)?;
-                if !matches!(checkpoint.tasks.get(owner).map(|task| &task.state),
-                    Some(State::Joining { left, right, .. }) if *left == index || *right == index)
-                {
-                    return Err(Fault::InvalidCheckpoint);
-                }
-            }
-            let mut parent = task.parent;
-            let mut depth = 0;
-            while let Some(parent_index) = parent {
-                if parent_index >= count || parent_index == index || depth >= count {
-                    return Err(Fault::InvalidCheckpoint);
-                }
-                parent = checkpoint.tasks[parent_index].parent;
-                depth += 1;
-            }
-            match &task.state {
-                State::Ready => {
-                    image.node(task.pc)?;
-                    if task.input.is_none() {
-                        return Err(Fault::InvalidCheckpoint);
-                    }
-                }
-                State::Waiting { ticket, node } => {
-                    if *ticket == 0
-                        || *ticket > meta.ticket
-                        || task.input.is_none()
-                        || !matches!(
-                            image.node(*node)?.kind,
-                            NodeKind::Request(_) | NodeKind::Scope { .. }
-                        )
-                    {
-                        return Err(Fault::InvalidCheckpoint);
-                    }
-                    if checkpoint.tasks[..index].iter().any(|other| {
-                        matches!(other.state, State::Waiting { ticket: other, .. } if other == *ticket)
-                    }) {
-                        return Err(Fault::InvalidCheckpoint);
-                    }
-                }
-                State::Joining {
-                    left,
-                    right,
-                    node,
-                    join,
-                } => {
-                    if *left >= count
-                        || *right >= count
-                        || left == right
-                        || *left == index
-                        || *right == index
-                        || checkpoint.tasks[*left].parent != Some(index)
-                        || checkpoint.tasks[*right].parent != Some(index)
-                        || matches!(checkpoint.tasks[*left].state, State::Free)
-                        || matches!(checkpoint.tasks[*right].state, State::Free)
-                        || !matches!(image.node(*node)?.kind, NodeKind::Fork { join: expected, .. } if *join == expected)
-                    {
-                        return Err(Fault::InvalidCheckpoint);
-                    }
-                }
-                State::Free if task.parent.is_some() || task.stack.depth != 0 => {
-                    return Err(Fault::InvalidCheckpoint);
-                }
-                _ => {}
-            }
-            let mut frame_index = task.stack.top;
-            for _ in 0..task.stack.depth {
-                let frame = checkpoint.frames[frame_index as usize]
-                    .as_ref()
-                    .ok_or(Fault::InvalidCheckpoint)?;
-                frame_index = frame.previous;
-                match &frame.kind {
-                    FrameKind::Continuation { node, entry } => {
-                        image.node(*entry)?;
-                        if !matches!(image.node(*node)?.kind, NodeKind::Request(_)) {
-                            return Err(Fault::InvalidCheckpoint);
-                        }
-                    }
-                    FrameKind::Finish(node)
-                    | FrameKind::Then(node)
-                    | FrameKind::Catch(node)
-                    | FrameKind::Finally { cleanup: node, .. } => {
-                        image.node(*node)?;
-                    }
-                    FrameKind::Condition {
-                        condition, body, ..
-                    }
-                    | FrameKind::Iteration {
-                        condition, body, ..
-                    } => {
-                        image.node(*condition)?;
-                        image.node(*body)?;
-                    }
-                    FrameKind::Choose { yes, no, .. } => {
-                        image.node(*yes)?;
-                        image.node(*no)?;
-                    }
-                    FrameKind::Bind { slot, body } => {
-                        image.node(*body)?;
-                        if *slot as usize >= meta.limits.bindings_per_task {
-                            return Err(Fault::InvalidCheckpoint);
-                        }
-                    }
-                    FrameKind::Unbind { slot, .. }
-                        if *slot as usize >= meta.limits.bindings_per_task =>
-                    {
-                        return Err(Fault::InvalidCheckpoint);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if matches!(checkpoint.tasks[0].state, State::Free) {
-            return Err(Fault::InvalidCheckpoint);
-        }
-        Ok(())
     }
 
     /// Entries of subprograms still active after [`HostEvent::Continue`].
@@ -579,8 +418,8 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
         Ok(())
     }
 
-    /// Enumerate pending requests after a restore. The host must reconcile each
-    /// with the effect journal before replaying or dispatching it.
+    /// Clone inputs of already-issued live requests for host-side inspection.
+    /// Inspection does not authorize redispatch; use `view` to borrow inputs.
     pub fn pending_requests<'b>(
         &'b self,
         image: &'b ProgramImage<'_, V, E>,
@@ -598,9 +437,10 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
 
     /// True only while a host result is still eligible for delivery.
     pub fn is_pending(&self, task: usize, ticket: u64) -> bool {
-        self.tasks.get(task).is_some_and(
-            |task| matches!(task.state, State::Waiting { ticket: live, .. } if live == ticket),
-        )
+        self.tasks[0].state.terminal_result().is_none()
+            && self.tasks.get(task).is_some_and(
+                |task| matches!(task.state, State::Waiting { ticket: live, .. } if live == ticket),
+            )
     }
 
     /// Retain the currently live data and control dependencies for an embedding
@@ -614,7 +454,12 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
             if let Some(input) = &task.input {
                 control = values.influence(control, input);
             }
-            if let State::Returning(result) | State::Done(result) = &task.state {
+            if let State::Returning(result)
+            | State::Done(result)
+            | State::Halted {
+                outcome: result, ..
+            } = &task.state
+            {
                 let result = values.retain_result(result);
                 control = values.influence(control, &result);
             }
@@ -638,9 +483,15 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
 
     /// Request structured cancellation. Cleanup still receives a bounded budget.
     pub fn cancel(&mut self) {
+        if self.tasks[0].state.terminal_result().is_some() {
+            return;
+        }
         self.aborting = true;
         for task in self.tasks.iter_mut() {
-            if !matches!(task.state, State::Free | State::Done(_)) {
+            if !matches!(
+                task.state,
+                State::Free | State::Done(_) | State::Halted { .. }
+            ) {
                 task.cancelled = true;
             }
         }
@@ -648,7 +499,6 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
 
     fn push(&mut self, task: usize, frame: FrameKind<V, E>) -> Result<(), Fault> {
         self.frames.push(
-            task,
             &mut self.tasks[task].stack,
             frame,
             self.limits.frames_per_task,
@@ -718,13 +568,6 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
         let result = self.influence_result(task, result, values);
         let result = match result {
             Ok(value) => {
-                if let Some(slot) = instruction.save {
-                    if slot as usize >= self.limits.bindings_per_task {
-                        return Err(Fault::InvalidBinding);
-                    }
-                    self.bindings[task * self.limits.bindings_per_task + slot as usize] =
-                        Some(value.clone());
-                }
                 if let Some(next) = instruction.next {
                     self.start(task, next, value);
                     return Ok(());
@@ -749,6 +592,9 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
     ) -> Result<(), Fault> {
         if image.id != self.image_id {
             return Err(Fault::ImageMismatch);
+        }
+        if self.tasks[0].state.terminal_result().is_some() {
+            return Err(Fault::StaleEvent);
         }
         let node = match self.tasks.get(task).map(|task| &task.state) {
             Some(State::Waiting { ticket: live, node }) if *live == ticket => *node,
@@ -810,7 +656,7 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
             return Advance::Done(self.terminal_fault(Fault::ImageMismatch, values));
         }
         for _ in 0..fuel {
-            if let State::Done(result) = &self.tasks[0].state {
+            if let Some(result) = self.tasks[0].state.terminal_result() {
                 return Advance::Done(result.clone());
             }
             if !self.aborting && self.limits.max_steps.is_some_and(|max| self.steps >= max) {
@@ -829,7 +675,7 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
                         }
                         if !matches!(
                             self.tasks[index].state,
-                            State::Joining { .. } | State::Returning(Err(_))
+                            State::Joining(_) | State::Returning(Err(_))
                         ) {
                             self.tasks[index].state = State::Returning(self.fault_result(
                                 index,
@@ -840,9 +686,9 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
                     }
                     let ready = match self.tasks[index].state {
                         State::Waiting { .. } => false,
-                        State::Joining {
+                        State::Joining(JoinState {
                             left, right, join, ..
-                        } => {
+                        }) => {
                             let a = matches!(self.tasks[left].state, State::Done(_));
                             let b = matches!(self.tasks[right].state, State::Done(_));
                             (a && b)
@@ -864,7 +710,10 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
             if self.aborting {
                 if self.cleanup_steps >= self.limits.cleanup_steps {
                     let result = self.terminal_fault(Fault::Fuel, values);
-                    self.tasks[0].state = State::Done(result.clone());
+                    self.tasks[0].state = State::Halted {
+                        outcome: result.clone(),
+                        join: self.tasks[0].state.join().copied(),
+                    };
                     return Advance::Done(result);
                 }
                 self.cleanup_steps += 1;
@@ -933,7 +782,7 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
                     return Ok(None);
                 };
                 match frame {
-                    FrameKind::Vacant => return Err(Fault::InvalidCheckpoint),
+                    FrameKind::Vacant => return Err(Fault::InvalidState),
                     FrameKind::Finish(node) | FrameKind::Continuation { node, .. } => {
                         self.finish(task, node, outcome, image, values)?
                     }
@@ -1059,18 +908,18 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
                     },
                 }
             }
-            State::Joining {
+            State::Joining(JoinState {
                 left,
                 right,
                 join,
                 node,
-            } => {
-                self.tasks[task].state = State::Joining {
+            }) => {
+                self.tasks[task].state = State::Joining(JoinState {
                     left,
                     right,
                     join,
                     node,
-                };
+                });
                 let a = matches!(self.tasks[left].state, State::Done(_));
                 let b = matches!(self.tasks[right].state, State::Done(_));
                 if join == Join::Race && (a || b) {
@@ -1248,18 +1097,19 @@ impl<'a, V: Clone, E: Clone> Execution<'a, V, E> {
                                     .clone();
                             }
                         }
-                        self.tasks[task].state = State::Joining {
+                        self.tasks[task].state = State::Joining(JoinState {
                             left: a,
                             right: b,
                             join: *join,
                             node: pc,
-                        };
+                        });
                     }
                 }
             }
-            state @ (State::Free | State::Waiting { .. } | State::Done(_)) => {
-                self.tasks[task].state = state
-            }
+            state @ (State::Free
+            | State::Waiting { .. }
+            | State::Done(_)
+            | State::Halted { .. }) => self.tasks[task].state = state,
         }
         Ok(None)
     }

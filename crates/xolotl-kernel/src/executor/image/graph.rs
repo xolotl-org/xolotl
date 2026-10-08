@@ -6,16 +6,12 @@ use super::*;
 pub(super) struct NodeLinks {
     pub next: Option<u32>,
     pub arms: [Option<u32>; 2],
-    pub save: Option<u32>,
-    pub load: Option<u32>,
 }
 
 pub(super) fn index_edges(
     graph: &ExecutionGraph,
     ids: &HashMap<NodeId, u32>,
     base: u32,
-    bindings: &mut usize,
-    max_bindings: usize,
 ) -> Result<Vec<NodeLinks>, Failure> {
     let mut nodes = vec![NodeLinks::default(); graph.nodes.len()];
     for edge in &graph.edges {
@@ -26,7 +22,6 @@ pub(super) fn index_edges(
             .get(&edge.to)
             .ok_or_else(|| machine_error("dangling graph edge"))?;
         let source = (from - base) as usize;
-        let target = (to - base) as usize;
         match edge.kind {
             EdgeKind::Then => {
                 if nodes[source].next.replace(to).is_some() {
@@ -41,26 +36,6 @@ pub(super) fn index_edges(
                     .ok_or_else(|| machine_error("too many graph arms"))?;
                 *arm = Some(to);
             }
-            EdgeKind::Use => {
-                if !matches!(graph.nodes[target].kind, NodeKind::Pure(_)) {
-                    return Err(machine_error("binding target must be a value node"));
-                }
-                let slot = match nodes[source].save {
-                    Some(slot) => slot,
-                    None => {
-                        if *bindings >= max_bindings.min(u32::MAX as usize) {
-                            return Err(machine_error("binding capacity exceeded"));
-                        }
-                        let slot = *bindings as u32;
-                        *bindings += 1;
-                        nodes[source].save = Some(slot);
-                        slot
-                    }
-                };
-                if nodes[target].load.replace(slot).is_some() {
-                    return Err(machine_error("multiple values for one binding use"));
-                }
-            }
             EdgeKind::Value | EdgeKind::Else => {
                 return Err(machine_error("unsupported native graph edge"));
             }
@@ -73,8 +48,91 @@ pub(super) fn index_edges(
 mod tests {
     use super::*;
     use anyhow::ensure;
-    use xolotl_graph::{Edge, Node};
+    use xolotl_graph::{DoNode, Edge, Node};
     use xolotl_types::Value;
+
+    #[test]
+    fn native_lexical_slots_are_reused_between_finally_arms() -> anyhow::Result<()> {
+        let local = |value| {
+            DoNode::r#let(
+                "local",
+                DoNode::pure(Value::integer(value)),
+                DoNode::use_("local"),
+            )
+        };
+        let body = (1..64).fold(local(0), |body, value| body.finally(local(value)));
+        let config = crate::ExecutionConfig {
+            bindings_per_task: 1,
+            ..Default::default()
+        };
+        let program = MachineProgram::new(&xolotl_graph::compile_do(&body)?, &config)?;
+        ensure!(program.bindings == 1);
+        ensure!(
+            program
+                .nodes
+                .iter()
+                .filter(|node| matches!(node.kind, Code::Let { slot: 0, .. }))
+                .count()
+                == 64
+        );
+        ensure!(
+            program
+                .nodes
+                .iter()
+                .filter(|node| matches!(node.kind, Code::Load(0)))
+                .count()
+                == 64
+        );
+        program.image().validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn native_lexical_exit_releases_bindings_before_later_host_wait() -> anyhow::Result<()> {
+        use xolotl_core::{Advance, Execution, ExecutionLimits, Task};
+        let body = DoNode::r#let(
+            "payload",
+            DoNode::pure(Value::bytes(vec![0; 1024 * 1024])),
+            DoNode::r#let(
+                "used",
+                DoNode::use_("payload"),
+                DoNode::pure(Value::integer(0)),
+            ),
+        )
+        .and_then(StepRef::new("wait"));
+        let program = MachineProgram::new(
+            &xolotl_graph::compile_do(&body)?,
+            &crate::ExecutionConfig::default(),
+        )?;
+        ensure!(program.bindings == 1);
+        let image = program.image();
+        let mut tasks = vec![Task::default()];
+        let mut frames = vec![None; 16];
+        let mut bindings = vec![None; program.bindings];
+        let limits = ExecutionLimits {
+            frames_per_task: 16,
+            bindings_per_task: program.bindings,
+            ..Default::default()
+        };
+        let mut execution = Execution::new(
+            &image,
+            &mut tasks,
+            &mut frames,
+            &mut bindings,
+            limits,
+            TaintedValue::pristine(Value::null()),
+            1,
+        )?;
+        let mut values = crate::RuntimeValues;
+        let request = match execution.advance(&image, &mut values, 128) {
+            Advance::Request(request) => request,
+            state => anyhow::bail!("expected later host wait, got {state:?}"),
+        };
+        ensure!(request.input.value == Value::integer(0));
+        let _suspended = execution.suspend();
+        ensure!(bindings.iter().all(Option::is_none));
+        Ok(())
+    }
 
     #[test]
     fn native_graph_admission_can_exceed_the_old_fixed_ceiling() -> anyhow::Result<()> {

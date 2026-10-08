@@ -1,4 +1,4 @@
-//! Explicit retention and capacity admission for hosted process records.
+//! Safe retirement and capacity admission for hosted process records.
 
 use super::{ProcessEntry, ProcessTable, ProcessTableInner, ProcessTableShared};
 use std::num::NonZeroUsize;
@@ -38,24 +38,6 @@ pub enum ProcessAdmissionError {
     /// The process identifier space has been exhausted without wrapping.
     #[error("process identifiers exhausted")]
     IdentifierExhausted,
-    /// Historical process identities were discarded by explicit reap.
-    #[cfg(feature = "durable")]
-    #[error("checkpoint admission is closed after process records were reaped")]
-    RecoveryClosed,
-    /// A loaded checkpoint does not match the retained process lifecycle.
-    #[cfg(feature = "durable")]
-    #[error("checkpoint identity, authority or lifecycle mismatch for process {process}")]
-    CheckpointMismatch {
-        /// Process whose retained context must not be replaced.
-        process: ProcessId,
-    },
-    /// This lifecycle has already permanently retired its journal.
-    #[cfg(feature = "durable")]
-    #[error("checkpoint for process {process} was retired")]
-    CheckpointRetired {
-        /// Process whose retired journal must never become a fresh execution.
-        process: ProcessId,
-    },
 }
 
 impl ProcessTableInner {
@@ -77,36 +59,43 @@ impl ProcessTableInner {
         parent: Option<ProcessId>,
     ) -> Result<(), ProcessAdmissionError> {
         self.check_vacancy(id)?;
-        if !parent
+        let unavailable = || ProcessAdmissionError::Unavailable {
+            process: parent.unwrap_or(id),
+        };
+        let entry = parent
             .and_then(|parent| self.procs.get(&parent))
-            .is_some_and(ProcessEntry::accepts_children)
-        {
-            return Err(ProcessAdmissionError::Unavailable {
-                process: parent.unwrap_or(id),
-            });
+            .ok_or_else(unavailable)?;
+        if !entry.accepts_children() {
+            return Err(unavailable());
         }
         Ok(())
     }
 
     pub(super) fn link_entry(&mut self, mut entry: ProcessEntry) -> Option<ProcessEntry> {
         if let Some(parent) = entry.parent {
+            if entry.request_authorizer.is_none() {
+                entry.request_authorizer = self
+                    .procs
+                    .get(&parent)
+                    .and_then(|entry| entry.request_authorizer.clone());
+            }
             let children = self.children.entry(parent).or_default();
             entry.parent_slot = children.len();
             children.push(entry.scope.process());
         }
+        self.ordered_ids.insert(entry.scope.process());
         self.procs.insert(entry.scope.process(), entry)
     }
 
     fn can_reap(&self, id: ProcessId) -> bool {
         self.procs.get(&id).is_some_and(|entry| {
-            #[cfg(feature = "durable")]
-            if matches!(
-                entry.checkpoint,
-                super::CheckpointState::Creating | super::CheckpointState::Active
-            ) {
-                return false;
-            }
             entry.scope.finalized()
+                && entry.cleanup_pin.strong_count() == 0
+                && entry.managed_captures == 0
+                && entry.request_authorizer.is_none()
+                && entry.publication.is_none()
+                && entry.steps.is_empty()
+                && entry.on_finalize.is_empty()
                 && entry.scope.status().is_terminal()
                 && !entry.scope.finalizer_active()
                 && entry.scope.budget().inflight_ops == 0
@@ -128,7 +117,7 @@ impl ProcessTableInner {
         }
     }
 
-    fn unlink_from_parent(&mut self, entry: &ProcessEntry) {
+    pub(super) fn unlink_from_parent(&mut self, entry: &ProcessEntry) {
         let Some(parent) = entry.parent else {
             return;
         };
@@ -148,17 +137,36 @@ impl ProcessTableInner {
 }
 
 impl ProcessTable {
-    /// Construct an empty shared table with a limit, without reserving its maximum
-    /// storage up front. The system root consumes one entry when initialized.
-    pub fn with_capacity(capacity: NonZeroUsize) -> Self {
+    /// Construct an isolated table for internal lifecycle tests. Production
+    /// process admission and its shared clock are assembled by KernelBuilder.
+    #[cfg(test)]
+    pub(crate) fn with_capacity(capacity: NonZeroUsize) -> Self {
+        Self::with_capacity_and_runtime(capacity, crate::host::HostRuntime::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_capacity_and_runtime(
+        capacity: NonZeroUsize,
+        host_runtime: crate::host::HostRuntime,
+    ) -> Self {
+        Self::with_capacity_runtime_and_domain(capacity, host_runtime, None)
+    }
+
+    pub(crate) fn with_capacity_runtime_and_domain(
+        capacity: NonZeroUsize,
+        host_runtime: crate::host::HostRuntime,
+        runtime_domain: Option<crate::runtime_domain::RuntimeDomain>,
+    ) -> Self {
         Self {
             inner: std::sync::Arc::new(ProcessTableShared {
+                runtime_domain,
                 state: parking_lot::RwLock::new(ProcessTableInner {
                     capacity: Some(capacity),
                     ..ProcessTableInner::default()
                 }),
                 changed: tokio::sync::Notify::new(),
                 root_initialization: std::sync::OnceLock::new(),
+                host_runtime,
             }),
         }
     }
@@ -194,12 +202,9 @@ impl ProcessTable {
         self.inner.state.read().procs.is_empty()
     }
 
-    /// Remove at most `limit` committed terminal leaves without changing history
+    /// Examine at most `limit` queued candidates and remove eligible terminal leaves without changing history
     /// in Fact or state storage. Roots and ancestors of retained children remain.
     ///
-    /// The first actual removal permanently closes checkpoint admission into this
-    /// table. Historical checkpoints can then be imported into a fresh Kernel.
-    /// A zero limit or an empty ready queue has no effect on checkpoint admission.
     /// Table allocation is retained for reuse; this does not promise an RSS reduction.
     pub fn reap_finalized(&self, limit: usize) -> usize {
         if limit == 0 {
@@ -208,7 +213,7 @@ impl ProcessTable {
         let removed = {
             let mut inner = self.inner.state.write();
             let mut removed = Vec::new();
-            while removed.len() < limit {
+            for _ in 0..limit {
                 let Some(id) = inner.reap_ready.pop_front() else {
                     break;
                 };
@@ -219,10 +224,7 @@ impl ProcessTable {
                     continue;
                 }
                 if let Some(entry) = inner.procs.remove(&id) {
-                    #[cfg(feature = "durable")]
-                    {
-                        inner.recovery_closed = true;
-                    }
+                    inner.ordered_ids.remove(&id);
                     inner.children.remove(&id);
                     inner.unlink_from_parent(&entry);
                     removed.push(entry);
@@ -236,6 +238,22 @@ impl ProcessTable {
             self.inner.changed.notify_waiters();
         }
         count
+    }
+
+    pub(super) fn reclaim_for_admission(&self) {
+        let mut remaining = self.inner.state.read().reap_ready.len();
+        while remaining != 0 {
+            let examined = remaining.min(32);
+            self.reap_finalized(examined);
+            remaining -= examined;
+            let inner = self.inner.state.read();
+            if inner
+                .capacity
+                .is_none_or(|limit| inner.procs.len() < limit.get())
+            {
+                break;
+            }
+        }
     }
 }
 
@@ -358,10 +376,13 @@ mod tests {
     }
 
     #[test]
-    fn capacity_counts_terminal_records_until_explicit_reap() -> anyhow::Result<()> {
+    fn capacity_counts_terminal_custody_until_pin_release() -> anyhow::Result<()> {
         let table = ProcessTable::with_capacity(NonZeroUsize::MIN.saturating_add(1));
         let root = table.initialize_root(|_| {});
         let completed = child(&table, root)?;
+        let custody = table
+            .cleanup_ticket(completed)
+            .map_err(|_error| anyhow::anyhow!("missing custody"))?;
         finish(&table, completed)?;
         ensure!(table.len() == 2);
         let next = table.fresh_id()?;
@@ -377,11 +398,22 @@ mod tests {
                 })
         );
         ensure!(table.capacity() == Some(NonZeroUsize::MIN.saturating_add(1)));
-        ensure!(table.reap_finalized(1) == 1);
-        ensure!(table.status(completed).is_none());
+        drop(custody);
         table.admit_child(ProcessEntry::new(next, Some(root), IdentityRef::ROOT))?;
+        ensure!(table.status(completed).is_none());
         ensure!(table.children_of(root) == vec![next]);
         ensure!(next.get() > completed.get());
+        let observed = table.observe_page(None, NonZeroUsize::MIN.saturating_add(1));
+        ensure!(
+            observed
+                .entries
+                .iter()
+                .map(|row| row.process)
+                .collect::<Vec<_>>()
+                == vec![root, next]
+        );
+        ensure!(observed.next.is_none());
+        ensure!(observed.entries[0].child_count == 1);
         table.set_capacity(None)?;
         ensure!(table.capacity().is_none());
         Ok(())
@@ -419,6 +451,67 @@ mod tests {
                 == 1
         );
         ensure!(table.len() == 2 && table.children_of(root).len() == 1);
+        Ok(())
+    }
+
+    #[test]
+    fn full_capacity_examines_stale_candidates_fairly_in_bounded_batches() -> anyhow::Result<()> {
+        let table = ProcessTable::with_capacity(NonZeroUsize::MIN.saturating_add(80));
+        let root = table.initialize_root(|_| {});
+        let members = (0..80)
+            .map(|_| child(&table, root))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for process in &members {
+            finish(&table, *process)?;
+        }
+        let pins = members[..79]
+            .iter()
+            .map(|process| {
+                table
+                    .cleanup_ticket(*process)
+                    .map_err(|_error| anyhow::anyhow!("missing cleanup identity"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let before = table.inner.state.read().reap_ready.len();
+        ensure!(table.reap_finalized(1) == 0);
+        ensure!(table.inner.state.read().reap_ready.len() == before - 1);
+        let admitted = child(&table, root)?;
+        ensure!(table.status(members[79]).is_none());
+        ensure!(
+            members[..79]
+                .iter()
+                .all(|process| table.status(*process).is_some())
+        );
+        ensure!(table.len() == 81);
+        ensure!(admitted.get() > members[79].get());
+        drop(pins);
+        ensure!(table.status(members[0]).is_some());
+        child(&table, root)?;
+        ensure!(table.status(members[0]).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn tree_selection_pins_completed_members_across_other_admissions() -> anyhow::Result<()> {
+        let table = ProcessTable::new();
+        let root = table.initialize_root(|_| {});
+        let parent = child(&table, root)?;
+        let member = child(&table, parent)?;
+        finish(&table, member)?;
+        let parent_ticket = table
+            .cleanup_ticket(parent)
+            .map_err(|_error| anyhow::anyhow!("missing parent"))?;
+        let selection = table
+            .request_tree_cleanup_selection(&parent_ticket)
+            .map_err(|_error| anyhow::anyhow!("missing selection"))?;
+        child(&table, root)?;
+        ensure!(table.status(member) == Some(ProcessStatus::Completed));
+        ensure!(selection.contains(member));
+        drop(selection);
+        ensure!(table.status(member).is_some());
+        child(&table, root)?;
+        ensure!(table.status(member).is_none());
+        ensure!(table.status(parent).is_some());
         Ok(())
     }
 
@@ -495,7 +588,7 @@ mod tests {
         let table = ProcessTable::new();
         let root = table.initialize_root(|_| {});
         let process = child(&table, root)?;
-        let handles = Arc::new(parking_lot::RwLock::new(crate::HandleTable::new()));
+        let handles = crate::HandleTable::new();
         let (started, observed) = tokio::sync::oneshot::channel();
         ensure!(
             table
@@ -520,15 +613,18 @@ mod tests {
     }
 
     #[test]
-    fn removed_entry_captures_drop_outside_the_table_lock() -> anyhow::Result<()> {
+    fn native_captures_release_before_retirement_under_an_outer_directory_lock()
+    -> anyhow::Result<()> {
         struct Capture {
             table: ProcessTable,
             released: Arc<AtomicBool>,
+            directory: Arc<parking_lot::Mutex<()>>,
         }
         impl Drop for Capture {
             fn drop(&mut self) {
                 self.released.store(
-                    self.table.inner.state.try_read().is_some(),
+                    self.table.inner.state.try_read().is_some()
+                        && self.directory.try_lock().is_some(),
                     Ordering::SeqCst,
                 );
             }
@@ -537,19 +633,21 @@ mod tests {
         let root = table.initialize_root(|_| {});
         let process = table.fresh_id()?;
         let released = Arc::new(AtomicBool::new(false));
+        let directory = Arc::new(parking_lot::Mutex::new(()));
         let capture = Capture {
             table: table.clone(),
             released: released.clone(),
+            directory: directory.clone(),
         };
         let mut entry = ProcessEntry::new(process, Some(root), IdentityRef::ROOT);
-        entry.scope.mark_terminal_status(ProcessStatus::Completed);
-        entry.scope.complete_finalization();
         entry.steps = crate::StepModule::single("capture", move |value, _| {
             let _capture = &capture;
             xolotl_graph::DoNode::pure(value)
         })?;
         table.insert(entry);
-        table.inner.state.write().queue_reap_if_eligible(process);
+        finish(&table, process)?;
+        ensure!(released.load(Ordering::SeqCst));
+        let _directory = directory.lock();
         ensure!(table.reap_finalized(1) == 1);
         ensure!(released.load(Ordering::SeqCst));
         Ok(())

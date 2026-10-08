@@ -2,12 +2,15 @@
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use tonic::Code;
 use tonic::Status;
 use tonic::codegen::tokio_stream::Stream;
-use xolotl_gateway::{GatewayOutputEvent, GatewayOutputStream};
+use xolotl_gateway::{Gateway, GatewayOutputEvent, GatewayOutputStream, GatewaySession};
 use xolotl_proto::xolotl::v1::application as pb;
+use xolotl_types::UnresolvedOperations;
 
-use super::{gateway_status, wire};
+use super::{gateway_status, validate_reconciliation_access, wire};
+use std::sync::Arc;
 
 #[cfg(feature = "structured-output")]
 mod structured;
@@ -19,6 +22,8 @@ pub(super) use structured::ObjectDelivery;
 /// HTTP body; transport capacity also follows encoded DATA beyond body Drop.
 pub struct ApplicationOutputStream {
     output: Option<GatewayOutputStream>,
+    gateway: Arc<dyn Gateway>,
+    session: GatewaySession,
     accepted: Option<pb::SubmitOutputResponse>,
     max_frame_bytes: usize,
     done: bool,
@@ -27,10 +32,17 @@ pub struct ApplicationOutputStream {
 }
 
 impl ApplicationOutputStream {
-    pub(super) fn new(output: GatewayOutputStream, max_frame_bytes: usize) -> Result<Self, Status> {
+    pub(super) fn new(
+        output: GatewayOutputStream,
+        gateway: Arc<dyn Gateway>,
+        session: GatewaySession,
+        max_frame_bytes: usize,
+    ) -> Result<Self, Status> {
         let accepted = wire::output_accepted_to_pb(output.accepted(), max_frame_bytes)?;
         Ok(Self {
             output: Some(output),
+            gateway,
+            session,
             accepted: Some(accepted),
             max_frame_bytes,
             done: false,
@@ -65,6 +77,21 @@ impl Stream for ApplicationOutputStream {
             return Poll::Ready(None);
         }
         if let Some(accepted) = this.accepted.take() {
+            let access = this
+                .output
+                .as_ref()
+                .ok_or_else(|| Status::internal("output owner is missing"))
+                .and_then(|output| {
+                    validate_reconciliation_access(
+                        this.gateway.as_ref(),
+                        &this.session,
+                        &output.accepted().surface_id,
+                    )
+                });
+            if let Err(error) = access {
+                this.close();
+                return Poll::Ready(Some(Err(error)));
+            }
             return Poll::Ready(Some(Ok(accepted)));
         }
         #[cfg(feature = "structured-output")]
@@ -89,6 +116,14 @@ impl Stream for ApplicationOutputStream {
         match output.poll_next(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(Ok(event))) => {
+                if let Err(error) = validate_reconciliation_access(
+                    this.gateway.as_ref(),
+                    &this.session,
+                    &output.accepted().surface_id,
+                ) {
+                    this.close();
+                    return Poll::Ready(Some(Err(error)));
+                }
                 // Keep the chunk's kernel credits until borrowed conversion and
                 // encoded-size admission finish. Tonic owns its bounded copy.
                 let frame = wire::output_event_to_pb(&event, this.max_frame_bytes);
@@ -102,14 +137,64 @@ impl Stream for ApplicationOutputStream {
                     let result = objects.poll_next(cx, this.max_frame_bytes);
                     return this.object_result(result);
                 }
-                if frame.is_err() || matches!(event, GatewayOutputEvent::Complete(_)) {
+                let frame = match frame {
+                    Err(status) if status.code() == Code::ResourceExhausted => {
+                        if let Err(denied) = validate_reconciliation_access(
+                            this.gateway.as_ref(),
+                            &this.session,
+                            &output.accepted().surface_id,
+                        ) {
+                            this.close();
+                            return Poll::Ready(Some(Err(denied)));
+                        }
+                        let unresolved = match &event {
+                            GatewayOutputEvent::Complete(result) => {
+                                result.output.unresolved_operations.clone()
+                            }
+                            GatewayOutputEvent::Chunk(_) => UnresolvedOperations {
+                                operation_ids: Vec::new(),
+                                identities_incomplete: true,
+                            },
+                        };
+                        wire::output_indeterminate_to_pb(
+                            &unresolved,
+                            "response_encoding_failed",
+                            this.max_frame_bytes,
+                        )
+                    }
+                    other => other,
+                };
+                if frame.is_err()
+                    || matches!(event, GatewayOutputEvent::Complete(_))
+                    || matches!(
+                        frame.as_ref().ok().and_then(|frame| frame.event.as_ref()),
+                        Some(pb::submit_output_response::Event::Indeterminate(_))
+                    )
+                {
                     this.close();
                 }
                 Poll::Ready(Some(frame))
             }
             Poll::Ready(Some(Err(error))) => {
+                let frame = match error {
+                    xolotl_gateway::GatewayError::SubmissionIndeterminate(unknown) => {
+                        validate_reconciliation_access(
+                            this.gateway.as_ref(),
+                            &this.session,
+                            &unknown.accepted.surface_id,
+                        )
+                        .and_then(|()| {
+                            wire::output_indeterminate_to_pb(
+                                &unknown.unresolved_operations,
+                                unknown.reason_code,
+                                this.max_frame_bytes,
+                            )
+                        })
+                    }
+                    other => Err(gateway_status(other)),
+                };
                 this.close();
-                Poll::Ready(Some(Err(gateway_status(error))))
+                Poll::Ready(Some(frame))
             }
             Poll::Ready(None) => {
                 this.close();

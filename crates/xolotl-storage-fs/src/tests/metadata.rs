@@ -76,7 +76,7 @@ async fn malformed_or_mismatched_descriptors_preserve_the_same_file_source_heade
     let encoded = std::fs::read(&path)?;
     let offset = descriptor_offset(&encoded)?;
     let mut wrong_identity = metadata.blob.clone();
-    wrong_identity.hash = "0".repeat(64);
+    wrong_identity.hash = "0".repeat(xolotl_types::BlobRef::HASH_HEX_LEN);
     for payload in [
         b"{".to_vec(),
         b"null".to_vec(),

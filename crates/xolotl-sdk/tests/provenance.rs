@@ -9,8 +9,8 @@ use std::sync::{
 use xolotl_kernel::{DriverOutput, FnDriver, MethodSpec};
 use xolotl_sdk::{
     Driver, DriverContext, DriverError, ExecutionConfig, Expression, Failure, IdentityRef,
-    OperationTemplate, Outcome, Path, PreparedProgram, Program, TaintSet, TaintedValue, Value,
-    Xolotl, XolotlBuilder,
+    KernelBuilder, OperationTemplate, Outcome, Path, PreparedProgram, Program, TaintSet,
+    TaintedValue, Value, Xolotl,
 };
 use xolotl_types::{MethodId, OutputMode, Purity, ResourceName, TaintSource};
 
@@ -52,20 +52,31 @@ fn invoke(target: ResourceName) -> anyhow::Result<PreparedProgram> {
 
 #[tokio::test]
 async fn separate_requests_cannot_clear_success_or_failure_lineage() -> anyhow::Result<()> {
-    let runtime = Xolotl::new();
+    let runtime = Xolotl::new(xolotl_state::InMemoryBackend::new().into_backend());
     let taint = TaintSet::of(TaintSource::Protected {
         path: Path::parse("state://vault/report")?,
     });
     let source = runtime.bootstrap().register_effect(
         "effect://provenance/read",
-        &[MethodSpec::unary_async("invoke", Purity::Pure)],
+        &[MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Pure,
+            MethodSpec::UNARY_ASYNC,
+        )],
         Arc::new(ProtectedRead(taint.clone())),
     )?;
     let sent = Arc::new(AtomicUsize::new(0));
     let observed = sent.clone();
     let sink = runtime.bootstrap().register_effect(
         "effect://provenance/send",
-        &[MethodSpec::unary_async("invoke", Purity::Pure).unprotected_input()],
+        &[MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Pure,
+            MethodSpec::UNARY_ASYNC,
+        )
+        .unprotected_input()],
         Arc::new(FnDriver(move |_, input| {
             observed.fetch_add(1, Ordering::SeqCst);
             Ok(input)
@@ -81,9 +92,12 @@ async fn separate_requests_cannot_clear_success_or_failure_lineage() -> anyhow::
                 &source,
                 TaintedValue::pristine(Value::boolean(failure)),
             )
-            .await?;
+            .await?
+            .output;
         ensure!(first.taint == taint);
-        let input = match first.into_result() {
+        let (first_result, unresolved) = first.into_parts();
+        ensure!(unresolved.is_empty());
+        let input = match first_result {
             Ok(value) => {
                 ensure!(!failure && value.value == Value::string("protected value".into()));
                 value
@@ -107,7 +121,8 @@ async fn separate_requests_cannot_clear_success_or_failure_lineage() -> anyhow::
                 &sink,
                 input,
             )
-            .await?;
+            .await?
+            .output;
         ensure!(
             matches!(second.outcome, Outcome::Fail(Failure::PolicyViolation { ref policy, .. }) if policy == "taint")
         );
@@ -119,12 +134,14 @@ async fn separate_requests_cannot_clear_success_or_failure_lineage() -> anyhow::
 
 #[tokio::test]
 async fn program_admission_failure_preserves_submitted_input_lineage() -> anyhow::Result<()> {
-    let runtime = XolotlBuilder::new()
-        .with_execution_config(ExecutionConfig {
-            max_storage_bytes: 1,
-            ..ExecutionConfig::default()
-        })
-        .build();
+    let runtime = Xolotl::from_kernel(
+        KernelBuilder::new(xolotl_state::InMemoryBackend::new().into_backend())
+            .with_execution_config(ExecutionConfig {
+                max_storage_bytes: 1,
+                ..ExecutionConfig::default()
+            })
+            .build(),
+    );
     let taint = TaintSet::of(TaintSource::Protected {
         path: Path::parse("state://vault/input")?,
     });
@@ -136,7 +153,8 @@ async fn program_admission_failure_preserves_submitted_input_lineage() -> anyhow
             &program,
             TaintedValue::new(Value::integer(23), taint.clone()),
         )
-        .await?;
+        .await?
+        .output;
     ensure!(matches!(
         result.outcome,
         Outcome::Fail(Failure::PolicyViolation { .. })

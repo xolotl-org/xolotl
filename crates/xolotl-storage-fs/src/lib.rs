@@ -3,13 +3,20 @@
 //! Bounded, incremental object storage on a local filesystem.
 //!
 //! Only chunk buffers cross the Tokio blocking-pool boundary. Uploads stage on
-//! disk and become readable after atomic publication. [`FileObjectStore`] starts
-//! no background task. The optional `value-workspace` feature supplies a separate
+//! disk and become readable after atomic publication. The first upload starts
+//! one bounded cleanup worker independent of the caller's Tokio runtime.
+//! Failed upload cleanup retains the directory, upload admission slot and root lease.
+//! The worker retries independently due directories after 100 ms, doubling to
+//! at most 5 s. Closing its last sender makes one final attempt per pending
+//! directory and exits; failed leftovers are reclaimed by a later cold open.
+//! The optional `value-workspace` feature supplies a separate
 //! asynchronous cleanup worker for each incremental map-key workspace. State,
 //! history, subscriptions and the kernel remain independent.
 
+mod cleanup;
 #[cfg(feature = "value-workspace")]
 pub mod key_workspace;
+mod staging;
 mod storage;
 mod upload;
 
@@ -37,9 +44,11 @@ type Request<'a, T> = Pin<Box<dyn Future<Output = StateResult<T>> + Send + 'a>>;
 pub struct FileObjectOptions {
     /// Maximum bytes accepted or returned by a single chunk request.
     pub chunk_bytes: NonZeroUsize,
-    /// Maximum live upload records, including interrupted commits awaiting retry.
+    /// Maximum upload responsibilities: creation, live records, lost receipts,
+    /// and deferred cleanup. Admission rejects before creating staging.
     pub max_uploads: NonZeroUsize,
-    /// Maximum simultaneous filesystem jobs and their resident chunk buffers.
+    /// Maximum simultaneous foreground filesystem jobs and their chunk buffers.
+    /// Deferred cleanup uses one separate worker while retaining upload slots.
     pub max_io_tasks: NonZeroUsize,
     /// Maximum encoded metadata per object, including provenance.
     /// Sources decode before total-size and descriptor validation. A source
@@ -60,9 +69,26 @@ impl Default for FileObjectOptions {
 
 struct Shared {
     root: PathBuf,
+    _staging_use: Arc<staging::StagingUse>,
     options: FileObjectOptions,
     io: Arc<tokio::sync::Semaphore>,
     uploads: Mutex<HashMap<String, Arc<UploadRecord>>>,
+    upload_slots: Arc<tokio::sync::Semaphore>,
+    cleanup: Mutex<Option<cleanup::Sender>>,
+    #[cfg(test)]
+    probe: Arc<tests::IoProbe>,
+}
+
+impl Shared {
+    fn cleanup_sender(&self) -> StateResult<cleanup::Sender> {
+        let mut worker = self.cleanup.lock();
+        if let Some(sender) = worker.as_ref() {
+            return Ok(sender.clone());
+        }
+        let sender = cleanup::start(self)?;
+        *worker = Some(sender.clone());
+        Ok(sender)
+    }
 }
 
 struct UploadRecord {
@@ -102,7 +128,8 @@ impl Drop for UploadLease {
 }
 
 /// Shared filesystem object ports. Methods require a Tokio runtime; synchronous
-/// initialization creates only directories. Different instances may share a root.
+/// initialization reclaims abandoned staging when no live instance owns the
+/// root. Different instances may share a root.
 #[derive(Clone)]
 pub struct FileObjectStore {
     shared: Arc<Shared>,
@@ -122,15 +149,26 @@ impl FileObjectStore {
             )
             .into());
         }
-        std::fs::create_dir_all(root.as_ref().join("objects")).map_err(storage::io_error)?;
-        std::fs::create_dir_all(root.as_ref().join("staging")).map_err(storage::io_error)?;
+        if options.max_uploads.get() > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(StateError::Backend(
+                "object upload capacity exceeds supported range".into(),
+            )
+            .into());
+        }
+        storage::create_root(root.as_ref())?;
         let root = root.as_ref().canonicalize().map_err(storage::io_error)?;
+        let staging_use = staging::StagingUse::acquire(&root)?;
         Ok(Self {
             shared: Arc::new(Shared {
                 root,
+                _staging_use: Arc::new(staging_use),
                 options,
                 io: Arc::new(tokio::sync::Semaphore::new(options.max_io_tasks.get())),
                 uploads: Mutex::new(HashMap::new()),
+                upload_slots: Arc::new(tokio::sync::Semaphore::new(options.max_uploads.get())),
+                cleanup: Mutex::new(None),
+                #[cfg(test)]
+                probe: Arc::new(tests::IoProbe::default()),
             }),
         })
     }
@@ -145,7 +183,8 @@ impl FileObjectStore {
         self.shared.options
     }
 
-    /// Number of uploads the caller must commit or abort.
+    /// Number of registered uploads the caller must commit or abort. Deferred
+    /// cleanup is not registered but continues to occupy upload capacity.
     pub fn pending_uploads(&self) -> usize {
         self.shared.uploads.lock().len()
     }
@@ -241,19 +280,24 @@ impl ObjectWrite for FileObjectStore {
     fn begin_upload(&self, options: UploadOptions) -> Self::BeginUpload<'_> {
         Box::pin(async move {
             let sources = options.taint.clone();
+            let slot = self
+                .shared
+                .upload_slots
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_error| {
+                    StateFailure::new(
+                        StateError::Backend("object upload capacity exhausted".into()),
+                        sources.clone(),
+                    )
+                })?;
             let shared = self.shared.clone();
             let upload = self
-                .io(move || upload::Upload::new(&shared.root, options))
+                .io(move || upload::Upload::new(&shared, options, slot))
                 .await
                 .map_err(|failure| failure.with_taint(&sources))?;
             let id = upload.id().to_owned();
             let mut uploads = self.shared.uploads.lock();
-            if uploads.len() >= self.shared.options.max_uploads.get() {
-                return Err(StateFailure::new(
-                    StateError::Backend("object upload capacity exhausted".into()),
-                    sources,
-                ));
-            }
             uploads.insert(
                 id.clone(),
                 Arc::new(UploadRecord {
@@ -285,7 +329,9 @@ impl ObjectWrite for FileObjectStore {
                 .await
                 .map_err(|failure| failure.with_taint(&source_owner.staging.lock().sources()))?;
             let bytes = bytes[..bytes.len().min(self.shared.options.chunk_bytes.get())].to_vec();
+            let shared = self.shared.clone();
             Self::run_io(permit, move || {
+                let _keep_store_alive = shared;
                 let mut staging = upload.staging.lock();
                 upload.check_active()?;
                 staging.write(offset, &bytes)
@@ -329,12 +375,14 @@ impl ObjectWrite for FileObjectStore {
             let upload = self.shared.uploads.lock().get(id.as_str()).cloned();
             if let Some(upload) = upload {
                 let source_owner = upload.clone();
+                let shared = self.shared.clone();
                 upload.cancelled.store(true, Ordering::Release);
-                self.io(move || upload.staging.lock().abort())
-                    .await
-                    .map_err(|failure| {
-                        failure.with_taint(&source_owner.staging.lock().sources())
-                    })?;
+                self.io(move || {
+                    let _keep_store_alive = shared;
+                    upload.staging.lock().abort()
+                })
+                .await
+                .map_err(|failure| failure.with_taint(&source_owner.staging.lock().sources()))?;
                 self.shared.uploads.lock().remove(id.as_str());
             }
             Ok(())

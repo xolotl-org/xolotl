@@ -98,6 +98,82 @@ fn list_updates_preserve_snapshots_and_share_unaffected_paths() -> anyhow::Resul
 }
 
 #[test]
+fn prefix_pruning_shares_retained_subtrees_and_preserves_snapshots() -> anyhow::Result<()> {
+    for length in [0, 1, 31, 32, 33, 63, 64, 65, 1_025, 16_384] {
+        let original: ValueList = (0..length).map(Value::integer).collect();
+        let old_nodes = inspect(original.root.as_ref())?;
+        for removed in [0, 1, 31, 32, 33, length / 2, length] {
+            let mut changed = original.clone();
+            let identity = changed.root_identity();
+            if removed > length {
+                ensure!(
+                    changed.remove_prefix(removed as usize)
+                        == Err(CollectionError::PrefixOutOfBounds)
+                );
+                ensure!(changed.root_identity() == identity);
+                continue;
+            }
+            changed.remove_prefix(removed as usize)?;
+            ensure!(changed.len() == (length - removed) as usize);
+            ensure!(
+                changed
+                    .iter()
+                    .map(Value::as_int)
+                    .eq((removed..length).map(Some))
+            );
+            ensure!(original.iter().map(Value::as_int).eq((0..length).map(Some)));
+            let new_nodes = inspect(changed.root.as_ref())?;
+            let height = original
+                .root
+                .as_ref()
+                .map_or(0, |root| usize::from(root.height));
+            ensure!(new_nodes.difference(&old_nodes).count() <= 4 * (height + 1));
+            if removed == 0 {
+                ensure!(changed.root_identity() == identity);
+            }
+            changed.push(Value::integer(length))?;
+            ensure!(
+                changed
+                    .iter()
+                    .map(Value::as_int)
+                    .eq((removed..=length).map(Some))
+            );
+            drop(inspect(changed.root.as_ref())?);
+        }
+    }
+    let original: ValueList = (0..16_384).map(Value::integer).collect();
+    let old_nodes = inspect(original.root.as_ref())?;
+    let mut changed = original.clone();
+    changed.remove_prefix(1)?;
+    let new_nodes = inspect(changed.root.as_ref())?;
+    ensure!(new_nodes.intersection(&old_nodes).count() > old_nodes.len() / 2);
+    drop(original);
+    Ok(())
+}
+
+#[test]
+fn prefix_pruning_releases_removed_index_ownership() -> anyhow::Result<()> {
+    let mut list: ValueList = (0..2_048).map(Value::integer).collect();
+    let snapshot = list.clone();
+    let (removed, count) = match list.root.as_ref().context("list root")?.data() {
+        Data::Branch { left, .. } => (Arc::downgrade(left), left.len),
+        Data::Leaf(_) => anyhow::bail!("expected a branch"),
+    };
+    list.remove_prefix(count)?;
+    ensure!(removed.upgrade().is_some());
+    ensure!(list.first().and_then(Value::as_int) == Some(i64::try_from(count)?));
+    drop(snapshot);
+    ensure!(removed.upgrade().is_none());
+    let retained = Arc::downgrade(list.root.as_ref().context("retained root")?);
+    let identity = list.root_identity();
+    ensure!(list.remove_prefix(usize::MAX) == Err(CollectionError::PrefixOutOfBounds));
+    ensure!(list.root_identity() == identity);
+    list.remove_prefix(list.len())?;
+    ensure!(list.is_empty() && retained.upgrade().is_none());
+    Ok(())
+}
+
+#[test]
 fn list_append_balances_across_leaf_and_tree_boundaries() -> anyhow::Result<()> {
     let mut list = ValueList::new();
     for index in 0..8_193 {

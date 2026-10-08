@@ -26,9 +26,9 @@ fn failures() -> Result<Vec<Failure>> {
         },
         Failure::Timeout,
         Failure::Cancelled,
-        Failure::Quarantined {
-            op_id: "op-unique".into(),
-            reason: "unknown commit".into(),
+        Failure::OutcomeUnknown {
+            operation_ids: vec!["source/命令-42".into(), "".into(), "source/命令-43".into()],
+            reason: "ack 未确认".into(),
         },
         Failure::InvalidInput {
             reason: "  precise reason  ".into(),
@@ -58,6 +58,10 @@ fn failures() -> Result<Vec<Failure>> {
             kind: String::new(),
             message: String::new(),
         },
+        Failure::OutcomeUnknown {
+            operation_ids: Vec::new(),
+            reason: String::new(),
+        },
     ])
 }
 
@@ -81,6 +85,11 @@ fn repeated_empty_labels_and_varint_boundaries_are_admitted_before_cloning() -> 
         actual: Vec::new(),
     };
     ensure!(failure_to_pb_bounded(&wide, 256).is_err());
+    let unknown = Failure::OutcomeUnknown {
+        operation_ids: vec![String::new(); 65_536],
+        reason: String::new(),
+    };
+    ensure!(failure_to_pb_bounded(&unknown, 256).is_err());
     for len in [0, 1, 127, 128, 16_383, 16_384] {
         let failure = Failure::ApprovalPending {
             approval_key: "a".repeat(len),
@@ -96,8 +105,8 @@ fn repeated_empty_labels_and_varint_boundaries_are_admitted_before_cloning() -> 
 #[test]
 fn missing_unknown_and_malformed_failure_variants_fail_closed() -> Result<()> {
     ensure!(failure_from_pb(&pb::Failure { kind: None }).is_err());
-    // Unknown length-delimited alternative 15: prost skips it, leaving no kind.
-    let unknown = pb::Failure::decode([0x7a, 0].as_slice())?;
+    // Unknown length-delimited alternative 16: prost skips it, leaving no kind.
+    let unknown = pb::Failure::decode([0x82, 0x01, 0].as_slice())?;
     ensure!(failure_from_pb(&unknown).is_err());
     let missing_path = pb::Failure {
         kind: Some(pb::failure::Kind::PathInvalid(pb::failure::PathInvalid {

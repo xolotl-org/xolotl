@@ -1,46 +1,84 @@
 //! Console authentication and authorization.
 //!
-//! Account records live under `state://kernel/console/*`; credential verifiers,
-//! sessions, lockouts, and passkey challenges live under `state://vault/console/*`.
+//! Account metadata lives under `state://kernel/console/*`;
+//! credential verifiers and lockouts live under `state://vault/console/*`.
+//! Sessions are private typed aggregates owned by the injected session store.
 
 use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use argon2::{Algorithm, Argon2, Params, Version};
+use aws_lc_rs::signature::{ML_DSA_65, ML_DSA_65_SIGNING, ParsedPublicKey};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
-use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
-use tokio::sync::Semaphore;
 use webauthn_rs::prelude::{
     CreationChallengeResponse, Passkey, PasskeyAuthentication, PasskeyRegistration,
     PublicKeyCredential, RegisterPublicKeyCredential, RequestChallengeResponse, Url, Uuid,
     Webauthn, WebauthnBuilder,
 };
-use xolotl_kernel::{Bootstrap, CompiledRequestGrantTemplate, GatewayAudit};
+use xolotl_kernel::Bootstrap;
 use xolotl_state::{Backend, StateFailure};
-use xolotl_types::{CapSet, Capability, Path, ResourceName, ResourceSelector, Value};
+use xolotl_types::{CapSet, Capability, Path, Value};
 use xolotl_types::{ValueMap, ValueView};
 
 use crate::credentials::{LockoutState, lockout_until_ms};
+use crate::{AuthenticationEvidence, AuthenticationResponse, PrimaryAuthentication};
+mod account;
+pub(crate) mod audit;
+use account::LOCAL_AUTHORITY_ID;
+use account::local_identity_path;
+pub use account::{
+    AccountAuthority, AccountAuthorityError, AccountFuture, AccountKey, AccountSnapshot,
+};
+mod authorization;
+use audit::{audit_outcome, record_auth_audit};
+pub(crate) use authorization::{
+    authorize_path, authorize_prefix_read, compile_principal_propagation_grants,
+    compile_principal_request_grants, prepare_user_config, principal_request_selectors,
+};
+use authorization::{capset_from_strings, effective_grants, effective_session_grants};
+mod ceremonies;
+use ceremonies::{AuthenticationPurpose, AuthenticationStart};
+mod bootstrap;
+pub use bootstrap::{bootstrap_root_account, root_random_password_needed};
+mod challenges;
+pub use challenges::ConsoleChallengeConfig;
+mod credential_sealer;
+pub use credential_sealer::CredentialSealer;
+mod credentials;
+mod debug;
+mod evidence;
+mod execution;
+pub(crate) use execution::ExecutionOwner;
+mod external;
+use external::InstalledExternalAuthentication;
+pub use external::{
+    ExternalAssurance, ExternalAuthError, ExternalAuthFuture, ExternalPrimaryAuthentication,
+    VerifiedExternalIdentity,
+};
+mod mfa;
+mod passkeys;
+mod password;
+#[cfg(test)]
+mod test_key;
+use passkeys::passkey_credential_id;
+mod paths;
+pub(crate) use crate::paths::{ROLES_PREFIX, SESSIONS_PREFIX, USERS_PREFIX};
+use paths::{lockout_path, session_path};
+pub(crate) use paths::{role_path, user_path};
 
-const USERS_PREFIX: &str = "state://kernel/console/users";
-const SESSIONS_PREFIX: &str = "state://kernel/console/sessions";
-const CHALLENGES_PREFIX: &str = "state://kernel/console/challenges";
 const ROOT_USERNAME: &str = "root";
+const MAX_SESSION_CEILING_CAPABILITIES: usize = 128;
+const MAX_SESSION_CEILING_BYTES: usize = 8 * 1024;
+const MAX_SESSION_CAPABILITY_BYTES: usize = 2048;
 /// Default absolute session lifetime, in milliseconds.
 pub const DEFAULT_SESSION_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 /// Default idle session lifetime, in milliseconds.
 pub const DEFAULT_IDLE_TTL_MS: i64 = 2 * 60 * 60 * 1000;
-/// Default number of active sessions allowed per user.
-pub const DEFAULT_MAX_SESSIONS_PER_USER: usize = 5;
-/// Default total number of active sessions allowed globally.
-pub const DEFAULT_GLOBAL_SESSION_LIMIT: usize = 10_000;
 /// Minimum accepted absolute session lifetime, in milliseconds.
 pub const MIN_SESSION_TTL_MS: i64 = 60 * 1000;
 /// Maximum accepted absolute session lifetime, in milliseconds.
@@ -49,22 +87,13 @@ pub const MAX_SESSION_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 pub const MIN_IDLE_TTL_MS: i64 = 60 * 1000;
 /// Maximum accepted idle session lifetime, in milliseconds.
 pub const MAX_IDLE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
-/// Minimum accepted per-user session limit.
-pub const MIN_MAX_SESSIONS_PER_USER: usize = 1;
-/// Hard upper bound for per-user session limit.
-pub const HARD_MAX_SESSIONS_PER_USER: usize = 1_000;
-/// Minimum accepted global session limit.
-pub const MIN_GLOBAL_SESSION_LIMIT: usize = 1;
-/// Hard upper bound for global session limit.
-pub const HARD_GLOBAL_SESSION_LIMIT: usize = 100_000;
-/// Minimum Argon2 verification concurrency.
+/// Minimum Argon2 password-work concurrency.
 pub const MIN_ARGON2_CONCURRENCY: usize = 1;
-/// Hard upper bound for Argon2 verification concurrency.
+/// Hard upper bound for Argon2 password-work concurrency.
 pub const HARD_ARGON2_CONCURRENCY: usize = 256;
-const TOTP_PERIOD_SECS: i64 = 30;
 const KEY_CHALLENGE_TTL_MS: i64 = 60_000;
 
-/// Default Argon2 verification concurrency based on available CPU parallelism.
+/// Default Argon2 password-work concurrency based on available CPU parallelism.
 pub fn default_argon2_concurrency() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -72,11 +101,12 @@ pub fn default_argon2_concurrency() -> usize {
         .max(MIN_ARGON2_CONCURRENCY)
 }
 
-type HmacSha1 = Hmac<Sha1>;
-
 /// Optional root-account material supplied at daemon bootstrap.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
+#[cfg_attr(not(test), derive(Default))]
 pub struct RootProvisioning {
+    /// Host-owned secret used to encrypt the root credential record.
+    pub credential_sealer: Option<Arc<CredentialSealer>>,
     /// Optional precomputed Argon2 PHC string for the root password.
     pub password_hash: Option<String>,
     /// Optional plaintext root password consumed only during bootstrap.
@@ -84,12 +114,42 @@ pub struct RootProvisioning {
     pub password: Option<String>,
     /// Optional public-key descriptors for key login.
     pub pubkeys: Vec<String>,
+    /// Host-granted capabilities added to the default root authority at initial
+    /// provisioning. They also extend its delegation ceiling. This never updates
+    /// an existing account; later changes use the normal authorized user actions.
+    pub additional_grants: Vec<String>,
+}
+
+// Unit tests use a shared sealer by default; production hosts must supply one.
+#[cfg(test)]
+impl Default for RootProvisioning {
+    fn default() -> Self {
+        Self {
+            credential_sealer: Some(test_credential_sealer()),
+            password_hash: None,
+            password: None,
+            pubkeys: Vec::new(),
+            additional_grants: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "fixed test key and identifier are valid"
+)]
+fn test_credential_sealer() -> Arc<CredentialSealer> {
+    static SEALER: std::sync::OnceLock<Arc<CredentialSealer>> = std::sync::OnceLock::new();
+    SEALER
+        .get_or_init(|| Arc::new(CredentialSealer::new("unit", &[0x71; 32]).unwrap()))
+        .clone()
 }
 
 /// WebAuthn relying-party configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConsoleWebAuthnConfig {
-    /// Whether passkey endpoints are enabled.
+    /// Explicit opt-in to classical WebAuthn/passkey signatures.
     pub enabled: bool,
     /// Stable relying-party id, usually the console hostname.
     pub rp_id: String,
@@ -129,29 +189,46 @@ impl ConsoleWebAuthnConfig {
 /// Console authentication tuning.
 #[derive(Clone, Debug)]
 pub struct ConsoleAuthConfig {
+    /// Host-owned secret used to decrypt and encrypt persistent credentials.
+    pub credential_sealer: Option<Arc<CredentialSealer>>,
     /// Absolute session TTL in milliseconds.
     pub session_ttl_ms: i64,
     /// Idle session TTL in milliseconds.
     pub idle_ttl_ms: i64,
-    /// Maximum active sessions per user.
-    pub max_sessions_per_user: usize,
-    /// Maximum active sessions across all users.
-    pub global_session_limit: usize,
-    /// Maximum concurrent Argon2 verifications.
+    /// Maximum concurrent Argon2 hashing and verification tasks.
     pub argon2_concurrency: usize,
+    /// Maximum concurrent external authentication preparations, from assertion
+    /// verification through account lookup and session or continuation admission.
+    /// The permit is released on completion or cancellation, not at a stage handoff.
+    pub max_external_verifications: usize,
+    /// Shared bounded storage for public-key and WebAuthn ceremonies.
+    pub challenges: ConsoleChallengeConfig,
     /// Passkey/WebAuthn relying-party settings.
     pub webauthn: ConsoleWebAuthnConfig,
+    /// Second-factor providers and enrollment policy.
+    pub mfa: crate::mfa::ConsoleMfaConfig,
 }
 
 impl Default for ConsoleAuthConfig {
     fn default() -> Self {
         Self {
+            credential_sealer: {
+                #[cfg(test)]
+                {
+                    Some(test_credential_sealer())
+                }
+                #[cfg(not(test))]
+                {
+                    None
+                }
+            },
             session_ttl_ms: DEFAULT_SESSION_TTL_MS,
             idle_ttl_ms: DEFAULT_IDLE_TTL_MS,
-            max_sessions_per_user: DEFAULT_MAX_SESSIONS_PER_USER,
-            global_session_limit: DEFAULT_GLOBAL_SESSION_LIMIT,
             argon2_concurrency: default_argon2_concurrency(),
+            max_external_verifications: 32,
+            challenges: ConsoleChallengeConfig::default(),
             webauthn: ConsoleWebAuthnConfig::default(),
+            mfa: crate::mfa::ConsoleMfaConfig::default(),
         }
     }
 }
@@ -167,24 +244,22 @@ impl ConsoleAuthConfig {
             .clamp(MIN_IDLE_TTL_MS, MAX_IDLE_TTL_MS)
             .min(session_ttl_ms);
         Self {
+            credential_sealer: self.credential_sealer,
             session_ttl_ms,
             idle_ttl_ms,
-            max_sessions_per_user: self
-                .max_sessions_per_user
-                .clamp(MIN_MAX_SESSIONS_PER_USER, HARD_MAX_SESSIONS_PER_USER),
-            global_session_limit: self
-                .global_session_limit
-                .clamp(MIN_GLOBAL_SESSION_LIMIT, HARD_GLOBAL_SESSION_LIMIT),
             argon2_concurrency: self
                 .argon2_concurrency
                 .clamp(MIN_ARGON2_CONCURRENCY, HARD_ARGON2_CONCURRENCY),
+            max_external_verifications: self.max_external_verifications.clamp(1, 256),
             webauthn: self.webauthn.bounded(),
+            challenges: self.challenges.bounded(),
+            mfa: self.mfa,
         }
     }
 }
 
 /// Result of root-account bootstrap.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum BootstrapOutcome {
     /// A root account already exists.
     AlreadyPresent,
@@ -207,34 +282,21 @@ pub enum BootstrapOutcome {
     },
 }
 
-/// Return whether bootstrap would need to generate a random root password.
-pub async fn root_random_password_needed(
-    boot: &Bootstrap,
-    provisioning: &RootProvisioning,
-) -> Result<bool, AuthError> {
-    if provisioning.password_hash.is_some()
-        || provisioning.password.is_some()
-        || !provisioning.pubkeys.is_empty()
-    {
-        return Ok(false);
-    }
-    Ok(!prefix_has_entries(&boot.kernel.state, Path::parse(USERS_PREFIX)?).await?)
-}
-
 /// Password login request.
-#[derive(Debug, Deserialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoginRequest {
     /// Console username.
     pub username: String,
     /// Plaintext password, consumed only by the auth boundary.
     pub password: String,
-    /// Optional TOTP code when the user has TOTP enabled.
+    /// Independent second-factor proof; required when the account has MFA enrolled.
     #[serde(default)]
-    pub totp_code: Option<String>,
+    pub second_factor: Option<crate::mfa::MfaProof>,
 }
 
 /// Login or step-up response carrying a new bearer token.
-#[derive(Debug, Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct LoginResponse {
     /// Session id.
     pub sid: String,
@@ -244,23 +306,23 @@ pub struct LoginResponse {
     pub expires_at: i64,
     /// Idle expiry timestamp in millis since epoch.
     pub idle_expires_at: i64,
-    /// MFA level attached to the session.
-    pub mfa_level: u8,
+    /// Committed authentication proofs retained by this session.
+    pub authentication: AuthenticationEvidence,
 }
 
 /// Request to upgrade an existing session's MFA level.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StepUpRequest {
-    /// Password proof for accounts without TOTP.
-    #[serde(default)]
-    pub password: Option<String>,
-    /// TOTP code for accounts with TOTP enabled.
-    #[serde(default)]
-    pub totp_code: Option<String>,
+    /// An enrolled independent factor or one-time recovery code. Repeating a
+    /// password alone cannot raise the MFA level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<crate::mfa::MfaProof>,
 }
 
 /// Request to start public-key login.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeyChallengeRequest {
     /// Console username.
     pub username: String,
@@ -269,7 +331,7 @@ pub struct KeyChallengeRequest {
 }
 
 /// One public-key login challenge.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct KeyChallengeResponse {
     /// Challenge id used by the finish request.
     pub challenge_id: String,
@@ -284,7 +346,8 @@ pub struct KeyChallengeResponse {
 }
 
 /// Request to finish public-key login.
-#[derive(Debug, Deserialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeyLoginRequest {
     /// Console username.
     pub username: String,
@@ -294,21 +357,26 @@ pub struct KeyLoginRequest {
     pub signature: String,
     /// Client origin; must match the challenge.
     pub origin: String,
-    /// Optional public-key descriptor selecting a registered key.
+    /// Exact registered ML-DSA-65 key descriptor. Selects one verifier.
+    pub key: String,
+    /// Required when this account has an independent second factor enrolled.
     #[serde(default)]
-    pub key: Option<String>,
+    pub second_factor: Option<crate::mfa::MfaProof>,
 }
 
 /// Request to begin passkey registration for the bearer principal.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PasskeyRegisterBeginRequest {
+    /// Local credential label, 1–128 UTF-8 bytes without control characters.
+    pub label: String,
     /// Optional display name sent to the authenticator.
     #[serde(default)]
     pub display_name: Option<String>,
 }
 
 /// Passkey registration options and server-side ceremony id.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PasskeyRegisterBeginResponse {
     /// Single-use server-side ceremony id.
     pub challenge_id: String,
@@ -317,7 +385,8 @@ pub struct PasskeyRegisterBeginResponse {
 }
 
 /// Request to finish passkey registration.
-#[derive(Debug, Deserialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PasskeyRegisterFinishRequest {
     /// Ceremony id returned by registration begin.
     pub challenge_id: String,
@@ -326,21 +395,24 @@ pub struct PasskeyRegisterFinishRequest {
 }
 
 /// Passkey registration result.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PasskeyRegisterFinishResponse {
     /// Stored credential id, base64url encoded by the WebAuthn library.
     pub credential_id: String,
+    /// Replacement session. Registration invalidates every old token and SID.
+    pub session: LoginResponse,
 }
 
 /// Request to begin passkey login.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PasskeyLoginBeginRequest {
     /// Console username.
     pub username: String,
 }
 
 /// Passkey authentication options and server-side ceremony id.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PasskeyLoginBeginResponse {
     /// Single-use server-side ceremony id.
     pub challenge_id: String,
@@ -349,7 +421,8 @@ pub struct PasskeyLoginBeginResponse {
 }
 
 /// Request to finish passkey login.
-#[derive(Debug, Deserialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PasskeyLoginFinishRequest {
     /// Console username.
     pub username: String,
@@ -364,12 +437,31 @@ pub struct PasskeyLoginFinishRequest {
 pub(crate) struct ConsolePrincipal {
     /// Console username.
     pub(crate) username: String,
+    /// Authority that owns the account instance.
+    pub(crate) authority_id: String,
+    /// Immutable instance identifier within the authority.
+    pub(crate) account_id: String,
     /// Xolotl identity path associated with the user.
     pub(crate) identity_path: String,
     /// Effective grants after roles and direct grants are combined.
     pub(crate) grants: CapSet,
-    /// Session MFA level.
-    pub(crate) mfa_level: u8,
+    /// Maximum authority captured when an external assertion was exchanged.
+    pub(crate) authority_ceiling: Option<CapSet>,
+    /// Committed authentication proofs retained by this session.
+    pub(crate) authentication: AuthenticationEvidence,
+}
+
+struct SessionView {
+    principal: ConsolePrincipal,
+    username: String,
+    revocation_epoch: String,
+    credential_epoch: String,
+}
+
+impl ConsolePrincipal {
+    pub(crate) fn account_key(&self) -> AccountKey {
+        AccountKey::from_parts(&self.authority_id, &self.account_id)
+    }
 }
 
 /// Public session metadata returned by session-list actions.
@@ -381,23 +473,74 @@ pub(crate) struct SessionSummary {
     pub(crate) username: String,
     /// Identity path active for this session.
     pub(crate) identity_path: String,
-    /// Issue timestamp in millis since epoch.
+    /// Time this session was issued, in milliseconds since the Unix epoch.
     pub(crate) issued_at: i64,
     /// Absolute expiry timestamp in millis since epoch.
     pub(crate) expires_at: i64,
     /// Idle expiry timestamp in millis since epoch.
     pub(crate) idle_expires_at: i64,
-    /// Session MFA level.
-    pub(crate) mfa_level: u8,
+    /// Committed authentication proofs retained by this session.
+    pub(crate) authentication: AuthenticationEvidence,
     /// Last-seen timestamp in millis since epoch.
     pub(crate) last_seen: i64,
     /// Source address recorded when the session was issued.
     pub(crate) source_addr: String,
 }
 
+pub(crate) struct SessionPage {
+    pub entries: Vec<SessionSummary>,
+    pub next: Option<xolotl_state::StateCursor>,
+}
+
 /// Authentication and authorization errors returned by the console boundary.
 #[derive(Debug, Error)]
 pub enum AuthError {
+    /// No trusted external verifier was installed on this Console host.
+    #[error("external authentication is not configured")]
+    ExternalAuthenticationNotConfigured,
+    /// The trusted external verifier could not complete its check.
+    #[error("external authentication is unavailable")]
+    ExternalAuthenticationUnavailable,
+    /// Externally authenticated accounts require a configured account authority.
+    #[error("account authority is not configured")]
+    AccountAuthorityNotConfigured,
+    /// The account authority could not establish current account state.
+    #[error("account authority is temporarily unavailable")]
+    AccountAuthorityUnavailable,
+    /// This Console uses a host account authority and has no local primary login.
+    #[error("local account authentication is unavailable in this Console")]
+    LocalAuthenticationUnavailable,
+    /// Login/step-up needs an enrolled independent factor.
+    #[error(
+        "an enrolled second factor is required; enroll a factor after primary login if none exists"
+    )]
+    MfaRequired {
+        /// Account-specific choices, disclosed only after authentication.
+        options: Option<crate::mfa::MfaOptions>,
+    },
+    /// A credential-management operation needs a newly authenticated session.
+    #[error("a recent login or second-factor verification is required")]
+    ReauthenticationRequired,
+    /// Unknown factor, malformed lifecycle request, or exceeded limits.
+    #[error("invalid second-factor management request")]
+    InvalidMfaRequest,
+    /// This host forbids the requested use of an installed second-factor provider.
+    /// This is a policy decision, not a failed credential proof.
+    #[error("second-factor provider use is forbidden by host policy")]
+    MfaUsageDenied,
+    /// This host has no installed provider supporting the requested factor operation.
+    /// Installation or capability mismatch does not prove a credential is invalid.
+    #[error("second-factor operation is unavailable on this host")]
+    MfaOperationUnavailable,
+    /// Malformed credential identifier, unsupported key or rejected password policy.
+    #[error("invalid credential request or password rejected by policy")]
+    InvalidCredentialRequest,
+    /// A concurrent credential change won the shared vault CAS.
+    #[error("credentials changed concurrently; authenticate again and inspect current credentials")]
+    CredentialConflict,
+    /// Removing the final primary credential would make the account unusable.
+    #[error("at least one primary login credential must remain")]
+    LastPrimaryCredential,
     /// Username failed syntax validation.
     #[error("invalid username")]
     InvalidUsername,
@@ -410,8 +553,8 @@ pub enum AuthError {
     /// Session token or id is missing, expired, revoked, or malformed.
     #[error("session is missing, expired, or revoked")]
     InvalidSession,
-    /// Key-login challenge is missing, expired, already used, or mismatched.
-    #[error("key challenge is missing, expired, or already used")]
+    /// Authentication challenge is missing, expired, already used, or mismatched.
+    #[error("authentication challenge is missing, expired, or already used")]
     InvalidChallenge,
     /// Bearer token was required but absent.
     #[error("authorization bearer token is required")]
@@ -425,6 +568,18 @@ pub enum AuthError {
         /// Milliseconds until the next allowed attempt.
         retry_after_ms: i64,
     },
+    /// All password-verification slots are occupied; no work was queued.
+    #[error("authentication capacity exceeded")]
+    CapacityExceeded,
+    /// Invalid or over-budget session page query.
+    #[error("session query rejected: {0}")]
+    Query(String),
+    /// An accepted session mutation cannot be proved committed or rejected.
+    #[error("session mutation outcome is unknown")]
+    SessionCommitUnknown,
+    /// The injected storage domain rejected a new retained aggregate.
+    #[error("session storage capacity or policy rejected admission")]
+    SessionAdmissionRejected,
     /// State backend error.
     #[error("state error: {0}")]
     State(String),
@@ -452,6 +607,11 @@ struct RateState {
     global: FailureBucket,
 }
 
+// Limit attacker-controlled usernames and peer names retained by the local
+// backoff. Existing buckets are never evicted while their rate window is live.
+const MAX_RATE_BUCKETS: usize = 4_096;
+const RATE_WINDOW_MS: i64 = 60_000;
+
 #[derive(Clone, Copy, Debug, Default)]
 struct FailureBucket {
     failures: u32,
@@ -461,22 +621,85 @@ struct FailureBucket {
 
 /// Console authentication service.
 pub(crate) struct ConsoleAuth {
+    pub(crate) session_store: Arc<dyn crate::session_store::ConsoleSessionStore>,
     config: ConsoleAuthConfig,
     decoy_phc: String,
-    argon2_slots: Semaphore,
+    passwords: password::PasswordVerifier,
     rate: Mutex<RateState>,
+    mfa_providers: BTreeMap<String, mfa::InstalledProvider>,
+    #[cfg(feature = "http")]
+    mfa_provider_json: std::sync::Arc<[u8]>,
+    external: InstalledExternalAuthentication,
+    account_authority: Option<Arc<dyn AccountAuthority>>,
+    external_verifications: tokio::sync::Semaphore,
+    host_runtime: xolotl_kernel::host::HostRuntime,
 }
 
 impl ConsoleAuth {
+    fn credential_sealer(&self) -> Result<&CredentialSealer, AuthError> {
+        self.config.credential_sealer.as_deref().ok_or_else(|| {
+            AuthError::Crypto("console credential encryption key is required".into())
+        })
+    }
+
     /// Create an auth service with bounded tuning and a decoy password hash.
+    #[cfg(test)]
     pub(crate) fn new(config: ConsoleAuthConfig) -> Result<Self, AuthError> {
+        Self::with_external(
+            config,
+            Arc::new(crate::session_store::MemoryConsoleSessionStore::new(
+                crate::session_store::ConsoleSessionPolicy::default(),
+            )),
+            None,
+            None,
+            Arc::new(xolotl_kernel::host::TokioBlockingSpawner::default()),
+            xolotl_kernel::host::HostRuntime::default(),
+        )
+    }
+
+    pub(crate) fn with_external(
+        config: ConsoleAuthConfig,
+        session_store: Arc<dyn crate::session_store::ConsoleSessionStore>,
+        external: InstalledExternalAuthentication,
+        account_authority: Option<Arc<dyn AccountAuthority>>,
+        blocking_spawner: Arc<dyn xolotl_kernel::host::BlockingSpawner>,
+        host_runtime: xolotl_kernel::host::HostRuntime,
+    ) -> Result<Self, AuthError> {
+        if external.is_some() && account_authority.is_none() {
+            return Err(AuthError::AccountAuthorityNotConfigured);
+        }
+        if let Some(authority) = &account_authority {
+            let id = authority.authority_id();
+            if id == LOCAL_AUTHORITY_ID || AccountKey::new(id, "probe").is_err() {
+                return Err(AuthError::State(
+                    "invalid external account authority id".into(),
+                ));
+            }
+        }
         let config = config.bounded();
+        if config.credential_sealer.is_none() {
+            return Err(AuthError::Crypto(
+                "console credential encryption key is required".into(),
+            ));
+        }
+        let mfa_providers = mfa::providers(&config)?;
+        #[cfg(feature = "http")]
+        let mfa_provider_json = mfa::provider_catalog_json(&mfa_providers)?;
         let decoy_phc = hash_password_with_salt("invalid-password", &[0x42; 16])?;
+        let external_verifications = tokio::sync::Semaphore::new(config.max_external_verifications);
         Ok(Self {
-            argon2_slots: Semaphore::new(config.argon2_concurrency),
+            session_store,
+            passwords: password::PasswordVerifier::new(config.argon2_concurrency, blocking_spawner),
             config,
             decoy_phc,
             rate: Mutex::new(RateState::default()),
+            mfa_providers,
+            #[cfg(feature = "http")]
+            mfa_provider_json,
+            external,
+            account_authority,
+            external_verifications,
+            host_runtime,
         })
     }
 
@@ -488,19 +711,30 @@ impl ConsoleAuth {
         boot: &Bootstrap,
         req: LoginRequest,
         source_addr: String,
-    ) -> Result<LoginResponse, AuthError> {
+    ) -> Result<AuthenticationResponse, AuthError> {
+        if self.external_accounts() {
+            return Err(AuthError::LocalAuthenticationUnavailable);
+        }
         let username = req.username.trim().to_string();
         let result = self
-            .login_inner(&boot.kernel.state, req, source_addr.clone())
+            .login_inner(boot.kernel().state(), req, source_addr.clone())
             .await;
         match &result {
-            Ok(response) => record_auth_audit(
+            Ok(AuthenticationResponse::Authenticated { session: response }) => record_auth_audit(
                 boot,
                 "console_login",
                 Some(&username),
                 Some(&source_addr),
                 "ok",
-                Some(response.mfa_level),
+                Some(&response.authentication),
+            )?,
+            Ok(AuthenticationResponse::Continue(_)) => record_auth_audit(
+                boot,
+                "console_credential",
+                Some(&username),
+                Some(&source_addr),
+                "authentication_pending",
+                None,
             )?,
             Err(err) => record_auth_audit(
                 boot,
@@ -519,11 +753,11 @@ impl ConsoleAuth {
         state: &Backend,
         req: LoginRequest,
         source_addr: String,
-    ) -> Result<LoginResponse, AuthError> {
+    ) -> Result<AuthenticationResponse, AuthError> {
         let username = req.username.trim().to_string();
         validate_username(&username)?;
-        self.check_rate_limits(&username, &source_addr, now_millis())?;
-        let now = now_millis();
+        self.check_rate_limits(&username, &source_addr, self.host_runtime.now_millis())?;
+        let now = self.host_runtime.now_millis();
         let lockout = read_lockout(state, &username).await?;
         if lockout.is_locked(now) {
             return Err(AuthError::RateLimited {
@@ -532,25 +766,20 @@ impl ConsoleAuth {
         }
 
         let user = read_user(state, &username).await?;
-        let password_ref = user.as_ref().and_then(|u| u.password_hash_ref());
-        let phc = match password_ref {
-            Some(path) => read_string(state, &path)
-                .await?
-                .unwrap_or_else(|| self.decoy_phc.clone()),
-            None => self.decoy_phc.clone(),
-        };
+        let credentials = credentials::read(state, &username, self.credential_sealer()?).await?;
+        let password_enabled = credentials.password.is_some();
+        let phc = credentials
+            .password
+            .clone()
+            .unwrap_or_else(|| self.decoy_phc.clone());
 
-        let permit = self
-            .argon2_slots
-            .acquire()
-            .await
-            .map_err(|_error| AuthError::Crypto("argon2 semaphore closed".into()))?;
-        let password_ok = verify_password(&phc, &req.password);
-        drop(permit);
+        let password_ok = self.passwords.verify(phc, req.password).await?;
+        let verified_at = self.host_runtime.now_millis();
 
-        let Some(mut user) = user else {
+        let Some(user) = user else {
             self.record_login_failure(&username, &source_addr, now);
-            record_account_lockout_failure(state, &username, now).await?;
+            // A name with no account must not create permanent vault state.
+            // The decoy password verification and local backoff still apply.
             return Err(AuthError::InvalidCredentials);
         };
         if !matches!(user.status.as_str(), "active") {
@@ -558,37 +787,27 @@ impl ConsoleAuth {
             record_account_lockout_failure(state, &username, now).await?;
             return Err(AuthError::AccountUnavailable);
         }
-        if !password_ok {
+        if !password_enabled || !password_ok {
             self.record_login_failure(&username, &source_addr, now);
             record_account_lockout_failure(state, &username, now).await?;
             return Err(AuthError::InvalidCredentials);
         }
 
-        let mut mfa_level = 1u8;
-        if user.totp_enabled {
-            let Some(code) = req.totp_code.as_deref() else {
-                self.record_login_failure(&username, &source_addr, now);
-                record_account_lockout_failure(state, &username, now).await?;
-                return Err(AuthError::InvalidCredentials);
-            };
-            let seed_ref = user
-                .totp_seed_ref
-                .clone()
-                .ok_or(AuthError::InvalidCredentials)?;
-            let seed = read_string(state, &seed_ref)
-                .await?
-                .ok_or(AuthError::InvalidCredentials)?;
-            let step = verify_totp(&seed, code, user.totp_last_step, now_millis())?
-                .ok_or(AuthError::InvalidCredentials)?;
-            user.totp_last_step = Some(step);
-            write_user(state, &user).await?;
-            mfa_level = 2;
-        }
-
-        self.clear_login_failures(&username, &source_addr, now);
-        clear_lockout(state, &username).await?;
-        self.issue_session(state, &user, source_addr, mfa_level)
-            .await
+        let account = self.local_snapshot(state, &user).await?;
+        self.start_authentication(
+            state,
+            AuthenticationStart {
+                account: &account,
+                credentials,
+                primary: PrimaryAuthentication::Password { verified_at },
+                purpose: AuthenticationPurpose::Login,
+                proof: req.second_factor.as_ref(),
+                bearer: None,
+                source: &source_addr,
+                authority_ceiling: None,
+            },
+        )
+        .await
     }
 
     /// Start public-key login by creating a single-use signed challenge.
@@ -601,8 +820,13 @@ impl ConsoleAuth {
         req: KeyChallengeRequest,
         source_addr: String,
     ) -> Result<KeyChallengeResponse, AuthError> {
+        if self.external_accounts() {
+            return Err(AuthError::LocalAuthenticationUnavailable);
+        }
         let username = req.username.trim().to_string();
-        let result = self.begin_key_login_inner(&boot.kernel.state, req).await;
+        let result = self
+            .begin_key_login_inner(boot.kernel().state(), req, &source_addr)
+            .await;
         match &result {
             Ok(_) => record_auth_audit(
                 boot,
@@ -628,24 +852,32 @@ impl ConsoleAuth {
         &self,
         state: &Backend,
         req: KeyChallengeRequest,
+        source_addr: &str,
     ) -> Result<KeyChallengeResponse, AuthError> {
         let username = req.username.trim().to_string();
         validate_username(&username)?;
         let origin = validate_origin(req.origin.trim())?;
-        let challenge_id = random_token(18)?;
         let nonce = random_token(32)?;
-        let now = now_millis();
-        sweep_expired_key_challenges(state, now).await?;
+        let now = self.host_runtime.now_millis();
         let expires_at = now.saturating_add(KEY_CHALLENGE_TTL_MS);
         let challenge = KeyChallengeRecord {
-            challenge_id: challenge_id.clone(),
-            username: username.clone(),
+            credential_epoch: credentials::epoch(state, &username, self.credential_sealer()?)
+                .await?,
             nonce: nonce.clone(),
-            origin: origin.clone(),
-            issued_at: now,
-            expires_at,
         };
-        write_key_challenge(state, &challenge).await?;
+        let challenge_id = challenges::issue(
+            &self.host_runtime,
+            state,
+            &self.config.challenges,
+            challenges::Binding::PublicKey {
+                username: username.clone(),
+                origin: origin.clone(),
+            },
+            source_addr,
+            expires_at,
+            &challenge,
+        )
+        .await?;
         let transcript = key_login_transcript(&username, &challenge_id, &nonce, &origin);
         Ok(KeyChallengeResponse {
             challenge_id,
@@ -665,19 +897,30 @@ impl ConsoleAuth {
         boot: &Bootstrap,
         req: KeyLoginRequest,
         source_addr: String,
-    ) -> Result<LoginResponse, AuthError> {
+    ) -> Result<AuthenticationResponse, AuthError> {
+        if self.external_accounts() {
+            return Err(AuthError::LocalAuthenticationUnavailable);
+        }
         let username = req.username.trim().to_string();
         let result = self
-            .finish_key_login_inner(&boot.kernel.state, req, source_addr.clone())
+            .finish_key_login_inner(boot.kernel().state(), req, source_addr.clone())
             .await;
         match &result {
-            Ok(response) => record_auth_audit(
+            Ok(AuthenticationResponse::Authenticated { session: response }) => record_auth_audit(
                 boot,
                 "console_login",
                 Some(&username),
                 Some(&source_addr),
                 "ok",
-                Some(response.mfa_level),
+                Some(&response.authentication),
+            )?,
+            Ok(AuthenticationResponse::Continue(_)) => record_auth_audit(
+                boot,
+                "console_credential",
+                Some(&username),
+                Some(&source_addr),
+                "authentication_pending",
+                None,
             )?,
             Err(err) => record_auth_audit(
                 boot,
@@ -696,26 +939,22 @@ impl ConsoleAuth {
         state: &Backend,
         req: KeyLoginRequest,
         source_addr: String,
-    ) -> Result<LoginResponse, AuthError> {
+    ) -> Result<AuthenticationResponse, AuthError> {
         let username = req.username.trim().to_string();
         validate_username(&username)?;
         validate_session_id(&req.challenge_id).map_err(|_error| AuthError::InvalidChallenge)?;
         let origin = validate_origin(req.origin.trim())?;
 
-        let Some(challenge) = read_key_challenge(state, &req.challenge_id).await? else {
-            return Err(AuthError::InvalidChallenge);
-        };
-        if challenge.expires_at <= now_millis()
-            || challenge.username != username
-            || challenge.origin != origin
-        {
-            revoke_key_challenge(state, &req.challenge_id).await?;
-            return Err(AuthError::InvalidChallenge);
-        }
-
-        // Single-use challenge: once a client attempts verification, the nonce
-        // cannot be replayed even if the signature is wrong.
-        revoke_key_challenge(state, &req.challenge_id).await?;
+        let challenge: KeyChallengeRecord = challenges::take(
+            &self.host_runtime,
+            state,
+            &req.challenge_id,
+            &challenges::Binding::PublicKey {
+                username: username.clone(),
+                origin: origin.clone(),
+            },
+        )
+        .await?;
 
         let user = read_user(state, &username)
             .await?
@@ -723,302 +962,53 @@ impl ConsoleAuth {
         if !matches!(user.status.as_str(), "active") {
             return Err(AuthError::AccountUnavailable);
         }
-        let transcript = key_login_transcript(
-            &username,
-            &challenge.challenge_id,
-            &challenge.nonce,
-            &origin,
-        );
-        if !verify_key_login(
-            &user.pubkeys,
-            req.key.as_deref(),
+        let transcript =
+            key_login_transcript(&username, &req.challenge_id, &challenge.nonce, &origin);
+        let credentials = credentials::read(state, &username, self.credential_sealer()?).await?;
+        if credentials.epoch != challenge.credential_epoch {
+            return Err(AuthError::InvalidChallenge);
+        }
+        let credential_key = verify_key_login(
+            &credentials.public_keys,
+            &req.key,
             &req.signature,
             &transcript,
-        )? {
-            return Err(AuthError::InvalidCredentials);
-        }
-
-        self.issue_session(state, &user, source_addr, 1).await
-    }
-
-    fn webauthn(&self) -> Result<Webauthn, AuthError> {
-        if !self.config.webauthn.enabled {
-            return Err(AuthError::AccountUnavailable);
-        }
-        let origin = Url::parse(&self.config.webauthn.rp_origin)
-            .map_err(|error| AuthError::Crypto(format!("invalid WebAuthn origin: {error}")))?;
-        WebauthnBuilder::new(&self.config.webauthn.rp_id, &origin)
-            .map_err(|error| AuthError::Crypto(error.to_string()))?
-            .rp_name(&self.config.webauthn.rp_name)
-            .timeout(Duration::from_millis(
-                self.config.webauthn.challenge_ttl_ms as u64,
-            ))
-            .build()
-            .map_err(|error| AuthError::Crypto(error.to_string()))
-    }
-
-    /// Begin passkey registration for the authenticated bearer principal.
-    pub(crate) async fn begin_passkey_registration(
-        &self,
-        boot: &Bootstrap,
-        bearer: &str,
-        req: PasskeyRegisterBeginRequest,
-        source_addr: String,
-    ) -> Result<PasskeyRegisterBeginResponse, AuthError> {
-        let principal = self.authenticate_token(boot, bearer).await?;
-        if principal.mfa_level < 2 {
-            return Err(AuthError::PermissionDenied);
-        }
-        let state = &boot.kernel.state;
-        let user = read_user(state, &principal.username)
-            .await?
-            .ok_or(AuthError::InvalidSession)?;
-        if !matches!(user.status.as_str(), "active") {
-            return Err(AuthError::AccountUnavailable);
-        }
-        let webauthn = self.webauthn()?;
-        let passkeys = read_passkey_records(state, &user.username).await?;
-        let exclude = passkeys
-            .iter()
-            .map(|record| record.credential.cred_id().clone())
-            .collect::<Vec<_>>();
-        let display_name = req.display_name.as_deref().unwrap_or(&user.username);
-        let (public_key, registration) = webauthn
-            .start_passkey_registration(
-                stable_user_uuid(&user.username),
-                &user.username,
-                display_name,
-                Some(exclude),
-            )
-            .map_err(|error| AuthError::Crypto(error.to_string()))?;
-        let challenge_id = random_token(18)?;
-        let expires_at = now_millis().saturating_add(self.config.webauthn.challenge_ttl_ms);
-        write_passkey_challenge(
+        )?
+        .ok_or(AuthError::InvalidCredentials)?
+        .to_owned();
+        let verified_at = self.host_runtime.now_millis();
+        let account = self.local_snapshot(state, &user).await?;
+        self.start_authentication(
             state,
-            &challenge_id,
-            &PasskeyChallengeRecord::Registration {
-                username: user.username.clone(),
-                expires_at,
-                state: registration,
+            AuthenticationStart {
+                account: &account,
+                credentials,
+                primary: PrimaryAuthentication::PublicKey {
+                    credential_key,
+                    verified_at,
+                },
+                purpose: AuthenticationPurpose::Login,
+                proof: req.second_factor.as_ref(),
+                bearer: None,
+                source: &source_addr,
+                authority_ceiling: None,
             },
         )
-        .await?;
-        record_auth_audit(
-            boot,
-            "console_credential",
-            Some(&user.username),
-            Some(&source_addr),
-            "passkey_register_begin",
-            Some(principal.mfa_level),
-        )?;
-        Ok(PasskeyRegisterBeginResponse {
-            challenge_id,
-            public_key,
-        })
-    }
-
-    /// Finish passkey registration and persist the credential.
-    pub(crate) async fn finish_passkey_registration(
-        &self,
-        boot: &Bootstrap,
-        bearer: &str,
-        req: PasskeyRegisterFinishRequest,
-        source_addr: String,
-    ) -> Result<PasskeyRegisterFinishResponse, AuthError> {
-        let principal = self.authenticate_token(boot, bearer).await?;
-        if principal.mfa_level < 2 {
-            return Err(AuthError::PermissionDenied);
-        }
-        let state = &boot.kernel.state;
-        let challenge = take_passkey_challenge(state, &req.challenge_id).await?;
-        let PasskeyChallengeRecord::Registration {
-            username,
-            expires_at,
-            state: registration,
-        } = challenge
-        else {
-            return Err(AuthError::InvalidChallenge);
-        };
-        if expires_at <= now_millis() || username != principal.username {
-            return Err(AuthError::InvalidChallenge);
-        }
-        let webauthn = self.webauthn()?;
-        let credential = webauthn
-            .finish_passkey_registration(&req.credential, &registration)
-            .map_err(|error| AuthError::Crypto(error.to_string()))?;
-        let credential_id = passkey_credential_id(&credential);
-        let now = now_millis();
-        write_passkey_record(
-            state,
-            &PasskeyCredentialRecord {
-                username: username.clone(),
-                credential,
-                created_at: now,
-                updated_at: now,
-            },
-        )
-        .await?;
-        record_auth_audit(
-            boot,
-            "console_credential",
-            Some(&username),
-            Some(&source_addr),
-            "passkey_register_finish",
-            Some(principal.mfa_level),
-        )?;
-        Ok(PasskeyRegisterFinishResponse { credential_id })
-    }
-
-    /// Begin passkey login for an active user.
-    pub(crate) async fn begin_passkey_login(
-        &self,
-        boot: &Bootstrap,
-        req: PasskeyLoginBeginRequest,
-        source_addr: String,
-    ) -> Result<PasskeyLoginBeginResponse, AuthError> {
-        let state = &boot.kernel.state;
-        let username = req.username.trim().to_string();
-        validate_username(&username)?;
-        self.check_rate_limits(&username, &source_addr, now_millis())?;
-        let user = read_user(state, &username)
-            .await?
-            .ok_or(AuthError::InvalidCredentials)?;
-        if !matches!(user.status.as_str(), "active") {
-            return Err(AuthError::AccountUnavailable);
-        }
-        let records = read_passkey_records(state, &username).await?;
-        if records.is_empty() {
-            return Err(AuthError::InvalidCredentials);
-        }
-        let credentials = records
-            .iter()
-            .map(|record| record.credential.clone())
-            .collect::<Vec<_>>();
-        let webauthn = self.webauthn()?;
-        let (public_key, authentication) = webauthn
-            .start_passkey_authentication(&credentials)
-            .map_err(|error| AuthError::Crypto(error.to_string()))?;
-        let challenge_id = random_token(18)?;
-        let expires_at = now_millis().saturating_add(self.config.webauthn.challenge_ttl_ms);
-        write_passkey_challenge(
-            state,
-            &challenge_id,
-            &PasskeyChallengeRecord::Authentication {
-                username,
-                expires_at,
-                state: authentication,
-            },
-        )
-        .await?;
-        record_auth_audit(
-            boot,
-            "console_credential",
-            Some(&user.username),
-            Some(&source_addr),
-            "passkey_login_begin",
-            None,
-        )?;
-        Ok(PasskeyLoginBeginResponse {
-            challenge_id,
-            public_key,
-        })
-    }
-
-    /// Finish passkey login and issue an MFA-level session.
-    pub(crate) async fn finish_passkey_login(
-        &self,
-        boot: &Bootstrap,
-        req: PasskeyLoginFinishRequest,
-        source_addr: String,
-    ) -> Result<LoginResponse, AuthError> {
-        let username = req.username.trim().to_string();
-        validate_username(&username)?;
-        let result = self
-            .finish_passkey_login_inner(&boot.kernel.state, req, source_addr.clone())
-            .await;
-        match &result {
-            Ok(response) => record_auth_audit(
-                boot,
-                "console_login",
-                Some(&username),
-                Some(&source_addr),
-                "passkey_ok",
-                Some(response.mfa_level),
-            )?,
-            Err(err) => record_auth_audit(
-                boot,
-                "console_login_failed",
-                Some(&username),
-                Some(&source_addr),
-                audit_outcome(err),
-                None,
-            )?,
-        }
-        result
-    }
-
-    async fn finish_passkey_login_inner(
-        &self,
-        state: &Backend,
-        req: PasskeyLoginFinishRequest,
-        source_addr: String,
-    ) -> Result<LoginResponse, AuthError> {
-        let username = req.username.trim().to_string();
-        let challenge = take_passkey_challenge(state, &req.challenge_id).await?;
-        let PasskeyChallengeRecord::Authentication {
-            username: challenge_username,
-            expires_at,
-            state: authentication,
-        } = challenge
-        else {
-            return Err(AuthError::InvalidChallenge);
-        };
-        if expires_at <= now_millis() || challenge_username != username {
-            return Err(AuthError::InvalidChallenge);
-        }
-        let mut user = read_user(state, &username)
-            .await?
-            .ok_or(AuthError::InvalidCredentials)?;
-        if !matches!(user.status.as_str(), "active") {
-            return Err(AuthError::AccountUnavailable);
-        }
-        let records = read_passkey_records(state, &username).await?;
-        let webauthn = self.webauthn()?;
-        let auth_result = webauthn
-            .finish_passkey_authentication(&req.credential, &authentication)
-            .map_err(|error| AuthError::Crypto(error.to_string()))?;
-        if !auth_result.user_verified() {
-            return Err(AuthError::InvalidCredentials);
-        }
-        let mut matched = None;
-        for mut record in records {
-            if record.credential.update_credential(&auth_result).is_some() {
-                record.updated_at = now_millis();
-                write_passkey_record(state, &record).await?;
-                matched = Some(());
-                break;
-            }
-        }
-        if matched.is_none() {
-            return Err(AuthError::InvalidCredentials);
-        }
-        clear_lockout(state, &username).await?;
-        user.password_changed_at = user.password_changed_at.max(0);
-        self.issue_session(state, &user, source_addr, 2).await
+        .await
     }
 
     /// Upgrade an existing bearer session to MFA level 2.
     ///
-    /// Uses TOTP when enabled for the user, otherwise rechecks the password.
+    /// Requires an independent enrolled factor or an unused recovery code.
     pub(crate) async fn step_up(
         &self,
         boot: &Bootstrap,
         bearer: &str,
         req: StepUpRequest,
         source_addr: String,
-    ) -> Result<LoginResponse, AuthError> {
+    ) -> Result<AuthenticationResponse, AuthError> {
         let audit_username = match self
-            .authenticate_token_inner(&boot.kernel.state, bearer)
+            .authenticate_token_inner(boot.kernel().state(), bearer)
             .await
         {
             Ok(principal) => Some(principal.username),
@@ -1029,16 +1019,24 @@ impl ConsoleAuth {
             }
         };
         let result = self
-            .step_up_inner(&boot.kernel.state, bearer, req, source_addr.clone())
+            .step_up_inner(boot.kernel().state(), bearer, req, source_addr.clone())
             .await;
         match &result {
-            Ok(response) => record_auth_audit(
+            Ok(AuthenticationResponse::Authenticated { session: response }) => record_auth_audit(
                 boot,
                 "console_credential",
                 audit_username.as_deref(),
                 Some(&source_addr),
                 "step_up",
-                Some(response.mfa_level),
+                Some(&response.authentication),
+            )?,
+            Ok(AuthenticationResponse::Continue(_)) => record_auth_audit(
+                boot,
+                "console_credential",
+                audit_username.as_deref(),
+                Some(&source_addr),
+                "authentication_pending",
+                None,
             )?,
             Err(err) => record_auth_audit(
                 boot,
@@ -1058,58 +1056,40 @@ impl ConsoleAuth {
         bearer: &str,
         req: StepUpRequest,
         source_addr: String,
-    ) -> Result<LoginResponse, AuthError> {
+    ) -> Result<AuthenticationResponse, AuthError> {
         let principal = self.authenticate_token_inner(state, bearer).await?;
-        let mut user = read_user(state, &principal.username)
-            .await?
-            .ok_or(AuthError::InvalidSession)?;
-        if !matches!(user.status.as_str(), "active") {
+        let account = self
+            .current_account(state, &principal.account_key(), Some(&principal.username))
+            .await?;
+        if !account.active {
             return Err(AuthError::AccountUnavailable);
         }
 
-        if user.totp_enabled {
-            let code = req
-                .totp_code
-                .as_deref()
-                .ok_or(AuthError::InvalidCredentials)?;
-            let seed_ref = user
-                .totp_seed_ref
-                .clone()
-                .ok_or(AuthError::InvalidCredentials)?;
-            let seed = read_string(state, &seed_ref)
-                .await?
-                .ok_or(AuthError::InvalidCredentials)?;
-            let step = verify_totp(&seed, code, user.totp_last_step, now_millis())?
-                .ok_or(AuthError::InvalidCredentials)?;
-            user.totp_last_step = Some(step);
-            write_user(state, &user).await?;
-        } else {
-            let password = req
-                .password
-                .as_deref()
-                .ok_or(AuthError::InvalidCredentials)?;
-            self.check_rate_limits(&user.username, &source_addr, now_millis())?;
-            let phc = match user.password_hash_ref() {
-                Some(path) => read_string(state, &path)
-                    .await?
-                    .unwrap_or_else(|| self.decoy_phc.clone()),
-                None => self.decoy_phc.clone(),
-            };
-            let permit = self
-                .argon2_slots
-                .acquire()
-                .await
-                .map_err(|_error| AuthError::Crypto("argon2 semaphore closed".into()))?;
-            let ok = verify_password(&phc, password);
-            drop(permit);
-            if !ok {
-                self.record_login_failure(&user.username, &source_addr, now_millis());
-                return Err(AuthError::InvalidCredentials);
-            }
-            self.clear_login_failures(&user.username, &source_addr, now_millis());
-        }
-
-        self.issue_session(state, &user, source_addr, 2).await
+        self.start_authentication(
+            state,
+            AuthenticationStart {
+                account: &account,
+                credentials: credentials::read_by_key(
+                    state,
+                    &account.key,
+                    self.credential_sealer()?,
+                )
+                .await?,
+                primary: principal.authentication.primary,
+                purpose: AuthenticationPurpose::StepUp {
+                    sid: bearer
+                        .split_once('.')
+                        .ok_or(AuthError::InvalidSession)?
+                        .0
+                        .into(),
+                },
+                proof: req.proof.as_ref(),
+                bearer: Some(bearer),
+                source: &source_addr,
+                authority_ceiling: principal.authority_ceiling,
+            },
+        )
+        .await
     }
 
     /// Authenticate a bearer token in `sid.secret` form.
@@ -1118,7 +1098,7 @@ impl ConsoleAuth {
         boot: &Bootstrap,
         bearer: &str,
     ) -> Result<ConsolePrincipal, AuthError> {
-        self.authenticate_token_inner(&boot.kernel.state, bearer)
+        self.authenticate_token_inner(boot.kernel().state(), bearer)
             .await
     }
 
@@ -1126,40 +1106,110 @@ impl ConsoleAuth {
     ///
     /// This is intended for trusted management paths that already validated
     /// access to the session id.
+    #[cfg(any(feature = "http", test))]
     pub(crate) async fn authenticate_sid(
         &self,
         boot: &Bootstrap,
         sid: &str,
     ) -> Result<ConsolePrincipal, AuthError> {
+        self.session_principal(boot, sid, true).await
+    }
+
+    /// Check an already authenticated SID without renewing idle time or writing
+    /// State. Event delivery must not recursively trigger State subscriptions.
+    pub(crate) async fn validate_sid(
+        &self,
+        boot: &Bootstrap,
+        sid: &str,
+    ) -> Result<ConsolePrincipal, AuthError> {
+        self.session_principal(boot, sid, false).await
+    }
+
+    async fn session_principal(
+        &self,
+        boot: &Bootstrap,
+        sid: &str,
+        touch: bool,
+    ) -> Result<ConsolePrincipal, AuthError> {
+        self.session_view(boot, sid, touch)
+            .await
+            .map(|view| view.principal)
+    }
+
+    async fn session_view(
+        &self,
+        boot: &Bootstrap,
+        sid: &str,
+        touch: bool,
+    ) -> Result<SessionView, AuthError> {
         validate_session_id(sid)?;
-        let state = &boot.kernel.state;
+        let state = boot.kernel().state();
         let session_path = session_path(sid)?;
-        let Some(mut session) = read_session(state, &session_path).await? else {
+        let Some(mut session) = read_session(self.session_store.as_ref(), &session_path).await?
+        else {
             return Err(AuthError::InvalidSession);
         };
-        let now = now_millis();
-        if session.expires_at <= now || session.idle_expires_at <= now {
-            revoke_session(state, sid).await?;
+        let now = self.host_runtime.now_millis();
+        if !session.is_live_at(now) {
+            if touch {
+                retire_expired_session(self.session_store.as_ref(), &session, now).await?;
+            }
             return Err(AuthError::InvalidSession);
         }
 
-        let user = read_user(state, &session.username)
-            .await?
-            .ok_or(AuthError::InvalidSession)?;
-        if !matches!(user.status.as_str(), "active") {
+        let account = self
+            .current_account(state, &session.account_key(), Some(&session.username))
+            .await?;
+        if !account.active {
             return Err(AuthError::AccountUnavailable);
         }
 
-        session.last_seen = now;
-        session.idle_expires_at = now.saturating_add(self.config.idle_ttl_ms);
-        write_session(state, &session_path, &session).await?;
+        if session.revocation_epoch != account.revocation_epoch
+            || session.identity_path != account.identity.to_string()
+            || session.credential_epoch
+                != credentials::epoch_by_key(state, &account.key, self.credential_sealer()?).await?
+        {
+            return Err(AuthError::InvalidSession);
+        }
+        if touch {
+            session.renew_activity(now, self.config.idle_ttl_ms);
+            if !session.is_live_at(self.host_runtime.now_millis()) {
+                return Err(AuthError::InvalidSession);
+            }
+            session = write_session(self.session_store.as_ref(), &session_path, &session).await?;
+        } else {
+            let current = read_session(self.session_store.as_ref(), &session_path)
+                .await?
+                .ok_or(AuthError::InvalidSession)?;
+            if !current.has_same_authority_as(&session) {
+                return Err(AuthError::InvalidSession);
+            }
+            session = current;
+        }
 
-        let grants = effective_grants(state, &user).await?;
-        Ok(ConsolePrincipal {
-            username: user.username,
-            identity_path: user.identity_path,
-            grants,
-            mfa_level: session.mfa_level,
+        let grants = effective_session_grants(
+            &account.grants,
+            session
+                .authority_ceiling
+                .as_ref()
+                .ok_or(AuthError::InvalidSession)?,
+        )?;
+        if !session.is_live_at(self.host_runtime.now_millis()) {
+            return Err(AuthError::InvalidSession);
+        }
+        Ok(SessionView {
+            username: session.username,
+            revocation_epoch: session.revocation_epoch,
+            credential_epoch: session.credential_epoch,
+            principal: ConsolePrincipal {
+                username: account.display_name,
+                authority_id: account.key.authority_id().into(),
+                account_id: account.key.instance_id().into(),
+                identity_path: account.identity.to_string(),
+                grants,
+                authority_ceiling: session.authority_ceiling,
+                authentication: session.authentication,
+            },
         })
     }
 
@@ -1171,19 +1221,18 @@ impl ConsoleAuth {
         let (sid, token) = bearer.split_once('.').ok_or(AuthError::InvalidSession)?;
         validate_session_id(sid)?;
         let session_path = session_path(sid)?;
-        let Some(mut session) = read_session(state, &session_path).await? else {
+        let Some(mut session) = read_session(self.session_store.as_ref(), &session_path).await?
+        else {
             return Err(AuthError::InvalidSession);
         };
-        let now = now_millis();
-        if session.expires_at <= now || session.idle_expires_at <= now {
-            revoke_session(state, sid).await?;
+        let now = self.host_runtime.now_millis();
+        if !session.is_live_at(now) {
+            retire_expired_session(self.session_store.as_ref(), &session, now).await?;
             return Err(AuthError::InvalidSession);
         }
         let token_hash = token_hash(token);
-        let expected_hash = read_string(state, &session_token_path(sid)?)
-            .await?
-            .ok_or(AuthError::InvalidSession)?;
-        if expected_hash
+        if session
+            .token_hash
             .as_bytes()
             .ct_eq(token_hash.as_bytes())
             .unwrap_u8()
@@ -1192,23 +1241,44 @@ impl ConsoleAuth {
             return Err(AuthError::InvalidSession);
         }
 
-        let user = read_user(state, &session.username)
-            .await?
-            .ok_or(AuthError::InvalidSession)?;
-        if !matches!(user.status.as_str(), "active") {
+        let account = self
+            .current_account(state, &session.account_key(), Some(&session.username))
+            .await?;
+        if !account.active {
             return Err(AuthError::AccountUnavailable);
         }
 
-        session.last_seen = now;
-        session.idle_expires_at = now.saturating_add(self.config.idle_ttl_ms);
-        write_session(state, &session_path, &session).await?;
+        if session.revocation_epoch != account.revocation_epoch
+            || session.identity_path != account.identity.to_string()
+            || session.credential_epoch
+                != credentials::epoch_by_key(state, &account.key, self.credential_sealer()?).await?
+        {
+            return Err(AuthError::InvalidSession);
+        }
+        session.renew_activity(now, self.config.idle_ttl_ms);
+        if !session.is_live_at(self.host_runtime.now_millis()) {
+            return Err(AuthError::InvalidSession);
+        }
+        session = write_session(self.session_store.as_ref(), &session_path, &session).await?;
 
-        let grants = effective_grants(state, &user).await?;
+        let grants = effective_session_grants(
+            &account.grants,
+            session
+                .authority_ceiling
+                .as_ref()
+                .ok_or(AuthError::InvalidSession)?,
+        )?;
+        if !session.is_live_at(self.host_runtime.now_millis()) {
+            return Err(AuthError::InvalidSession);
+        }
         Ok(ConsolePrincipal {
-            username: user.username,
-            identity_path: user.identity_path,
+            username: account.display_name,
+            authority_id: account.key.authority_id().into(),
+            account_id: account.key.instance_id().into(),
+            identity_path: account.identity.to_string(),
             grants,
-            mfa_level: session.mfa_level,
+            authority_ceiling: session.authority_ceiling,
+            authentication: session.authentication,
         })
     }
 
@@ -1219,23 +1289,49 @@ impl ConsoleAuth {
         &self,
         boot: &Bootstrap,
         bearer: &str,
+        source_addr: Option<&str>,
     ) -> Result<LoginResponse, AuthError> {
-        let state = &boot.kernel.state;
+        let result = self
+            .refresh_session_inner(boot.kernel().state(), bearer)
+            .await;
+        let (outcome, username, authentication) = match &result {
+            Ok((response, username)) => (
+                "token_refresh",
+                Some(username.as_str()),
+                Some(&response.authentication),
+            ),
+            Err(error) => (audit_outcome(error), None, None),
+        };
+        record_auth_audit(
+            boot,
+            "console_credential",
+            username,
+            source_addr,
+            outcome,
+            authentication,
+        )?;
+        result.map(|(response, _)| response)
+    }
+
+    async fn refresh_session_inner(
+        &self,
+        state: &Backend,
+        bearer: &str,
+    ) -> Result<(LoginResponse, String), AuthError> {
         let (sid, token) = bearer.split_once('.').ok_or(AuthError::InvalidSession)?;
         validate_session_id(sid)?;
         let session_path = session_path(sid)?;
-        let Some(mut session) = read_session(state, &session_path).await? else {
+        let Some(mut session) = read_session(self.session_store.as_ref(), &session_path).await?
+        else {
             return Err(AuthError::InvalidSession);
         };
-        let now = now_millis();
-        if session.expires_at <= now || session.idle_expires_at <= now {
-            revoke_session(state, sid).await?;
+        let now = self.host_runtime.now_millis();
+        if !session.is_live_at(now) {
+            retire_expired_session(self.session_store.as_ref(), &session, now).await?;
             return Err(AuthError::InvalidSession);
         }
-        let expected_hash = read_string(state, &session_token_path(sid)?)
-            .await?
-            .ok_or(AuthError::InvalidSession)?;
-        if expected_hash
+        if session
+            .token_hash
             .as_bytes()
             .ct_eq(token_hash(token).as_bytes())
             .unwrap_u8()
@@ -1244,23 +1340,48 @@ impl ConsoleAuth {
             return Err(AuthError::InvalidSession);
         }
 
+        let account = self
+            .current_account(state, &session.account_key(), Some(&session.username))
+            .await?;
+        if !account.active {
+            return Err(AuthError::AccountUnavailable);
+        }
+
+        if session.revocation_epoch != account.revocation_epoch
+            || session.identity_path != account.identity.to_string()
+            || session.credential_epoch
+                != credentials::epoch_by_key(state, &account.key, self.credential_sealer()?).await?
+        {
+            return Err(AuthError::InvalidSession);
+        }
+        session.renew_activity(now, self.config.idle_ttl_ms);
+        if !session.is_live_at(self.host_runtime.now_millis()) {
+            return Err(AuthError::InvalidSession);
+        }
         let new_secret = random_token(32)?;
         let new_token = format!("{sid}.{new_secret}");
-        session.last_seen = now;
-        session.idle_expires_at = now.saturating_add(self.config.idle_ttl_ms);
-        write_session(state, &session_path, &session).await?;
-        write_string(state, &session_token_path(sid)?, token_hash(&new_secret)).await?;
+        session.token_hash = token_hash(&new_secret);
+        session = write_session(self.session_store.as_ref(), &session_path, &session).await?;
+        let completed_at = self.host_runtime.now_millis();
+        if !session.is_live_at(completed_at) {
+            retire_expired_session(self.session_store.as_ref(), &session, completed_at).await?;
+            return Err(AuthError::InvalidSession);
+        }
 
-        Ok(LoginResponse {
-            sid: sid.to_string(),
-            token: new_token,
-            expires_at: session.expires_at,
-            idle_expires_at: session.idle_expires_at,
-            mfa_level: session.mfa_level,
-        })
+        Ok((
+            LoginResponse {
+                sid: sid.to_string(),
+                token: new_token,
+                expires_at: session.expires_at,
+                idle_expires_at: session.idle_expires_at,
+                authentication: session.authentication,
+            },
+            account.display_name,
+        ))
     }
 
-    /// Revoke one session id and record an optional source address.
+    /// Revoke one session id and record its account attribution. Reading a target
+    /// session is not authentication; this event does not claim assurance.
     pub(crate) async fn logout_sid_from_source(
         &self,
         boot: &Bootstrap,
@@ -1268,10 +1389,9 @@ impl ConsoleAuth {
         source_addr: Option<&str>,
     ) -> Result<(), AuthError> {
         validate_session_id(sid)?;
-        let session = read_session(&boot.kernel.state, &session_path(sid)?).await?;
+        let session = read_session(self.session_store.as_ref(), &session_path(sid)?).await?;
         let username = session.as_ref().map(|s| s.username.as_str());
-        let mfa_level = session.as_ref().map(|s| s.mfa_level);
-        let result = revoke_session(&boot.kernel.state, sid).await;
+        let result = revoke_session(self.session_store.as_ref(), sid).await;
         match &result {
             Ok(()) => {
                 record_auth_audit(
@@ -1280,7 +1400,7 @@ impl ConsoleAuth {
                     username,
                     source_addr,
                     "logout",
-                    mfa_level,
+                    None,
                 )?;
             }
             Err(err) => {
@@ -1290,37 +1410,72 @@ impl ConsoleAuth {
                     username,
                     source_addr,
                     audit_outcome(err),
-                    mfa_level,
+                    None,
                 )?;
             }
         }
         result
     }
 
-    /// List all visible console sessions for `principal`.
+    /// Read one live session page without mutating or sweeping expired records.
     pub(crate) async fn list_sessions(
         &self,
         boot: &Bootstrap,
         principal: &ConsolePrincipal,
-    ) -> Result<Vec<SessionSummary>, AuthError> {
+        query: &xolotl_state::StateScan,
+    ) -> Result<SessionPage, AuthError> {
         let sessions_root = Path::parse(SESSIONS_PREFIX)?;
-        authorize_path(&boot.kernel.state, principal, "read", &sessions_root, None).await?;
-        let now = now_millis();
-        sweep_expired_sessions(&boot.kernel.state, now).await?;
-        let mut pages = boot
-            .kernel
-            .state
-            .pages(xolotl_state::StateScan::new(sessions_root));
+        authorize_prefix_read(boot.kernel().state(), principal, &sessions_root).await?;
+        if query.prefix != sessions_root {
+            return Err(AuthError::Query(
+                "expected the console session prefix".into(),
+            ));
+        }
+        let after = query
+            .cursor
+            .as_ref()
+            .map(|cursor| {
+                let bytes = cursor
+                    .0
+                    .strip_prefix(b"console-session-v1:")
+                    .ok_or_else(|| AuthError::Query("invalid session cursor".into()))?;
+                std::str::from_utf8(bytes)
+                    .map_err(|_invalid_utf8| AuthError::Query("invalid session cursor".into()))
+            })
+            .transpose()?;
+        let page = self
+            .session_store
+            .list(
+                after,
+                crate::session_store::SessionPageLimits {
+                    rows: query.limits.entries.get().min(query.limits.examined.get()),
+                    bytes: query.limits.encoded_bytes.get(),
+                },
+            )
+            .await
+            .map_err(|error| match error {
+                crate::session_store::SessionStoreError::Rejected(reason) => {
+                    AuthError::Query(reason)
+                }
+                error => session_store_error(error),
+            })?;
+        let now = self.host_runtime.now_millis();
         let mut sessions = Vec::new();
-        while let Some(page) = pages.next().await? {
-            for (path, value) in page.entries {
-                let sid = path_leaf(&path, "console session id")?;
-                let session = SessionRecord::from_value(&sid, &value.value)?;
-                sessions.push(SessionSummary::from(session));
+        for row in page.entries {
+            let target = crate::paths::session_path(row.sid())?;
+            authorize_path(boot.kernel().state(), principal, "read", &target, None).await?;
+            if row.record.is_live_at(now) {
+                sessions.push(SessionSummary::from(row.record));
             }
         }
-        sessions.sort_by_key(|s| (s.username.clone(), s.issued_at));
-        Ok(sessions)
+        Ok(SessionPage {
+            entries: sessions,
+            next: page.next.map(|sid| {
+                xolotl_state::StateCursor(
+                    [b"console-session-v1:".as_slice(), sid.as_bytes()].concat(),
+                )
+            }),
+        })
     }
 
     /// Revoke one session and record an optional source address.
@@ -1332,9 +1487,9 @@ impl ConsoleAuth {
         source_addr: Option<&str>,
     ) -> Result<(), AuthError> {
         validate_session_id(sid)?;
-        let path = Path::parse(&session_path(sid)?)?;
-        authorize_path(&boot.kernel.state, principal, "write", &path, None).await?;
-        let result = revoke_session(&boot.kernel.state, sid).await;
+        let path = crate::paths::session_path(sid)?;
+        authorize_path(boot.kernel().state(), principal, "write", &path, None).await?;
+        let result = revoke_session(self.session_store.as_ref(), sid).await;
         match &result {
             Ok(()) => record_auth_audit(
                 boot,
@@ -1342,7 +1497,7 @@ impl ConsoleAuth {
                 Some(&principal.username),
                 source_addr,
                 "session_revoke",
-                Some(principal.mfa_level),
+                Some(&principal.authentication),
             )?,
             Err(err) => record_auth_audit(
                 boot,
@@ -1350,7 +1505,7 @@ impl ConsoleAuth {
                 Some(&principal.username),
                 source_addr,
                 audit_outcome(err),
-                Some(principal.mfa_level),
+                Some(&principal.authentication),
             )?,
         }
         result
@@ -1365,21 +1520,24 @@ impl ConsoleAuth {
         source_addr: Option<&str>,
     ) -> Result<usize, AuthError> {
         validate_username(username)?;
-        let user_path = Path::parse(&user_path(username)?)?;
-        authorize_path(&boot.kernel.state, principal, "write", &user_path, None).await?;
-        let mut pages = boot
-            .kernel
-            .state
-            .pages(xolotl_state::StateScan::new(Path::parse(SESSIONS_PREFIX)?));
+        let user_path = user_path(username)?;
+        authorize_path(boot.kernel().state(), principal, "write", &user_path, None).await?;
+        let account = read_user(boot.kernel().state(), username)
+            .await?
+            .ok_or(AuthError::AccountUnavailable)?;
         let mut revoked = 0usize;
-        while let Some(page) = pages.next().await? {
-            for (path, value) in page.entries {
-                let sid = path_leaf(&path, "console session id")?;
-                let session = SessionRecord::from_value(&sid, &value.value)?;
-                if session.username == username {
-                    revoke_session(&boot.kernel.state, &sid).await?;
-                    revoked += 1;
-                }
+        for _ in 0..self.session_store.policy().per_account() {
+            let count = self
+                .session_store
+                .revoke_account(
+                    account.account_key().authority_id(),
+                    account.account_key().instance_id(),
+                )
+                .await
+                .map_err(session_store_error)?;
+            revoked += count;
+            if count == 0 || revoked >= self.session_store.policy().per_account() {
+                break;
             }
         }
         record_auth_audit(
@@ -1388,7 +1546,7 @@ impl ConsoleAuth {
             Some(&principal.username),
             source_addr,
             "user_sessions_revoke",
-            Some(principal.mfa_level),
+            Some(&principal.authentication),
         )?;
         Ok(revoked)
     }
@@ -1396,45 +1554,85 @@ impl ConsoleAuth {
     async fn issue_session(
         &self,
         state: &Backend,
-        user: &UserRecord,
+        account: &AccountSnapshot,
         source_addr: String,
-        mfa_level: u8,
+        authentication: AuthenticationEvidence,
+        credential_epoch: String,
+        authority_ceiling: Option<CapSet>,
     ) -> Result<LoginResponse, AuthError> {
-        sweep_expired_sessions(state, now_millis()).await?;
-        enforce_session_limits(
-            state,
-            &user.username,
-            self.config.max_sessions_per_user,
-            self.config.global_session_limit,
-        )
-        .await?;
+        authentication.validate()?;
+        if authentication
+            .primary
+            .valid_until()
+            .is_some_and(|until| until <= self.host_runtime.now_millis())
+        {
+            return Err(AuthError::InvalidCredentials);
+        }
+        let current = self
+            .current_account(state, &account.key, Some(&account.display_name))
+            .await?;
+        if !current.active {
+            return Err(AuthError::AccountUnavailable);
+        }
+        if current.revocation_epoch != account.revocation_epoch
+            || current.identity != account.identity
+            || credentials::epoch_by_key(state, &account.key, self.credential_sealer()?).await?
+                != credential_epoch
+        {
+            return Err(AuthError::InvalidCredentials);
+        }
+        let authority_ceiling = match authority_ceiling {
+            Some(requested) => effective_session_grants(&current.grants, &requested)?,
+            None => current.grants,
+        };
+        validate_issued_authority_ceiling(&authority_ceiling)?;
 
         let sid = random_token(18)?;
         let token_secret = random_token(32)?;
         let token = format!("{sid}.{token_secret}");
-        let now = now_millis();
-        let expires_at = now.saturating_add(self.config.session_ttl_ms);
-        let idle_expires_at = now.saturating_add(self.config.idle_ttl_ms);
+        let now = self.host_runtime.now_millis();
+        let expires_at = authentication
+            .primary
+            .valid_until()
+            .map_or(now.saturating_add(self.config.session_ttl_ms), |until| {
+                until.min(now.saturating_add(self.config.session_ttl_ms))
+            });
+        if expires_at <= now {
+            return Err(AuthError::InvalidCredentials);
+        }
+        let idle_expires_at = now.saturating_add(self.config.idle_ttl_ms).min(expires_at);
         let session = SessionRecord {
+            persisted: None,
             sid: sid.clone(),
-            username: user.username.clone(),
-            identity_path: user.identity_path.clone(),
+            token_hash: token_hash(&token_secret),
+            username: current.display_name,
+            authority_id: account.key.authority_id().into(),
+            account_id: account.key.instance_id().into(),
+            revocation_epoch: account.revocation_epoch.clone(),
+            identity_path: account.identity.to_string(),
             issued_at: now,
             expires_at,
             idle_expires_at,
-            mfa_level,
+            authentication,
+            credential_epoch,
+            authority_ceiling: Some(authority_ceiling),
             last_seen: now,
             source_addr,
         };
-        write_session(state, &session_path(&sid)?, &session).await?;
-        write_string(state, &session_token_path(&sid)?, token_hash(&token_secret)).await?;
+        let session =
+            write_session(self.session_store.as_ref(), &session_path(&sid)?, &session).await?;
+        let completed_at = self.host_runtime.now_millis();
+        if !session.is_live_at(completed_at) {
+            retire_expired_session(self.session_store.as_ref(), &session, completed_at).await?;
+            return Err(AuthError::InvalidCredentials);
+        }
 
         Ok(LoginResponse {
             sid,
             token,
             expires_at,
             idle_expires_at,
-            mfa_level,
+            authentication: session.authentication,
         })
     }
 
@@ -1451,49 +1649,22 @@ impl ConsoleAuth {
                 retry_after_ms: retry,
             });
         }
-        let user = rate.by_user.entry(username.to_string()).or_default();
-        prune_bucket(user, now);
-        if let Some(retry) = retry_after(*user, now) {
-            return Err(AuthError::RateLimited {
-                retry_after_ms: retry,
-            });
-        }
-        let source = rate.by_source.entry(source_addr.to_string()).or_default();
-        prune_bucket(source, now);
-        if let Some(retry) = retry_after(*source, now) {
-            return Err(AuthError::RateLimited {
-                retry_after_ms: retry,
-            });
-        }
+        check_rate_bucket(&mut rate.by_user, username, now)?;
+        check_rate_bucket(&mut rate.by_source, source_addr, now)?;
         Ok(())
     }
 
     fn record_login_failure(&self, username: &str, source_addr: &str, now: i64) {
         let mut rate = self.rate();
-        mark_failure(rate.by_user.entry(username.to_string()).or_default(), now);
-        mark_failure(
-            rate.by_source.entry(source_addr.to_string()).or_default(),
-            now,
-        );
+        mark_rate_failure(&mut rate.by_user, username, now);
+        mark_rate_failure(&mut rate.by_source, source_addr, now);
         mark_failure(&mut rate.global, now);
     }
 
-    fn clear_login_failures(&self, username: &str, source_addr: &str, now: i64) {
+    fn clear_login_failures(&self, username: &str, source_addr: &str, _now: i64) {
         let mut rate = self.rate();
-        rate.by_user.insert(
-            username.to_string(),
-            FailureBucket {
-                window_started_at: now,
-                ..Default::default()
-            },
-        );
-        rate.by_source.insert(
-            source_addr.to_string(),
-            FailureBucket {
-                window_started_at: now,
-                ..Default::default()
-            },
-        );
+        rate.by_user.remove(username);
+        rate.by_source.remove(source_addr);
     }
 
     fn rate(&self) -> MutexGuard<'_, RateState> {
@@ -1502,129 +1673,6 @@ impl ConsoleAuth {
             Err(poisoned) => poisoned.into_inner(),
         }
     }
-}
-
-/// Create the root account if no console users exist.
-///
-/// A random password is generated only when no password hash or public keys are
-/// preseeded. Successful creation records a bootstrap audit fact.
-pub async fn bootstrap_root_account(
-    boot: &Bootstrap,
-    provisioning: RootProvisioning,
-) -> Result<BootstrapOutcome, AuthError> {
-    let outcome = bootstrap_root_account_inner(&boot.kernel.state, provisioning).await?;
-    if !matches!(outcome, BootstrapOutcome::AlreadyPresent) {
-        record_auth_audit(
-            boot,
-            "console_bootstrap",
-            Some(ROOT_USERNAME),
-            None,
-            "ok",
-            None,
-        )?;
-    }
-    Ok(outcome)
-}
-
-async fn bootstrap_root_account_inner(
-    state: &Backend,
-    provisioning: RootProvisioning,
-) -> Result<BootstrapOutcome, AuthError> {
-    if provisioning.password_hash.is_some() && provisioning.password.is_some() {
-        return Err(AuthError::Crypto(
-            "root password and password_hash are mutually exclusive".into(),
-        ));
-    }
-    if let Some(phc) = &provisioning.password_hash {
-        PasswordHash::new(phc)
-            .map_err(|_error| AuthError::Crypto("invalid root password PHC string".into()))?;
-    }
-    let supported_key = has_valid_ed25519_pubkey(&provisioning.pubkeys)?;
-    if provisioning.password_hash.is_none() && !provisioning.pubkeys.is_empty() && !supported_key {
-        return Err(AuthError::Crypto(
-            "root pubkey provisioning requires at least one supported ed25519 key".into(),
-        ));
-    }
-
-    if prefix_has_entries(state, Path::parse(USERS_PREFIX)?).await? {
-        return Ok(BootstrapOutcome::AlreadyPresent);
-    }
-
-    let now = now_millis();
-    let root_grants = root_grants();
-    let (password_hash_ref, outcome) = if let Some(phc) = provisioning.password_hash {
-        let hash_ref = password_hash_path(ROOT_USERNAME)?;
-        write_string(state, &hash_ref, phc).await?;
-        (
-            Some(hash_ref),
-            BootstrapOutcome::CreatedPreseeded {
-                username: ROOT_USERNAME.into(),
-            },
-        )
-    } else if let Some(password) = provisioning.password {
-        crate::credentials::enforce_password_strength(
-            &crate::credentials::PasswordPolicy::default().bounded(),
-            ROOT_USERNAME,
-            &password,
-        )
-        .map_err(|error| AuthError::Crypto(format!("root password rejected by policy: {error}")))?;
-        let phc = hash_password(&password)?;
-        let hash_ref = password_hash_path(ROOT_USERNAME)?;
-        write_string(state, &hash_ref, phc).await?;
-        (
-            Some(hash_ref),
-            BootstrapOutcome::CreatedFromProvisionedPassword {
-                username: ROOT_USERNAME.into(),
-            },
-        )
-    } else if provisioning.pubkeys.is_empty() {
-        let password = random_token(36)?;
-        let phc = hash_password(&password)?;
-        let hash_ref = password_hash_path(ROOT_USERNAME)?;
-        write_string(state, &hash_ref, phc).await?;
-        (
-            Some(hash_ref),
-            BootstrapOutcome::CreatedRandomPassword {
-                username: ROOT_USERNAME.into(),
-                password,
-            },
-        )
-    } else {
-        (
-            None,
-            BootstrapOutcome::CreatedPreseeded {
-                username: ROOT_USERNAME.into(),
-            },
-        )
-    };
-
-    let user = UserRecord {
-        username: ROOT_USERNAME.into(),
-        identity_path: "identity://console/root".into(),
-        status: "active".into(),
-        password_hash_ref,
-        totp_enabled: false,
-        totp_seed_ref: None,
-        totp_last_step: None,
-        pubkeys: provisioning.pubkeys,
-        roles: Vec::new(),
-        grants: root_grants.clone(),
-        authority_ceiling: root_grants,
-        created_by: "bootstrap".into(),
-        created_at: now,
-        password_changed_at: now,
-    };
-    write_user(state, &user).await?;
-    Ok(outcome)
-}
-
-/// Extract a `Bearer ...` token from HTTP headers.
-pub(crate) fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Result<&str, AuthError> {
-    let header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .ok_or(AuthError::MissingBearer)?;
-    let raw = header.to_str().map_err(|_error| AuthError::MissingBearer)?;
-    raw.strip_prefix("Bearer ").ok_or(AuthError::MissingBearer)
 }
 
 /// Validate console username syntax.
@@ -1644,286 +1692,138 @@ pub(crate) fn validate_username(username: &str) -> Result<(), AuthError> {
     }
 }
 
-/// Compile one request grant after checking that `principal` covers it.
-pub(crate) fn compile_principal_request_grant(
-    boot: &Bootstrap,
-    principal: &ConsolePrincipal,
-    target: &ResourceName,
-    verb: &str,
-    selector: ResourceSelector,
-) -> Result<CompiledRequestGrantTemplate, AuthError> {
-    if !principal.grants.contains(verb, target.path()) {
-        return Err(AuthError::PermissionDenied);
+fn validate_issued_authority_ceiling(ceiling: &CapSet) -> Result<(), AuthError> {
+    if ceiling.len() > MAX_SESSION_CEILING_CAPABILITIES {
+        return Err(AuthError::State(
+            "session authority ceiling exceeds limit".into(),
+        ));
     }
-    let methods = boot
-        .request_method_bitmap(target, verb)
-        .map_err(|error| AuthError::State(error.to_string()))?;
-    Ok(CompiledRequestGrantTemplate { selector, methods })
-}
-
-/// Authorize a principal for a state path and optional replacement value.
-///
-/// Console management paths require both direct path authority and the console
-/// management effect authority; user/role writes are additionally checked so a
-/// non-root admin cannot grant authority above their ceiling.
-pub(crate) async fn authorize_path(
-    state: &Backend,
-    principal: &ConsolePrincipal,
-    verb: &str,
-    path: &Path,
-    new_value: Option<&Value>,
-) -> Result<(), AuthError> {
-    if !principal.grants.contains(verb, path) {
-        return Err(AuthError::PermissionDenied);
-    }
-    let path_s = path.to_string();
-    if path_s.starts_with("state://kernel/console/") {
-        let user_mgmt = Path::parse("effect://kernel/console/users")?;
-        if !principal.grants.contains("perform", &user_mgmt) {
-            return Err(AuthError::PermissionDenied);
-        }
-    }
-    if verb == "write" && path_s.starts_with("state://kernel/console/users/") {
-        authorize_user_target(state, principal, path, new_value).await?;
-    }
-    if verb == "write" && path_s.starts_with("state://kernel/console/roles/") {
-        authorize_role_target(state, principal, path, new_value).await?;
-    }
-    Ok(())
-}
-
-async fn authorize_user_target(
-    state: &Backend,
-    principal: &ConsolePrincipal,
-    path: &Path,
-    new_value: Option<&Value>,
-) -> Result<(), AuthError> {
-    let Some(username) = path.segments().last().map(|s| s.to_string()) else {
-        return Err(AuthError::PermissionDenied);
-    };
-    validate_username(&username)?;
-
-    if username == ROOT_USERNAME && principal.username != ROOT_USERNAME {
-        return Err(AuthError::PermissionDenied);
-    }
-
-    if let Some(existing) = read_user(state, &username).await? {
-        let target = effective_grants(state, &existing).await?;
-        if !capset_covers(&principal.grants, &target) {
-            return Err(AuthError::PermissionDenied);
-        }
-    }
-    if let Some(value) = new_value {
-        let candidate = UserRecord::from_value(&username, value)?;
-        let candidate_ceiling = capset_from_strings(&candidate.authority_ceiling)?;
-        let candidate_effective = effective_grants(state, &candidate).await?;
-        if !capset_covers(&principal.grants, &candidate_ceiling)
-            || !capset_covers(&principal.grants, &candidate_effective)
+    let mut total_bytes = 0usize;
+    for capability in ceiling.iter() {
+        let literal = capability.to_string();
+        total_bytes = total_bytes.saturating_add(literal.len());
+        if literal.len() > MAX_SESSION_CAPABILITY_BYTES
+            || total_bytes > MAX_SESSION_CEILING_BYTES
+            || !matches!(Capability::parse(&literal), Ok(parsed) if parsed == *capability)
         {
-            return Err(AuthError::PermissionDenied);
-        }
-        if username == ROOT_USERNAME {
-            enforce_root_invariants(&candidate, &candidate_effective)?;
-        }
-    }
-    Ok(())
-}
-
-async fn authorize_role_target(
-    state: &Backend,
-    principal: &ConsolePrincipal,
-    path: &Path,
-    new_value: Option<&Value>,
-) -> Result<(), AuthError> {
-    let Some(role) = path.segments().last().map(|s| s.to_string()) else {
-        return Err(AuthError::PermissionDenied);
-    };
-    validate_username(&role)?;
-
-    let role_path = role_path(&role)?;
-    if let Some(existing) = state.read(&Path::parse(&role_path)?).await? {
-        let existing_grants = capset_from_strings(&role_grants(&existing)?)?;
-        if !capset_covers(&principal.grants, &existing_grants) {
-            return Err(AuthError::PermissionDenied);
-        }
-        if role_frozen(&existing)? && principal.username != ROOT_USERNAME {
-            return Err(AuthError::PermissionDenied);
-        }
-    }
-
-    if let Some(value) = new_value {
-        let candidate_grants = capset_from_strings(&role_grants(value)?)?;
-        if !capset_covers(&principal.grants, &candidate_grants) {
-            return Err(AuthError::PermissionDenied);
-        }
-        if role_frozen(value)? && principal.username != ROOT_USERNAME {
-            return Err(AuthError::PermissionDenied);
+            return Err(AuthError::State(
+                "session authority ceiling exceeds limit".into(),
+            ));
         }
     }
     Ok(())
 }
 
-fn enforce_root_invariants(user: &UserRecord, effective: &CapSet) -> Result<(), AuthError> {
-    if !matches!(user.status.as_str(), "active") {
-        return Err(AuthError::PermissionDenied);
+fn read_authority_ceiling(value: &Value) -> Result<Option<CapSet>, AuthError> {
+    if value.is_null() {
+        return Ok(None);
     }
-    if user.password_hash_ref.is_none() && !has_valid_ed25519_pubkey(&user.pubkeys)? {
-        return Err(AuthError::PermissionDenied);
+    let items = value.as_list().ok_or(AuthError::InvalidSession)?;
+    if items.len() > MAX_SESSION_CEILING_CAPABILITIES {
+        return Err(AuthError::InvalidSession);
     }
-    let user_mgmt = Path::parse("effect://kernel/console/users")?;
-    let root_user = Path::parse("state://kernel/console/users/root")?;
-    if !effective.contains("perform", &user_mgmt) || !effective.contains("write", &root_user) {
-        return Err(AuthError::PermissionDenied);
+    if items
+        .iter()
+        .map(|item| item.as_str().map_or(0, str::len))
+        .sum::<usize>()
+        > MAX_SESSION_CEILING_BYTES
+    {
+        return Err(AuthError::InvalidSession);
     }
-    Ok(())
-}
-
-fn capset_covers(parent: &CapSet, child: &CapSet) -> bool {
-    child.iter().all(|c| parent.iter().any(|p| p.covers_cap(c)))
-}
-
-async fn effective_grants(state: &Backend, user: &UserRecord) -> Result<CapSet, AuthError> {
-    let mut grants = user.grants.clone();
-    for role in &user.roles {
-        let role_path = role_path(role)?;
-        if let Some(v) = state.read(&Path::parse(&role_path)?).await? {
-            grants.extend(role_grants(&v)?);
-        }
-    }
-    let requested = capset_from_strings(&grants)?;
-    let ceiling = capset_from_strings(&user.authority_ceiling)?;
-    Ok(ceiling.intersect(&requested))
-}
-
-fn capset_from_strings(items: &[String]) -> Result<CapSet, AuthError> {
     let caps = items
         .iter()
-        .map(|s| Capability::parse(s).map_err(|e| AuthError::State(e.to_string())))
+        .map(|item| {
+            let text = item.as_str().ok_or(AuthError::InvalidSession)?;
+            if text.len() > MAX_SESSION_CAPABILITY_BYTES {
+                return Err(AuthError::InvalidSession);
+            }
+            Capability::parse(text).map_err(|_error| AuthError::InvalidSession)
+        })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(CapSet(caps))
-}
-
-fn role_grants(value: &Value) -> Result<Vec<String>, AuthError> {
-    let map = value
-        .as_map()
-        .ok_or_else(|| AuthError::State("console role must be a map".into()))?;
-    optional_string_list_field(map, "grants", "console role")
-}
-
-fn role_frozen(value: &Value) -> Result<bool, AuthError> {
-    let map = value
-        .as_map()
-        .ok_or_else(|| AuthError::State("console role must be a map".into()))?;
-    optional_bool_field(map, "frozen", "console role")
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PasskeyCredentialRecord {
-    username: String,
-    credential: Passkey,
-    created_at: i64,
-    updated_at: i64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum PasskeyChallengeRecord {
-    Registration {
-        username: String,
-        expires_at: i64,
-        state: PasskeyRegistration,
-    },
-    Authentication {
-        username: String,
-        expires_at: i64,
-        state: PasskeyAuthentication,
-    },
+    Ok(Some(CapSet(caps)))
 }
 
 #[derive(Clone, Debug)]
 struct UserRecord {
+    // Exact state observed at read time, used to serialize authentication and
+    // administrative edits through the same CAS boundary.
+    persisted: Option<Value>,
     username: String,
+    account_id: String,
+    bootstrap_owner: bool,
     identity_path: String,
     status: String,
-    password_hash_ref: Option<String>,
-    totp_enabled: bool,
-    totp_seed_ref: Option<String>,
-    totp_last_step: Option<i64>,
-    pubkeys: Vec<String>,
     roles: Vec<String>,
     grants: Vec<String>,
     authority_ceiling: Vec<String>,
     created_by: String,
     created_at: i64,
-    password_changed_at: i64,
 }
 
 impl UserRecord {
-    fn password_hash_ref(&self) -> Option<String> {
-        self.password_hash_ref.clone()
+    fn account_key(&self) -> AccountKey {
+        AccountKey::local(&self.account_id)
+    }
+
+    fn version(&self) -> i64 {
+        self.persisted
+            .as_ref()
+            .and_then(Value::as_map)
+            .and_then(|map| map.get("version"))
+            .and_then(Value::as_int)
+            .unwrap_or(0)
     }
 
     fn from_value(username: &str, value: &Value) -> Result<Self, AuthError> {
         let m = value.as_map().ok_or(AuthError::InvalidCredentials)?;
+        let account_id = required_str_field(m, "account_id", "console user")?;
         let identity_path = required_str_field(m, "identity_path", "console user")?;
         validate_console_identity_path(&identity_path)?;
+        if identity_path != local_identity_path(&account_id)? {
+            return Err(AuthError::AccountUnavailable);
+        }
+        let bootstrap_owner = m
+            .get("bootstrap_owner")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| AuthError::State("console user.bootstrap_owner is invalid".into()))?;
+        if bootstrap_owner && username != ROOT_USERNAME {
+            return Err(AuthError::AccountUnavailable);
+        }
         let status = required_str_field(m, "status", "console user")?;
-        if !matches!(status.as_str(), "active" | "disabled" | "locked") {
+        if !matches!(
+            status.as_str(),
+            "active" | "disabled" | "locked" | "provisioning"
+        ) {
             return Err(AuthError::State("console user.status is invalid".into()));
         }
-        let authn = required_map_field(m, "authn", "console user")?;
-        let password = required_map_field(authn, "password", "console user.authn")?;
-        let totp = required_map_field(authn, "totp", "console user.authn")?;
         let created_at = required_nonnegative_int_field(m, "created_at", "console user")?;
-        let password_changed_at =
-            required_nonnegative_int_field(m, "password_changed_at", "console user")?;
         Ok(Self {
+            persisted: Some(value.clone()),
             username: username.to_string(),
+            account_id,
+            bootstrap_owner,
             identity_path,
             status,
-            password_hash_ref: optional_string_field(
-                password,
-                "hash_ref",
-                "console user.password",
-            )?,
-            totp_enabled: optional_bool_field(totp, "enabled", "console user.totp")?,
-            totp_seed_ref: optional_string_field(totp, "seed_ref", "console user.totp")?,
-            totp_last_step: optional_nonnegative_int_field(totp, "last_step", "console user.totp")?,
-            pubkeys: required_string_list_field(authn, "pubkeys", "console user.authn")?,
             roles: required_string_list_field(m, "roles", "console user")?,
             grants: required_string_list_field(m, "grants", "console user")?,
             authority_ceiling: required_string_list_field(m, "authority_ceiling", "console user")?,
             created_by: required_str_field(m, "created_by", "console user")?,
             created_at,
-            password_changed_at,
         })
     }
 
     fn to_value(&self) -> Value {
-        let mut authn = BTreeMap::new();
-        let mut password = BTreeMap::new();
-        if let Some(hash_ref) = &self.password_hash_ref {
-            password.insert("hash_ref".into(), Value::string(hash_ref.clone()));
-        }
-        authn.insert("password".into(), Value::map(password));
-        let mut totp = BTreeMap::new();
-        totp.insert("enabled".into(), Value::boolean(self.totp_enabled));
-        if let Some(seed_ref) = &self.totp_seed_ref {
-            totp.insert("seed_ref".into(), Value::string(seed_ref.clone()));
-        }
-        if let Some(step) = self.totp_last_step {
-            totp.insert("last_step".into(), Value::integer(step));
-        }
-        authn.insert("totp".into(), Value::map(totp));
-        authn.insert("pubkeys".into(), string_values(&self.pubkeys));
-
         let mut m = BTreeMap::new();
+        m.insert("account_id".into(), Value::string(self.account_id.clone()));
+        m.insert(
+            "bootstrap_owner".into(),
+            Value::boolean(self.bootstrap_owner),
+        );
         m.insert(
             "identity_path".into(),
             Value::string(self.identity_path.clone()),
         );
         m.insert("status".into(), Value::string(self.status.clone()));
-        m.insert("authn".into(), Value::map(authn));
         m.insert("roles".into(), string_values(&self.roles));
         m.insert("grants".into(), string_values(&self.grants));
         m.insert(
@@ -1932,53 +1832,144 @@ impl UserRecord {
         );
         m.insert("created_by".into(), Value::string(self.created_by.clone()));
         m.insert("created_at".into(), Value::integer(self.created_at));
-        m.insert(
-            "password_changed_at".into(),
-            Value::integer(self.password_changed_at),
-        );
         Value::map(m)
     }
 }
 
-#[derive(Clone, Debug)]
-struct SessionRecord {
-    sid: String,
-    username: String,
-    identity_path: String,
-    issued_at: i64,
-    expires_at: i64,
-    idle_expires_at: i64,
-    mfa_level: u8,
-    last_seen: i64,
-    source_addr: String,
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SessionRecord {
+    pub(crate) persisted: Option<Value>,
+    pub(crate) sid: String,
+    pub(crate) token_hash: String,
+    pub(crate) username: String,
+    pub(crate) authority_id: String,
+    pub(crate) account_id: String,
+    pub(crate) revocation_epoch: String,
+    pub(crate) identity_path: String,
+    pub(crate) issued_at: i64,
+    pub(crate) expires_at: i64,
+    pub(crate) idle_expires_at: i64,
+    pub(crate) authentication: AuthenticationEvidence,
+    pub(crate) credential_epoch: String,
+    pub(crate) authority_ceiling: Option<CapSet>,
+    pub(crate) last_seen: i64,
+    pub(crate) source_addr: String,
 }
 
 impl SessionRecord {
-    fn from_value(sid: &str, value: &Value) -> Result<Self, AuthError> {
+    fn is_live_at(&self, now: i64) -> bool {
+        self.expires_at > now && self.idle_expires_at > now
+    }
+
+    fn renew_activity(&mut self, admitted_at: i64, idle_ttl_ms: i64) {
+        self.last_seen = admitted_at;
+        self.idle_expires_at = admitted_at.saturating_add(idle_ttl_ms).min(self.expires_at);
+    }
+
+    fn has_same_authority_as(&self, observed: &Self) -> bool {
+        self.sid == observed.sid
+            && self.username == observed.username
+            && self.authority_id == observed.authority_id
+            && self.account_id == observed.account_id
+            && self.identity_path == observed.identity_path
+            && self.issued_at == observed.issued_at
+            && self.expires_at == observed.expires_at
+            && self.authentication == observed.authentication
+            && self.revocation_epoch == observed.revocation_epoch
+            && self.credential_epoch == observed.credential_epoch
+            && self.authority_ceiling == observed.authority_ceiling
+            && self.source_addr == observed.source_addr
+    }
+
+    fn account_key(&self) -> AccountKey {
+        AccountKey::from_parts(&self.authority_id, &self.account_id)
+    }
+
+    pub(crate) fn from_value(sid: &str, value: &Value) -> Result<Self, AuthError> {
         let m = value.as_map().ok_or(AuthError::InvalidSession)?;
-        let mfa_level = optional_int_field(m, "mfa_level", "console session", 1)?;
-        let mfa_level = u8::try_from(mfa_level).map_err(|_error| {
-            AuthError::State("console session.mfa_level is out of range".into())
-        })?;
+        let token_hash = str_field(m, "token_hash").ok_or(AuthError::InvalidSession)?;
+        if token_hash.len() != 43
+            || URL_SAFE_NO_PAD
+                .decode(&token_hash)
+                .ok()
+                .is_none_or(|digest| {
+                    digest.len() != 32 || URL_SAFE_NO_PAD.encode(digest) != token_hash
+                })
+        {
+            return Err(AuthError::InvalidSession);
+        }
         let username = str_field(m, "username").ok_or(AuthError::InvalidSession)?;
-        validate_username(&username)?;
+        if username.is_empty() || username.len() > 256 || username.chars().any(char::is_control) {
+            return Err(AuthError::InvalidSession);
+        }
+        let authority_id = str_field(m, "authority_id").ok_or(AuthError::InvalidSession)?;
+        let account_id = str_field(m, "account_id").ok_or(AuthError::InvalidSession)?;
+        AccountKey::new(&authority_id, &account_id).map_err(|_error| AuthError::InvalidSession)?;
+        let revocation_epoch = str_field(m, "revocation_epoch").ok_or(AuthError::InvalidSession)?;
+        if revocation_epoch.is_empty()
+            || revocation_epoch.len() > 128
+            || revocation_epoch.chars().any(char::is_control)
+        {
+            return Err(AuthError::InvalidSession);
+        }
         let identity_path = str_field(m, "identity_path").ok_or(AuthError::InvalidSession)?;
         validate_console_identity_path(&identity_path)?;
+        if authority_id == LOCAL_AUTHORITY_ID
+            && identity_path
+                != local_identity_path(&account_id).map_err(|_error| AuthError::InvalidSession)?
+        {
+            return Err(AuthError::InvalidSession);
+        }
+        let expires_at = int_field(m, "expires_at").ok_or(AuthError::InvalidSession)?;
+        let idle_expires_at = int_field(m, "idle_expires_at").ok_or(AuthError::InvalidSession)?;
+        let authentication = AuthenticationEvidence::from_value(
+            m.get("authentication").ok_or(AuthError::InvalidSession)?,
+        )?;
+        if idle_expires_at > expires_at
+            || authentication
+                .primary
+                .valid_until()
+                .is_some_and(|until| expires_at > until)
+        {
+            return Err(AuthError::InvalidSession);
+        }
         Ok(Self {
+            persisted: Some(value.clone()),
             sid: sid.to_string(),
+            token_hash,
             username,
+            authority_id,
+            account_id,
+            revocation_epoch,
             identity_path,
             issued_at: int_field(m, "issued_at").ok_or(AuthError::InvalidSession)?,
-            expires_at: int_field(m, "expires_at").ok_or(AuthError::InvalidSession)?,
-            idle_expires_at: int_field(m, "idle_expires_at").ok_or(AuthError::InvalidSession)?,
-            mfa_level,
+            expires_at,
+            idle_expires_at,
+            authentication,
+            credential_epoch: str_field(m, "credential_epoch").ok_or(AuthError::InvalidSession)?,
+            authority_ceiling: read_authority_ceiling(
+                m.get("authority_ceiling")
+                    .ok_or(AuthError::InvalidSession)?,
+            )?
+            .ok_or(AuthError::InvalidSession)
+            .map(Some)?,
             last_seen: optional_int_field(m, "last_seen", "console session", 0)?,
             source_addr: optional_str_field(m, "source_addr", "console session", "")?,
         })
     }
 
-    fn to_value(&self) -> Value {
+    pub(crate) fn to_value(&self) -> Value {
         let mut m = BTreeMap::new();
+        m.insert(
+            "authority_id".into(),
+            Value::string(self.authority_id.clone()),
+        );
+        m.insert("token_hash".into(), Value::string(self.token_hash.clone()));
+        m.insert("account_id".into(), Value::string(self.account_id.clone()));
+        m.insert(
+            "revocation_epoch".into(),
+            Value::string(self.revocation_epoch.clone()),
+        );
         m.insert("username".into(), Value::string(self.username.clone()));
         m.insert(
             "identity_path".into(),
@@ -1990,7 +1981,24 @@ impl SessionRecord {
             "idle_expires_at".into(),
             Value::integer(self.idle_expires_at),
         );
-        m.insert("mfa_level".into(), Value::integer(self.mfa_level as i64));
+        m.insert("authentication".into(), self.authentication.to_value());
+        m.insert(
+            "credential_epoch".into(),
+            Value::string(self.credential_epoch.clone()),
+        );
+        m.insert(
+            "authority_ceiling".into(),
+            self.authority_ceiling
+                .as_ref()
+                .map_or(Value::null(), |ceiling| {
+                    Value::list(
+                        ceiling
+                            .iter()
+                            .map(|cap| Value::string(cap.to_string()))
+                            .collect(),
+                    )
+                }),
+        );
         m.insert("last_seen".into(), Value::integer(self.last_seen));
         m.insert(
             "source_addr".into(),
@@ -2009,49 +2017,22 @@ impl From<SessionRecord> for SessionSummary {
             issued_at: s.issued_at,
             expires_at: s.expires_at,
             idle_expires_at: s.idle_expires_at,
-            mfa_level: s.mfa_level,
+            authentication: s.authentication,
             last_seen: s.last_seen,
             source_addr: s.source_addr,
         }
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KeyChallengeRecord {
-    challenge_id: String,
-    username: String,
+    credential_epoch: String,
     nonce: String,
-    origin: String,
-    issued_at: i64,
-    expires_at: i64,
-}
-
-impl KeyChallengeRecord {
-    fn from_value(challenge_id: &str, value: &Value) -> Result<Self, AuthError> {
-        let m = value.as_map().ok_or(AuthError::InvalidChallenge)?;
-        Ok(Self {
-            challenge_id: challenge_id.to_string(),
-            username: str_field(m, "username").ok_or(AuthError::InvalidChallenge)?,
-            nonce: str_field(m, "nonce").ok_or(AuthError::InvalidChallenge)?,
-            origin: str_field(m, "origin").ok_or(AuthError::InvalidChallenge)?,
-            issued_at: int_field(m, "issued_at").ok_or(AuthError::InvalidChallenge)?,
-            expires_at: int_field(m, "expires_at").ok_or(AuthError::InvalidChallenge)?,
-        })
-    }
-
-    fn to_value(&self) -> Value {
-        let mut m = BTreeMap::new();
-        m.insert("username".into(), Value::string(self.username.clone()));
-        m.insert("nonce".into(), Value::string(self.nonce.clone()));
-        m.insert("origin".into(), Value::string(self.origin.clone()));
-        m.insert("issued_at".into(), Value::integer(self.issued_at));
-        m.insert("expires_at".into(), Value::integer(self.expires_at));
-        Value::map(m)
-    }
 }
 
 async fn read_user(state: &Backend, username: &str) -> Result<Option<UserRecord>, AuthError> {
-    let path = Path::parse(&user_path(username)?)?;
+    let path = user_path(username)?;
     state
         .read(&path)
         .await?
@@ -2059,158 +2040,175 @@ async fn read_user(state: &Backend, username: &str) -> Result<Option<UserRecord>
         .transpose()
 }
 
-async fn write_user(state: &Backend, user: &UserRecord) -> Result<(), AuthError> {
-    let path = Path::parse(&user_path(&user.username)?)?;
-    state.write_set(&path, user.to_value()).await?;
-    Ok(())
+async fn write_user(state: &Backend, user: &UserRecord) -> Result<Value, AuthError> {
+    let path = user_path(&user.username)?;
+    let mut value = user
+        .to_value()
+        .into_map()
+        .ok_or_else(|| AuthError::State("console user must be an object".into()))?;
+    let version = user
+        .persisted
+        .as_ref()
+        .map(|current| {
+            let map = current.as_map().ok_or(AuthError::InvalidCredentials)?;
+            optional_int_field(map, "version", "console user", 0)
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let next = version
+        .checked_add(1)
+        .filter(|_| version >= 0)
+        .ok_or_else(|| AuthError::State("console user version is out of range".into()))?;
+    value
+        .insert("version".into(), Value::integer(next))
+        .map_err(|error| AuthError::State(error.to_string()))?;
+    let value = Value::from(value);
+    match state
+        .write_cas(&path, user.persisted.clone(), value.clone())
+        .await
+    {
+        Ok(_) => {}
+        Err(xolotl_state::StateFailure {
+            error: xolotl_state::StateError::CasFailed { .. },
+            ..
+        }) => {
+            // A consumed TOTP or concurrent account edit invalidates this
+            // authentication attempt; never restore stale grants or status.
+            return Err(AuthError::InvalidCredentials);
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(value)
 }
 
-async fn read_session(state: &Backend, path: &str) -> Result<Option<SessionRecord>, AuthError> {
-    let sid = path.rsplit('/').next().ok_or(AuthError::InvalidSession)?;
-    state
-        .read(&Path::parse(path)?)
-        .await?
-        .map(|v| SessionRecord::from_value(sid, &v))
+async fn read_session(
+    store: &dyn crate::session_store::ConsoleSessionStore,
+    path: &Path,
+) -> Result<Option<SessionRecord>, AuthError> {
+    let sid = crate::paths::stored_session_id_from_path(path).ok_or(AuthError::InvalidSession)?;
+    store
+        .get(sid)
+        .await
+        .map_err(session_store_error)?
+        .map(|row| {
+            let mut record = row.record;
+            record.persisted = Some(record.to_value());
+            Ok(record)
+        })
         .transpose()
+}
+
+fn session_store_error(error: crate::session_store::SessionStoreError) -> AuthError {
+    match error {
+        crate::session_store::SessionStoreError::Conflict => AuthError::InvalidSession,
+        crate::session_store::SessionStoreError::Rejected(_) => AuthError::SessionAdmissionRejected,
+        crate::session_store::SessionStoreError::Unknown(_) => AuthError::SessionCommitUnknown,
+        error => AuthError::State(error.to_string()),
+    }
 }
 
 async fn write_session(
-    state: &Backend,
-    path: &str,
+    store: &dyn crate::session_store::ConsoleSessionStore,
+    path: &Path,
     session: &SessionRecord,
-) -> Result<(), AuthError> {
-    state
-        .write_set(&Path::parse(path)?, session.to_value())
-        .await?;
-    Ok(())
-}
-
-async fn read_key_challenge(
-    state: &Backend,
-    challenge_id: &str,
-) -> Result<Option<KeyChallengeRecord>, AuthError> {
-    validate_session_id(challenge_id).map_err(|_error| AuthError::InvalidChallenge)?;
-    let path = key_challenge_path(challenge_id)?;
-    state
-        .read(&Path::parse(&path)?)
-        .await?
-        .map(|v| KeyChallengeRecord::from_value(challenge_id, &v))
-        .transpose()
-}
-
-async fn write_key_challenge(
-    state: &Backend,
-    challenge: &KeyChallengeRecord,
-) -> Result<(), AuthError> {
-    state
-        .write_set(
-            &Path::parse(&key_challenge_path(&challenge.challenge_id)?)?,
-            challenge.to_value(),
-        )
-        .await?;
-    Ok(())
-}
-
-async fn revoke_key_challenge(state: &Backend, challenge_id: &str) -> Result<(), AuthError> {
-    state
-        .write_delete(&Path::parse(&key_challenge_path(challenge_id)?)?)
-        .await?;
-    Ok(())
-}
-
-async fn sweep_expired_key_challenges(state: &Backend, now: i64) -> Result<(), AuthError> {
-    let mut pages = state.pages(xolotl_state::StateScan::new(Path::parse(
-        CHALLENGES_PREFIX,
-    )?));
-    while let Some(page) = pages.next().await? {
-        for (path, value) in page.entries {
-            let challenge_id = path_leaf(&path, "console key challenge id")?;
-            let challenge = KeyChallengeRecord::from_value(&challenge_id, &value.value)?;
-            if challenge.expires_at <= now {
-                revoke_key_challenge(state, &challenge_id).await?;
+) -> Result<SessionRecord, AuthError> {
+    use crate::session_store::{ConsoleSession, SessionStoreError};
+    let mut expected = session.persisted.clone();
+    let observed_token_hash = expected
+        .as_ref()
+        .map(|value| SessionRecord::from_value(&session.sid, value).map(|record| record.token_hash))
+        .transpose()?;
+    let mut updated = session.clone();
+    for _ in 0..8 {
+        let row = ConsoleSession::from_record(updated.clone());
+        let result = match &expected {
+            Some(value) => {
+                store
+                    .compare_replace(
+                        ConsoleSession::from_record(SessionRecord::from_value(
+                            &session.sid,
+                            value,
+                        )?),
+                        row,
+                    )
+                    .await
             }
-        }
-    }
-    Ok(())
-}
-
-async fn revoke_session(state: &Backend, sid: &str) -> Result<(), AuthError> {
-    state
-        .write_delete(&Path::parse(&session_path(sid)?)?)
-        .await?;
-    state
-        .write_delete(&Path::parse(&session_token_path(sid)?)?)
-        .await?;
-    Ok(())
-}
-
-async fn sweep_expired_sessions(state: &Backend, now: i64) -> Result<(), AuthError> {
-    let mut pages = state.pages(xolotl_state::StateScan::new(Path::parse(SESSIONS_PREFIX)?));
-    while let Some(page) = pages.next().await? {
-        for (path, value) in page.entries {
-            let sid = path_leaf(&path, "console session id")?;
-            let session = SessionRecord::from_value(&sid, &value.value)?;
-            if session.expires_at <= now || session.idle_expires_at <= now {
-                revoke_session(state, &sid).await?;
+            None => store.create(row).await,
+        };
+        match result {
+            Ok(()) => {
+                let current = read_session(store, path)
+                    .await?
+                    .ok_or(AuthError::InvalidSession)?;
+                if !current.has_same_authority_as(&updated)
+                    || current.token_hash != updated.token_hash
+                {
+                    return Err(AuthError::InvalidSession);
+                }
+                return Ok(current);
             }
+            Err(SessionStoreError::Unknown(_)) if expected.is_none() => {
+                let current = read_session(store, path)
+                    .await
+                    .map_err(|_read_error| AuthError::SessionCommitUnknown)?;
+                if let Some(current) = current {
+                    if current.has_same_authority_as(session)
+                        && current.token_hash == session.token_hash
+                    {
+                        return Ok(current);
+                    }
+                    return Err(AuthError::InvalidSession);
+                }
+                return Err(AuthError::SessionCommitUnknown);
+            }
+            Err(SessionStoreError::Conflict) if session.persisted.is_some() => {}
+            Err(error) => return Err(session_store_error(error)),
         }
+        let current = read_session(store, path)
+            .await?
+            .ok_or(AuthError::InvalidSession)?;
+        if !current.has_same_authority_as(session)
+            || Some(current.token_hash.as_str()) != observed_token_hash.as_deref()
+        {
+            return Err(AuthError::InvalidSession);
+        }
+        updated.last_seen = updated.last_seen.max(current.last_seen);
+        updated.idle_expires_at = updated
+            .idle_expires_at
+            .max(current.idle_expires_at)
+            .min(updated.expires_at);
+        expected = current.persisted;
     }
-    Ok(())
+    Err(AuthError::RateLimited { retry_after_ms: 10 })
 }
 
-async fn enforce_session_limits(
-    state: &Backend,
-    username: &str,
-    max_per_user: usize,
-    global_limit: usize,
+async fn revoke_session(
+    store: &dyn crate::session_store::ConsoleSessionStore,
+    sid: &str,
 ) -> Result<(), AuthError> {
-    let mut pages = state.pages(xolotl_state::StateScan::new(Path::parse(SESSIONS_PREFIX)?));
-    let mut sessions = Vec::new();
-    while let Some(page) = pages.next().await? {
-        for (path, value) in page.entries {
-            let sid = path_leaf(&path, "console session id")?;
-            sessions.push(SessionRecord::from_value(&sid, &value.value)?);
-        }
-    }
-    sessions.sort_by_key(|s| s.issued_at);
-
-    let mut user_sessions: Vec<_> = sessions
-        .iter()
-        .filter(|s| s.username == username)
-        .cloned()
-        .collect();
-    while user_sessions.len() >= max_per_user {
-        if let Some(oldest) = user_sessions.first().cloned() {
-            revoke_session(state, &oldest.sid).await?;
-            user_sessions.remove(0);
-        } else {
-            break;
-        }
-    }
-
-    while sessions.len() >= global_limit {
-        if let Some(oldest) = sessions.first().cloned() {
-            revoke_session(state, &oldest.sid).await?;
-            sessions.remove(0);
-        } else {
-            break;
-        }
-    }
-    Ok(())
+    store.delete(sid, None).await.map_err(session_store_error)
 }
 
-async fn read_string(state: &Backend, path: &str) -> Result<Option<String>, AuthError> {
-    Ok(state
-        .read(&Path::parse(path)?)
-        .await?
-        .and_then(|v| v.as_str().map(str::to_string)))
-}
-
-async fn write_string(state: &Backend, path: &str, value: String) -> Result<(), AuthError> {
-    state
-        .write_set(&Path::parse(path)?, Value::string(value))
-        .await?;
-    Ok(())
+async fn retire_expired_session(
+    store: &dyn crate::session_store::ConsoleSessionStore,
+    session: &SessionRecord,
+    now: i64,
+) -> Result<(), AuthError> {
+    if session.is_live_at(now) {
+        return Ok(());
+    }
+    let expected = session
+        .persisted
+        .as_ref()
+        .ok_or(AuthError::InvalidSession)?;
+    let expected = crate::session_store::ConsoleSession::from_record(SessionRecord::from_value(
+        &session.sid,
+        expected,
+    )?);
+    match store.delete(&session.sid, Some(expected)).await {
+        Ok(()) | Err(crate::session_store::SessionStoreError::Conflict) => Ok(()),
+        Err(error) => Err(session_store_error(error)),
+    }
 }
 
 fn root_grants() -> Vec<String> {
@@ -2226,96 +2224,6 @@ fn root_grants() -> Vec<String> {
     ]
 }
 
-fn passkey_challenge_path(challenge_id: &str) -> Result<String, AuthError> {
-    validate_session_id(challenge_id).map_err(|_error| AuthError::InvalidChallenge)?;
-    state_path_string(&["vault", "console", "passkey_challenges", challenge_id])
-}
-
-fn passkey_credential_id(credential: &Passkey) -> String {
-    URL_SAFE_NO_PAD.encode(credential.cred_id().as_ref())
-}
-
-fn passkey_credential_key(credential: &Passkey) -> String {
-    URL_SAFE_NO_PAD.encode(Sha256::digest(credential.cred_id().as_ref()))
-}
-
-fn passkey_user_prefix(username: &str) -> Result<String, AuthError> {
-    validate_username(username)?;
-    state_path_string(&["kernel", "console", "credentials", "passkeys", username])
-}
-
-fn passkey_credential_path(username: &str, credential: &Passkey) -> Result<String, AuthError> {
-    let prefix = passkey_user_prefix(username)?;
-    Ok(format!("{prefix}/{}", passkey_credential_key(credential)))
-}
-
-fn stable_user_uuid(username: &str) -> Uuid {
-    let digest = Sha256::digest(username.as_bytes());
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x50;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Uuid::from_bytes(bytes)
-}
-
-async fn write_passkey_challenge(
-    state: &Backend,
-    challenge_id: &str,
-    record: &PasskeyChallengeRecord,
-) -> Result<(), AuthError> {
-    let encoded =
-        serde_json::to_string(record).map_err(|error| AuthError::Crypto(error.to_string()))?;
-    write_string(state, &passkey_challenge_path(challenge_id)?, encoded).await
-}
-
-async fn take_passkey_challenge(
-    state: &Backend,
-    challenge_id: &str,
-) -> Result<PasskeyChallengeRecord, AuthError> {
-    let path = passkey_challenge_path(challenge_id)?;
-    let encoded = read_string(state, &path)
-        .await?
-        .ok_or(AuthError::InvalidChallenge)?;
-    state.write_delete(&Path::parse(&path)?).await?;
-    serde_json::from_str(&encoded).map_err(|_error| AuthError::InvalidChallenge)
-}
-
-async fn write_passkey_record(
-    state: &Backend,
-    record: &PasskeyCredentialRecord,
-) -> Result<(), AuthError> {
-    let encoded =
-        serde_json::to_string(record).map_err(|error| AuthError::Crypto(error.to_string()))?;
-    write_string(
-        state,
-        &passkey_credential_path(&record.username, &record.credential)?,
-        encoded,
-    )
-    .await
-}
-
-async fn read_passkey_records(
-    state: &Backend,
-    username: &str,
-) -> Result<Vec<PasskeyCredentialRecord>, AuthError> {
-    let prefix = Path::parse(&passkey_user_prefix(username)?)?;
-    let mut pages = state.pages(xolotl_state::StateScan::new(prefix));
-    let mut records = Vec::new();
-    while let Some(page) = pages.next().await? {
-        for (_path, value) in page.entries {
-            let Some(encoded) = value.value.as_str() else {
-                return Err(AuthError::State(
-                    "passkey credential record must be a string".into(),
-                ));
-            };
-            records.push(serde_json::from_str(encoded).map_err(|error| {
-                AuthError::State(format!("invalid passkey credential: {error}"))
-            })?);
-        }
-    }
-    Ok(records)
-}
-
 async fn prefix_has_entries(state: &Backend, prefix: Path) -> Result<bool, AuthError> {
     let mut query = xolotl_state::StateScan::new(prefix);
     query.limits.entries = std::num::NonZeroUsize::MIN;
@@ -2328,51 +2236,27 @@ async fn prefix_has_entries(state: &Backend, prefix: Path) -> Result<bool, AuthE
     Ok(false)
 }
 
-fn state_path_string(segments: &[&str]) -> Result<String, AuthError> {
-    let mut path = Path::try_new("state")?;
-    for segment in segments {
-        path = path.try_push_literal(segment)?;
-    }
-    Ok(path.to_string())
-}
-
-fn user_path(username: &str) -> Result<String, AuthError> {
-    validate_username(username)?;
-    state_path_string(&["kernel", "console", "users", username])
-}
-
-fn role_path(role: &str) -> Result<String, AuthError> {
-    validate_username(role)?;
-    state_path_string(&["kernel", "console", "roles", role])
-}
-
-fn password_hash_path(username: &str) -> Result<String, AuthError> {
-    validate_username(username)?;
-    state_path_string(&["vault", "console", username, "password"])
-}
-
-fn session_path(sid: &str) -> Result<String, AuthError> {
-    validate_session_id(sid)?;
-    state_path_string(&["kernel", "console", "sessions", sid])
-}
-
-fn session_token_path(sid: &str) -> Result<String, AuthError> {
-    validate_session_id(sid)?;
-    state_path_string(&["vault", "console", "sessions", sid])
-}
-
-fn lockout_path(username: &str) -> Result<String, AuthError> {
-    validate_username(username)?;
-    state_path_string(&["vault", "console", "lockouts", username])
-}
-
 const LOCKOUT_THRESHOLD: u32 = 5;
 const LOCKOUT_BASE_MS: i64 = 1_000;
 const LOCKOUT_MAX_MS: i64 = 60_000;
 
 async fn read_lockout(state: &Backend, username: &str) -> Result<LockoutState, AuthError> {
-    let path = Path::parse(&lockout_path(username)?)?;
-    let Some(value) = state.read(&path).await? else {
+    read_lockout_at(state, &lockout_path(username)?).await
+}
+
+async fn read_account_lockout(
+    state: &Backend,
+    key: &AccountKey,
+) -> Result<LockoutState, AuthError> {
+    read_lockout_at(
+        state,
+        &crate::paths::account_lockout_path(key.authority_id(), key.instance_id())?,
+    )
+    .await
+}
+
+async fn read_lockout_at(state: &Backend, path: &Path) -> Result<LockoutState, AuthError> {
+    let Some(value) = state.read(path).await? else {
         return Ok(LockoutState::default());
     };
     let Some(map) = value.as_map() else {
@@ -2398,7 +2282,14 @@ async fn write_lockout(
     username: &str,
     lockout: &LockoutState,
 ) -> Result<(), AuthError> {
-    let path = Path::parse(&lockout_path(username)?)?;
+    write_lockout_at(state, &lockout_path(username)?, lockout).await
+}
+
+async fn write_lockout_at(
+    state: &Backend,
+    path: &Path,
+    lockout: &LockoutState,
+) -> Result<(), AuthError> {
     let mut map = BTreeMap::new();
     map.insert(
         "consecutive_failures".into(),
@@ -2408,12 +2299,18 @@ async fn write_lockout(
         "locked_until_ms".into(),
         Value::integer(lockout.locked_until_ms),
     );
-    state.write_set(&path, Value::map(map)).await?;
+    state.write_set(path, Value::map(map)).await?;
     Ok(())
 }
 
 async fn clear_lockout(state: &Backend, username: &str) -> Result<(), AuthError> {
-    let path = Path::parse(&lockout_path(username)?)?;
+    let path = lockout_path(username)?;
+    state.write_delete(&path).await?;
+    Ok(())
+}
+
+async fn clear_account_lockout(state: &Backend, key: &AccountKey) -> Result<(), AuthError> {
+    let path = crate::paths::account_lockout_path(key.authority_id(), key.instance_id())?;
     state.write_delete(&path).await?;
     Ok(())
 }
@@ -2435,18 +2332,22 @@ async fn record_account_lockout_failure(
     write_lockout(state, username, &lockout).await
 }
 
-fn key_challenge_path(challenge_id: &str) -> Result<String, AuthError> {
-    validate_session_id(challenge_id).map_err(|_error| AuthError::InvalidChallenge)?;
-    state_path_string(&["kernel", "console", "challenges", challenge_id])
-}
-
-fn path_leaf(path: &Path, label: &str) -> Result<String, AuthError> {
-    path.segments()
-        .last()
-        .map(|segment| segment.as_str())
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| AuthError::State(format!("missing {label} in path {path}")))
+async fn record_factor_lockout_failure(
+    state: &Backend,
+    key: &AccountKey,
+    now: i64,
+) -> Result<(), AuthError> {
+    let path = crate::paths::account_lockout_path(key.authority_id(), key.instance_id())?;
+    let mut lockout = read_lockout_at(state, &path).await?;
+    lockout.consecutive_failures = lockout.consecutive_failures.saturating_add(1);
+    lockout.locked_until_ms = lockout_until_ms(
+        lockout.consecutive_failures,
+        LOCKOUT_THRESHOLD,
+        LOCKOUT_BASE_MS,
+        LOCKOUT_MAX_MS,
+        now,
+    );
+    write_lockout_at(state, &path, &lockout).await
 }
 
 fn hash_password(password: &str) -> Result<String, AuthError> {
@@ -2506,124 +2407,132 @@ fn validate_origin(origin: &str) -> Result<String, AuthError> {
 }
 
 fn key_login_transcript(username: &str, challenge_id: &str, nonce: &str, origin: &str) -> String {
-    format!("xolotl-console-ed25519-v1\n{username}\n{challenge_id}\n{nonce}\n{origin}")
+    format!("xolotl-console-ml-dsa-65-v1\n{username}\n{challenge_id}\n{nonce}\n{origin}")
 }
 
-fn verify_key_login(
-    descriptors: &[String],
-    requested_key: Option<&str>,
+fn verify_key_login<'a>(
+    descriptors: &'a [String],
+    requested_key: &str,
     signature_b64: &str,
     transcript: &str,
-) -> Result<bool, AuthError> {
+) -> Result<Option<&'a str>, AuthError> {
+    if signature_b64.len() != (ML_DSA_65_SIGNING.signature_len() * 8).div_ceil(6) {
+        return Err(AuthError::InvalidCredentials);
+    }
     let signature_bytes = URL_SAFE_NO_PAD
         .decode(signature_b64.as_bytes())
         .map_err(|_error| AuthError::InvalidCredentials)?;
-    let signature = Signature::try_from(signature_bytes.as_slice())
-        .map_err(|_error| AuthError::InvalidCredentials)?;
-
-    for descriptor in descriptors {
-        if requested_key.is_some_and(|key| key != descriptor) {
-            continue;
-        }
-        let key = parse_ed25519_key_descriptor(descriptor)?;
-        if key.verify(transcript.as_bytes(), &signature).is_ok() {
-            return Ok(true);
-        }
+    if signature_bytes.len() != ML_DSA_65_SIGNING.signature_len()
+        || URL_SAFE_NO_PAD.encode(&signature_bytes) != signature_b64
+    {
+        return Err(AuthError::InvalidCredentials);
     }
-    Ok(false)
-}
 
-fn parse_ed25519_key_descriptor(descriptor: &str) -> Result<VerifyingKey, AuthError> {
-    let Some(encoded) = descriptor.strip_prefix("ed25519:") else {
-        return Err(AuthError::Crypto("unsupported key descriptor".into()));
-    };
-    let bytes = URL_SAFE_NO_PAD
-        .decode(encoded.as_bytes())
-        .map_err(|_error| AuthError::Crypto("invalid ed25519 key encoding".into()))?;
-    let key_bytes: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_error| AuthError::Crypto("invalid ed25519 key length".into()))?;
-    let key = VerifyingKey::from_bytes(&key_bytes)
-        .map_err(|_error| AuthError::Crypto("invalid ed25519 public key".into()))?;
-    if key.is_weak() {
-        return Err(AuthError::Crypto("weak ed25519 public key".into()));
-    }
-    Ok(key)
-}
-
-fn has_valid_ed25519_pubkey(pubkeys: &[String]) -> Result<bool, AuthError> {
-    let mut has_key = false;
-    for key in pubkeys {
-        parse_ed25519_key_descriptor(key)?;
-        has_key = true;
-    }
-    Ok(has_key)
-}
-
-fn verify_totp(
-    seed_b64: &str,
-    code: &str,
-    last_step: Option<i64>,
-    now_ms: i64,
-) -> Result<Option<i64>, AuthError> {
-    if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+    let Some(descriptor) = descriptors.iter().find(|key| key.as_str() == requested_key) else {
         return Ok(None);
-    }
-    let seed = URL_SAFE_NO_PAD
-        .decode(seed_b64.as_bytes())
-        .map_err(|_error| AuthError::Crypto("invalid TOTP seed encoding".into()))?;
-    let current_step = (now_ms / 1000) / TOTP_PERIOD_SECS;
-    for step in [current_step - 1, current_step, current_step + 1] {
-        if last_step.is_some_and(|last| step <= last) {
-            continue;
-        }
-        let expected = totp_at_step(&seed, step)?;
-        if expected.as_bytes().ct_eq(code.as_bytes()).unwrap_u8() == 1 {
-            return Ok(Some(step));
-        }
+    };
+    let key = parse_ml_dsa_65_key_descriptor(descriptor)?;
+    if key
+        .verify_sig(transcript.as_bytes(), &signature_bytes)
+        .is_ok()
+    {
+        return Ok(Some(descriptor));
     }
     Ok(None)
 }
 
-fn totp_at_step(seed: &[u8], step: i64) -> Result<String, AuthError> {
-    let mut mac = HmacSha1::new_from_slice(seed)
-        .map_err(|_error| AuthError::Crypto("invalid TOTP seed".into()))?;
-    mac.update(&(step as u64).to_be_bytes());
-    let out = mac.finalize().into_bytes();
-    let offset = (out[19] & 0x0f) as usize;
-    let binary = (((out[offset] & 0x7f) as u32) << 24)
-        | ((out[offset + 1] as u32) << 16)
-        | ((out[offset + 2] as u32) << 8)
-        | (out[offset + 3] as u32);
-    Ok(format!("{:06}", binary % 1_000_000))
+fn parse_ml_dsa_65_key_descriptor(descriptor: &str) -> Result<ParsedPublicKey, AuthError> {
+    let Some(encoded) = descriptor.strip_prefix("ml-dsa-65:") else {
+        return Err(AuthError::Crypto("unsupported key descriptor".into()));
+    };
+    if encoded.len() != (1952usize * 8).div_ceil(6) {
+        return Err(AuthError::Crypto("invalid ML-DSA-65 key length".into()));
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded.as_bytes())
+        .map_err(|_error| AuthError::Crypto("invalid ML-DSA-65 key encoding".into()))?;
+    // FIPS 204's raw ML-DSA-65 public key is exactly 1952 bytes. Reject
+    // alternate DER encodings so descriptors have a single wire form.
+    if bytes.len() != 1952 || URL_SAFE_NO_PAD.encode(&bytes) != encoded {
+        return Err(AuthError::Crypto("invalid ML-DSA-65 key encoding".into()));
+    }
+    ParsedPublicKey::new(&ML_DSA_65, bytes)
+        .map_err(|_error| AuthError::Crypto("invalid ML-DSA-65 public key".into()))
 }
 
-fn validate_session_id(sid: &str) -> Result<(), AuthError> {
-    if sid
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric())
-        && sid
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
+pub(crate) fn validate_session_id(sid: &str) -> Result<(), AuthError> {
+    if xolotl_types::path::is_simple_id_segment(sid) {
         Ok(())
     } else {
         Err(AuthError::InvalidSession)
     }
 }
 
-fn now_millis() -> i64 {
-    xolotl_kernel::now_millis()
-}
-
 fn prune_bucket(bucket: &mut FailureBucket, now: i64) {
-    if bucket.window_started_at == 0 || now.saturating_sub(bucket.window_started_at) > 60_000 {
+    if bucket.window_started_at == 0
+        || now.saturating_sub(bucket.window_started_at) > RATE_WINDOW_MS
+    {
         *bucket = FailureBucket {
             window_started_at: now,
             ..Default::default()
         };
+    }
+}
+
+fn rate_capacity_retry(
+    buckets: &mut HashMap<String, FailureBucket>,
+    key: &str,
+    now: i64,
+) -> Option<i64> {
+    if buckets.contains_key(key) || buckets.len() < MAX_RATE_BUCKETS {
+        return None;
+    }
+    buckets.retain(|_, bucket| {
+        bucket.window_started_at != 0
+            && now.saturating_sub(bucket.window_started_at) <= RATE_WINDOW_MS
+    });
+    if buckets.len() < MAX_RATE_BUCKETS {
+        return None;
+    }
+    // Fail closed instead of evicting a live penalty to admit another name.
+    buckets
+        .values()
+        .map(|bucket| {
+            bucket
+                .window_started_at
+                .saturating_add(RATE_WINDOW_MS + 1)
+                .saturating_sub(now)
+                .max(1)
+        })
+        .min()
+}
+
+fn check_rate_bucket(
+    buckets: &mut HashMap<String, FailureBucket>,
+    key: &str,
+    now: i64,
+) -> Result<(), AuthError> {
+    if let Some(bucket) = buckets.get_mut(key) {
+        prune_bucket(bucket, now);
+        if let Some(retry) = retry_after(*bucket, now) {
+            return Err(AuthError::RateLimited {
+                retry_after_ms: retry,
+            });
+        }
+    }
+    if let Some(retry) = rate_capacity_retry(buckets, key, now) {
+        return Err(AuthError::RateLimited {
+            retry_after_ms: retry,
+        });
+    }
+    Ok(())
+}
+
+fn mark_rate_failure(buckets: &mut HashMap<String, FailureBucket>, key: &str, now: i64) {
+    // An already admitted attempt may finish after its slot expires. Keep the
+    // hard bound; the global bucket still charges it.
+    if rate_capacity_retry(buckets, key, now).is_none() {
+        mark_failure(buckets.entry(key.to_string()).or_default(), now);
     }
 }
 
@@ -2662,18 +2571,6 @@ fn required_str_field(m: &ValueMap, key: &str, label: &str) -> Result<String, Au
     }
 }
 
-fn required_map_field<'a>(
-    m: &'a ValueMap,
-    key: &str,
-    label: &str,
-) -> Result<&'a ValueMap, AuthError> {
-    match m.get(key).map(Value::view) {
-        Some(ValueView::Map(value)) => Ok(value),
-        Some(_) => Err(AuthError::State(format!("{label}.{key} must be an object"))),
-        None => Err(AuthError::State(format!("{label}.{key} is required"))),
-    }
-}
-
 fn required_nonnegative_int_field(m: &ValueMap, key: &str, label: &str) -> Result<i64, AuthError> {
     match m.get(key).map(Value::view) {
         Some(ValueView::Int(value)) if value >= 0 => Ok(value),
@@ -2695,38 +2592,6 @@ fn required_string_list_field(
     match m.get(key) {
         Some(value) => string_list(value, &format!("{label}.{key}")),
         None => Err(AuthError::State(format!("{label}.{key} is required"))),
-    }
-}
-
-fn optional_string_field(
-    m: &ValueMap,
-    key: &str,
-    label: &str,
-) -> Result<Option<String>, AuthError> {
-    match m.get(key).map(Value::view) {
-        Some(ValueView::Str(value)) if !value.is_empty() => Ok(Some(value.to_owned())),
-        Some(ValueView::Str(_)) => {
-            Err(AuthError::State(format!("{label}.{key} must not be empty")))
-        }
-        Some(_) => Err(AuthError::State(format!("{label}.{key} must be a string"))),
-        None => Ok(None),
-    }
-}
-
-fn optional_nonnegative_int_field(
-    m: &ValueMap,
-    key: &str,
-    label: &str,
-) -> Result<Option<i64>, AuthError> {
-    match m.get(key).map(Value::view) {
-        Some(ValueView::Int(value)) if value >= 0 => Ok(Some(value)),
-        Some(ValueView::Int(_)) => Err(AuthError::State(format!(
-            "{label}.{key} must be non-negative"
-        ))),
-        Some(_) => Err(AuthError::State(format!(
-            "{label}.{key} must be an integer"
-        ))),
-        None => Ok(None),
     }
 }
 
@@ -2811,1039 +2676,11 @@ fn string_values(items: &[String]) -> Value {
     Value::list(items.iter().map(|s| Value::string(s.clone())).collect())
 }
 
-fn record_auth_audit(
-    boot: &Bootstrap,
-    event: &str,
-    username: Option<&str>,
-    source_addr: Option<&str>,
-    outcome: &str,
-    mfa_level: Option<u8>,
-) -> Result<(), AuthError> {
-    boot.record_gateway_audit(GatewayAudit {
-        event,
-        username,
-        source_addr,
-        outcome,
-        mfa_level,
-        details: None,
-    })
-    .map_err(|e| AuthError::State(e.to_string()))
-}
-
-fn audit_outcome(err: &AuthError) -> &'static str {
-    match err {
-        AuthError::InvalidUsername => "invalid_username",
-        AuthError::InvalidCredentials => "invalid_credentials",
-        AuthError::AccountUnavailable => "account_unavailable",
-        AuthError::InvalidSession => "invalid_session",
-        AuthError::InvalidChallenge => "invalid_challenge",
-        AuthError::MissingBearer => "missing_bearer",
-        AuthError::PermissionDenied => "permission_denied",
-        AuthError::RateLimited { .. } => "rate_limited",
-        AuthError::State(_) => "state_error",
-        AuthError::Crypto(_) => "crypto_error",
-    }
-}
-
 #[cfg(test)]
 mod crypto_tests;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use anyhow::{Context, bail, ensure};
-    use ed25519_dalek::{Signer, SigningKey};
-    use xolotl_kernel::Bootstrap;
-    use xolotl_types::Fact;
+mod request_tests;
 
-    fn auth_boot() -> Bootstrap {
-        Bootstrap::in_memory()
-    }
-
-    fn test_auth() -> anyhow::Result<ConsoleAuth> {
-        Ok(ConsoleAuth::new(ConsoleAuthConfig::default())?)
-    }
-
-    async fn bootstrap_root_password(boot: &Bootstrap) -> anyhow::Result<String> {
-        match bootstrap_root_account(boot, RootProvisioning::default()).await? {
-            BootstrapOutcome::CreatedRandomPassword { password, .. } => Ok(password),
-            outcome => bail!("expected generated root password, got {outcome:?}"),
-        }
-    }
-
-    fn audit_facts(boot: &Bootstrap) -> anyhow::Result<Vec<Fact>> {
-        let mut facts = Vec::new();
-        for pid in boot.kernel.processes.all_ids() {
-            facts.extend(
-                boot.kernel
-                    .facts
-                    .facts_of(pid)
-                    .with_context(|| format!("read audit facts for process {pid:?}"))?,
-            );
-        }
-        Ok(facts
-            .into_iter()
-            .filter(|fact| match &fact.outcome {
-                Some(value) => value.as_map().is_some_and(|m| m.contains_key("event")),
-                _ => false,
-            })
-            .collect())
-    }
-
-    fn audit_events(boot: &Bootstrap) -> anyhow::Result<Vec<String>> {
-        Ok(audit_facts(boot)?
-            .into_iter()
-            .filter_map(|fact| match fact.outcome {
-                Some(value) => value
-                    .as_map()
-                    .and_then(|m| m.get("event"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                _ => None,
-            })
-            .collect())
-    }
-
-    fn audit_outcomes(boot: &Bootstrap, event: &str) -> anyhow::Result<Vec<String>> {
-        Ok(audit_facts(boot)?
-            .into_iter()
-            .filter_map(|fact| match fact.outcome {
-                Some(value)
-                    if value
-                        .as_map()
-                        .and_then(|m| m.get("event"))
-                        .and_then(Value::as_str)
-                        == Some(event) =>
-                {
-                    value
-                        .as_map()
-                        .and_then(|m| m.get("outcome"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                }
-                _ => None,
-            })
-            .collect())
-    }
-
-    #[test]
-    fn auth_config_is_bounded_by_backend() {
-        let cfg = ConsoleAuthConfig {
-            session_ttl_ms: i64::MAX,
-            idle_ttl_ms: i64::MAX,
-            max_sessions_per_user: 0,
-            global_session_limit: usize::MAX,
-            argon2_concurrency: 0,
-            webauthn: ConsoleWebAuthnConfig::default(),
-        }
-        .bounded();
-        assert_eq!(cfg.session_ttl_ms, MAX_SESSION_TTL_MS);
-        assert_eq!(cfg.idle_ttl_ms, MAX_IDLE_TTL_MS);
-        assert_eq!(cfg.max_sessions_per_user, 1);
-        assert_eq!(cfg.global_session_limit, HARD_GLOBAL_SESSION_LIMIT);
-        assert_eq!(cfg.argon2_concurrency, MIN_ARGON2_CONCURRENCY);
-
-        let cfg = ConsoleAuthConfig {
-            session_ttl_ms: 30_000,
-            idle_ttl_ms: MAX_SESSION_TTL_MS,
-            max_sessions_per_user: 10,
-            global_session_limit: 100,
-            argon2_concurrency: 2,
-            webauthn: ConsoleWebAuthnConfig::default(),
-        }
-        .bounded();
-        assert_eq!(cfg.session_ttl_ms, MIN_SESSION_TTL_MS);
-        assert_eq!(cfg.idle_ttl_ms, MIN_SESSION_TTL_MS);
-    }
-
-    fn fact_contains_string(fact: &Fact, needle: &str) -> anyhow::Result<bool> {
-        Ok(serde_json::to_string(fact)?.contains(needle))
-    }
-
-    fn facts_contain_string(facts: &[Fact], needle: &str) -> anyhow::Result<bool> {
-        for fact in facts {
-            if fact_contains_string(fact, needle)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn role_value(grants: Vec<&str>, frozen: bool) -> Value {
-        let mut m = BTreeMap::new();
-        m.insert(
-            "grants".into(),
-            Value::list(
-                grants
-                    .into_iter()
-                    .map(|grant| Value::string(grant.into()))
-                    .collect(),
-            ),
-        );
-        m.insert("frozen".into(), Value::boolean(frozen));
-        Value::map(m)
-    }
-
-    #[tokio::test]
-    async fn random_root_password_preflight_tracks_empty_user_store() -> anyhow::Result<()> {
-        let boot = auth_boot();
-        ensure!(
-            root_random_password_needed(&boot, &RootProvisioning::default()).await?,
-            "empty user store should require a random root password"
-        );
-        ensure!(
-            !root_random_password_needed(
-                &boot,
-                &RootProvisioning {
-                    password_hash: None,
-                    password: None,
-                    pubkeys: vec!["ssh-ed25519 unsupported".into()],
-                },
-            )
-            .await?,
-            "preseeded key material should skip random root password"
-        );
-
-        bootstrap_root_account(&boot, RootProvisioning::default()).await?;
-        ensure!(
-            !root_random_password_needed(&boot, &RootProvisioning::default()).await?,
-            "existing root account should skip random root password"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn bootstraps_root_and_logs_in() -> anyhow::Result<()> {
-        let boot = auth_boot();
-        let password = bootstrap_root_password(&boot).await?;
-        let auth = test_auth()?;
-        let login = auth
-            .login(
-                &boot,
-                LoginRequest {
-                    username: "root".into(),
-                    password,
-                    totp_code: None,
-                },
-                "test".into(),
-            )
-            .await?;
-        let principal = auth.authenticate_token(&boot, &login.token).await?;
-        ensure!(
-            principal.username == "root",
-            "unexpected principal username"
-        );
-        ensure!(
-            principal
-                .grants
-                .contains("write", &Path::parse("state://kernel/x")?),
-            "root principal should have kernel state write access"
-        );
-        ensure!(
-            principal
-                .grants
-                .contains("perform", &Path::parse("effect://external/pairing/create")?),
-            "root principal should be able to create pairings"
-        );
-        ensure!(
-            principal
-                .grants
-                .contains("perform", &Path::parse("effect://proc/spawn")?),
-            "root principal should be able to spawn processes"
-        );
-        let events = audit_events(&boot)?;
-        ensure!(
-            events.iter().any(|event| event == "console_bootstrap"),
-            "missing console bootstrap audit event"
-        );
-        ensure!(
-            events.iter().any(|event| event == "console_login"),
-            "missing console login audit event"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn random_tokens_are_valid_path_segments() -> anyhow::Result<()> {
-        for _ in 0..128 {
-            let token = random_token(18)?;
-            validate_session_id(&token)?;
-            Path::parse(&session_path(&token)?)?;
-        }
-        ensure!(
-            validate_session_id("-bad").is_err(),
-            "leading '-' was accepted"
-        );
-        ensure!(
-            validate_session_id("_bad").is_err(),
-            "leading '_' was accepted"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn username_validation_is_strict() {
-        assert!(validate_username("alice_1").is_ok());
-        assert!(validate_username("bad/name").is_err());
-        assert!(validate_username(".bad").is_err());
-        assert!(validate_username("\u{542b}").is_err());
-    }
-
-    #[test]
-    fn malformed_user_records_do_not_default_to_active() -> anyhow::Result<()> {
-        let user = UserRecord {
-            username: "alice".into(),
-            identity_path: "identity://console/alice".into(),
-            status: "active".into(),
-            password_hash_ref: None,
-            totp_enabled: false,
-            totp_seed_ref: None,
-            totp_last_step: None,
-            pubkeys: Vec::new(),
-            roles: Vec::new(),
-            grants: Vec::new(),
-            authority_ceiling: Vec::new(),
-            created_by: "test".into(),
-            created_at: 1,
-            password_changed_at: 1,
-        };
-
-        let mut map = (user.to_value()).into_map().context("expected map")?;
-        map.remove("status");
-        let missing_status = Value::from(map);
-        ensure!(
-            UserRecord::from_value("alice", &missing_status).is_err(),
-            "missing status defaulted to active"
-        );
-
-        let mut map = (user.to_value()).into_map().context("expected map")?;
-        map.remove("identity_path");
-        let missing_identity = Value::from(map);
-        ensure!(
-            UserRecord::from_value("alice", &missing_identity).is_err(),
-            "missing identity_path was synthesized"
-        );
-
-        let mut map = user.to_value().into_map().context("user map")?;
-        let mut authn = map
-            .remove("authn")
-            .and_then(Value::into_map)
-            .context("authn map")?;
-        let mut password = authn
-            .remove("password")
-            .and_then(Value::into_map)
-            .context("password map")?;
-        password.insert("hash_ref".into(), Value::integer(7))?;
-        authn.insert("password".into(), Value::from(password))?;
-        map.insert("authn".into(), Value::from(authn))?;
-        let bad_hash = Value::from(map);
-        ensure!(
-            UserRecord::from_value("alice", &bad_hash).is_err(),
-            "malformed password hash ref was ignored"
-        );
-
-        let mut map = (user.to_value()).into_map().context("expected map")?;
-        map.insert(
-            "identity_path".into(),
-            Value::string("identity://console/**".into()),
-        )?;
-        let wildcard_identity = Value::from(map);
-        ensure!(
-            UserRecord::from_value("alice", &wildcard_identity).is_err(),
-            "wildcard identity_path was accepted"
-        );
-
-        let mut map = (user.to_value()).into_map().context("expected map")?;
-        map.insert(
-            "identity_path".into(),
-            Value::string("path://remote/identity/console/alice".into()),
-        )?;
-        let clustered_identity = Value::from(map);
-        ensure!(
-            UserRecord::from_value("alice", &clustered_identity).is_err(),
-            "clustered identity_path was accepted"
-        );
-
-        let mut map = (user.to_value()).into_map().context("expected map")?;
-        map.insert("status".into(), Value::string("locked".into()))?;
-        let locked = Value::from(map);
-        let locked = UserRecord::from_value("alice", &locked)?;
-        ensure!(
-            locked.status == "locked",
-            "locked status did not round-trip"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn refresh_rotates_token_and_invalidates_old_secret() -> anyhow::Result<()> {
-        let boot = auth_boot();
-        let password = bootstrap_root_password(&boot).await?;
-        let auth = test_auth()?;
-        let login = auth
-            .login(
-                &boot,
-                LoginRequest {
-                    username: "root".into(),
-                    password,
-                    totp_code: None,
-                },
-                "test".into(),
-            )
-            .await?;
-        let rotated = auth.refresh_session(&boot, &login.token).await?;
-        ensure!(
-            rotated.sid == login.sid,
-            "refresh must preserve the session id"
-        );
-        ensure!(
-            rotated.token != login.token,
-            "refresh must mint a new token"
-        );
-
-        // The new token authenticates.
-        auth.authenticate_token(&boot, &rotated.token).await?;
-        // The old token no longer authenticates.
-        ensure!(
-            matches!(
-                auth.authenticate_token(&boot, &login.token).await,
-                Err(AuthError::InvalidSession)
-            ),
-            "old token still authenticated after rotation"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn bearer_logout_revokes_session() -> anyhow::Result<()> {
-        let boot = auth_boot();
-        let password = bootstrap_root_password(&boot).await?;
-        let auth = test_auth()?;
-        let login = auth
-            .login(
-                &boot,
-                LoginRequest {
-                    username: "root".into(),
-                    password,
-                    totp_code: None,
-                },
-                "test".into(),
-            )
-            .await?;
-        auth.logout_sid_from_source(&boot, &login.sid, Some("203.0.113.10"))
-            .await?;
-        ensure!(
-            matches!(
-                auth.authenticate_token(&boot, &login.token).await,
-                Err(AuthError::InvalidSession)
-            ),
-            "revoked bearer token still authenticated"
-        );
-        let events = audit_events(&boot)?;
-        ensure!(
-            events.iter().any(|event| event == "console_credential"),
-            "missing console credential audit event"
-        );
-        let facts = audit_facts(&boot)?;
-        ensure!(
-            facts.into_iter().any(|fact| {
-                let Some(value) = fact.outcome else {
-                    return false;
-                };
-                let Some(m) = value.as_map() else {
-                    return false;
-                };
-                m.get("event").and_then(Value::as_str) == Some("console_credential")
-                    && m.get("outcome").and_then(Value::as_str) == Some("logout")
-                    && m.get("username").and_then(Value::as_str) == Some("root")
-                    && m.get("source_addr").and_then(Value::as_str) == Some("203.0.113.10")
-            }),
-            "missing logout audit fact with source address"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn step_up_issues_new_session_without_reusing_token() -> anyhow::Result<()> {
-        let boot = auth_boot();
-        let password = bootstrap_root_password(&boot).await?;
-        let auth = test_auth()?;
-        let login = auth
-            .login(
-                &boot,
-                LoginRequest {
-                    username: "root".into(),
-                    password: password.clone(),
-                    totp_code: None,
-                },
-                "test".into(),
-            )
-            .await?;
-        ensure!(
-            login.mfa_level == 1,
-            "initial login should have MFA level 1"
-        );
-        let elevated = auth
-            .step_up(
-                &boot,
-                &login.token,
-                StepUpRequest {
-                    password: Some(password),
-                    totp_code: None,
-                },
-                "test".into(),
-            )
-            .await?;
-        ensure!(
-            elevated.sid != login.sid,
-            "step-up should issue a new session id"
-        );
-        ensure!(
-            elevated.token != login.token,
-            "step-up should issue a new bearer token"
-        );
-        ensure!(elevated.mfa_level == 2, "step-up should raise MFA level");
-        ensure!(
-            auth.authenticate_token(&boot, &login.token)
-                .await?
-                .mfa_level
-                == 1,
-            "original session MFA level changed"
-        );
-        ensure!(
-            auth.authenticate_token(&boot, &elevated.token)
-                .await?
-                .mfa_level
-                == 2,
-            "elevated session did not authenticate at MFA level 2"
-        );
-        let facts = audit_facts(&boot)?;
-        ensure!(
-            !facts_contain_string(&facts, &login.token)?,
-            "audit facts leaked original bearer token"
-        );
-        ensure!(
-            !facts_contain_string(&facts, &elevated.token)?,
-            "audit facts leaked elevated bearer token"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn root_can_list_and_revoke_console_sessions() -> anyhow::Result<()> {
-        let boot = auth_boot();
-        let password = bootstrap_root_password(&boot).await?;
-        let auth = test_auth()?;
-        let login1 = auth
-            .login(
-                &boot,
-                LoginRequest {
-                    username: "root".into(),
-                    password: password.clone(),
-                    totp_code: None,
-                },
-                "test-a".into(),
-            )
-            .await?;
-        let login2 = auth
-            .login(
-                &boot,
-                LoginRequest {
-                    username: "root".into(),
-                    password,
-                    totp_code: None,
-                },
-                "test-b".into(),
-            )
-            .await?;
-        let principal = auth.authenticate_token(&boot, &login1.token).await?;
-        let sessions = auth.list_sessions(&boot, &principal).await?;
-        ensure!(
-            sessions.iter().any(|s| s.sid == login1.sid),
-            "first session missing from session list"
-        );
-        ensure!(
-            sessions.iter().any(|s| s.sid == login2.sid),
-            "second session missing from session list"
-        );
-
-        auth.revoke_session_by_id_from_source(&boot, &principal, &login2.sid, None)
-            .await?;
-        ensure!(
-            matches!(
-                auth.authenticate_token(&boot, &login2.token).await,
-                Err(AuthError::InvalidSession)
-            ),
-            "revoked session still authenticated"
-        );
-        let events = audit_events(&boot)?;
-        ensure!(
-            events.iter().any(|event| event == "console_credential"),
-            "missing console credential audit event"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn malformed_console_session_state_is_rejected() -> anyhow::Result<()> {
-        let boot = auth_boot();
-        let password = bootstrap_root_password(&boot).await?;
-        let auth = test_auth()?;
-        let login = auth
-            .login(
-                &boot,
-                LoginRequest {
-                    username: "root".into(),
-                    password,
-                    totp_code: None,
-                },
-                "test".into(),
-            )
-            .await?;
-        let principal = auth.authenticate_token(&boot, &login.token).await?;
-        boot.kernel
-            .state
-            .write_set(
-                &Path::parse(&session_path("malformed")?)?,
-                Value::map(BTreeMap::new()),
-            )
-            .await?;
-
-        ensure!(
-            matches!(
-                auth.list_sessions(&boot, &principal).await,
-                Err(AuthError::InvalidSession)
-            ),
-            "malformed session state was accepted"
-        );
-
-        let malformed_identity = SessionRecord {
-            sid: "malformed-identity".into(),
-            username: "root".into(),
-            identity_path: "identity://console/**".into(),
-            issued_at: 1,
-            expires_at: i64::MAX,
-            idle_expires_at: i64::MAX,
-            mfa_level: 1,
-            last_seen: 1,
-            source_addr: "test".into(),
-        }
-        .to_value();
-        ensure!(
-            SessionRecord::from_value("malformed-identity", &malformed_identity).is_err(),
-            "wildcard session identity was accepted"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn root_can_revoke_all_sessions_for_user() -> anyhow::Result<()> {
-        let boot = auth_boot();
-        let password = bootstrap_root_password(&boot).await?;
-        let auth = test_auth()?;
-        let login1 = auth
-            .login(
-                &boot,
-                LoginRequest {
-                    username: "root".into(),
-                    password: password.clone(),
-                    totp_code: None,
-                },
-                "test-a".into(),
-            )
-            .await?;
-        let login2 = auth
-            .login(
-                &boot,
-                LoginRequest {
-                    username: "root".into(),
-                    password,
-                    totp_code: None,
-                },
-                "test-b".into(),
-            )
-            .await?;
-        let principal = auth.authenticate_token(&boot, &login1.token).await?;
-        let revoked = auth
-            .revoke_user_sessions_from_source(&boot, &principal, "root", None)
-            .await?;
-        ensure!(revoked >= 2, "expected at least two revoked sessions");
-        ensure!(
-            matches!(
-                auth.authenticate_token(&boot, &login1.token).await,
-                Err(AuthError::InvalidSession)
-            ),
-            "first revoked session still authenticated"
-        );
-        ensure!(
-            matches!(
-                auth.authenticate_token(&boot, &login2.token).await,
-                Err(AuthError::InvalidSession)
-            ),
-            "second revoked session still authenticated"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn root_password_and_hash_are_mutually_exclusive() -> anyhow::Result<()> {
-        let boot = auth_boot();
-        let phc = hash_password_with_salt("strong-root-password-9qL", &[1u8; 16])?;
-        let err = match bootstrap_root_account(
-            &boot,
-            RootProvisioning {
-                password_hash: Some(phc),
-                password: Some("another-strong-root-password-8pK".into()),
-                pubkeys: Vec::new(),
-            },
-        )
-        .await
-        {
-            Ok(outcome) => bail!("unexpected bootstrap success: {outcome:?}"),
-            Err(error) => error,
-        };
-        ensure!(
-            matches!(err, AuthError::Crypto(ref message) if message.contains("mutually exclusive")),
-            "unexpected error: {err}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn pubkey_only_root_can_use_single_use_challenge_login() -> anyhow::Result<()> {
-        let boot = auth_boot();
-        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
-        let descriptor = format!(
-            "ed25519:{}",
-            URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes())
-        );
-        let outcome = bootstrap_root_account(
-            &boot,
-            RootProvisioning {
-                password_hash: None,
-                password: None,
-                pubkeys: vec![descriptor.clone()],
-            },
-        )
-        .await?;
-        let expected = BootstrapOutcome::CreatedPreseeded {
-            username: "root".into(),
-        };
-        ensure!(
-            outcome == expected,
-            "unexpected bootstrap outcome: {outcome:?}"
-        );
-
-        let auth = test_auth()?;
-        let challenge = auth
-            .begin_key_login(
-                &boot,
-                KeyChallengeRequest {
-                    username: "root".into(),
-                    origin: "https://console.local".into(),
-                },
-                "test".into(),
-            )
-            .await?;
-        let outcomes = audit_outcomes(&boot, "console_credential")?;
-        ensure!(
-            outcomes.iter().any(|outcome| outcome == "key_challenge"),
-            "missing key challenge audit outcome"
-        );
-        let signature = signing_key.sign(challenge.transcript.as_bytes());
-        let login = auth
-            .finish_key_login(
-                &boot,
-                KeyLoginRequest {
-                    username: "root".into(),
-                    challenge_id: challenge.challenge_id.clone(),
-                    signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
-                    origin: "https://console.local".into(),
-                    key: Some(descriptor),
-                },
-                "test".into(),
-            )
-            .await?;
-        let principal = auth.authenticate_token(&boot, &login.token).await?;
-        ensure!(
-            principal.username == "root",
-            "unexpected principal username"
-        );
-
-        let reused = signing_key.sign(challenge.transcript.as_bytes());
-        ensure!(
-            matches!(
-                auth.finish_key_login(
-                    &boot,
-                    KeyLoginRequest {
-                        username: "root".into(),
-                        challenge_id: challenge.challenge_id,
-                        signature: URL_SAFE_NO_PAD.encode(reused.to_bytes()),
-                        origin: "https://console.local".into(),
-                        key: None,
-                    },
-                    "test".into(),
-                )
-                .await,
-                Err(AuthError::InvalidChallenge)
-            ),
-            "single-use key challenge was accepted twice"
-        );
-        let events = audit_events(&boot)?;
-        ensure!(
-            events.iter().any(|event| event == "console_login"),
-            "missing key login audit event"
-        );
-        ensure!(
-            events.iter().any(|event| event == "console_login_failed"),
-            "missing replay failure audit event"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn root_cannot_self_lock_or_self_demote() -> anyhow::Result<()> {
-        let boot = auth_boot();
-        let state = &boot.kernel.state;
-        let password = bootstrap_root_password(&boot).await?;
-        let auth = test_auth()?;
-        let login = auth
-            .login(
-                &boot,
-                LoginRequest {
-                    username: "root".into(),
-                    password,
-                    totp_code: None,
-                },
-                "test".into(),
-            )
-            .await?;
-        let principal = auth.authenticate_token(&boot, &login.token).await?;
-        let path = Path::parse("state://kernel/console/users/root")?;
-        let mut root = read_user(state, "root")
-            .await?
-            .context("root user missing after bootstrap")?;
-
-        root.status = "disabled".into();
-        ensure!(
-            matches!(
-                authorize_path(state, &principal, "write", &path, Some(&root.to_value())).await,
-                Err(AuthError::PermissionDenied)
-            ),
-            "root was allowed to self-lock"
-        );
-
-        let mut root = read_user(state, "root")
-            .await?
-            .context("root user missing after disabled self-lock check")?;
-        root.status = "locked".into();
-        ensure!(
-            matches!(
-                authorize_path(state, &principal, "write", &path, Some(&root.to_value())).await,
-                Err(AuthError::PermissionDenied)
-            ),
-            "root was allowed to self-lock with locked status"
-        );
-
-        let mut root = read_user(state, "root")
-            .await?
-            .context("root user missing after self-lock check")?;
-        root.grants = vec!["read://state/kernel/**".into()];
-        root.authority_ceiling = root.grants.clone();
-        ensure!(
-            matches!(
-                authorize_path(state, &principal, "write", &path, Some(&root.to_value())).await,
-                Err(AuthError::PermissionDenied)
-            ),
-            "root was allowed to self-demote"
-        );
-
-        let mut root = read_user(state, "root")
-            .await?
-            .context("root user missing after self-demote check")?;
-        root.password_hash_ref = None;
-        root.pubkeys.clear();
-        ensure!(
-            matches!(
-                authorize_path(state, &principal, "write", &path, Some(&root.to_value())).await,
-                Err(AuthError::PermissionDenied)
-            ),
-            "root was allowed to remove all login methods"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn locked_user_cannot_login() -> anyhow::Result<()> {
-        let boot = auth_boot();
-        let state = &boot.kernel.state;
-        let password = bootstrap_root_password(&boot).await?;
-        let mut root = read_user(state, "root")
-            .await?
-            .context("root user missing after bootstrap")?;
-        root.status = "locked".into();
-        write_user(state, &root).await?;
-
-        let auth = test_auth()?;
-        ensure!(
-            matches!(
-                auth.login(
-                    &boot,
-                    LoginRequest {
-                        username: "root".into(),
-                        password,
-                        totp_code: None,
-                    },
-                    "test".into(),
-                )
-                .await,
-                Err(AuthError::AccountUnavailable)
-            ),
-            "locked user was able to login"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn frozen_roles_and_role_grants_are_enforced() -> anyhow::Result<()> {
-        let boot = auth_boot();
-        let state = boot.kernel.state.clone();
-        let admin = ConsolePrincipal {
-            username: "admin".into(),
-            identity_path: "identity://console/admin".into(),
-            grants: CapSet::from_strs([
-                "write://state/kernel/console/roles/**",
-                "perform://effect/kernel/console/users/**",
-            ])?,
-            mfa_level: 1,
-        };
-
-        let role_path = Path::parse("state://kernel/console/roles/ops")?;
-        state
-            .write_set(&role_path, role_value(vec![], true))
-            .await?;
-        ensure!(
-            matches!(
-                authorize_path(
-                    &state,
-                    &admin,
-                    "write",
-                    &role_path,
-                    Some(&role_value(vec![], false))
-                )
-                .await,
-                Err(AuthError::PermissionDenied)
-            ),
-            "frozen role was mutable"
-        );
-
-        let new_role = Path::parse("state://kernel/console/roles/newrole")?;
-        ensure!(
-            matches!(
-                authorize_path(
-                    &state,
-                    &admin,
-                    "write",
-                    &new_role,
-                    Some(&role_value(vec![], true))
-                )
-                .await,
-                Err(AuthError::PermissionDenied)
-            ),
-            "caller created a frozen role"
-        );
-        ensure!(
-            matches!(
-                authorize_path(
-                    &state,
-                    &admin,
-                    "write",
-                    &new_role,
-                    Some(&role_value(vec!["write://state/kernel/**"], false))
-                )
-                .await,
-                Err(AuthError::PermissionDenied)
-            ),
-            "caller exceeded role grant authority"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn malformed_role_grants_are_rejected() -> anyhow::Result<()> {
-        let boot = auth_boot();
-        let state = boot.kernel.state.clone();
-        let admin = ConsolePrincipal {
-            username: "root".into(),
-            identity_path: "identity://console/root".into(),
-            grants: CapSet::from_strs(["*://**"])?,
-            mfa_level: 2,
-        };
-        let mut role = BTreeMap::new();
-        role.insert(
-            "grants".into(),
-            Value::list(vec![
-                Value::string("read://state/kernel/**".into()),
-                Value::integer(7),
-            ]),
-        );
-        role.insert("frozen".into(), Value::boolean(false));
-
-        ensure!(
-            matches!(
-            authorize_path(
-                &state,
-                &admin,
-                "write",
-                &Path::parse("state://kernel/console/roles/bad")?,
-                Some(&Value::map(role))
-            )
-            .await,
-            Err(AuthError::State(message)) if message.contains("console role.grants[1]")
-            ),
-            "malformed role grant was accepted"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn auth_audit_facts_are_redacted() -> anyhow::Result<()> {
-        let boot = auth_boot();
-        let password = bootstrap_root_password(&boot).await?;
-        let auth = test_auth()?;
-        let login = auth
-            .login(
-                &boot,
-                LoginRequest {
-                    username: "root".into(),
-                    password: password.clone(),
-                    totp_code: None,
-                },
-                "audit-source".into(),
-            )
-            .await?;
-
-        let facts = audit_facts(&boot)?;
-        ensure!(
-            facts_contain_string(&facts, "console_login")?,
-            "missing console login audit fact"
-        );
-        ensure!(
-            !facts_contain_string(&facts, &password)?,
-            "audit facts leaked password"
-        );
-        ensure!(
-            !facts_contain_string(&facts, &login.token)?,
-            "audit facts leaked bearer token"
-        );
-        ensure!(
-            !facts_contain_string(&facts, "password")?,
-            "audit facts included password field"
-        );
-        ensure!(
-            !facts_contain_string(&facts, "token")?,
-            "audit facts included token field"
-        );
-        Ok(())
-    }
-}
+#[cfg(test)]
+mod tests;

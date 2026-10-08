@@ -21,3 +21,5 @@ yaml_serde = { workspace = true, default-features = false }
 
 [dev-dependencies]
 anyhow = { workspace = true, default-features = false, features = ["std"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "macros"] }
+xolotl-kernel = { workspace = true, features = ["memory"] }

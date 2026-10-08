@@ -7,9 +7,9 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tonic::{Request, Response, Status, Streaming};
-use xolotl_gateway::{Gateway, GatewayError, StreamWindow};
+use xolotl_gateway::{Gateway, GatewayError, GatewaySession, GatewaySubmissionHead, StreamWindow};
 use xolotl_proto::xolotl::v1::application as pb;
 
 mod auth;
@@ -22,10 +22,14 @@ mod wire;
 pub use config::ApplicationGrpcConfig;
 pub use download::ApplicationObjectDownloadStream;
 pub use ingress::ApplicationIngress;
-use ingress::{RequestEvidence, ResponsePermit};
+use ingress::{RequestEvidence, ResponsePermit, RpcDeadline};
 pub use output::ApplicationOutputStream;
 
 /// Authenticated application ingress over one shared Gateway runtime.
+/// Submission response bodies retain the original session and surface through
+/// encoding and check current disclosure authority before handing off frames.
+/// Revocation withholds pending bytes and successful completion, not effects or
+/// bytes already handed to the network. Encoded buffers retain only capacity.
 #[derive(Clone)]
 pub struct ApplicationGrpcService {
     gateway: Arc<dyn Gateway>,
@@ -103,6 +107,136 @@ impl ApplicationGrpcService {
         self.outputs.close();
     }
 
+    async fn deliver_result(
+        &self,
+        session: GatewaySession,
+        result: xolotl_gateway::GatewaySubmitResult,
+        permit: ResponsePermit,
+        retained_delivery: bool,
+    ) -> Result<Response<pb::SubmitResponse>, Status> {
+        validate_reconciliation_access(
+            self.gateway.as_ref(),
+            &session,
+            &result.accepted.surface_id,
+        )?;
+        let response = wire::submit_response_to_pb(&result, self.config.max_frame_bytes);
+        #[cfg(feature = "structured-output")]
+        if response
+            .as_ref()
+            .is_err_and(|status| status.code() == tonic::Code::ResourceExhausted)
+            && let Some(externalizer) = &self.output_externalizer
+        {
+            let accepted = result.accepted.clone();
+            let unresolved = result.output.unresolved_operations.clone();
+            let current_session = session.clone();
+            let object = externalizer
+                .clone()
+                .externalize(
+                    session,
+                    result.accepted.clone(),
+                    xolotl_gateway::GatewayOutputEvent::Complete(result),
+                )
+                .await;
+            validate_reconciliation_access(
+                self.gateway.as_ref(),
+                &current_session,
+                &accepted.surface_id,
+            )?;
+            let object = match object {
+                Ok(object) => object,
+                Err(failure) => {
+                    // A later revocation must not be bypassed by the
+                    // reconciliation fallback.
+                    validate_reconciliation_access(
+                        self.gateway.as_ref(),
+                        &current_session,
+                        &accepted.surface_id,
+                    )?;
+                    if retained_delivery
+                        && !matches!(
+                            failure.error,
+                            GatewayError::Indeterminate(_)
+                                | GatewayError::SubmissionIndeterminate(_)
+                        )
+                    {
+                        return Err(match failure.error {
+                            GatewayError::Rejected(_) => {
+                                Status::failed_precondition("retained result delivery unavailable")
+                            }
+                            error => gateway_status(error),
+                        });
+                    }
+                    let mut response = Response::new(wire::submit_indeterminate_to_pb(
+                        &accepted,
+                        &unresolved,
+                        "response_delivery_failed",
+                        self.config.max_frame_bytes,
+                    )?);
+                    tracing::debug!(error = %failure.error, "gateway result delivery failed");
+                    response.extensions_mut().insert(permit);
+                    return Ok(response);
+                }
+            };
+            let mut response = Response::new(
+                match wire::structured::submit_to_pb(&object, self.config.max_frame_bytes) {
+                    Ok(response) => response,
+                    Err(status) if status.code() == tonic::Code::ResourceExhausted => {
+                        validate_reconciliation_access(
+                            self.gateway.as_ref(),
+                            &current_session,
+                            &accepted.surface_id,
+                        )?;
+                        wire::submit_indeterminate_to_pb(
+                            &accepted,
+                            &unresolved,
+                            "response_encoding_failed",
+                            self.config.max_frame_bytes,
+                        )?
+                    }
+                    Err(status) => return Err(status),
+                },
+            );
+            response.extensions_mut().insert(permit);
+            return Ok(response);
+        }
+        let mut response = Response::new(match response {
+            Ok(response) => response,
+            Err(status) if status.code() == tonic::Code::ResourceExhausted => {
+                if retained_delivery {
+                    return Err(Status::resource_exhausted(
+                        "retained result exceeds the inline envelope and no usable externalizer is configured",
+                    ));
+                }
+                validate_reconciliation_access(
+                    self.gateway.as_ref(),
+                    &session,
+                    &result.accepted.surface_id,
+                )?;
+                wire::submit_indeterminate_to_pb(
+                    &result.accepted,
+                    &result.output.unresolved_operations,
+                    "response_encoding_failed",
+                    self.config.max_frame_bytes,
+                )?
+            }
+            Err(status) => return Err(status),
+        });
+        response.extensions_mut().insert(permit);
+        Ok(response)
+    }
+
+    fn submission_permit(
+        &self,
+        permit: OwnedSemaphorePermit,
+        session: GatewaySession,
+        surface_id: String,
+    ) -> ResponsePermit {
+        let gateway = self.gateway.clone();
+        ResponsePermit::new(permit).with_access(move || {
+            validate_reconciliation_access(gateway.as_ref(), &session, &surface_id)
+        })
+    }
+
     async fn run<T>(
         &self,
         operation: impl Future<Output = Result<T, Status>>,
@@ -126,6 +260,22 @@ impl ApplicationGrpcService {
             .await
             .map_err(|_error| Status::deadline_exceeded("gateway storage wait expired"))?
             .map_err(gateway_status)
+    }
+
+    fn with_transport_deadline(
+        &self,
+        mut submission: GatewaySubmissionHead,
+        deadline: Option<RpcDeadline>,
+    ) -> Result<GatewaySubmissionHead, Status> {
+        let Some(deadline) = deadline else {
+            return Ok(submission);
+        };
+        let host_deadline = self
+            .gateway
+            .deadline_after(deadline.remaining())
+            .map_err(gateway_status)?;
+        submission.server_deadline = Some(host_deadline);
+        Ok(submission)
     }
 
     async fn receive(
@@ -243,11 +393,77 @@ impl ApplicationGateway for ApplicationGrpcService {
     ) -> Result<Response<pb::DescribeResponse>, Status> {
         self.run(async {
             let session = self.authenticate(&request).await?;
+            let retry_epoch = self.storage(self.gateway.retry_epoch(&session)).await?;
             let descriptor = self.gateway.describe(&session).map_err(gateway_status)?;
             Ok(Response::new(wire::descriptor_to_pb(
                 &descriptor,
+                retry_epoch,
                 self.config.max_frame_bytes,
             )?))
+        })
+        .await
+    }
+
+    async fn lookup_request(
+        &self,
+        request: Request<pb::LookupRequestRequest>,
+    ) -> Result<Response<pb::LookupRequestResponse>, Status> {
+        self.run(async {
+            let permit =
+                self.outputs.clone().try_acquire_owned().map_err(|_error| {
+                    Status::resource_exhausted("output response window is full")
+                })?;
+            let session = self.authenticate(&request).await?;
+            let lookup = wire::lookup_request_from_pb(request.into_inner())?;
+            let permit = self.submission_permit(permit, session.clone(), lookup.surface_id.clone());
+            let evidence = self
+                .storage(self.gateway.lookup_request(&session, lookup))
+                .await?;
+            let mut response = Response::new(wire::lookup_response_to_pb(
+                evidence,
+                self.config.max_frame_bytes,
+            )?);
+            response.extensions_mut().insert(permit);
+            Ok(response)
+        })
+        .await
+    }
+
+    async fn deliver_request_result(
+        &self,
+        request: Request<pb::LookupRequestRequest>,
+    ) -> Result<Response<pb::SubmitResponse>, Status> {
+        self.run(async {
+            let permit =
+                self.outputs.clone().try_acquire_owned().map_err(|_error| {
+                    Status::resource_exhausted("output response window is full")
+                })?;
+            let session = self.authenticate(&request).await?;
+            let lookup = wire::lookup_request_from_pb(request.into_inner())?;
+            let permit = self.submission_permit(permit, session.clone(), lookup.surface_id.clone());
+            let retained = self
+                .storage(self.gateway.read_retained_request_result(&session, lookup))
+                .await?;
+            use xolotl_gateway::GatewayRetainedRequestResult;
+            let result = match retained {
+                GatewayRetainedRequestResult::Available(result) => *result,
+                GatewayRetainedRequestResult::Unproven => {
+                    return Err(Status::failed_precondition(
+                        "retained result unavailable: unproven",
+                    ));
+                }
+                GatewayRetainedRequestResult::Reserved => {
+                    return Err(Status::failed_precondition(
+                        "retained result unavailable: reserved",
+                    ));
+                }
+                GatewayRetainedRequestResult::Retired => {
+                    return Err(Status::failed_precondition(
+                        "retained result unavailable: retired",
+                    ));
+                }
+            };
+            self.deliver_result(session, result, permit, true).await
         })
         .await
     }
@@ -286,41 +502,45 @@ impl ApplicationGateway for ApplicationGrpcService {
                     Status::resource_exhausted("output response window is full")
                 })?;
             let session = self.authenticate(&request).await?;
-            let result = self
+            let deadline = request
+                .extensions()
+                .get::<RequestEvidence>()
+                .and_then(RequestEvidence::deadline);
+            let submission = self.with_transport_deadline(
+                wire::submission_head_from_pb(request.get_ref(), false)?,
+                deadline,
+            )?;
+            let permit =
+                self.submission_permit(permit, session.clone(), submission.surface_id.clone());
+            let preparation = self
                 .gateway
-                .submit(&session, wire::submission_from_pb(request.into_inner())?)
-                .await
+                .prepare_submission(&session, submission, None)
                 .map_err(gateway_status)?;
-            let response = wire::submit_response_to_pb(&result, self.config.max_frame_bytes);
-            #[cfg(feature = "structured-output")]
-            if response
-                .as_ref()
-                .is_err_and(|status| status.code() == tonic::Code::ResourceExhausted)
-                && let Some(externalizer) = &self.output_externalizer
+            let (payload, provenance) = wire::submission_payload_from_pb(request.into_inner())?;
+            let result = match self
+                .gateway
+                .submit_prepared(preparation, payload, provenance)
+                .await
             {
-                let object = externalizer
-                    .clone()
-                    .externalize(
-                        session,
-                        result.accepted.clone(),
-                        xolotl_gateway::GatewayOutputEvent::Complete(result),
-                    )
-                    .await
-                    .map_err(|failure| gateway_status(failure.error))?;
-                let mut response = Response::new(wire::structured::submit_to_pb(
-                    &object,
-                    self.config.max_frame_bytes,
-                )?);
-                response
-                    .extensions_mut()
-                    .insert(ResponsePermit::new(permit));
-                return Ok(response);
-            }
-            let mut response = Response::new(response?);
-            response
-                .extensions_mut()
-                .insert(ResponsePermit::new(permit));
-            Ok(response)
+                Ok(result) => result,
+                Err(GatewayError::SubmissionIndeterminate(unknown)) => {
+                    validate_reconciliation_access(
+                        self.gateway.as_ref(),
+                        &session,
+                        &unknown.accepted.surface_id,
+                    )?;
+                    let mut response = Response::new(wire::submit_indeterminate_to_pb(
+                        &unknown.accepted,
+                        &unknown.unresolved_operations,
+                        unknown.reason_code,
+                        self.config.max_frame_bytes,
+                    )?);
+                    response.extensions_mut().insert(permit);
+                    return Ok(response);
+                }
+                Err(error) => return Err(gateway_status(error)),
+            };
+            self.deliver_result(session, result, permit, false).await
         })
         .await
     }
@@ -339,33 +559,36 @@ impl ApplicationGateway for ApplicationGrpcService {
                 .extensions()
                 .get::<RequestEvidence>()
                 .and_then(RequestEvidence::deadline);
-            let mut submission = wire::output_submission_from_pb(request.into_inner())?;
-            if let Some(deadline) = deadline {
-                let mut options = submission.options().clone();
-                options.deadline_ms =
-                    Some(options.deadline_ms.map_or(deadline.unix_ms(), |requested| {
-                        requested.min(deadline.unix_ms())
-                    }));
-                submission = submission.with_options(options);
-            }
+            let submission = self.with_transport_deadline(
+                wire::submission_head_from_pb(request.get_ref(), true)?,
+                deadline,
+            )?;
+            let permit =
+                self.submission_permit(permit, session.clone(), submission.surface_id.clone());
+            let preparation = self
+                .gateway
+                .prepare_submission(&session, submission, Some(self.output_window))
+                .map_err(gateway_status)?;
+            let (payload, provenance) = wire::submission_payload_from_pb(request.into_inner())?;
             let output = self
-                .storage(self.gateway.submit_output_stream(
-                    &session,
-                    submission,
-                    self.output_window,
+                .storage(self.gateway.submit_output_stream_prepared(
+                    preparation,
+                    payload,
+                    provenance,
                 ))
                 .await?;
-            let output = ApplicationOutputStream::new(output, self.config.max_frame_bytes)?;
+            let output = ApplicationOutputStream::new(
+                output,
+                self.gateway.clone(),
+                session.clone(),
+                self.config.max_frame_bytes,
+            )?;
             #[cfg(feature = "structured-output")]
-            let output = output.with_objects(
-                self.output_externalizer
-                    .as_ref()
-                    .map(|encoder| output::ObjectDelivery::new(encoder.clone(), session)),
-            );
+            let output = output.with_objects(self.output_externalizer.as_ref().map(|encoder| {
+                output::ObjectDelivery::new(encoder.clone(), self.gateway.clone(), session)
+            }));
             let mut response = Response::new(output);
-            response
-                .extensions_mut()
-                .insert(ResponsePermit::new(permit));
+            response.extensions_mut().insert(permit);
             Ok(response)
         })
         .await
@@ -374,11 +597,56 @@ impl ApplicationGateway for ApplicationGrpcService {
 
 fn gateway_status(error: GatewayError) -> Status {
     let message = error.public_message();
-    match error {
+    let code = error.code();
+    let mut status = match error {
         GatewayError::Unauthenticated => Status::unauthenticated(message),
         GatewayError::Unauthorized(_) => Status::permission_denied(message),
         GatewayError::LimitExceeded(_) => Status::resource_exhausted(message),
         GatewayError::InvalidProfile(_) => Status::failed_precondition(message),
         GatewayError::Rejected(_) => Status::invalid_argument(message),
+        GatewayError::Indeterminate(_) | GatewayError::SubmissionIndeterminate(_) => {
+            Status::failed_precondition(message)
+        }
+    };
+    let _previous = status.metadata_mut().insert(
+        "x-xolotl-error-code",
+        tonic::metadata::MetadataValue::from_static(code),
+    );
+    status
+}
+
+fn validate_reconciliation_access(
+    gateway: &dyn Gateway,
+    session: &GatewaySession,
+    surface_id: &str,
+) -> Result<(), Status> {
+    gateway
+        .validate_submission_access(session, surface_id)
+        .map_err(|_access_error| {
+            gateway_status(GatewayError::Indeterminate(
+                "submission delivery access unavailable".into(),
+            ))
+        })
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_outcome_maps_to_reconciliation_required_status() {
+        let status = gateway_status(GatewayError::Indeterminate("private detail".into()));
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            status.message(),
+            "outcome unknown; reconcile before retrying"
+        );
+        assert_eq!(
+            status
+                .metadata()
+                .get("x-xolotl-error-code")
+                .and_then(|value| value.to_str().ok()),
+            Some("outcome_unknown")
+        );
     }
 }

@@ -24,6 +24,12 @@ pub struct DescribeResponse {
     /// Effective admission limits for the active profile.
     #[prost(message, optional, tag = "5")]
     pub limits: ::core::option::Option<LimitProfile>,
+    /// Store-wide open retry range; never automatically move unknown requests.
+    #[prost(uint64, tag = "6")]
+    pub retry_epoch: u64,
+    /// Maximum encoded protobuf envelope bytes for this transport.
+    #[prost(uint64, tag = "7")]
+    pub max_frame_bytes: u64,
 }
 
 /// Public description of one authenticated surface.
@@ -44,6 +50,9 @@ pub struct SurfaceDescriptor {
     /// Optional schema for each incremental output, independent of the final value.
     #[prost(message, optional, tag = "5")]
     pub output_stream_schema: ::core::option::Option<super::Value>,
+    /// Immutable authenticated request scope; not an authorization credential.
+    #[prost(string, tag = "8")]
+    pub request_scope: ::prost::alloc::string::String,
 }
 
 /// Protocol metadata published for one visible surface.
@@ -71,8 +80,8 @@ pub struct PublicationDescriptor {
     #[prost(string, optional, tag = "7")]
     pub description: ::core::option::Option<::prost::alloc::string::String>,
     /// Adapter-specific properties preserving the common value types.
-    #[prost(map = "string, message", tag = "8")]
-    pub properties: ::std::collections::HashMap<::prost::alloc::string::String, super::Value>,
+    #[prost(btree_map = "string, message", tag = "8")]
+    pub properties: ::std::collections::BTreeMap<::prost::alloc::string::String, super::Value>,
     /// Optional protocol annotations.
     #[prost(message, optional, tag = "9")]
     pub annotations: ::core::option::Option<super::Value>,
@@ -117,6 +126,18 @@ pub struct LimitProfile {
     /// Maximum inline bytes per input stream item.
     #[prost(uint64, tag = "11")]
     pub max_stream_inline_item_bytes: u64,
+    /// Maximum recent cancellations retained for idempotent cancel requests.
+    #[prost(uint64, tag = "12")]
+    pub max_recent_cancellations: u64,
+    /// Maximum typed objects bound to one upload ticket.
+    #[prost(uint64, tag = "13")]
+    pub max_ticket_objects: u64,
+    /// Maximum aggregate bytes of distinct backing objects on one ticket.
+    #[prost(uint64, tag = "14")]
+    pub max_ticket_total_bytes: u64,
+    /// Maximum encoded State record bytes for one ticket.
+    #[prost(uint64, tag = "15")]
+    pub max_ticket_record_bytes: u64,
 }
 
 /// Optional aggregate budgets, independent of transport frame size.
@@ -188,7 +209,7 @@ pub struct IssueUploadTicketRequest {
     /// Expected size, or absent when unknown before upload.
     #[prost(uint64, optional, tag = "4")]
     pub expected_size: ::core::option::Option<u64>,
-    /// Expected lowercase BLAKE3 digest, when known.
+    /// Expected lowercase SHA-384 digest, when known.
     #[prost(string, optional, tag = "5")]
     pub expected_digest: ::core::option::Option<::prost::alloc::string::String>,
     /// Allowed media types or media type patterns.
@@ -200,6 +221,15 @@ pub struct IssueUploadTicketRequest {
     /// Consume the committed receipt on successful submission admission.
     #[prost(bool, tag = "8")]
     pub single_use: bool,
+    /// Requested maximum number of typed objects on this ticket.
+    #[prost(uint64, optional, tag = "9")]
+    pub max_objects: ::core::option::Option<u64>,
+    /// Requested maximum aggregate bytes of distinct backing objects.
+    #[prost(uint64, optional, tag = "10")]
+    pub max_total_bytes: ::core::option::Option<u64>,
+    /// Requested maximum encoded State record bytes.
+    #[prost(uint64, optional, tag = "11")]
+    pub max_record_bytes: ::core::option::Option<u64>,
 }
 
 /// Server-issued upload reservation.
@@ -214,6 +244,15 @@ pub struct IssueUploadTicketResponse {
     /// Whether successful submission admission consumes the receipt.
     #[prost(bool, tag = "3")]
     pub single_use: bool,
+    /// Maximum typed objects accepted on this ticket.
+    #[prost(uint64, tag = "4")]
+    pub max_objects: u64,
+    /// Maximum aggregate bytes of distinct backing objects.
+    #[prost(uint64, tag = "5")]
+    pub max_total_bytes: u64,
+    /// Maximum encoded State record bytes.
+    #[prost(uint64, tag = "6")]
+    pub max_record_bytes: u64,
 }
 
 /// One frame in the strict Begin, Chunk*, Finish, EOF upload sequence.
@@ -253,6 +292,12 @@ pub struct BeginObjectUpload {
     /// Token required when the ticket is token-bound.
     #[prost(string, optional, tag = "3")]
     pub submission_token: ::core::option::Option<::prost::alloc::string::String>,
+    /// Optional expected byte size for this upload.
+    #[prost(uint64, optional, tag = "4")]
+    pub expected_size: ::core::option::Option<u64>,
+    /// Optional lowercase SHA-384 digest for this upload.
+    #[prost(string, optional, tag = "5")]
+    pub expected_digest: ::core::option::Option<::prost::alloc::string::String>,
 }
 
 /// Interpret received content without a client-supplied blob reference or digest.
@@ -315,7 +360,7 @@ pub struct UploadObjectResponse {
     /// Common provenance bound to this principal and surface.
     #[prost(message, optional, tag = "2")]
     pub provenance: ::core::option::Option<super::PayloadProvenance>,
-    /// Lowercase BLAKE3 digest of committed bytes.
+    /// Lowercase SHA-384 digest of committed bytes.
     #[prost(string, tag = "3")]
     pub digest: ::prost::alloc::string::String,
     /// Committed byte count.
@@ -439,10 +484,149 @@ pub struct SubmitOptions {
     /// Requested absolute deadline in Unix milliseconds, clamped by the profile.
     #[prost(uint64, optional, tag = "3")]
     pub deadline_ms: ::core::option::Option<u64>,
-    /// Requested transport encoding, not an authorization input.
-    #[prost(string, optional, tag = "4")]
-    pub requested_encoding: ::core::option::Option<::prost::alloc::string::String>,
+    /// Explicit retry range; changing it starts a new request, not a retry.
+    #[prost(uint64, tag = "5")]
+    pub retry_epoch: u64,
+    /// Original discovered scope, required for keyed or token-bound submissions.
+    #[prost(string, optional, tag = "6")]
+    pub expected_request_scope: ::core::option::Option<::prost::alloc::string::String>,
 }
+
+/// Read-only lookup of original-request evidence, without payload disclosure or effects.
+/// Backend observation may decode the full bounded original record; this does
+/// not promise payload-independent storage I/O or working memory.
+///
+/// The caller must authenticate and be authorized under the current Gateway
+/// profile. The original request scope must match the evidence owner; neither
+/// the scope nor the identity grants authority. Closed retry ranges remain
+/// queryable. Lookup never advances the epoch, reserves a request, or executes
+/// work, and changing the epoch identifies a new request rather than a retry.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LookupRequestRequest {
+    /// Surface of the original request, checked against current authorization.
+    #[prost(string, tag = "1")]
+    pub surface_id: ::prost::alloc::string::String,
+    /// Required original request scope, not a newly discovered replacement.
+    #[prost(string, tag = "2")]
+    pub expected_request_scope: ::prost::alloc::string::String,
+    /// Original retry range, including closed ranges; never advanced by lookup.
+    #[prost(uint64, tag = "3")]
+    pub retry_epoch: u64,
+    /// Exactly one nonempty literal identity is required.
+    #[prost(oneof = "lookup_request_request::Identity", tags = "4, 5")]
+    pub identity: ::core::option::Option<lookup_request_request::Identity>,
+}
+
+/// Mutually exclusive original-request identities; neither grants authority.
+pub mod lookup_request_request {
+    /// Literal identity material, without special string prefixes.
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Identity {
+        /// Original idempotency key.
+        #[prost(string, tag = "4")]
+        IdempotencyKey(::prost::alloc::string::String),
+        /// Original submission token.
+        #[prost(string, tag = "5")]
+        SubmissionToken(::prost::alloc::string::String),
+    }
+}
+
+/// Original acceptance and bounded reconciliation evidence without result contents.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RequestSettled {
+    /// Original acceptance.
+    #[prost(message, optional, tag = "1")]
+    pub accepted: Option<GatewayAccepted>,
+    /// Original result class.
+    #[prost(enumeration = "RequestResultClass", tag = "2")]
+    pub result_class: i32,
+    /// Bounded unresolved evidence; omitted identities are explicit.
+    #[prost(message, optional, tag = "3")]
+    pub unresolved_operations: Option<super::UnresolvedOperations>,
+}
+
+/// Terminal result class without value or failure details.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum RequestResultClass {
+    /// Not a valid result class.
+    Unspecified = 0,
+    /// Normal completion.
+    Done = 1,
+    /// Short-circuit completion.
+    Short = 2,
+    /// Known program failure.
+    Fail = 3,
+}
+
+impl RequestResultClass {
+    /// Stable protobuf enum field name.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "REQUEST_RESULT_CLASS_UNSPECIFIED",
+            Self::Done => "REQUEST_RESULT_CLASS_DONE",
+            Self::Short => "REQUEST_RESULT_CLASS_SHORT",
+            Self::Fail => "REQUEST_RESULT_CLASS_FAIL",
+        }
+    }
+
+    /// Parse the stable protobuf enum field name.
+    pub fn from_str_name(value: &str) -> Option<Self> {
+        match value {
+            "REQUEST_RESULT_CLASS_UNSPECIFIED" => Some(Self::Unspecified),
+            "REQUEST_RESULT_CLASS_DONE" => Some(Self::Done),
+            "REQUEST_RESULT_CLASS_SHORT" => Some(Self::Short),
+            "REQUEST_RESULT_CLASS_FAIL" => Some(Self::Fail),
+            _ => None,
+        }
+    }
+}
+
+/// Evidence observed without executing or changing the original request.
+///
+/// An absent evidence arm is invalid, not [`RequestUnproven`]. Explicit empty
+/// state messages distinguish each verdict from a zero/default response.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LookupRequestResponse {
+    /// Required observation of the original request's retained evidence.
+    #[prost(oneof = "lookup_request_response::Evidence", tags = "1, 2, 3, 4")]
+    pub evidence: ::core::option::Option<lookup_request_response::Evidence>,
+}
+
+/// Mutually exclusive evidence states, not execution liveness states.
+pub mod lookup_request_response {
+    /// Original-request evidence under current authorization and delivery rules.
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Evidence {
+        /// No provable evidence; does not prove non-execution or retry safety.
+        #[prost(message, tag = "1")]
+        Unproven(super::RequestUnproven),
+        /// Retained reservation; does not prove running or accepted execution.
+        #[prost(message, tag = "2")]
+        Reserved(super::RequestReserved),
+        /// Payload-independent original settled summary; no export is created.
+        #[prost(message, boxed, tag = "3")]
+        Settled(Box<super::RequestSettled>),
+        /// Retired original range/identity; it cannot be re-executed.
+        #[prost(message, tag = "4")]
+        Retired(super::RequestRetired),
+    }
+}
+
+/// No provable original-request evidence, not proof that it was never executed.
+/// This observation does not establish that retry is safe.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RequestUnproven {}
+
+/// A retained reservation without a provable complete result.
+/// This does not imply running execution, acceptance, or a known failure.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RequestReserved {}
+
+/// The original retry range/identity is retired and cannot be re-executed.
+/// Advancing the epoch creates a new request, not a retry of the original.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RequestRetired {}
 
 /// Server-generated acceptance identity for a completed submission.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -461,28 +645,68 @@ pub struct GatewayAccepted {
     pub surface_id: ::prost::alloc::string::String,
 }
 
-/// Acceptance metadata and the shared complete submission result.
+/// Acceptance metadata and one terminal submission verdict.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SubmitResponse {
     /// Server-owned admission metadata.
     #[prost(message, optional, tag = "1")]
     pub accepted: ::core::option::Option<GatewayAccepted>,
-    /// Required final outcome, provenance and request cache origin.
-    #[prost(message, optional, tag = "2")]
-    pub completion: ::core::option::Option<SubmissionCompletion>,
+    /// Complete result or bounded reconciliation evidence after execution.
+    #[prost(oneof = "submit_response::Terminal", tags = "2, 3")]
+    pub terminal: ::core::option::Option<submit_response::Terminal>,
+}
+
+impl SubmitResponse {
+    /// Borrow the complete outcome when this response has one.
+    pub fn completion(&self) -> ::core::option::Option<&SubmissionCompletion> {
+        match self.terminal.as_ref()? {
+            submit_response::Terminal::Completion(completion) => Some(completion),
+            submit_response::Terminal::Indeterminate(_) => None,
+        }
+    }
+
+    /// Take the complete outcome when this response has one.
+    pub fn into_completion(self) -> ::core::option::Option<SubmissionCompletion> {
+        match self.terminal? {
+            submit_response::Terminal::Completion(completion) => Some(completion),
+            submit_response::Terminal::Indeterminate(_) => None,
+        }
+    }
+
+    /// Borrow the bounded evidence for an indeterminate result.
+    pub fn indeterminate(&self) -> ::core::option::Option<&SubmissionIndeterminate> {
+        match self.terminal.as_ref()? {
+            submit_response::Terminal::Completion(_) => None,
+            submit_response::Terminal::Indeterminate(unknown) => Some(unknown),
+        }
+    }
+}
+
+/// Mutually exclusive terminal verdicts for a unary submission.
+pub mod submit_response {
+    /// One complete outcome or an indeterminate delivery/settlement.
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Terminal {
+        /// Final outcome, provenance and request cache origin.
+        #[prost(message, tag = "2")]
+        Completion(super::SubmissionCompletion),
+        /// Known acceptance with an unavailable complete result.
+        #[prost(message, tag = "3")]
+        Indeterminate(super::SubmissionIndeterminate),
+    }
 }
 
 /// One ordered event of a request-owned output stream.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SubmitOutputResponse {
-    /// Acceptance, one typed chunk, or final request completion.
-    #[prost(oneof = "submit_output_response::Event", tags = "1, 2, 3")]
+    /// Acceptance, one typed chunk, or a terminal verdict.
+    #[prost(oneof = "submit_output_response::Event", tags = "1, 2, 3, 4")]
     pub event: ::core::option::Option<submit_output_response::Event>,
 }
 
 /// Ordered application output events.
 pub mod submit_output_response {
-    /// Accepted, Chunk*, Completed, followed by successful gRPC EOF.
+    /// Accepted, Chunk*, Completed or Indeterminate, followed by successful EOF.
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Event {
         /// Admission completed, including input receipt consumption.
@@ -494,7 +718,23 @@ pub mod submit_output_response {
         /// Final outcome after Gateway persistence and request cleanup.
         #[prost(message, tag = "3")]
         Completed(super::SubmissionCompletion),
+        /// Execution was observed, but full settlement or delivery is unavailable.
+        #[prost(message, tag = "4")]
+        Indeterminate(super::SubmissionIndeterminate),
     }
+}
+
+/// Bounded host-observed evidence for an accepted submission without a
+/// deliverable complete result. Neither this nor a missing response permits
+/// retrying under a new operation identity.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SubmissionIndeterminate {
+    /// Stable, redacted cause such as settlement_failed or response_encoding_failed.
+    #[prost(string, tag = "1")]
+    pub reason_code: ::prost::alloc::string::String,
+    /// Known unresolved effects; omissions are marked explicitly.
+    #[prost(message, optional, tag = "2")]
+    pub unresolved_operations: ::core::option::Option<super::UnresolvedOperations>,
 }
 
 /// A typed incremental output with independent provenance.
@@ -641,15 +881,34 @@ pub struct SubmissionCompletion {
     /// Required result lineage, including failures and cached outcomes.
     #[prost(message, optional, tag = "3")]
     pub taint: ::core::option::Option<super::TaintSet>,
+    /// Effects that remain uncertain independent of the final program outcome.
+    #[prost(message, optional, tag = "4")]
+    pub unresolved_operations: ::core::option::Option<super::UnresolvedOperations>,
 }
 
 /// Tonic server bindings for authenticated application requests.
+#[cfg(feature = "grpc")]
 pub mod application_gateway_server {
     use tonic::codegen::*;
 
     /// Application surface protocol, separate from External role sessions.
     #[async_trait]
     pub trait ApplicationGateway: std::marker::Send + std::marker::Sync + 'static {
+        /// Observe original-request evidence without payload disclosure, reservation or effects.
+        /// Requires current authorization and the original scope; closed ranges
+        /// remain queryable without advancing the epoch. See [`super::LookupRequestRequest`]
+        /// and [`super::lookup_request_response::Evidence`] for verdict semantics.
+        async fn lookup_request(
+            &self,
+            request: tonic::Request<super::LookupRequestRequest>,
+        ) -> std::result::Result<tonic::Response<super::LookupRequestResponse>, tonic::Status>;
+        /// Deliver only the original cached result; never executes.
+        /// Missing adapter or capacity rejects delivery, not original settlement.
+        /// Indeterminate means export/delivery uncertainty; Lookup remains settled.
+        async fn deliver_request_result(
+            &self,
+            request: tonic::Request<super::LookupRequestRequest>,
+        ) -> std::result::Result<tonic::Response<super::SubmitResponse>, tonic::Status>;
         /// Discover the authenticated caller's visible surfaces and limits.
         async fn describe(
             &self,
@@ -769,6 +1028,81 @@ pub mod application_gateway_server {
 
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
+                "/xolotl.v1.application.ApplicationGateway/LookupRequest" => {
+                    struct LookupRequestSvc<T: ApplicationGateway>(pub Arc<T>);
+                    impl<T: ApplicationGateway>
+                        tonic::server::UnaryService<super::LookupRequestRequest>
+                        for LookupRequestSvc<T>
+                    {
+                        type Response = super::LookupRequestResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::LookupRequestRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            Box::pin(async move {
+                                <T as ApplicationGateway>::lookup_request(&inner, request).await
+                            })
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = Arc::clone(&self.inner);
+                    Box::pin(async move {
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        Ok(grpc.unary(LookupRequestSvc(inner), req).await)
+                    })
+                }
+                "/xolotl.v1.application.ApplicationGateway/DeliverRequestResult" => {
+                    struct DeliverRequestResultSvc<T: ApplicationGateway>(pub Arc<T>);
+                    impl<T: ApplicationGateway>
+                        tonic::server::UnaryService<super::LookupRequestRequest>
+                        for DeliverRequestResultSvc<T>
+                    {
+                        type Response = super::SubmitResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::LookupRequestRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            Box::pin(async move {
+                                <T as ApplicationGateway>::deliver_request_result(&inner, request)
+                                    .await
+                            })
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = Arc::clone(&self.inner);
+                    Box::pin(async move {
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        Ok(grpc.unary(DeliverRequestResultSvc(inner), req).await)
+                    })
+                }
                 "/xolotl.v1.application.ApplicationGateway/Describe" => {
                     struct DescribeSvc<T: ApplicationGateway>(pub Arc<T>);
                     impl<T: ApplicationGateway> tonic::server::UnaryService<super::DescribeRequest> for DescribeSvc<T> {
@@ -1027,6 +1361,7 @@ pub mod application_gateway_server {
 }
 
 /// Tonic client bindings for application discovery, objects and submission.
+#[cfg(feature = "grpc")]
 pub mod application_gateway_client {
     use tonic::codegen::http::Uri;
     use tonic::codegen::*;
@@ -1037,6 +1372,7 @@ pub mod application_gateway_client {
         inner: tonic::client::Grpc<T>,
     }
 
+    #[cfg(feature = "transport")]
     impl ApplicationGatewayClient<tonic::transport::Channel> {
         /// Connect to an application Gateway endpoint.
         pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
@@ -1192,6 +1528,50 @@ pub mod application_gateway_client {
             ));
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Observe original-request evidence without payload disclosure, reservation or effects.
+        /// Requires current authorization and the original scope; closed ranges
+        /// remain queryable without advancing the epoch. See [`super::LookupRequestRequest`]
+        /// and [`super::lookup_request_response::Evidence`] for verdict semantics.
+        pub async fn lookup_request(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LookupRequestRequest>,
+        ) -> std::result::Result<tonic::Response<super::LookupRequestResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|error| {
+                tonic::Status::unknown(format!("Service was not ready: {}", error.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/xolotl.v1.application.ApplicationGateway/LookupRequest",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "xolotl.v1.application.ApplicationGateway",
+                "LookupRequest",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Deliver only the original cached result; never executes.
+        /// Missing adapter or capacity rejects delivery, not original settlement.
+        /// Indeterminate means export/delivery uncertainty; Lookup remains settled.
+        pub async fn deliver_request_result(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LookupRequestRequest>,
+        ) -> std::result::Result<tonic::Response<super::SubmitResponse>, tonic::Status> {
+            self.inner.ready().await.map_err(|error| {
+                tonic::Status::unknown(format!("Service was not ready: {}", error.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/xolotl.v1.application.ApplicationGateway/DeliverRequestResult",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "xolotl.v1.application.ApplicationGateway",
+                "DeliverRequestResult",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
         /// Submit direct typed input and await a Unary or Collect outcome.
         pub async fn submit(
             &mut self,
@@ -1232,6 +1612,313 @@ pub mod application_gateway_client {
                 "SubmitOutput",
             ));
             self.inner.server_streaming(req, path, codec).await
+        }
+    }
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::*;
+    use anyhow::ensure;
+    use prost::Message;
+
+    #[test]
+    fn original_identity_wire_tags() -> anyhow::Result<()> {
+        for (identity, identity_tag) in [
+            (
+                lookup_request_request::Identity::IdempotencyKey("key".into()),
+                0x22,
+            ),
+            (
+                lookup_request_request::Identity::SubmissionToken("key".into()),
+                0x2a,
+            ),
+        ] {
+            let request = LookupRequestRequest {
+                surface_id: "surface".into(),
+                expected_request_scope: "scope".into(),
+                retry_epoch: 7,
+                identity: Some(identity),
+            };
+            let mut expected = vec![0x0a, 7];
+            expected.extend_from_slice(b"surface");
+            expected.extend_from_slice(&[0x12, 5]);
+            expected.extend_from_slice(b"scope");
+            expected.extend_from_slice(&[0x18, 7, identity_tag, 3]);
+            expected.extend_from_slice(b"key");
+            ensure!(
+                request.encode_to_vec() == expected,
+                "identity wire tags changed"
+            );
+            ensure!(
+                LookupRequestRequest::decode(expected.as_slice())? == request,
+                "identity roundtrip changed"
+            );
+        }
+        ensure!(
+            LookupRequestRequest::decode(&[][..])?.identity.is_none(),
+            "empty request gained an identity"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_evidence_states_have_explicit_presence() -> anyhow::Result<()> {
+        use lookup_request_response::Evidence;
+
+        let absent = LookupRequestResponse::default();
+        ensure!(
+            absent.encode_to_vec().is_empty(),
+            "absent evidence encoded a state"
+        );
+        ensure!(
+            LookupRequestResponse::decode(&[][..])?.evidence.is_none(),
+            "empty response gained evidence"
+        );
+        for (evidence, tag) in [
+            (Evidence::Unproven(RequestUnproven {}), 0x0a),
+            (Evidence::Reserved(RequestReserved {}), 0x12),
+            (Evidence::Retired(RequestRetired {}), 0x22),
+        ] {
+            let response = LookupRequestResponse {
+                evidence: Some(evidence),
+            };
+            let expected = [tag, 0];
+            ensure!(
+                response.encode_to_vec() == expected,
+                "empty state lost its wire presence"
+            );
+            ensure!(
+                LookupRequestResponse::decode(expected.as_slice())? == response,
+                "evidence roundtrip changed"
+            );
+            ensure!(response != absent, "explicit state became absent evidence");
+        }
+        Ok(())
+    }
+
+    fn settled_response() -> LookupRequestResponse {
+        LookupRequestResponse {
+            evidence: Some(lookup_request_response::Evidence::Settled(Box::new(
+                RequestSettled {
+                    accepted: Some(GatewayAccepted {
+                        submission_id: "original".into(),
+                        trace_root: "trace".into(),
+                        profile_rev: 3,
+                        surface_id: "surface".into(),
+                    }),
+                    result_class: RequestResultClass::Done as i32,
+                    unresolved_operations: Some(super::super::UnresolvedOperations::default()),
+                },
+            ))),
+        }
+    }
+
+    #[test]
+    fn settled_preserves_original_summary() -> anyhow::Result<()> {
+        let response = settled_response();
+        let encoded = response.encode_to_vec();
+        ensure!(encoded.first() == Some(&0x1a), "settled wire tag changed");
+        ensure!(LookupRequestResponse::decode(encoded.as_slice())? == response);
+        Ok(())
+    }
+
+    #[cfg(feature = "grpc")]
+    mod grpc {
+        use super::*;
+        use anyhow::Context as _;
+        use application_gateway_client::ApplicationGatewayClient;
+        use application_gateway_server::{ApplicationGateway, ApplicationGatewayServer};
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        use tonic::codegen::{Service, http, tokio_stream};
+
+        struct LookupGateway;
+
+        #[tonic::async_trait]
+        impl ApplicationGateway for LookupGateway {
+            async fn deliver_request_result(
+                &self,
+                _request: tonic::Request<LookupRequestRequest>,
+            ) -> Result<tonic::Response<SubmitResponse>, tonic::Status> {
+                Err(tonic::Status::unimplemented("test only"))
+            }
+
+            async fn lookup_request(
+                &self,
+                request: tonic::Request<LookupRequestRequest>,
+            ) -> Result<tonic::Response<LookupRequestResponse>, tonic::Status> {
+                let authorization = request.metadata().get("authorization").ok_or_else(|| {
+                    tonic::Status::unauthenticated("missing authorization metadata")
+                })?;
+                if authorization != "Bearer test" {
+                    return Err(tonic::Status::unauthenticated(
+                        "authorization metadata changed",
+                    ));
+                }
+                let request = request.into_inner();
+                if request.surface_id != "surface"
+                    || request.expected_request_scope != "original-scope"
+                    || request.retry_epoch != 7
+                    || request.identity
+                        != Some(lookup_request_request::Identity::IdempotencyKey(
+                            "key".into(),
+                        ))
+                {
+                    return Err(tonic::Status::invalid_argument(
+                        "original lookup identity changed",
+                    ));
+                }
+                Ok(tonic::Response::new(settled_response()))
+            }
+
+            async fn describe(
+                &self,
+                _request: tonic::Request<DescribeRequest>,
+            ) -> Result<tonic::Response<DescribeResponse>, tonic::Status> {
+                Err(tonic::Status::unimplemented("lookup-only test"))
+            }
+
+            async fn issue_upload_ticket(
+                &self,
+                _request: tonic::Request<IssueUploadTicketRequest>,
+            ) -> Result<tonic::Response<IssueUploadTicketResponse>, tonic::Status> {
+                Err(tonic::Status::unimplemented("lookup-only test"))
+            }
+
+            async fn upload_object(
+                &self,
+                _request: tonic::Request<tonic::Streaming<UploadObjectRequest>>,
+            ) -> Result<tonic::Response<UploadObjectResponse>, tonic::Status> {
+                Err(tonic::Status::unimplemented("lookup-only test"))
+            }
+
+            async fn submit(
+                &self,
+                _request: tonic::Request<SubmitRequest>,
+            ) -> Result<tonic::Response<SubmitResponse>, tonic::Status> {
+                Err(tonic::Status::unimplemented("lookup-only test"))
+            }
+
+            type DownloadObjectStream =
+                tokio_stream::Empty<Result<DownloadObjectResponse, tonic::Status>>;
+            async fn download_object(
+                &self,
+                _request: tonic::Request<DownloadObjectRequest>,
+            ) -> Result<tonic::Response<Self::DownloadObjectStream>, tonic::Status> {
+                Err(tonic::Status::unimplemented("lookup-only test"))
+            }
+            type SubmitOutputStream =
+                tokio_stream::Empty<Result<SubmitOutputResponse, tonic::Status>>;
+            async fn submit_output(
+                &self,
+                _request: tonic::Request<SubmitRequest>,
+            ) -> Result<tonic::Response<Self::SubmitOutputStream>, tonic::Status> {
+                Err(tonic::Status::unimplemented("lookup-only test"))
+            }
+        }
+
+        struct CheckedRoute(ApplicationGatewayServer<LookupGateway>);
+
+        impl Service<http::Request<tonic::body::Body>> for CheckedRoute {
+            type Response = http::Response<tonic::body::Body>;
+            type Error = tonic::Status;
+            type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+            fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                <ApplicationGatewayServer<LookupGateway> as Service<
+                    http::Request<tonic::body::Body>,
+                >>::poll_ready(&mut self.0, context)
+                .map_err(|error| match error {})
+            }
+
+            fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+                let mut server = self.0.clone();
+                Box::pin(async move {
+                    if request.uri().path()
+                        != "/xolotl.v1.application.ApplicationGateway/LookupRequest"
+                    {
+                        return Err(tonic::Status::internal("lookup RPC route changed"));
+                    }
+                    let method = request
+                        .extensions()
+                        .get::<tonic::GrpcMethod<'_>>()
+                        .ok_or_else(|| tonic::Status::internal("missing GrpcMethod extension"))?;
+                    if method.service() != "xolotl.v1.application.ApplicationGateway"
+                        || method.method() != "LookupRequest"
+                    {
+                        return Err(tonic::Status::internal("lookup GrpcMethod changed"));
+                    }
+                    server.call(request).await.map_err(|error| match error {})
+                })
+            }
+        }
+
+        fn ready_result(
+            future: impl Future<Output = Result<tonic::Response<LookupRequestResponse>, tonic::Status>>,
+        ) -> Result<LookupRequestResponse, tonic::Status> {
+            let mut future = std::pin::pin!(future);
+            match future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            {
+                Poll::Ready(result) => result.map(tonic::Response::into_inner),
+                Poll::Pending => Err(tonic::Status::internal(
+                    "in-memory lookup unexpectedly blocked",
+                )),
+            }
+        }
+
+        fn request() -> anyhow::Result<tonic::Request<LookupRequestRequest>> {
+            let mut request = tonic::Request::new(LookupRequestRequest {
+                surface_id: "surface".into(),
+                expected_request_scope: "original-scope".into(),
+                retry_epoch: 7,
+                identity: Some(lookup_request_request::Identity::IdempotencyKey(
+                    "key".into(),
+                )),
+            });
+            request
+                .metadata_mut()
+                .insert("authorization", "Bearer test".parse()?);
+            Ok(request)
+        }
+
+        #[test]
+        fn lookup_client_dispatches_to_server_with_metadata() -> anyhow::Result<()> {
+            let mut client = ApplicationGatewayClient::new(CheckedRoute(
+                ApplicationGatewayServer::new(LookupGateway),
+            ));
+            ensure!(
+                ready_result(client.lookup_request(request()?))? == settled_response(),
+                "lookup result changed in transport"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn lookup_inherits_message_limits_without_fabricating_evidence() -> anyhow::Result<()> {
+            let mut client = ApplicationGatewayClient::new(CheckedRoute(
+                ApplicationGatewayServer::new(LookupGateway).max_decoding_message_size(1),
+            ));
+            let error = ready_result(client.lookup_request(request()?))
+                .err()
+                .context("decoding limit did not reject lookup")?;
+            ensure!(
+                error.code() == tonic::Code::OutOfRange,
+                "unexpected decoding limit status: {error}"
+            );
+            let mut client = ApplicationGatewayClient::new(CheckedRoute(
+                ApplicationGatewayServer::new(LookupGateway).max_encoding_message_size(1),
+            ));
+            let error = ready_result(client.lookup_request(request()?))
+                .err()
+                .context("encoding limit did not reject lookup")?;
+            ensure!(
+                error.code() == tonic::Code::OutOfRange,
+                "unexpected encoding limit status: {error}"
+            );
+            Ok(())
         }
     }
 }

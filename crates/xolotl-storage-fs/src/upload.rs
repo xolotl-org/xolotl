@@ -1,4 +1,5 @@
-use crate::{Shared, storage};
+use crate::{Shared, cleanup, storage};
+use sha2::{Digest as _, Sha384};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -26,24 +27,62 @@ pub(crate) struct Upload {
     directory: Option<tempfile::TempDir>,
     file: Option<File>,
     options: UploadOptions,
-    hasher: blake3::Hasher,
+    hasher: Sha384,
     size: u64,
     phase: Phase,
+    cleanup: cleanup::Sender,
+    slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    #[cfg(test)]
+    probe: std::sync::Arc<crate::tests::IoProbe>,
 }
 
 impl Drop for Upload {
     fn drop(&mut self) {
-        drop(self.file.take());
+        if let Some(directory) = self.directory.take() {
+            self.cleanup.enqueue(cleanup::Task {
+                file: self.file.take(),
+                directory,
+                slot: self.slot.take(),
+                #[cfg(test)]
+                probe: self.probe.clone(),
+            });
+        }
     }
 }
 
 impl Upload {
-    pub(crate) fn new(root: &Path, options: UploadOptions) -> StateResult<Self> {
+    pub(crate) fn new(
+        shared: &Shared,
+        options: UploadOptions,
+        slot: tokio::sync::OwnedSemaphorePermit,
+    ) -> StateResult<Self> {
+        #[cfg(test)]
+        shared
+            .probe
+            .upload_creations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let taint = options.taint.clone();
-        Self::create(root, options).map_err(|failure| failure.with_taint(&taint))
+        let cleanup = shared
+            .cleanup_sender()
+            .map_err(|failure| failure.with_taint(&taint))?;
+        Self::create(
+            &shared.root,
+            options,
+            cleanup,
+            slot,
+            #[cfg(test)]
+            shared.probe.clone(),
+        )
+        .map_err(|failure| failure.with_taint(&taint))
     }
 
-    fn create(root: &Path, options: UploadOptions) -> StateResult<Self> {
+    fn create(
+        root: &Path,
+        options: UploadOptions,
+        cleanup: cleanup::Sender,
+        slot: tokio::sync::OwnedSemaphorePermit,
+        #[cfg(test)] probe: std::sync::Arc<crate::tests::IoProbe>,
+    ) -> StateResult<Self> {
         let directory = tempfile::Builder::new()
             .prefix("upload-")
             .tempdir_in(root.join("staging"))
@@ -54,21 +93,52 @@ impl Upload {
             .and_then(|name| name.to_str())
             .ok_or_else(|| StateError::Backend("invalid staging name".into()))?
             .to_owned();
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(directory.path().join("data"))
-            .map_err(storage::io_error)?;
-        Ok(Self {
+        let mut upload = Self {
             id,
             directory: Some(directory),
-            file: Some(file),
+            file: None,
             options,
-            hasher: blake3::Hasher::new(),
+            hasher: Sha384::new(),
             size: 0,
             phase: Phase::Open,
-        })
+            cleanup,
+            slot: Some(slot),
+            #[cfg(test)]
+            probe,
+        };
+        #[cfg(test)]
+        if upload
+            .probe
+            .upload_open_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(storage::io_error(std::io::Error::other(
+                "injected staging data open failure",
+            )));
+        }
+        upload.file = Some(
+            OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(
+                    upload
+                        .directory
+                        .as_ref()
+                        .ok_or_else(|| {
+                            StateError::Backend("upload has no staging directory".into())
+                        })?
+                        .path()
+                        .join("data"),
+                )
+                .map_err(storage::io_error)?,
+        );
+        Ok(upload)
     }
 
     pub(crate) fn id(&self) -> &str {
@@ -183,7 +253,7 @@ impl Upload {
                 self.phase = Phase::Sealed(Commit {
                     request: ObjectMetadata {
                         blob: BlobRef {
-                            hash: self.hasher.finalize().to_hex().to_string(),
+                            hash: BlobRef::sha384_hex(&self.hasher.clone().finalize().into()),
                             size: self.size,
                             mime: self.options.mime.clone(),
                         },

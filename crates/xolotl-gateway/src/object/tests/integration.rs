@@ -1,7 +1,5 @@
 use super::*;
-use crate::{
-    GatewayInputStreamStart, GatewayStreamDirection, GatewayStreamOpenRequest, GatewaySubmitResult,
-};
+use crate::{GatewayStreamDirection, GatewayStreamOpenRequest, GatewaySubmitResult};
 use xolotl_graph::{DoNode, OperationTemplate};
 use xolotl_kernel::{Driver, DriverContext, DriverError, DriverOutput, MethodSpec};
 use xolotl_standard::{StandardConfig, StandardModule, StandardModules, install_standard};
@@ -21,10 +19,10 @@ async fn gateway_upload_is_readable_by_standard_blob_without_state_content() -> 
     let name = ResourceName::new(Path::parse("effect://blob/read")?);
     let handle = fixture
         .boot
-        .open_for(fixture.boot.root, &name, "perform")
+        .open_for(fixture.boot.root(), &name, "perform")
         .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-    let executor = fixture.boot.kernel.executor_for(fixture.boot.root);
-    executor.bind_handle(name.clone(), handle);
+    let executor = fixture.boot.kernel().executor_for(fixture.boot.root());
+    executor.bind_handle(name.clone(), handle)?;
     for bytes in [
         Vec::new(),
         b"small shared object".to_vec(),
@@ -37,8 +35,8 @@ async fn gateway_upload_is_readable_by_standard_blob_without_state_content() -> 
         ensure!(
             fixture
                 .boot
-                .kernel
-                .state
+                .kernel()
+                .state()
                 .read(&Path::parse(&format!("state://blob/{}", response.digest))?)
                 .await?
                 .is_none(),
@@ -119,11 +117,11 @@ async fn submit_object(
             .gateway
             .submit(
                 &fixture.session,
-                direct_input_with_provenance(
+                fixture.direct_input_with_provenance(
                     "echo",
                     response.item.clone(),
                     response.provenance.clone(),
-                ),
+                )?,
             )
             .await?);
     }
@@ -145,9 +143,7 @@ async fn submit_object(
             ),
         )
         .await?;
-    let GatewayInputStreamStart::Accepted(stream) = start else {
-        bail!("unexpected input stream replay");
-    };
+    let stream = start;
     Ok(fixture
         .gateway
         .complete_input_stream_submission(
@@ -162,7 +158,12 @@ async fn submit_object(
 async fn shared_object_provenance_reaches_both_submission_entries_and_taint_policy()
 -> anyhow::Result<()> {
     for require_unprotected in [false, true] {
-        let mut method = MethodSpec::unary_async("invoke", Purity::Pure);
+        let mut method = MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Pure,
+            MethodSpec::UNARY_ASYNC,
+        );
         if require_unprotected {
             method = method.unprotected_input();
         }
@@ -239,6 +240,10 @@ async fn all_typed_uploads_return_canonical_backing_metadata() -> anyhow::Result
             allowed_media_types: Vec::new(),
             expires_in_ms: Some(60_000),
             single_use: false,
+
+            max_objects: None,
+            max_total_bytes: None,
+            max_record_bytes: None,
         };
         let ticket = fixture
             .gateway
@@ -256,7 +261,12 @@ async fn all_typed_uploads_return_canonical_backing_metadata() -> anyhow::Result
         let mut upload = fixture.begin(&constrained, Some("image/png")).await?;
         upload.write(b"typed").await?;
         ensure!(upload.commit(kind()).await.is_err());
-        ensure!(!fixture.record(constrained.ticket_id()).await?.committed);
+        ensure!(
+            !fixture
+                .record(constrained.ticket_id())
+                .await?
+                .is_committed()
+        );
         ensure!(
             fixture
                 .files

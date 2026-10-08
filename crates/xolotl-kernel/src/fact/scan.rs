@@ -109,9 +109,9 @@ impl FactPage {
 
     pub(super) fn validate(&self, query: FactQuery) -> Result<(), FactError> {
         let count = u64::try_from(self.facts.len())
-            .map_err(|error| FactError(format!("fact page count overflow: {error}")))?;
+            .map_err(|error| FactError::new(format!("fact page count overflow: {error}")))?;
         let examined = u64::try_from(self.examined)
-            .map_err(|error| FactError(format!("fact examination count overflow: {error}")))?;
+            .map_err(|error| FactError::new(format!("fact examination count overflow: {error}")))?;
         let consumed = match query.order {
             FactOrder::Forward => self.next.unwrap_or(self.end).checked_sub(query.from),
             FactOrder::Reverse => self.end.checked_sub(self.next.unwrap_or(query.from)),
@@ -136,7 +136,7 @@ impl FactPage {
                 .process
                 .is_some_and(|process| self.facts.iter().any(|f| f.caller != process))
         {
-            return Err(FactError("invalid fact scan page".into()));
+            return Err(FactError::new("invalid fact scan page".into()));
         }
         Ok(())
     }
@@ -149,7 +149,7 @@ pub(super) fn scan_memory(
 ) -> Result<FactPage, FactError> {
     let end = query.before.unwrap_or(head).min(head);
     if query.from > end {
-        return Err(FactError("fact scan starts after its end".into()));
+        return Err(FactError::new("fact scan starts after its end".into()));
     }
     let mut page = FactPage {
         facts: Vec::new(),
@@ -159,11 +159,13 @@ pub(super) fn scan_memory(
         encoded_bytes: 0,
     };
     let from = usize::try_from(query.from)
-        .map_err(|error| FactError(format!("fact scan start overflow: {error}")))?;
+        .map_err(|error| FactError::new(format!("fact scan start overflow: {error}")))?;
     let before = usize::try_from(end)
-        .map_err(|error| FactError(format!("fact scan end overflow: {error}")))?;
+        .map_err(|error| FactError::new(format!("fact scan end overflow: {error}")))?;
     if facts.get(from..before).is_none() {
-        return Err(FactError("fact append interval is missing records".into()));
+        return Err(FactError::new(
+            "fact append interval is missing records".into(),
+        ));
     }
     let mut slots = from..before;
     while page.examined < query.max_examined.get() && page.facts.len() < query.limit.get() {
@@ -180,7 +182,7 @@ pub(super) fn scan_memory(
         let remaining = query.max_encoded_bytes.get() - page.encoded_bytes;
         let Some(size) = encoded_size(fact, remaining)? else {
             if page.facts.is_empty() {
-                return Err(FactError(format!(
+                return Err(FactError::new(format!(
                     "fact at slot {slot} exceeds encoded byte limit {}",
                     query.max_encoded_bytes
                 )));
@@ -233,7 +235,7 @@ pub(super) fn encoded_size(fact: &Fact, limit: usize) -> Result<Option<usize>, F
     match serde_json::to_writer(&mut writer, fact) {
         Ok(()) => Ok(Some(writer.size)),
         Err(_error) if writer.exceeded => Ok(None),
-        Err(error) => Err(FactError(format!("fact encoding failed: {error}"))),
+        Err(error) => Err(FactError::new(format!("fact encoding failed: {error}"))),
     }
 }
 

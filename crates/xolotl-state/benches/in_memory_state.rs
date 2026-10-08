@@ -7,16 +7,20 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, Runtime};
 use xolotl_state::{
-    InMemoryBackend, InMemoryOptions, MemoryHistory, StateHistoryQuery, StateScan, prelude::*,
+    InMemoryBackend, InMemoryOptions, MemoryHistory, StateHistoryQuery, StateHistoryTrimLimits,
+    StateScan, prelude::*,
 };
-use xolotl_types::{Path, Value};
+use xolotl_types::{Path, TaintSet, TaintSource, Value};
 
 const ITEMS: u32 = 1_024;
 const THREADS: usize = 8;
 const OPERATIONS_PER_THREAD: u32 = 1_024;
 
 fn configurations() -> [(&'static str, InMemoryOptions); 5] {
-    let compact = InMemoryOptions::default();
+    let compact = InMemoryOptions {
+        history: MemoryHistory::Full,
+        ..InMemoryOptions::default()
+    };
     let sharded = InMemoryOptions {
         read_shards: NonZeroUsize::MIN.saturating_add(31),
         ..compact
@@ -101,6 +105,33 @@ fn bench_current_values(c: &mut Criterion) {
     }
 }
 
+fn bench_source_fingerprint(c: &mut Criterion) {
+    let mut deep = Value::null();
+    for _depth in 0..65_536 {
+        deep = Value::list(vec![deep]);
+    }
+    let wide = Value::list(vec![Value::null(); 65_536]);
+    let shared = Value::list(vec![Value::bytes(vec![255; 16 * 1024]); 64]);
+    let mut group = c.benchmark_group("state/source_fingerprint");
+    for (name, value, budget) in [
+        ("deep_reject", &deep, 1024),
+        ("wide_reject", &wide, 1024),
+        ("shared_accept", &shared, 1024 * 1024),
+    ] {
+        group.bench_function(name, |bench| {
+            bench.iter(|| {
+                black_box(required(
+                    xolotl_state::host::source_payload_fingerprint_bounded(
+                        black_box(value),
+                        budget,
+                    ),
+                ))
+            })
+        });
+    }
+    group.finish();
+}
+
 fn bench_current_values_for(c: &mut Criterion, name: &str, options: InMemoryOptions) {
     let rt = required(runtime());
     let create = || required(InMemoryBackend::with_options(options));
@@ -148,6 +179,49 @@ fn bench_current_values_for(c: &mut Criterion, name: &str, options: InMemoryOpti
         );
     });
 
+    group.finish();
+}
+
+fn bench_absence_replacement(c: &mut Criterion) {
+    let rt = required(runtime());
+    let target = required(path("state://absence-bench/target"));
+    let taint = TaintSet::of(TaintSource::ModelOutput);
+    let mut group = c.benchmark_group("state/in_memory/absence_replacement");
+    for read_shards in [NonZeroUsize::MIN, NonZeroUsize::MIN.saturating_add(31)] {
+        for records in [1_024_u32, 16_384] {
+            let backend = required(InMemoryBackend::with_options(InMemoryOptions {
+                read_shards,
+                history: MemoryHistory::Disabled,
+                ..InMemoryOptions::default()
+            }));
+            required(rt.block_on(async {
+                for index in 0..records {
+                    let key = path(&format!("state://absence-bench/retained/{index:05}"))?;
+                    backend
+                        .write_set_tainted(&key, Value::integer(1), taint.clone())
+                        .await?;
+                    backend.write_delete(&key).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }));
+            group.bench_function(format!("shards_{read_shards}/records_{records}"), |bench| {
+                bench.iter(|| {
+                    required(rt.block_on(async {
+                        backend
+                            .write_set_tainted(black_box(&target), Value::integer(1), taint.clone())
+                            .await?;
+                        backend.write_delete(black_box(&target)).await?;
+                        Ok::<(), anyhow::Error>(())
+                    }));
+                });
+            });
+            let observed = required(rt.block_on(backend.read_at(&target, 0)));
+            required((|| -> Result<()> {
+                ensure!(observed.value.is_none() && observed.taint == taint);
+                Ok(())
+            })());
+        }
+    }
     group.finish();
 }
 
@@ -231,6 +305,50 @@ fn bench_sequences_and_history_for(c: &mut Criterion, name: &str, options: InMem
         });
     });
 
+    group.finish();
+}
+
+fn bench_rolling_history_trim(c: &mut Criterion) {
+    let rt = required(runtime());
+    let path = required(path("state://bench/rolling_history"));
+    let mut group = c.benchmark_group("state/in_memory/history_retention");
+    group.sample_size(10);
+    for retained in [256, 4_096] {
+        group.bench_function(format!("trim_64_of_{retained}"), |b| {
+            b.iter_custom(|iterations| {
+                let backend = required(InMemoryBackend::with_options(InMemoryOptions {
+                    history: MemoryHistory::Full,
+                    ..InMemoryOptions::default()
+                }));
+                for _ in 0..retained {
+                    required(rt.block_on(backend.write_set(&path, Value::integer(1))));
+                }
+                let mut query = StateHistoryQuery::new(path.clone(), 0, i64::MAX);
+                query.limits.entries = NonZeroUsize::MIN.saturating_add(64);
+                let mut elapsed = Duration::ZERO;
+                for _ in 0..iterations {
+                    let page = required(rt.block_on(backend.history(&query)));
+                    let floor = required(
+                        page.entries
+                            .get(64)
+                            .map(|entry| entry.at_millis)
+                            .ok_or_else(|| anyhow!("rolling history lost its trim boundary")),
+                    );
+                    let start = Instant::now();
+                    let trimmed = required(
+                        rt.block_on(backend.trim_before(floor, StateHistoryTrimLimits::default())),
+                    );
+                    elapsed += start.elapsed();
+                    assert_eq!(trimmed.removed_events, 64);
+                    query.from_millis = floor;
+                    for _ in 0..64 {
+                        required(rt.block_on(backend.write_set(&path, Value::integer(1))));
+                    }
+                }
+                elapsed
+            });
+        });
+    }
     group.finish();
 }
 
@@ -384,7 +502,10 @@ fn bench_concurrency_for(c: &mut Criterion, name: &str, options: InMemoryOptions
 criterion_group!(
     benches,
     bench_current_values,
+    bench_source_fingerprint,
+    bench_absence_replacement,
     bench_sequences_and_history,
+    bench_rolling_history_trim,
     bench_concurrency
 );
 criterion_main!(benches);

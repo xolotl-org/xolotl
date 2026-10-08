@@ -1,8 +1,8 @@
 //! Approval Broker: `effect://approval/ask`,
 //! `effect://approval/check`, `effect://approval/respond`.
 //!
-//! `ask` records a pending approval keyed by `dedup_key`; duplicate asks merge
-//! into the same pending decision. An ask carries a **fanout policy**:
+//! `ask` records a pending approval keyed by `dedup_key`; duplicate asks reuse
+//! the original record. An ask carries a **fanout policy**:
 //! `AnyOne`, where the first responder decides, or `RequireAll`, where every
 //! listed approver must approve. It may also carry a **deadline** in
 //! milliseconds since epoch.
@@ -14,14 +14,16 @@
 //! `check` is a pure read of whether a key is decided, reported as a status
 //! string (`pending` / `approved` / `denied` / `expired`), so Policy `Ask`
 //! checks can consult it without re-issuing the ask. `check` reports
-//! `expired` once `now > deadline` while still pending; `now` comes from a
-//! `now_millis` input field when supplied, else the
-//! wall clock.
+//! `expired` once the Kernel host clock is past the deadline while still pending.
+//! Responses compare the complete observed record before committing; conflicts
+//! reread and re-resolve without overwriting a terminal decision.
 
 use crate::error::ObservedFailure;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
-use xolotl_kernel::{Driver, DriverContext, DriverError, DriverOutput, MethodSpec};
+use xolotl_kernel::{
+    Driver, DriverContext, DriverError, DriverOutput, MethodSpec, host::HostRuntime,
+};
 use xolotl_state::Backend;
 use xolotl_types::{MethodId, Outcome, OutputMode, Path, Purity, Value};
 use xolotl_types::{ValueMap, ValueView};
@@ -30,9 +32,25 @@ use xolotl_types::{ValueMap, ValueView};
 /// one as a separate `effect://approval/<method>` Resource with public method
 /// `invoke`.
 pub(crate) const APPROVAL_METHODS: &[MethodSpec] = &[
-    MethodSpec::new("ask", Purity::Idempotent, MethodSpec::UNARY_ASYNC),
-    MethodSpec::new("check", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external(),
-    MethodSpec::new("respond", Purity::Effectful, MethodSpec::UNARY_ASYNC),
+    MethodSpec::new(
+        "ask",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Idempotent,
+        MethodSpec::UNARY_ASYNC,
+    ),
+    MethodSpec::new(
+        "check",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Pure,
+        MethodSpec::UNARY_ASYNC,
+    )
+    .observes_external(),
+    MethodSpec::new(
+        "respond",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Effectful,
+        MethodSpec::UNARY_ASYNC,
+    ),
 ];
 
 const STATUS_PENDING: &str = "pending";
@@ -250,12 +268,16 @@ fn parse_str_list(v: Option<&Value>, field: &'static str) -> Result<Vec<String>,
 /// Drives the approval actions.
 pub(crate) struct ApprovalDriver {
     state: Backend,
+    host_runtime: HostRuntime,
 }
 
 impl ApprovalDriver {
     /// Create an approval broker backed by the state plane.
-    pub(crate) fn new(state: Backend) -> Self {
-        Self { state }
+    pub(crate) fn new(state: Backend, host_runtime: HostRuntime) -> Self {
+        Self {
+            state,
+            host_runtime,
+        }
     }
 
     /// Build an approval record's path. `key` arrives from Operation input, so
@@ -273,33 +295,59 @@ impl ApprovalDriver {
         &self,
         path: &Path,
         observed: &mut xolotl_types::TaintSet,
-    ) -> Result<Option<Record>, ObservedFailure> {
+    ) -> Result<Option<(Value, Record)>, ObservedFailure> {
         let v = self
             .state
             .read_tainted(path)
             .await
             .map_err(ObservedFailure::from)?;
-        match v {
+        observed.union(&v.taint);
+        match v.value {
             Some(value) => {
-                observed.union(&value.taint);
-                Record::from_value(&value.value)
-                    .map(Some)
-                    .map_err(ObservedFailure::from)
+                let record = Record::from_value(&value).map_err(ObservedFailure::from)?;
+                Ok(Some((value, record)))
             }
             None => Ok(None),
         }
     }
-}
 
-/// Resolve `now` (millis since epoch) from a `now_millis` input field, falling
-/// back to the wall clock so live asks expire without an injected clock.
-fn now_from(m: &ValueMap) -> Result<i64, DriverError> {
-    match m.get("now_millis").map(Value::view) {
-        None => Ok(crate::time::now_millis()),
-        Some(ValueView::Int(now)) => Ok(now),
-        Some(_) => Err(DriverError::InvalidInput(
-            "approval now_millis must be an integer".into(),
-        )),
+    async fn respond_record(
+        &self,
+        path: &Path,
+        approver: &str,
+        approve: bool,
+        observed: &mut xolotl_types::TaintSet,
+    ) -> Result<String, ObservedFailure> {
+        for _ in 0..8 {
+            let (expected, mut record) =
+                self.read_record(path, observed).await?.ok_or_else(|| {
+                    DriverError::Other("approval record missing during response".into())
+                })?;
+            if record.is_decided() {
+                return Ok(record.status);
+            }
+            if record.effective_status(self.host_runtime.now_millis()) == STATUS_EXPIRED {
+                record.status = STATUS_EXPIRED.into();
+            } else {
+                record.apply(approver, approve);
+            }
+            match self
+                .state
+                .write_cas_tainted(path, Some(expected), record.to_value(), observed.clone())
+                .await
+            {
+                Ok(commit) => {
+                    observed.union(&commit.taint);
+                    return Ok(record.status);
+                }
+                Err(xolotl_state::StateFailure {
+                    error: xolotl_state::StateError::CasFailed { .. },
+                    taint,
+                }) => observed.union(&taint),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(DriverError::Other("approval response CAS retries exhausted".into()).into())
     }
 }
 
@@ -384,6 +432,12 @@ impl ApprovalDriver {
         observed: &mut xolotl_types::TaintSet,
     ) -> Result<DriverOutput, ObservedFailure> {
         let m = crate::input::map(input, "approval")?;
+        if m.contains_key("now_millis") {
+            return Err(DriverError::InvalidInput(
+                "approval time is owned by the host clock".into(),
+            )
+            .into());
+        }
         let key = required_input_str(&m, "dedup_key")?.to_string();
         let path = Self::key_path(&key)?;
         match method.get() {
@@ -406,16 +460,19 @@ impl ApprovalDriver {
                     }) => observed.union(&taint),
                     Err(error) => return Err(error.into()),
                 }
-                let current = self.read_record(&path, observed).await?.ok_or_else(|| {
-                    DriverError::Other("approval record missing after ask".into())
-                })?;
+                let (_value, current) =
+                    self.read_record(&path, observed).await?.ok_or_else(|| {
+                        DriverError::Other("approval record missing after ask".into())
+                    })?;
                 Ok(DriverOutput::new(Outcome::Done(current.to_value())))
             }
             // check: pure read of the current decision, reported as a status
             // string. Reports `expired` once now > deadline while pending.
             1 => {
                 let status = match self.read_record(&path, observed).await? {
-                    Some(r) => r.effective_status(now_from(&m)?).to_string(),
+                    Some((_value, record)) => record
+                        .effective_status(self.host_runtime.now_millis())
+                        .to_string(),
                     None => return Ok(DriverOutput::new(Outcome::Done(Value::null()))),
                 };
                 Ok(DriverOutput::new(Outcome::Done(Value::string(status))))
@@ -424,38 +481,10 @@ impl ApprovalDriver {
             2 => {
                 let approver = required_input_str(&m, "approver")?.to_string();
                 let approve = decision_from(&m)?;
-                let mut record = self
-                    .read_record(&path, observed)
-                    .await?
-                    .ok_or_else(|| DriverError::Other(format!("no approval for key {key:?}")))?;
-                // A lapsed deadline freezes the record at `expired`; late
-                // responses do not revive it.
-                if record.effective_status(now_from(&m)?) == STATUS_EXPIRED {
-                    record.status = STATUS_EXPIRED.into();
-                    let commit = self
-                        .state
-                        .write_set_tainted(&path, record.to_value(), observed.clone())
-                        .await
-                        .map_err(ObservedFailure::from)?;
-                    observed.union(&commit.taint);
-                    return Ok(DriverOutput::new(Outcome::Done(Value::string(
-                        STATUS_EXPIRED.into(),
-                    ))));
-                }
-                // Once decided (AnyOne first-responder), further responses
-                // return the stable verdict without rewriting state.
-                if !record.is_decided() {
-                    record.apply(&approver, approve);
-                    let commit = self
-                        .state
-                        .write_set_tainted(&path, record.to_value(), observed.clone())
-                        .await
-                        .map_err(ObservedFailure::from)?;
-                    observed.union(&commit.taint);
-                }
-                Ok(DriverOutput::new(Outcome::Done(Value::string(
-                    record.status.clone(),
-                ))))
+                let status = self
+                    .respond_record(&path, &approver, approve, observed)
+                    .await?;
+                Ok(DriverOutput::new(Outcome::Done(Value::string(status))))
             }
             _ => Err(DriverError::NoSuchMethod(method).into()),
         }
@@ -487,6 +516,8 @@ impl Driver for ApprovalDriver {
 
 #[cfg(test)]
 mod tests {
+    mod consistency;
+
     use super::*;
     use anyhow::{Context, Result, bail, ensure};
     use xolotl_state::InMemoryBackend;
@@ -497,7 +528,10 @@ mod tests {
     }
 
     fn driver() -> ApprovalDriver {
-        ApprovalDriver::new(InMemoryBackend::new().into_backend())
+        ApprovalDriver::new(
+            InMemoryBackend::new().into_backend(),
+            HostRuntime::default(),
+        )
     }
 
     fn ask(key: &str) -> Value {
@@ -506,12 +540,9 @@ mod tests {
         Value::map(m)
     }
 
-    async fn check(d: &ApprovalDriver, key: &str, now: Option<i64>) -> Result<String> {
+    async fn check(d: &ApprovalDriver, key: &str) -> Result<String> {
         let mut m = BTreeMap::new();
         m.insert("dedup_key".into(), Value::string(key.into()));
-        if let Some(n) = now {
-            m.insert("now_millis".into(), Value::integer(n));
-        }
         match d
             .call(MethodId::new(1), Value::map(m), OutputMode::Unary, &ctx())
             .await
@@ -562,7 +593,7 @@ mod tests {
             .await
             .context("duplicate approval ask")?;
         ensure!(a == b, "duplicate approval ask: expected {a:?}, got {b:?}");
-        let status = check(&d, "pay-42", None).await?;
+        let status = check(&d, "pay-42").await?;
         ensure!(status == "pending", "pending approval status: {status:?}");
         Ok(())
     }
@@ -640,14 +671,14 @@ mod tests {
         d.call(MethodId::new(0), Value::map(m), OutputMode::Unary, &ctx())
             .await
             .context("ask approval")?;
-        let pending = check(&d, "deploy", None).await?;
+        let pending = check(&d, "deploy").await?;
         ensure!(pending == "pending", "initial approval status: {pending:?}");
         let approved = respond(&d, "deploy", "alice", "approve").await?;
         ensure!(
             approved == "approved",
             "approval response status: {approved:?}"
         );
-        let status = check(&d, "deploy", None).await?;
+        let status = check(&d, "deploy").await?;
         ensure!(status == "approved", "resolved approval status: {status:?}");
         Ok(())
     }
@@ -667,11 +698,11 @@ mod tests {
             .context("ask approval")?;
         let first = respond(&d, "wire", "alice", "approve").await?;
         ensure!(first == "pending", "partial quorum status: {first:?}");
-        let pending = check(&d, "wire", None).await?;
+        let pending = check(&d, "wire").await?;
         ensure!(pending == "pending", "partial quorum check: {pending:?}");
         let second = respond(&d, "wire", "bob", "approve").await?;
         ensure!(second == "approved", "full quorum status: {second:?}");
-        let status = check(&d, "wire", None).await?;
+        let status = check(&d, "wire").await?;
         ensure!(status == "approved", "full quorum check: {status:?}");
         Ok(())
     }
@@ -693,7 +724,7 @@ mod tests {
         ensure!(first == "pending", "pre-veto status: {first:?}");
         let denied = respond(&d, "merge", "bob", "deny").await?;
         ensure!(denied == "denied", "veto status: {denied:?}");
-        let status = check(&d, "merge", None).await?;
+        let status = check(&d, "merge").await?;
         ensure!(status == "denied", "veto check: {status:?}");
         Ok(())
     }
@@ -717,36 +748,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_reports_expired_past_deadline() -> Result<()> {
-        let d = driver();
-        let mut m = BTreeMap::new();
-        m.insert("dedup_key".into(), Value::string("timed".into()));
-        m.insert("deadline_millis".into(), Value::integer(1_000));
-        d.call(MethodId::new(0), Value::map(m), OutputMode::Unary, &ctx())
-            .await
-            .context("ask approval with deadline")?;
-        let pending = check(&d, "timed", Some(500)).await?;
-        ensure!(pending == "pending", "before deadline status: {pending:?}");
-        let expired = check(&d, "timed", Some(2_000)).await?;
-        ensure!(expired == "expired", "after deadline status: {expired:?}");
-        let mut r = BTreeMap::new();
-        r.insert("dedup_key".into(), Value::string("timed".into()));
-        r.insert("approver".into(), Value::string("alice".into()));
-        r.insert("decision".into(), Value::string("approve".into()));
-        r.insert("now_millis".into(), Value::integer(2_001));
-        let out = d
-            .call(MethodId::new(2), Value::map(r), OutputMode::Unary, &ctx())
-            .await
-            .context("late approval response")?;
-        let expected = Outcome::Done(Value::string("expired".into()));
-        ensure!(out.outcome == expected, "late response status: {out:?}");
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn malformed_stored_record_is_an_error() -> Result<()> {
         let state: Backend = InMemoryBackend::new().into_backend();
-        let d = ApprovalDriver::new(state.clone());
+        let d = ApprovalDriver::new(state.clone(), HostRuntime::default());
         let path = ApprovalDriver::key_path("corrupt").context("approval path")?;
         state
             .write_set(&path, Value::map(BTreeMap::new()))

@@ -8,27 +8,30 @@
 
 use async_trait::async_trait;
 use xolotl_kernel::{
-    Driver, DriverContext, DriverError, DriverOutput, FactSink, MethodSpec, SharedFactStore,
+    Driver, DriverContext, DriverError, DriverOutput, MethodSpec, SharedFactStore,
 };
 use xolotl_types::{Failure, MethodId, Outcome, OutputMode, ProcessId, Purity, Value};
 
 /// Method names in registration order for `state://fact/*`. Read-only:
 /// `read` is an Observation (it reflects external/durable state), not Pure, so
 /// its outcome is recorded when it feeds control flow.
-pub(crate) const FACT_METHODS: &[MethodSpec] =
-    &[MethodSpec::new("read", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external()];
+pub(crate) const FACT_METHODS: &[MethodSpec] = &[MethodSpec::new(
+    "read",
+    xolotl_types::MethodAuthority::Read,
+    Purity::Pure,
+    MethodSpec::UNARY_ASYNC,
+)
+.observes_external()];
 
 /// Drives `state://fact/*` over the kernel's [`SharedFactStore`].
 pub(crate) struct FactDriver {
-    facts: FactSink,
+    facts: SharedFactStore,
 }
 
 impl FactDriver {
     /// Create a fact read-side projection driver backed by a shared fact store.
     pub(crate) fn new(facts: SharedFactStore) -> Self {
-        Self {
-            facts: FactSink::new(facts),
-        }
+        Self { facts }
     }
 }
 
@@ -62,7 +65,7 @@ impl Driver for FactDriver {
         };
         let page = self
             .facts
-            .scan(query)
+            .scan_checked(query)
             .map_err(|error| DriverError::Other(error.to_string()))?;
         Ok(DriverOutput::new(Outcome::Done(read::page_value(
             query, page,
@@ -106,7 +109,10 @@ mod tests {
     use super::*;
     use anyhow::{Context, Result, bail, ensure};
     use std::collections::BTreeMap;
-    use xolotl_kernel::FactSink;
+    use xolotl_kernel::{
+        FactError, FactLookup, FactLookupResult, FactPage, FactQuery, FactSink, FactStore,
+        InMemoryFactStore,
+    };
     use xolotl_types::{
         DecisionTag, ExecutionId, Fact, HandleId, IdentityRef, InvocationId, MethodId, NodeId,
         OperationId, ReplayClass, ResourceId, Timestamp,
@@ -123,6 +129,7 @@ mod tests {
             ),
             schema_version: Fact::SCHEMA_VERSION,
             caller: process,
+            caller_identity: Some(IdentityRef::ROOT),
             acting: IdentityRef::ROOT,
             handle: HandleId::new(0, 1),
             resource: ResourceId::new(1),
@@ -140,6 +147,105 @@ mod tests {
     fn ctx_with_target(target: &str) -> Result<DriverContext> {
         let path = xolotl_types::Path::parse(target).with_context(|| format!("parse {target}"))?;
         Ok(DriverContext::new(IdentityRef::ROOT, ProcessId::new(1)).with_target_path(path))
+    }
+
+    struct UnfilteredFactStore(InMemoryFactStore);
+
+    impl FactStore for UnfilteredFactStore {
+        fn append(&self, fact: Fact) -> Result<u64, FactError> {
+            self.0.append(fact)
+        }
+
+        fn complete(&self, fact: Fact) -> Result<(), FactError> {
+            self.0.complete(fact)
+        }
+
+        fn scan(&self, mut query: FactQuery) -> Result<FactPage, FactError> {
+            query.process = None;
+            self.0.scan(query)
+        }
+
+        fn lookup(&self, query: FactLookup) -> Result<FactLookupResult, FactError> {
+            self.0.lookup(query)
+        }
+
+        fn facts_of(&self, process: ProcessId) -> Result<Vec<Fact>, FactError> {
+            self.0.facts_of(process)
+        }
+
+        fn all_facts(&self) -> Result<Vec<Fact>, FactError> {
+            self.0.all_facts()
+        }
+
+        fn cursor(&self) -> u64 {
+            self.0.cursor()
+        }
+    }
+
+    #[tokio::test]
+    async fn fact_projection_rejects_a_backend_page_outside_its_process_filter() -> Result<()> {
+        let store = std::sync::Arc::new(UnfilteredFactStore(InMemoryFactStore::new()));
+        store.append(fact(ProcessId::new(2), 0))?;
+        let driver = FactDriver::new(store);
+        let result = driver
+            .call(
+                MethodId::new(0),
+                Value::null(),
+                OutputMode::Unary,
+                &ctx_with_target("state://fact/1")?,
+            )
+            .await;
+        ensure!(
+            matches!(result, Err(DriverError::Other(message)) if message.contains("invalid fact scan page"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_read_uses_retained_identities_without_process_number_inference() -> Result<()> {
+        let (sink, store) = FactSink::in_memory();
+        let cases = [
+            (
+                Some(IdentityRef::new(u64::MAX)),
+                IdentityRef::new(u64::MAX),
+                false,
+            ),
+            (Some(IdentityRef::new(8)), IdentityRef::new(7), true),
+            (Some(IdentityRef::new(8)), IdentityRef::ROOT, true),
+            (None, IdentityRef::new(7), false),
+        ];
+        for (index, (identity, acting, _)) in cases.iter().enumerate() {
+            let mut record = fact(ProcessId::new(7), u32::try_from(index)?);
+            record.caller_identity = *identity;
+            record.acting = *acting;
+            sink.complete(record)?;
+        }
+        let driver = FactDriver::new(store);
+        let ctx = ctx_with_target("state://fact/7")?;
+        let Outcome::Done(output) = driver
+            .call(MethodId::new(0), Value::null(), OutputMode::Unary, &ctx)
+            .await?
+            .outcome
+        else {
+            bail!("expected audit page")
+        };
+        let rows = output
+            .as_map()
+            .and_then(|page| page.get("items"))
+            .and_then(Value::as_list)
+            .context("audit rows")?;
+        ensure!(rows.len() == cases.len());
+        for (row, (identity, _, cross_identity)) in rows.iter().zip(cases) {
+            let fields = row.as_map().context("audit fields")?;
+            let expected = identity.map_or(Value::null(), |id| Value::string(id.get().to_string()));
+            ensure!(fields.get("caller_identity") == Some(&expected));
+            let tagged = fields
+                .get("audit_tags")
+                .and_then(Value::as_list)
+                .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some("CrossIdentity")));
+            ensure!(tagged == cross_identity);
+        }
+        Ok(())
     }
 
     #[tokio::test]

@@ -114,10 +114,13 @@ where
         installed.read = Some(
             boot.register_effect(
                 "effect://value/read",
-                &[
-                    MethodSpec::new("invoke", Purity::Pure, MethodSpec::UNARY_ASYNC)
-                        .observes_external(),
-                ],
+                &[MethodSpec::new(
+                    "invoke",
+                    xolotl_types::MethodAuthority::Perform,
+                    Purity::Pure,
+                    MethodSpec::UNARY_ASYNC,
+                )
+                .observes_external()],
                 Arc::new(ValueObjectDriver {
                     shared: shared.clone(),
                     action: Action::Read,
@@ -130,6 +133,7 @@ where
             "effect://value/write",
             &[MethodSpec::new(
                 "invoke",
+                xolotl_types::MethodAuthority::Perform,
                 Purity::Idempotent,
                 MethodSpec::UNARY_ASYNC,
             )],

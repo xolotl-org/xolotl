@@ -22,7 +22,13 @@ pub struct Fact {
     pub schema_version: u32,
     /// Process that issued the operation.
     pub caller: ProcessId,
-    /// Identity the operation ran as.
+    /// The caller process's identity observed by the host for this attempt.
+    /// This snapshot survives process reclamation and completion. `None` means
+    /// the host could not establish the identity; it is never inferred from the
+    /// process id or acting identity. The serialized field is required, with
+    /// explicit null representing an unknown identity.
+    pub caller_identity: Option<IdentityRef>,
+    /// Identity selected for this attempt, including attempts denied admission.
     pub acting: IdentityRef,
     /// Handle used to authorize and dispatch the operation.
     pub handle: HandleId,

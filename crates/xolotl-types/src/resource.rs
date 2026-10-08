@@ -10,6 +10,7 @@ use crate::ids::{BindingId, DriverId, EndpointId, InterfaceId, MethodId, Resourc
 use crate::path::Path;
 use crate::replay::{Purity, ReplayClass};
 use alloc::{string::String, vec::Vec};
+use core::borrow::Borrow;
 use serde::{Deserialize, Serialize};
 
 /// Implements serde for a `bitflags` type via its raw integer bits.
@@ -178,7 +179,60 @@ impl CostModel {
     }
 }
 
-/// One method of an interface. Describes how the method executes,
+/// Capability category required to open a method.
+///
+/// The host declares this independently of the method's name, purity, output
+/// modes and resource scheme. `Spawn` is reserved for Process resources;
+/// other callable categories can be installed on application schemes.
+/// Categories do not implicitly include each
+/// other: a standard State append, for example, explicitly requires `Write`.
+/// Identity delegation is a scope permission, not a callable method category.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MethodAuthority {
+    /// Perform a resource action.
+    Perform,
+    /// Read resource content through a host-defined method.
+    Read,
+    /// Modify resource content through a host-defined method.
+    Write,
+    /// Append when the host exposes a separate append capability.
+    Append,
+    /// Observe resource changes.
+    Subscribe,
+    /// Publish to a host-defined resource.
+    Publish,
+    /// Spawn through a Process resource.
+    Spawn,
+}
+
+impl MethodAuthority {
+    /// All callable capability categories for discovery and tooling.
+    pub const ALL: [Self; 7] = [
+        Self::Perform,
+        Self::Read,
+        Self::Write,
+        Self::Append,
+        Self::Subscribe,
+        Self::Publish,
+        Self::Spawn,
+    ];
+
+    /// Exact capability verb matched when opening this method.
+    pub const fn verb(self) -> &'static str {
+        match self {
+            Self::Perform => "perform",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Append => "append",
+            Self::Subscribe => "subscribe",
+            Self::Publish => "publish",
+            Self::Spawn => "spawn",
+        }
+    }
+}
+
+/// One method of an interface. Describes how the method is authorized, executes,
 /// outputs, replays, and bills.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Method {
@@ -186,6 +240,8 @@ pub struct Method {
     pub id: MethodId,
     /// Stable name within the interface (e.g. `read`, `invoke`, `append`).
     pub name: String,
+    /// Host-declared capability category, independent of the method name.
+    pub authority: MethodAuthority,
     /// Input schema descriptor id.
     pub input: SchemaId,
     /// Output schema descriptor id.
@@ -265,8 +321,8 @@ pub struct Interface {
 }
 
 impl Interface {
-    /// Find a method by name and return its index (bit position in the
-    /// [`MethodBitmap`](crate::grant::MethodBitmap)) and descriptor.
+    /// Find a method by name and return its interface-local index and descriptor.
+    /// Resource-level method bits include the preceding interfaces' lengths.
     pub fn method_index(&self, name: &str) -> Option<(u32, &Method)> {
         self.methods
             .iter()
@@ -307,6 +363,12 @@ impl InterfaceSet {
 #[serde(transparent)]
 pub struct ResourceName(pub Path);
 
+impl Borrow<Path> for ResourceName {
+    fn borrow(&self) -> &Path {
+        &self.0
+    }
+}
+
 impl ResourceName {
     /// Wrap a parsed path as a resource name.
     pub fn new(path: Path) -> Self {
@@ -318,9 +380,8 @@ impl ResourceName {
     }
 }
 
-/// Broad category of a Resource, for the console and for routing heuristics.
-/// Not load-bearing on the hot path — kind never gates execution; rights and
-/// interfaces do.
+/// Broad descriptive category of a Resource for discovery and presentation.
+/// Kind does not decide addressing, authorization, or Driver dispatch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
@@ -334,6 +395,19 @@ pub enum ResourceKind {
     Device,
     /// A kernel-internal resource (reserved prefixes).
     Kernel,
+}
+
+/// How an installed Resource name resolves a requested concrete path.
+/// Authorization and Driver dispatch still use the complete requested path.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceAddressing {
+    /// Only the registered name resolves to this Resource.
+    #[default]
+    Exact,
+    /// The registered name and its descendants resolve to this Resource,
+    /// unless a more specific registration takes precedence.
+    Prefix,
 }
 
 /// Control-plane metadata attached to a Resource descriptor.
@@ -361,6 +435,9 @@ pub struct ResourceDescriptor {
     pub name: ResourceName,
     /// Broad resource category.
     pub kind: ResourceKind,
+    /// Whether this registration serves one path or a path subtree.
+    #[serde(default)]
+    pub addressing: ResourceAddressing,
     /// Console/provider metadata.
     #[serde(default)]
     pub metadata: Metadata,
@@ -408,4 +485,26 @@ pub struct Binding {
     pub endpoint: Option<EndpointId>,
     /// Link epoch; incremented on hot replace.
     pub generation: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::ensure;
+    use std::collections::HashMap;
+
+    #[test]
+    fn resource_name_supports_borrowed_path_lookup() -> anyhow::Result<()> {
+        let mut names = HashMap::new();
+        for source in [
+            "state://",
+            "state://memory/item",
+            "path://phone/state/memory",
+        ] {
+            let path = Path::parse(source)?;
+            names.insert(ResourceName::new(path.clone()), source);
+            ensure!(names.get(&path) == Some(&source));
+        }
+        Ok(())
+    }
 }

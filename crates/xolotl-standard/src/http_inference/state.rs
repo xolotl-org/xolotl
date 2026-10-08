@@ -6,6 +6,7 @@ use crate::router::{GroupPolicy, Router};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use xolotl_state::Backend;
+use xolotl_types::inference::{INFERENCE_ROUTING_PATH, InferenceDeclarationKind};
 use xolotl_types::{
     InferenceAuthRef, InferenceBackendDef, InferenceGroupDef, InferenceGroupPolicy,
     InferenceModelCapabilities, InferenceModelDef, InferenceRoutingDef, Path, Value,
@@ -17,8 +18,8 @@ use xolotl_types::{
 pub(crate) async fn router_from_state(
     state: &Backend,
 ) -> Result<Option<Arc<Router>>, HttpInferenceError> {
-    let backend_values = read_prefix_values(state, "state://kernel/inference/backends").await?;
-    let model_values = read_prefix_values(state, "state://kernel/inference/models").await?;
+    let backend_values = read_prefix_values(state, InferenceDeclarationKind::Backend).await?;
+    let model_values = read_prefix_values(state, InferenceDeclarationKind::Model).await?;
     if backend_values.is_empty() && model_values.is_empty() {
         return Ok(None);
     }
@@ -29,7 +30,11 @@ pub(crate) async fn router_from_state(
     let mut backends = BTreeMap::new();
     for (path, value) in backend_values {
         let def: InferenceBackendDef = decode_state_value(value, "InferenceBackendDef")?;
-        let path_id = path_tail(&path, "InferenceBackendDef")?;
+        let path_id = declaration_id(
+            &path,
+            InferenceDeclarationKind::Backend,
+            "InferenceBackendDef",
+        )?;
         def.validate_admission(path_id)
             .map_err(|source| HttpInferenceError::StateAdmission {
                 label: "InferenceBackendDef",
@@ -42,7 +47,7 @@ pub(crate) async fn router_from_state(
     let mut qualified_models = BTreeMap::new();
     for (path, value) in model_values {
         let model: InferenceModelDef = decode_state_value(value, "InferenceModelDef")?;
-        let path_id = path_tail(&path, "InferenceModelDef")?;
+        let path_id = declaration_id(&path, InferenceDeclarationKind::Model, "InferenceModelDef")?;
         model
             .validate_admission(path_id)
             .map_err(|source| HttpInferenceError::StateAdmission {
@@ -63,9 +68,10 @@ pub(crate) async fn router_from_state(
             routing_config.with_route(HttpInferenceRoute::new(config).with_weight(model.weight));
     }
 
-    for (path, value) in read_prefix_values(state, "state://kernel/inference/groups").await? {
+    for (path, value) in read_prefix_values(state, InferenceDeclarationKind::Group).await? {
         let group: InferenceGroupDef = decode_state_value(value, "InferenceGroupDef")?;
-        let path_name = path_tail(&path, "InferenceGroupDef")?;
+        let path_name =
+            declaration_id(&path, InferenceDeclarationKind::Group, "InferenceGroupDef")?;
         group.validate_admission(path_name).map_err(|source| {
             HttpInferenceError::StateAdmission {
                 label: "InferenceGroupDef",
@@ -85,7 +91,7 @@ pub(crate) async fn router_from_state(
         routing_config = routing_config.with_group(route_group);
     }
 
-    if let Some(value) = state_read(state, "state://kernel/routing/inference").await? {
+    if let Some(value) = state_read(state, INFERENCE_ROUTING_PATH).await? {
         let routing: InferenceRoutingDef = decode_state_value(value, "InferenceRoutingDef")?;
         routing
             .validate_admission()
@@ -104,11 +110,11 @@ pub(crate) async fn router_from_state(
 
 async fn read_prefix_values(
     state: &Backend,
-    prefix: &str,
+    kind: InferenceDeclarationKind,
 ) -> Result<Vec<(Path, Value)>, HttpInferenceError> {
-    let path = Path::parse(prefix).map_err(|_error| HttpInferenceError::StatePath {
+    let path = Path::parse(kind.prefix()).map_err(|_error| HttpInferenceError::StatePath {
         label: "inference configuration prefix",
-        path: prefix.into(),
+        path: kind.prefix().into(),
     })?;
     let mut pages = state.pages(xolotl_state::StateScan::new(path));
     let mut values = Vec::new();
@@ -122,11 +128,15 @@ async fn read_prefix_values(
         for (_, value) in &page.entries {
             observed.union(&value.taint);
         }
-        values.extend(
-            page.entries
-                .into_iter()
-                .map(|(path, value)| (path, value.value)),
-        );
+        for (entry_path, value) in page.entries {
+            if kind.id(&entry_path).is_none() {
+                return Err(HttpInferenceError::StatePath {
+                    label: "inference configuration declaration",
+                    path: entry_path.to_string(),
+                });
+            }
+            values.push((entry_path, value.value));
+        }
     }
     Ok(values)
 }
@@ -148,14 +158,15 @@ fn decode_state_value<T: serde::de::DeserializeOwned>(
     serde_json::from_value(json).map_err(|source| HttpInferenceError::StateDecode { label, source })
 }
 
-fn path_tail<'a>(path: &'a Path, label: &'static str) -> Result<&'a str, HttpInferenceError> {
-    path.segments()
-        .last()
-        .map(|segment| segment.as_str())
-        .ok_or_else(|| HttpInferenceError::StatePath {
-            label,
-            path: path.to_string(),
-        })
+fn declaration_id<'a>(
+    path: &'a Path,
+    kind: InferenceDeclarationKind,
+    label: &'static str,
+) -> Result<&'a str, HttpInferenceError> {
+    kind.id(path).ok_or_else(|| HttpInferenceError::StatePath {
+        label,
+        path: path.to_string(),
+    })
 }
 
 async fn resolve_auth(

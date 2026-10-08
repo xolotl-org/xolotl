@@ -8,6 +8,10 @@ pub(crate) const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
 pub(crate) const JSONRPC_INVALID_PARAMS: i64 = -32602;
 pub(crate) const JSONRPC_RESOURCE_NOT_FOUND: i64 = -32002;
 pub(crate) const JSONRPC_GATEWAY_ERROR: i64 = -32000;
+/// JSON-RPC error code for an outcome requiring reconciliation before retry.
+pub const JSONRPC_OUTCOME_UNKNOWN: i64 = -32001;
+/// JSON-RPC error code for a known execution failure.
+pub const JSONRPC_EXECUTION_FAILED: i64 = -32003;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
@@ -51,6 +55,9 @@ pub struct McpJsonRpcError {
     pub code: i64,
     /// Redacted error message.
     pub message: String,
+    /// Optional host-owned result or reconciliation evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 pub(crate) fn jsonrpc_ok(id: serde_json::Value, result: serde_json::Value) -> McpJsonRpcResponse {
@@ -70,6 +77,7 @@ pub(crate) fn jsonrpc_error(id: serde_json::Value, code: i64) -> McpJsonRpcRespo
         error: Some(McpJsonRpcError {
             code,
             message: jsonrpc_error_message(code).into(),
+            data: None,
         }),
     }
 }
@@ -121,6 +129,8 @@ fn jsonrpc_error_message(code: i64) -> &'static str {
         JSONRPC_INVALID_PARAMS => "invalid params",
         JSONRPC_RESOURCE_NOT_FOUND => "resource not found",
         JSONRPC_GATEWAY_ERROR => "gateway request rejected",
+        JSONRPC_OUTCOME_UNKNOWN => "outcome unknown; reconcile before retrying",
+        JSONRPC_EXECUTION_FAILED => "execution failed",
         _ => "gateway request rejected",
     }
 }

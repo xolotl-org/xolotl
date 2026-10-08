@@ -5,6 +5,7 @@ async fn authority_admission_never_combines_old_hosts_with_a_new_session() -> an
     let gateway = GatewayRuntime::new(
         Arc::new(Bootstrap::in_memory()),
         identity_profile()?.with_registered_host("old.example:9445")?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
     )?;
     let old_session = gateway
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))

@@ -1,10 +1,10 @@
 //! Borrow program addresses without exposing the private task or frame layouts.
 
-use super::{Checkpoint, Frame, FrameKind, State};
+use super::{ExecutionView, Frame, FrameKind, State};
 
-impl<V, E> Checkpoint<'_, V, E> {
+impl<V, E> ExecutionView<'_, V, E> {
     /// Call sites and entries of host-loaded continuations still owned by this
-    /// checkpoint. Validate the checkpoint before relying on this view.
+    /// live execution.
     pub fn continuations(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         continuations(self.frames)
     }
@@ -16,8 +16,15 @@ impl<V, E> Checkpoint<'_, V, E> {
     pub fn instruction_indices(&self) -> impl Iterator<Item = u32> + '_ {
         let tasks = self.tasks.iter().filter_map(|task| match task.state {
             State::Ready => Some(task.pc),
-            State::Waiting { node, .. } | State::Joining { node, .. } => Some(node),
-            State::Free | State::Returning(_) | State::Done(_) => None,
+            State::Waiting { node, .. } => Some(node),
+            State::Joining(join)
+            | State::Halted {
+                join: Some(join), ..
+            } => Some(join.node),
+            State::Free
+            | State::Returning(_)
+            | State::Done(_)
+            | State::Halted { join: None, .. } => None,
         });
         let frames = self.frames.iter().flat_map(|frame| {
             let indices = match frame.as_ref().map(|frame| &frame.kind) {

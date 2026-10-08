@@ -6,7 +6,8 @@ use std::{
     task::{Context as TaskContext, Waker},
 };
 use xolotl_state::{
-    StateCursor, StateMutation, StatePage, StateQuery, StateResult, StateScan, StateWrite,
+    StateCursor, StateMutation, StateObservation, StatePage, StateQuery, StateRead, StateResult,
+    StateScan, StateWrite,
 };
 
 struct ChangingEmbedder(Arc<AtomicUsize>);
@@ -46,10 +47,13 @@ fn result_generation(result: &ValueMap) -> anyhow::Result<&str> {
 }
 
 async fn stored(state: &Backend, owner: &str, id: &str) -> anyhow::Result<TaintedValue> {
-    state
+    let observation = state
         .read_tainted(&memory_path(owner, DEFAULT_NAMESPACE, id)?)
-        .await?
-        .context("stored record")
+        .await?;
+    Ok(TaintedValue::new(
+        observation.value.context("stored record")?,
+        observation.taint,
+    ))
 }
 
 #[tokio::test]
@@ -297,10 +301,12 @@ async fn concurrent_replacements_have_one_state_cas_winner_and_preserve_its_proj
         !driver.reindex_existing(&original).await?.0,
         "stale State read overwrote winner"
     );
-    ensure!(
-        !driver.delete_entry_with_index(&original).await?.0,
-        "stale delete removed winner"
-    );
+    let input_taint = TaintSet::of(TaintSource::ModelOutput);
+    let (removed, observed) = driver
+        .delete_entry_with_index(&original, &input_taint)
+        .await?;
+    ensure!(!removed, "stale delete removed winner");
+    ensure!(observed == input_taint.merged(&original.taint).merged(&current.taint));
     ensure!(stored(&state, "owner", "id").await? == current);
     let hits = done_list(
         driver
@@ -597,7 +603,7 @@ impl StateQuery for LatePages {
 
 #[tokio::test]
 async fn late_namespace_errors_keep_sources_already_seen_by_every_consumer() -> anyhow::Result<()> {
-    for method in [4, 5, 2] {
+    for method in [1, 4, 5, 2] {
         let base = InMemoryBackend::new().into_backend();
         let creator = driver(base.clone());
         let path = memory_path("owner", DEFAULT_NAMESPACE, "id")?;
@@ -614,29 +620,50 @@ async fn late_namespace_errors_keep_sources_already_seen_by_every_consumer() -> 
                 &ctx(1).with_taint(TaintSet::of(TaintSource::Protected { path: path.clone() })),
             )
             .await?;
-        let record = base.read_tainted(&path).await?.context("record")?;
+        let record = base.read_tainted(&path).await?;
+        let record_value = record.value.clone().context("record")?;
+        let page_taint = record
+            .taint
+            .clone()
+            .merged(&TaintSet::of(TaintSource::ModelOutput));
         let query = Arc::new(LatePages {
             page: StatePage {
-                taint: record.taint.clone(),
-                entries: vec![(path, record)],
+                taint: page_taint.clone(),
+                entries: vec![(path.clone(), TaintedValue::new(record_value, record.taint))],
                 next: Some(StateCursor(vec![1])),
                 examined: 1,
                 encoded_bytes: 1,
             },
         });
+        let mut events = base.subscribe(&path).await?;
         let driver = driver(base.with_query(query));
+        let operation_ctx = tainted_ctx(2);
         let output = driver
             .call(
                 MethodId::new(method),
                 Value::map(BTreeMap::from([
                     ("owner".into(), Value::string("owner".into())),
                     ("confirm_all".into(), Value::boolean(true)),
+                    ("query".into(), Value::string("coffee".into())),
+                    ("consistency".into(), Value::string("reconcile".into())),
                 ])),
                 OutputMode::Unary,
-                &ctx(2),
+                &operation_ctx,
             )
             .await?;
         ensure!(output.taint.has_protected() && matches!(output.outcome, Outcome::Fail(_)));
+        let expected = operation_ctx.taint.clone().merged(&page_taint);
+        ensure!(output.taint.contains_all(&expected) && expected.contains_all(&output.taint));
+        if method == 2 {
+            ensure!(output.taint == expected);
+            ensure!(
+                events.try_recv()?
+                    == xolotl_state::StateEvent::Delete {
+                        path,
+                        taint: expected
+                    }
+            );
+        }
     }
     Ok(())
 }
@@ -665,9 +692,10 @@ async fn consolidation_retains_page_observations_in_empty_results_and_persisted_
                     )
                     .await?;
                 let path = memory_path("owner", DEFAULT_NAMESPACE, id)?;
-                let entry = base.read_tainted(&path).await?.context("stored entry")?;
+                let entry = base.read_tainted(&path).await?;
+                let entry_value = entry.value.clone().context("stored entry")?;
                 ensure!(!entry.taint.has_protected());
-                entries.push((path, entry));
+                entries.push((path, TaintedValue::new(entry_value, entry.taint)));
             }
         }
         let query = Arc::new(LatePages {
@@ -755,6 +783,85 @@ async fn protected_replacement_rejection_retains_canonical_record_sources() -> a
 }
 
 #[tokio::test]
+async fn namespace_scan_preserves_records_before_an_oversized_provenance_header()
+-> anyhow::Result<()> {
+    let state = InMemoryBackend::new().into_backend();
+    let creator = driver(state.clone());
+    let prefix = namespace_path("owner", DEFAULT_NAMESPACE)?;
+    let paths = ["a", "b", "c"]
+        .map(|id| memory_path("owner", DEFAULT_NAMESPACE, id))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let large_taint = TaintSet::of(TaintSource::Protected {
+        path: Path::parse(&format!("state://private/{}", "s".repeat(1024 * 1024)))?,
+    });
+    for (index, id) in ["a", "b", "c"].into_iter().enumerate() {
+        creator
+            .call(
+                MethodId::new(0),
+                store_with_id(
+                    "owner",
+                    DEFAULT_NAMESPACE,
+                    id,
+                    Value::string("coffee".into()),
+                ),
+                OutputMode::Unary,
+                &ctx(index as u32 + 1).with_taint(if index == 1 {
+                    large_taint.clone()
+                } else {
+                    TaintSet::of(TaintSource::ModelOutput)
+                }),
+            )
+            .await?;
+    }
+    let mut scan = scan::NamespaceScan::new(&state, prefix);
+    let mut actual = Vec::new();
+    let mut observed = TaintSet::pristine();
+    let mut pages = 0;
+    while let Some(page) = scan.next().await? {
+        pages += 1;
+        ensure!(pages <= 4, "namespace scan did not terminate");
+        observed.union(&page.taint);
+        actual.extend(page.entries.into_iter().map(|(path, _)| path));
+    }
+    ensure!(actual == paths, "namespace scan lost records: {actual:?}");
+    let expected = TaintSet::of(TaintSource::ModelOutput).merged(&large_taint);
+    ensure!(observed == expected);
+    let consumer = driver(state.clone());
+    let loaded = consumer
+        .load_namespace_entries("owner", DEFAULT_NAMESPACE)
+        .await?;
+    ensure!(loaded.0.iter().map(|(path, _)| path).eq(paths.iter()));
+    ensure!(loaded.1 == expected);
+    for (method, input) in [
+        (
+            5,
+            Value::map(BTreeMap::from([(
+                "owner".into(),
+                Value::string("owner".into()),
+            )])),
+        ),
+        (
+            2,
+            Value::map(BTreeMap::from([
+                ("owner".into(), Value::string("owner".into())),
+                ("confirm_all".into(), Value::boolean(true)),
+            ])),
+        ),
+    ] {
+        let output = consumer
+            .call(MethodId::new(method), input, OutputMode::Unary, &ctx(9))
+            .await?;
+        ensure!(output.outcome == Outcome::Done(Value::integer(3)));
+        ensure!(output.taint == expected);
+    }
+    for path in paths {
+        ensure!(state.read_tainted(&path).await?.value.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn namespace_rebuild_reads_a_record_larger_than_its_page_window() -> anyhow::Result<()> {
     let state = InMemoryBackend::new().into_backend();
     let creator = driver(state.clone());
@@ -830,12 +937,14 @@ impl StateWrite for RelabelBeforeCas {
                     expected: Some(_),
                     ..
                 }
-            ) && let Some(mut current) = self.base.read_tainted(path).await?
-            {
-                current.taint.union(&self.extra);
-                self.base
-                    .write_set_tainted(path, current.value, current.taint)
-                    .await?;
+            ) {
+                let mut current = self.base.read_tainted(path).await?;
+                if let Some(value) = current.value {
+                    current.taint.union(&self.extra);
+                    self.base
+                        .write_set_tainted(path, value, current.taint)
+                        .await?;
+                }
             }
             self.base.mutate(path, mutation).await
         })
@@ -913,6 +1022,7 @@ impl StateQuery for VanishedOversizedRow {
             StateError::RowTooLarge(Box::new(xolotl_state::StateRowTooLarge {
                 path: self.path.clone(),
                 encoded_bytes: usize::MAX,
+                provenance_observed: true,
                 retry: None,
                 resume: StateCursor(vec![1]),
             })),
@@ -943,5 +1053,257 @@ async fn oversized_scan_keeps_atomic_sources_when_the_following_point_read_is_ab
         )
         .await?;
     ensure!(output.outcome == Outcome::Done(Value::integer(0)) && output.taint == taint);
+    Ok(())
+}
+
+struct ChangingMemoryRead {
+    base: Backend,
+    path: Path,
+    reads: AtomicUsize,
+    changes: AtomicUsize,
+    every_read: bool,
+}
+
+impl StateRead for ChangingMemoryRead {
+    type Read<'a> = Pin<Box<dyn Future<Output = StateResult<StateObservation>> + Send + 'a>>;
+
+    fn read_tainted<'a>(&'a self, path: &'a Path) -> Self::Read<'a> {
+        Box::pin(async move {
+            if path == &self.path {
+                let read = self.reads.fetch_add(1, Ordering::Relaxed) + 1;
+                if (self.every_read || read % 2 == 1)
+                    && self
+                        .changes
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                            remaining.checked_sub(1)
+                        })
+                        .is_ok()
+                {
+                    let current = self.base.read_tainted(path).await?;
+                    let value = current
+                        .value
+                        .ok_or_else(|| StateError::NotFound(path.to_string()))?;
+                    let mut entry = value
+                        .into_map()
+                        .ok_or_else(|| StateError::Serde("entry map".into()))?;
+                    let mut metadata = entry
+                        .get("index")
+                        .cloned()
+                        .and_then(Value::into_map)
+                        .ok_or_else(|| StateError::Serde("index map".into()))?;
+                    metadata.insert(
+                        "generation".into(),
+                        Value::string(format!("changed-{read}")),
+                    )?;
+                    entry.insert("index".into(), Value::from(metadata))?;
+                    self.base
+                        .write_set_tainted(
+                            path,
+                            Value::from(entry),
+                            TaintSet::of(TaintSource::Fetched {
+                                host: format!("change-{read}").into(),
+                            }),
+                        )
+                        .await?;
+                }
+            }
+            self.base.read_tainted(path).await
+        })
+    }
+}
+
+async fn competing_memory(
+    method: u64,
+    attempts: usize,
+    changes: usize,
+) -> anyhow::Result<(MemoryDriver, Arc<ChangingMemoryRead>, Value)> {
+    let base = InMemoryBackend::new().into_backend();
+    let index = Arc::new(IndexDriver::new());
+    let creator =
+        driver(base.clone()).with_retrieval_stack(index.clone(), Arc::new(RankerDriver::new()));
+    creator
+        .call(
+            MethodId::new(0),
+            store_with_id(
+                "owner",
+                DEFAULT_NAMESPACE,
+                "id",
+                Value::string("coffee".into()),
+            ),
+            OutputMode::Unary,
+            &ctx(1),
+        )
+        .await?;
+    let reader = Arc::new(ChangingMemoryRead {
+        base: base.clone(),
+        path: memory_path("owner", DEFAULT_NAMESPACE, "id")?,
+        reads: AtomicUsize::new(0),
+        changes: AtomicUsize::new(changes),
+        every_read: method == 5,
+    });
+    let memory = driver(base.with_read(reader.clone()))
+        .with_retrieval_stack(index, Arc::new(RankerDriver::new()))
+        .with_repair_attempts(std::num::NonZeroUsize::new(attempts).context("zero attempts")?);
+    let input = if method == 1 {
+        recall_input("owner", DEFAULT_NAMESPACE, "coffee", 1)
+    } else {
+        Value::map(BTreeMap::from([(
+            "owner".into(),
+            Value::string("owner".into()),
+        )]))
+    };
+    Ok((memory, reader, input))
+}
+
+#[tokio::test]
+async fn competing_recall_and_rebuild_exhaust_attempts_with_all_observed_sources()
+-> anyhow::Result<()> {
+    for method in [1, 5] {
+        for attempts in [1, 3] {
+            let (memory, reader, input) = competing_memory(method, attempts, usize::MAX).await?;
+            let context = tainted_ctx(2);
+            let mut request =
+                Box::pin(memory.call(MethodId::new(method), input, OutputMode::Unary, &context));
+            let mut completed = None;
+            for _ in 0..16 {
+                if let std::task::Poll::Ready(output) = request
+                    .as_mut()
+                    .poll(&mut TaskContext::from_waker(Waker::noop()))
+                {
+                    completed = Some(output);
+                    break;
+                }
+            }
+            let output =
+                completed.context("repair did not terminate within its attempt budget")??;
+            ensure!(
+                matches!(output.outcome, Outcome::Fail(Failure::HandlerError { ref kind, .. }) if kind == "memory_repair_exhausted")
+            );
+            ensure!(reader.reads.load(Ordering::Relaxed) == 2 * attempts);
+            let mut expected = context.taint.clone();
+            expected.add(TaintSource::ModelOutput);
+            for read in 1..=2 * attempts {
+                if method == 5 || read % 2 == 1 {
+                    expected.add(TaintSource::Fetched {
+                        host: format!("change-{read}").into(),
+                    });
+                }
+            }
+            ensure!(
+                output.taint.contains_all(&expected) && expected.contains_all(&output.taint),
+                "method={method} attempts={attempts} observed={:?} expected={expected:?}",
+                output.taint
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn finite_memory_competition_succeeds_and_cancellation_stops_repair() -> anyhow::Result<()> {
+    for method in [1, 5] {
+        let (memory, reader, input) = competing_memory(method, 3, 2).await?;
+        let output = memory
+            .call(MethodId::new(method), input, OutputMode::Unary, &ctx(2))
+            .await?;
+        if method == 1 {
+            let recalled = done_list(output)?;
+            ensure!(recalled.len() == 1);
+            let current = reader
+                .base
+                .read_tainted(&reader.path)
+                .await?
+                .value
+                .context("missing current memory")?;
+            ensure!(
+                indexed_entry(&recalled[0])?.generation.as_str()
+                    == indexed_entry(&current)?.generation.as_str()
+            );
+            ensure!(reader.reads.load(Ordering::Relaxed) == 5);
+        } else {
+            ensure!(output.outcome == Outcome::Done(Value::integer(1)));
+            ensure!(reader.reads.load(Ordering::Relaxed) == 3);
+        }
+        let (memory, reader, input) = competing_memory(method, 3, usize::MAX).await?;
+        let context = ctx(3);
+        let mut request =
+            Box::pin(memory.call(MethodId::new(method), input, OutputMode::Unary, &context));
+        ensure!(
+            request
+                .as_mut()
+                .poll(&mut TaskContext::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let reads = reader.reads.load(Ordering::Relaxed);
+        ensure!(reads == 2);
+        drop(request);
+        tokio::task::yield_now().await;
+        ensure!(reader.reads.load(Ordering::Relaxed) == reads);
+    }
+    Ok(())
+}
+
+struct UnavailableRankWeights {
+    base: Backend,
+    taint: TaintSet,
+}
+
+impl StateRead for UnavailableRankWeights {
+    type Read<'a> = Pin<Box<dyn Future<Output = StateResult<StateObservation>> + Send + 'a>>;
+
+    fn read_tainted<'a>(&'a self, path: &'a Path) -> Self::Read<'a> {
+        Box::pin(async move {
+            if path.to_string() == "state://kernel/rank/weights" {
+                return Err(StateFailure::new(
+                    StateError::Backend("rank weights unavailable".into()),
+                    self.taint.clone(),
+                ));
+            }
+            self.base.read_tainted(path).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn memory_recall_preserves_the_rankers_failure_class_and_sources() -> anyhow::Result<()> {
+    let base = InMemoryBackend::new().into_backend();
+    let sources = TaintSet::of(TaintSource::Protected {
+        path: Path::parse("state://rank-policy")?,
+    });
+    let state = base.clone().with_read(Arc::new(UnavailableRankWeights {
+        base,
+        taint: sources.clone(),
+    }));
+    let memory = driver(state.clone()).with_retrieval_stack(
+        Arc::new(IndexDriver::new()),
+        Arc::new(RankerDriver::new().with_state(state)),
+    );
+    memory
+        .call(
+            MethodId::new(0),
+            store_with_id(
+                "owner",
+                DEFAULT_NAMESPACE,
+                "id",
+                Value::string("coffee".into()),
+            ),
+            OutputMode::Unary,
+            &ctx(1),
+        )
+        .await?;
+    let output = memory
+        .call(
+            MethodId::new(1),
+            recall_input("owner", DEFAULT_NAMESPACE, "coffee", 1),
+            OutputMode::Unary,
+            &tainted_ctx(2),
+        )
+        .await?;
+    ensure!(
+        matches!(output.outcome, Outcome::Fail(Failure::Custom { ref kind, .. }) if kind == "rank")
+    );
+    ensure!(
+        output.taint.contains_all(&sources) && output.taint.contains_all(&tainted_ctx(2).taint)
+    );
     Ok(())
 }

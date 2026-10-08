@@ -33,9 +33,26 @@ use lsh::{LshIndex, Signatures};
 use storage::{Entry, Metric, SearchMode, Snapshot, SpaceIndex};
 
 pub(crate) const INDEX_METHODS: &[MethodSpec] = &[
-    MethodSpec::new("upsert", Purity::Idempotent, MethodSpec::UNARY_ASYNC).batchable(),
-    MethodSpec::new("search", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external(),
-    MethodSpec::new("delete", Purity::Effectful, MethodSpec::UNARY_ASYNC),
+    MethodSpec::new(
+        "upsert",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Idempotent,
+        MethodSpec::UNARY_ASYNC,
+    )
+    .batchable(),
+    MethodSpec::new(
+        "search",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Pure,
+        MethodSpec::UNARY_ASYNC,
+    )
+    .observes_external(),
+    MethodSpec::new(
+        "delete",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Effectful,
+        MethodSpec::UNARY_ASYNC,
+    ),
 ];
 
 #[derive(Clone, Default)]
@@ -117,7 +134,7 @@ impl IndexDriver {
             return Err(ObservedFailure {
                 error: admission::invalid(
                     "embedding does not match the index space's representation, dimension, or metric",
-                ),
+                ).into(),
                 taint: snapshot.observed_sources(&admitted.taint, &mut work).await,
             });
         }
@@ -175,7 +192,10 @@ impl IndexDriver {
                     } else {
                         input_taint
                     };
-                    Err(ObservedFailure { error, taint })
+                    Err(ObservedFailure {
+                        error: error.into(),
+                        taint,
+                    })
                 }
             };
         }
@@ -356,7 +376,8 @@ impl IndexDriver {
             return Err(ObservedFailure {
                 error: admission::invalid(
                     "query does not match the index space's representation, dimension, or metric",
-                ),
+                )
+                .into(),
                 taint: snapshot.observed_sources(&admitted.taint, &mut work).await,
             });
         }

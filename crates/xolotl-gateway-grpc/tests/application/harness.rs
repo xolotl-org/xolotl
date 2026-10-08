@@ -19,7 +19,8 @@ use xolotl_gateway::{
     GatewayPrincipalSurfaceBinding, GatewayProfile, GatewayRuntime, GatewaySurface,
 };
 use xolotl_gateway_grpc::{ApplicationGrpcConfig, ApplicationGrpcService};
-use xolotl_kernel::{Bootstrap, Driver, EchoDriver, FactSink, Kernel, MethodSpec};
+use xolotl_kernel::host::HostRuntime;
+use xolotl_kernel::{Bootstrap, Driver, EchoDriver, FactSink, KernelBuilder, MethodSpec};
 use xolotl_proto::xolotl::v1::application as pb;
 use xolotl_state::Backend;
 use xolotl_state::host::object::ObjectStore;
@@ -57,9 +58,10 @@ pub fn inline_value(value: &pb::OutputValue) -> anyhow::Result<&xolotl_proto::xo
 }
 
 pub const TEST_WAIT: Duration = Duration::from_secs(10);
-pub const TOKEN: &str = "application-test-alice-credential";
+pub const TOKEN: &str = "application-test-alice-credential-32-bytes";
 const UPLOAD_PATH: &str = "/xolotl.v1.application.ApplicationGateway/UploadObject";
 pub const DESCRIBE_PATH: &str = "/xolotl.v1.application.ApplicationGateway/Describe";
+pub const SUBMIT_PATH: &str = "/xolotl.v1.application.ApplicationGateway/Submit";
 pub const OUTPUT_PATH: &str = "/xolotl.v1.application.ApplicationGateway/SubmitOutput";
 pub const DOWNLOAD_PATH: &str = "/xolotl.v1.application.ApplicationGateway/DownloadObject";
 
@@ -77,7 +79,12 @@ impl EffectOptions {
     pub fn stream(driver: Arc<dyn Driver>, purity: Purity) -> Self {
         Self {
             driver,
-            method: MethodSpec::stream_async("invoke", purity),
+            method: MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                purity,
+                MethodSpec::STREAM_ASYNC,
+            ),
             output_schema: None,
             stream_schema: None,
             response_probe: None,
@@ -86,10 +93,14 @@ impl EffectOptions {
         }
     }
 
-    #[cfg(feature = "structured-output")]
     pub fn unary(driver: Arc<dyn Driver>, purity: Purity) -> Self {
         Self {
-            method: MethodSpec::unary_async("invoke", purity),
+            method: MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                purity,
+                MethodSpec::UNARY_ASYNC,
+            ),
             ..Self::stream(driver, purity)
         }
     }
@@ -109,6 +120,7 @@ pub struct Fixture {
     pub files: FileObjectStore,
     pub boot: Arc<Bootstrap>,
     pub gateway: Arc<GatewayRuntime>,
+    pub idempotency: Arc<xolotl_gateway::MemoryGatewayIdempotencyStore>,
     pub probe: Arc<ProbeStore>,
     pub service: ApplicationGrpcService,
     pub body_waits: Arc<Signal>,
@@ -133,13 +145,19 @@ impl Fixture {
             receipt.map(ReceiptState::new),
             EffectOptions {
                 driver: Arc::new(EchoDriver),
-                method: MethodSpec::unary_async("invoke", Purity::Pure),
+                method: MethodSpec::new(
+                    "invoke",
+                    xolotl_types::MethodAuthority::Perform,
+                    Purity::Pure,
+                    MethodSpec::UNARY_ASYNC,
+                ),
                 output_schema: None,
                 stream_schema: None,
                 response_probe: None,
                 #[cfg(feature = "structured-output")]
                 disclosure: None,
             },
+            None,
         )
         .await
     }
@@ -154,6 +172,22 @@ impl Fixture {
             ProbeOptions::default(),
             consume_receipt.map(ReceiptState::consuming),
             effect,
+            None,
+        )
+        .await
+    }
+
+    pub async fn with_effect_and_host_runtime(
+        config: ApplicationGrpcConfig,
+        effect: EffectOptions,
+        host_runtime: HostRuntime,
+    ) -> anyhow::Result<Self> {
+        Self::build(
+            config,
+            ProbeOptions::default(),
+            None,
+            effect,
+            Some(host_runtime),
         )
         .await
     }
@@ -164,7 +198,7 @@ impl Fixture {
         effect: EffectOptions,
         options: ProbeOptions,
     ) -> anyhow::Result<Self> {
-        Self::build(config, options, None, effect).await
+        Self::build(config, options, None, effect, None).await
     }
 
     async fn build(
@@ -172,22 +206,33 @@ impl Fixture {
         options: ProbeOptions,
         receipt: Option<ReceiptState>,
         effect: EffectOptions,
+        host_runtime: Option<HostRuntime>,
     ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let directory = tempfile::tempdir()?;
         let files = FileObjectStore::open(directory.path())?;
         let probe = Arc::new(ProbeStore::new(files.clone(), options));
-        let boot = match receipt {
+        let builder = match receipt {
             Some(state) => {
                 let state = Arc::new(state);
-                Arc::new(Bootstrap::from_kernel(Kernel::with_backends(
-                    Backend::new().with_read(state.clone()).with_write(state),
-                    FactSink::in_memory().0,
-                )))
+                KernelBuilder::new(
+                    Backend::new()
+                        .with_read(state.clone())
+                        .with_bounded_read(state.clone())
+                        .with_write(state.clone())
+                        .with_bounded_write(state),
+                )
+                .with_fact_sink(FactSink::in_memory().0)
             }
-            None => Arc::new(Bootstrap::in_memory()),
+            None => KernelBuilder::in_memory(),
         };
+        let builder = if let Some(runtime) = host_runtime {
+            builder.with_host_runtime(runtime)
+        } else {
+            builder
+        };
+        let boot = Arc::new(Bootstrap::from_kernel(builder.build()));
         let name = boot.register_effect("effect://echo/say", &[effect.method], effect.driver)?;
         let mut surface =
             GatewaySurface::effect_invoke("echo", name).with_schema(None, effect.output_schema);
@@ -195,7 +240,7 @@ impl Fixture {
             surface = surface.with_output_stream_schema(schema);
         }
         let profile = GatewayProfile::new("application-test")
-            .with_bearer_identity("alice-credential", "alice", TOKEN, "process://alice")?
+            .with_bearer_identity("alice-credential", "alice", TOKEN, "identity://alice")?
             .with_registered_host(&addr.to_string())?
             .with_surface(surface)
             .with_principal_surface_binding(GatewayPrincipalSurfaceBinding::allow(
@@ -203,8 +248,9 @@ impl Fixture {
                 ["echo"],
                 ["perform://effect/echo/say"],
             ));
+        let idempotency = Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default());
         let gateway = Arc::new(
-            GatewayRuntime::new(boot.clone(), profile)?.with_object_store(
+            GatewayRuntime::new(boot.clone(), profile, idempotency.clone())?.with_object_store(
                 ObjectStore::new()
                     .with_read(probe.clone())
                     .with_write(probe.clone()),
@@ -242,6 +288,7 @@ impl Fixture {
             files,
             boot,
             gateway,
+            idempotency,
             probe,
             service,
             body_waits,
@@ -259,6 +306,27 @@ impl Fixture {
         .await??)
     }
 
+    pub fn authority(&self) -> String {
+        self.addr.to_string()
+    }
+
+    pub async fn request_scope(
+        &self,
+        client: &mut ApplicationGatewayClient<Channel>,
+    ) -> anyhow::Result<String> {
+        let descriptor = client
+            .describe(request(pb::DescribeRequest {})?)
+            .await?
+            .into_inner();
+        let surface = descriptor
+            .surfaces
+            .into_iter()
+            .find(|surface| surface.surface_id == "echo")
+            .context("echo surface missing")?;
+        ensure!(!surface.request_scope.is_empty());
+        Ok(surface.request_scope)
+    }
+
     pub async fn issue(
         &self,
         client: &mut ApplicationGatewayClient<Channel>,
@@ -273,6 +341,9 @@ impl Fixture {
                 allowed_media_types: vec![],
                 expires_in_ms: Some(60_000),
                 single_use: true,
+                max_objects: None,
+                max_total_bytes: None,
+                max_record_bytes: None,
             })?)
             .await?
             .into_inner())
@@ -281,17 +352,23 @@ impl Fixture {
     pub async fn receipt_flag(&self, ticket: &str, flag: &str) -> anyhow::Result<bool> {
         let value = self
             .boot
-            .kernel
-            .state
+            .kernel()
+            .state()
             .read(&Path::parse(&format!(
                 "state://gateway/upload-ticket/{ticket}"
             ))?)
             .await?
             .context("ticket record missing")?;
-        let flag = value
-            .as_map()
-            .and_then(|map| map.get(flag))
-            .context("ticket state field missing")?;
+        let map = value.as_map().context("ticket state map missing")?;
+        if flag == "committed" {
+            return Ok(map
+                .get("committed_items")
+                .is_some_and(|items| items.as_list().is_some_and(|items| !items.is_empty())));
+        }
+        if flag == "used" {
+            return Ok(map.get("used_by").is_some());
+        }
+        let flag = map.get(flag).context("ticket state field missing")?;
         let Some(flag) = flag.as_bool() else {
             anyhow::bail!("ticket state field is not boolean")
         };
@@ -395,6 +472,8 @@ pub fn begin(ticket: &str) -> pb::UploadObjectRequest {
                 ticket_id: ticket.into(),
                 media_type: Some("application/octet-stream".into()),
                 submission_token: None,
+                expected_size: None,
+                expected_digest: None,
             },
         )),
     }

@@ -3,19 +3,27 @@
 //! Plan document compiler.
 //!
 //! This crate parses YAML or JSON [`Plan`] documents and lowers them to
-//! [`DoNode`] programs for kernel execution.
+//! [`DoNode`](xolotl_graph::DoNode) programs for kernel execution.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use thiserror::Error;
-use xolotl_graph::{DoNode, OperationTemplate, StepRef};
-use xolotl_types::{OutputMode, Path, PathRegistry, ResourceName, Value, default_registry};
+#[cfg(test)]
+use xolotl_graph::DoNode;
+use xolotl_types::{Path, PathRegistry};
+
+mod compiler;
+#[cfg(test)]
+use compiler::json_to_value;
+pub use compiler::{CompileLimits, compile, compile_with_limits};
+#[cfg(test)]
+use xolotl_types::Value;
 
 /// JSON value used by Plan documents before they are lowered to
 /// [`xolotl_types::Value`].
 pub type JsonValue = serde_json::Value;
 
-/// A serializable workflow document that compiles to one [`DoNode`] program.
+/// A serializable workflow document that compiles to one
+/// [`DoNode`](xolotl_graph::DoNode) program.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
     /// Stable author-chosen identifier for the plan.
@@ -124,13 +132,14 @@ pub enum Step {
         /// Steps executed under `identity`.
         body: Vec<Step>,
     },
-    /// Resource acquire/use/release idiom: `release` runs on success or failure.
+    /// Acquire a value, run the body, then release on success, failure or
+    /// cooperative cancellation. Release receives the acquired value.
     Bracket {
         /// Step that acquires the resource.
         acquire: Box<Step>,
         /// Steps run while the acquired resource is bound.
         body: Vec<Step>,
-        /// Release step run on both success and failure paths.
+        /// Release step run on every cooperative exit from the body.
         release: StepRefSpec,
     },
 }
@@ -173,6 +182,9 @@ impl WriteModeSpec {
 /// Errors raised while parsing, validating, or lowering a [`Plan`].
 #[derive(Debug, Error)]
 pub enum PlanError {
+    /// Source bytes, output nodes, or nesting exceeded the compiler admission limit.
+    #[error("plan compiler capacity exceeded")]
+    Capacity,
     /// A path literal failed Xolotl path parsing.
     #[error("path: {0}")]
     Path(#[from] xolotl_types::PathError),
@@ -182,12 +194,9 @@ pub enum PlanError {
     /// A continuation-only step appeared before any current node existed.
     #[error("step {0} cannot be the first step")]
     BadFirstStep(&'static str),
-    /// Two bindings use the same name in one plan.
-    #[error("duplicate step name: {0}")]
-    DuplicateName(String),
-    /// A `${name}` binding dependency graph contains a cycle.
-    #[error("reference cycle detected involving step: {0}")]
-    Cycle(String),
+    /// A local name is not bound in the current lexical scope.
+    #[error("unbound local name: {0}")]
+    UnboundName(String),
     /// A step target path is malformed or uses the wrong scheme for its kind.
     #[error("invalid {kind} target `{target}`: {reason}")]
     Target {
@@ -204,76 +213,6 @@ pub enum PlanError {
     /// JSON decoding or `DoNode` serialization failed.
     #[error("json: {0}")]
     Json(String),
-}
-
-/// Compile a Plan into a [`DoNode`] program reusable across processes.
-pub fn compile(plan: &Plan) -> Result<DoNode, PlanError> {
-    if plan.steps.is_empty() {
-        return Err(PlanError::Empty);
-    }
-    validate_plan(plan)?;
-    compile_steps(&plan.steps)
-}
-
-/// Static validation pass run before lowering.
-///
-/// Rejects: duplicate explicit `let` binding names, and reference cycles formed
-/// by steps that bind a name and reference another binding via `${name}`
-/// placeholders in their args. The empty-plan and bad-first-step checks live in
-/// [`compile`] / [`step_to_do`] respectively.
-fn validate_plan(plan: &Plan) -> Result<(), PlanError> {
-    let mut all = Vec::new();
-    collect_all_steps(&plan.steps, &mut all);
-    let path_registry = default_registry();
-
-    // Reject duplicate `let` binding names across the whole step tree.
-    let mut seen = std::collections::BTreeSet::new();
-    for step in &all {
-        if let Step::Let { name, .. } = step
-            && !seen.insert(name.clone())
-        {
-            return Err(PlanError::DuplicateName(name.clone()));
-        }
-    }
-
-    // Operation targets must match their step kind; this catches
-    // resource-path/capability confusion before lowering.
-    for step in &all {
-        validate_step_target(step, &path_registry)?;
-    }
-
-    // Acting identities must be real identity paths, not bare schemes.
-    for step in &all {
-        if let Step::Acting { identity, .. } = step {
-            validate_identity_literal("acting identity", identity)?;
-        }
-    }
-
-    // Build binding reference edges and reject cycles among `${...}` links.
-    let binders: std::collections::BTreeSet<String> = all
-        .iter()
-        .flat_map(|s| step_binds(s))
-        .filter(|n| n != "_")
-        .collect();
-    let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for step in &all {
-        let binds = step_binds(step);
-        if binds.is_empty() {
-            continue;
-        }
-        let refs = step_refs(step);
-        for b in binds {
-            if b == "_" {
-                continue;
-            }
-            for r in &refs {
-                if binders.contains(r) {
-                    graph.entry(b.clone()).or_default().push(r.clone());
-                }
-            }
-        }
-    }
-    detect_cycle(&graph)
 }
 
 fn validate_step_target(step: &Step, registry: &PathRegistry) -> Result<(), PlanError> {
@@ -330,302 +269,32 @@ fn validate_identity_literal(kind: &'static str, literal: &str) -> Result<(), Pl
     Ok(())
 }
 
-/// DFS three-color cycle detection over the binding dependency graph.
-fn detect_cycle(graph: &BTreeMap<String, Vec<String>>) -> Result<(), PlanError> {
-    #[derive(Clone, Copy, PartialEq)]
-    enum Mark {
-        InProgress,
-        Done,
-    }
-    let mut marks: BTreeMap<&str, Mark> = BTreeMap::new();
-    // Iterative DFS to avoid stack overflow on adversarial input.
-    for root in graph.keys() {
-        if marks.contains_key(root.as_str()) {
-            continue;
-        }
-        let mut stack: Vec<(&str, bool)> = vec![(root.as_str(), false)];
-        while let Some((node, exiting)) = stack.pop() {
-            if exiting {
-                marks.insert(node, Mark::Done);
-                continue;
-            }
-            match marks.get(node) {
-                Some(Mark::Done) => continue,
-                Some(Mark::InProgress) => {}
-                None => {}
-            }
-            marks.insert(node, Mark::InProgress);
-            stack.push((node, true));
-            if let Some(succs) = graph.get(node) {
-                for s in succs {
-                    match marks.get(s.as_str()) {
-                        Some(Mark::InProgress) => return Err(PlanError::Cycle(s.clone())),
-                        Some(Mark::Done) => {}
-                        None => stack.push((s.as_str(), false)),
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Flatten the step tree (recursing into nested bodies) for validation.
-fn collect_all_steps<'a>(steps: &'a [Step], out: &mut Vec<&'a Step>) {
-    for step in steps {
-        out.push(step);
-        match step {
-            Step::Parallel { left, right } | Step::Race { left, right } => {
-                collect_all_steps(left, out);
-                collect_all_steps(right, out);
-            }
-            Step::Acting { body, .. } => {
-                collect_all_steps(body, out);
-            }
-            Step::Bracket { acquire, body, .. } => {
-                collect_all_steps(std::slice::from_ref(acquire.as_ref()), out);
-                collect_all_steps(body, out);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Names a step binds into the local environment (`let`, `read … as`).
-fn step_binds(step: &Step) -> Vec<String> {
-    match step {
-        Step::Let { name, .. } => vec![name.clone()],
-        Step::Read { r#as, .. } => vec![r#as.clone()],
-        _ => Vec::new(),
-    }
-}
-
-/// Names a step references — via `${name}` placeholders in its args, or via an
-/// explicit `Use`. Used for cycle detection and the auto-parallelism check.
-fn step_refs(step: &Step) -> Vec<String> {
-    match step {
-        Step::Perform { input, .. } => input.as_ref().map(extract_refs).unwrap_or_default(),
-        Step::Write { value, .. } | Step::Let { value, .. } | Step::Pure { value } => {
-            extract_refs(value)
-        }
-        Step::Use { name } => vec![name.clone()],
-        Step::Then { arg, .. } | Step::OnFail { arg, .. } => {
-            arg.as_ref().map(extract_refs).unwrap_or_default()
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// Scan a JSON value for `${name}` placeholders, returning each referenced name
-/// The Plan model otherwise binds via `let`/`use`; this lets
-/// inline args express data dependencies for ordering and parallelism.
-fn extract_refs(value: &JsonValue) -> Vec<String> {
-    let mut out = Vec::new();
-    collect_refs(value, &mut out);
-    out
-}
-
-fn collect_refs(value: &JsonValue, out: &mut Vec<String>) {
-    match value {
-        JsonValue::String(s) => scan_placeholders(s, out),
-        JsonValue::Array(xs) => xs.iter().for_each(|x| collect_refs(x, out)),
-        JsonValue::Object(m) => m.values().for_each(|v| collect_refs(v, out)),
-        _ => {}
-    }
-}
-
-/// Pull every `${...}` token out of a string. A name runs until the closing `}`.
-fn scan_placeholders(s: &str, out: &mut Vec<String>) {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'$'
-            && bytes[i + 1] == b'{'
-            && let Some(end_rel) = s[i + 2..].find('}')
-        {
-            let name = &s[i + 2..i + 2 + end_rel];
-            if !name.is_empty() {
-                out.push(name.to_string());
-            }
-            i = i + 2 + end_rel + 1;
-            continue;
-        }
-        i += 1;
-    }
-}
-
-/// Whether two adjacent value steps carry no data dependency in either
-/// direction, so they may run in parallel.
-fn independent(a: &Step, b: &Step) -> bool {
-    let (ba, bb) = (step_binds(a), step_binds(b));
-    let (ra, rb) = (step_refs(a), step_refs(b));
-    let intersects = |xs: &[String], ys: &[String]| xs.iter().any(|x| ys.contains(x));
-    !intersects(&rb, &ba) && !intersects(&ra, &bb)
-}
-
-/// Whether a step is a plain value step eligible for auto-parallel pairing.
-/// Control steps and compound steps are never auto-paired.
-fn is_mergeable(step: &Step) -> bool {
-    matches!(
-        step,
-        Step::Perform { .. }
-            | Step::Read { .. }
-            | Step::Write { .. }
-            | Step::Let { .. }
-            | Step::Use { .. }
-            | Step::Pure { .. }
-    )
-}
-
-/// Compile a sequence of steps, threading `then`/`on_fail` as continuations and
-/// binding other steps in sequence via `Let`. Adjacent independent value steps
-/// are paired into `Both` for parallelism.
-///
-/// Parallel pairing is local and left-to-right.
-fn compile_steps(steps: &[Step]) -> Result<DoNode, PlanError> {
-    if steps.is_empty() {
-        return Err(PlanError::Empty);
-    }
-    let mut current: Option<DoNode> = None;
-    let mut i = 0;
-    while i < steps.len() {
-        let step = &steps[i];
-        match step {
-            Step::Then { name, arg } => {
-                let c = current.ok_or(PlanError::BadFirstStep("then"))?;
-                current = Some(c.and_then(step_ref(name, arg)));
-                i += 1;
-            }
-            Step::OnFail { name, arg } => {
-                let c = current.ok_or(PlanError::BadFirstStep("on_fail"))?;
-                current = Some(c.or_else(step_ref(name, arg)));
-                i += 1;
-            }
-            other => {
-                // Try to pair with the next step for parallel execution.
-                let unit = match steps.get(i + 1) {
-                    Some(next)
-                        if is_mergeable(other)
-                            && is_mergeable(next)
-                            && independent(other, next) =>
-                    {
-                        i += 2;
-                        DoNode::both(step_to_do(other)?, step_to_do(next)?)
-                    }
-                    _ => {
-                        i += 1;
-                        step_to_do(other)?
-                    }
-                };
-                current = Some(match current {
-                    None => unit,
-                    Some(c) => {
-                        let n = c.size();
-                        DoNode::r#let(format!("_step_{n}"), c, unit)
-                    }
-                });
-            }
-        }
-    }
-    current.ok_or(PlanError::Empty)
-}
-
-fn step_ref(name: &str, arg: &Option<JsonValue>) -> StepRef {
-    let sr = StepRef::new(name);
-    match arg {
-        Some(a) => sr.with_arg(json_to_value(a)),
-        None => sr,
-    }
-}
-
-/// One operation template targeting `path`'s Resource via `method`.
-fn op(path: &str, method: &str, input: Option<Value>) -> Result<DoNode, PlanError> {
-    Ok(DoNode::Op(OperationTemplate {
-        target: ResourceName::new(Path::parse(path)?),
-        method: method.to_string(),
-        method_id: None,
-        output: OutputMode::Unary,
-        literal_input: input,
-    }))
-}
-
-fn step_to_do(step: &Step) -> Result<DoNode, PlanError> {
-    Ok(match step {
-        Step::Perform { target, input } => op(target, "invoke", input.as_ref().map(json_to_value))?,
-        Step::Read { path, .. } => op(path, "read", None)?,
-        Step::Subscribe { path, step } => {
-            // The handling step is carried as literal input so a compatible
-            // subscribe driver can wire delivery.
-            let mut m = BTreeMap::new();
-            m.insert("step".into(), Value::string(step.name.clone()));
-            if let Some(a) = &step.arg {
-                m.insert("arg".into(), json_to_value(a));
-            }
-            op(path, "subscribe", Some(Value::map(m)))?
-        }
-        Step::Write { path, value, mode } => op(path, mode.method(), Some(json_to_value(value)))?,
-        Step::Then { .. } => return Err(PlanError::BadFirstStep("then")),
-        Step::OnFail { .. } => return Err(PlanError::BadFirstStep("on_fail")),
-        Step::Parallel { left, right } => DoNode::both(compile_steps(left)?, compile_steps(right)?),
-        Step::Race { left, right } => DoNode::race(compile_steps(left)?, compile_steps(right)?),
-        Step::Let { name, value } => DoNode::r#let(
-            name.clone(),
-            DoNode::pure(json_to_value(value)),
-            DoNode::use_(name.clone()),
-        ),
-        Step::Use { name } => DoNode::use_(name.clone()),
-        Step::Pure { value } => DoNode::pure(json_to_value(value)),
-        Step::Acting { identity, body } => {
-            DoNode::acting(Path::parse(identity)?, compile_steps(body)?)
-        }
-        Step::Bracket {
-            acquire,
-            body,
-            release,
-        } => {
-            let acquire_node = step_to_do(acquire)?;
-            let body_node = compile_steps(body)?;
-            let release_ref = step_ref(&release.name, &release.arg);
-            let released_on_success = body_node.and_then(release_ref.clone());
-            let released_on_failure = released_on_success.or_else(release_ref);
-            DoNode::r#let("_resource", acquire_node, released_on_failure)
-        }
-    })
-}
-
-fn json_to_value(j: &JsonValue) -> Value {
-    match j {
-        JsonValue::Null => Value::null(),
-        JsonValue::Bool(b) => Value::boolean(*b),
-        JsonValue::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::integer(i)
-            } else if let Some(f) = n.as_f64() {
-                Value::float(xolotl_types::FloatBits(f))
-            } else {
-                Value::null()
-            }
-        }
-        JsonValue::String(s) => Value::string(s.clone()),
-        JsonValue::Array(xs) => Value::list(xs.iter().map(json_to_value).collect()),
-        JsonValue::Object(m) => {
-            let mut bm = BTreeMap::new();
-            for (k, v) in m {
-                bm.insert(k.clone(), json_to_value(v));
-            }
-            Value::map(bm)
-        }
-    }
-}
-
 /// Parse a YAML Plan document.
 pub fn parse_yaml(src: &str) -> Result<Plan, PlanError> {
-    yaml_serde::from_str(src).map_err(|e| PlanError::Yaml(e.to_string()))
+    parse_yaml_with_limits(src, CompileLimits::default())
+}
+
+/// Decode YAML within a raw source-byte bound. Decoder recursion and the
+/// returned caller-owned AST lifecycle are distinct from compiler admission.
+pub fn parse_yaml_with_limits(src: &str, limits: CompileLimits) -> Result<Plan, PlanError> {
+    if src.len() > limits.source_bytes {
+        return Err(PlanError::Capacity);
+    }
+    yaml_serde::from_str(src).map_err(|error| PlanError::Yaml(error.to_string()))
 }
 
 /// Parse a JSON Plan document.
 pub fn parse_json(src: &str) -> Result<Plan, PlanError> {
-    serde_json::from_str(src).map_err(|e| PlanError::Json(e.to_string()))
+    parse_json_with_limits(src, CompileLimits::default())
+}
+
+/// Decode JSON within a raw source-byte bound. The decoder retains its own
+/// recursion limit; raising compiler depth does not raise that decoder limit.
+pub fn parse_json_with_limits(src: &str, limits: CompileLimits) -> Result<Plan, PlanError> {
+    if src.len() > limits.source_bytes {
+        return Err(PlanError::Capacity);
+    }
+    serde_json::from_str(src).map_err(|error| PlanError::Json(error.to_string()))
 }
 
 #[cfg(test)]
@@ -652,7 +321,7 @@ mod tests {
             target: "effect://x/post".into(),
             input: Some(serde_json::json!("hello")),
         }]))?;
-        match node {
+        match &node {
             DoNode::Op(t) => {
                 ensure!(
                     t.target.path().to_string() == "effect://x/post",
@@ -677,7 +346,7 @@ mod tests {
             path: "state://memory/alice".into(),
             r#as: "v".into(),
         }]))?;
-        match node {
+        match &node {
             DoNode::Op(t) => ensure!(t.method == "read", "unexpected method: {}", t.method),
             other => bail!("expected operation node, got {other:?}"),
         }
@@ -691,7 +360,7 @@ mod tests {
             value: serde_json::json!(1),
             mode: WriteModeSpec::Set,
         }]))?;
-        match set {
+        match &set {
             DoNode::Op(t) => ensure!(t.method == "write", "unexpected method: {}", t.method),
             other => bail!("expected operation node, got {other:?}"),
         }
@@ -700,7 +369,7 @@ mod tests {
             value: serde_json::json!("e"),
             mode: WriteModeSpec::Append,
         }]))?;
-        match app {
+        match &app {
             DoNode::Op(t) => ensure!(t.method == "append", "unexpected method: {}", t.method),
             other => bail!("expected operation node, got {other:?}"),
         }
@@ -724,7 +393,7 @@ mod tests {
             },
         ]))?;
         ensure!(
-            matches!(node, DoNode::OrElse { .. }),
+            matches!(&node, DoNode::OrElse { .. }),
             "expected OrElse node, got {node:?}"
         );
         Ok(())
@@ -752,7 +421,7 @@ mod tests {
             }],
         }]))?;
         ensure!(
-            matches!(par, DoNode::Both(_, _)),
+            matches!(&par, DoNode::Both(_, _)),
             "expected Both node, got {par:?}"
         );
         let race = compile_test(&plan(vec![Step::Race {
@@ -766,7 +435,7 @@ mod tests {
             }],
         }]))?;
         ensure!(
-            matches!(race, DoNode::Race(_, _)),
+            matches!(&race, DoNode::Race(_, _)),
             "expected Race node, got {race:?}"
         );
         Ok(())
@@ -775,13 +444,13 @@ mod tests {
     #[test]
     fn acting_compiles() -> anyhow::Result<()> {
         let node = compile_test(&plan(vec![Step::Acting {
-            identity: "process://alice".into(),
+            identity: "identity://alice".into(),
             body: vec![Step::Pure {
                 value: serde_json::json!(1),
             }],
         }]))?;
         ensure!(
-            matches!(node, DoNode::Acting { .. }),
+            matches!(&node, DoNode::Acting { .. }),
             "expected Acting node, got {node:?}"
         );
         Ok(())
@@ -815,7 +484,7 @@ mod tests {
                 arg: None,
             },
         }]))?;
-        match node {
+        match &node {
             DoNode::Op(t) => {
                 ensure!(t.method == "subscribe", "unexpected method: {}", t.method);
                 ensure!(
@@ -830,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn bracket_compiles_to_let_with_release() -> anyhow::Result<()> {
+    fn bracket_compiles_to_let_with_finally_and_resource_release() -> anyhow::Result<()> {
         let node = compile_test(&plan(vec![Step::Bracket {
             acquire: Box::new(Step::Perform {
                 target: "effect://lock/take".into(),
@@ -844,11 +513,16 @@ mod tests {
                 arg: None,
             },
         }]))?;
-        match node {
-            DoNode::Let { body, .. } => ensure!(
-                matches!(*body, DoNode::OrElse { .. }),
-                "expected OrElse release body, got {body:?}"
-            ),
+        match &node {
+            DoNode::Let { body, .. } => match body.as_ref() {
+                DoNode::Finally { cleanup, .. } => ensure!(
+                    matches!(cleanup.as_ref(), DoNode::AndThen { d, then }
+                        if matches!(d.as_ref(), DoNode::Use(name) if name == "_resource")
+                            && then.name == "release"),
+                    "release must receive the acquired resource"
+                ),
+                other => bail!("expected Finally release body, got {other:?}"),
+            },
             other => bail!("expected Let node, got {other:?}"),
         }
         Ok(())
@@ -894,8 +568,8 @@ steps:
     }
 
     #[test]
-    fn duplicate_let_name_rejected() -> anyhow::Result<()> {
-        let err = compile_test(&plan(vec![
+    fn duplicate_let_name_shadows() -> anyhow::Result<()> {
+        let node = compile_test(&plan(vec![
             Step::Let {
                 name: "x".into(),
                 value: serde_json::json!(1),
@@ -904,33 +578,15 @@ steps:
                 name: "x".into(),
                 value: serde_json::json!(2),
             },
-        ]));
-        ensure!(
-            matches!(err, Err(PlanError::DuplicateName(n)) if n == "x"),
-            "duplicate name should be rejected"
-        );
+            Step::Use { name: "x".into() },
+        ]))?;
+        xolotl_graph::compile_do(&node)?;
         Ok(())
     }
 
     #[test]
-    fn extract_refs_finds_placeholders() -> anyhow::Result<()> {
-        let v = serde_json::json!({"a": "${first}", "b": ["x", "${second}y"]});
-        let mut refs = extract_refs(&v);
-        refs.sort();
-        ensure!(
-            refs == vec!["first".to_string(), "second".to_string()],
-            "unexpected refs: {refs:?}"
-        );
-        ensure!(
-            extract_refs(&serde_json::json!("no refs here")).is_empty(),
-            "non-placeholder string should not produce refs"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn reference_cycle_rejected() -> anyhow::Result<()> {
-        let err = compile_test(&plan(vec![
+    fn placeholder_strings_are_literals() -> anyhow::Result<()> {
+        let node = compile_test(&plan(vec![
             Step::Let {
                 name: "a".into(),
                 value: serde_json::json!("${b}"),
@@ -939,16 +595,14 @@ steps:
                 name: "b".into(),
                 value: serde_json::json!("${a}"),
             },
-        ]));
-        ensure!(
-            matches!(err, Err(PlanError::Cycle(_))),
-            "cycle should be rejected"
-        );
+            Step::Use { name: "b".into() },
+        ]))?;
+        xolotl_graph::compile_do(&node)?;
         Ok(())
     }
 
     #[test]
-    fn independent_steps_compile_to_both() -> anyhow::Result<()> {
+    fn effect_steps_are_sequential() -> anyhow::Result<()> {
         let node = compile_test(&plan(vec![
             Step::Perform {
                 target: "effect://x/a".into(),
@@ -960,8 +614,8 @@ steps:
             },
         ]))?;
         ensure!(
-            matches!(node, DoNode::Both(_, _)),
-            "expected Both node, got {node:?}"
+            matches!(&node, DoNode::Let { .. }),
+            "effects must remain sequential, got {node:?}"
         );
         Ok(())
     }
@@ -979,14 +633,14 @@ steps:
             },
         ]))?;
         ensure!(
-            matches!(node, DoNode::Let { .. }),
+            matches!(&node, DoNode::Let { .. }),
             "expected Let node, got {node:?}"
         );
         Ok(())
     }
 
     #[test]
-    fn three_independent_steps_pairwise_parallel() -> anyhow::Result<()> {
+    fn three_effect_steps_remain_sequential() -> anyhow::Result<()> {
         let node = compile_test(&plan(vec![
             Step::Perform {
                 target: "effect://x/a".into(),
@@ -1001,18 +655,18 @@ steps:
                 input: None,
             },
         ]))?;
-        match node {
+        match &node {
             DoNode::Let { value, body, .. } => {
                 ensure!(
-                    matches!(*value, DoNode::Both(_, _)),
-                    "expected Both value, got {value:?}"
+                    matches!(value.as_ref(), DoNode::Let { .. }),
+                    "expected sequential prefix, got {value:?}"
                 );
                 ensure!(
-                    matches!(*body, DoNode::Op(_)),
+                    matches!(body.as_ref(), DoNode::Op(_)),
                     "expected Op body, got {body:?}"
                 );
             }
-            other => bail!("expected Let wrapping Both, got {other:?}"),
+            other => bail!("expected sequential Let, got {other:?}"),
         }
         Ok(())
     }

@@ -24,6 +24,26 @@ pub struct ValueTableEncoder<'a> {
 }
 
 impl<'a> ValueTableEncoder<'a> {
+    /// Intern one root with a conservative predescent work budget. Unique nodes,
+    /// reference edges, map key bytes, and string/byte payload bytes each charge
+    /// one unit. Shared nodes charge once, but every resident reference charges.
+    /// Rejection happens before allocating the candidate's traversal frame;
+    /// discard this encoder after an error. Exact encoded bytes are a separate
+    /// writer limit, and this work budget is not an RSS ceiling.
+    pub fn intern_bounded(
+        &mut self,
+        root: &'a Value,
+        budget: usize,
+    ) -> Result<ValueRoot, ValueTableEncodeError> {
+        self.intern_with_budget(root, Some(budget))
+    }
+
+    /// Serialize an already indexed root in the same standalone format as
+    /// [`super::serializable`], without rebuilding its node index.
+    pub fn serializable_root(&self, root: ValueRoot) -> impl Serialize + '_ {
+        IndexedRoot { table: self, root }
+    }
+
     /// Construct an empty context without allocating.
     pub fn new() -> Self {
         Self::default()
@@ -34,8 +54,44 @@ impl<'a> ValueTableEncoder<'a> {
     /// Calling this again for a previously interned allocation reuses its ID.
     /// Semantic equality alone does not merge independently allocated nodes.
     pub fn intern(&mut self, root: &'a Value) -> Result<ValueRoot, ValueTableEncodeError> {
+        self.intern_with_budget(root, None)
+    }
+
+    fn intern_with_budget(
+        &mut self,
+        root: &'a Value,
+        mut remaining: Option<usize>,
+    ) -> Result<ValueRoot, ValueTableEncodeError> {
         let mut walk = ValuePostorder::new(root);
-        while let Some(value) = walk.next(|key| self.ids.contains_key(&key)) {
+        while let Some(value) = walk.try_next(
+            |key| self.ids.contains_key(&key),
+            |value, _depth| {
+                let Some(budget) = remaining.as_mut() else {
+                    return Ok(());
+                };
+                let mut charge = |units: usize| -> Result<(), ValueTableEncodeError> {
+                    *budget = budget
+                        .checked_sub(units)
+                        .ok_or(ValueTableEncodeError::BudgetExceeded)?;
+                    Ok(())
+                };
+                charge(1)?;
+                match value.view() {
+                    ValueView::List(items) => charge(items.len())?,
+                    ValueView::Map(entries) => {
+                        charge(entries.len())?;
+                        for (key, _) in entries.iter() {
+                            charge(key.len())?;
+                        }
+                    }
+                    ValueView::Str(text) => charge(text.len())?,
+                    ValueView::StreamEnd(StreamMarker::Error { message }) => charge(message.len())?,
+                    ValueView::Bytes(bytes) => charge(bytes.len())?,
+                    _ => {}
+                }
+                Ok(())
+            },
+        )? {
             let id = u64::try_from(self.nodes.len())
                 .map_err(|_error| ValueTableEncodeError::NodeIdOverflow)?;
             self.ids.insert(ValueNodeKey::of(value), id);
@@ -51,6 +107,21 @@ impl<'a> ValueTableEncoder<'a> {
     /// Number of distinct resident nodes currently represented in this table.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+}
+
+struct IndexedRoot<'index, 'value> {
+    table: &'index ValueTableEncoder<'value>,
+    root: ValueRoot,
+}
+
+impl Serialize for IndexedRoot<'_, '_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut record = serializer.serialize_struct("ValueTable", 3)?;
+        record.serialize_field("version", &VERSION)?;
+        record.serialize_field("nodes", &Nodes(self.table))?;
+        record.serialize_field("root", &self.root)?;
+        record.end()
     }
 }
 

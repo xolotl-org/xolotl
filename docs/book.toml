@@ -6,4 +6,4 @@ src = "src"
 
 [output.html]
 git-repository-url = "https://github.com/xolotl-org/xolotl"
-edit-url-template = "https://github.com/xolotl-org/xolotl/edit/main/docs/{path}"
+edit-url-template = "https://github.com/xolotl-org/xolotl/edit/main/docs/src/{path}"

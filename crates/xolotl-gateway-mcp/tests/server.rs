@@ -1,7 +1,10 @@
 use anyhow::{Context, bail, ensure};
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex, Weak,
+    atomic::{AtomicUsize, Ordering},
+};
 use xolotl_gateway::{
     GatewayError, GatewayPrincipalSurfaceBinding, GatewayProfile, GatewayPublication,
     GatewayRuntime, GatewaySurface,
@@ -10,7 +13,7 @@ use xolotl_gateway_mcp::{
     McpGateway, McpJsonRpcResponse, McpOutputLimits, mcp_prompt_publication,
     mcp_resource_publication, mcp_resource_template_publication, mcp_tool_publication,
 };
-use xolotl_kernel::{Bootstrap, EchoDriver, FnDriver};
+use xolotl_kernel::{Bootstrap, DriverError, EchoDriver, FnDriver};
 use xolotl_types::{Outcome, Value};
 
 const JSONRPC_INVALID_REQUEST: i64 = -32600;
@@ -18,7 +21,7 @@ const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
 const JSONRPC_INVALID_PARAMS: i64 = -32602;
 const JSONRPC_RESOURCE_NOT_FOUND: i64 = -32002;
 const JSONRPC_GATEWAY_ERROR: i64 = -32000;
-const TEST_TOKEN: &str = "mcp-token-for-alice-0001";
+const TEST_TOKEN: &str = "mcp-token-for-alice-0001-32-bytes";
 const MCP_PUBLISHED_PROTOCOL_VERSIONS: &[(&str, bool)] = &[
     ("2025-11-25", true),
     ("2025-06-18", true),
@@ -76,7 +79,7 @@ fn schema_type(kind: &str) -> Value {
 }
 
 fn audit_outcomes(boot: &Bootstrap, event: &str) -> anyhow::Result<Vec<String>> {
-    Ok(must(boot.kernel.facts.all_facts())?
+    Ok(must(boot.kernel().facts().all_facts())?
         .into_iter()
         .filter_map(|fact| match fact.outcome {
             Some(value)
@@ -102,6 +105,7 @@ fn register_echo(boot: &Bootstrap, effect: &str) -> anyhow::Result<xolotl_types:
         effect,
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -118,6 +122,7 @@ fn register_fixed(
         effect,
         &[xolotl_kernel::MethodSpec::new(
             "invoke",
+            xolotl_types::MethodAuthority::Perform,
             xolotl_types::Purity::Pure,
             xolotl_kernel::MethodSpec::UNARY_ASYNC,
         )],
@@ -133,7 +138,7 @@ fn echo_profile(
         "cred-alice",
         "alice",
         TEST_TOKEN,
-        "process://alice",
+        "identity://alice",
     ))?
     .with_surface(
         GatewaySurface::effect_invoke("echo", target)
@@ -153,26 +158,88 @@ async fn tool_call_runs_through_gateway() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
     let target = register_echo(&boot, "effect://echo/say")?;
     let profile = echo_profile(target, mcp_tool_publication("echo", "echo"))?;
-    let inner = must(GatewayRuntime::new(boot, profile))?;
+    let inner = must(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    ))?;
     let mcp = McpGateway::new(Arc::new(inner));
 
     let input = Value::map(BTreeMap::from([("text".into(), Value::from("from-mcp"))]));
     let out = mcp.call_tool(TEST_TOKEN, "echo", input.clone()).await;
     let out = must(out)?;
-    assert_eq!(out, Outcome::Done(input));
+    assert_eq!(out.output.outcome, Outcome::Done(input));
+    assert!(!out.output.taint.is_pristine());
+    assert_eq!(out.accepted.surface_id, "echo");
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_preparation_rejects_before_json_arguments_materialize() -> anyhow::Result<()> {
+    use xolotl_gateway::{
+        Gateway, GatewayLimitProfile, GatewaySubmissionHead, PresentedCredential,
+    };
+    let boot = Arc::new(Bootstrap::in_memory());
+    let target = register_echo(&boot, "effect://echo/say")?;
+    let profile = echo_profile(target, mcp_tool_publication("echo", "echo"))?.with_limits(
+        GatewayLimitProfile {
+            max_in_flight_requests: 1,
+            ..GatewayLimitProfile::default()
+        },
+    );
+    let gateway = Arc::new(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    )?);
+    let session = gateway
+        .authenticate(PresentedCredential::bearer(TEST_TOKEN))
+        .await?;
+    let owner =
+        gateway.prepare_submission(&session, GatewaySubmissionHead::direct_input("echo"), None)?;
+    let mcp = McpGateway::new(gateway.clone());
+    let request = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"outside_i64": u64::MAX}}
+    });
+    let rejected = mcp.handle_jsonrpc_value(TEST_TOKEN, request.clone()).await;
+    ensure!(
+        rejected
+            .error
+            .context("missing shared admission rejection")?
+            .code
+            == JSONRPC_GATEWAY_ERROR
+    );
+    drop(owner);
+    let malformed = mcp.handle_jsonrpc_value(TEST_TOKEN, request).await;
+    ensure!(
+        malformed
+            .error
+            .context("missing argument materialization rejection")?
+            .code
+            == JSONRPC_INVALID_PARAMS
+    );
+    let result = mcp
+        .call_tool(TEST_TOKEN, "echo", Value::map(BTreeMap::new()))
+        .await?;
+    ensure!(matches!(result.output.outcome, Outcome::Done(_)));
     Ok(())
 }
 
 #[tokio::test]
 async fn descriptors_are_authenticated_and_kind_filtered() -> anyhow::Result<()> {
-    let boot = Arc::new(Bootstrap::in_memory());
+    let boot = Arc::new(Bootstrap::from_kernel(
+        xolotl_kernel::KernelBuilder::in_memory()
+            .with_fact_sink(xolotl_kernel::FactSink::in_memory().0)
+            .build(),
+    ));
     let echo = register_echo(&boot, "effect://echo/say")?;
     let hidden = register_echo(&boot, "effect://hidden/run")?;
     let profile = must(GatewayProfile::new("mcp-test").with_bearer_identity(
         "cred-alice",
         "alice",
         TEST_TOKEN,
-        "process://alice",
+        "identity://alice",
     ))?
     .with_surface(
         GatewaySurface::effect_invoke("echo", echo)
@@ -208,7 +275,11 @@ async fn descriptors_are_authenticated_and_kind_filtered() -> anyhow::Result<()>
         ["echo"],
         ["perform://effect/echo/say"],
     ));
-    let inner = must(GatewayRuntime::new(boot.clone(), profile))?;
+    let inner = must(GatewayRuntime::new(
+        boot.clone(),
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    ))?;
     let mcp = McpGateway::new(Arc::new(inner));
 
     let tools = must(mcp.list_tools(TEST_TOKEN).await)?;
@@ -231,6 +302,7 @@ async fn descriptors_are_authenticated_and_kind_filtered() -> anyhow::Result<()>
 #[tokio::test]
 async fn jsonrpc_lists_and_calls_tools() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
+    assert!(!boot.kernel().facts().is_enabled());
     let echo = register_echo(&boot, "effect://echo/say")?;
     let profile = echo_profile(
         echo,
@@ -248,7 +320,11 @@ async fn jsonrpc_lists_and_calls_tools() -> anyhow::Result<()> {
                 Value::from("xolotl-test"),
             )]))),
     );
-    let inner = must(GatewayRuntime::new(boot, profile?))?;
+    let inner = must(GatewayRuntime::new(
+        boot,
+        profile?,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    ))?;
     let mcp = McpGateway::new(Arc::new(inner));
 
     let response = mcp
@@ -298,17 +374,21 @@ async fn jsonrpc_output_budgets_are_configurable_and_reset_per_response() -> any
     let boot = Arc::new(Bootstrap::in_memory());
     let target = register_echo(&boot, "effect://echo/say")?;
     let profile = echo_profile(target, mcp_tool_publication("echo", "echo"))?;
-    let inner = Arc::new(GatewayRuntime::new(boot, profile)?);
+    let inner = Arc::new(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    )?);
     let limits = McpOutputLimits {
-        max_message_bytes: 256,
+        max_message_bytes: 1024,
         ..McpOutputLimits::default()
     };
     let small = McpGateway::new(inner.clone()).with_output_limits(limits)?;
     let large = McpGateway::new(inner).with_output_limits(McpOutputLimits {
-        max_message_bytes: 4096,
+        max_message_bytes: 16384,
         ..limits
     })?;
-    let text = "\n".repeat(128);
+    let text = "\n".repeat(1024);
     let request = json!({
         "jsonrpc": "2.0",
         "id": "large-result",
@@ -320,9 +400,21 @@ async fn jsonrpc_output_budgets_are_configurable_and_reset_per_response() -> any
         .await;
     assert_eq!(
         rejected.error.as_ref().map(|error| error.code),
-        Some(JSONRPC_GATEWAY_ERROR)
+        Some(-32001)
+    );
+    assert_eq!(
+        rejected.error.as_ref().map(|error| error.message.as_str()),
+        Some("outcome unknown; reconcile before retrying")
     );
     assert_eq!(rejected.id, "large-result");
+    let evidence = rejected
+        .error
+        .as_ref()
+        .and_then(|error| error.data.as_ref())
+        .context("accepted evidence missing after oversized response")?;
+    assert_eq!(evidence["code"], "outcome_unknown");
+    assert_eq!(evidence["reason_code"], "response_encoding_failed");
+    assert_eq!(evidence["accepted"]["surface_id"], "echo");
     assert!(serde_json::to_vec(&rejected)?.len() <= limits.max_message_bytes);
 
     let accepted = large.handle_jsonrpc_value(TEST_TOKEN, request).await;
@@ -333,7 +425,11 @@ async fn jsonrpc_output_budgets_are_configurable_and_reset_per_response() -> any
     );
     let typed = Value::map(BTreeMap::from([("text".into(), Value::from(text))]));
     assert_eq!(
-        small.call_tool(TEST_TOKEN, "echo", typed.clone()).await?,
+        small
+            .call_tool(TEST_TOKEN, "echo", typed.clone())
+            .await?
+            .output
+            .outcome,
         Outcome::Done(typed)
     );
 
@@ -356,7 +452,7 @@ async fn jsonrpc_output_budgets_are_configurable_and_reset_per_response() -> any
         .handle_jsonrpc_value(
             TEST_TOKEN,
             json!({
-                "jsonrpc": "2.0", "id": "x".repeat(1024), "method": "ping"
+                "jsonrpc": "2.0", "id": "x".repeat(4096), "method": "ping"
             }),
         )
         .await;
@@ -373,6 +469,13 @@ async fn jsonrpc_output_budgets_are_configurable_and_reset_per_response() -> any
 async fn jsonrpc_passes_native_tool_content_types() -> anyhow::Result<()> {
     let boot = Arc::new(Bootstrap::in_memory());
     let native_result = Value::map(BTreeMap::from([
+        (
+            "_meta".into(),
+            Value::map(BTreeMap::from([
+                ("xolotl/gateway".into(), Value::from("forged acceptance")),
+                ("provider_note".into(), Value::from("retained")),
+            ])),
+        ),
         (
             "content".into(),
             Value::list(vec![
@@ -416,7 +519,7 @@ async fn jsonrpc_passes_native_tool_content_types() -> anyhow::Result<()> {
         "cred-alice",
         "alice",
         TEST_TOKEN,
-        "process://alice",
+        "identity://alice",
     ))?
     .with_surface(
         GatewaySurface::effect_invoke("echo", target)
@@ -428,7 +531,11 @@ async fn jsonrpc_passes_native_tool_content_types() -> anyhow::Result<()> {
         ["echo"],
         ["perform://effect/tool/native"],
     ));
-    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(boot, profile))?));
+    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    ))?));
 
     let call = mcp
         .handle_jsonrpc_value(
@@ -451,6 +558,11 @@ async fn jsonrpc_passes_native_tool_content_types() -> anyhow::Result<()> {
     assert_eq!(result["content"][2]["type"], "resource_link");
     assert_eq!(result["content"][3]["resource"]["text"], "embedded");
     assert_eq!(result["structuredContent"]["count"], 4);
+    assert_eq!(result["_meta"]["provider_note"], "retained");
+    assert_eq!(
+        result["_meta"]["xolotl/gateway"]["accepted"]["surface_id"],
+        "echo"
+    );
     Ok(())
 }
 
@@ -469,7 +581,7 @@ async fn jsonrpc_rejects_invalid_native_tool_result() -> anyhow::Result<()> {
         "cred-alice",
         "alice",
         TEST_TOKEN,
-        "process://alice",
+        "identity://alice",
     ))?
     .with_surface(
         GatewaySurface::effect_invoke("echo", target)
@@ -481,7 +593,11 @@ async fn jsonrpc_rejects_invalid_native_tool_result() -> anyhow::Result<()> {
         ["echo"],
         ["perform://effect/tool/native-bad"],
     ));
-    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(boot, profile))?));
+    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    ))?));
 
     let call = mcp
         .handle_jsonrpc_value(
@@ -497,10 +613,7 @@ async fn jsonrpc_rejects_invalid_native_tool_result() -> anyhow::Result<()> {
             }),
         )
         .await;
-    assert_eq!(
-        call.error.as_ref().map(|error| error.code),
-        Some(JSONRPC_GATEWAY_ERROR)
-    );
+    assert_eq!(call.error.as_ref().map(|error| error.code), Some(-32001));
     Ok(())
 }
 
@@ -509,7 +622,11 @@ async fn jsonrpc_rejects_task_augmented_tool_call_when_not_advertised() -> anyho
     let boot = Arc::new(Bootstrap::in_memory());
     let target = register_echo(&boot, "effect://echo/say")?;
     let profile = echo_profile(target, mcp_tool_publication("echo", "echo"))?;
-    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(boot, profile))?));
+    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    ))?));
 
     let call = mcp
         .handle_jsonrpc_value(
@@ -545,7 +662,7 @@ async fn jsonrpc_lists_and_reads_resources() -> anyhow::Result<()> {
         "cred-alice",
         "alice",
         TEST_TOKEN,
-        "process://alice",
+        "identity://alice",
     ))?
     .with_surface(
         GatewaySurface::effect_invoke("resource", target)
@@ -563,7 +680,11 @@ async fn jsonrpc_lists_and_reads_resources() -> anyhow::Result<()> {
         ["resource"],
         ["perform://effect/resource/read"],
     ));
-    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(boot, profile))?));
+    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    ))?));
 
     let list = mcp
         .handle_jsonrpc_value(
@@ -593,6 +714,10 @@ async fn jsonrpc_lists_and_reads_resources() -> anyhow::Result<()> {
     assert_eq!(contents[0]["uri"], "xolotl://docs/readme");
     assert_eq!(contents[0]["mimeType"], "text/plain");
     assert_eq!(contents[0]["text"], "resource text");
+    assert_eq!(
+        response_result(&read, "resources/read")?["_meta"]["xolotl/gateway"]["accepted"]["surface_id"],
+        "resource"
+    );
     Ok(())
 }
 
@@ -608,7 +733,7 @@ async fn jsonrpc_reads_binary_resource_content() -> anyhow::Result<()> {
         "cred-alice",
         "alice",
         TEST_TOKEN,
-        "process://alice",
+        "identity://alice",
     ))?
     .with_surface(
         GatewaySurface::effect_invoke("resource", target)
@@ -623,7 +748,11 @@ async fn jsonrpc_reads_binary_resource_content() -> anyhow::Result<()> {
         ["resource"],
         ["perform://effect/resource/bin"],
     ));
-    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(boot, profile))?));
+    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    ))?));
 
     let read = mcp
         .handle_jsonrpc_value(
@@ -650,7 +779,7 @@ async fn jsonrpc_lists_templates_and_routes_template_reads() -> anyhow::Result<(
         "cred-alice",
         "alice",
         TEST_TOKEN,
-        "process://alice",
+        "identity://alice",
     ))?
     .with_surface(
         GatewaySurface::effect_invoke("template", target)
@@ -665,7 +794,11 @@ async fn jsonrpc_lists_templates_and_routes_template_reads() -> anyhow::Result<(
         ["template"],
         ["perform://effect/resource/template"],
     ));
-    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(boot, profile))?));
+    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    ))?));
 
     let list = mcp
         .handle_jsonrpc_value(
@@ -708,7 +841,7 @@ async fn jsonrpc_lists_and_gets_prompts() -> anyhow::Result<()> {
         "cred-alice",
         "alice",
         TEST_TOKEN,
-        "process://alice",
+        "identity://alice",
     ))?
     .with_surface(
         GatewaySurface::effect_invoke("prompt", target)
@@ -731,7 +864,11 @@ async fn jsonrpc_lists_and_gets_prompts() -> anyhow::Result<()> {
         ["prompt"],
         ["perform://effect/prompt/review"],
     ));
-    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(boot, profile))?));
+    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    ))?));
 
     let list = mcp
         .handle_jsonrpc_value(
@@ -761,6 +898,10 @@ async fn jsonrpc_lists_and_gets_prompts() -> anyhow::Result<()> {
     assert_eq!(result["description"], "Review prompt");
     assert_eq!(result["messages"][0]["role"], "user");
     assert_eq!(result["messages"][0]["content"]["text"], "Review this.");
+    assert_eq!(
+        result["_meta"]["xolotl/gateway"]["accepted"]["surface_id"],
+        "prompt"
+    );
     Ok(())
 }
 
@@ -773,7 +914,7 @@ async fn jsonrpc_completes_prompt_and_resource_template_arguments() -> anyhow::R
         "cred-alice",
         "alice",
         TEST_TOKEN,
-        "process://alice",
+        "identity://alice",
     ))?
     .with_surface(
         GatewaySurface::effect_invoke("prompt", prompt)
@@ -825,7 +966,11 @@ async fn jsonrpc_completes_prompt_and_resource_template_arguments() -> anyhow::R
             "perform://effect/resource/template",
         ],
     ));
-    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(boot, profile))?));
+    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    ))?));
 
     let prompt_complete = mcp
         .handle_jsonrpc_value(
@@ -894,9 +1039,13 @@ async fn jsonrpc_rejects_unknown_and_bad_requests_without_catalog_leak() -> anyh
         "cred-alice",
         "alice",
         TEST_TOKEN,
-        "process://alice",
+        "identity://alice",
     ))?;
-    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(boot, profile))?));
+    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    ))?));
 
     let unknown = mcp
         .handle_jsonrpc_value(
@@ -971,9 +1120,13 @@ async fn jsonrpc_initialize_ping_and_initialized_notification_do_not_expose_surf
         "cred-alice",
         "alice",
         TEST_TOKEN,
-        "process://alice",
+        "identity://alice",
     ))?;
-    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(boot, profile))?));
+    let mcp = McpGateway::new(Arc::new(must(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    ))?));
 
     for (id, &(protocol_version, supports_completions)) in
         MCP_PUBLISHED_PROTOCOL_VERSIONS.iter().enumerate()
@@ -1050,7 +1203,7 @@ fn publication_requires_surface_publish_capability() -> anyhow::Result<()> {
         "cred-alice",
         "alice",
         TEST_TOKEN,
-        "process://alice",
+        "identity://alice",
     ))?
     .with_surface(GatewaySurface::effect_invoke("echo", target))
     .with_publication(mcp_tool_publication("echo", "echo"))
@@ -1061,7 +1214,7 @@ fn publication_requires_surface_publish_capability() -> anyhow::Result<()> {
     ));
     ensure!(
         matches!(
-        GatewayRuntime::new(boot, profile),
+        GatewayRuntime::new(boot, profile, Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default())),
         Err(GatewayError::InvalidProfile(message))
             if message.contains("without publish_capability")
         ),
@@ -1072,10 +1225,18 @@ fn publication_requires_surface_publish_capability() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn auth_failure_is_redacted_and_audited() -> anyhow::Result<()> {
-    let boot = Arc::new(Bootstrap::in_memory());
+    let boot = Arc::new(Bootstrap::from_kernel(
+        xolotl_kernel::KernelBuilder::in_memory()
+            .with_fact_sink(xolotl_kernel::FactSink::in_memory().0)
+            .build(),
+    ));
     let target = register_echo(&boot, "effect://echo/say")?;
     let profile = echo_profile(target, mcp_tool_publication("echo", "echo"))?;
-    let inner = must(GatewayRuntime::new(boot.clone(), profile))?;
+    let inner = must(GatewayRuntime::new(
+        boot.clone(),
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    ))?;
     let mcp = McpGateway::new(Arc::new(inner));
 
     let err = match mcp
@@ -1085,8 +1246,104 @@ async fn auth_failure_is_redacted_and_audited() -> anyhow::Result<()> {
         Ok(_) => bail!("call with wrong token unexpectedly succeeded"),
         Err(err) => err,
     };
-    assert_eq!(err.to_string(), "gateway rejected MCP request");
+    assert_eq!(err.to_string(), "gateway MCP request failed");
     assert!(audit_outcomes(&boot, "gateway_mcp")?.contains(&"auth_failed".into()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn installed_observation_failure_rejects_discovery() -> anyhow::Result<()> {
+    let facts = Arc::new(xolotl_kernel::InMemoryFactStore::with_limits(
+        xolotl_kernel::FactRetentionLimits {
+            max_records: std::num::NonZeroUsize::MIN,
+            max_encoded_bytes: std::num::NonZeroUsize::MIN,
+            max_record_bytes: std::num::NonZeroUsize::MIN,
+        },
+    )?);
+    let boot = Arc::new(Bootstrap::from_kernel(
+        xolotl_kernel::KernelBuilder::in_memory()
+            .with_fact_sink(xolotl_kernel::FactSink::new(facts.clone()))
+            .build(),
+    ));
+    let target = register_echo(&boot, "effect://echo/say")?;
+    let profile = echo_profile(target, mcp_tool_publication("echo", "echo"))?;
+    let inner = GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    )?;
+    let mcp = McpGateway::new(Arc::new(inner));
+    assert!(matches!(
+        mcp.list_tools(TEST_TOKEN).await,
+        Err(xolotl_gateway_mcp::McpGatewayError::Audit(_))
+    ));
+    assert_eq!(facts.usage(), xolotl_kernel::FactRetentionUsage::default());
+    Ok(())
+}
+
+#[tokio::test]
+async fn revocation_during_execution_prevents_typed_and_wire_evidence_delivery()
+-> anyhow::Result<()> {
+    for typed in [false, true] {
+        let boot = Arc::new(Bootstrap::in_memory());
+        let runtime_slot: Arc<Mutex<Option<Weak<GatewayRuntime>>>> = Arc::new(Mutex::new(None));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let driver_slot = runtime_slot.clone();
+        let driver_calls = calls.clone();
+        let target = boot.register_effect(
+            "effect://echo/say",
+            &[xolotl_kernel::MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                xolotl_types::Purity::Pure,
+                xolotl_kernel::MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(FnDriver(move |_, input| {
+                driver_calls.fetch_add(1, Ordering::SeqCst);
+                let runtime = driver_slot
+                    .lock()
+                    .map_err(|error| DriverError::Other(error.to_string()))?
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .ok_or_else(|| DriverError::Other("test runtime is unavailable".into()))?;
+                runtime
+                    .replace_profile(GatewayProfile::new("mcp-test").with_revision(2))
+                    .map_err(|error| DriverError::Other(error.to_string()))?;
+                Ok(input)
+            })),
+        )?;
+        let profile = echo_profile(target, mcp_tool_publication("echo", "echo"))?;
+        let runtime = Arc::new(GatewayRuntime::new_manual(
+            boot,
+            profile,
+            Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+        )?);
+        *runtime_slot
+            .lock()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))? = Some(Arc::downgrade(&runtime));
+        let adapter = McpGateway::new(runtime);
+        if typed {
+            let error = adapter
+                .call_tool(TEST_TOKEN, "echo", Value::map(BTreeMap::new()))
+                .await
+                .err()
+                .context("revoked typed result was delivered")?;
+            ensure!(matches!(
+                error,
+                xolotl_gateway_mcp::McpGatewayError::Gateway(GatewayError::Indeterminate(ref detail))
+                    if detail == "submission delivery access unavailable"
+            ));
+        } else {
+            let response = adapter.handle_jsonrpc_value(TEST_TOKEN, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "echo", "arguments": {} } })).await;
+            ensure!(response.result.is_none());
+            let error = response
+                .error
+                .context("revoked wire result was delivered")?;
+            ensure!(error.code == -32001);
+            ensure!(error.data.is_none());
+        }
+        ensure!(calls.load(Ordering::SeqCst) == 1);
+    }
     Ok(())
 }
 
@@ -1098,7 +1355,7 @@ async fn tool_failure_is_mcp_result_not_jsonrpc_error() -> anyhow::Result<()> {
         "cred-alice",
         "alice",
         TEST_TOKEN,
-        "process://alice",
+        "identity://alice",
     ))?
     .with_surface(
         GatewaySurface::effect_invoke("echo", target)
@@ -1111,7 +1368,11 @@ async fn tool_failure_is_mcp_result_not_jsonrpc_error() -> anyhow::Result<()> {
         ["echo"],
         ["perform://effect/echo/say"],
     ));
-    let inner = must(GatewayRuntime::new(boot, profile))?;
+    let inner = must(GatewayRuntime::new(
+        boot,
+        profile,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+    ))?;
     let mcp = McpGateway::new(Arc::new(inner));
 
     let response = mcp
@@ -1131,5 +1392,6 @@ async fn tool_failure_is_mcp_result_not_jsonrpc_error() -> anyhow::Result<()> {
     assert!(response.error.is_none());
     let result = response_result(&response, "tools/call")?;
     assert_eq!(result["isError"], true);
+    assert_eq!(result["_meta"]["xolotl/gateway"]["outcome_status"], "fail");
     Ok(())
 }

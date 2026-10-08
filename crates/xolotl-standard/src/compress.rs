@@ -22,9 +22,19 @@ use xolotl_types::{ValueMap, ValueText, ValueView};
 /// `invoke`.
 pub(crate) const COMPRESS_METHODS: &[MethodSpec] = &[
     // summarize: model-backed; not safely replayable by default.
-    MethodSpec::new("summarize", Purity::Effectful, MethodSpec::UNARY_ASYNC),
+    MethodSpec::new(
+        "summarize",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Effectful,
+        MethodSpec::UNARY_ASYNC,
+    ),
     // trim-plan: pure structural truncation.
-    MethodSpec::new("trim-plan", Purity::Pure, MethodSpec::UNARY_ASYNC),
+    MethodSpec::new(
+        "trim-plan",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Pure,
+        MethodSpec::UNARY_ASYNC,
+    ),
 ];
 
 /// Drives the compression actions. Holds an embedding/inference backend used to

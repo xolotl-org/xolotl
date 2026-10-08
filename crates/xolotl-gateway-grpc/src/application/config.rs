@@ -8,8 +8,11 @@ use xolotl_gateway::GatewayTransportSecurityConfig;
 pub struct ApplicationGrpcConfig {
     /// Listener security and explicitly trusted reverse proxies.
     pub transport_security: GatewayTransportSecurityConfig,
-    /// Maximum encoded protobuf message, including metadata and envelope overhead.
+    /// Maximum encoded protobuf envelope, including its fields and nested messages.
+    /// Excludes HTTP/2 headers and gRPC framing; neither an object nor RSS limit.
     /// Applies to incoming and outgoing frames, not cumulative object or stream bytes.
+    /// At least 256 bytes are required for a meaningful acceptance/reconciliation
+    /// envelope. Larger profile metadata may still require a larger window.
     pub max_frame_bytes: usize,
     /// Upload RPCs allowed to hold a staging owner at once. Excess calls fail
     /// immediately instead of waiting in an adapter-owned queue.
@@ -50,9 +53,9 @@ impl Default for ApplicationGrpcConfig {
 
 impl ApplicationGrpcConfig {
     pub(super) fn validate(&mut self) -> Result<(), Status> {
-        if self.max_frame_bytes == 0 || self.max_frame_bytes > u32::MAX as usize {
+        if self.max_frame_bytes < 256 || self.max_frame_bytes > u32::MAX as usize {
             return Err(Status::invalid_argument(
-                "max_frame_bytes must fit the nonzero gRPC message length",
+                "max_frame_bytes must be at least 256 and fit the gRPC message length",
             ));
         }
         if self.max_concurrent_uploads == 0 || self.max_concurrent_uploads > Semaphore::MAX_PERMITS
@@ -84,5 +87,36 @@ impl ApplicationGrpcConfig {
         }
         self.transport_security = self.transport_security.clone().bounded();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_window_rejects_below_minimum_and_preserves_exact_configuration() {
+        for bytes in [0, 1, 255] {
+            let mut config = ApplicationGrpcConfig {
+                max_frame_bytes: bytes,
+                ..Default::default()
+            };
+            assert!(config.validate().is_err());
+        }
+        for bytes in [256, 1024, u32::MAX as usize] {
+            let mut config = ApplicationGrpcConfig {
+                max_frame_bytes: bytes,
+                ..Default::default()
+            };
+            assert!(config.validate().is_ok());
+            assert_eq!(config.max_frame_bytes, bytes);
+        }
+        if let Some(bytes) = (u32::MAX as usize).checked_add(1) {
+            let mut config = ApplicationGrpcConfig {
+                max_frame_bytes: bytes,
+                ..Default::default()
+            };
+            assert!(config.validate().is_err());
+        }
     }
 }

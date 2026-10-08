@@ -1,6 +1,9 @@
 use super::*;
 use crate::RedbStore;
 use anyhow::{Context, anyhow, bail, ensure};
+use redb::ReadableTableMetadata;
+use std::num::NonZeroUsize;
+use xolotl_state::StateHistoryRetention;
 use xolotl_state::prelude::*;
 use xolotl_state::test_support::{CollectHistory, CollectState};
 use xolotl_types::{MergeRule, Path};
@@ -14,7 +17,7 @@ fn p(s: &str) -> anyhow::Result<Path> {
 fn tmp_backend() -> anyhow::Result<RedbStateBackend> {
     let dir = tempfile::tempdir()?;
     let path = dir.keep().join("test.redb");
-    Ok(RedbStore::open(path)?.state_backend())
+    Ok(RedbStore::open_with_history(path, RedbHistory::Full)?.state_backend())
 }
 
 fn history_millis(db: &Database) -> anyhow::Result<i64> {
@@ -48,6 +51,283 @@ fn raw_history(db: &Database) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
 }
 
 #[tokio::test]
+async fn segmented_append_preserves_raw_members_and_recorded_source_order() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let file = directory.path().join("incremental-list.redb");
+    let path = p("state://list/incremental")?;
+    let stored_taint = TaintSet::from_recorded_sources(vec![
+        xolotl_types::TaintSource::ModelOutput,
+        xolotl_types::TaintSource::AuthorConstant,
+        xolotl_types::TaintSource::ModelOutput,
+    ]);
+    let input_taint = TaintSet::from_recorded_sources(vec![
+        xolotl_types::TaintSource::AuthorConstant,
+        xolotl_types::TaintSource::AuthorConstant,
+    ]);
+    let expected_value = Value::list((0..4).map(Value::integer).collect());
+    {
+        let store = RedbStore::open_with_history(&file, RedbHistory::Full)?;
+        let backend = store.state_backend();
+        backend
+            .write_set_tainted(
+                &path,
+                Value::list((0..3).map(Value::integer).collect()),
+                stored_taint.clone(),
+            )
+            .await?;
+        let retained = {
+            let txn = backend.db.begin_write()?;
+            let mut values = txn.open_table(STATE_VALUES_TABLE)?;
+            let key = path.to_string();
+            let mut marker =
+                list::marker(values.get(key.as_str())?.context("current marker")?.value())?
+                    .context("List is not segmented")?;
+            let mut items = list::item_table(&txn)?;
+            let first = list::item_key(marker.id, marker.first);
+            let mut padded = items
+                .get(first.as_slice())?
+                .context("first item")?
+                .value()
+                .to_vec();
+            padded.extend_from_slice(b" \n");
+            items.insert(first.as_slice(), padded.as_slice())?;
+            marker.item_bytes += 2;
+            values.insert(key.as_str(), marker.encode()?.as_slice())?;
+            let retained = items
+                .iter()?
+                .map(|row| {
+                    let (key, value) = row?;
+                    Ok((key.value().to_vec(), value.value().to_vec()))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            drop(items);
+            drop(values);
+            txn.commit()?;
+            retained
+        };
+        let mut events = backend.subscribe(&path).await?;
+        let result = backend
+            .write_append_tainted(&path, Value::integer(3), input_taint.clone())
+            .await?;
+        ensure!(result.taint == input_taint.clone().merged(&stored_taint));
+        let observed = backend.read_tainted(&path).await?;
+        ensure!(observed.value == Some(expected_value.clone()));
+        ensure!(observed.taint == stored_taint.clone().merged(&input_taint));
+        let event =
+            tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await??;
+        ensure!(matches!(&event, StateEvent::Append { item, .. } if item == &Value::integer(3)));
+        ensure!(event.taint() == &result.taint);
+        let txn = backend.db.begin_read()?;
+        let items = txn.open_table(crate::schema::STATE_LIST_ITEMS_TABLE)?;
+        ensure!(items.len()? == 4);
+        for (key, bytes) in retained {
+            ensure!(
+                items.get(key.as_slice())?.context("retained item")?.value() == bytes.as_slice()
+            );
+        }
+        let entries = backend.read_range(&path, 0, i64::MAX).await?;
+        ensure!(entries.len() == 2);
+        ensure!(entries[1].event == event);
+        let replay = backend.read_at(&path, entries[1].at_millis).await?;
+        ensure!(replay == observed);
+        drop(items);
+        drop(txn);
+        drop(events);
+        let idle = store.wait_idle();
+        drop(backend);
+        drop(store);
+        idle.await;
+    }
+    let store = RedbStore::open_with_history(&file, RedbHistory::Full)?;
+    let observed = store.state_backend().read_tainted(&path).await?;
+    ensure!(observed.value == Some(expected_value));
+    ensure!(observed.taint == stored_taint.merged(&input_taint));
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_replacement_preserves_recorded_duplicates_but_unions_observations()
+-> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let file = directory.path().join("list-set-provenance.redb");
+    let path = p("state://list/replacement")?;
+    let earlier = TaintSet::from_recorded_sources(vec![
+        xolotl_types::TaintSource::ModelOutput,
+        xolotl_types::TaintSource::ModelOutput,
+    ]);
+    let replacement = TaintSet::from_recorded_sources(vec![
+        xolotl_types::TaintSource::AuthorConstant,
+        xolotl_types::TaintSource::AuthorConstant,
+    ]);
+    {
+        let store = RedbStore::open(&file)?;
+        let backend = store.state_backend();
+        backend
+            .write_set_tainted(&path, Value::list(vec![Value::integer(1)]), earlier.clone())
+            .await?;
+        let commit = backend
+            .write_set_tainted(&path, Value::list(Vec::new()), replacement.clone())
+            .await?;
+        ensure!(commit.taint == replacement.clone().merged(&earlier));
+        ensure!(commit.taint.sources().len() == 3);
+        let current = backend.read_tainted(&path).await?;
+        ensure!(current.taint == replacement);
+        ensure!(current.value == Some(Value::list(Vec::new())));
+        let idle = store.wait_idle();
+        drop(backend);
+        drop(store);
+        idle.await;
+    }
+    let store = RedbStore::open(&file)?;
+    let current = store.state_backend().read_tainted(&path).await?;
+    ensure!(current.taint == replacement && current.taint.sources().len() == 2);
+    ensure!(current.value == Some(Value::list(Vec::new())));
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_lists_allocate_independent_items_only_on_append_after_reopen() -> anyhow::Result<()>
+{
+    let directory = tempfile::tempdir()?;
+    let file = directory.path().join("empty-list-ownership.redb");
+    let first = p("state://list/first")?;
+    let second = p("state://list/second")?;
+    {
+        let store = RedbStore::open(&file)?;
+        let backend = store.state_backend();
+        for path in [&first, &second] {
+            backend.write_set(path, Value::list(Vec::new())).await?;
+        }
+        let txn = backend.db.begin_read()?;
+        let meta = txn.open_table(crate::schema::STATE_LIST_META_TABLE)?;
+        ensure!(
+            meta.get(crate::schema::NEXT_STATE_LIST_ID)?
+                .context("List id counter")?
+                .value()
+                == 0
+        );
+        drop(meta);
+        drop(txn);
+        let idle = store.wait_idle();
+        drop(backend);
+        drop(store);
+        idle.await;
+    }
+    let store = RedbStore::open(&file)?;
+    let backend = store.state_backend();
+    backend.write_append(&first, Value::integer(1)).await?;
+    backend.write_append(&second, Value::integer(2)).await?;
+    ensure!(backend.read(&first).await? == Some(Value::list(vec![Value::integer(1)])));
+    ensure!(backend.read(&second).await? == Some(Value::list(vec![Value::integer(2)])));
+    let txn = backend.db.begin_read()?;
+    let items = txn.open_table(crate::schema::STATE_LIST_ITEMS_TABLE)?;
+    ensure!(items.len()? == 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordinary_list_count_is_not_a_source_admission_limit() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let file = directory.path().join("ordinary-large-list.redb");
+    let path = p("state://list/ordinary-capacity")?;
+    let count = xolotl_source::MAX_SINK_EVENTS + 1;
+    {
+        let store = RedbStore::open(&file)?;
+        let backend = store.state_backend();
+        backend
+            .write_set(
+                &path,
+                Value::from(
+                    (0..count)
+                        .map(|value| Value::integer(value as i64))
+                        .collect::<xolotl_types::ValueList>(),
+                ),
+            )
+            .await?;
+        backend
+            .write_append(&path, Value::integer(count as i64))
+            .await?;
+        let idle = store.wait_idle();
+        drop(backend);
+        drop(store);
+        idle.await;
+    }
+    let store = RedbStore::open(&file)?;
+    let observed = store.state_backend().read_tainted(&path).await?;
+    let values = observed
+        .value
+        .as_ref()
+        .and_then(Value::as_list)
+        .context("ordinary List")?;
+    ensure!(values.len() == count + 1);
+    ensure!(values.last().and_then(Value::as_int) == Some(count as i64));
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_store_keeps_current_values_without_history() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let file = directory.path().join("current-only.redb");
+    let path = p("state://history/current-only")?;
+    {
+        let store = RedbStore::open(&file)?;
+        let backend = store.state_backend();
+        let state = backend.into_backend();
+        ensure!(!state.has_history());
+        state
+            .write_set(&path, Value::list(vec![Value::integer(1)]))
+            .await?;
+        state.write_append(&path, Value::integer(2)).await?;
+        ensure!(matches!(
+            state
+                .history(&xolotl_state::StateHistoryQuery::new(
+                    path.clone(),
+                    0,
+                    i64::MAX
+                ))
+                .await,
+            Err(xolotl_state::StateFailure {
+                error: StateError::MissingCapability("history"),
+                ..
+            })
+        ));
+        ensure!(raw_history(&store.db)?.is_empty());
+        ensure!(history_millis(&store.db)? == 0);
+    }
+    let store = RedbStore::open(&file)?;
+    let direct = store.state_backend();
+    ensure!(matches!(
+        direct
+            .history(&xolotl_state::StateHistoryQuery::new(
+                path.clone(),
+                0,
+                i64::MAX
+            ))
+            .await,
+        Err(xolotl_state::StateFailure {
+            error: StateError::MissingCapability("history"),
+            ..
+        })
+    ));
+    ensure!(matches!(
+        direct.read_at(&path, 1).await,
+        Err(xolotl_state::StateFailure {
+            error: StateError::MissingCapability("history"),
+            ..
+        })
+    ));
+    ensure!(
+        direct.read_at(&path, 0).await?
+            == xolotl_state::StateObservation::from(TaintedValue::pristine(Value::list(vec![
+                Value::integer(1),
+                Value::integer(2),
+            ])))
+    );
+    ensure!(raw_history(&store.db)?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn set_and_read() -> anyhow::Result<()> {
     let b = tmp_backend()?;
     b.write_set(&p("state://x")?, Value::integer(42)).await?;
@@ -65,10 +345,85 @@ async fn read_missing_returns_none() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn bounded_point_read_rejects_raw_row_before_provenance_decode() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = RedbStore::open(dir.path().join("bounded.redb"))?;
+    let path = p("state://bounded/value")?;
+    let taint = TaintSet::of(xolotl_types::TaintSource::Protected { path: path.clone() });
+    let backend = store.state_backend();
+    backend
+        .write_set_tainted(&path, Value::bytes(vec![9; 4096]), taint.clone())
+        .await?;
+    let encoded_bytes = {
+        let txn = store.db.begin_read()?;
+        let table = txn.open_table(STATE_VALUES_TABLE)?;
+        path.to_string().len()
+            + table
+                .get(path.to_string().as_str())?
+                .context("missing persisted value")?
+                .value()
+                .len()
+    };
+    let too_small = NonZeroUsize::new(encoded_bytes - 1).context("smaller budget")?;
+    let failure = backend
+        .read_tainted_bounded(&path, too_small)
+        .await
+        .err()
+        .context("oversized point read succeeded")?;
+    ensure!(failure.taint.is_pristine());
+    let StateError::PointTooLarge(row) = failure.error else {
+        bail!("unexpected bounded point error")
+    };
+    ensure!(
+        row.path == path
+            && row.encoded_bytes == encoded_bytes
+            && row.limit_encoded_bytes == too_small
+            && !row.provenance_observed
+    );
+    let exact = NonZeroUsize::new(encoded_bytes).context("encoded size")?;
+    let value = backend.read_tainted_bounded(&path, exact).await?;
+    let value_value = value.value.clone().context("bounded exact read missing")?;
+    ensure!(value_value == Value::bytes(vec![9; 4096]) && value.taint == taint);
+    ensure!(
+        backend
+            .read_tainted_bounded(&p("state://bounded")?, NonZeroUsize::MIN)
+            .await?
+            .value
+            .is_none(),
+        "exact point read returned a descendant"
+    );
+
+    let corrupt = p("state://bounded/corrupt")?;
+    let mut raw = vec![b'x'; 4096];
+    raw[..4].copy_from_slice(b"XSV1");
+    raw[4..12].copy_from_slice(&4084_u64.to_le_bytes());
+    let txn = store.db.begin_write()?;
+    {
+        let mut table = txn.open_table(STATE_VALUES_TABLE)?;
+        table.insert(corrupt.to_string().as_str(), raw.as_slice())?;
+    }
+    txn.commit()?;
+    let failure = backend
+        .read_tainted_bounded(&corrupt, NonZeroUsize::new(1024).context("budget")?)
+        .await
+        .err()
+        .context("oversized malformed point read succeeded")?;
+    ensure!(matches!(failure.error, StateError::PointTooLarge(_)));
+    ensure!(failure.taint.is_pristine());
+    let malformed = backend
+        .read_tainted_bounded(&corrupt, NonZeroUsize::new(8192).context("larger budget")?)
+        .await
+        .err()
+        .context("malformed record decoded")?;
+    ensure!(matches!(malformed.error, StateError::Serde(_)));
+    Ok(())
+}
+
+#[tokio::test]
 async fn bare_value_encoding_is_rejected() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.keep().join("test.redb");
-    let store = RedbStore::open(path)?;
+    let store = RedbStore::open_with_history(path, RedbHistory::Full)?;
     {
         let txn = store.db.begin_write()?;
         {
@@ -102,7 +457,7 @@ async fn unsupported_records_are_rejected_without_rewriting_them() -> anyhow::Re
     history_key.push(0xff);
     history_key.extend_from_slice(&1_i64.to_be_bytes());
     {
-        let store = RedbStore::open(&file)?;
+        let store = RedbStore::open_with_history(&file, RedbHistory::Full)?;
         let txn = store.db.begin_write()?;
         txn.open_table(STATE_VALUES_TABLE)?
             .insert("state://unsupported/value", envelope.as_slice())?;
@@ -110,7 +465,7 @@ async fn unsupported_records_are_rejected_without_rewriting_them() -> anyhow::Re
             .insert(history_key.as_slice(), history.as_slice())?;
         txn.commit()?;
     }
-    let store = RedbStore::open(&file)?;
+    let store = RedbStore::open_with_history(&file, RedbHistory::Full)?;
     let backend = store.state_backend();
     ensure!(backend.read_tainted(&path).await.is_err());
     ensure!(backend.read_prefix_tainted(&path).await.is_err());
@@ -184,7 +539,7 @@ async fn append_creates_and_grows() -> anyhow::Result<()> {
 async fn history_keeps_multiple_events_for_same_path_in_one_millisecond() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.keep().join("test.redb");
-    let store = RedbStore::open(path)?;
+    let store = RedbStore::open_with_history(path, RedbHistory::Full)?;
     let state_path = p("state://history/collide")?;
     let txn = store.db.begin_write()?;
     RedbStateBackend::record_history_at_millis_in_txn(
@@ -210,6 +565,28 @@ async fn history_keeps_multiple_events_for_same_path_in_one_millisecond() -> any
     let backend = store.state_backend();
     let entries = backend.read_range(&state_path, 0, i64::MAX).await?;
     ensure!(entries.len() == 2, "unexpected entries: {entries:?}");
+    let mut query = xolotl_state::StateHistoryQuery::new(state_path.clone(), 0, i64::MAX);
+    query.limits.entries = NonZeroUsize::MIN;
+    let mut pages = backend.history_pages(query);
+    let mut paged = Vec::new();
+    while let Some(page) = pages.next().await? {
+        ensure!(page.entries.len() <= 1);
+        paged.extend(page.entries);
+        ensure!(paged.len() <= 2, "collision cursor repeated records");
+    }
+    ensure!(paged == entries, "collision pagination changed event order");
+    let floor = 1_700_000_000_001;
+    let trimmed = StateHistoryRetention::trim_before(
+        &backend,
+        floor,
+        xolotl_state::StateHistoryTrimLimits::default(),
+    )
+    .await?;
+    ensure!(trimmed.removed_events == 2);
+    ensure!(backend.read_at(&state_path, floor).await?.value == Some(Value::integer(2)));
+    let txn = store.db.begin_read()?;
+    ensure!(txn.open_table(STATE_HISTORY_TABLE)?.len()? == 0);
+    ensure!(txn.open_table(STATE_HISTORY_TIME_INDEX_TABLE)?.len()? == 0);
     Ok(())
 }
 
@@ -217,7 +594,7 @@ async fn history_keeps_multiple_events_for_same_path_in_one_millisecond() -> any
 async fn history_metadata_orders_writes_across_state_backends() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.keep().join("test.redb");
-    let store = RedbStore::open(path)?;
+    let store = RedbStore::open_with_history(path, RedbHistory::Full)?;
     let first = store.state_backend();
     let second = store.state_backend();
     let state_path = p("state://history/shared-clock")?;
@@ -246,7 +623,7 @@ async fn history_timestamps_survive_reopen_ahead_of_wall_clock() -> anyhow::Resu
     let path = p("state://history/reopen")?;
     let future_millis = i64::MAX - 16;
     {
-        let store = RedbStore::open(&file)?;
+        let store = RedbStore::open_with_history(&file, RedbHistory::Full)?;
         set_history_millis(&store.db, future_millis)?;
         store
             .state_backend()
@@ -254,7 +631,7 @@ async fn history_timestamps_survive_reopen_ahead_of_wall_clock() -> anyhow::Resu
             .await?;
         ensure!(history_millis(&store.db)? == future_millis + 1);
     }
-    let store = RedbStore::open(&file)?;
+    let store = RedbStore::open_with_history(&file, RedbHistory::Full)?;
     let backend = store.state_backend();
     ensure!(history_millis(&store.db)? == future_millis + 1);
     backend.write_set(&path, Value::integer(2)).await?;
@@ -285,7 +662,7 @@ fn new_and_empty_database_files_initialize_history_metadata() -> anyhow::Result<
     for precreated in [false, true] {
         let file = directory.path().join(format!("empty-{precreated}.redb"));
         if precreated {
-            drop(Database::create(&file)?);
+            drop(crate::open_database(file.clone())?);
         }
         let store = RedbStore::open(&file)?;
         ensure!(history_millis(&store.db)? == 0);
@@ -300,7 +677,7 @@ fn populated_partial_schema_is_rejected_without_metadata_backfill() -> anyhow::R
     let file = directory.path().join("partial-history.redb");
     let maximum = i64::MAX - 16;
     {
-        let db = Database::create(&file)?;
+        let db = crate::open_database(file.clone())?;
         let txn = db.begin_write()?;
         {
             let mut history = txn.open_table(STATE_HISTORY_TABLE)?;
@@ -322,7 +699,7 @@ fn populated_partial_schema_is_rejected_without_metadata_backfill() -> anyhow::R
         txn.commit()?;
     }
     ensure!(RedbStore::open(&file).is_err());
-    let db = Database::create(&file)?;
+    let db = Database::new(crate::open_database(file)?);
     let txn = db.begin_read()?;
     ensure!(matches!(
         txn.open_table(STATE_META_TABLE),
@@ -345,7 +722,7 @@ fn partial_schema_with_malformed_rows_is_not_initialized() -> anyhow::Result<()>
     {
         let file = directory.path().join(format!("malformed-{index}.redb"));
         {
-            let db = Database::create(&file)?;
+            let db = crate::open_database(file.clone())?;
             let txn = db.begin_write()?;
             {
                 let mut history = txn.open_table(STATE_HISTORY_TABLE)?;
@@ -357,7 +734,7 @@ fn partial_schema_with_malformed_rows_is_not_initialized() -> anyhow::Result<()>
             Ok(_store) => bail!("partial storage schema was accepted"),
             Err(error) => ensure!(error.to_string().contains("schema table missing")),
         }
-        let db = Database::create(&file)?;
+        let db = Database::new(crate::open_database(file.clone())?);
         let txn = db.begin_read()?;
         ensure!(matches!(
             txn.open_table(STATE_META_TABLE),
@@ -374,7 +751,7 @@ async fn initialized_open_retains_metadata_without_decoding_history_rows() -> an
     let file = directory.path().join("initialized-history.redb");
     let maximum = i64::MAX - 16;
     {
-        let store = RedbStore::open(&file)?;
+        let store = RedbStore::open_with_history(&file, RedbHistory::Full)?;
         set_history_millis(&store.db, maximum)?;
         let txn = store.db.begin_write()?;
         {
@@ -383,7 +760,7 @@ async fn initialized_open_retains_metadata_without_decoding_history_rows() -> an
         }
         txn.commit()?;
     }
-    let store = RedbStore::open(&file)?;
+    let store = RedbStore::open_with_history(&file, RedbHistory::Full)?;
     ensure!(history_millis(&store.db)? == maximum);
     let path = p("state://fresh/value")?;
     store
@@ -526,7 +903,8 @@ async fn merge_missing_path_uses_incoming_value() -> anyhow::Result<()> {
 #[test]
 fn concurrent_merges_across_adapters_keep_updates_and_provenance() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
-    let store = RedbStore::open(directory.path().join("merge.redb"))?;
+    let store =
+        RedbStore::open_with_history(directory.path().join("merge.redb"), RedbHistory::Full)?;
     let path = p("state://merge/concurrent")?;
     let taint = TaintSet::of(xolotl_types::TaintSource::Protected { path: path.clone() });
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
@@ -579,12 +957,10 @@ fn concurrent_merges_across_adapters_keep_updates_and_provenance() -> anyhow::Re
         }
         Ok(())
     })?;
-    let current = runtime
-        .block_on(backend.read_tainted(&path))?
-        .context("missing merged value")?;
+    let current = runtime.block_on(backend.read_tainted(&path))?;
+    let current_value = current.value.clone().context("missing merged value")?;
     ensure!(
-        current
-            .value
+        current_value
             .as_map()
             .context("merged value is not a map")?
             .len()
@@ -613,7 +989,7 @@ fn concurrent_merges_across_adapters_keep_updates_and_provenance() -> anyhow::Re
     runtime.block_on(backend.write_merge(&path, Value::integer(9), MergeRule::Deep))?;
     ensure!(
         runtime.block_on(backend.read_tainted(&path))?
-            == Some(TaintedValue::new(Value::integer(9), taint))
+            == xolotl_state::StateObservation::from(TaintedValue::new(Value::integer(9), taint))
     );
     Ok(())
 }
@@ -684,7 +1060,10 @@ async fn exhausted_history_rolls_back_value_taint_metadata_and_notifications() -
         })
     ));
     ensure!(backend.read(&missing).await?.is_none());
-    ensure!(backend.read_tainted(&path).await? == Some(TaintedValue::new(value, taint)));
+    ensure!(
+        backend.read_tainted(&path).await?
+            == xolotl_state::StateObservation::from(TaintedValue::new(value, taint))
+    );
     ensure!(raw_history(&backend.db)? == history);
     ensure!(history_millis(&backend.db)? == i64::MAX);
     ensure!(matches!(
@@ -799,6 +1178,7 @@ async fn read_range_includes_descendants_but_not_string_prefix_siblings() -> any
         .map(|entry| match entry.event {
             StateEvent::Set { path, .. } => path.to_string(),
             StateEvent::Append { path, .. } => path.to_string(),
+            StateEvent::DropPrefixAppend { path, .. } => path.to_string(),
             StateEvent::Delete { path, .. } => path.to_string(),
         })
         .collect();
@@ -838,7 +1218,7 @@ async fn independent_adapters_share_subscriptions_after_committed_writes() -> an
     let path = p("state://watched/shared")?;
     writer.write_set(&path, Value::integer(1)).await?;
     ensure!(
-        !reader.subs.is_initialized(),
+        !reader.publication.subscriptions().is_initialized(),
         "a write initialized unused subscriptions"
     );
     let mut events = reader.subscribe(&p("state://watched/**")?).await?;

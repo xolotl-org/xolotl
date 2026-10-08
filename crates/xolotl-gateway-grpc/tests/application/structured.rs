@@ -9,7 +9,7 @@ use anyhow::{Context, bail, ensure};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tonic::{Code, Streaming};
+use tonic::Streaming;
 use xolotl_gateway::{
     Gateway, GatewayCancelRequest, GatewayError, GatewayOutputDisclosurePolicy,
     GatewayOutputDisclosureRequest, GatewayOutputKind, PresentedCredential,
@@ -119,7 +119,7 @@ fn config() -> ApplicationGrpcConfig {
     }
 }
 
-fn submission(stream: bool) -> pb::SubmitRequest {
+fn submission(stream: bool, request_scope: &str) -> pb::SubmitRequest {
     pb::SubmitRequest {
         surface_id: "echo".into(),
         payload: Some(value_to_pb(&Value::null())),
@@ -131,6 +131,7 @@ fn submission(stream: bool) -> pb::SubmitRequest {
         provenance: None,
         options: Some(pb::SubmitOptions {
             idempotency_key: Some("structured-result".into()),
+            expected_request_scope: Some(request_scope.into()),
             ..Default::default()
         }),
     }
@@ -269,11 +270,12 @@ async fn unary_objects_preserve_program_results_typed_failures_and_cached_origin
         )
         .await?;
         let mut client = fixture.client().await?;
+        let request_scope = fixture.request_scope(&mut client).await?;
         let current = client
-            .submit(request(submission(false))?)
+            .submit(request(submission(false, &request_scope))?)
             .await?
             .into_inner()
-            .completion
+            .into_completion()
             .context("completion missing")?;
         ensure!(current.origin == pb::CompletionOrigin::CurrentAttempt as i32);
         let (reference, kind) = object(current.outcome.as_ref().context("outcome missing")?)?;
@@ -303,11 +305,54 @@ async fn unary_objects_preserve_program_results_typed_failures_and_cached_origin
                 ensure!(fields.get("detail").and_then(Value::as_str) == Some(detail.as_str()));
             }
         }
-        let cached = client
-            .submit(request(submission(false))?)
+        let lookup = pb::LookupRequestRequest {
+            surface_id: "echo".into(),
+            expected_request_scope: request_scope.clone(),
+            retry_epoch: 0,
+            identity: Some(pb::lookup_request_request::Identity::IdempotencyKey(
+                "structured-result".into(),
+            )),
+        };
+        use xolotl_gateway::GatewayIdempotencyStore;
+        let usage = fixture.idempotency.usage().await?;
+        let commits = fixture.probe.commits();
+        let writes = fixture.probe.writes();
+        let disclosures = policy
+            .kinds
+            .lock()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            .len();
+        let Some(pb::lookup_request_response::Evidence::Settled(summary)) = client
+            .lookup_request(request(lookup.clone())?)
             .await?
             .into_inner()
-            .completion
+            .evidence
+        else {
+            bail!("missing pure summary");
+        };
+        ensure!(
+            summary.result_class
+                == if matches!(outcome, Outcome::Fail(_)) {
+                    pb::RequestResultClass::Fail as i32
+                } else {
+                    pb::RequestResultClass::Done as i32
+                }
+        );
+        ensure!(fixture.idempotency.usage().await? == usage && fixture.probe.commits() == commits);
+        ensure!(fixture.probe.writes() == writes);
+        ensure!(
+            policy
+                .kinds
+                .lock()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?
+                .len()
+                == disclosures
+        );
+        let cached = client
+            .deliver_request_result(request(lookup)?)
+            .await?
+            .into_inner()
+            .into_completion()
             .context("cached completion missing")?;
         ensure!(cached.origin == pb::CompletionOrigin::CachedOutcome as i32);
         let (cached_reference, cached_kind) =
@@ -334,8 +379,9 @@ async fn a_stream_externalizes_each_large_item_and_keeps_its_real_final_outcome(
     )
     .await?;
     let mut client = fixture.client().await?;
+    let request_scope = fixture.request_scope(&mut client).await?;
     let mut output = client
-        .submit_output(request(submission(true))?)
+        .submit_output(request(submission(true, &request_scope))?)
         .await?
         .into_inner();
     ensure!(matches!(
@@ -374,12 +420,35 @@ async fn externalization_requires_host_installation_and_explicit_disclosure() ->
     )
     .await?;
     let mut client = fixture.client().await?;
-    let error = client
-        .submit(request(submission(false))?)
+    let request_scope = fixture.request_scope(&mut client).await?;
+    let unavailable = client
+        .submit(request(submission(false, &request_scope))?)
+        .await?
+        .into_inner();
+    ensure!(unavailable.accepted.is_some());
+    ensure!(
+        unavailable
+            .indeterminate()
+            .context("missing delivery uncertainty")?
+            .reason_code
+            == "response_encoding_failed"
+    );
+    ensure!(fixture.probe.commits() == 0);
+    let lookup = pb::LookupRequestRequest {
+        surface_id: "echo".into(),
+        expected_request_scope: request_scope.clone(),
+        retry_epoch: 0,
+        identity: Some(pb::lookup_request_request::Identity::IdempotencyKey(
+            "structured-result".into(),
+        )),
+    };
+    let unavailable_delivery = client
+        .deliver_request_result(request(lookup.clone())?)
         .await
         .err()
-        .context("unconfigured object output succeeded")?;
-    ensure!(error.code() == Code::ResourceExhausted && fixture.probe.commits() == 0);
+        .context("oversized delivery unexpectedly succeeded")?;
+    ensure!(unavailable_delivery.code() == tonic::Code::ResourceExhausted);
+    ensure!(driver.calls.load(Ordering::Acquire) == 1 && fixture.probe.commits() == 0);
     fixture.close().await?;
 
     let policy = Arc::new(Disclosure {
@@ -388,24 +457,43 @@ async fn externalization_requires_host_installation_and_explicit_disclosure() ->
     });
     let fixture = Fixture::with_effect(
         config(),
-        EffectOptions::unary(driver, Purity::Pure).with_disclosure(policy.clone()),
+        EffectOptions::unary(driver.clone(), Purity::Pure).with_disclosure(policy.clone()),
         None,
     )
     .await?;
     let mut client = fixture.client().await?;
-    let error = client
-        .submit(request(submission(false))?)
+    let request_scope = fixture.request_scope(&mut client).await?;
+    let denied = client
+        .submit(request(submission(false, &request_scope))?)
+        .await?
+        .into_inner();
+    ensure!(denied.accepted.is_some());
+    ensure!(
+        denied
+            .indeterminate()
+            .context("missing disclosure uncertainty")?
+            .reason_code
+            == "response_delivery_failed"
+    );
+    ensure!(fixture.probe.commits() == 1);
+    let lookup = pb::LookupRequestRequest {
+        expected_request_scope: request_scope.clone(),
+        ..lookup
+    };
+    let unavailable_delivery = client
+        .deliver_request_result(request(lookup)?)
         .await
         .err()
-        .context("denied object output succeeded")?;
-    ensure!(error.code() == Code::PermissionDenied && fixture.probe.commits() == 1);
+        .context("denied delivery unexpectedly succeeded")?;
+    ensure!(unavailable_delivery.code() == tonic::Code::PermissionDenied);
+    ensure!(driver.calls.load(Ordering::Acquire) == 2 && fixture.probe.commits() == 2);
     ensure!(fixture.files.pending_uploads() == 0);
     policy.deny.store(false, Ordering::Release);
     let completion = client
-        .submit(request(submission(false))?)
+        .submit(request(submission(false, &request_scope))?)
         .await?
         .into_inner()
-        .completion
+        .into_completion()
         .context("cached completion missing")?;
     ensure!(completion.origin == pb::CompletionOrigin::CachedOutcome as i32);
     let (reference, kind) = object(completion.outcome.as_ref().context("outcome missing")?)?;
@@ -433,7 +521,8 @@ async fn request_cancellation_and_deadline_advance_while_disclosure_is_pending()
         )
         .await?;
         let mut client = fixture.client().await?;
-        let mut input = submission(true);
+        let request_scope = fixture.request_scope(&mut client).await?;
+        let mut input = submission(true, &request_scope);
         if deadline {
             input
                 .options
@@ -501,9 +590,15 @@ async fn reset_during_object_encoding_reclaims_staging_and_transport_capacity() 
         },
     )
     .await?;
+    let mut client = fixture.client().await?;
+    let request_scope = fixture.request_scope(&mut client).await?;
     let raw = fixture.raw().await?;
     let mut rpc = raw
-        .request(OUTPUT_PATH, encode_frames(&[submission(true)])?, true)
+        .request(
+            OUTPUT_PATH,
+            encode_frames(&[submission(true, &request_scope)])?,
+            true,
+        )
         .await?;
     gate.wait().await?;
     ensure!(fixture.files.pending_uploads() == 1);
@@ -513,5 +608,71 @@ async fn reset_during_object_encoding_reclaims_staging_and_transport_capacity() 
     ensure!(fixture.files.pending_uploads() == 0 && fixture.probe.commits() == 0);
     drop(rpc);
     drop(raw);
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn uncertain_export_commit_does_not_change_original_settlement() -> anyhow::Result<()> {
+    use xolotl_gateway::GatewayIdempotencyStore;
+    let driver = Output::unary(Outcome::Done(Value::bytes(vec![7; 4096])));
+    let fixture = Fixture::with_effect_and_options(
+        config(),
+        EffectOptions::unary(driver.clone(), Purity::Effectful)
+            .with_disclosure(Arc::new(Disclosure::default())),
+        ProbeOptions {
+            uncertain_commit: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let mut client = fixture.client().await?;
+    let request_scope = fixture.request_scope(&mut client).await?;
+    let submitted = client
+        .submit(request(submission(false, &request_scope))?)
+        .await?
+        .into_inner();
+    ensure!(
+        submitted
+            .indeterminate()
+            .context("missing uncertain export")?
+            .reason_code
+            == "response_delivery_failed"
+    );
+    let lookup = pb::LookupRequestRequest {
+        surface_id: "echo".into(),
+        expected_request_scope: request_scope,
+        retry_epoch: 0,
+        identity: Some(pb::lookup_request_request::Identity::IdempotencyKey(
+            "structured-result".into(),
+        )),
+    };
+    let usage = fixture.idempotency.usage().await?;
+    let before = client
+        .lookup_request(request(lookup.clone())?)
+        .await?
+        .into_inner();
+    let Some(pb::lookup_request_response::Evidence::Settled(summary)) = &before.evidence else {
+        bail!("export uncertainty lost original settlement");
+    };
+    ensure!(
+        summary.accepted == submitted.accepted
+            && summary.result_class == pb::RequestResultClass::Done as i32
+    );
+    let delivered = client
+        .deliver_request_result(request(lookup.clone())?)
+        .await?
+        .into_inner();
+    ensure!(delivered.accepted == submitted.accepted);
+    ensure!(
+        delivered
+            .indeterminate()
+            .context("missing uncertain delivery commit")?
+            .reason_code
+            == "response_delivery_failed"
+    );
+    ensure!(client.lookup_request(request(lookup)?).await?.into_inner() == before);
+    ensure!(fixture.idempotency.usage().await? == usage);
+    ensure!(driver.calls.load(Ordering::Acquire) == 1 && fixture.probe.commits() == 2);
+    ensure!(fixture.files.pending_uploads() == 0);
     fixture.close().await
 }

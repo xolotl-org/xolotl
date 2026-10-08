@@ -16,20 +16,59 @@ use async_trait::async_trait;
 use xolotl_kernel::{Driver, DriverContext, DriverError, DriverOutput, MethodSpec};
 use xolotl_state::Backend;
 use xolotl_types::ValueView;
-use xolotl_types::{MethodId, Outcome, OutputMode, Purity, TaintSet, Value};
+use xolotl_types::{MethodId, Outcome, OutputMode, Purity, Value};
 
 /// Method names in registration order for `state://**`. The kernel derives the
 /// rights-bitmap bit and ReplayClass from each; `read` is an Observation,
-/// `write`/`append`/`delete` are effects on durable state. Event subscriptions
-/// are exposed by `effect://events/subscribe`, not by this generic state
-/// driver.
+/// `write`/`append`/`delete` are effects on durable state. Unary `subscribe`
+/// waits for a present complete current value on the exact bound path.
+/// Topic event streams are exposed by `effect://events/subscribe`.
 pub(crate) const STATE_METHODS: &[MethodSpec] = &[
-    MethodSpec::new("read", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external(),
-    MethodSpec::new("write", Purity::Idempotent, MethodSpec::UNARY_ASYNC),
-    MethodSpec::new("append", Purity::Effectful, MethodSpec::UNARY_ASYNC),
-    MethodSpec::new("delete", Purity::Idempotent, MethodSpec::UNARY_ASYNC),
-    MethodSpec::new("list", Purity::Pure, MethodSpec::UNARY_ASYNC).observes_external(),
-    MethodSpec::new("compare_set", Purity::Idempotent, MethodSpec::UNARY_ASYNC),
+    MethodSpec::new(
+        "read",
+        xolotl_types::MethodAuthority::Read,
+        Purity::Pure,
+        MethodSpec::UNARY_ASYNC,
+    )
+    .observes_external(),
+    MethodSpec::new(
+        "write",
+        xolotl_types::MethodAuthority::Write,
+        Purity::Idempotent,
+        MethodSpec::UNARY_ASYNC,
+    ),
+    MethodSpec::new(
+        "append",
+        xolotl_types::MethodAuthority::Write,
+        Purity::Effectful,
+        MethodSpec::UNARY_ASYNC,
+    ),
+    MethodSpec::new(
+        "delete",
+        xolotl_types::MethodAuthority::Write,
+        Purity::Idempotent,
+        MethodSpec::UNARY_ASYNC,
+    ),
+    MethodSpec::new(
+        "list",
+        xolotl_types::MethodAuthority::Read,
+        Purity::Pure,
+        MethodSpec::UNARY_ASYNC,
+    )
+    .observes_external(),
+    MethodSpec::new(
+        "compare_set",
+        xolotl_types::MethodAuthority::Write,
+        Purity::Idempotent,
+        MethodSpec::UNARY_ASYNC,
+    ),
+    MethodSpec::new(
+        "subscribe",
+        xolotl_types::MethodAuthority::Subscribe,
+        Purity::Pure,
+        xolotl_types::OutputModeSet::UNARY,
+    )
+    .observes_external(),
 ];
 
 /// Drives `state://**` over the kernel's state [`Backend`].
@@ -68,10 +107,8 @@ impl StateDriver {
                     .read_tainted(&path)
                     .await
                     .map_err(ObservedFailure::from)?;
-                let (value, taint) = match tv {
-                    Some(tv) => (tv.value, tv.taint),
-                    None => (Value::null(), TaintSet::pristine()),
-                };
+                let value = tv.value.unwrap_or_else(Value::null);
+                let taint = tv.taint;
                 Ok(DriverOutput::new(Outcome::Done(value)).with_taint(taint))
             }
             // write: set the value, persisting the operation's input taint
@@ -97,25 +134,33 @@ impl StateDriver {
             3 => {
                 let commit = self
                     .state
-                    .write_delete(&path)
+                    .write_delete_tainted(&path, ctx.taint.clone())
                     .await
                     .map_err(ObservedFailure::from)?;
                 Ok(DriverOutput::new(Outcome::Done(Value::null())).with_taint(commit.taint))
             }
             // list: return one bounded page under the bound prefix.
             4 => {
+                if path.cluster().is_none()
+                    && path.scheme() == "state"
+                    && path.segments().is_empty()
+                {
+                    return Err(DriverError::InvalidInput(
+                        "state root collection contains reserved namespaces".into(),
+                    )
+                    .into());
+                }
                 let query = state_scan(path, input)?;
                 let page = self
                     .state
                     .query(&query)
                     .await
                     .map_err(ObservedFailure::from)?;
-                let mut taint = page.taint;
+                let taint = page.taint;
                 let values = page
                     .entries
                     .into_iter()
                     .map(|(p, tv)| {
-                        taint.union(&tv.taint);
                         let mut m = std::collections::BTreeMap::new();
                         m.insert("path".into(), Value::string(p.to_string()));
                         m.insert("value".into(), tv.value);
@@ -155,7 +200,49 @@ impl StateDriver {
                     .map_err(ObservedFailure::from)?;
                 Ok(DriverOutput::new(Outcome::Done(Value::boolean(true))).with_taint(commit.taint))
             }
+            6 => self.wait_signal(&path).await,
             _ => Err(DriverError::NoSuchMethod(method).into()),
+        }
+    }
+
+    async fn wait_signal(
+        &self,
+        path: &xolotl_types::Path,
+    ) -> Result<DriverOutput, ObservedFailure> {
+        // The paired port registers before reading from the same commit domain.
+        // Dropping the driver future releases the observer; the owning
+        // operation supplies cancellation.
+        let (current, mut events) = self
+            .state
+            .observe_signal(path)
+            .await
+            .map_err(ObservedFailure::from)?;
+        let mut observed = current.taint;
+        if let Some(value) = current.value {
+            return Ok(DriverOutput::new(Outcome::Done(value)).with_taint(observed));
+        }
+        loop {
+            match events.recv().await {
+                Ok(event) if event.path() != path => continue,
+                Ok(event) => {
+                    observed.union(event.taint());
+                    let current = self
+                        .state
+                        .observe_signal_current(path)
+                        .await
+                        .map_err(|error| ObservedFailure::from(error).with_taint(&observed))?;
+                    observed.union(&current.taint);
+                    if let Some(value) = current.value {
+                        return Ok(DriverOutput::new(Outcome::Done(value)).with_taint(observed));
+                    }
+                }
+                Err(error) => {
+                    return Err(ObservedFailure::from(DriverError::Other(format!(
+                        "state subscription failed: {error}"
+                    )))
+                    .with_taint(&observed));
+                }
+            }
         }
     }
 }

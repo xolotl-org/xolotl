@@ -56,13 +56,18 @@ impl GatewayOutputChunk {
         Ok(())
     }
 
-    #[cfg(feature = "structured-output")]
-    pub(crate) fn validate_delivery(&self) -> Result<(), GatewayError> {
+    /// Recheck the original session and surface against the current profile,
+    /// as well as cancellation and expiry. Call after the last asynchronous
+    /// projection and before disclosing this borrowed chunk. Denial does not
+    /// erase already committed effects or authorize re-execution.
+    pub fn validate_delivery(&self) -> Result<(), GatewayError> {
+        self.lease.delivery.validate()?;
         if self.lease.output_interruption().is_some() {
             return Err(GatewayError::Rejected(
                 "output request was interrupted".into(),
             ));
         }
+        let now = self.lease.registry.host.now();
         let inner = self.lease.registry.inner.lock();
         let entry = inner
             .entries
@@ -70,9 +75,10 @@ impl GatewayOutputChunk {
             .ok_or_else(|| {
                 GatewayError::Rejected("output request is no longer available".into())
             })?;
-        if entry
-            .deadline
-            .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+        if entry.state == crate::GatewayRequestState::Running
+            && entry
+                .deadline
+                .is_some_and(|deadline| deadline.elapsed_at(now).unwrap_or(true))
         {
             return Err(GatewayError::Rejected(
                 "output request deadline expired".into(),
@@ -83,6 +89,8 @@ impl GatewayOutputChunk {
 
     /// Acknowledge the chunk and transfer its envelope to the caller.
     /// Retention after this call is outside the kernel and Gateway windows.
+    /// Call [`Self::validate_delivery`] immediately before disclosure; ownership
+    /// transfer alone is not authorization to deliver the value.
     pub fn into_value(self) -> TaintedValue {
         let Self { chunk, lease } = self;
         let value = chunk.into_value();
@@ -105,6 +113,7 @@ pub enum GatewayOutputEvent {
 /// remaining execution. Admission and window capacity remain reserved while
 /// the response or any borrowed output chunks still own them.
 pub struct GatewayOutputStream {
+    delivery: Arc<crate::GatewaySubmissionAuthority>,
     accepted: GatewayAccepted,
     execution: Option<SubmissionExecution>,
     receiver: Option<StreamReceiver>,
@@ -115,7 +124,10 @@ pub struct GatewayOutputStream {
 }
 
 impl GatewayOutputStream {
-    pub(super) fn start(prepared: PreparedSubmission, window: StreamWindow) -> Self {
+    pub(super) fn start(
+        prepared: PreparedSubmission,
+        window: StreamWindow,
+    ) -> Result<Self, GatewayError> {
         let accepted = prepared.accepted.clone();
         let lease = prepared.request_guard.lease.clone();
         let (sink, receiver) = channel(window);
@@ -130,18 +142,23 @@ impl GatewayOutputStream {
             router: Arc::new(SingleOperationRouter(Mutex::new(Some(sink)))),
             state,
         };
-        Self {
+        Ok(Self {
+            delivery: lease.delivery.clone(),
             accepted,
-            execution: Some(prepared.execute(Some(port))),
+            execution: Some(prepared.execute(Some(port))?),
             receiver: Some(receiver),
             result: None,
             ended: false,
             lease: Some(lease),
-        }
+        })
     }
 
-    pub(super) fn replay(result: GatewaySubmitResult) -> Self {
+    pub(super) fn replay(
+        result: GatewaySubmitResult,
+        delivery: Arc<crate::GatewaySubmissionAuthority>,
+    ) -> Self {
         Self {
+            delivery,
             accepted: result.accepted.clone(),
             execution: None,
             receiver: None,
@@ -152,8 +169,16 @@ impl GatewayOutputStream {
     }
 
     /// Metadata issued only after admission and input receipt consumption.
+    /// This borrowed metadata is not delivery authorization. Before disclosing
+    /// it, call [`Self::validate_delivery`] at actual emission.
     pub fn accepted(&self) -> &GatewayAccepted {
         &self.accepted
+    }
+
+    /// Reauthorize disclosure under the current runtime profile. Failure only
+    /// withholds delivery; execution and committed effects are not rolled back.
+    pub fn validate_delivery(&self) -> Result<(), GatewayError> {
+        self.delivery.validate()
     }
 
     /// Receive the next item without allocating a receive future.
@@ -214,6 +239,9 @@ impl GatewayOutputStream {
             match receiver.poll_recv(cx) {
                 Poll::Ready(Some(StreamItem::Chunk(chunk))) => {
                     if lease.output_interruption().is_none() {
+                        if let Err(error) = self.delivery.validate() {
+                            return Poll::Ready(Some(Err(error)));
+                        }
                         return Poll::Ready(Some(Ok(GatewayOutputEvent::Chunk(
                             GatewayOutputChunk {
                                 chunk,
@@ -234,6 +262,9 @@ impl GatewayOutputStream {
             return Poll::Pending;
         };
         self.ended = true;
+        if let Err(error) = self.delivery.validate() {
+            return Poll::Ready(Some(Err(error)));
+        }
         Poll::Ready(Some(result.map(GatewayOutputEvent::Complete)))
     }
 }

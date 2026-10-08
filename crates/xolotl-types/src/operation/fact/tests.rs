@@ -15,6 +15,7 @@ fn fact(input: Value, outcome: Option<Value>) -> Fact {
         ),
         schema_version: Fact::SCHEMA_VERSION,
         caller: ProcessId::new(2),
+        caller_identity: Some(IdentityRef::ROOT),
         acting: IdentityRef::ROOT,
         handle: HandleId::new(0, 1),
         resource: ResourceId::new(7),
@@ -27,6 +28,43 @@ fn fact(input: Value, outcome: Option<Value>) -> Fact {
         replay: ReplayClass::Deterministic,
         timestamp: Timestamp::millis(123),
     }
+}
+
+#[test]
+fn caller_identity_round_trips_known_and_explicitly_unknown_values() -> anyhow::Result<()> {
+    for identity in [
+        None,
+        Some(IdentityRef::ROOT),
+        Some(IdentityRef::new(u64::MAX)),
+    ] {
+        let mut record = fact(Value::null(), None);
+        record.caller_identity = identity;
+        let encoded = serde_json::to_value(&record)?;
+        ensure!(encoded.get("caller_identity") == Some(&serde_json::to_value(identity)?));
+        let decoded: Fact = serde_json::from_slice(&serde_json::to_vec(&record)?)?;
+        ensure!(decoded == record);
+        ensure!(decoded.caller_identity == identity);
+        ensure!(serde_json::to_value(decoded)? == encoded);
+    }
+    Ok(())
+}
+
+#[test]
+fn caller_identity_rejects_malformed_values() -> anyhow::Result<()> {
+    let original = serde_json::to_value(fact(Value::null(), None))?;
+    for value in [
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!("1"),
+        serde_json::json!(true),
+        serde_json::json!({}),
+        serde_json::json!([]),
+    ] {
+        let mut invalid = original.clone();
+        invalid["caller_identity"] = value;
+        ensure!(serde_json::from_value::<Fact>(invalid).is_err());
+    }
+    Ok(())
 }
 
 #[test]
@@ -103,7 +141,7 @@ fn input_outcome_and_batch_share_one_resident_graph_after_decode() -> anyhow::Re
 #[test]
 fn media_values_retain_their_complete_descriptors() -> anyhow::Result<()> {
     let blob = BlobRef {
-        hash: "0123456789abcdef".repeat(4),
+        hash: "0123456789abcdef".repeat(6),
         size: u64::MAX,
         mime: Some("application/x-full-descriptor".into()),
     };
@@ -129,7 +167,7 @@ fn media_values_retain_their_complete_descriptors() -> anyhow::Result<()> {
 }
 
 #[test]
-fn invalid_roots_and_missing_taint_are_rejected() -> anyhow::Result<()> {
+fn invalid_roots_and_missing_required_fields_are_rejected() -> anyhow::Result<()> {
     let original = serde_json::to_value(overlapping())?;
     for pointer in [
         "/input",
@@ -144,7 +182,7 @@ fn invalid_roots_and_missing_taint_are_rejected() -> anyhow::Result<()> {
             .context("invalid root was accepted")?;
         ensure!(error.to_string().contains("root"));
     }
-    for field in ["input", "outcome", "taint", "values"] {
+    for field in ["caller_identity", "input", "outcome", "taint", "values"] {
         let mut invalid = original.clone();
         drop(
             invalid

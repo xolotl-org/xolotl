@@ -4,15 +4,8 @@ use super::*;
 use std::ops::Range;
 use xolotl_core::Execution;
 
-#[cfg(feature = "durable")]
-mod checkpoint;
-#[cfg(feature = "durable")]
-pub(in crate::executor) use checkpoint::ArenaSnapshot;
-
 #[derive(Clone)]
 pub(super) struct ProgramArena {
-    #[cfg(feature = "durable")]
-    base: Extents,
     nodes: RangePool,
     imports: RangePool,
     bindings: RangePool,
@@ -21,23 +14,12 @@ pub(super) struct ProgramArena {
 
 #[derive(Clone)]
 struct Fragment {
-    #[cfg(feature = "durable")]
-    id: [u8; 32],
     entry: u32,
     nodes: Range<usize>,
     imports: Range<usize>,
     bindings: Range<usize>,
     requirements: ResourceRequirements,
     live: bool,
-}
-
-#[cfg(feature = "durable")]
-#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Extents {
-    nodes: usize,
-    imports: usize,
-    bindings: usize,
 }
 
 /// Sorted, coalescing gaps. Empty and tail allocations do not allocate metadata.
@@ -134,9 +116,6 @@ impl MachineProgram {
         max_instructions: usize,
         max_bindings: usize,
     ) -> Result<u32, Failure> {
-        if program.inner.durable && !self.durable {
-            return Err(machine_error("a durable module requires a durable caller"));
-        }
         if program.inner.arena.is_some() {
             return Err(machine_error(
                 "a loaded module must be an independent program",
@@ -166,12 +145,6 @@ impl MachineProgram {
         self.requirements()?;
         let arena = self.arena.get_or_insert_with(|| {
             Box::new(ProgramArena {
-                #[cfg(feature = "durable")]
-                base: Extents {
-                    nodes: self.nodes.len(),
-                    imports: self.imports.len(),
-                    bindings: self.bindings,
-                },
                 nodes: RangePool::new(self.nodes.len()),
                 imports: RangePool::new(self.imports.len()),
                 bindings: RangePool::new(self.bindings),
@@ -229,8 +202,6 @@ impl MachineProgram {
         arena.fragments.insert(
             index,
             Fragment {
-                #[cfg(feature = "durable")]
-                id: fragment.id,
                 entry,
                 nodes,
                 imports,
@@ -314,9 +285,6 @@ fn relocate(
 ) {
     if let Some(next) = &mut node.next {
         *next += code;
-    }
-    if let Some(save) = &mut node.save {
-        *save += bindings;
     }
     match &mut node.kind {
         Code::Input | Code::Literal(_) | Code::Fail(_) => {}
@@ -442,21 +410,20 @@ mod tests {
             &compile_do(&DoNode::pure(Value::null()))?,
             &crate::ExecutionConfig::default(),
         )?;
-        let first = program.append(&fragment(11)?, 7, 2)?;
-        let second = program.append(&fragment(22)?, 7, 2)?;
+        let max_instructions = 1 + 2 * fragment(11)?.nodes.len();
+        let first = program.append(&fragment(11)?, max_instructions, 2)?;
+        let second = program.append(&fragment(22)?, max_instructions, 2)?;
         let live = program.nodes[second as usize..].to_vec();
         let position = program.nodes[first as usize].position;
         program.discard(first);
         ensure!(
             program.nodes[first as usize..second as usize]
                 .iter()
-                .all(|node| {
-                    matches!(node.kind, Code::Input) && node.next.is_none() && node.save.is_none()
-                })
+                .all(|node| { matches!(node.kind, Code::Input) && node.next.is_none() })
         );
         ensure!(matches!(program.imports[0], Import::Vacant));
         program.image().validate()?;
-        let third = program.append(&fragment(33)?, 7, 2)?;
+        let third = program.append(&fragment(33)?, max_instructions, 2)?;
         ensure!(third == first);
         ensure!(program.nodes[second as usize..] == live);
         ensure!(program.nodes[third as usize].position == position);
@@ -482,9 +449,10 @@ mod tests {
             &compile_do(&DoNode::pure(Value::null()))?,
             &crate::ExecutionConfig::default(),
         )?;
-        let first = program.append(&fragment(11)?, 7, 1)?;
+        let max_instructions = 1 + 2 * fragment(11)?.nodes.len();
+        let first = program.append(&fragment(11)?, max_instructions, 1)?;
         let code = program.nodes.clone();
-        let error = program.append(&fragment(22)?, 7, 1);
+        let error = program.append(&fragment(22)?, max_instructions, 1);
         ensure!(
             matches!(error, Err(Failure::PolicyViolation { detail, .. }) if detail.contains("binding capacity"))
         );
@@ -494,7 +462,7 @@ mod tests {
         ensure!(arena.imports.end == program.imports.len());
         ensure!(arena.bindings.end == program.bindings && arena.fragments.len() == 1);
         program.discard(first);
-        ensure!(program.append(&fragment(33)?, 4, 1)? == first);
+        ensure!(program.append(&fragment(33)?, 1 + fragment(33)?.nodes.len(), 1)? == first);
         program.image().validate()?;
         Ok(())
     }

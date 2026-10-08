@@ -34,8 +34,20 @@ use count::DeliveryCount;
 /// one as a separate `effect://events/<method>` Resource with public method
 /// `invoke`.
 pub(crate) const EVENTS_METHODS: &[MethodSpec] = &[
-    MethodSpec::new("publish", Purity::Effectful, MethodSpec::UNARY_ASYNC).finalize_allowed(),
-    MethodSpec::new("subscribe", Purity::Pure, MethodSpec::STREAM_ASYNC).observes_external(),
+    MethodSpec::new(
+        "publish",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Effectful,
+        MethodSpec::UNARY_ASYNC,
+    )
+    .finalize_allowed(),
+    MethodSpec::new(
+        "subscribe",
+        xolotl_types::MethodAuthority::Perform,
+        Purity::Pure,
+        MethodSpec::STREAM_ASYNC,
+    )
+    .observes_external(),
 ];
 
 /// Drives the event bus actions.
@@ -109,6 +121,7 @@ impl EventBusDriver {
             }
             let (value, taint) = match event {
                 StateEvent::Append { item, taint, .. }
+                | StateEvent::DropPrefixAppend { item, taint, .. }
                 | StateEvent::Set {
                     value: item, taint, ..
                 } => (item, taint),

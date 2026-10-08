@@ -39,9 +39,9 @@ fn every_failure_variant_has_exactly_its_serde_value_shape() -> anyhow::Result<(
         },
         Failure::Timeout,
         Failure::Cancelled,
-        Failure::Quarantined {
-            op_id: "op-7".into(),
-            reason: "unknown completion".into(),
+        Failure::OutcomeUnknown {
+            operation_ids: vec!["1/2/3/4/0".into(), "1/2/4/5/0".into()],
+            reason: "delivery_or_session_lost".into(),
         },
         Failure::InvalidInput {
             reason: "输入无效".into(),
@@ -149,12 +149,9 @@ fn path_text_uses_the_canonical_formatter_for_every_shape() -> anyhow::Result<()
             .try_with_cluster("remote")?
             .try_push_literal("a")?
             .try_push_literal("b")?,
-        // A path-invalid diagnostic may carry unchecked path components.
-        Path::new("state")
-            .with_cluster("remote")
-            .push("雪")
-            .push("")
-            .push("x/y"),
+        Path::try_new("state")?
+            .try_with_cluster("remote")?
+            .try_push_literal("entry")?,
     ] {
         ensure!(path.canonical_parts().collect::<String>() == path.to_string());
         let failure = Failure::NoHandler { path };

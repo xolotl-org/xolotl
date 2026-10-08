@@ -1,6 +1,9 @@
 //! Folded input streams enter the same owned execution as direct submissions.
 
-use super::idempotency::finish_request_release_idempotency_and_fail;
+use super::idempotency::{
+    SubmissionIdempotency, finish_request_output, finish_request_release_idempotency_and_fail,
+    required_idempotency_material, reserve_submission_idempotency_if_present,
+};
 use super::{PreparedSubmission, entry_taint};
 use crate::{
     GatewayAcceptedInputStream, GatewayDirectInput, GatewayError, GatewayPayloadProvenance,
@@ -9,6 +12,18 @@ use crate::{
 };
 
 pub(crate) async fn complete_input_stream(
+    runtime: &GatewayRuntime,
+    stream: GatewayAcceptedInputStream,
+    payload: Value,
+    provenance: Option<GatewayPayloadProvenance>,
+) -> Result<GatewaySubmitResult, GatewayError> {
+    let delivery = stream.request_guard.lease.delivery.clone();
+    let result = complete_input_stream_inner(runtime, stream, payload, provenance).await;
+    delivery.validate()?;
+    result
+}
+
+async fn complete_input_stream_inner(
     runtime: &GatewayRuntime,
     stream: GatewayAcceptedInputStream,
     payload: Value,
@@ -23,8 +38,7 @@ pub(crate) async fn complete_input_stream(
         requested_output,
         options,
         deadline,
-        idempotency,
-        request_guard,
+        mut request_guard,
         request_process,
         executor,
         ..
@@ -37,6 +51,53 @@ pub(crate) async fn complete_input_stream(
         }),
         requested_output,
         options,
+        // The stream-open admission already froze and stored the combined deadline.
+        server_deadline: None,
+    };
+    // Stream-open admission cannot authorize a later replay after its request
+    // expires or is cancelled while the transport folds input chunks.
+    request_guard.ensure_live(runtime, deadline)?;
+    // Only the folded submission has the complete payload fingerprint. The
+    // stream-open declaration cannot authorize a cached result on its own.
+    let material = match required_idempotency_material(&submission) {
+        Ok(material) => material,
+        Err(error) => {
+            return finish_request_release_idempotency_and_fail(
+                &runtime.boot,
+                request_process,
+                None,
+                error,
+            )
+            .await;
+        }
+    };
+    let idempotency = match reserve_submission_idempotency_if_present(
+        &runtime.idempotency,
+        &profile,
+        &session,
+        &submission,
+        material,
+        runtime.boot.kernel().host_runtime().now_millis(),
+    )
+    .await
+    {
+        Ok(Some(SubmissionIdempotency::Replay(mut result))) => {
+            request_guard.ensure_live(runtime, deadline)?;
+            finish_request_output(&runtime.boot, request_process, &mut result.output).await?;
+            request_guard.finish()?;
+            return Ok(*result);
+        }
+        Ok(Some(SubmissionIdempotency::Reserved(reservation))) => Some(reservation),
+        Ok(None) => None,
+        Err(error) => {
+            return finish_request_release_idempotency_and_fail(
+                &runtime.boot,
+                request_process,
+                None,
+                error,
+            )
+            .await;
+        }
     };
     let LoweredSubmission {
         program,
@@ -73,19 +134,28 @@ pub(crate) async fn complete_input_stream(
             .await;
         }
     };
-    if admission.requires_idempotency && idempotency.is_none() {
+    if (admission.requires_idempotency || objects.requires_idempotency()) && idempotency.is_none() {
         return finish_request_release_idempotency_and_fail(
             &runtime.boot,
             request_process,
             idempotency.as_deref(),
             GatewayError::Rejected(
-                "idempotency_key or submission_token is required for non-idempotent effects".into(),
+                "idempotency_key or submission_token is required for non-idempotent effects and single-use objects".into(),
             ),
         )
         .await;
     }
+    let object_identity = idempotency
+        .as_deref()
+        .map(|reservation| reservation.effect_identity());
     let object_taint = match request_guard
-        .commit_objects(runtime, &session, objects, deadline)
+        .commit_objects(
+            runtime,
+            &session,
+            objects,
+            deadline,
+            object_identity.as_deref(),
+        )
         .await
     {
         Ok(taint) => taint,
@@ -113,7 +183,7 @@ pub(crate) async fn complete_input_stream(
         program,
         entry_taint,
     }
-    .execute(None)
+    .execute(None)?
     .complete()
     .await
 }

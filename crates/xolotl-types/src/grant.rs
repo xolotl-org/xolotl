@@ -14,7 +14,11 @@
 use crate::cap::Capability;
 use crate::ids::{GrantId, ProcessId};
 use crate::value::Value;
-use alloc::{string::ToString, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 
@@ -38,11 +42,11 @@ macro_rules! bitflags_serde_bits {
 }
 
 bitflags::bitflags! {
-    /// Method bitmap: which methods of a Resource's interface this
-    /// grant authorizes. `O(1)` subset check at `open()` and on the hot path.
+    /// Method bitmap in a resolved Resource contract. Handles and open
+    /// requests use this compiled form; Grants use stable method names.
     ///
-    /// Methods are assigned bit positions per-interface at admission time; the
-    /// bitmap is interpreted relative to the Resource's interface method order.
+    /// Methods are assigned bit positions across the Resource's interfaces in
+    /// declaration order. Admission rejects more than 64 methods in that set.
     #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
     pub struct MethodBitmap: u64 {
         /// No methods.
@@ -54,9 +58,9 @@ bitflags::bitflags! {
 bitflags_serde_bits!(MethodBitmap, u64);
 
 impl MethodBitmap {
-    /// Bit for method index `i` (its position in the interface's method list).
+    /// Bit for method index `i` (its position in the resource's combined method list).
     pub fn method(i: u32) -> Self {
-        debug_assert!(i < 64, "interfaces are limited to 64 methods");
+        debug_assert!(i < 64, "resources are limited to 64 methods");
         MethodBitmap::from_bits_retain(1u64 << i)
     }
 
@@ -70,6 +74,156 @@ impl MethodBitmap {
     /// parent's methods.
     pub fn is_subset_of(self, other: MethodBitmap) -> bool {
         other.contains(self)
+    }
+}
+
+/// Method authority carried by a Grant before a Resource contract is opened.
+/// Named methods survive interface reordering; only `all()` deliberately
+/// includes methods added by a later resource relink.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GrantMethods(GrantMethodSelection);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum GrantMethodSelection {
+    None,
+    All,
+    Names(Arc<[String]>),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", content = "names", rename_all = "snake_case")]
+enum GrantMethodsWire {
+    None,
+    All,
+    Names(Vec<String>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "names", rename_all = "snake_case")]
+enum GrantMethodsRef<'a> {
+    None,
+    All,
+    Names(&'a [String]),
+}
+
+impl Serialize for GrantMethods {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.0 {
+            GrantMethodSelection::None => GrantMethodsRef::None.serialize(serializer),
+            GrantMethodSelection::All => GrantMethodsRef::All.serialize(serializer),
+            GrantMethodSelection::Names(names) => {
+                GrantMethodsRef::Names(names.as_ref()).serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GrantMethods {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match GrantMethodsWire::deserialize(deserializer)? {
+            GrantMethodsWire::None => Self::none(),
+            GrantMethodsWire::All => Self::all(),
+            GrantMethodsWire::Names(names) => Self::names(names),
+        })
+    }
+}
+
+impl GrantMethods {
+    /// Grant no callable methods; propagation flags may still be granted.
+    pub const fn none() -> Self {
+        Self(GrantMethodSelection::None)
+    }
+
+    /// Explicitly grant every matching method, including future methods.
+    pub const fn all() -> Self {
+        Self(GrantMethodSelection::All)
+    }
+
+    /// Grant these stable method names. Order and duplicates are normalized.
+    pub fn names<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut names: Vec<String> = names.into_iter().map(Into::into).collect();
+        names.sort_unstable();
+        names.dedup();
+        if names.is_empty() {
+            Self::none()
+        } else {
+            Self(GrantMethodSelection::Names(names.into()))
+        }
+    }
+
+    /// Grant one stable method name.
+    pub fn name(name: impl Into<String>) -> Self {
+        Self(GrantMethodSelection::Names(Arc::from([name.into()])))
+    }
+
+    /// Whether this grants no callable methods.
+    pub fn is_empty(&self) -> bool {
+        matches!(self.0, GrantMethodSelection::None)
+    }
+
+    /// Whether a method in the selected Resource contract is covered.
+    pub fn allows(&self, name: &str) -> bool {
+        match &self.0 {
+            GrantMethodSelection::None => false,
+            GrantMethodSelection::All => true,
+            GrantMethodSelection::Names(names) => names
+                .binary_search_by(|candidate| candidate.as_str().cmp(name))
+                .is_ok(),
+        }
+    }
+
+    /// Explicit stable names, if this is not an open-ended `all` selection.
+    /// `none` returns an empty slice.
+    pub fn selected_names(&self) -> Option<&[String]> {
+        match &self.0 {
+            GrantMethodSelection::None => Some(&[]),
+            GrantMethodSelection::All => None,
+            GrantMethodSelection::Names(names) => Some(names.as_ref()),
+        }
+    }
+
+    /// Compile a requested bitmap against one Resource's current method list.
+    /// Unknown bit positions fail closed. Callers also check the request verb.
+    pub fn covers_bitmap(&self, requested: MethodBitmap, methods: &[crate::Method]) -> bool {
+        let mut bits = requested.bits();
+        while bits != 0 {
+            let index = bits.trailing_zeros() as usize;
+            let Some(method) = methods.get(index) else {
+                return false;
+            };
+            if !self.allows(&method.name) {
+                return false;
+            }
+            bits &= bits - 1;
+        }
+        true
+    }
+
+    /// Whether this selection attenuates another Grant's method selection.
+    pub fn is_subset_of(&self, parent: &Self) -> bool {
+        match (&self.0, &parent.0) {
+            (GrantMethodSelection::None, _) | (_, GrantMethodSelection::All) => true,
+            (GrantMethodSelection::All, _) | (_, GrantMethodSelection::None) => false,
+            (GrantMethodSelection::Names(child), GrantMethodSelection::Names(parent)) => {
+                child.iter().all(|name| parent.binary_search(name).is_ok())
+            }
+        }
+    }
+
+    /// Union two selections while preserving their explicit future-method policy.
+    pub fn union(&self, other: &Self) -> Self {
+        match (&self.0, &other.0) {
+            (GrantMethodSelection::All, _) | (_, GrantMethodSelection::All) => Self::all(),
+            (GrantMethodSelection::None, _) => other.clone(),
+            (_, GrantMethodSelection::None) => self.clone(),
+            (GrantMethodSelection::Names(left), GrantMethodSelection::Names(right)) => {
+                Self::names(left.iter().chain(right.iter()).cloned())
+            }
+        }
     }
 }
 
@@ -116,8 +270,8 @@ impl DeriveKind {
     }
 }
 
-/// The methods + derivation flags a grant authorizes.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Compiled method bits and derivation flags on an open request or Handle.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct Rights {
     /// Authorized method bitmap.
     pub methods: MethodBitmap,
@@ -131,7 +285,7 @@ impl Rights {
         Self { methods, flags }
     }
 
-    /// Bitmap subset used by `open()` and `derive_handle`: requested rights
+    /// Bitmap subset used by `open()` and handle derivation: requested rights
     /// must be ⊆ the grant's rights, and flags monotonically attenuate.
     pub fn is_subset_of(&self, parent: &Rights) -> bool {
         self.methods.is_subset_of(parent.methods) && parent.flags.contains(self.flags)
@@ -143,14 +297,40 @@ impl Rights {
     }
 }
 
+/// Stable method selection and propagation flags on a source Grant.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct GrantRights {
+    /// Authorized method names, or an explicit grant of all matching methods.
+    pub methods: GrantMethods,
+    /// Authorized Handle propagation.
+    pub flags: RightFlags,
+}
+
+impl GrantRights {
+    /// Build source rights without consulting a Resource's current layout.
+    pub fn new(methods: GrantMethods, flags: RightFlags) -> Self {
+        Self { methods, flags }
+    }
+
+    /// Whether both method and propagation authority are empty.
+    pub fn is_empty(&self) -> bool {
+        self.methods.is_empty() && self.flags.is_empty()
+    }
+
+    /// Source-level attenuation is independent of method bit positions.
+    pub fn is_subset_of(&self, parent: &Self) -> bool {
+        self.methods.is_subset_of(&parent.methods) && parent.flags.contains(self.flags)
+    }
+}
+
 /// Which Resources a grant matches. The same selector serves both
 /// authorization (does `open()` of resource R hit this grant?) and capability
-/// discovery. It is a path
-/// pattern, reusing the [`Capability`] literal grammar (`*` / `**` segments).
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// discovery. It is a path pattern, reusing the [`Capability`] literal
+/// grammar (cluster scope and `*` / `**` segments).
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ResourceSelector {
     /// The path-pattern capability literal, e.g. `read://state/memory/alice/**`.
-    /// `verb`/`scheme`/`segments` come straight from [`Capability`].
+    /// `verb`/`cluster`/`scheme`/`segments` come straight from [`Capability`].
     pub pattern: Capability,
 }
 
@@ -160,8 +340,10 @@ impl ResourceSelector {
         Self {
             pattern: Capability {
                 verb: "*".to_string(),
+                cluster: None,
                 scheme: "**".to_string(),
                 segments: vec![SmolStr::from("**")],
+                method: None,
                 predicate: None,
             },
         }
@@ -174,16 +356,36 @@ impl ResourceSelector {
         })
     }
 
+    /// Select one concrete resource path with the given capability verb.
+    /// Preserves cluster qualification without formatting and reparsing a path.
+    pub fn exact(verb: &str, target: &crate::path::Path) -> Result<Self, crate::cap::CapError> {
+        if !target.is_concrete() {
+            return Err(crate::cap::CapError::Malformed(
+                "exact resource selector requires a concrete path".into(),
+            ));
+        }
+        let pattern = Capability::try_new(
+            verb,
+            target.scheme(),
+            target.segments().iter().map(|segment| segment.as_str()),
+            None,
+        )?;
+        let pattern = match target.cluster() {
+            Some(cluster) => pattern.try_with_cluster(cluster)?,
+            None => pattern,
+        };
+        Ok(Self { pattern })
+    }
+
     /// The verb this selector authorizes (`perform`/`read`/`write`/…).
     pub fn verb(&self) -> &str {
         &self.pattern.verb
     }
 
-    /// Does this selector match `(verb, target)`, ignoring constraints?
+    /// Does this selector structurally match `(verb, target)`, including its
+    /// cluster? Callers must check its predicate against the operation input.
     pub fn matches(&self, verb: &str, target: &crate::path::Path) -> bool {
-        // `covers` is fail-closed on predicates; selector matching is
-        // structural only, so test the path pattern directly.
-        self.pattern.verb_scheme_segments_match(verb, target)
+        self.pattern.matches_structure(verb, target)
     }
 }
 
@@ -192,7 +394,7 @@ impl ResourceSelector {
 /// type mismatch, or expired window means "not covered". Reuses the
 /// [`Capability`] predicate machinery; the constraints are the residual the
 /// hot path checks for a `Conditional` handle.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ConstraintSet {
     /// Each entry is a `@key<op>value` predicate carried on a capability.
     /// All must hold for the grant to cover a request.
@@ -218,7 +420,9 @@ impl ConstraintSet {
 }
 
 /// When a grant stops being valid.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Expiry {
     /// Never expires on its own (revocation still applies).
@@ -247,7 +451,7 @@ pub struct Grant {
     /// Resources and verb this grant selects.
     pub selector: ResourceSelector,
     /// Rights authorized by this grant.
-    pub rights: Rights,
+    pub rights: GrantRights,
     /// Residual constraints on use.
     pub constraints: ConstraintSet,
     /// Expiry policy.
@@ -256,8 +460,8 @@ pub struct Grant {
 
 impl Grant {
     /// Whether this grant currently covers `(verb, target)` with operation
-    /// `input` at `now_millis`: selector matches, not expired, constraints
-    /// hold. Fail-closed throughout.
+    /// `input` at `now_millis`: selector structure, its predicate, inherited
+    /// constraints and expiry must all hold. Fail-closed throughout.
     pub fn covers(
         &self,
         verb: &str,
@@ -268,6 +472,84 @@ impl Grant {
         if self.expires.is_expired(now_millis) {
             return false;
         }
-        self.selector.matches(verb, target) && self.constraints.eval(input, now_millis)
+        self.selector.matches(verb, target)
+            && self
+                .selector
+                .pattern
+                .predicate
+                .as_ref()
+                .is_none_or(|predicate| predicate.eval(input, now_millis))
+            && self.constraints.eval(input, now_millis)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Path;
+    use anyhow::{Result, ensure};
+
+    #[test]
+    fn grant_method_names_are_canonical_and_all_is_explicit() -> Result<()> {
+        let names = GrantMethods::names(["write", "read", "read"]);
+        ensure!(names == GrantMethods::names(["read", "write"]));
+        ensure!(names.allows("read") && !names.allows("new_method"));
+        ensure!(GrantMethods::name("read").is_subset_of(&names));
+        ensure!(!names.is_subset_of(&GrantMethods::name("read")));
+        ensure!(names.is_subset_of(&GrantMethods::all()));
+        ensure!(!GrantMethods::all().is_subset_of(&names));
+        let restored: GrantMethods =
+            serde_json::from_str(r#"{"kind":"names","names":["write","read","read"]}"#)?;
+        ensure!(restored == names);
+        ensure!(
+            serde_json::to_value(&restored)?
+                == serde_json::json!({
+                    "kind": "names", "names": ["read", "write"]
+                })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_selector_preserves_cluster_and_rejects_patterns() -> Result<()> {
+        let target = Path::parse("path://phone/effect/external-provider/acme/search")?;
+        let selector = ResourceSelector::exact("perform", &target)?;
+        ensure!(selector.matches("perform", &target));
+        ensure!(!selector.matches(
+            "perform",
+            &Path::parse("effect://external-provider/acme/search")?
+        ));
+        ensure!(!selector.matches("read", &target));
+        ensure!(ResourceSelector::exact("perform", &Path::parse("effect://tools/**")?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn grant_covers_requires_selector_and_inherited_conditions() -> Result<()> {
+        let grant = Grant {
+            id: GrantId::new(1),
+            holder: ProcessId::new(2),
+            selector: ResourceSelector::parse("perform://effect/job/run@tenant=alice")?,
+            rights: GrantRights::new(GrantMethods::none(), RightFlags::empty()),
+            constraints: ConstraintSet {
+                predicates: vec![crate::Predicate::parse("lane=east")?],
+            },
+            expires: Expiry::At(10),
+        };
+        let target = Path::parse("effect://job/run")?;
+        for (tenant, lane, now_millis, allowed) in [
+            ("alice", "east", 10, true),
+            ("bob", "east", 10, false),
+            ("alice", "west", 10, false),
+            ("alice", "east", 11, false),
+        ] {
+            let input = Value::map(alloc::collections::BTreeMap::from([
+                ("tenant".into(), Value::string(tenant.into())),
+                ("lane".into(), Value::string(lane.into())),
+            ]));
+            ensure!(grant.covers("perform", &target, &input, now_millis) == allowed);
+        }
+        ensure!(!grant.covers("read", &target, &Value::null(), 0));
+        Ok(())
     }
 }

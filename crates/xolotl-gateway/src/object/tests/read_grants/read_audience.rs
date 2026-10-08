@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 
 fn audience_profile(visible: bool) -> anyhow::Result<GatewayProfile> {
     let mut profile = GatewayProfile::new("gateway-test")
-        .with_bearer_identity("cred-alice", "alice", TEST_TOKEN, "process://alice")?
+        .with_bearer_identity("cred-alice", "alice", TEST_TOKEN, "identity://alice")?
         .with_surface(GatewaySurface::effect_invoke(
             "echo",
             ResourceName::new(Path::parse("effect://echo/say")?),
@@ -46,10 +46,14 @@ async fn explicit_read_grants_support_audiences_without_submission_or_discovery(
     let metadata = fixture
         .seed(bytes, "application/octet-stream", TaintSet::pristine())
         .await?;
-    let process_count = fixture.boot.kernel.processes.all_ids().len();
+    let process_count = fixture.boot.kernel().processes().all_ids().len();
     for visible in [true, false] {
-        let gateway = GatewayRuntime::new(fixture.boot.clone(), audience_profile(visible)?)?
-            .with_object_store(fixture.files.clone().into_object_store());
+        let gateway = GatewayRuntime::new(
+            fixture.boot.clone(),
+            audience_profile(visible)?,
+            fixture.gateway.idempotency.clone(),
+        )?
+        .with_object_store(fixture.files.clone().into_object_store());
         let session = gateway
             .authenticate(PresentedCredential::bearer(TEST_TOKEN))
             .await?;
@@ -64,6 +68,16 @@ async fn explicit_read_grants_support_audiences_without_submission_or_discovery(
                 request(TaintedValue::pristine(Value::blob(metadata.blob.clone()))),
             )
             .await?;
+        ensure!(matches!(
+            gateway.prepare_submission(&session, crate::GatewaySubmissionHead::direct_input("echo"), None),
+            Err(GatewayError::Rejected(message)) if message == "surface echo is not callable by principal"
+        ));
+        {
+            let requests = gateway.requests.inner.lock();
+            ensure!(requests.global_running == 0);
+            ensure!(requests.entries.is_empty());
+            ensure!(requests.budget_running == crate::GatewayBudgetCharge::default());
+        }
         ensure!(
             matches!(
                 gateway
@@ -76,7 +90,7 @@ async fn explicit_read_grants_support_audiences_without_submission_or_discovery(
             ),
             "object read delegation must not authorize submission"
         );
-        ensure!(fixture.boot.kernel.processes.all_ids().len() == process_count);
+        ensure!(fixture.boot.kernel().processes().all_ids().len() == process_count);
         let download = gateway.open_object_read(&session, open(&grant)).await?;
         read_and_finish(download, bytes).await?;
         ensure!(
@@ -95,7 +109,7 @@ async fn explicit_read_grants_support_audiences_without_submission_or_discovery(
                 .await
                 .is_err()
         );
-        ensure!(fixture.boot.kernel.processes.all_ids().len() == process_count);
+        ensure!(fixture.boot.kernel().processes().all_ids().len() == process_count);
     }
     Ok(())
 }
@@ -115,10 +129,14 @@ async fn replicas_can_consume_read_grants_with_different_discovery_and_submissio
             request(TaintedValue::pristine(Value::blob(metadata.blob))),
         )
         .await?;
-    let process_count = fixture.boot.kernel.processes.all_ids().len();
+    let process_count = fixture.boot.kernel().processes().all_ids().len();
     for visible in [true, false] {
-        let replica = GatewayRuntime::new(fixture.boot.clone(), audience_profile(visible)?)?
-            .with_object_store(fixture.files.clone().into_object_store());
+        let replica = GatewayRuntime::new(
+            fixture.boot.clone(),
+            audience_profile(visible)?,
+            fixture.gateway.idempotency.clone(),
+        )?
+        .with_object_store(fixture.files.clone().into_object_store());
         let session = replica
             .authenticate(PresentedCredential::bearer(TEST_TOKEN))
             .await?;
@@ -126,7 +144,7 @@ async fn replicas_can_consume_read_grants_with_different_discovery_and_submissio
         let download = replica.open_object_read(&session, open(&grant)).await?;
         read_and_finish(download, bytes).await?;
     }
-    ensure!(fixture.boot.kernel.processes.all_ids().len() == process_count);
+    ensure!(fixture.boot.kernel().processes().all_ids().len() == process_count);
     Ok(())
 }
 
@@ -142,12 +160,16 @@ async fn known_object_hashes_and_upload_receipts_do_not_delegate_reads() -> anyh
         .as_ref()
         .context("committed upload receipt")?;
     ensure!(receipt.proof == ticket.ticket_id());
-    ensure!(fixture.record(ticket.ticket_id()).await?.committed);
+    ensure!(fixture.record(ticket.ticket_id()).await?.is_committed());
     let blob = committed.item.backing_blob().context("committed blob")?;
     for visible in [true, false] {
         let probe = Arc::new(ProbeStore::new(fixture.files.clone()));
-        let gateway = GatewayRuntime::new(fixture.boot.clone(), audience_profile(visible)?)?
-            .with_object_store(ObjectStore::new().with_read(probe.clone()));
+        let gateway = GatewayRuntime::new(
+            fixture.boot.clone(),
+            audience_profile(visible)?,
+            fixture.gateway.idempotency.clone(),
+        )?
+        .with_object_store(ObjectStore::new().with_read(probe.clone()));
         let session = gateway
             .authenticate(PresentedCredential::bearer(TEST_TOKEN))
             .await?;
@@ -172,7 +194,7 @@ async fn known_object_hashes_and_upload_receipts_do_not_delegate_reads() -> anyh
         }
         ensure!(probe.metadata_reads.load(Ordering::Acquire) == 0);
     }
-    ensure!(!fixture.record(ticket.ticket_id()).await?.used);
+    ensure!(!fixture.record(ticket.ticket_id()).await?.used_by.is_some());
     Ok(())
 }
 
@@ -183,8 +205,12 @@ async fn unknown_export_surfaces_are_rejected_before_object_metadata_io() -> any
         .seed(b"artifact", "text/plain", TaintSet::pristine())
         .await?;
     let probe = Arc::new(ProbeStore::new(fixture.files.clone()));
-    let gateway = GatewayRuntime::new(fixture.boot.clone(), audience_profile(false)?)?
-        .with_object_store(ObjectStore::new().with_read(probe.clone()));
+    let gateway = GatewayRuntime::new(
+        fixture.boot.clone(),
+        audience_profile(false)?,
+        fixture.gateway.idempotency.clone(),
+    )?
+    .with_object_store(ObjectStore::new().with_read(probe.clone()));
     let session = gateway
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;

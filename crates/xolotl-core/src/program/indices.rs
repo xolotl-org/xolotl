@@ -15,9 +15,6 @@ impl<V, E> Node<V, E> {
         if let Some(next) = self.next {
             node(next)?;
         }
-        if let Some(save) = self.save {
-            binding(save)?;
-        }
         match &self.kind {
             NodeKind::Literal(_) | NodeKind::Input | NodeKind::Fail(_) => {}
             NodeKind::Load(slot) => binding(*slot)?,

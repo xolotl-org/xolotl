@@ -5,17 +5,21 @@ use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::time::Instant;
-use xolotl_kernel::{Bootstrap, Executor};
-use xolotl_types::{CompletionOrigin, Outcome, OutputMode, ProcessId, TaintSet, TaintSource};
+use xolotl_kernel::{Bootstrap, Executor, host::HostDeadline};
+use xolotl_types::{
+    CompletionOrigin, Outcome, OutputMode, ProcessId, ProcessStatus, TaintSet, TaintSource,
+};
 
+use crate::request_registry::GatewayAdmissionGuard;
 use crate::schema::enforce_surface_output_schema;
 use crate::{
-    CompiledGatewayProfile, GatewayAccepted, GatewayError, GatewayRequestEntry,
-    GatewayRequestGuard, GatewayRequestState, GatewayRuntime, GatewaySession, GatewaySubmission,
-    GatewaySubmitResult, LoweredSubmission, StreamWindow, gateway_budget_charge_for_submit,
-    inspect_lowered_submission, lower_submission, lowered_large_value_ref_summaries, now_millis,
-    request_deadline, request_risk_class, validate_current_session, validate_submit_options,
+    CompiledGatewayProfile, GATEWAY_EFFECT_METHOD, GatewayAccepted, GatewayDirectInput,
+    GatewayError, GatewayPayloadProvenance, GatewayRequestEntry, GatewayRequestGuard,
+    GatewayRequestState, GatewayRuntime, GatewaySession, GatewaySubmission, GatewaySubmissionBody,
+    GatewaySubmissionHead, GatewaySubmitResult, LoweredSubmission, ReplayClass, StreamWindow,
+    Value, gateway_budget_charge_for_submit, inspect_lowered_submission, lower_submission,
+    operation_replay_class, request_deadline, request_risk_class, validate_current_session,
+    validate_request_deadline, validate_submit_options,
 };
 use idempotency::{
     GatewayIdempotencyReservation, SubmissionIdempotency,
@@ -32,6 +36,163 @@ mod output;
 pub(crate) use input::complete_input_stream;
 pub use output::{GatewayOutputChunk, GatewayOutputEvent, GatewayOutputStream};
 
+/// Affine capacity owner for one authenticated, payload-independent preparation.
+#[must_use]
+pub struct GatewayPreparation {
+    profile: Arc<CompiledGatewayProfile>,
+    session: GatewaySession,
+    head: GatewaySubmissionHead,
+    deadline: Option<HostDeadline>,
+    output_window: Option<StreamWindow>,
+    admission_guard: GatewayAdmissionGuard,
+    risk_class: String,
+}
+
+pub(crate) fn prepare_submission(
+    runtime: &GatewayRuntime,
+    session: &GatewaySession,
+    head: GatewaySubmissionHead,
+    output_window: Option<StreamWindow>,
+) -> Result<GatewayPreparation, GatewayError> {
+    validate_output_port(head.requested_output, output_window.is_some())?;
+    if output_window
+        .is_some_and(|window| window.max_chunks.get() > tokio::sync::Semaphore::MAX_PERMITS)
+    {
+        return Err(GatewayError::Rejected(
+            "stream chunk window exceeds host channel capacity".into(),
+        ));
+    }
+    let profile = runtime.profile_snapshot();
+    validate_current_session(&profile, session)?;
+    let surface = profile.surface_by_id(&head.surface_id).ok_or_else(|| {
+        GatewayError::Rejected(format!("unknown gateway surface {}", head.surface_id))
+    })?;
+    if !profile.principal_can_submit(&session.principal.principal_id, &surface.surface_id) {
+        return Err(GatewayError::Rejected(format!(
+            "surface {} is not callable by principal",
+            surface.surface_id
+        )));
+    }
+    let host = runtime.boot.kernel().host_runtime();
+    let deadline = request_deadline(
+        &head.options,
+        head.server_deadline,
+        host.now(),
+        host.now_millis(),
+    )?;
+    validate_request_deadline(deadline, host.now(), &profile.limits)?;
+    validate_submit_options(&head.options)?;
+    crate::request_scope::validate(
+        &profile,
+        session,
+        surface,
+        runtime.idempotency.as_ref(),
+        &head.options,
+    )?;
+    let risk_class = if matches!(
+        operation_replay_class(&runtime.boot, &surface.target, GATEWAY_EFFECT_METHOD)?,
+        ReplayClass::NonIdempotentEffect
+    ) {
+        "non_idempotent_effect"
+    } else {
+        "effect"
+    }
+    .to_string();
+    let admission_guard = runtime.requests.try_admit(
+        &profile.limits,
+        session.principal.principal_id.clone(),
+        vec![surface.surface_id.clone()],
+        risk_class.clone(),
+    )?;
+    Ok(GatewayPreparation {
+        profile,
+        session: session.clone(),
+        head,
+        deadline,
+        output_window,
+        admission_guard,
+        risk_class,
+    })
+}
+
+fn prepare_direct(
+    runtime: &GatewayRuntime,
+    session: &GatewaySession,
+    submission: GatewaySubmission,
+    output_window: Option<StreamWindow>,
+) -> Result<(GatewayPreparation, GatewayDirectInput), GatewayError> {
+    let GatewaySubmission {
+        surface_id,
+        body,
+        requested_output,
+        options,
+        server_deadline,
+    } = submission;
+    let GatewaySubmissionBody::DirectInput(input) = body else {
+        return Err(GatewayError::Rejected(
+            "stream input must be completed by its admitted owner".into(),
+        ));
+    };
+    let preparation = prepare_submission(
+        runtime,
+        session,
+        GatewaySubmissionHead {
+            surface_id,
+            requested_output,
+            options,
+            server_deadline,
+        },
+        output_window,
+    )?;
+    Ok((preparation, input))
+}
+
+impl GatewayRequestGuard {
+    fn ensure_live(
+        &self,
+        runtime: &GatewayRuntime,
+        deadline: Option<HostDeadline>,
+    ) -> Result<(), GatewayError> {
+        let process = self
+            .process
+            .as_ref()
+            .ok_or_else(|| GatewayError::Rejected("gateway request is already finished".into()))?;
+        if deadline
+            .map(|deadline| deadline.elapsed_at(runtime.boot.kernel().host_runtime().now()))
+            .transpose()
+            .map_err(|error| GatewayError::Rejected(error.to_string()))?
+            .unwrap_or(false)
+        {
+            return Err(GatewayError::Rejected(
+                "gateway request deadline expired".into(),
+            ));
+        }
+        if self.lease.state() != Some(GatewayRequestState::Running) {
+            return Err(GatewayError::Rejected(
+                "gateway request is no longer running".into(),
+            ));
+        }
+        if runtime.boot.kernel().processes().status(process.id()) != Some(ProcessStatus::Running) {
+            return Err(GatewayError::Rejected(
+                "gateway request is no longer running".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn commit_objects(
+        &self,
+        runtime: &GatewayRuntime,
+        session: &GatewaySession,
+        objects: crate::object::ObjectAdmission,
+        deadline: Option<HostDeadline>,
+        identity: Option<&str>,
+    ) -> Result<TaintSet, GatewayError> {
+        self.ensure_live(runtime, deadline)?;
+        objects.commit(runtime, session, identity).await
+    }
+}
+
 enum SubmissionStart {
     Accepted(Box<PreparedSubmission>),
     Replay(Box<GatewaySubmitResult>),
@@ -42,7 +203,7 @@ struct PreparedSubmission {
     profile: Arc<CompiledGatewayProfile>,
     accepted: GatewayAccepted,
     requested_output: OutputMode,
-    deadline: Option<Instant>,
+    deadline: Option<HostDeadline>,
     idempotency: Option<Box<GatewayIdempotencyReservation>>,
     request_guard: GatewayRequestGuard,
     request_process: ProcessId,
@@ -69,10 +230,41 @@ pub(crate) async fn submit(
     session: &GatewaySession,
     submission: GatewaySubmission,
 ) -> Result<GatewaySubmitResult, GatewayError> {
-    match prepare(runtime, session, submission, None).await? {
-        SubmissionStart::Replay(result) => Ok(*result),
-        SubmissionStart::Accepted(prepared) => prepared.execute(None).complete().await,
+    let (preparation, input) = prepare_direct(runtime, session, submission, None)?;
+    submit_prepared(runtime, preparation, input.payload, input.provenance).await
+}
+
+pub(crate) async fn submit_prepared(
+    runtime: &GatewayRuntime,
+    preparation: GatewayPreparation,
+    payload: Value,
+    provenance: Option<GatewayPayloadProvenance>,
+) -> Result<GatewaySubmitResult, GatewayError> {
+    if preparation.output_window.is_some() {
+        return Err(GatewayError::Rejected(
+            "stream preparation requires submit_output_stream_prepared".into(),
+        ));
     }
+    let delivery = crate::GatewaySubmissionAuthority::new(
+        runtime,
+        &preparation.session,
+        &preparation.head.surface_id,
+    );
+    let start = match prepare(runtime, preparation, payload, provenance, delivery.clone()).await {
+        Ok(start) => start,
+        Err(error) => {
+            if matches!(error, GatewayError::SubmissionIndeterminate(_)) {
+                delivery.validate()?;
+            }
+            return Err(error);
+        }
+    };
+    let result = match start {
+        SubmissionStart::Replay(result) => Ok(*result),
+        SubmissionStart::Accepted(prepared) => prepared.execute(None)?.complete().await,
+    };
+    delivery.validate()?;
+    result
 }
 
 pub(crate) async fn submit_output_stream(
@@ -81,31 +273,79 @@ pub(crate) async fn submit_output_stream(
     submission: GatewaySubmission,
     window: StreamWindow,
 ) -> Result<GatewayOutputStream, GatewayError> {
-    match prepare(runtime, session, submission, Some(window)).await? {
-        SubmissionStart::Replay(result) => Ok(GatewayOutputStream::replay(*result)),
-        SubmissionStart::Accepted(prepared) => Ok(GatewayOutputStream::start(*prepared, window)),
+    let (preparation, input) = prepare_direct(runtime, session, submission, Some(window))?;
+    submit_output_stream_prepared(runtime, preparation, input.payload, input.provenance).await
+}
+
+pub(crate) async fn submit_output_stream_prepared(
+    runtime: &GatewayRuntime,
+    preparation: GatewayPreparation,
+    payload: Value,
+    provenance: Option<GatewayPayloadProvenance>,
+) -> Result<GatewayOutputStream, GatewayError> {
+    let window = preparation.output_window.ok_or_else(|| {
+        GatewayError::Rejected("unary preparation requires submit_prepared".into())
+    })?;
+    let delivery = crate::GatewaySubmissionAuthority::new(
+        runtime,
+        &preparation.session,
+        &preparation.head.surface_id,
+    );
+    let start = match prepare(runtime, preparation, payload, provenance, delivery.clone()).await {
+        Ok(start) => start,
+        Err(error) => {
+            if matches!(error, GatewayError::SubmissionIndeterminate(_)) {
+                delivery.validate()?;
+            }
+            return Err(error);
+        }
+    };
+    match start {
+        SubmissionStart::Replay(result) => Ok(GatewayOutputStream::replay(*result, delivery)),
+        SubmissionStart::Accepted(prepared) => GatewayOutputStream::start(*prepared, window),
     }
 }
 
 async fn prepare(
     runtime: &GatewayRuntime,
-    session: &GatewaySession,
-    submission: GatewaySubmission,
-    output_window: Option<StreamWindow>,
+    preparation: GatewayPreparation,
+    payload: Value,
+    provenance: Option<GatewayPayloadProvenance>,
+    delivery: Arc<crate::GatewaySubmissionAuthority>,
 ) -> Result<SubmissionStart, GatewayError> {
-    validate_output_port(submission.requested_output, output_window.is_some())?;
-    if output_window
-        .is_some_and(|window| window.max_chunks.get() > tokio::sync::Semaphore::MAX_PERMITS)
-    {
+    if !preparation.admission_guard.belongs_to(&runtime.requests) {
         return Err(GatewayError::Rejected(
-            "stream chunk window exceeds host channel capacity".into(),
+            "preparation belongs to another gateway runtime".into(),
         ));
     }
-    let profile = runtime.profile_snapshot();
-    validate_current_session(&profile, session)?;
-    let now_ms = now_millis();
+    let GatewayPreparation {
+        profile,
+        session,
+        head,
+        deadline,
+        output_window,
+        admission_guard,
+        risk_class: prepared_risk_class,
+    } = preparation;
+    let session = &session;
+    validate_current_session(&runtime.profile_snapshot(), session)?;
+    let submission = GatewaySubmission {
+        surface_id: head.surface_id,
+        body: GatewaySubmissionBody::DirectInput(GatewayDirectInput {
+            payload,
+            provenance,
+        }),
+        requested_output: head.requested_output,
+        options: head.options,
+        server_deadline: head.server_deadline,
+    };
+    let host = runtime.boot.kernel().host_runtime();
+    let now = host.now();
+    let now_ms = host.now_millis();
+    validate_request_deadline(deadline, now, &profile.limits)?;
+    let mut admission_guard = Some(admission_guard);
     let mut idempotency = match reserve_submission_idempotency_if_present(
-        &runtime.boot.kernel.state,
+        &runtime.idempotency,
         &profile,
         session,
         &submission,
@@ -114,7 +354,11 @@ async fn prepare(
     )
     .await?
     {
-        Some(SubmissionIdempotency::Replay(result)) => return Ok(SubmissionStart::Replay(result)),
+        Some(SubmissionIdempotency::Replay(result)) => {
+            runtime.validate_submission_access(session, &submission.surface_id)?;
+            validate_request_deadline(deadline, host.now(), &profile.limits)?;
+            return Ok(SubmissionStart::Replay(result));
+        }
         Some(SubmissionIdempotency::Reserved(reservation)) => Some(reservation),
         None => None,
     };
@@ -122,13 +366,15 @@ async fn prepare(
     // Ordinary pre-dispatch failures release only this reservation. Dropping an
     // in-progress admission leaves its uncertain CAS result reserved.
     let admitted = async {
-        validate_submit_options(&submission.options, &profile.limits, now_ms)?;
-        let deadline = request_deadline(&submission.options)?;
+        runtime.validate_submission_access(session, &submission.surface_id)?;
+        validate_request_deadline(deadline, host.now(), &profile.limits)?;
         let LoweredSubmission {
             program,
             surface,
             objects,
         } = lower_submission(submission.clone(), &profile, runtime, session).await?;
+        runtime.validate_submission_access(session, &submission.surface_id)?;
+        validate_request_deadline(deadline, host.now(), &profile.limits)?;
         let admission = inspect_lowered_submission(
             &program,
             &profile,
@@ -137,9 +383,9 @@ async fn prepare(
             &runtime.boot,
             true,
         )?;
-        if admission.requires_idempotency && idempotency.is_none() {
+        if (admission.requires_idempotency || objects.requires_idempotency()) && idempotency.is_none() {
             idempotency = match reserve_submission_idempotency_if_present(
-                &runtime.boot.kernel.state,
+                &runtime.idempotency,
                 &profile,
                 session,
                 &submission,
@@ -149,22 +395,27 @@ async fn prepare(
             .await?
             {
                 Some(SubmissionIdempotency::Replay(result)) => {
+                    runtime.validate_submission_access(session, &submission.surface_id)?;
+                    validate_request_deadline(deadline, host.now(), &profile.limits)?;
                     return Ok(SubmissionStart::Replay(result));
                 }
                 Some(SubmissionIdempotency::Reserved(reservation)) => Some(reservation),
                 None => {
                     return Err(GatewayError::Rejected(
-                        "idempotency_key or submission_token is required for non-idempotent effects"
+                        "idempotency_key or submission_token is required for non-idempotent effects and single-use objects"
                             .into(),
                     ));
                 }
             };
         }
         let risk_class = request_risk_class(&admission);
+        if risk_class != prepared_risk_class {
+            return Err(GatewayError::Rejected("prepared operation risk class changed".into()));
+        }
+        runtime.validate_submission_access(session, &submission.surface_id)?;
+        validate_request_deadline(deadline, host.now(), &profile.limits)?;
         let surface_ids = BTreeSet::from([surface.surface_id.clone()]);
-        let fair_surface_ids = vec![surface.surface_id.clone()];
-        let mut budget_charge =
-            gateway_budget_charge_for_submit(&admission, &submission.options, now_ms)?;
+        let mut budget_charge = gateway_budget_charge_for_submit(&admission, deadline, now)?;
         if let Some(window) = output_window {
             let bytes = u64::try_from(window.max_inline_bytes.get()).map_err(|_error| {
                 GatewayError::Rejected("stream byte window is out of range".into())
@@ -182,18 +433,14 @@ async fn prepare(
         let budget_guard = runtime
             .requests
             .try_reserve_budget(&profile.limits.budget, budget_charge)?;
-        let admission_guard = runtime.requests.try_admit(
-            &profile.limits,
-            session.principal.principal_id.clone(),
-            fair_surface_ids.clone(),
-            risk_class.clone(),
-        )?;
         let accepted = runtime
             .requests
             .new_acceptance(profile.revision, surface.surface_id.clone())?;
         let (request_owner, executor) = runtime
-            .executor_for(&profile, session, &surface_ids)
+            .executor_for(&profile, session, &surface_ids, delivery.clone())
             .await?;
+        runtime.validate_submission_access(session, &submission.surface_id)?;
+        validate_request_deadline(deadline, host.now(), &profile.limits)?;
         let request_process = request_owner.id();
         let entry = GatewayRequestEntry {
             accepted: accepted.clone(),
@@ -202,18 +449,18 @@ async fn prepare(
             principal_id: session.principal.principal_id.clone(),
             state: GatewayRequestState::Running,
             deadline,
-            retained_until_ms: i64::MAX,
-            risk_class,
-            surface_ids: fair_surface_ids,
-            large_value_refs: lowered_large_value_ref_summaries(&program),
-            admission_released: false,
+            cancelled_until: None,
         };
         let request_guard =
             runtime
                 .requests
-                .insert_running(entry, admission_guard, budget_guard, request_owner)?;
+                .insert_running(entry, admission_guard.take().ok_or_else(|| GatewayError::Rejected(
+                    "preparation admission was already transferred".into(),
+                ))?, budget_guard, request_owner,
+                    delivery.clone())?;
+        let object_identity = idempotency.as_deref().map(GatewayIdempotencyReservation::effect_identity);
         let object_taint = match request_guard
-            .commit_objects(runtime, session, objects, deadline)
+            .commit_objects(runtime, session, objects, deadline, object_identity.as_deref())
             .await
         {
             Ok(taint) => taint,
@@ -245,12 +492,7 @@ async fn prepare(
     match admitted {
         Ok(start) => Ok(start),
         Err(error) => {
-            release_submission_idempotency_reservation_and_fail(
-                &runtime.boot.kernel.state,
-                idempotency.as_deref(),
-                error,
-            )
-            .await
+            release_submission_idempotency_reservation_and_fail(idempotency.as_deref(), error).await
         }
     }
 }
@@ -273,7 +515,7 @@ struct SubmissionExecution {
 }
 
 impl PreparedSubmission {
-    fn execute(self, output: Option<OutputPort>) -> SubmissionExecution {
+    fn execute(self, output: Option<OutputPort>) -> Result<SubmissionExecution, GatewayError> {
         let Self {
             boot,
             profile,
@@ -291,7 +533,9 @@ impl PreparedSubmission {
             executor = executor.with_stream_router(output.router.clone());
         }
         if let Some(deadline) = deadline {
-            executor = executor.with_deadline(deadline);
+            executor = executor
+                .with_deadline(deadline)
+                .map_err(|error| GatewayError::Rejected(error.to_string()))?;
         }
         let lease = request_guard.lease.clone();
         let future = Box::pin(async move {
@@ -310,19 +554,27 @@ impl PreparedSubmission {
                 request_process,
                 idempotency.as_deref(),
                 &accepted,
-                &execution_output,
+                &mut execution_output,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                GatewayError::submission_indeterminate(
+                    accepted.clone(),
+                    execution_output.unresolved_operations.clone(),
+                    "settlement_failed",
+                    error.to_string(),
+                )
+            })?;
             Ok(GatewaySubmitResult {
                 accepted,
                 output: execution_output,
                 origin: CompletionOrigin::CurrentAttempt,
             })
         });
-        SubmissionExecution {
+        Ok(SubmissionExecution {
             future: Some(future),
             request_guard,
-        }
+        })
     }
 }
 
@@ -338,9 +590,19 @@ impl SubmissionExecution {
             return Poll::Pending;
         };
         self.future = None;
-        match &result {
-            Ok(_) => self.request_guard.finish(),
-            Err(_) => self.request_guard.fail(),
+        let result = result.and_then(|result| {
+            self.request_guard.finish().map_err(|error| {
+                GatewayError::submission_indeterminate(
+                    result.accepted.clone(),
+                    result.output.unresolved_operations.clone(),
+                    "settlement_failed",
+                    error.to_string(),
+                )
+            })?;
+            Ok(result)
+        });
+        if result.is_err() {
+            self.request_guard.fail();
         }
         Poll::Ready(result)
     }

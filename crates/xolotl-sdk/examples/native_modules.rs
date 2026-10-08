@@ -1,8 +1,8 @@
 //! Compose native functions and loaded portable programs in the same execution.
 use std::io::Write;
 use xolotl_sdk::{
-    DoNode, ExecutionConfig, Expression, Failure, LoaderRevision, Outcome, PreparedProgram,
-    Program, StepModule, StepRef, Transform, Value, XolotlBuilder,
+    DoNode, ExecutionConfig, Expression, Failure, IdentityRef, KernelBuilder, LoaderRevision,
+    Outcome, PreparedProgram, Program, StepModule, StepRef, Transform, Value, Xolotl,
 };
 
 #[tokio::main(flavor = "current_thread")]
@@ -38,16 +38,21 @@ async fn main() -> anyhow::Result<()> {
         move |_, _| Ok(prepared.clone()),
     )?;
     let module = StepModule::compose([math, pipeline, portable])?;
-    let runtime = XolotlBuilder::new()
-        .with_execution_config(ExecutionConfig {
-            max_storage_bytes: 2048,
-            ..ExecutionConfig::default()
-        })
-        .build();
+    let runtime = Xolotl::from_kernel(
+        KernelBuilder::new(xolotl_state::InMemoryBackend::new().into_backend())
+            .with_execution_config(ExecutionConfig {
+                max_storage_bytes: 2048,
+                ..ExecutionConfig::default()
+            })
+            .build(),
+    );
     for input in [21, 7] {
         for (entry, expected) in [("pipeline", input * 2), ("portable/math", (input + 1) * 2)] {
             let program = DoNode::pure(input).and_then(StepRef::new(entry));
-            let output = runtime.run_with_steps(&[], program, module.clone()).await?;
+            let output = runtime
+                .run_with_steps(IdentityRef::ROOT, &[], program, module.clone())
+                .await?
+                .output;
             anyhow::ensure!(output.outcome == Outcome::Done(Value::integer(expected)));
             writeln!(
                 std::io::stdout().lock(),

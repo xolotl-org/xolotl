@@ -9,10 +9,12 @@ use xolotl_types::{Path, Value};
 struct LocalRead(Rc<Value>);
 
 impl StateRead for LocalRead {
-    type Read<'a> = Ready<StateResult<Option<TaintedValue>>>;
+    type Read<'a> = Ready<StateResult<xolotl_state::StateObservation>>;
 
     fn read_tainted<'a>(&'a self, _path: &'a Path) -> Self::Read<'a> {
-        ready(Ok(Some(TaintedValue::pristine((*self.0).clone()))))
+        ready(Ok(xolotl_state::StateObservation::from(
+            TaintedValue::pristine((*self.0).clone()),
+        )))
     }
 }
 
@@ -26,7 +28,9 @@ fn static_read_allows_local_ownership_without_a_scheduler() -> anyhow::Result<()
     else {
         anyhow::bail!("local read unexpectedly suspended");
     };
-    anyhow::ensure!(value? == Some(TaintedValue::pristine(Value::integer(42))));
+    anyhow::ensure!(
+        value? == xolotl_state::StateObservation::from(TaintedValue::pristine(Value::integer(42)))
+    );
     Ok(())
 }
 
@@ -39,10 +43,12 @@ mod host {
     struct ReadOnly;
 
     impl StateRead for ReadOnly {
-        type Read<'a> = Ready<StateResult<Option<TaintedValue>>>;
+        type Read<'a> = Ready<StateResult<xolotl_state::StateObservation>>;
 
         fn read_tainted<'a>(&'a self, _path: &'a Path) -> Self::Read<'a> {
-            ready(Ok(Some(TaintedValue::pristine(Value::integer(7)))))
+            ready(Ok(xolotl_state::StateObservation::from(
+                TaintedValue::pristine(Value::integer(7)),
+            )))
         }
     }
 

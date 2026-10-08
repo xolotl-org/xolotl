@@ -6,12 +6,14 @@ const LEFT: u8 = 2;
 const RIGHT: u8 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 struct Tagged {
     value: i64,
     sources: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 struct TaggedFailure {
     fault: Fault,
     sources: u8,
@@ -88,7 +90,6 @@ fn image(nodes: &[Node<Tagged, TaggedFailure>]) -> ProgramImage<'_, Tagged, Tagg
         entry: 0,
         bindings: 0,
         imports: 2,
-        durable: false,
     }
 }
 
@@ -468,6 +469,90 @@ fn rejected_continuations_preserve_sources_without_accepting_stale_events() -> a
         };
         ensure!(result == Err(failure(Fault::Frames, sources)));
     }
+    Ok(())
+}
+
+#[test]
+fn exhausted_cleanup_freezes_a_fork_without_losing_evidence() -> anyhow::Result<()> {
+    let nodes = [
+        Node::new(
+            NodeKind::Finally {
+                body: 1,
+                cleanup: 2,
+            },
+            0,
+        ),
+        Node::new(NodeKind::Request(0), 1),
+        Node::new(
+            NodeKind::Fork {
+                left: 3,
+                right: 4,
+                join: Join::All,
+            },
+            2,
+        ),
+        Node::new(NodeKind::Call(3), 3),
+        Node::new(NodeKind::Request(1), 4),
+    ];
+    let program = image(&nodes);
+    let mut tasks = core::array::from_fn::<_, 3, _>(|_| Task::default());
+    let mut frames = core::array::from_fn::<_, 32, _>(|_| None);
+    let mut machine = Execution::new(
+        &program,
+        &mut tasks,
+        &mut frames,
+        &mut [],
+        ExecutionLimits {
+            frames_per_task: 32,
+            bindings_per_task: 0,
+            cleanup_steps: 0,
+            ..ExecutionLimits::default()
+        },
+        value(7, INPUT),
+        0,
+    )?;
+    let Advance::Request(body) = machine.advance(&program, &mut Provenance, 32) else {
+        bail!("missing body request");
+    };
+    machine.complete(
+        body.task,
+        body.ticket,
+        HostEvent::Complete(Ok(value(42, LEFT))),
+        &program,
+        &mut Provenance,
+    )?;
+    let Advance::Request(cleanup) = machine.advance(&program, &mut Provenance, 32) else {
+        bail!("missing fork cleanup request");
+    };
+    ensure!(cleanup.cleanup);
+    machine.cancel();
+    let expected = Err(failure(Fault::Fuel, INPUT | LEFT));
+    let Advance::Done(result) = machine.advance(&program, &mut Provenance, 32) else {
+        bail!("cleanup exhaustion did not stop execution");
+    };
+    ensure!(result == expected);
+    let view = machine.view();
+    ensure!(view.result() == Some(&expected));
+    ensure!(view.instruction_indices().any(|index| index == 2));
+    ensure!(view.pending_tickets().eq([cleanup.ticket]));
+    ensure!(view.pending_requests(&program).count() == 1);
+    let meta = machine.suspend();
+    let mut restored = Execution::resume(&program, meta, &mut tasks, &mut frames, &mut [])?;
+    ensure!(!restored.is_pending(cleanup.task, cleanup.ticket));
+    ensure!(
+        restored.complete(
+            cleanup.task,
+            cleanup.ticket,
+            HostEvent::Complete(Ok(value(99, RIGHT))),
+            &program,
+            &mut Provenance
+        ) == Err(Fault::StaleEvent)
+    );
+    let Advance::Done(result) = restored.advance(&program, &mut Provenance, 32) else {
+        bail!("suspended terminal machine resumed work");
+    };
+    ensure!(result == expected);
+    ensure!(restored.view().pending_tickets().eq([cleanup.ticket]));
     Ok(())
 }
 

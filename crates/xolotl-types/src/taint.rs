@@ -36,7 +36,7 @@ pub enum TaintSource {
     /// self-reported provenance cannot clear or forge them.
     Inbound {
         /// Daemon-assigned ingress source, for example `gateway/default`,
-        /// `source/<installation>/<projection>`, or `provider/endpoint/...`.
+        /// `source/<installation>/<projection>`, or `remote/endpoint/...`.
         source: SmolStr,
         /// Daemon-assigned ingress channel within that source.
         channel: SmolStr,

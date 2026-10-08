@@ -3,9 +3,11 @@
 use super::{DataPlane, collect_outcome};
 use crate::driver::{DriverContext, DriverError, DriverOutput};
 use crate::host::stream::{DynStreamSink, StreamItem, StreamReceiver, channel};
-use crate::stream::{StreamEnd, StreamWindow};
+use crate::invocation::{CompletionError, InvocationResult};
+use crate::stream::{StreamEnd, StreamError, StreamWindow};
 use futures_util::FutureExt;
 use std::future::{Future, poll_fn};
+use std::sync::atomic::{AtomicBool, Ordering};
 use xolotl_types::{
     CompletionOrigin, Failure, Operation, Outcome, OutputMode, Path, TaintSet, Value,
 };
@@ -52,65 +54,121 @@ impl DataPlane {
 }
 
 /// Own the stream around admission, cached results, dispatch, and accounting.
-/// Facts describe effect results: cancelling a pending invocation leaves any
-/// write-ahead Fact pending, and terminal delivery cannot replace a known result.
+/// Optional Facts describe observations; terminal delivery cannot replace a
+/// known driver result merely because observation completion failed.
 pub(super) async fn run_streamed_invocation(
-    call: impl Future<Output = DriverOutput>,
+    call: impl Future<Output = InvocationResult>,
     sink: DynStreamSink,
+    operation: xolotl_types::OperationId,
     input_taint: &TaintSet,
-) -> DriverOutput {
+    observations: Option<&parking_lot::Mutex<TaintSet>>,
+    effect_dispatched: &AtomicBool,
+) -> InvocationResult {
     let mut completion = StreamCompletion {
         sink,
-        taint: input_taint.clone(),
-        origin: CompletionOrigin::CurrentAttempt,
-        finished: false,
+        end: Some(StreamEnd {
+            outcome: Err(Failure::Cancelled),
+            taint: input_taint.clone(),
+            origin: CompletionOrigin::CurrentAttempt,
+        }),
+        observations,
     };
     // The invocation remains owned by this scope, including when it is waiting
     // outside emit. No producer or cancellation task can outlive this call.
-    let output = tokio::select! {
+    let mut result = tokio::select! {
         biased;
         output = call => output,
         () = poll_fn(|cx| completion.sink.poll_closed(cx)) => {
-            DriverOutput::new(Outcome::Fail(Failure::HandlerError {
-                kind: "stream".into(),
-                message: "stream receiver closed".into(),
-            }))
+            let dispatched = effect_dispatched.load(Ordering::Relaxed);
+            let failure = if dispatched {
+                Failure::OutcomeUnknown {
+                    operation_ids: vec![operation.to_string()],
+                    reason: "stream_receiver_closed_after_dispatch".into(),
+                }
+            } else {
+                Failure::HandlerError {
+                    kind: "stream".into(),
+                    message: "stream receiver closed".into(),
+                }
+            };
+            InvocationResult {
+                output: DriverOutput::new(Outcome::Fail(failure)),
+                completion_error: None,
+                effect_may_have_started: dispatched,
+            }
         }
     };
-    let output = crate::invocation::complete_output(output, input_taint);
-    completion.taint.union(&output.taint);
-    completion.origin = output.origin;
-    let outcome = match &output.outcome {
-        Outcome::Fail(failure) => Err(failure.clone()),
-        _ => Ok(()),
-    };
-    let mut end = Some(StreamEnd {
-        outcome,
-        taint: completion.taint.clone(),
-        origin: completion.origin,
-    });
-    match poll_fn(|cx| completion.sink.poll_finish(cx, &mut end)).await {
-        Ok(()) => completion.finished = true,
-        Err(error) => tracing::debug!(?error, "stream terminal receiver unavailable"),
+    result.output = crate::invocation::complete_output(result.output, input_taint);
+    if let Some(observations) = observations {
+        let observed = observations.lock();
+        result.output.taint.union(&observed);
+        if let Some(end) = &mut completion.end {
+            end.taint.union(&observed);
+        }
     }
-    output
+    let output = &result.output;
+    let outcome = match &result.completion_error {
+        Some(error @ (CompletionError::Settlement(_) | CompletionError::Output(_))) => {
+            Err(error.outcome_unknown(operation))
+        }
+        Some(error @ CompletionError::Dispatch(_)) if result.effect_may_have_started => {
+            Err(error.outcome_unknown(operation))
+        }
+        Some(CompletionError::Fact(_) | CompletionError::Dispatch(_)) | None => {
+            match &output.outcome {
+                Outcome::Fail(failure) => Err(failure.clone()),
+                _ => Ok(()),
+            }
+        }
+    };
+    if let Some(end) = &mut completion.end {
+        end.outcome = outcome;
+        end.taint.union(&output.taint);
+        end.origin = output.origin;
+    }
+    match poll_fn(|cx| completion.sink.poll_finish(cx, &mut completion.end)).await {
+        Ok(()) => {}
+        Err(error) => {
+            let delivery_is_primary = match &result.completion_error {
+                Some(CompletionError::Settlement(_) | CompletionError::Output(_)) => false,
+                Some(CompletionError::Dispatch(_)) => !result.effect_may_have_started,
+                Some(CompletionError::Fact(_)) | None => true,
+            };
+            if delivery_is_primary {
+                if let Some(previous) = result.completion_error.take() {
+                    tracing::warn!(%previous, "invocation completion diagnostic preceded stream delivery failure");
+                }
+                result.completion_error = Some(CompletionError::Output(match error {
+                    StreamError::Failed(failure) => failure,
+                    other => Failure::HandlerError {
+                        kind: "stream".into(),
+                        message: format!("stream terminal was not accepted: {other}"),
+                    },
+                }));
+            } else {
+                tracing::debug!(
+                    ?error,
+                    "stream terminal receiver unavailable after invocation commit failure"
+                );
+            }
+        }
+    }
+    result
 }
 
-struct StreamCompletion {
+struct StreamCompletion<'a> {
     sink: DynStreamSink,
-    taint: TaintSet,
-    origin: CompletionOrigin,
-    finished: bool,
+    end: Option<StreamEnd>,
+    observations: Option<&'a parking_lot::Mutex<TaintSet>>,
 }
 
-impl Drop for StreamCompletion {
+impl Drop for StreamCompletion<'_> {
     fn drop(&mut self) {
-        if !self.finished {
-            self.sink.close(StreamEnd {
-                outcome: Err(Failure::Cancelled),
-                taint: self.taint.clone(),
-                origin: self.origin,
-            });
+        if let Some(mut end) = self.end.take() {
+            if let Some(observations) = self.observations {
+                end.taint.union(&observations.lock());
+            }
+            self.sink.close(end);
         }
     }
 }

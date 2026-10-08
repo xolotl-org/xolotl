@@ -59,8 +59,8 @@ id_u64!(/// Identifies one dynamic host request within an execution scope.
 
 /// One host execution scope in a retained allocator namespace.
 ///
-/// A fresh evaluation receives a fresh identifier; checkpoint restoration reuses
-/// the original identifier. Administrative lifecycle events have their own scope.
+/// A fresh evaluation receives a fresh identifier. Administrative lifecycle
+/// events have their own scope.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ExecutionId(NonZeroU64);
@@ -89,8 +89,9 @@ impl core::fmt::Display for ExecutionId {
     }
 }
 
-/// A resolved identity prefix. The data plane carries this, never the raw
-/// `Path` of the identity. `acting` on an operation is one of these.
+/// Compact ID for a concrete path registered in the host's shared identity
+/// directory. Zero is reserved for [`IdentityRef::ROOT`]. An ID has meaning
+/// only with its issuing directory; retained IDs must be verified on admission.
 #[derive(
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
@@ -100,7 +101,8 @@ pub struct IdentityRef(pub u64);
 impl IdentityRef {
     /// Root/system identity.
     pub const ROOT: IdentityRef = IdentityRef(0);
-    /// Construct an identity ref from its raw integer value.
+    /// Reconstruct an ID from persisted data or a trusted host. This does not
+    /// register the identity; admission must verify it against the directory.
     pub const fn new(v: u64) -> Self {
         Self(v)
     }

@@ -56,6 +56,12 @@ impl HandleSlot {
         self.generation
     }
 
+    /// Delegation ancestor retained by this slot. Validate the slot's generation
+    /// and ancestry before using this metadata to authorize a handle.
+    pub const fn parent(&self) -> Option<HandleKey> {
+        self.parent
+    }
+
     /// Install a fresh generation. The table must authorize a parent first.
     pub fn install(&mut self, parent: Option<HandleKey>) -> Result<u64, AuthorityError> {
         if !self.reusable() {

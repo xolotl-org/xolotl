@@ -3,7 +3,7 @@
 //!
 //! Bootstrap sequence: parse config, open the state backend, mount the
 //! FactSink, build registries, create the root/system Process, install
-//! in-process Drivers, recover unfinished Processes, start Gateways, and mark
+//! in-process Drivers, start Gateways, and mark
 //! the daemon ready.
 //!
 //! This module provides the assembly primitives; the daemon drives the full
@@ -15,25 +15,25 @@
 
 use crate::driver::{DriverDescriptor, DynDriver};
 use crate::kernel::Kernel;
-use crate::open::{OpenError, OpenRequest, open_resource_with_attached};
+use crate::open::{OpenError, OpenRequest, prepare_open};
 use crate::process::{ProcessEntry, TaskAttachment};
-use crate::registry::{AdmissionError, ResolveError};
+use crate::registry::AdmissionError;
 use crate::step::StepModule;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use thiserror::Error;
+use xolotl_types::audit::{GATEWAY_AUDIT_NODE, gateway_audit_event};
 use xolotl_types::{
-    Binding, CapError, ConstraintSet, DriverRef, Expiry, Fact, Grant, HandleId, IdentityRef,
-    Interface, InterfaceFamily, InterfaceSet, Metadata, Method, MethodBitmap, ModalitySet,
-    OutputModeSet, Path, PathError, ProcessId, ProcessStatus, Purity, Resource, ResourceDescriptor,
-    ResourceKind, ResourceName, ResourceSelector, RightFlags, Rights, SchemaId, Transport,
+    Binding, CapError, Capability, ConstraintSet, DriverRef, Expiry, Fact, Grant, GrantMethods,
+    GrantRights, HandleId, IdentityRef, Interface, InterfaceFamily, InterfaceSet, Metadata, Method,
+    MethodBitmap, ModalitySet, OutputModeSet, Path, PathError, ProcessId, ProcessStatus, Purity,
+    Resource, ResourceDescriptor, ResourceKind, ResourceName, ResourceSelector, RightFlags, Rights,
+    SchemaId, Transport,
 };
 
-#[cfg(feature = "durable")]
-pub(crate) mod durable;
-#[cfg(feature = "durable")]
-pub use durable::{DurableRecovery, DurableRecoveryConfig, DurableRecoveryReport};
 mod request;
-pub use request::{ProcessCleanupFailure, ProcessCleanupReport, RequestProcess};
+pub use request::{
+    ProcessCleanupFailure, ProcessCleanupReport, RequestFinishError, RequestProcess,
+};
 mod actor;
 pub(crate) mod finalize;
 
@@ -42,25 +42,28 @@ pub(crate) mod finalize;
 #[derive(Clone)]
 pub struct Bootstrap {
     /// Assembled kernel instance.
-    pub kernel: Kernel,
+    kernel: Kernel,
     /// Root/system process seeded during bootstrap.
-    pub root: ProcessId,
+    root: ProcessId,
+    /// Detached request cleanup must release its Kernel captures before a
+    /// graceful host can reopen storage in the same process.
+    cleanup_tasks: std::sync::Arc<request::DetachedCleanupTasks>,
 }
 
-/// Redacted gateway-layer audit metadata. These events happen before a request
-/// Process exists, and credentials remain outside Operation input.
+/// Redacted gateway-layer audit metadata, separate from Operation input.
+/// The application owns its meaning and redaction; the kernel records it
+/// without interpreting authentication or authorization claims.
 pub struct GatewayAudit<'a> {
-    /// Audit event name, such as `console_login`.
+    /// Nonempty application event name, such as `console_login`.
     pub event: &'a str,
-    /// Username involved in the event, when known.
+    /// Caller-supplied account or principal label, when known.
     pub username: Option<&'a str>,
     /// Redacted source address or peer label.
     pub source_addr: Option<&'a str>,
-    /// Stable outcome tag for the event.
+    /// Nonempty, stable outcome tag for the event.
     pub outcome: &'a str,
-    /// MFA assurance level associated with the event.
-    pub mfa_level: Option<u8>,
-    /// Additional redacted metadata.
+    /// Additional redacted, application-owned metadata, retained without
+    /// interpretation or promotion into the common event fields.
     pub details: Option<xolotl_types::Value>,
 }
 
@@ -68,8 +71,8 @@ pub struct GatewayAudit<'a> {
 pub struct RequestGrantTemplate<'a> {
     /// Capability selector literal for the request grant.
     pub literal: &'a str,
-    /// Method bits the request grant may exercise.
-    pub methods: MethodBitmap,
+    /// Explicit method and propagation rights, attenuated against the anchor.
+    pub rights: GrantRights,
 }
 
 /// Parsed request grant template attached to a spawned request Process.
@@ -77,8 +80,8 @@ pub struct RequestGrantTemplate<'a> {
 pub struct CompiledRequestGrantTemplate {
     /// Capability selector for the request grant.
     pub selector: ResourceSelector,
-    /// Method bits the request grant may exercise.
-    pub methods: MethodBitmap,
+    /// Explicit method and propagation rights, attenuated against the anchor.
+    pub rights: GrantRights,
 }
 
 /// A spawned actor process.
@@ -99,17 +102,29 @@ struct EffectRegistration<'a> {
     relink_existing: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ParsedRequestGrantTemplate {
     selector: ResourceSelector,
-    methods: Option<MethodBitmap>,
+    rights: Option<GrantRights>,
 }
 
+#[derive(Clone, Copy)]
+struct RequestGrantView<'a> {
+    selector: &'a ResourceSelector,
+    rights: Option<&'a GrantRights>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PlannedRequestGrant {
     selector: ResourceSelector,
-    rights: Rights,
+    rights: GrantRights,
     constraints: ConstraintSet,
     expires: Expiry,
 }
+
+// A Console may admit 16,384 distinct request templates. The Kernel also
+// bounds any additional alternatives produced by overlapping parent grants.
+const MAX_REQUEST_GRANT_ALTERNATIVES: usize = 16_384;
 
 /// Errors raised while assembling built-in resources, drivers, and bootstrap
 /// facts/state.
@@ -144,6 +159,9 @@ pub enum BootstrapError {
     /// Registry admission rejected a bootstrap object.
     #[error("admission failed: {0}")]
     Admission(#[from] AdmissionError),
+    /// The caller identity is not registered in this Kernel's directory.
+    #[error("identity admission failed: {0}")]
+    Identity(#[from] crate::identity::IdentityError),
     /// A request grant selector is not covered by any grant the authority
     /// anchor holds. No Process is created.
     #[error("request grant {literal:?} exceeds authority anchor ceiling")]
@@ -151,10 +169,22 @@ pub enum BootstrapError {
         /// Request grant literal that exceeded the anchor.
         literal: String,
     },
+    /// Attenuation would attach more distinct grants than one Process may hold.
+    #[error("request grant alternatives exceed limit {limit}")]
+    RequestGrantLimit {
+        /// Maximum number of distinct attached grants.
+        limit: usize,
+    },
     /// The requested Process does not exist.
     #[error("process {process} not found")]
     NoSuchProcess {
         /// Process id supplied by the caller.
+        process: ProcessId,
+    },
+    /// The cleanup ticket belongs to a different kernel process table.
+    #[error("cleanup ticket for process {process} belongs to a different process table")]
+    CleanupTicketMismatch {
+        /// Process named by the mismatched ticket.
         process: ProcessId,
     },
     /// A terminal or finalizing process cannot admit children or start work.
@@ -172,8 +202,14 @@ pub enum BootstrapError {
         /// Process whose owner must first return or request cancellation.
         process: ProcessId,
     },
-    /// Background process creation requires an active Tokio runtime.
-    #[error("process {process} requires an active Tokio runtime")]
+    /// The caller stopped waiting; cleanup and already accepted effects remain owned.
+    #[error("cleanup observation deadline expired for process {process}")]
+    CleanupWaitExpired {
+        /// Original process whose cleanup may still complete.
+        process: ProcessId,
+    },
+    /// Background process creation requires an available host task spawner.
+    #[error("process {process} requires an available host task spawner")]
     ProcessRuntimeUnavailable {
         /// Process whose task could not be started.
         process: ProcessId,
@@ -189,13 +225,18 @@ pub enum BootstrapError {
     /// Writing a bootstrap fact failed.
     #[error("fact write failed: {0}")]
     Fact(#[from] crate::FactError),
+    /// No host blocking worker accepted the terminal record before it changed state.
+    #[error("terminal record scheduling failed: {0}")]
+    TerminalRecordScheduling(#[source] crate::host::BlockingSpawnError),
+    /// The accepted worker ended without confirming its terminal record result.
+    #[error("terminal record result unknown; retry after reconciling its fact: {0}")]
+    TerminalRecordUnknown(#[source] crate::host::BlockingTaskError),
+    /// A host-owned process result could not be published; cleanup remains retryable.
+    #[error("process result publication failed: {0}")]
+    Publication(#[source] Box<xolotl_types::Failure>),
     /// An execution identity could not be reserved before dispatch or cleanup.
     #[error("execution identity allocation failed: {0}")]
     ExecutionId(#[from] crate::ExecutionIdError),
-    /// Persisting the terminal checkpoint retirement failed; cleanup is retryable.
-    #[cfg(feature = "durable")]
-    #[error("checkpoint lifecycle failed: {0}")]
-    Checkpoint(#[source] Box<xolotl_types::Failure>),
     /// Writing bootstrap state failed.
     #[error("state write failed: {0}")]
     State(#[source] Box<xolotl_state::StateFailure>),
@@ -247,14 +288,15 @@ impl From<crate::process::ProcessAdmissionError> for BootstrapError {
 pub struct MethodSpec {
     /// Public method name inside the interface.
     pub name: &'static str,
+    /// Capability category required to open this method.
+    pub authority: xolotl_types::MethodAuthority,
     /// Method purity used to derive replay class.
     pub purity: Purity,
     /// Output modes supported by this method.
     pub supports: OutputModeSet,
     /// Whether the method accepts explicit list-shaped batches.
     pub batchable: bool,
-    /// Whether the method observes external state and must record observations
-    /// that affect recovery.
+    /// Whether the method observes external state.
     pub observes_external: bool,
     /// Whether the method may run while the owning Process is finalizing.
     pub finalize_allowed: bool,
@@ -270,10 +312,16 @@ impl MethodSpec {
     /// Convenience output set for sink-only plus async-process methods.
     pub const SINK_ASYNC: OutputModeSet = OutputModeSet::from_bits_retain(0b1100);
 
-    /// Create a method specification with explicit output support.
-    pub const fn new(name: &'static str, purity: Purity, supports: OutputModeSet) -> Self {
+    /// Create a method with explicit authority and output support.
+    pub const fn new(
+        name: &'static str,
+        authority: xolotl_types::MethodAuthority,
+        purity: Purity,
+        supports: OutputModeSet,
+    ) -> Self {
         Self {
             name,
+            authority,
             purity,
             supports,
             batchable: false,
@@ -306,38 +354,22 @@ impl MethodSpec {
         self.requires_unprotected_input = true;
         self
     }
-
-    /// Create a unary/async-process method spec.
-    pub fn unary_async(name: &'static str, purity: Purity) -> Self {
-        Self::new(
-            name,
-            purity,
-            OutputModeSet::UNARY | OutputModeSet::ASYNC_PROCESS,
-        )
-    }
-
-    /// Create a stream-capable method spec.
-    pub fn stream_async(name: &'static str, purity: Purity) -> Self {
-        Self::new(
-            name,
-            purity,
-            OutputModeSet::UNARY | OutputModeSet::STREAM | OutputModeSet::ASYNC_PROCESS,
-        )
-    }
-
-    /// Create a sink-only/async-process method spec.
-    pub fn sink_async(name: &'static str, purity: Purity) -> Self {
-        Self::new(
-            name,
-            purity,
-            OutputModeSet::SINK_ONLY | OutputModeSet::ASYNC_PROCESS,
-        )
-    }
 }
 
 impl Bootstrap {
+    /// The assembled kernel whose process table owns this bootstrap's root.
+    pub fn kernel(&self) -> &Kernel {
+        &self.kernel
+    }
+
+    /// The root/system process initialized once in this kernel's process table.
+    pub fn root(&self) -> ProcessId {
+        self.root
+    }
+
     /// Build an in-memory kernel, create the root Process, and grant it the
     /// omnipotent capability (`*://**`).
+    #[cfg(any(test, feature = "memory"))]
     pub fn in_memory() -> Self {
         let kernel = Kernel::in_memory();
         Self::seed(kernel)
@@ -350,18 +382,22 @@ impl Bootstrap {
     }
 
     fn seed(kernel: Kernel) -> Self {
-        let root = kernel.processes.initialize_root(|root| {
-            kernel.registry.register_grant(Grant {
-                id: kernel.registry.next_grant_id(),
+        let root = kernel.processes().initialize_root(|root| {
+            kernel.registry().register_grant(Grant {
+                id: kernel.registry().next_grant_id(),
                 holder: root,
                 selector: ResourceSelector::all(),
-                rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
+                rights: GrantRights::new(GrantMethods::all(), RightFlags::all()),
                 constraints: ConstraintSet::empty(),
                 expires: Expiry::Never,
             });
         });
 
-        Bootstrap { kernel, root }
+        Bootstrap {
+            kernel,
+            root,
+            cleanup_tasks: std::sync::Arc::default(),
+        }
     }
 
     /// Register a Callable effect Resource backed by an in-process driver, and
@@ -433,10 +469,13 @@ impl Bootstrap {
             generation,
             relink_existing,
         } = registration;
-        if methods.len() != 1 || methods[0].name != "invoke" {
+        if methods.len() != 1
+            || methods[0].name != "invoke"
+            || methods[0].authority != xolotl_types::MethodAuthority::Perform
+        {
             return Err(BootstrapError::InvalidMethodSpec {
                 resource: path.to_string(),
-                reason: "Callable effect resources expose exactly one public `invoke` method"
+                reason: "Callable effect resources expose one public `invoke` method with perform authority"
                     .into(),
             });
         }
@@ -450,55 +489,46 @@ impl Bootstrap {
             literal: path.to_string(),
             source,
         })?);
-        let reg = &self.kernel.registry;
-        if relink_existing {
-            match reg.resource_binding_generation(&name) {
-                Ok(current) if generation < current => {
-                    return Err(
-                        crate::registry::AdmissionError::BindingGenerationRegressed {
-                            resource: name.path().to_string(),
-                            current,
-                            attempted: generation,
-                        }
-                        .into(),
-                    );
-                }
-                Ok(_) | Err(crate::registry::AdmissionError::ResourceNotRegistered(_)) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        let selector_literal = format!("perform://{}", strip_scheme(path));
-        let selector = ResourceSelector::parse(&selector_literal).map_err(|source| {
-            BootstrapError::Selector {
-                literal: selector_literal,
-                source,
-            }
+        let reg = self.kernel().registry();
+        let target = name.path();
+        let capability = Capability::try_new(
+            "perform",
+            target.scheme(),
+            target.segments().iter().map(|segment| segment.as_str()),
+            None,
+        )
+        .and_then(|capability| match target.cluster() {
+            Some(cluster) => capability.try_with_cluster(cluster),
+            None => Ok(capability),
+        })
+        .map_err(|source| BootstrapError::Selector {
+            literal: path.to_string(),
+            source,
         })?;
+        let selector = ResourceSelector {
+            pattern: capability,
+        };
         let iface_id = reg.next_interface_id();
         let method_descs = build_methods(methods, cost, false);
         let interfaces = InterfaceSet::new(vec![iface_id]);
-        reg.register_interface(Interface {
+        let interface = Interface {
             id: iface_id,
             family: InterfaceFamily::Callable,
             methods: method_descs,
             laws: Vec::new(),
-        });
+        };
 
         let driver_id = reg.next_driver_id();
-        reg.register_driver(DriverDescriptor {
+        let driver = DriverDescriptor {
             id: driver_id,
             name: path.to_string(),
             implements: interfaces.clone(),
             transport: Transport::InProcess,
             driver,
-        });
+        };
 
         let binding_id = reg.next_binding_id();
-        // Admit (not bare-register) so the invariant is enforced even for
-        // built-ins: the bound Driver implements every Interface the Binding
-        // declares. The driver registered just above implements `iface_id`, so a
-        // failure here is an assembly-time programmer error.
-        reg.admit_binding(Binding {
+        let binding = Binding {
             id: binding_id,
             selector,
             interfaces: interfaces.clone(),
@@ -508,32 +538,25 @@ impl Bootstrap {
             },
             endpoint: None,
             generation,
-        })?;
-
-        if relink_existing {
-            match reg.resolve_resource(&name) {
-                Ok(_) => {
-                    reg.relink_resource(&name, interfaces, binding_id)?;
-                    return Ok(name);
-                }
-                Err(ResolveError::NoSuchResource(_)) => {}
-            }
-        }
+        };
 
         let rid = reg.next_resource_id();
-        reg.admit_resource(
-            Resource {
-                id: rid,
-                descriptor: ResourceDescriptor {
-                    name: name.clone(),
-                    kind: ResourceKind::Effect,
-                    metadata,
-                },
-                interfaces,
-                binding: binding_id,
+        let resource = Resource {
+            id: rid,
+            descriptor: ResourceDescriptor {
+                name: name.clone(),
+                kind: ResourceKind::Effect,
+                addressing: xolotl_types::ResourceAddressing::Exact,
+                metadata,
             },
-            true,
-        )?;
+            interfaces,
+            binding: binding_id,
+        };
+        if relink_existing {
+            reg.upsert_resource_bundle(vec![interface], driver, binding, resource, true)?;
+        } else {
+            reg.admit_resource_bundle(vec![interface], driver, binding, resource, true)?;
+        }
         Ok(name)
     }
 
@@ -560,10 +583,11 @@ impl Bootstrap {
         )
     }
 
-    /// Register a concrete subtree root, e.g. `state://fact`, with an explicit
-    /// grant selector pattern, e.g. `read://state/fact/**`. More-specific roots
-    /// win during name resolution, so read-only projections can live under
-    /// `state://` without falling through to the generic StateDriver.
+    /// Register a State collection at a concrete subtree root, e.g.
+    /// `state://fact`, with an explicit grant selector pattern such as
+    /// `read://state/fact/**`. This convenience method declares Prefix
+    /// addressing; use [`Self::register_resource`] to choose another kind or
+    /// addressing mode. The bundle publishes atomically.
     pub fn register_subtree_resource_at(
         &self,
         root_path: &str,
@@ -572,45 +596,6 @@ impl Bootstrap {
         methods: &[MethodSpec],
         driver: DynDriver,
     ) -> Result<ResourceName, BootstrapError> {
-        let reg = &self.kernel.registry;
-        let iface_id = reg.next_interface_id();
-        let method_descs = build_methods(methods, Default::default(), true);
-        reg.register_interface(Interface {
-            id: iface_id,
-            family,
-            methods: method_descs,
-            laws: Vec::new(),
-        });
-
-        let driver_id = reg.next_driver_id();
-        reg.register_driver(DriverDescriptor {
-            id: driver_id,
-            name: root_path.to_string(),
-            implements: InterfaceSet::new(vec![iface_id]),
-            transport: Transport::InProcess,
-            driver,
-        });
-
-        let binding_id = reg.next_binding_id();
-        let selector = ResourceSelector::parse(selector_pattern).map_err(|source| {
-            BootstrapError::Selector {
-                literal: selector_pattern.to_string(),
-                source,
-            }
-        })?;
-        reg.admit_binding(Binding {
-            id: binding_id,
-            selector,
-            interfaces: InterfaceSet::new(vec![iface_id]),
-            driver: DriverRef {
-                id: driver_id,
-                name: root_path.to_string(),
-            },
-            endpoint: None,
-            generation: 1,
-        })?;
-
-        let rid = reg.next_resource_id();
         let name =
             ResourceName::new(
                 Path::parse(root_path).map_err(|source| BootstrapError::Path {
@@ -618,15 +603,95 @@ impl Bootstrap {
                     source,
                 })?,
             );
-        reg.admit_resource(
+        self.register_resource_inner(
+            ResourceDescriptor {
+                name,
+                kind: ResourceKind::State,
+                addressing: xolotl_types::ResourceAddressing::Prefix,
+                metadata: Metadata::default(),
+            },
+            selector_pattern,
+            family,
+            methods,
+            driver,
+            true,
+        )
+    }
+
+    /// Register one host-defined Resource with explicit classification and
+    /// addressing. A Prefix resource handles descendants only when no closer
+    /// explicit registration exists. Authorization uses the requested path,
+    /// not merely this descriptor's root. All descriptions publish atomically.
+    pub fn register_resource(
+        &self,
+        descriptor: ResourceDescriptor,
+        selector_pattern: &str,
+        family: InterfaceFamily,
+        methods: &[MethodSpec],
+        driver: DynDriver,
+    ) -> Result<ResourceName, BootstrapError> {
+        self.register_resource_inner(descriptor, selector_pattern, family, methods, driver, false)
+    }
+
+    fn register_resource_inner(
+        &self,
+        descriptor: ResourceDescriptor,
+        selector_pattern: &str,
+        family: InterfaceFamily,
+        methods: &[MethodSpec],
+        driver: DynDriver,
+        state_backed: bool,
+    ) -> Result<ResourceName, BootstrapError> {
+        let name = descriptor.name.clone();
+        let root_path = name.path().to_string();
+        let selector = ResourceSelector::parse(selector_pattern).map_err(|source| {
+            BootstrapError::Selector {
+                literal: selector_pattern.to_string(),
+                source,
+            }
+        })?;
+        let reg = self.kernel().registry();
+        let iface_id = reg.next_interface_id();
+        let method_descs = build_methods(methods, Default::default(), state_backed);
+        let interfaces = InterfaceSet::new(vec![iface_id]);
+        let interface = Interface {
+            id: iface_id,
+            family,
+            methods: method_descs,
+            laws: Vec::new(),
+        };
+
+        let driver_id = reg.next_driver_id();
+        let driver = DriverDescriptor {
+            id: driver_id,
+            name: root_path.clone(),
+            implements: interfaces.clone(),
+            transport: Transport::InProcess,
+            driver,
+        };
+
+        let binding_id = reg.next_binding_id();
+        let binding = Binding {
+            id: binding_id,
+            selector,
+            interfaces: interfaces.clone(),
+            driver: DriverRef {
+                id: driver_id,
+                name: root_path,
+            },
+            endpoint: None,
+            generation: 1,
+        };
+
+        let rid = reg.next_resource_id();
+        reg.admit_resource_bundle(
+            vec![interface],
+            driver,
+            binding,
             Resource {
                 id: rid,
-                descriptor: ResourceDescriptor {
-                    name: name.clone(),
-                    kind: ResourceKind::State,
-                    metadata: Metadata::default(),
-                },
-                interfaces: InterfaceSet::new(vec![iface_id]),
+                descriptor,
+                interfaces,
                 binding: binding_id,
             },
             true,
@@ -634,43 +699,133 @@ impl Bootstrap {
         Ok(name)
     }
 
-    /// Open a handle for `process` against a registered resource.
+    /// Open a handle for `process` against a registered resource, requesting
+    /// every method declared under `verb`.
     pub fn open_for(
         &self,
         process: ProcessId,
         name: &ResourceName,
         verb: &str,
     ) -> Result<HandleId, OpenError> {
-        let resource_id = self.kernel.registry.resolve_resource(name)?;
-        let mut handles = self.kernel.handles.write();
         let acting = self
-            .kernel
-            .processes
+            .kernel()
+            .processes()
             .identity(process)
             .ok_or(OpenError::NoSuchProcess(process))?;
-        let attached_grants = self.kernel.processes.attached_grants(process);
-        open_resource_with_attached(
-            &self.kernel.registry,
-            &mut handles,
+        self.open_for_as(process, acting, name, verb)
+    }
+
+    /// Open only one named method for a process. This preserves a narrow
+    /// request grant when other methods share the same authority category.
+    pub fn open_for_method(
+        &self,
+        process: ProcessId,
+        name: &ResourceName,
+        verb: &str,
+        method: &str,
+    ) -> Result<HandleId, OpenError> {
+        let acting = self
+            .kernel()
+            .processes()
+            .identity(process)
+            .ok_or(OpenError::NoSuchProcess(process))?;
+        self.open_for_as_method(process, acting, name, verb, method)
+    }
+
+    /// Open one named method while retaining an explicit acting identity.
+    pub fn open_for_as_method(
+        &self,
+        process: ProcessId,
+        acting: IdentityRef,
+        name: &ResourceName,
+        verb: &str,
+        method: &str,
+    ) -> Result<HandleId, OpenError> {
+        self.open_for_as_selected(process, acting, name, verb, Some(method))
+    }
+
+    /// Open a process-owned handle for a particular acting identity, requesting
+    /// every method declared under `verb`.
+    ///
+    /// The handle retains this identity in its frozen open-time policy. The
+    /// executing `Acting` scope must still pass its own `act-as` check against
+    /// the value entering that scope; opening a handle cannot authorize entry.
+    /// Use this Kernel's identity directory to resolve an `Acting` path.
+    pub fn open_for_as(
+        &self,
+        process: ProcessId,
+        acting: IdentityRef,
+        name: &ResourceName,
+        verb: &str,
+    ) -> Result<HandleId, OpenError> {
+        self.open_for_as_selected(process, acting, name, verb, None)
+    }
+
+    fn open_for_as_selected(
+        &self,
+        process: ProcessId,
+        acting: IdentityRef,
+        name: &ResourceName,
+        verb: &str,
+        method: Option<&str>,
+    ) -> Result<HandleId, OpenError> {
+        if self.kernel().processes().identity(process).is_none() {
+            return Err(OpenError::NoSuchProcess(process));
+        }
+        self.kernel().identities().verify(acting)?;
+        let resource_id = self.kernel().registry().resolve_resource(name)?;
+        let (methods, selected) = if let Some(method) = method {
+            let (index, installed) = self
+                .kernel()
+                .registry()
+                .resource_method(resource_id, method)
+                .ok_or(OpenError::MethodContractChanged)?;
+            if installed.authority.verb() != verb {
+                return Err(OpenError::MethodAuthorityMismatch(verb.into()));
+            }
+            (MethodBitmap::method(index), Some((index, method)))
+        } else {
+            (
+                self.kernel()
+                    .registry()
+                    .method_bitmap_for_verb(resource_id, verb),
+                None,
+            )
+        };
+        let attached_grants = self.kernel().processes().attached_grants(process);
+        let prepared = prepare_open(
+            self.kernel().registry(),
             OpenRequest {
                 process,
                 resource: resource_id,
                 verb: verb.to_string(),
-                // Ordinary effect/state opens request only the method authority
-                // implied by the selector verb. Do not request derivation flags:
-                // attenuated request Processes intentionally receive no derive
-                // flags, and asking for them would make safe child opens fail.
-                rights: Rights::new(
-                    method_bitmap_for_verb(&self.kernel.registry, resource_id, verb),
-                    RightFlags::empty(),
-                ),
+                // Ordinary effect/state opens request only method authority.
+                // Propagation rights require an explicit host request.
+                rights: Rights::new(methods, RightFlags::empty()),
                 acting,
                 // Carry the concrete requested path so prefix-resolved Resources
                 // (state://**) bind the real path on the handle.
                 requested_path: Some(name.path().clone()),
-                now_millis: crate::executor::now_millis(),
+                now_millis: self.kernel().host_runtime().now_millis(),
             },
             &attached_grants,
+        )?;
+        // A resource may be relinked between the name lookup and open
+        // preparation. Verify the frozen dispatch contract before installing
+        // the handle; installation itself rejects any later registry change.
+        if let Some((index, method)) = selected
+            && !prepared.driver_plan().methods().any(|(_, entry)| {
+                entry.contract.method_index == index
+                    && entry.declaration().is_some_and(|frozen| {
+                        frozen.name == method && frozen.authority.verb() == verb
+                    })
+            })
+        {
+            return Err(OpenError::MethodContractChanged);
+        }
+        prepared.install_for(
+            &mut self.kernel().handles().write(),
+            self.kernel().processes(),
         )
     }
 
@@ -680,12 +835,11 @@ impl Bootstrap {
         name: &ResourceName,
         verb: &str,
     ) -> Result<MethodBitmap, OpenError> {
-        let resource_id = self.kernel.registry.resolve_resource(name)?;
-        Ok(method_bitmap_for_verb(
-            &self.kernel.registry,
-            resource_id,
-            verb,
-        ))
+        let resource_id = self.kernel().registry().resolve_resource(name)?;
+        Ok(self
+            .kernel()
+            .registry()
+            .method_bitmap_for_verb(resource_id, verb))
     }
 
     /// Spawn a request Process under `anchor` with explicit request grant
@@ -702,7 +856,7 @@ impl Bootstrap {
                 ResourceSelector::parse(grant.literal)
                     .map(|selector| ParsedRequestGrantTemplate {
                         selector,
-                        methods: Some(grant.methods),
+                        rights: Some(grant.rights.clone()),
                     })
                     .map_err(|source| BootstrapError::Selector {
                         literal: grant.literal.to_string(),
@@ -736,7 +890,7 @@ impl Bootstrap {
             .iter()
             .map(|grant| ParsedRequestGrantTemplate {
                 selector: grant.selector.clone(),
-                methods: Some(grant.methods),
+                rights: Some(grant.rights.clone()),
             })
             .collect();
         self.spawn_request_process_under_inner(anchor, identity, parsed, steps)
@@ -746,10 +900,24 @@ impl Bootstrap {
         &self,
         anchor: ProcessId,
         identity: IdentityRef,
-        mut grants: Vec<ParsedRequestGrantTemplate>,
+        grants: Vec<ParsedRequestGrantTemplate>,
         steps: StepModule,
     ) -> Result<ProcessId, BootstrapError> {
-        let child = self.kernel.processes.fresh_id()?;
+        let entry = self.prepare_request_process_entry(anchor, identity, grants, steps)?;
+        let child = entry.scope.process();
+        self.kernel().processes().admit_child(entry)?;
+        Ok(child)
+    }
+
+    fn prepare_request_process_entry(
+        &self,
+        anchor: ProcessId,
+        identity: IdentityRef,
+        mut grants: Vec<ParsedRequestGrantTemplate>,
+        steps: StepModule,
+    ) -> Result<ProcessEntry, BootstrapError> {
+        self.kernel().identities().verify(identity)?;
+        let child = self.kernel().processes().fresh_id()?;
         for grant in &mut grants {
             xolotl_graph::bind_process_self_capability(&mut grant.selector.pattern, child);
         }
@@ -757,8 +925,7 @@ impl Bootstrap {
         let mut entry = self.request_process_entry(child, anchor, identity, planned);
         entry.steps = steps;
         entry.scope.start();
-        self.kernel.processes.admit_child(entry)?;
-        Ok(child)
+        Ok(entry)
     }
 
     fn plan_request_grants(
@@ -766,50 +933,150 @@ impl Bootstrap {
         anchor: ProcessId,
         grants: &[ParsedRequestGrantTemplate],
     ) -> Result<Vec<PlannedRequestGrant>, BootstrapError> {
-        match self.kernel.processes.status(anchor) {
+        self.plan_request_grant_views(
+            anchor,
+            grants.iter().map(|grant| RequestGrantView {
+                selector: &grant.selector,
+                rights: grant.rights.as_ref(),
+            }),
+        )
+    }
+
+    fn plan_request_grant_views<'a>(
+        &self,
+        anchor: ProcessId,
+        grants: impl IntoIterator<Item = RequestGrantView<'a>>,
+    ) -> Result<Vec<PlannedRequestGrant>, BootstrapError> {
+        match self.kernel().processes().status(anchor) {
             None => return Err(BootstrapError::NoSuchProcess { process: anchor }),
             Some(status) if status.is_terminal() || status == ProcessStatus::Finalizing => {
                 return Err(BootstrapError::ProcessUnavailable { process: anchor });
             }
             Some(_) => {}
         }
-        let now_millis = crate::executor::now_millis();
-        let mut anchor_grants = self.kernel.registry.grants_of(anchor);
-        anchor_grants.extend(self.kernel.processes.attached_grants(anchor));
-        let mut planned: Vec<PlannedRequestGrant> = Vec::with_capacity(grants.len());
+        let now_millis = self.kernel().host_runtime().now_millis();
+        let mut anchor_grants = self.kernel().registry().grants_of(anchor);
+        anchor_grants.extend(self.kernel().processes().attached_grants(anchor));
+        Self::plan_grants_from_views(
+            &anchor_grants,
+            grants,
+            now_millis,
+            MAX_REQUEST_GRANT_ALTERNATIVES,
+        )
+    }
+
+    #[cfg(test)]
+    fn plan_grants_from(
+        anchor_grants: &[Grant],
+        grants: &[ParsedRequestGrantTemplate],
+        now_millis: i64,
+    ) -> Result<Vec<PlannedRequestGrant>, BootstrapError> {
+        Self::plan_grants_from_with_limit(
+            anchor_grants,
+            grants,
+            now_millis,
+            MAX_REQUEST_GRANT_ALTERNATIVES,
+        )
+    }
+
+    #[cfg(test)]
+    fn plan_grants_from_with_limit(
+        anchor_grants: &[Grant],
+        grants: &[ParsedRequestGrantTemplate],
+        now_millis: i64,
+        limit: usize,
+    ) -> Result<Vec<PlannedRequestGrant>, BootstrapError> {
+        Self::plan_grants_from_views(
+            anchor_grants,
+            grants.iter().map(|grant| RequestGrantView {
+                selector: &grant.selector,
+                rights: grant.rights.as_ref(),
+            }),
+            now_millis,
+            limit,
+        )
+    }
+
+    fn plan_grants_from_views<'a>(
+        anchor_grants: &[Grant],
+        grants: impl IntoIterator<Item = RequestGrantView<'a>>,
+        now_millis: i64,
+        limit: usize,
+    ) -> Result<Vec<PlannedRequestGrant>, BootstrapError> {
+        let mut unique = HashSet::new();
         for grant in grants {
-            let (selector, requested_predicate) =
-                Self::normalize_selector_constraints(&grant.selector);
-            // covers_cap matches on verb + scheme + segments; the anchor pattern
-            // must be at least as broad as the declared one.
-            let covering = anchor_grants.iter().find(|g| {
-                let requested = grant.methods.unwrap_or(g.rights.methods);
-                !requested.is_empty()
-                    && !g.expires.is_expired(now_millis)
-                    && requested.is_subset_of(g.rights.methods)
-                    && g.selector.pattern.covers_cap(&selector.pattern)
-            });
-            match covering {
-                Some(g) => {
-                    let rights = Rights::new(
-                        grant.methods.unwrap_or(g.rights.methods),
-                        RightFlags::empty(),
-                    );
-                    planned.push(PlannedRequestGrant {
-                        selector,
-                        rights,
-                        constraints: Self::derived_grant_constraints(g, requested_predicate),
-                        expires: g.expires,
-                    });
+            // Every covering parent is a separate OR candidate; choosing the
+            // first one would make the result depend on grant insertion order.
+            let mut covered = false;
+            for parent in anchor_grants {
+                if parent.expires.is_expired(now_millis)
+                    || !parent
+                        .selector
+                        .pattern
+                        .covers_cap_pattern(&grant.selector.pattern)
+                {
+                    continue;
                 }
-                None => {
-                    return Err(BootstrapError::CapabilityCeiling {
-                        literal: grant.selector.pattern.to_string(),
-                    });
+                let inherited;
+                let requested = if let Some(rights) = grant.rights {
+                    rights
+                } else {
+                    inherited =
+                        GrantRights::new(parent.rights.methods.clone(), RightFlags::empty());
+                    &inherited
+                };
+                if requested.is_empty() || !requested.is_subset_of(&parent.rights) {
+                    continue;
+                }
+                covered = true;
+                unique.insert(PlannedRequestGrant {
+                    selector: grant.selector.clone(),
+                    rights: requested.clone(),
+                    constraints: Self::derived_grant_constraints(
+                        parent,
+                        grant.selector.pattern.predicate.as_ref(),
+                    ),
+                    expires: parent.expires,
+                });
+                if unique.len() > limit {
+                    return Err(BootstrapError::RequestGrantLimit { limit });
                 }
             }
+            if !covered {
+                return Err(BootstrapError::CapabilityCeiling {
+                    literal: grant.selector.pattern.to_string(),
+                });
+            }
         }
+        let mut planned: Vec<_> = unique.into_iter().collect();
+        planned.sort_unstable_by(Self::compare_planned_grants);
         Ok(planned)
+    }
+
+    fn compare_request_selectors(
+        left: &ResourceSelector,
+        right: &ResourceSelector,
+    ) -> std::cmp::Ordering {
+        let left = &left.pattern;
+        let right = &right.pattern;
+        left.verb
+            .cmp(&right.verb)
+            .then_with(|| left.cluster.cmp(&right.cluster))
+            .then_with(|| left.scheme.cmp(&right.scheme))
+            .then_with(|| left.segments.cmp(&right.segments))
+            .then_with(|| left.method.cmp(&right.method))
+            .then_with(|| left.predicate.cmp(&right.predicate))
+    }
+
+    fn compare_planned_grants(
+        left: &PlannedRequestGrant,
+        right: &PlannedRequestGrant,
+    ) -> std::cmp::Ordering {
+        Self::compare_request_selectors(&left.selector, &right.selector)
+            .then_with(|| left.rights.methods.cmp(&right.rights.methods))
+            .then_with(|| left.rights.flags.bits().cmp(&right.rights.flags.bits()))
+            .then_with(|| left.constraints.cmp(&right.constraints))
+            .then_with(|| left.expires.cmp(&right.expires))
     }
 
     fn request_process_entry(
@@ -823,7 +1090,7 @@ impl Bootstrap {
 
         for grant in planned {
             entry.attached_grants.push(Grant {
-                id: self.kernel.processes.fresh_attached_grant_id(),
+                id: self.kernel().processes().fresh_attached_grant_id(),
                 holder: child,
                 selector: grant.selector,
                 rights: grant.rights,
@@ -834,65 +1101,48 @@ impl Bootstrap {
         entry
     }
 
-    fn normalize_selector_constraints(
-        selector: &ResourceSelector,
-    ) -> (ResourceSelector, Option<xolotl_types::Predicate>) {
-        let mut selector = selector.clone();
-        let predicate = selector.pattern.predicate.take();
-        (selector, predicate)
-    }
-
     fn derived_grant_constraints(
         parent: &Grant,
-        requested_predicate: Option<xolotl_types::Predicate>,
+        child_predicate: Option<&xolotl_types::Predicate>,
     ) -> ConstraintSet {
         let mut predicates = Vec::with_capacity(
             usize::from(parent.selector.pattern.predicate.is_some())
-                + parent.constraints.predicates.len()
-                + usize::from(requested_predicate.is_some()),
+                + parent.constraints.predicates.len(),
         );
-        if let Some(predicate) = parent.selector.pattern.predicate.clone() {
+        if let Some(predicate) = parent.selector.pattern.predicate.clone()
+            && Some(&predicate) != child_predicate
+        {
             predicates.push(predicate);
         }
-        predicates.extend(parent.constraints.predicates.iter().cloned());
-        if let Some(predicate) = requested_predicate {
-            predicates.push(predicate);
-        }
+        predicates.extend(
+            parent
+                .constraints
+                .predicates
+                .iter()
+                .filter(|predicate| Some(*predicate) != child_predicate)
+                .cloned(),
+        );
+        predicates.sort_unstable();
+        predicates.dedup();
         ConstraintSet { predicates }
     }
 
-    /// Classify every retained Fact, including records of processes already reaped
-    /// or not yet restored, and persist quarantine entries to `state://quarantine/*`.
-    /// Uses default per-page read budgets. Returns the aggregate recovery report
-    /// without scheduling execution; quiesce Fact writers for stable results.
-    pub async fn recover_all(&self) -> Result<crate::recovery::RecoveryReport, crate::FactError> {
-        crate::recovery::recover_all_persisting(&self.kernel.facts, &self.kernel.state).await
-    }
-
-    /// Classify retained Facts with explicit record and encoded-byte page budgets.
-    /// See [`crate::recovery::recover_all_persisting_with_limits`] for consistency
-    /// and partial-failure semantics.
-    pub async fn recover_all_with_limits(
-        &self,
-        limits: crate::RecoveryLimits,
-    ) -> Result<crate::RecoveryReport, crate::FactError> {
-        crate::recovery::recover_all_persisting_with_limits(
-            &self.kernel.facts,
-            &self.kernel.state,
-            limits,
-        )
-        .await
-    }
-
-    /// Record a Gateway-layer audit Fact for pre-Operation events such as
-    /// console login/logout/root bootstrap. Credential material is
-    /// intentionally absent: only redacted event metadata reaches the Fact log.
+    /// Record a gateway-layer application audit Fact under the root process.
+    /// The caller must redact credentials and other secrets before submission.
+    /// Identity labels and details remain application metadata; this method
+    /// neither verifies them nor derives authentication or authorization from them.
+    /// Empty event or outcome labels are rejected before Fact delivery.
     pub fn record_gateway_audit(&self, audit: GatewayAudit<'_>) -> Result<(), crate::FactError> {
+        if !self.kernel().facts().is_enabled() {
+            return Err(crate::FactError::new(
+                "observation storage is not installed".into(),
+            ));
+        }
         let execution = self
-            .kernel
+            .kernel()
             .execution_ids()
             .allocate()
-            .map_err(|error| crate::FactError(error.to_string()))?;
+            .map_err(|error| crate::FactError::new(error.to_string()))?;
         let process = self.root;
 
         let mut outcome = std::collections::BTreeMap::new();
@@ -916,17 +1166,11 @@ impl Bootstrap {
                 xolotl_types::Value::string(source_addr.into()),
             );
         }
-        if let Some(mfa_level) = audit.mfa_level {
-            outcome.insert(
-                "mfa_level".into(),
-                xolotl_types::Value::integer(i64::from(mfa_level)),
-            );
-        }
         if let Some(details) = audit.details {
             outcome.insert("details".into(), details);
         }
 
-        self.kernel.facts.complete(Fact {
+        let fact = Fact {
             id: xolotl_types::OperationId::new(
                 process,
                 execution,
@@ -936,6 +1180,7 @@ impl Bootstrap {
             ),
             schema_version: Fact::SCHEMA_VERSION,
             caller: process,
+            caller_identity: Some(IdentityRef::ROOT),
             acting: IdentityRef::ROOT,
             handle: xolotl_types::HandleId::new(0, 0),
             resource: xolotl_types::ResourceId::new(0),
@@ -946,27 +1191,28 @@ impl Bootstrap {
             outcome: Some(xolotl_types::Value::map(outcome)),
             batch: None,
             replay: xolotl_types::ReplayClass::Observation,
-            timestamp: xolotl_types::Timestamp::millis(crate::executor::now_millis()),
-        })?;
-        Ok(())
+            timestamp: xolotl_types::Timestamp::millis(self.kernel().host_runtime().now_millis()),
+        };
+        if gateway_audit_event(&fact).is_none() {
+            return Err(crate::FactError::new(
+                "invalid gateway audit event envelope".into(),
+            ));
+        }
+        self.kernel().facts().complete(fact)
     }
-}
 
-/// Reserved CausalPosition for the per-process `ProcessFinalized` lifecycle Fact
-/// Far above any compiled program's node ids so it never collides.
-const FINALIZED_NODE: xolotl_types::NodeId = xolotl_types::NodeId::new(u32::MAX);
-const GATEWAY_AUDIT_NODE: xolotl_types::NodeId = xolotl_types::NodeId::new(u32::MAX - 1);
-
-fn finalized_marker_path(
-    process: ProcessId,
-    execution: xolotl_types::ExecutionId,
-) -> Result<Path, PathError> {
-    Path::try_new("state")?
-        .try_push("kernel")?
-        .try_push("process")?
-        .try_push_literal(process.get().to_string())?
-        .try_push_literal(execution.get().to_string())?
-        .try_push("finalized")
+    /// Record a service observation only when the host installed observation
+    /// storage. Once selected, recording failures remain visible to the service.
+    /// This is not appropriate for an unconditionally required recording barrier.
+    pub fn record_optional_gateway_audit(
+        &self,
+        audit: GatewayAudit<'_>,
+    ) -> Result<(), crate::FactError> {
+        if !self.kernel().facts().is_enabled() {
+            return Ok(());
+        }
+        self.record_gateway_audit(audit)
+    }
 }
 
 pub(crate) fn panic_payload_message(
@@ -1006,44 +1252,6 @@ pub(crate) fn process_status_label(status: ProcessStatus) -> &'static str {
     }
 }
 
-fn method_bitmap_for_verb(
-    registry: &crate::registry::Registry,
-    resource_id: xolotl_types::ResourceId,
-    verb: &str,
-) -> MethodBitmap {
-    let Some(resource) = registry.resource(resource_id) else {
-        return MethodBitmap::empty();
-    };
-    let mut methods = MethodBitmap::empty();
-    for iface_id in &resource.interfaces.interfaces {
-        let Some(iface) = registry.interface(*iface_id) else {
-            continue;
-        };
-        if verb == "perform" {
-            for (index, _) in iface.methods.iter().enumerate() {
-                methods |= MethodBitmap::method(index as u32);
-            }
-        } else {
-            for (index, method) in iface.methods.iter().enumerate() {
-                let matches_verb = match verb {
-                    "read" => method.name == "read" || method.name == "list",
-                    "write" => {
-                        method.name == "write" || method.name == "append" || method.name == "delete"
-                    }
-                    "append" => method.name == "append",
-                    "subscribe" => method.name == "subscribe",
-                    "spawn" | "act-as" => false,
-                    _ => false,
-                };
-                if matches_verb {
-                    methods |= MethodBitmap::method(index as u32);
-                }
-            }
-        }
-    }
-    methods
-}
-
 fn build_methods(
     specs: &[MethodSpec],
     cost: xolotl_types::CostModel,
@@ -1055,10 +1263,11 @@ fn build_methods(
         .map(|(i, spec)| Method {
             // MethodId == the method's index within this interface, so the
             // rights bitmap bit, the driver's dispatch key, and the id all
-            // agree. Ids are interface-scoped (the handle identifies the
-            // resource), so cross-resource reuse of small ids is fine.
+            // agree for this single-interface resource. Multi-interface hosts
+            // must assign ids unique across each resource's interface set.
             id: xolotl_types::MethodId::new(i as u64),
             name: spec.name.to_string(),
+            authority: spec.authority,
             input: SchemaId::new(0),
             output: SchemaId::new(0),
             modality: ModalitySet::TEXT,
@@ -1075,15 +1284,11 @@ fn build_methods(
         .collect()
 }
 
-/// Strip the `scheme://` prefix, yielding `scheme/segments` for selector use.
-fn strip_scheme(path: &str) -> String {
-    path.replacen("://", "/", 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::driver::EchoDriver;
+    use crate::registry::ResolveError;
     use crate::step::{StepBinding, StepFn};
     use anyhow::{Context, bail, ensure};
     use std::collections::BTreeSet;
@@ -1100,13 +1305,325 @@ mod tests {
         }
     }
 
+    #[test]
+    fn effect_relink_updates_metadata_without_retaining_old_registrations() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let registry = boot.kernel().registry();
+        let methods = [MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Effectful,
+            MethodSpec::UNARY_ASYNC,
+        )];
+        let name = boot.register_or_relink_effect_with_cost(
+            "effect://relink/example",
+            &methods,
+            Arc::new(EchoDriver),
+            xolotl_types::CostModel::default(),
+            Metadata {
+                provider_id: Some("provider-v1".into()),
+                ..Metadata::default()
+            },
+            1,
+        )?;
+        let resource_id = registry.resolve_resource(&name)?;
+        let counts = registry.counts();
+
+        for generation in 2..=16 {
+            let metadata = Metadata {
+                provider_id: Some(format!("provider-v{generation}")),
+                tags: vec![format!("revision-{generation}")],
+                ..Metadata::default()
+            };
+            boot.register_or_relink_effect_with_cost(
+                "effect://relink/example",
+                &methods,
+                Arc::new(EchoDriver),
+                xolotl_types::CostModel::default(),
+                metadata.clone(),
+                generation,
+            )?;
+            ensure!(registry.resolve_resource(&name)? == resource_id);
+            ensure!(
+                registry
+                    .resource(resource_id)
+                    .context("relinked resource missing")?
+                    .descriptor
+                    .metadata
+                    == metadata
+            );
+            let after = registry.counts();
+            ensure!(after.resources == counts.resources);
+            ensure!(after.interfaces == counts.interfaces);
+            ensure!(after.drivers == counts.drivers);
+            ensure!(after.bindings == counts.bindings);
+        }
+
+        ensure!(
+            boot.register_or_relink_effect_with_cost(
+                "effect://relink/example",
+                &methods,
+                Arc::new(EchoDriver),
+                xolotl_types::CostModel::default(),
+                Metadata::default(),
+                1,
+            )
+            .is_err()
+        );
+        ensure!(registry.counts() == counts);
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_effect_registration_publishes_no_partial_bundle() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let registry = boot.kernel().registry();
+        let method = MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Effectful,
+            MethodSpec::UNARY_ASYNC,
+        );
+        let name = boot.register_effect(
+            "effect://assembly/duplicate",
+            &[method],
+            Arc::new(EchoDriver),
+        )?;
+        let resource_id = registry.resolve_resource(&name)?;
+        let counts = registry.counts();
+
+        let result = boot.register_effect(
+            "effect://assembly/duplicate",
+            &[method],
+            Arc::new(EchoDriver),
+        );
+        ensure!(matches!(
+            result,
+            Err(BootstrapError::Admission(
+                AdmissionError::DuplicateResourceName(_)
+            ))
+        ));
+        ensure!(registry.resolve_resource(&name)? == resource_id);
+        ensure!(registry.counts() == counts);
+        Ok(())
+    }
+
+    #[test]
+    fn effect_relink_reclaims_a_plain_registration_bundle() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let registry = boot.kernel().registry();
+        let method = MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Effectful,
+            MethodSpec::UNARY_ASYNC,
+        );
+        let name = boot.register_effect(
+            "effect://assembly/plain-relink",
+            &[method],
+            Arc::new(EchoDriver),
+        )?;
+        let id = registry.resolve_resource(&name)?;
+        let counts = registry.counts();
+
+        boot.register_or_relink_effect_with_cost(
+            "effect://assembly/plain-relink",
+            &[method],
+            Arc::new(EchoDriver),
+            xolotl_types::CostModel::default(),
+            Metadata::default(),
+            2,
+        )?;
+        ensure!(registry.resolve_resource(&name)? == id);
+        ensure!(registry.resource_binding_generation(&name)? == 2);
+        ensure!(registry.counts() == counts);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_effect_registration_and_relink_publish_complete_bundles() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let registry = boot.kernel().registry();
+        let baseline = registry.counts();
+        let method = MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Effectful,
+            MethodSpec::UNARY_ASYNC,
+        );
+        let start = std::sync::Barrier::new(8);
+        let registrations = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let boot = boot.clone();
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        boot.register_effect(
+                            "effect://assembly/concurrent",
+                            &[method],
+                            Arc::new(EchoDriver),
+                        )
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| {
+                    worker.join().map_err(|payload| {
+                        anyhow::Error::msg(panic_payload_message("effect registration", payload))
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        })?;
+        ensure!(registrations.iter().filter(|result| result.is_ok()).count() == 1);
+        ensure!(registrations.iter().all(|result| {
+            result.is_ok()
+                || matches!(
+                    result,
+                    Err(BootstrapError::Admission(
+                        AdmissionError::DuplicateResourceName(_)
+                    ))
+                )
+        }));
+        let name = ResourceName::new(Path::parse("effect://assembly/concurrent")?);
+        let id = registry.resolve_resource(&name)?;
+        let installed = registry.counts();
+        ensure!(installed.resources == baseline.resources + 1);
+        ensure!(installed.interfaces == baseline.interfaces + 1);
+        ensure!(installed.drivers == baseline.drivers + 1);
+        ensure!(installed.bindings == baseline.bindings + 1);
+
+        let start = std::sync::Barrier::new(8);
+        let relinks = std::thread::scope(|scope| {
+            let workers: Vec<_> = (2..=9)
+                .map(|generation| {
+                    let boot = boot.clone();
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        boot.register_or_relink_effect_with_cost(
+                            "effect://assembly/concurrent",
+                            &[method],
+                            Arc::new(EchoDriver),
+                            xolotl_types::CostModel::default(),
+                            Metadata::default(),
+                            generation,
+                        )
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| {
+                    worker.join().map_err(|payload| {
+                        anyhow::Error::msg(panic_payload_message("effect relink", payload))
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        })?;
+        ensure!(relinks.iter().any(Result::is_ok));
+        ensure!(relinks.iter().all(|result| {
+            result.is_ok()
+                || matches!(
+                    result,
+                    Err(BootstrapError::Admission(
+                        AdmissionError::BindingGenerationRegressed { .. }
+                    ))
+                )
+        }));
+        ensure!(registry.resolve_resource(&name)? == id);
+        ensure!(registry.resource_binding_generation(&name)? == 9);
+        ensure!(registry.counts() == installed);
+        Ok(())
+    }
+
+    #[test]
+    fn subtree_registration_failure_publishes_no_partial_bundle() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let registry = boot.kernel().registry();
+        let baseline = registry.counts();
+        let root = "state://subtree/atomic";
+        let selector = "read://state/subtree/atomic/**";
+        let method = MethodSpec::new(
+            "read",
+            xolotl_types::MethodAuthority::Read,
+            Purity::Pure,
+            OutputModeSet::UNARY,
+        );
+
+        let invalid_path = boot.register_subtree_resource_at(
+            "not a path",
+            selector,
+            InterfaceFamily::Value,
+            &[method],
+            Arc::new(EchoDriver),
+        );
+        ensure!(matches!(invalid_path, Err(BootstrapError::Path { .. })));
+        ensure!(registry.counts() == baseline);
+
+        let invalid_selector = boot.register_subtree_resource_at(
+            root,
+            "not a selector",
+            InterfaceFamily::Value,
+            &[method],
+            Arc::new(EchoDriver),
+        );
+        ensure!(matches!(
+            invalid_selector,
+            Err(BootstrapError::Selector { .. })
+        ));
+        ensure!(registry.counts() == baseline);
+
+        let invalid_methods = boot.register_subtree_resource_at(
+            root,
+            selector,
+            InterfaceFamily::Value,
+            &[method, method],
+            Arc::new(EchoDriver),
+        );
+        ensure!(matches!(invalid_methods, Err(BootstrapError::Admission(_))));
+        ensure!(registry.counts() == baseline);
+
+        let name = ResourceName::new(Path::parse(root)?);
+        ensure!(matches!(
+            registry.resolve_resource(&name),
+            Err(ResolveError::NoSuchResource(_))
+        ));
+        ensure!(
+            boot.register_subtree_resource_at(
+                root,
+                selector,
+                InterfaceFamily::Value,
+                &[method],
+                Arc::new(EchoDriver),
+            )? == name
+        );
+        let registered = registry.counts();
+        ensure!(registered.resources == baseline.resources + 1);
+        ensure!(registered.interfaces == baseline.interfaces + 1);
+        ensure!(registered.drivers == baseline.drivers + 1);
+        ensure!(registered.bindings == baseline.bindings + 1);
+
+        let duplicate = boot.register_subtree_resource_at(
+            root,
+            selector,
+            InterfaceFamily::Value,
+            &[method],
+            Arc::new(EchoDriver),
+        );
+        ensure!(matches!(duplicate, Err(BootstrapError::Admission(_))));
+        ensure!(registry.counts() == registered);
+        Ok(())
+    }
+
     async fn wait_actor_status(
         boot: &Bootstrap,
         directory: &Path,
         status: &str,
     ) -> anyhow::Result<Value> {
         for _ in 0..100 {
-            if let Some(value) = boot.kernel.state.read(directory).await?
+            if let Some(value) = boot.kernel().state().read(directory).await?
                 && value
                     .as_map()
                     .and_then(|map| map.get("status"))
@@ -1129,7 +1646,7 @@ mod tests {
             ..ActorSpec::default()
         };
         let actor = boot
-            .spawn_actor_under(boot.root, xolotl_types::IdentityRef::ROOT, "root", &spec)
+            .spawn_actor_under(boot.root(), xolotl_types::IdentityRef::ROOT, "root", &spec)
             .await?;
         let value = wait_actor_status(&boot, &actor.directory, "completed").await?;
         let map = value
@@ -1149,14 +1666,22 @@ mod tests {
 
     #[tokio::test]
     async fn actor_body_operation_opens_through_declared_capability() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
+        let boot = crate::fact::testing::observing_bootstrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
         let name = boot.register_effect(
             "effect://echo/actor-body",
-            &[
-                MethodSpec::new("invoke", Purity::Effectful, MethodSpec::UNARY_ASYNC)
-                    .finalize_allowed(),
-            ],
-            Arc::new(EchoDriver),
+            &[MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                Purity::Effectful,
+                MethodSpec::UNARY_ASYNC,
+            )
+            .finalize_allowed()],
+            Arc::new(crate::driver::FnDriver(move |_, value| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(value)
+            })),
         )?;
         let spec = ActorSpec {
             name: "body_op".into(),
@@ -1172,28 +1697,25 @@ mod tests {
         };
 
         let actor = boot
-            .spawn_actor_under(boot.root, xolotl_types::IdentityRef::ROOT, "root", &spec)
+            .spawn_actor_under(boot.root(), xolotl_types::IdentityRef::ROOT, "root", &spec)
             .await?;
         wait_actor_status(&boot, &actor.directory, "completed").await?;
-        let facts = boot.kernel.facts.facts_of(actor.process)?;
-        ensure!(
-            facts.iter().any(|fact| fact.caller == actor.process),
-            "actor operation should record a fact"
-        );
+        ensure!(calls.load(std::sync::atomic::Ordering::SeqCst) == 1);
+        ensure!(boot.kernel().facts().facts_of(actor.process)?.is_empty());
         Ok(())
     }
 
     #[tokio::test]
     async fn actor_spawn_rejects_missing_step_binding() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        let before = boot.kernel.processes.count();
+        let before = boot.kernel().processes().count();
         let spec = ActorSpec {
             name: "missing_step".into(),
             body: DoNode::pure(Value::null()).and_then(StepRef::new("send")),
             ..ActorSpec::default()
         };
         let err = expect_bootstrap_error(
-            boot.spawn_actor_under(boot.root, xolotl_types::IdentityRef::ROOT, "root", &spec)
+            boot.spawn_actor_under(boot.root(), xolotl_types::IdentityRef::ROOT, "root", &spec)
                 .await,
         )?;
         ensure!(
@@ -1201,7 +1723,7 @@ mod tests {
             "unexpected missing step error: {err:?}"
         );
         ensure!(
-            boot.kernel.processes.count() == before,
+            boot.kernel().processes().count() == before,
             "missing step binding should not create a process"
         );
         Ok(())
@@ -1209,14 +1731,22 @@ mod tests {
 
     #[tokio::test]
     async fn actor_spawn_with_step_binding_runs_immediately() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
+        let boot = crate::fact::testing::observing_bootstrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
         let name = boot.register_effect(
             "effect://echo/actor-bound-step",
-            &[
-                MethodSpec::new("invoke", Purity::Effectful, MethodSpec::UNARY_ASYNC)
-                    .finalize_allowed(),
-            ],
-            Arc::new(EchoDriver),
+            &[MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                Purity::Effectful,
+                MethodSpec::UNARY_ASYNC,
+            )
+            .finalize_allowed()],
+            Arc::new(crate::driver::FnDriver(move |_, value| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(value)
+            })),
         )?;
         let spec = ActorSpec {
             name: "bound_step".into(),
@@ -1227,7 +1757,7 @@ mod tests {
         let step_target = name.clone();
         let actor = boot
             .spawn_actor_under_with_steps(
-                boot.root,
+                boot.root(),
                 xolotl_types::IdentityRef::ROOT,
                 "root",
                 &spec,
@@ -1246,13 +1776,10 @@ mod tests {
             )
             .await?;
         wait_actor_status(&boot, &actor.directory, "completed").await?;
-        let facts = boot.kernel.facts.facts_of(actor.process)?;
+        ensure!(calls.load(std::sync::atomic::Ordering::SeqCst) == 1);
+        ensure!(boot.kernel().facts().facts_of(actor.process)?.is_empty());
         ensure!(
-            facts.iter().any(|fact| fact.caller == actor.process),
-            "bound step operation should record a fact"
-        );
-        ensure!(
-            boot.kernel.processes.steps(actor.process).is_empty(),
+            boot.kernel().processes().steps(actor.process).is_empty(),
             "process-local step should be removed after actor completion"
         );
         Ok(())
@@ -1263,18 +1790,23 @@ mod tests {
         use crate::{Driver, DriverContext, DriverError};
         use xolotl_types::{Failure, MethodId, Outcome};
 
-        #[derive(Default)]
-        struct Writes(parking_lot::Mutex<Vec<(ProcessId, Option<Path>, Value)>>);
+        struct Writes(
+            parking_lot::Mutex<Vec<(ProcessId, Option<Path>, Value)>>,
+            crate::DynDriver,
+        );
 
         #[async_trait::async_trait]
         impl Driver for Writes {
             async fn call(
                 &self,
-                _method: MethodId,
+                method: MethodId,
                 input: Value,
-                _output: OutputMode,
+                output: OutputMode,
                 ctx: &DriverContext,
             ) -> Result<crate::DriverOutput, DriverError> {
+                if method.get() == 1 {
+                    return self.1.call(MethodId::new(0), input, output, ctx).await;
+                }
                 self.0
                     .lock()
                     .push((ctx.caller, ctx.target_path.clone(), input.clone()));
@@ -1283,15 +1815,29 @@ mod tests {
         }
 
         let boot = Bootstrap::in_memory();
-        let writes = Arc::new(Writes::default());
+        let writes = Arc::new(Writes(
+            parking_lot::Mutex::new(Vec::new()),
+            crate::executor::signal_tests::signal_driver(boot.kernel().state().clone()),
+        ));
         boot.register_subtree_resource(
             "state",
             InterfaceFamily::Value,
-            &[MethodSpec::new(
-                "write",
-                Purity::Idempotent,
-                MethodSpec::UNARY_ASYNC,
-            )],
+            &[
+                MethodSpec::new(
+                    "write",
+                    xolotl_types::MethodAuthority::Write,
+                    Purity::Idempotent,
+                    MethodSpec::UNARY_ASYNC,
+                ),
+                MethodSpec::new(
+                    "subscribe",
+                    xolotl_types::MethodAuthority::Subscribe,
+                    Purity::Pure,
+                    MethodSpec::UNARY_ASYNC,
+                )
+                .observes_external()
+                .finalize_allowed(),
+            ],
             writes.clone(),
         )?;
         let signal = Path::parse("state://process/self/start")?;
@@ -1332,7 +1878,10 @@ mod tests {
         let spec = ActorSpec {
             name: "shared_steps".into(),
             body: DoNode::pure(Value::null()).and_then(StepRef::new("entry")),
-            declared_capabilities: vec!["write://state/process/self/**".into()],
+            declared_capabilities: vec![
+                "write://state/process/self/**".into(),
+                "subscribe://state/process/self/start".into(),
+            ],
             finalizers: vec![DoNode::pure(Value::null()).and_then(StepRef::new("cleanup"))],
             ..ActorSpec::default()
         };
@@ -1340,7 +1889,7 @@ mod tests {
         for identity in ["first", "second"] {
             actors.push(
                 boot.spawn_actor_under_with_steps(
-                    boot.root,
+                    boot.root(),
                     xolotl_types::IdentityRef::ROOT,
                     identity,
                     &spec,
@@ -1351,8 +1900,8 @@ mod tests {
         }
         for (index, actor) in actors.iter().enumerate() {
             let signal = Path::parse(&format!("state://process/{}/start", actor.process.get()))?;
-            boot.kernel
-                .state
+            boot.kernel()
+                .state()
                 .write_cas(&signal, None, Value::integer(index as i64))
                 .await?;
             wait_actor_status(&boot, &actor.directory, "completed").await?;
@@ -1371,7 +1920,7 @@ mod tests {
                 ensure!(path.as_ref() == Some(&expected_path));
                 ensure!(*value == Value::integer(expected));
             }
-            ensure!(boot.kernel.processes.steps(actor.process).is_empty());
+            ensure!(boot.kernel().processes().steps(actor.process).is_empty());
         }
         Ok(())
     }
@@ -1379,19 +1928,22 @@ mod tests {
     #[tokio::test]
     async fn actor_completion_runs_finalizers_before_step_cleanup() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
         let name = boot.register_effect(
             "effect://echo/actor-completion-finalizer",
-            &[
-                MethodSpec::new("invoke", Purity::Effectful, MethodSpec::UNARY_ASYNC)
-                    .finalize_allowed(),
-            ],
-            Arc::new(EchoDriver),
+            &[MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                Purity::Effectful,
+                MethodSpec::UNARY_ASYNC,
+            )
+            .finalize_allowed()],
+            Arc::new(crate::driver::FnDriver(move |_, value| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(value)
+            })),
         )?;
-        let resource_id = boot
-            .kernel
-            .registry
-            .resolve_resource(&name)
-            .context("registered completion finalizer effect did not resolve")?;
         let spec = ActorSpec {
             name: "completion_finalizer".into(),
             body: DoNode::pure(Value::null()),
@@ -1402,7 +1954,7 @@ mod tests {
         let step_target = name.clone();
         let actor = boot
             .spawn_actor_under_with_steps(
-                boot.root,
+                boot.root(),
                 xolotl_types::IdentityRef::ROOT,
                 "root",
                 &spec,
@@ -1422,20 +1974,16 @@ mod tests {
             .await?;
 
         wait_actor_status(&boot, &actor.directory, "completed").await?;
-        let facts = boot.kernel.facts.facts_of(actor.process)?;
+        ensure!(calls.load(std::sync::atomic::Ordering::SeqCst) == 1);
         ensure!(
-            facts.iter().any(|fact| fact.resource == resource_id),
-            "completion finalizer operation should record a fact"
-        );
-        ensure!(
-            boot.kernel.processes.steps(actor.process).is_empty(),
+            boot.kernel().processes().steps(actor.process).is_empty(),
             "finalizer step should be removed after actor completion"
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn finalizer_failure_is_recorded_in_lifecycle_fact() -> anyhow::Result<()> {
+    async fn finalizer_failure_retains_cleanup_result() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
         let spec = ActorSpec {
             name: "failing_finalizer".into(),
@@ -1446,28 +1994,15 @@ mod tests {
             ..ActorSpec::default()
         };
         let actor = boot
-            .spawn_actor_under(boot.root, xolotl_types::IdentityRef::ROOT, "root", &spec)
+            .spawn_actor_under(boot.root(), xolotl_types::IdentityRef::ROOT, "root", &spec)
             .await?;
 
         wait_actor_status(&boot, &actor.directory, "completed").await?;
-        let facts = boot.kernel.facts.facts_of(actor.process)?;
-        let finalized = facts
-            .iter()
-            .find(|fact| fact.id.position == FINALIZED_NODE)
-            .context("missing ProcessFinalized fact")?;
-        let map = finalized
-            .outcome
-            .as_ref()
-            .and_then(Value::as_map)
-            .context("ProcessFinalized outcome must be a map")?;
-        ensure!(
-            map.get("finalizer_failure_count").and_then(Value::as_int) == Some(1),
-            "finalizer failure count was not recorded: {map:?}"
-        );
-        let failures = map
-            .get("finalizer_failures")
-            .and_then(Value::as_list)
-            .context("finalizer failures list missing")?;
+        let failures = boot
+            .kernel()
+            .processes()
+            .finalizer_failures(actor.process)
+            .context("missing finalizer failures")?;
         ensure!(failures.len() == 1, "unexpected failures: {failures:?}");
         ensure!(
             failures
@@ -1492,14 +2027,14 @@ mod tests {
             ..ActorSpec::default()
         };
         let actor = boot
-            .spawn_actor_under(boot.root, xolotl_types::IdentityRef::ROOT, "root", &spec)
+            .spawn_actor_under(boot.root(), xolotl_types::IdentityRef::ROOT, "root", &spec)
             .await?;
 
         wait_actor_status(&boot, &actor.directory, "failed").await?;
         boot.finalize_process(actor.process).await?;
         let value = boot
-            .kernel
-            .state
+            .kernel()
+            .state()
             .read(&actor.directory)
             .await?
             .context("missing actor directory entry")?;
@@ -1511,20 +2046,7 @@ mod tests {
                 == Some("failed"),
             "terminal actor status was overwritten: {value:?}"
         );
-        let facts = boot.kernel.facts.facts_of(actor.process)?;
-        let finalized = facts
-            .iter()
-            .find(|fact| fact.id.position == FINALIZED_NODE)
-            .context("missing ProcessFinalized fact")?;
-        let map = finalized
-            .outcome
-            .as_ref()
-            .and_then(Value::as_map)
-            .context("ProcessFinalized outcome must be a map")?;
-        ensure!(
-            map.get("status").and_then(Value::as_str) == Some("failed"),
-            "ProcessFinalized status was overwritten: {map:?}"
-        );
+        ensure!(boot.kernel().processes().status(actor.process) == Some(ProcessStatus::Failed));
         Ok(())
     }
 
@@ -1533,32 +2055,28 @@ mod tests {
         let boot = Bootstrap::in_memory();
         let template = CompiledRequestGrantTemplate {
             selector: ResourceSelector::parse("write://state/process/self/scratch@account=alice")?,
-            methods: MethodBitmap::method(0),
+            rights: GrantRights::new(GrantMethods::name("write"), RightFlags::empty()),
         };
         let process = boot.spawn_request_process_under_with_steps(
-            boot.root,
+            boot.root(),
             xolotl_types::IdentityRef::ROOT,
             std::slice::from_ref(&template),
             StepModule::default(),
         )?;
-        let grants = boot.kernel.processes.attached_grants(process);
+        let grants = boot.kernel().processes().attached_grants(process);
         let grant = grants.first().context("request has no attached grant")?;
         ensure!(
             grant.selector.pattern.to_string()
-                == format!("write://state/process/{}/scratch", process.get())
+                == format!(
+                    "write://state/process/{}/scratch@account=alice",
+                    process.get()
+                )
         );
-        ensure!(
-            grant.constraints.predicates
-                == [template
-                    .selector
-                    .pattern
-                    .predicate
-                    .clone()
-                    .context("missing predicate")?]
-        );
+        ensure!(grant.selector.pattern.predicate == template.selector.pattern.predicate);
+        ensure!(grant.constraints.is_empty());
         ensure!(template.selector.pattern.segments[1].as_str() == "self");
 
-        let before = boot.kernel.processes.count();
+        let before = boot.kernel().processes().count();
         let rejected = boot.spawn_request_process_under_with_steps(
             process,
             xolotl_types::IdentityRef::ROOT,
@@ -1569,7 +2087,7 @@ mod tests {
             rejected,
             Err(BootstrapError::CapabilityCeiling { .. })
         ));
-        ensure!(boot.kernel.processes.count() == before);
+        ensure!(boot.kernel().processes().count() == before);
         Ok(())
     }
 
@@ -1580,19 +2098,19 @@ mod tests {
         let step: StepFn = Arc::new(|v, _| DoNode::pure(v));
         let weak = Arc::downgrade(&step);
         let process = boot.spawn_request_process_under_with_steps(
-            boot.root,
+            boot.root(),
             xolotl_types::IdentityRef::ROOT,
             &[],
             StepModule::new([StepBinding::new("identity", step)])?,
         )?;
         let program = DoNode::pure(42).and_then(StepRef::new("identity"));
-        let executor = boot.kernel.executor_for(process);
+        let executor = boot.kernel().executor_for(process);
         let outcome = executor.eval(&program).await;
         ensure!(outcome.outcome == Outcome::Done(Value::integer(42)));
         ensure!(
             matches!(
-                boot.kernel
-                    .executor_for(boot.root)
+                boot.kernel()
+                    .executor_for(boot.root())
                     .eval(&program)
                     .await
                     .outcome,
@@ -1601,13 +2119,13 @@ mod tests {
             "request functions must not leak to the parent"
         );
         let overridden = boot
-            .kernel
+            .kernel()
             .executor_for(process)
             .with_steps(StepModule::single("identity", |_, _| DoNode::pure(99))?);
         ensure!(overridden.eval(&program).await.outcome == Outcome::Done(Value::integer(99)));
         ensure!(executor.eval(&program).await == outcome);
         boot.finish_request_process(process, &outcome).await?;
-        ensure!(boot.kernel.processes.steps(process).is_empty());
+        ensure!(boot.kernel().processes().steps(process).is_empty());
         ensure!(
             executor.eval(&program).await.outcome == Outcome::Fail(Failure::Cancelled),
             "a retained executor must not invoke code after its process terminates"
@@ -1621,7 +2139,7 @@ mod tests {
     #[tokio::test]
     async fn actor_spawn_rejects_undeclared_capability() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        let before = boot.kernel.processes.count();
+        let before = boot.kernel().processes().count();
         let spec = ActorSpec {
             name: "bad_actor".into(),
             body: DoNode::op(OperationTemplate {
@@ -1636,7 +2154,7 @@ mod tests {
             ..ActorSpec::default()
         };
         let err = expect_bootstrap_error(
-            boot.spawn_actor_under(boot.root, xolotl_types::IdentityRef::ROOT, "root", &spec)
+            boot.spawn_actor_under(boot.root(), xolotl_types::IdentityRef::ROOT, "root", &spec)
                 .await,
         )?;
         ensure!(
@@ -1644,7 +2162,7 @@ mod tests {
             "unexpected error: {err:?}"
         );
         ensure!(
-            boot.kernel.processes.count() == before,
+            boot.kernel().processes().count() == before,
             "rejected actor should not create a process"
         );
         Ok(())
@@ -1660,11 +2178,11 @@ mod tests {
             ..ActorSpec::default()
         };
         let first = boot
-            .spawn_actor_under(boot.root, xolotl_types::IdentityRef::ROOT, "root", &spec)
+            .spawn_actor_under(boot.root(), xolotl_types::IdentityRef::ROOT, "root", &spec)
             .await?;
-        let before_second = boot.kernel.processes.count();
+        let before_second = boot.kernel().processes().count();
         let err = expect_bootstrap_error(
-            boot.spawn_actor_under(boot.root, xolotl_types::IdentityRef::ROOT, "root", &spec)
+            boot.spawn_actor_under(boot.root(), xolotl_types::IdentityRef::ROOT, "root", &spec)
                 .await,
         )?;
         ensure!(
@@ -1672,21 +2190,21 @@ mod tests {
             "unexpected error: {err:?}"
         );
         ensure!(boot.drain_cleanup().await.failures.is_empty());
-        ensure!(boot.kernel.processes.count() == before_second + 1);
+        ensure!(boot.kernel().processes().count() == before_second + 1);
         let rejected = boot
-            .kernel
-            .processes
-            .children_of(boot.root)
+            .kernel()
+            .processes()
+            .children_of(boot.root())
             .into_iter()
             .find(|process| *process != first.process)
             .context("missing rejected admission")?;
         ensure!(
-            boot.kernel
-                .processes
+            boot.kernel()
+                .processes()
                 .status(rejected)
                 .is_some_and(ProcessStatus::is_terminal)
         );
-        ensure!(!boot.kernel.processes.has_task(rejected));
+        ensure!(!boot.kernel().processes().has_task(rejected));
         wait_actor_status(&boot, &first.directory, "completed").await?;
         Ok(())
     }
@@ -1694,19 +2212,24 @@ mod tests {
     #[tokio::test]
     async fn finalize_actor_aborts_task_and_updates_directory() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
+        crate::executor::signal_tests::install_signal_resource(
+            &boot,
+            boot.kernel().state().clone(),
+        )?;
         let signal = Path::parse("state://signals/never")?;
         let spec = ActorSpec {
             name: "waiter".into(),
             body: DoNode::wait_signal(signal),
+            declared_capabilities: vec!["subscribe://state/signals/never".into()],
             ..ActorSpec::default()
         };
         let actor = boot
-            .spawn_actor_under(boot.root, xolotl_types::IdentityRef::ROOT, "root", &spec)
+            .spawn_actor_under(boot.root(), xolotl_types::IdentityRef::ROOT, "root", &spec)
             .await?;
         boot.finalize_process(actor.process).await?;
         let value = boot
-            .kernel
-            .state
+            .kernel()
+            .state()
             .read(&actor.directory)
             .await?
             .context("missing actor directory entry")?;
@@ -1719,7 +2242,7 @@ mod tests {
             "actor directory status was not cancelled: {value:?}"
         );
         ensure!(
-            !boot.kernel.processes.abort_task(actor.process),
+            !boot.kernel().processes().abort_task(actor.process),
             "actor task should have been removed"
         );
         Ok(())
@@ -1728,23 +2251,33 @@ mod tests {
     #[tokio::test]
     async fn actor_finalizer_operation_opens_while_finalizing() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        crate::executor::signal_tests::install_signal_resource(
+            &boot,
+            boot.kernel().state().clone(),
+        )?;
         let name = boot.register_effect(
             "effect://echo/actor-finalizer",
-            &[
-                MethodSpec::new("invoke", Purity::Effectful, MethodSpec::UNARY_ASYNC)
-                    .finalize_allowed(),
-            ],
-            Arc::new(EchoDriver),
+            &[MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                Purity::Effectful,
+                MethodSpec::UNARY_ASYNC,
+            )
+            .finalize_allowed()],
+            Arc::new(crate::driver::FnDriver(move |_, value| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(value)
+            })),
         )?;
-        let resource_id = boot
-            .kernel
-            .registry
-            .resolve_resource(&name)
-            .context("registered finalizer effect did not resolve")?;
         let spec = ActorSpec {
             name: "finalizer_op".into(),
             body: DoNode::wait_signal(Path::parse("state://signals/finalizer-never")?),
-            declared_capabilities: vec!["perform://effect/echo/actor-finalizer".into()],
+            declared_capabilities: vec![
+                "perform://effect/echo/actor-finalizer".into(),
+                "subscribe://state/signals/finalizer-never".into(),
+            ],
             finalizers: vec![DoNode::op(OperationTemplate {
                 target: name,
                 method: "invoke".into(),
@@ -1755,15 +2288,11 @@ mod tests {
             ..ActorSpec::default()
         };
         let actor = boot
-            .spawn_actor_under(boot.root, xolotl_types::IdentityRef::ROOT, "root", &spec)
+            .spawn_actor_under(boot.root(), xolotl_types::IdentityRef::ROOT, "root", &spec)
             .await?;
 
         boot.finalize_process(actor.process).await?;
-        let facts = boot.kernel.facts.facts_of(actor.process)?;
-        ensure!(
-            facts.iter().any(|fact| fact.resource == resource_id),
-            "finalizer operation should record a fact for the effect resource"
-        );
+        ensure!(calls.load(std::sync::atomic::Ordering::SeqCst) == 1);
         Ok(())
     }
 
@@ -1777,6 +2306,7 @@ mod tests {
             "effect://echo/not-finalize-allowed",
             &[MethodSpec::new(
                 "invoke",
+                xolotl_types::MethodAuthority::Perform,
                 Purity::Effectful,
                 MethodSpec::UNARY_ASYNC,
             )],
@@ -1785,11 +2315,6 @@ mod tests {
                 Ok(input)
             })),
         )?;
-        let resource_id = boot
-            .kernel
-            .registry
-            .resolve_resource(&name)
-            .context("registered finalizer denial effect did not resolve")?;
         let spec = ActorSpec {
             name: "finalizer_denied".into(),
             body: DoNode::pure(Value::null()),
@@ -1804,32 +2329,21 @@ mod tests {
             ..ActorSpec::default()
         };
         let actor = boot
-            .spawn_actor_under(boot.root, xolotl_types::IdentityRef::ROOT, "root", &spec)
+            .spawn_actor_under(boot.root(), xolotl_types::IdentityRef::ROOT, "root", &spec)
             .await?;
 
         wait_actor_status(&boot, &actor.directory, "completed").await?;
-        let facts = boot.kernel.facts.facts_of(actor.process)?;
         ensure!(
             calls.load(Ordering::SeqCst) == 0,
             "denied finalizer reached its driver"
         );
         ensure!(
-            facts.iter().any(|fact| fact.resource == resource_id
-                && fact.decision == xolotl_types::DecisionTag::Denied),
-            "denied finalizer should retain its admission record"
-        );
-        let finalized = facts
-            .iter()
-            .find(|fact| fact.id.position == FINALIZED_NODE)
-            .context("missing ProcessFinalized fact")?;
-        let map = finalized
-            .outcome
-            .as_ref()
-            .and_then(Value::as_map)
-            .context("ProcessFinalized outcome must be a map")?;
-        ensure!(
-            map.get("finalizer_failure_count").and_then(Value::as_int) == Some(1),
-            "denied finalizer failure was not recorded: {map:?}"
+            boot.kernel()
+                .processes()
+                .finalizer_failures(actor.process)
+                .context("missing finalizer failures")?
+                .len()
+                == 1
         );
         Ok(())
     }
@@ -1842,21 +2356,25 @@ mod tests {
             InterfaceFamily::Value,
             &[MethodSpec::new(
                 "write",
+                xolotl_types::MethodAuthority::Write,
                 Purity::Idempotent,
                 MethodSpec::UNARY_ASYNC,
             )],
             Arc::new(EchoDriver),
         )?;
-        let ex = boot.kernel.executor_for(boot.root).with_finalizer_mode();
+        let ex = boot
+            .kernel()
+            .executor_for(boot.root())
+            .with_finalizer_mode();
         ensure!(
-            boot.kernel
-                .processes
-                .begin_finalizing(boot.root, ProcessStatus::Completed)
+            boot.kernel()
+                .processes()
+                .begin_finalizing(boot.root(), ProcessStatus::Completed)
                 == crate::process::FinalizeStart::Started
         );
         let local_target = ResourceName::new(Path::parse(&format!(
             "state://process/{}/cleanup",
-            boot.root.get()
+            boot.root().get()
         ))?);
         let local_program = DoNode::op(OperationTemplate {
             target: local_target,
@@ -1866,8 +2384,8 @@ mod tests {
             literal_input: Some(Value::string("cleanup".into())),
         });
         let local = crate::process::scope_finalizer(
-            &boot.kernel.processes,
-            boot.root,
+            boot.kernel().processes(),
+            boot.root(),
             ex.eval(&local_program),
         )
         .await;
@@ -1885,8 +2403,8 @@ mod tests {
             literal_input: Some(Value::string("cleanup".into())),
         });
         let sibling = crate::process::scope_finalizer(
-            &boot.kernel.processes,
-            boot.root,
+            boot.kernel().processes(),
+            boot.root(),
             ex.eval(&sibling_program),
         )
         .await;
@@ -1903,7 +2421,7 @@ mod tests {
     #[tokio::test]
     async fn actor_spawn_rejects_undeclared_finalizer_capability() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        let before = boot.kernel.processes.count();
+        let before = boot.kernel().processes().count();
         let spec = ActorSpec {
             name: "bad_finalizer".into(),
             finalizers: vec![DoNode::op(OperationTemplate {
@@ -1918,7 +2436,7 @@ mod tests {
             ..ActorSpec::default()
         };
         let err = expect_bootstrap_error(
-            boot.spawn_actor_under(boot.root, xolotl_types::IdentityRef::ROOT, "root", &spec)
+            boot.spawn_actor_under(boot.root(), xolotl_types::IdentityRef::ROOT, "root", &spec)
                 .await,
         )?;
         ensure!(
@@ -1926,7 +2444,7 @@ mod tests {
             "unexpected error: {err:?}"
         );
         ensure!(
-            boot.kernel.processes.count() == before,
+            boot.kernel().processes().count() == before,
             "rejected actor should not create a process"
         );
         Ok(())
@@ -1950,6 +2468,7 @@ mod tests {
             "effect://echo/missing-process",
             &[MethodSpec::new(
                 "invoke",
+                xolotl_types::MethodAuthority::Perform,
                 Purity::Pure,
                 MethodSpec::UNARY_ASYNC,
             )],
@@ -1965,22 +2484,23 @@ mod tests {
 
     #[tokio::test]
     async fn end_to_end_operation_flows_through_resolved_handle() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
+        let boot = crate::fact::testing::observing_bootstrap();
         // Register an echo effect and open a handle for the root process.
         let name = boot.register_effect(
             "effect://echo/say",
             &[MethodSpec::new(
                 "invoke",
+                xolotl_types::MethodAuthority::Perform,
                 Purity::Pure,
                 MethodSpec::UNARY_ASYNC,
             )],
             Arc::new(EchoDriver),
         )?;
-        let handle = boot.open_for(boot.root, &name, "perform")?;
+        let handle = boot.open_for(boot.root(), &name, "perform")?;
 
         // Build an executor, bind the handle, run a one-Operation program.
-        let ex = boot.kernel.executor_for(boot.root);
-        ex.bind_handle(name.clone(), handle);
+        let ex = boot.kernel().executor_for(boot.root());
+        ex.bind_handle(name.clone(), handle)?;
         let prog = DoNode::Op(OperationTemplate {
             target: name,
             method: "invoke".into(),
@@ -1994,10 +2514,9 @@ mod tests {
             "unexpected operation outcome: {out:?}"
         );
 
-        // A single unconsumed pure-Deterministic read need not record a Fact
-        // because recovery can recompute it. The EchoDriver method is Pure, and
+        // Observation recording is disabled. The EchoDriver method is Pure, and
         // the op's output flows nowhere, so no Fact is written.
-        let facts = boot.kernel.facts.facts_of(boot.root)?;
+        let facts = boot.kernel().facts().facts_of(boot.root())?;
         ensure!(
             facts.is_empty(),
             "pure unconsumed op should not record facts"
@@ -2012,14 +2531,15 @@ mod tests {
             "effect://echo/unary",
             &[MethodSpec::new(
                 "invoke",
+                xolotl_types::MethodAuthority::Perform,
                 Purity::Pure,
                 MethodSpec::UNARY_ASYNC,
             )],
             Arc::new(EchoDriver),
         )?;
-        let handle = boot.open_for(boot.root, &name, "perform")?;
-        let ex = boot.kernel.executor_for(boot.root);
-        ex.bind_handle(name.clone(), handle);
+        let handle = boot.open_for(boot.root(), &name, "perform")?;
+        let ex = boot.kernel().executor_for(boot.root());
+        ex.bind_handle(name.clone(), handle)?;
         let prog = DoNode::Op(OperationTemplate {
             target: name,
             method: "invoke".into(),
@@ -2046,13 +2566,14 @@ mod tests {
             "effect://echo/unary-lazy",
             &[MethodSpec::new(
                 "invoke",
+                xolotl_types::MethodAuthority::Perform,
                 Purity::Pure,
                 MethodSpec::UNARY_ASYNC,
             )],
             Arc::new(EchoDriver),
         )?;
-        let before = boot.kernel.handles.read().len();
-        let ex = boot.kernel.executor_for(boot.root);
+        let before = boot.kernel().handles().read().len();
+        let ex = boot.kernel().executor_for(boot.root());
         let prog = DoNode::Op(OperationTemplate {
             target: name,
             method: "invoke".into(),
@@ -2070,7 +2591,7 @@ mod tests {
             other => bail!("expected unsupported stream request, got {other:?}"),
         }
         ensure!(
-            boot.kernel.handles.read().len() == before,
+            boot.kernel().handles().read().len() == before,
             "invalid output mode should not open a handle"
         );
         Ok(())
@@ -2078,13 +2599,14 @@ mod tests {
 
     #[tokio::test]
     async fn budget_exhaustion_denies_costly_op_before_effect() -> anyhow::Result<()> {
-        // A process with a tiny daily budget running a costed effect is denied
+        // A process with a tiny lifetime budget running a costed effect is denied
         // with BudgetExhausted because the reservation fires before dispatch.
         let boot = Bootstrap::in_memory();
         let name = boot.register_effect_with_cost(
             "effect://pricey/call",
             &[MethodSpec::new(
                 "invoke",
+                xolotl_types::MethodAuthority::Perform,
                 Purity::Effectful,
                 MethodSpec::UNARY_ASYNC,
             )],
@@ -2095,20 +2617,23 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        // Root's daily budget is only 500_000 micro-USD — below one call.
+        // Root's budget is only 500_000 micro-USD — below one call.
         ensure!(
-            boot.kernel.processes.set_budget_spec(
-                boot.root,
-                xolotl_types::BudgetSpec {
-                    daily_micro_usd: Some(500_000),
-                    ..Default::default()
-                },
-            ),
+            boot.kernel()
+                .processes()
+                .set_budget_spec(
+                    boot.root(),
+                    xolotl_types::BudgetSpec {
+                        max_micro_usd: Some(500_000),
+                        ..Default::default()
+                    },
+                )
+                .is_ok(),
             "root process missing while setting test budget"
         );
-        let handle = boot.open_for(boot.root, &name, "perform")?;
-        let ex = boot.kernel.executor_for(boot.root);
-        ex.bind_handle(name.clone(), handle);
+        let handle = boot.open_for(boot.root(), &name, "perform")?;
+        let ex = boot.kernel().executor_for(boot.root());
+        ex.bind_handle(name.clone(), handle)?;
         let prog = DoNode::Op(OperationTemplate {
             target: name,
             method: "invoke".into(),
@@ -2118,10 +2643,7 @@ mod tests {
         });
         match ex.eval(&prog).await.outcome {
             xolotl_types::Outcome::Fail(xolotl_types::Failure::BudgetExhausted { dim }) => {
-                ensure!(
-                    dim == "daily_micro_usd",
-                    "unexpected budget dimension: {dim}"
-                );
+                ensure!(dim == "micro_usd", "unexpected budget dimension: {dim}");
             }
             other => bail!("expected BudgetExhausted, got {other:?}"),
         }
@@ -2135,7 +2657,13 @@ mod tests {
         let boot = Bootstrap::in_memory();
         let name = boot.register_effect_with_cost(
             "effect://batch/embed",
-            &[MethodSpec::new("invoke", Purity::Idempotent, MethodSpec::UNARY_ASYNC).batchable()],
+            &[MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                Purity::Idempotent,
+                MethodSpec::UNARY_ASYNC,
+            )
+            .batchable()],
             Arc::new(EchoDriver),
             xolotl_types::CostModel {
                 flat_micro_usd: 100,
@@ -2143,18 +2671,21 @@ mod tests {
             },
         )?;
         ensure!(
-            boot.kernel.processes.set_budget_spec(
-                boot.root,
-                xolotl_types::BudgetSpec {
-                    daily_micro_usd: Some(250),
-                    ..Default::default()
-                },
-            ),
+            boot.kernel()
+                .processes()
+                .set_budget_spec(
+                    boot.root(),
+                    xolotl_types::BudgetSpec {
+                        max_micro_usd: Some(250),
+                        ..Default::default()
+                    },
+                )
+                .is_ok(),
             "root process missing while setting test budget"
         );
-        let handle = boot.open_for(boot.root, &name, "perform")?;
-        let ex = boot.kernel.executor_for(boot.root);
-        ex.bind_handle(name.clone(), handle);
+        let handle = boot.open_for(boot.root(), &name, "perform")?;
+        let ex = boot.kernel().executor_for(boot.root());
+        ex.bind_handle(name.clone(), handle)?;
         let prog = DoNode::Op(OperationTemplate {
             target: name,
             method: "invoke".into(),
@@ -2168,10 +2699,7 @@ mod tests {
         });
         match ex.eval(&prog).await.outcome {
             xolotl_types::Outcome::Fail(xolotl_types::Failure::BudgetExhausted { dim }) => {
-                ensure!(
-                    dim == "daily_micro_usd",
-                    "unexpected budget dimension: {dim}"
-                );
+                ensure!(dim == "micro_usd", "unexpected budget dimension: {dim}");
             }
             other => bail!("expected batch BudgetExhausted, got {other:?}"),
         }
@@ -2186,8 +2714,18 @@ mod tests {
                 boot.register_effect(
                     "effect://approval/ask",
                     &[
-                        MethodSpec::new("invoke", Purity::Effectful, MethodSpec::UNARY_ASYNC),
-                        MethodSpec::new("check", Purity::Idempotent, MethodSpec::UNARY_ASYNC),
+                        MethodSpec::new(
+                            "invoke",
+                            xolotl_types::MethodAuthority::Perform,
+                            Purity::Effectful,
+                            MethodSpec::UNARY_ASYNC
+                        ),
+                        MethodSpec::new(
+                            "check",
+                            xolotl_types::MethodAuthority::Perform,
+                            Purity::Idempotent,
+                            MethodSpec::UNARY_ASYNC
+                        ),
                     ],
                     Arc::new(EchoDriver),
                 ),
@@ -2206,6 +2744,7 @@ mod tests {
             "effect://cheap/call",
             &[MethodSpec::new(
                 "invoke",
+                xolotl_types::MethodAuthority::Perform,
                 Purity::Pure,
                 MethodSpec::UNARY_ASYNC,
             )],
@@ -2216,18 +2755,21 @@ mod tests {
             },
         )?;
         ensure!(
-            boot.kernel.processes.set_budget_spec(
-                boot.root,
-                xolotl_types::BudgetSpec {
-                    daily_micro_usd: Some(1_000_000),
-                    ..Default::default()
-                },
-            ),
+            boot.kernel()
+                .processes()
+                .set_budget_spec(
+                    boot.root(),
+                    xolotl_types::BudgetSpec {
+                        max_micro_usd: Some(1_000_000),
+                        ..Default::default()
+                    },
+                )
+                .is_ok(),
             "root process missing while setting test budget"
         );
-        let handle = boot.open_for(boot.root, &name, "perform")?;
-        let ex = boot.kernel.executor_for(boot.root);
-        ex.bind_handle(name.clone(), handle);
+        let handle = boot.open_for(boot.root(), &name, "perform")?;
+        let ex = boot.kernel().executor_for(boot.root());
+        ex.bind_handle(name.clone(), handle)?;
         let prog = DoNode::Op(OperationTemplate {
             target: name,
             method: "invoke".into(),
@@ -2242,37 +2784,39 @@ mod tests {
         );
         // Settled: inflight released, spend reflects the flat charge.
         let inflight = boot
-            .kernel
-            .processes
-            .budget_mut(boot.root, |b| b.inflight_ops)
+            .kernel()
+            .processes()
+            .budget_mut(boot.root(), |b| b.inflight_ops)
             .context("missing root budget state")?;
         ensure!(inflight == 0, "inflight slot released after settle");
         let spent = boot
-            .kernel
-            .processes
-            .budget_mut(boot.root, |b| b.spent_micro_usd)
+            .kernel()
+            .processes()
+            .budget_mut(boot.root(), |b| b.spent_micro_usd)
             .context("missing root budget state")?;
         ensure!(spent == 100, "flat cost settled");
         Ok(())
     }
 
     #[tokio::test]
-    async fn consumed_operation_records_a_fact() -> anyhow::Result<()> {
-        // When the operation's output is consumed downstream, a Fact is
-        // recorded so recovery can reuse it.
-        let boot = Bootstrap::in_memory();
+    async fn explicit_observation_records_a_fact() -> anyhow::Result<()> {
+        let boot = crate::fact::testing::observing_bootstrap();
         let name = boot.register_effect(
             "effect://echo2/say",
             &[MethodSpec::new(
                 "invoke",
+                xolotl_types::MethodAuthority::Perform,
                 Purity::Pure,
                 MethodSpec::UNARY_ASYNC,
             )],
             Arc::new(EchoDriver),
         )?;
-        let handle = boot.open_for(boot.root, &name, "perform")?;
-        let ex = boot.kernel.executor_for(boot.root);
-        ex.bind_handle(name.clone(), handle);
+        let handle = boot.open_for(boot.root(), &name, "perform")?;
+        let ex = boot
+            .kernel()
+            .executor_for(boot.root())
+            .with_fact_recording(true);
+        ex.bind_handle(name.clone(), handle)?;
         let ex = ex.with_steps(StepModule::single("echo_back", |v, _| DoNode::pure(v))?);
         let prog = DoNode::Op(OperationTemplate {
             target: name,
@@ -2287,66 +2831,41 @@ mod tests {
             out.outcome == xolotl_types::Outcome::Done(Value::string("hi".into())),
             "unexpected consumed operation outcome: {out:?}"
         );
-        let facts = boot.kernel.facts.facts_of(boot.root)?;
+        let facts = boot.kernel().facts().facts_of(boot.root())?;
         ensure!(facts.len() == 1, "consumed op should record one fact");
         Ok(())
     }
 
     #[tokio::test]
-    async fn recover_all_runs_clean_on_fresh_boot() -> anyhow::Result<()> {
-        // A freshly-booted kernel has no pending Facts → nothing to recover.
-        let boot = Bootstrap::in_memory();
-        let report = boot.recover_all().await?;
-        ensure!(
-            report.skipped + report.retried + report.quarantined == 0,
-            "fresh boot should have nothing to recover"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn finalize_marks_cancelled_and_writes_marker() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
+    async fn finalize_marks_cancelled_without_observation_records() -> anyhow::Result<()> {
+        let boot = crate::fact::testing::observing_bootstrap();
         // Spawn a child request Process, then finalize it.
         let child = boot.spawn_request_process_under_with_request_grants(
-            boot.root,
+            boot.root(),
             xolotl_types::IdentityRef::ROOT,
             &[],
         )?;
         boot.finalize_process(child).await?;
         ensure!(
-            boot.kernel.processes.status(child) == Some(xolotl_types::ProcessStatus::Cancelled),
+            boot.kernel().processes().status(child) == Some(xolotl_types::ProcessStatus::Cancelled),
             "unfinished child process should be cancelled"
         );
-        // The finalize marker is written to state.
-        let path = finalized_marker_path(
-            child,
-            boot.kernel
-                .processes
-                .lifecycle_execution(child)
-                .context("missing lifecycle scope")?,
-        )?;
-        let marker = boot.kernel.state.read(&path).await?;
-        ensure!(marker.is_some(), "finalize marker should be written");
-        // Finalization appends a ProcessFinalized Fact to the Fact stream.
-        let facts = boot.kernel.facts.facts_of(child)?;
+        ensure!(boot.cleanup_ticket(child)?.is_complete());
         ensure!(
-            facts.iter().any(|f| {
-                f.id.position == xolotl_types::NodeId::new(u32::MAX)
-                    && f.outcome.as_ref().and_then(Value::as_map).is_some_and(|m| {
-                        m.get("event").and_then(Value::as_str) == Some("ProcessFinalized")
-                    })
-            }),
-            "finalize records a ProcessFinalized Fact"
+            boot.kernel()
+                .processes()
+                .finalization_report(child)
+                .is_some()
         );
+        ensure!(boot.kernel().facts().facts_of(child)?.is_empty());
         Ok(())
     }
 
     #[tokio::test]
     async fn finalize_preserves_cancelled_request_status() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
+        let boot = crate::fact::testing::observing_bootstrap();
         let child = boot.spawn_request_process_under_with_request_grants(
-            boot.root,
+            boot.root(),
             xolotl_types::IdentityRef::ROOT,
             &[],
         )?;
@@ -2357,23 +2876,10 @@ mod tests {
 
         boot.finalize_process(child).await?;
         ensure!(
-            boot.kernel.processes.status(child) == Some(xolotl_types::ProcessStatus::Cancelled),
+            boot.kernel().processes().status(child) == Some(xolotl_types::ProcessStatus::Cancelled),
             "finalize should preserve cancelled status"
         );
-        let facts = boot.kernel.facts.facts_of(child)?;
-        let finalized = facts
-            .iter()
-            .find(|fact| fact.id.position == FINALIZED_NODE)
-            .context("missing ProcessFinalized fact")?;
-        let map = finalized
-            .outcome
-            .as_ref()
-            .and_then(Value::as_map)
-            .context("ProcessFinalized outcome must be a map")?;
-        ensure!(
-            map.get("status").and_then(Value::as_str) == Some("cancelled"),
-            "ProcessFinalized status should remain cancelled: {map:?}"
-        );
+        ensure!(boot.kernel().facts().facts_of(child)?.is_empty());
         Ok(())
     }
 
@@ -2402,15 +2908,15 @@ mod tests {
         }
 
         fn append(&self, _fact: Fact) -> Result<u64, crate::fact::FactError> {
-            Err(crate::fact::FactError("simulated append failure".into()))
+            Err(crate::fact::FactError::new(
+                "simulated append failure".into(),
+            ))
         }
 
         fn complete(&self, _fact: Fact) -> Result<(), crate::fact::FactError> {
-            Err(crate::fact::FactError("simulated complete failure".into()))
-        }
-
-        fn sync(&self) -> Result<(), crate::fact::FactError> {
-            Ok(())
+            Err(crate::fact::FactError::new(
+                "simulated complete failure".into(),
+            ))
         }
 
         fn facts_of(
@@ -2429,109 +2935,56 @@ mod tests {
         }
     }
 
-    struct FailOnceCompleteFactStore {
-        inner: crate::fact::InMemoryFactStore,
-        fail_next_complete: std::sync::atomic::AtomicBool,
-    }
-
-    impl FailOnceCompleteFactStore {
-        fn new() -> Self {
-            Self {
-                inner: crate::fact::InMemoryFactStore::new(),
-                fail_next_complete: std::sync::atomic::AtomicBool::new(true),
-            }
-        }
-    }
-
-    impl crate::ExecutionIdSource for FailOnceCompleteFactStore {
-        fn reserve(
-            &self,
-            count: std::num::NonZeroU64,
-        ) -> Result<crate::ExecutionIdRange, crate::ExecutionIdError> {
-            self.inner.reserve(count)
-        }
-    }
-
-    impl crate::fact::FactStore for FailOnceCompleteFactStore {
-        fn scan(&self, query: crate::FactQuery) -> Result<crate::FactPage, crate::FactError> {
-            self.inner.scan(query)
-        }
-
-        fn lookup(
-            &self,
-            query: crate::FactLookup,
-        ) -> Result<crate::FactLookupResult, crate::FactError> {
-            self.inner.lookup(query)
-        }
-
-        fn append(&self, fact: Fact) -> Result<u64, crate::fact::FactError> {
-            self.inner.append(fact)
-        }
-
-        fn complete(&self, fact: Fact) -> Result<(), crate::fact::FactError> {
-            if self
-                .fail_next_complete
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(crate::fact::FactError("simulated complete failure".into()));
-            }
-            self.inner.complete(fact)
-        }
-
-        fn sync(&self) -> Result<(), crate::fact::FactError> {
-            self.inner.sync()
-        }
-
-        fn facts_of(
-            &self,
-            process: xolotl_types::ProcessId,
-        ) -> Result<Vec<Fact>, crate::fact::FactError> {
-            self.inner.facts_of(process)
-        }
-
-        fn all_facts(&self) -> Result<Vec<Fact>, crate::fact::FactError> {
-            self.inner.all_facts()
-        }
-
-        fn cursor(&self) -> u64 {
-            self.inner.cursor()
-        }
-    }
-
     #[tokio::test]
-    async fn finalize_fact_failure_keeps_process_finalizing() -> anyhow::Result<()> {
+    async fn finalize_is_independent_of_fact_delivery() -> anyhow::Result<()> {
         let facts = crate::fact::FactSink::new(Arc::new(FailingFinalizeFactStore::default()));
         let state = xolotl_state::InMemoryBackend::new().into_backend();
-        let boot = Bootstrap::from_kernel(crate::Kernel::with_backends(state, facts));
+        let boot = Bootstrap::from_kernel(
+            crate::KernelBuilder::new(state)
+                .with_fact_sink(facts)
+                .build(),
+        );
         let child = boot.spawn_request_process_under_with_request_grants(
-            boot.root,
+            boot.root(),
             xolotl_types::IdentityRef::ROOT,
             &[],
         )?;
 
-        let err = expect_bootstrap_error(boot.finalize_process(child).await)?;
-        ensure!(
-            matches!(err, BootstrapError::Fact(_)),
-            "unexpected finalize error: {err:?}"
-        );
-        ensure!(
-            boot.kernel.processes.status(child) == Some(xolotl_types::ProcessStatus::Finalizing),
-            "a terminal status requires the authoritative finalization Fact"
-        );
+        boot.finalize_process(child).await?;
+        ensure!(boot.kernel().processes().status(child) == Some(ProcessStatus::Cancelled));
+        ensure!(boot.cleanup_ticket(child)?.is_complete());
         Ok(())
     }
 
     #[tokio::test]
-    async fn retrying_owned_completion_preserves_independent_actor_lifetime() -> anyhow::Result<()>
-    {
-        let facts = crate::fact::FactSink::new(Arc::new(FailOnceCompleteFactStore::new()));
+    async fn owned_completion_preserves_independent_actor_lifetime() -> anyhow::Result<()> {
+        let facts = crate::fact::FactSink::new(Arc::new(FailingFinalizeFactStore::default()));
         let state = xolotl_state::InMemoryBackend::new().into_backend();
-        let boot = Bootstrap::from_kernel(crate::Kernel::with_backends(state, facts));
-        let parent = boot.request_under(boot.root, IdentityRef::ROOT, &[])?;
+        let boot = Bootstrap::from_kernel(
+            crate::KernelBuilder::new(state)
+                .with_fact_sink(facts)
+                .build(),
+        );
+        crate::executor::signal_tests::install_signal_resource(
+            &boot,
+            boot.kernel().state().clone(),
+        )?;
+        let parent = boot.request_under(
+            boot.root(),
+            IdentityRef::ROOT,
+            &[CompiledRequestGrantTemplate {
+                selector: ResourceSelector::parse("subscribe://state/signal/never")?,
+                rights: xolotl_types::GrantRights::new(
+                    xolotl_types::GrantMethods::name("subscribe"),
+                    RightFlags::empty(),
+                ),
+            }],
+        )?;
         let parent_id = parent.id();
         let spec = ActorSpec {
             name: "independent_completion".into(),
             body: DoNode::wait_signal(Path::parse("state://signal/never")?),
+            declared_capabilities: vec!["subscribe://state/signal/never".into()],
             ..ActorSpec::default()
         };
         let actor = boot
@@ -2544,101 +2997,14 @@ mod tests {
                     xolotl_types::TaintSet::pristine()
                 ))
                 .await
-                .is_err()
+                .is_ok()
         );
         let report = boot.drain_cleanup().await;
         ensure!(report.failures.is_empty());
-        ensure!(boot.kernel.processes.status(parent_id) == Some(ProcessStatus::Completed));
-        ensure!(boot.kernel.processes.status(actor.process) == Some(ProcessStatus::Running));
+        ensure!(boot.kernel().processes().status(parent_id) == Some(ProcessStatus::Completed));
+        ensure!(boot.kernel().processes().status(actor.process) == Some(ProcessStatus::Running));
         boot.finalize_process(parent_id).await?;
-        ensure!(boot.kernel.processes.status(actor.process) == Some(ProcessStatus::Cancelled));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn finalize_can_retry_after_fact_failure() -> anyhow::Result<()> {
-        let facts = crate::fact::FactSink::new(Arc::new(FailOnceCompleteFactStore::new()));
-        let state = xolotl_state::InMemoryBackend::new().into_backend();
-        let boot = Bootstrap::from_kernel(crate::Kernel::with_backends(state, facts));
-        let effect = boot.register_effect(
-            "effect://finalize-retry",
-            &[MethodSpec::new(
-                "invoke",
-                Purity::Pure,
-                MethodSpec::UNARY_ASYNC,
-            )],
-            Arc::new(crate::EchoDriver),
-        )?;
-        let child = boot.spawn_request_process_under_with_request_grants(
-            boot.root,
-            xolotl_types::IdentityRef::ROOT,
-            &[RequestGrantTemplate {
-                literal: "perform://effect/finalize-retry",
-                methods: MethodBitmap::method(0),
-            }],
-        )?;
-        boot.open_for(child, &effect, "perform")?;
-
-        let err = expect_bootstrap_error(boot.finalize_process(child).await)?;
-        ensure!(
-            matches!(err, BootstrapError::Fact(_)),
-            "unexpected first finalize error: {err:?}"
-        );
-        ensure!(
-            boot.kernel.processes.status(child) == Some(xolotl_types::ProcessStatus::Finalizing),
-            "failed finalize should leave process retryable"
-        );
-
-        let (record, revoked) = boot
-            .kernel
-            .processes
-            .finalization_record(child)
-            .context("missing retry record")?;
-        ensure!(revoked == 1);
-        boot.finalize_process(child).await?;
-        ensure!(
-            boot.kernel.processes.status(child) == Some(xolotl_types::ProcessStatus::Cancelled),
-            "retry should preserve the forced cancellation intent"
-        );
-        ensure!(
-            boot.kernel
-                .state
-                .read(&finalized_marker_path(
-                    child,
-                    boot.kernel
-                        .processes
-                        .lifecycle_execution(child)
-                        .context("missing lifecycle scope")?
-                )?)
-                .await?
-                .is_some(),
-            "retry should write the finalized marker"
-        );
-        let facts = boot.kernel.facts.facts_of(child)?;
-        let committed = facts
-            .iter()
-            .find(|fact| fact.id.position == FINALIZED_NODE)
-            .context("missing committed record")?;
-        ensure!(committed.timestamp == record.timestamp);
-        ensure!(committed.outcome == record.outcome);
-        ensure!(
-            boot.kernel
-                .state
-                .read(&finalized_marker_path(
-                    child,
-                    boot.kernel
-                        .processes
-                        .lifecycle_execution(child)
-                        .context("missing lifecycle scope")?
-                )?)
-                .await?
-                == Some(Value::integer(1))
-        );
-        ensure!(boot.kernel.processes.attached_grants(child).is_empty());
-        ensure!(
-            facts.iter().any(|fact| fact.id.position == FINALIZED_NODE),
-            "retry should record the ProcessFinalized fact"
-        );
+        ensure!(boot.kernel().processes().status(actor.process) == Some(ProcessStatus::Cancelled));
         Ok(())
     }
 
@@ -2648,7 +3014,11 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::task::Poll;
         let boot = Bootstrap::in_memory();
-        let process = boot.kernel.processes.fresh_id()?;
+        crate::executor::signal_tests::install_signal_resource(
+            &boot,
+            boot.kernel().state().clone(),
+        )?;
+        let process = boot.kernel().processes().fresh_id()?;
         let calls = Arc::new([
             AtomicUsize::new(0),
             AtomicUsize::new(0),
@@ -2669,8 +3039,19 @@ mod tests {
                 .map_err(anyhow::Error::from)
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let mut entry = ProcessEntry::new(process, Some(boot.root), IdentityRef::ROOT);
+        let mut entry = ProcessEntry::new(process, Some(boot.root()), IdentityRef::ROOT);
         entry.scope.start();
+        entry.attached_grants.push(Grant {
+            id: boot.kernel().processes().fresh_attached_grant_id(),
+            holder: process,
+            selector: ResourceSelector::parse("subscribe://state/signals/interrupted-finalizer")?,
+            rights: xolotl_types::GrantRights::new(
+                xolotl_types::GrantMethods::name("subscribe"),
+                RightFlags::empty(),
+            ),
+            constraints: ConstraintSet::empty(),
+            expires: Expiry::Never,
+        });
         entry.steps = StepModule::compose(modules)?;
         entry.on_finalize = (0..3)
             .rev()
@@ -2679,7 +3060,7 @@ mod tests {
                     .and_then(xolotl_graph::StepRef::new(format!("step{index}")))
             })
             .collect();
-        boot.kernel.processes.insert(entry);
+        boot.kernel().processes().insert(entry);
 
         let mut first = Box::pin(boot.finish_process_as(process, ProcessStatus::Failed));
         ensure!(
@@ -2689,7 +3070,7 @@ mod tests {
         );
         ensure!(calls[0].load(Ordering::SeqCst) == 1 && calls[1].load(Ordering::SeqCst) == 1);
         ensure!(!boot.cancel_process(process)?);
-        ensure!(boot.kernel.processes.status(process) == Some(ProcessStatus::Finalizing));
+        ensure!(boot.kernel().processes().status(process) == Some(ProcessStatus::Finalizing));
         let mut second = Box::pin(boot.finalize_process(process));
         ensure!(
             std::future::poll_fn(|cx| Poll::Ready(second.as_mut().poll(cx)))
@@ -2699,27 +3080,13 @@ mod tests {
         drop(first);
         tokio::time::timeout(std::time::Duration::from_secs(1), second).await??;
         ensure!(calls.iter().all(|calls| calls.load(Ordering::SeqCst) == 1));
-        ensure!(boot.kernel.processes.status(process) == Some(ProcessStatus::Failed));
-        let facts = boot.kernel.facts.facts_of(process)?;
-        let fact = facts
-            .iter()
-            .find(|fact| fact.id.position == FINALIZED_NODE)
-            .context("missing finalization fact")?;
-        let record = fact
-            .outcome
-            .as_ref()
-            .and_then(Value::as_map)
-            .context("invalid lifecycle record")?;
-        ensure!(
-            record
-                .get("finalizer_failure_count")
-                .and_then(Value::as_int)
-                == Some(1)
-        );
-        let failures = record
-            .get("finalizer_failures")
-            .and_then(Value::as_list)
+        ensure!(boot.kernel().processes().status(process) == Some(ProcessStatus::Failed));
+        let failures = boot
+            .kernel()
+            .processes()
+            .finalizer_failures(process)
             .context("missing failures")?;
+        ensure!(failures.len() == 1);
         let failure = failures
             .first()
             .and_then(Value::as_map)
@@ -2737,18 +3104,94 @@ mod tests {
     }
 
     #[test]
+    fn gateway_audit_preserves_application_metadata_without_interpreting_authentication()
+    -> anyhow::Result<()> {
+        let boot = crate::fact::testing::observing_bootstrap();
+        let details = Value::map(BTreeMap::from([
+            ("event".into(), Value::from("application_detail")),
+            (
+                "authentication".into(),
+                Value::map(BTreeMap::from([
+                    ("method".into(), Value::from("host_defined")),
+                    ("assurance".into(), Value::from("verified_by_host")),
+                ])),
+            ),
+        ]));
+        for (event, details) in [
+            ("console_login", Some(details)),
+            ("gateway_mcp", Some(Value::integer(7))),
+            ("host.work_completed", None),
+        ] {
+            boot.record_gateway_audit(GatewayAudit {
+                event,
+                username: Some("service-account"),
+                source_addr: Some("local-adapter"),
+                outcome: "accepted",
+                details: details.clone(),
+            })?;
+            let facts = boot.kernel().facts().facts_of(boot.root())?;
+            let fact = facts.last().context("missing gateway audit")?;
+            ensure!(fact.schema_version == 1 && Fact::SCHEMA_VERSION == 1);
+            ensure!(fact.id.position == GATEWAY_AUDIT_NODE);
+            ensure!(fact.replay == xolotl_types::ReplayClass::Observation);
+            let outcome = fact
+                .outcome
+                .as_ref()
+                .and_then(Value::as_map)
+                .context("missing gateway audit envelope")?;
+            ensure!(outcome.get("event").and_then(Value::as_str) == Some(event));
+            ensure!(outcome.get("outcome").and_then(Value::as_str) == Some("accepted"));
+            ensure!(outcome.get("details") == details.as_ref());
+            ensure!(!outcome.contains_key("authentication") && !outcome.contains_key("mfa_level"));
+            ensure!(
+                xolotl_types::AuditRules::default().tags_for(fact, 0)
+                    == vec![xolotl_types::AuditTag::Custom {
+                        label: event.into()
+                    }]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gateway_audit_rejects_invalid_envelopes_before_fact_delivery() {
+        let boot = crate::fact::testing::observing_bootstrap();
+        for (event, outcome) in [("", "accepted"), ("gateway_mcp", "")] {
+            assert!(
+                boot.record_gateway_audit(GatewayAudit {
+                    event,
+                    username: None,
+                    source_addr: None,
+                    outcome,
+                    details: None,
+                })
+                .is_err()
+            );
+        }
+        assert!(
+            boot.kernel()
+                .facts()
+                .facts_of(boot.root())
+                .is_ok_and(|facts| facts.is_empty())
+        );
+    }
+
+    #[test]
     fn gateway_audit_fact_failure_does_not_insert_audit_process() -> anyhow::Result<()> {
         let facts = crate::fact::FactSink::new(Arc::new(FailingFinalizeFactStore::default()));
         let state = xolotl_state::InMemoryBackend::new().into_backend();
-        let boot = Bootstrap::from_kernel(crate::Kernel::with_backends(state, facts));
-        let before = boot.kernel.processes.all_ids().len();
+        let boot = Bootstrap::from_kernel(
+            crate::KernelBuilder::new(state)
+                .with_fact_sink(facts)
+                .build(),
+        );
+        let before = boot.kernel().processes().all_ids().len();
 
         let err = match boot.record_gateway_audit(GatewayAudit {
             event: "login",
             username: Some("alice"),
             source_addr: Some("127.0.0.1"),
             outcome: "denied",
-            mfa_level: None,
             details: None,
         }) {
             Ok(()) => bail!("expected gateway audit fact error"),
@@ -2760,7 +3203,7 @@ mod tests {
             "unexpected audit error: {err}"
         );
         ensure!(
-            boot.kernel.processes.all_ids().len() == before,
+            boot.kernel().processes().all_ids().len() == before,
             "pre-operation audit events must not create process rows without audit Facts"
         );
         Ok(())
@@ -2769,13 +3212,13 @@ mod tests {
     #[test]
     fn request_process_rejects_malformed_request_grant_before_insert() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        let before = boot.kernel.processes.all_ids().len();
+        let before = boot.kernel().processes().all_ids().len();
         let err = expect_bootstrap_error(boot.spawn_request_process_under_with_request_grants(
-            boot.root,
+            boot.root(),
             xolotl_types::IdentityRef::ROOT,
             &[RequestGrantTemplate {
                 literal: "effect://x/post",
-                methods: MethodBitmap::method(0),
+                rights: GrantRights::new(GrantMethods::name("invoke"), RightFlags::empty()),
             }],
         ))?;
         ensure!(
@@ -2783,7 +3226,7 @@ mod tests {
             "unexpected malformed request grant error: {err:?}"
         );
         ensure!(
-            boot.kernel.processes.all_ids().len() == before,
+            boot.kernel().processes().all_ids().len() == before,
             "malformed request grants must not leave a child process behind"
         );
         Ok(())
@@ -2795,46 +3238,239 @@ mod tests {
         boot: &Bootstrap,
         selectors: &[&str],
     ) -> anyhow::Result<xolotl_types::ProcessId> {
-        let anchor = boot.kernel.processes.fresh_id()?;
-        let mut entry = ProcessEntry::new(anchor, Some(boot.root), xolotl_types::IdentityRef::ROOT);
+        let anchor = boot.kernel().processes().fresh_id()?;
+        let mut entry =
+            ProcessEntry::new(anchor, Some(boot.root()), xolotl_types::IdentityRef::ROOT);
         entry.scope.start();
-        boot.kernel.processes.insert(entry);
+        boot.kernel().processes().insert(entry);
         for sel in selectors {
             let grant = Grant {
-                id: boot.kernel.registry.next_grant_id(),
+                id: boot.kernel().registry().next_grant_id(),
                 holder: anchor,
                 selector: ResourceSelector::parse(sel)?,
-                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+                rights: xolotl_types::GrantRights::new(
+                    xolotl_types::GrantMethods::name("invoke"),
+                    RightFlags::empty(),
+                ),
                 constraints: ConstraintSet::empty(),
                 expires: Expiry::Never,
             };
-            boot.kernel.registry.register_grant(grant);
+            boot.kernel().registry().register_grant(grant);
         }
         Ok(anchor)
+    }
+
+    #[test]
+    fn request_attenuation_keeps_parent_alternatives_across_generations() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let literal = "perform://effect/inference/infer";
+        let requested = RequestGrantTemplate {
+            literal,
+            rights: xolotl_types::GrantRights::new(
+                xolotl_types::GrantMethods::name("invoke"),
+                RightFlags::empty(),
+            ),
+        };
+        let parents = [
+            "perform://effect/inference/**@tenant=alice",
+            "perform://effect/inference/**@tenant=bob",
+        ];
+        let anchor = restricted_anchor(&boot, &parents)?;
+        let child = boot.spawn_request_process_under_with_request_grants(
+            anchor,
+            IdentityRef::ROOT,
+            std::slice::from_ref(&requested),
+        )?;
+        let first = boot.kernel().processes().attached_grants(child);
+        ensure!(first.len() == 2, "both parent alternatives must survive");
+        let target = Path::parse("effect://inference/infer")?;
+        let input = |tenant: &str, region: &str| {
+            Value::map(std::collections::BTreeMap::from([
+                ("tenant".into(), Value::string(tenant.into())),
+                ("region".into(), Value::string(region.into())),
+            ]))
+        };
+        for tenant in ["alice", "bob"] {
+            ensure!(
+                first
+                    .iter()
+                    .any(|grant| { grant.covers("perform", &target, &input(tenant, "east"), 0) })
+            );
+        }
+        ensure!(
+            !first
+                .iter()
+                .any(|grant| { grant.covers("perform", &target, &input("mallory", "east"), 0) })
+        );
+        ensure!(
+            first
+                .iter()
+                .all(|grant| grant.selector.pattern.predicate.is_none())
+        );
+
+        let narrower = RequestGrantTemplate {
+            literal: "perform://effect/inference/infer@region=east",
+            rights: requested.rights.clone(),
+        };
+        let grandchild = boot.spawn_request_process_under_with_request_grants(
+            child,
+            IdentityRef::ROOT,
+            std::slice::from_ref(&narrower),
+        )?;
+        let second = boot.kernel().processes().attached_grants(grandchild);
+        ensure!(second.len() == 2);
+        let region_east = xolotl_types::Predicate::parse("region=east")?;
+        ensure!(second.iter().all(|grant| {
+            grant.selector.pattern.predicate.as_ref() == Some(&region_east)
+                && grant.constraints.predicates.len() == 1
+        }));
+        for tenant in ["alice", "bob"] {
+            ensure!(
+                second
+                    .iter()
+                    .any(|grant| { grant.covers("perform", &target, &input(tenant, "east"), 0) })
+            );
+            ensure!(
+                !second
+                    .iter()
+                    .any(|grant| { grant.covers("perform", &target, &input(tenant, "west"), 0) })
+            );
+        }
+        let great_grandchild = boot.spawn_request_process_under_with_request_grants(
+            grandchild,
+            IdentityRef::ROOT,
+            &[narrower],
+        )?;
+        let third = boot.kernel().processes().attached_grants(great_grandchild);
+        ensure!(third.len() == 2);
+        ensure!(
+            third
+                .iter()
+                .all(|grant| grant.constraints.predicates.len() == 1)
+        );
+
+        let reversed = restricted_anchor(&boot, &[parents[1], parents[0]])?;
+        let reordered = boot.spawn_request_process_under_with_request_grants(
+            reversed,
+            IdentityRef::ROOT,
+            &[requested],
+        )?;
+        let reordered = boot.kernel().processes().attached_grants(reordered);
+        ensure!(
+            first.iter().zip(&reordered).all(|(left, right)| {
+                left.selector == right.selector
+                    && left.rights == right.rights
+                    && left.constraints == right.constraints
+                    && left.expires == right.expires
+            }),
+            "attached alternatives must have canonical order"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_attenuation_deduplicates_and_bounds_parent_alternatives() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let anchor = restricted_anchor(
+            &boot,
+            &[
+                "perform://effect/inference/**@tenant=alice",
+                "perform://effect/inference/**@tenant=alice",
+            ],
+        )?;
+        let template = ParsedRequestGrantTemplate {
+            selector: ResourceSelector::parse("perform://effect/inference/infer")?,
+            rights: Some(GrantRights::new(
+                GrantMethods::name("invoke"),
+                RightFlags::empty(),
+            )),
+        };
+        let mut parents = boot.kernel().registry().grants_of(anchor);
+        ensure!(
+            Bootstrap::plan_grants_from(&parents, std::slice::from_ref(&template), 0)?.len() == 1
+        );
+        for index in 0..2 {
+            parents.push(Grant {
+                id: boot.kernel().registry().next_grant_id(),
+                holder: anchor,
+                selector: ResourceSelector::parse(&format!(
+                    "perform://effect/inference/**@tenant=tenant{index}"
+                ))?,
+                rights: template.rights.clone().context("explicit rights")?,
+                constraints: ConstraintSet::empty(),
+                expires: Expiry::Never,
+            });
+        }
+        ensure!(matches!(
+            Bootstrap::plan_grants_from_with_limit(&parents, &[template], 0, 2),
+            Err(BootstrapError::RequestGrantLimit { limit: 2 })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn implicit_actor_request_inherits_each_parent_method_without_propagation() -> anyhow::Result<()>
+    {
+        let boot = Bootstrap::in_memory();
+        let selector = ResourceSelector::parse("perform://effect/echo/**")?;
+        let parents = [
+            Grant {
+                id: boot.kernel().registry().next_grant_id(),
+                holder: boot.root(),
+                selector: selector.clone(),
+                rights: GrantRights::new(GrantMethods::name("invoke"), RightFlags::CLONE),
+                constraints: ConstraintSet::empty(),
+                expires: Expiry::Never,
+            },
+            Grant {
+                id: boot.kernel().registry().next_grant_id(),
+                holder: boot.root(),
+                selector,
+                rights: GrantRights::new(GrantMethods::name("observe"), RightFlags::TRANSFER),
+                constraints: ConstraintSet::empty(),
+                expires: Expiry::Never,
+            },
+        ];
+        let template = ParsedRequestGrantTemplate {
+            selector: ResourceSelector::parse("perform://effect/echo/say")?,
+            rights: None,
+        };
+        let planned = Bootstrap::plan_grants_from(&parents, &[template], 0)?;
+        ensure!(planned.len() == 2);
+        ensure!(planned.iter().all(|grant| grant.rights.flags.is_empty()));
+        let methods: Vec<_> = planned
+            .iter()
+            .map(|grant| grant.rights.methods.clone())
+            .collect();
+        ensure!(
+            methods.contains(&GrantMethods::name("invoke"))
+                && methods.contains(&GrantMethods::name("observe"))
+        );
+        Ok(())
     }
 
     #[test]
     fn root_anchor_covers_every_request_grant_template() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
         let child = boot.spawn_request_process_under_with_request_grants(
-            boot.root,
+            boot.root(),
             xolotl_types::IdentityRef::ROOT,
             &[
                 RequestGrantTemplate {
                     literal: "perform://effect/x/post",
-                    methods: MethodBitmap::method(0),
+                    rights: GrantRights::new(GrantMethods::name("invoke"), RightFlags::empty()),
                 },
                 RequestGrantTemplate {
                     literal: "read://state/memory/alice/x",
-                    methods: MethodBitmap::method(0),
+                    rights: GrantRights::new(GrantMethods::name("read"), RightFlags::empty()),
                 },
             ],
         )?;
         ensure!(
-            boot.kernel.registry.grants_of(child).is_empty(),
+            boot.kernel().registry().grants_of(child).is_empty(),
             "request Process grants must not be registered in the global grant table"
         );
-        let grants = boot.kernel.processes.attached_grants(child);
+        let grants = boot.kernel().processes().attached_grants(child);
         ensure!(grants.len() == 2, "one grant per request grant template");
         Ok(())
     }
@@ -2845,7 +3481,7 @@ mod tests {
         // grant outside that ceiling.
         let boot = Bootstrap::in_memory();
         let anchor = restricted_anchor(&boot, &["perform://effect/inference/**"])?;
-        let before = boot.kernel.processes.all_ids().len();
+        let before = boot.kernel().processes().all_ids().len();
 
         // Covered capability is fine.
         boot.spawn_request_process_under_with_request_grants(
@@ -2853,18 +3489,18 @@ mod tests {
             xolotl_types::IdentityRef::ROOT,
             &[RequestGrantTemplate {
                 literal: "perform://effect/inference/infer",
-                methods: MethodBitmap::method(0),
+                rights: GrantRights::new(GrantMethods::name("invoke"), RightFlags::empty()),
             }],
         )?;
 
         // Rejected declarations must not allocate a child Process.
-        let mid = boot.kernel.processes.all_ids().len();
+        let mid = boot.kernel().processes().all_ids().len();
         let err = expect_bootstrap_error(boot.spawn_request_process_under_with_request_grants(
             anchor,
             xolotl_types::IdentityRef::ROOT,
             &[RequestGrantTemplate {
                 literal: "perform://effect/proc/spawn",
-                methods: MethodBitmap::method(0),
+                rights: GrantRights::new(GrantMethods::name("invoke"), RightFlags::empty()),
             }],
         ))?;
         ensure!(
@@ -2872,7 +3508,7 @@ mod tests {
             "request grant outside anchor ceiling must be rejected"
         );
         ensure!(
-            boot.kernel.processes.all_ids().len() == mid,
+            boot.kernel().processes().all_ids().len() == mid,
             "a rejected over-broad request grant must not leave a child process behind"
         );
         ensure!(mid > before, "the covered spawn did create a child");
@@ -2885,18 +3521,18 @@ mod tests {
         // covered ones must not be partially granted.
         let boot = Bootstrap::in_memory();
         let anchor = restricted_anchor(&boot, &["perform://effect/inference/**"])?;
-        let before = boot.kernel.processes.all_ids().len();
+        let before = boot.kernel().processes().all_ids().len();
         let err = expect_bootstrap_error(boot.spawn_request_process_under_with_request_grants(
             anchor,
             xolotl_types::IdentityRef::ROOT,
             &[
                 RequestGrantTemplate {
                     literal: "perform://effect/inference/infer",
-                    methods: MethodBitmap::method(0),
+                    rights: GrantRights::new(GrantMethods::name("invoke"), RightFlags::empty()),
                 },
                 RequestGrantTemplate {
                     literal: "write://state/vault/alice/x",
-                    methods: MethodBitmap::method(0),
+                    rights: GrantRights::new(GrantMethods::name("write"), RightFlags::empty()),
                 },
             ],
         ))?;
@@ -2905,7 +3541,7 @@ mod tests {
             "unexpected capability ceiling error: {err:?}"
         );
         ensure!(
-            boot.kernel.processes.all_ids().len() == before,
+            boot.kernel().processes().all_ids().len() == before,
             "a partially-uncovered declared set must spawn nothing"
         );
         Ok(())
@@ -2914,15 +3550,19 @@ mod tests {
     #[test]
     fn request_grant_template_narrows_anchor_method_rights() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        let anchor = boot.kernel.processes.fresh_id()?;
-        let mut entry = ProcessEntry::new(anchor, Some(boot.root), xolotl_types::IdentityRef::ROOT);
+        let anchor = boot.kernel().processes().fresh_id()?;
+        let mut entry =
+            ProcessEntry::new(anchor, Some(boot.root()), xolotl_types::IdentityRef::ROOT);
         entry.scope.start();
-        boot.kernel.processes.insert(entry);
-        boot.kernel.registry.register_grant(Grant {
-            id: boot.kernel.registry.next_grant_id(),
+        boot.kernel().processes().insert(entry);
+        boot.kernel().registry().register_grant(Grant {
+            id: boot.kernel().registry().next_grant_id(),
             holder: anchor,
             selector: ResourceSelector::parse("perform://effect/echo/**")?,
-            rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
+            rights: xolotl_types::GrantRights::new(
+                xolotl_types::GrantMethods::all(),
+                RightFlags::empty(),
+            ),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
         });
@@ -2932,21 +3572,21 @@ mod tests {
             xolotl_types::IdentityRef::ROOT,
             &[RequestGrantTemplate {
                 literal: "perform://effect/echo/say",
-                methods: MethodBitmap::method(0),
+                rights: GrantRights::new(GrantMethods::name("invoke"), RightFlags::empty()),
             }],
         )?;
-        let grants = boot.kernel.processes.attached_grants(child);
+        let grants = boot.kernel().processes().attached_grants(child);
         ensure!(
             grants.len() == 1,
             "unexpected grant count: {}",
             grants.len()
         );
         ensure!(
-            grants[0].rights.methods.allows(0),
+            grants[0].rights.methods.allows("invoke"),
             "method 0 should be allowed"
         );
         ensure!(
-            !grants[0].rights.methods.allows(1),
+            !grants[0].rights.methods.allows("other"),
             "method 1 should not be allowed"
         );
         Ok(())
@@ -2955,16 +3595,20 @@ mod tests {
     #[test]
     fn request_grant_derivation_preserves_parent_limits() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        let anchor = boot.kernel.processes.fresh_id()?;
-        let mut entry = ProcessEntry::new(anchor, Some(boot.root), xolotl_types::IdentityRef::ROOT);
+        let anchor = boot.kernel().processes().fresh_id()?;
+        let mut entry =
+            ProcessEntry::new(anchor, Some(boot.root()), xolotl_types::IdentityRef::ROOT);
         entry.scope.start();
-        boot.kernel.processes.insert(entry);
-        let expires = Expiry::At(crate::executor::now_millis() + 60_000);
-        boot.kernel.registry.register_grant(Grant {
-            id: boot.kernel.registry.next_grant_id(),
+        boot.kernel().processes().insert(entry);
+        let expires = Expiry::At(boot.kernel().host_runtime().now_millis() + 60_000);
+        boot.kernel().registry().register_grant(Grant {
+            id: boot.kernel().registry().next_grant_id(),
             holder: anchor,
             selector: ResourceSelector::parse("perform://effect/echo/**@tenant=acme")?,
-            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            rights: xolotl_types::GrantRights::new(
+                xolotl_types::GrantMethods::name("invoke"),
+                RightFlags::empty(),
+            ),
             constraints: ConstraintSet {
                 predicates: vec![xolotl_types::Predicate::parse("account=alice")?],
             },
@@ -2976,21 +3620,83 @@ mod tests {
             xolotl_types::IdentityRef::ROOT,
             &[RequestGrantTemplate {
                 literal: "perform://effect/echo/say@purpose=test",
-                methods: MethodBitmap::method(0),
+                rights: GrantRights::new(GrantMethods::name("invoke"), RightFlags::empty()),
             }],
         )?;
-        let grants = boot.kernel.processes.attached_grants(child);
+        let grants = boot.kernel().processes().attached_grants(child);
         let grant = grants.first().context("missing derived grant")?;
         ensure!(grant.expires == expires, "grant expiry was not preserved");
         ensure!(
-            grant.selector.pattern.predicate.is_none(),
-            "selector predicate should be normalized into constraints"
+            grant.selector.pattern.predicate
+                == Some(xolotl_types::Predicate::parse("purpose=test")?),
+            "request predicate must remain on the selector"
         );
         ensure!(
-            grant.constraints.predicates.len() == 3,
-            "parent/request predicates were not all retained: {:?}",
+            grant.constraints.predicates.len() == 2,
+            "parent predicates were not all retained: {:?}",
             grant.constraints.predicates
         );
+        Ok(())
+    }
+
+    #[test]
+    fn request_grant_multigeneration_retains_each_ancestor_condition() -> anyhow::Result<()> {
+        let boot = Bootstrap::in_memory();
+        let anchor = restricted_anchor(&boot, &["perform://effect/echo/**@tenant=acme"])?;
+        let rights = GrantRights::new(GrantMethods::name("invoke"), RightFlags::empty());
+        let child = boot.spawn_request_process_under_with_request_grants(
+            anchor,
+            xolotl_types::IdentityRef::ROOT,
+            &[RequestGrantTemplate {
+                literal: "perform://effect/echo/say@purpose=test",
+                rights: rights.clone(),
+            }],
+        )?;
+        let grandchild = boot.spawn_request_process_under_with_request_grants(
+            child,
+            xolotl_types::IdentityRef::ROOT,
+            &[RequestGrantTemplate {
+                literal: "perform://effect/echo/say@lane=east",
+                rights: rights.clone(),
+            }],
+        )?;
+        let grants = boot.kernel().processes().attached_grants(grandchild);
+        let grant = grants.first().context("missing grandchild grant")?;
+        ensure!(grants.len() == 1);
+        ensure!(grant.rights == rights);
+        ensure!(
+            grant.selector.pattern.predicate == Some(xolotl_types::Predicate::parse("lane=east")?)
+        );
+        ensure!(
+            grant.constraints.predicates
+                == [
+                    xolotl_types::Predicate::parse("purpose=test")?,
+                    xolotl_types::Predicate::parse("tenant=acme")?,
+                ]
+        );
+        let mut predicates = grant.constraints.predicates.clone();
+        predicates.push(
+            grant
+                .selector
+                .pattern
+                .predicate
+                .clone()
+                .context("missing request predicate")?,
+        );
+        let conditions = ConstraintSet { predicates };
+        for (tenant, purpose, lane, allowed) in [
+            ("acme", "test", "east", true),
+            ("other", "test", "east", false),
+            ("acme", "other", "east", false),
+            ("acme", "test", "west", false),
+        ] {
+            let input = Value::map(std::collections::BTreeMap::from([
+                ("tenant".into(), Value::string(tenant.into())),
+                ("purpose".into(), Value::string(purpose.into())),
+                ("lane".into(), Value::string(lane.into())),
+            ]));
+            ensure!(conditions.eval(&input, 0) == allowed);
+        }
         Ok(())
     }
 
@@ -2998,11 +3704,11 @@ mod tests {
     fn request_grant_derivation_uses_attached_anchor_grants() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
         let anchor = boot.spawn_request_process_under_with_request_grants(
-            boot.root,
+            boot.root(),
             xolotl_types::IdentityRef::ROOT,
             &[RequestGrantTemplate {
                 literal: "perform://effect/echo/**",
-                methods: MethodBitmap::method(0),
+                rights: GrantRights::new(GrantMethods::name("invoke"), RightFlags::empty()),
             }],
         )?;
 
@@ -3011,11 +3717,11 @@ mod tests {
             xolotl_types::IdentityRef::ROOT,
             &[RequestGrantTemplate {
                 literal: "perform://effect/echo/say",
-                methods: MethodBitmap::method(0),
+                rights: GrantRights::new(GrantMethods::name("invoke"), RightFlags::empty()),
             }],
         )?;
         ensure!(
-            boot.kernel.processes.attached_grants(child).len() == 1,
+            boot.kernel().processes().attached_grants(child).len() == 1,
             "child should derive from anchor's attached grant"
         );
         Ok(())
@@ -3024,7 +3730,7 @@ mod tests {
     #[test]
     fn request_process_rejects_missing_anchor() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        let before = boot.kernel.processes.all_ids().len();
+        let before = boot.kernel().processes().all_ids().len();
         let err = expect_bootstrap_error(boot.spawn_request_process_under_with_request_grants(
             ProcessId::new(99_999),
             xolotl_types::IdentityRef::ROOT,
@@ -3035,7 +3741,7 @@ mod tests {
             "unexpected missing-anchor error: {err:?}"
         );
         ensure!(
-            boot.kernel.processes.all_ids().len() == before,
+            boot.kernel().processes().all_ids().len() == before,
             "missing anchor should not create a child process"
         );
         Ok(())
@@ -3044,22 +3750,26 @@ mod tests {
     #[test]
     fn compiled_request_grant_template_uses_anchor_backstop() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        let anchor = boot.kernel.processes.fresh_id()?;
-        let mut entry = ProcessEntry::new(anchor, Some(boot.root), xolotl_types::IdentityRef::ROOT);
+        let anchor = boot.kernel().processes().fresh_id()?;
+        let mut entry =
+            ProcessEntry::new(anchor, Some(boot.root()), xolotl_types::IdentityRef::ROOT);
         entry.scope.start();
-        boot.kernel.processes.insert(entry);
-        boot.kernel.registry.register_grant(Grant {
-            id: boot.kernel.registry.next_grant_id(),
+        boot.kernel().processes().insert(entry);
+        boot.kernel().registry().register_grant(Grant {
+            id: boot.kernel().registry().next_grant_id(),
             holder: anchor,
             selector: ResourceSelector::parse("perform://effect/echo/**")?,
-            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            rights: xolotl_types::GrantRights::new(
+                xolotl_types::GrantMethods::name("invoke"),
+                RightFlags::empty(),
+            ),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
         });
 
         let compiled = CompiledRequestGrantTemplate {
             selector: ResourceSelector::parse("perform://effect/echo/say")?,
-            methods: MethodBitmap::method(0),
+            rights: GrantRights::new(GrantMethods::name("invoke"), RightFlags::empty()),
         };
         let child = boot.spawn_request_process_under_with_compiled_request_grants(
             anchor,
@@ -3067,13 +3777,13 @@ mod tests {
             &[compiled],
         )?;
         ensure!(
-            boot.kernel.processes.attached_grants(child).len() == 1,
+            boot.kernel().processes().attached_grants(child).len() == 1,
             "compiled grant should attach one grant"
         );
 
         let overbroad = CompiledRequestGrantTemplate {
             selector: ResourceSelector::parse("perform://effect/echo/say")?,
-            methods: MethodBitmap::method(1),
+            rights: GrantRights::new(GrantMethods::name("other"), RightFlags::empty()),
         };
         ensure!(
             matches!(
@@ -3098,11 +3808,12 @@ mod tests {
         static CALLS: AtomicU32 = AtomicU32::new(0);
         CALLS.store(0, Ordering::SeqCst);
 
-        let boot = Bootstrap::in_memory();
+        let boot = crate::fact::testing::observing_bootstrap();
         let name = boot.register_effect(
             "effect://counter/tick",
             &[MethodSpec::new(
                 "invoke",
+                xolotl_types::MethodAuthority::Perform,
                 Purity::Effectful,
                 MethodSpec::UNARY_ASYNC,
             )],
@@ -3111,9 +3822,9 @@ mod tests {
                 Ok(Value::integer(7))
             })),
         )?;
-        let handle = boot.open_for(boot.root, &name, "perform")?;
+        let handle = boot.open_for(boot.root(), &name, "perform")?;
 
-        // A program whose Operation output is consumed (so a Fact is recorded).
+        // Each evaluation has a distinct identity when observation is requested.
         let prog = DoNode::Op(OperationTemplate {
             target: name.clone(),
             method: "invoke".into(),
@@ -3125,10 +3836,11 @@ mod tests {
 
         let steps = StepModule::single("use_it", |v, _| DoNode::pure(v))?;
         let ex1 = boot
-            .kernel
-            .executor_for(boot.root)
-            .with_steps(steps.clone());
-        ex1.bind_handle(name.clone(), handle);
+            .kernel()
+            .executor_for(boot.root())
+            .with_steps(steps.clone())
+            .with_fact_recording(true);
+        ex1.bind_handle(name.clone(), handle)?;
         let first = ex1.eval(&prog).await;
         ensure!(
             first.outcome == xolotl_types::Outcome::Done(Value::integer(7)),
@@ -3141,9 +3853,13 @@ mod tests {
 
         let repeated = ex1.eval(&prog).await;
         ensure!(repeated == first);
-        let handle2 = boot.open_for(boot.root, &name, "perform")?;
-        let ex2 = boot.kernel.executor_for(boot.root).with_steps(steps);
-        ex2.bind_handle(name.clone(), handle2);
+        let handle2 = boot.open_for(boot.root(), &name, "perform")?;
+        let ex2 = boot
+            .kernel()
+            .executor_for(boot.root())
+            .with_steps(steps)
+            .with_fact_recording(true);
+        ex2.bind_handle(name.clone(), handle2)?;
         let out = ex2.eval(&prog).await;
 
         ensure!(
@@ -3154,7 +3870,7 @@ mod tests {
             out.outcome == xolotl_types::Outcome::Done(Value::integer(7)),
             "unexpected independent evaluation result"
         );
-        let facts = boot.kernel.facts.facts_of(boot.root)?;
+        let facts = boot.kernel().facts().facts_of(boot.root())?;
         ensure!(facts.len() == 3);
         ensure!(
             facts

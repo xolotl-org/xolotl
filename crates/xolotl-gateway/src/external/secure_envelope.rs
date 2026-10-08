@@ -2,6 +2,7 @@
 
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+use cipher::zeroize::Zeroize;
 use hkdf::Hkdf;
 use sha2::Sha256;
 
@@ -13,7 +14,12 @@ const _: () = {
 
 /// Default replay window size for secure external envelopes.
 pub const DEFAULT_SECURE_ENVELOPE_REPLAY_WINDOW: usize = 64;
+/// Authenticated direction for envelopes sent by an external client to the daemon.
+pub const CLIENT_TO_DAEMON: &str = "client_to_daemon";
+/// Authenticated direction for envelopes sent by the daemon to an external client.
+pub const DAEMON_TO_CLIENT: &str = "daemon_to_client";
 const MAX_SECURE_ENVELOPE_REPLAY_WINDOW: usize = 128;
+const DEFAULT_DRAIN_FRAME_TYPE: &str = "control.config_ack";
 
 /// A paired installation's credential.
 #[derive(Clone)]
@@ -51,16 +57,18 @@ impl ExternalCredential {
         payload: &[u8],
         aad: EnvelopeAad,
     ) -> Result<SecureEnvelope, EnvelopeError> {
+        validate_envelope_aad(self.generation, &aad)?;
         let mut nonce_prefix = [0u8; 12];
         getrandom::fill(&mut nonce_prefix).map_err(|_error| EnvelopeError::Crypto)?;
         let seq = aad.seq;
+        let authenticated = aad_bytes(&self.installation_id, self.generation, &aad);
         let ciphertext = self
-            .cipher(&aad)?
+            .cipher(&authenticated)?
             .encrypt(
                 &Nonce::from(nonce_bytes(&nonce_prefix, seq)),
                 Payload {
                     msg: payload,
-                    aad: &aad_bytes(&self.installation_id, self.generation, &aad),
+                    aad: &authenticated,
                 },
             )
             .map_err(|_error| EnvelopeError::Crypto)?;
@@ -83,32 +91,22 @@ impl ExternalCredential {
         if env.generation != self.generation {
             return Err(EnvelopeError::BadAead);
         }
-        self.cipher(&env.aad)?
+        let authenticated = aad_bytes(&env.installation_id, env.generation, &env.aad);
+        self.cipher(&authenticated)?
             .decrypt(
                 &Nonce::from(nonce_bytes(&env.nonce_prefix, env.aad.seq)),
                 Payload {
                     msg: &env.ciphertext,
-                    aad: &aad_bytes(&env.installation_id, env.generation, &env.aad),
+                    aad: &authenticated,
                 },
             )
             .map_err(|_error| EnvelopeError::BadAead)
     }
 
-    /// Verify and open `env` through `replay_window`.
-    pub fn open_with_replay_window(
-        &self,
-        env: &SecureEnvelope,
-        valid_floor: u64,
-        replay_window: &mut SecureEnvelopeReplayWindow,
-    ) -> Result<Vec<u8>, EnvelopeError> {
-        validate_envelope_aad(env)?;
-        let decision = replay_window.check(env.aad.seq)?;
-        let plaintext = self.open(env, valid_floor)?;
-        replay_window.commit(decision);
-        Ok(plaintext)
-    }
-
-    /// Verify and open `env` after checking the accepted key epoch.
+    /// Verify and open `env` only after checking the accepted key epoch.
+    /// The caller constructs the gate from the current authoritative session
+    /// record on every frame, including after a rekey. An epoch copied from
+    /// the envelope is not an authority decision.
     pub fn open_with_replay_window_and_epoch_gate(
         &self,
         env: &SecureEnvelope,
@@ -116,7 +114,7 @@ impl ExternalCredential {
         replay_window: &mut SecureEnvelopeReplayWindow,
         epoch_gate: &SecureEnvelopeEpochGate,
     ) -> Result<Vec<u8>, EnvelopeError> {
-        validate_envelope_aad(env)?;
+        validate_envelope_aad(env.generation, &env.aad)?;
         epoch_gate.check(&env.aad)?;
         let decision = replay_window.check(env.aad.seq)?;
         let plaintext = self.open(env, valid_floor)?;
@@ -124,18 +122,23 @@ impl ExternalCredential {
         Ok(plaintext)
     }
 
-    fn cipher(&self, aad: &EnvelopeAad) -> Result<ChaCha20Poly1305, EnvelopeError> {
+    fn cipher(&self, authenticated: &[u8]) -> Result<ChaCha20Poly1305, EnvelopeError> {
         let hk = Hkdf::<Sha256>::new(
             Some(b"xolotl/external/session-envelope/chacha20poly1305/v1"),
             &self.psk,
         );
         let mut key = [0u8; 32];
-        hk.expand(
-            &aad_bytes(&self.installation_id, self.generation, aad),
-            &mut key,
-        )
-        .map_err(|_error| EnvelopeError::Crypto)?;
-        Ok(ChaCha20Poly1305::new((&key).into()))
+        hk.expand(authenticated, &mut key)
+            .map_err(|_error| EnvelopeError::Crypto)?;
+        let cipher = ChaCha20Poly1305::new((&key).into());
+        key.zeroize();
+        Ok(cipher)
+    }
+}
+
+impl Drop for ExternalCredential {
+    fn drop(&mut self) {
+        self.psk.zeroize();
     }
 }
 
@@ -172,9 +175,6 @@ impl SecureEnvelopeReplayWindow {
 
     fn check(&self, seq: u64) -> Result<ReplayWindowDecision, EnvelopeError> {
         let Some(highest) = self.highest else {
-            if seq >= self.window_size as u64 {
-                return Err(EnvelopeError::SequenceTooFarAhead);
-            }
             return Ok(ReplayWindowDecision::First(seq));
         };
 
@@ -237,25 +237,22 @@ pub struct SecureEnvelopeEpochGate {
     drain_frame_types: Vec<String>,
 }
 
-impl Default for SecureEnvelopeEpochGate {
-    fn default() -> Self {
-        Self::new(0)
-    }
-}
-
 impl SecureEnvelopeEpochGate {
-    /// Create a gate for the current session key epoch.
+    /// Create a gate from the current authoritative session key epoch.
     pub fn new(current_key_epoch: u64) -> Self {
         Self {
             current_key_epoch,
-            drain_frame_types: vec!["control.config_ack".into()],
+            drain_frame_types: Vec::new(),
         }
     }
 
     /// Add an old-epoch frame type accepted during drain.
     pub fn with_drain_frame_type(mut self, frame_type: impl Into<String>) -> Self {
         let frame_type = frame_type.into();
-        if !frame_type.trim().is_empty() && !self.drain_frame_types.contains(&frame_type) {
+        if !frame_type.trim().is_empty()
+            && frame_type != DEFAULT_DRAIN_FRAME_TYPE
+            && !self.drain_frame_types.contains(&frame_type)
+        {
             self.drain_frame_types.push(frame_type);
         }
         self
@@ -266,13 +263,14 @@ impl SecureEnvelopeEpochGate {
         if aad.key_epoch == self.current_key_epoch {
             return Ok(());
         }
-        if aad.key_epoch > self.current_key_epoch {
+        if aad.key_epoch.checked_add(1) != Some(self.current_key_epoch) {
             return Err(EnvelopeError::InvalidKeyEpoch);
         }
-        if self
-            .drain_frame_types
-            .iter()
-            .any(|frame_type| frame_type == &aad.frame_type)
+        if aad.frame_type == DEFAULT_DRAIN_FRAME_TYPE
+            || self
+                .drain_frame_types
+                .iter()
+                .any(|frame_type| frame_type == &aad.frame_type)
         {
             Ok(())
         } else {
@@ -304,6 +302,8 @@ pub struct EnvelopeAad {
     pub transcript_hash: Vec<u8>,
     /// Session key epoch used to seal this frame.
     pub key_epoch: u64,
+    /// Authenticated transport direction.
+    pub direction: String,
 }
 
 impl Default for EnvelopeAad {
@@ -319,6 +319,7 @@ impl Default for EnvelopeAad {
             credential_generation: 0,
             transcript_hash: Vec::new(),
             key_epoch: 0,
+            direction: CLIENT_TO_DAEMON.into(),
         }
     }
 }
@@ -380,6 +381,17 @@ impl SecureEnvelope {
     pub fn ciphertext(&self) -> &[u8] {
         &self.ciphertext
     }
+
+    /// Consume the envelope for zero-copy transfer to a transport frame.
+    pub(crate) fn into_parts(self) -> (String, u64, EnvelopeAad, [u8; 12], Vec<u8>) {
+        (
+            self.installation_id,
+            self.generation,
+            self.aad,
+            self.nonce_prefix,
+            self.ciphertext,
+        )
+    }
 }
 
 /// Why an envelope failed to open.
@@ -426,15 +438,15 @@ impl std::fmt::Display for EnvelopeError {
 
 impl std::error::Error for EnvelopeError {}
 
-fn validate_envelope_aad(env: &SecureEnvelope) -> Result<(), EnvelopeError> {
-    let aad = &env.aad;
+fn validate_envelope_aad(generation: u64, aad: &EnvelopeAad) -> Result<(), EnvelopeError> {
     if aad.version != 1
         || aad.projection_id.is_empty()
         || aad.role.is_empty()
         || aad.session_id.is_empty()
         || aad.frame_type.is_empty()
-        || aad.credential_generation != env.generation
+        || aad.credential_generation != generation
         || aad.transcript_hash.len() != 32
+        || !matches!(aad.direction.as_str(), CLIENT_TO_DAEMON | DAEMON_TO_CLIENT)
     {
         return Err(EnvelopeError::InvalidAad);
     }
@@ -456,6 +468,7 @@ fn aad_bytes(installation_id: &str, generation: u64, aad: &EnvelopeAad) -> Vec<u
     aad_push_bytes(&mut out, &aad.credential_generation.to_le_bytes());
     aad_push_bytes(&mut out, &aad.transcript_hash);
     aad_push_bytes(&mut out, &aad.key_epoch.to_le_bytes());
+    aad_push_bytes(&mut out, aad.direction.as_bytes());
     out
 }
 
@@ -488,6 +501,21 @@ mod tests {
         ExternalCredential::new(installation_id, generation, OTHER_TEST_PSK)
     }
 
+    fn open_for_test(
+        credential: &ExternalCredential,
+        envelope: &SecureEnvelope,
+        valid_floor: u64,
+        replay_window: &mut SecureEnvelopeReplayWindow,
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        let epoch_gate = SecureEnvelopeEpochGate::new(envelope.aad.key_epoch);
+        credential.open_with_replay_window_and_epoch_gate(
+            envelope,
+            valid_floor,
+            replay_window,
+            &epoch_gate,
+        )
+    }
+
     fn valid_aad(seq: u64) -> EnvelopeAad {
         EnvelopeAad {
             projection_id: "provider".into(),
@@ -517,31 +545,32 @@ mod tests {
     fn v1_envelope_matches_an_independent_aead_vector() -> anyhow::Result<()> {
         // Node/OpenSSL HKDF-SHA256 and ChaCha20-Poly1305, using the v1 AAD below.
         const CIPHERTEXT: [u8; 27] = [
-            0x55, 0x71, 0xa3, 0xc8, 0xe6, 0x0d, 0x82, 0x48, 0xcf, 0xe2, 0x70, 0xac, 0x3f, 0xe3,
-            0x40, 0x5c, 0xe7, 0x34, 0x75, 0x9f, 0xdb, 0x7a, 0xf2, 0x01, 0xe7, 0x24, 0x7d,
+            0xe5, 0x5c, 0x1e, 0xea, 0x67, 0x8b, 0xf3, 0x15, 0xe4, 0xee, 0xb3, 0xb3, 0x92, 0xd6,
+            0x06, 0x0e, 0xd4, 0xf5, 0x4e, 0xfb, 0x1e, 0x0a, 0xbf, 0x9c, 0xd6, 0x93, 0x10,
         ];
         let prefix = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
         let aad = valid_aad(7);
         let nonce = nonce_bytes(&prefix, aad.seq);
         ensure!(nonce == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12]);
         let cred = test_credential("inst-1", 1);
+        let authenticated = aad_bytes("inst-1", 1, &aad);
         let sealed = cred
-            .cipher(&aad)?
+            .cipher(&authenticated)?
             .encrypt(
                 &Nonce::from(nonce),
                 Payload {
                     msg: b"hello frame",
-                    aad: &aad_bytes("inst-1", 1, &aad),
+                    aad: &authenticated,
                 },
             )
             .map_err(|_error| EnvelopeError::Crypto)?;
         ensure!(sealed == CIPHERTEXT);
         let mut env = SecureEnvelope::from_parts("inst-1", 1, aad, prefix, CIPHERTEXT.to_vec());
         let mut replay = SecureEnvelopeReplayWindow::default();
-        ensure!(cred.open_with_replay_window(&env, 0, &mut replay)? == b"hello frame");
+        ensure!(open_for_test(&cred, &env, 0, &mut replay)? == b"hello frame");
         env.aad.transcript_hash[0] ^= 1;
         ensure!(
-            cred.open_with_replay_window(&env, 0, &mut SecureEnvelopeReplayWindow::default())
+            open_for_test(&cred, &env, 0, &mut SecureEnvelopeReplayWindow::default())
                 == Err(EnvelopeError::BadAead)
         );
         Ok(())
@@ -562,22 +591,23 @@ mod tests {
     #[test]
     fn tampered_aad_fails_aead() -> anyhow::Result<()> {
         let cred = test_credential("inst-1", 1);
-        let mut env = cred.seal_with_aad(
-            b"transfer $10",
-            EnvelopeAad {
-                role: "provider".into(),
-                session_id: "session-1".into(),
-                seq: 7,
-                binding_generation: 3,
-                credential_generation: 1,
-                ..EnvelopeAad::default()
-            },
-        )?;
+        let mut aad = valid_aad(7);
+        aad.binding_generation = 3;
+        let mut env = cred.seal_with_aad(b"transfer $10", aad)?;
         env.aad.binding_generation = 4;
         ensure!(
             cred.open(&env, 0) == Err(EnvelopeError::BadAead),
             "tampered AAD should fail AEAD"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn opposite_direction_cannot_open_same_ciphertext() -> anyhow::Result<()> {
+        let cred = test_credential("inst-1", 1);
+        let mut env = cred.seal_with_aad(b"frame", valid_aad(0))?;
+        env.aad.direction = DAEMON_TO_CLIENT.into();
+        ensure!(cred.open(&env, 0) == Err(EnvelopeError::BadAead));
         Ok(())
     }
 
@@ -608,7 +638,9 @@ mod tests {
     #[test]
     fn revoked_generation_is_rejected() -> anyhow::Result<()> {
         let cred = test_credential("inst-1", 2);
-        let env = cred.seal_with_aad(b"frame", valid_aad(0))?;
+        let mut aad = valid_aad(0);
+        aad.credential_generation = 2;
+        let env = cred.seal_with_aad(b"frame", aad)?;
         ensure!(
             cred.open(&env, 5) == Err(EnvelopeError::RevokedGeneration),
             "revoked generation should be rejected"
@@ -646,7 +678,7 @@ mod tests {
         let env = cred.seal_with_aad(b"frame-0", valid_aad(0))?;
         let mut replay_window = SecureEnvelopeReplayWindow::default();
 
-        let opened = cred.open_with_replay_window(&env, 0, &mut replay_window)?;
+        let opened = open_for_test(&cred, &env, 0, &mut replay_window)?;
         ensure!(
             opened == b"frame-0",
             "unexpected replay-window plaintext: {opened:?}"
@@ -660,9 +692,9 @@ mod tests {
         let env = cred.seal_with_aad(b"frame-0", valid_aad(0))?;
         let mut replay_window = SecureEnvelopeReplayWindow::default();
 
-        cred.open_with_replay_window(&env, 0, &mut replay_window)?;
+        open_for_test(&cred, &env, 0, &mut replay_window)?;
         ensure!(
-            cred.open_with_replay_window(&env, 0, &mut replay_window) == Err(EnvelopeError::Replay),
+            open_for_test(&cred, &env, 0, &mut replay_window) == Err(EnvelopeError::Replay),
             "duplicate sequence should be rejected"
         );
         Ok(())
@@ -676,13 +708,12 @@ mod tests {
         let env2 = cred.seal_with_aad(b"frame-2", valid_aad(2))?;
         let env1 = cred.seal_with_aad(b"frame-1", valid_aad(1))?;
 
-        cred.open_with_replay_window(&env0, 0, &mut replay_window)?;
-        cred.open_with_replay_window(&env2, 0, &mut replay_window)?;
-        let opened = cred.open_with_replay_window(&env1, 0, &mut replay_window)?;
+        open_for_test(&cred, &env0, 0, &mut replay_window)?;
+        open_for_test(&cred, &env2, 0, &mut replay_window)?;
+        let opened = open_for_test(&cred, &env1, 0, &mut replay_window)?;
         ensure!(opened == b"frame-1", "unexpected plaintext: {opened:?}");
         ensure!(
-            cred.open_with_replay_window(&env1, 0, &mut replay_window)
-                == Err(EnvelopeError::Replay),
+            open_for_test(&cred, &env1, 0, &mut replay_window) == Err(EnvelopeError::Replay),
             "replayed out-of-order sequence should be rejected"
         );
         Ok(())
@@ -696,11 +727,11 @@ mod tests {
         let env3 = cred.seal_with_aad(b"frame-3", valid_aad(3))?;
         let env6 = cred.seal_with_aad(b"frame-6", valid_aad(6))?;
 
-        cred.open_with_replay_window(&env0, 0, &mut replay_window)?;
-        cred.open_with_replay_window(&env3, 0, &mut replay_window)?;
-        cred.open_with_replay_window(&env6, 0, &mut replay_window)?;
+        open_for_test(&cred, &env0, 0, &mut replay_window)?;
+        open_for_test(&cred, &env3, 0, &mut replay_window)?;
+        open_for_test(&cred, &env6, 0, &mut replay_window)?;
         ensure!(
-            cred.open_with_replay_window(&env0, 0, &mut replay_window)
+            open_for_test(&cred, &env0, 0, &mut replay_window)
                 == Err(EnvelopeError::SequenceTooOld),
             "too-old sequence should be rejected"
         );
@@ -714,11 +745,32 @@ mod tests {
         let env0 = cred.seal_with_aad(b"frame-0", valid_aad(0))?;
         let env4 = cred.seal_with_aad(b"frame-4", valid_aad(4))?;
 
-        cred.open_with_replay_window(&env0, 0, &mut replay_window)?;
+        open_for_test(&cred, &env0, 0, &mut replay_window)?;
         ensure!(
-            cred.open_with_replay_window(&env4, 0, &mut replay_window)
+            open_for_test(&cred, &env4, 0, &mut replay_window)
                 == Err(EnvelopeError::SequenceTooFarAhead),
             "too-far-ahead sequence should be rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replay_window_can_attach_to_authenticated_high_sequence() -> anyhow::Result<()> {
+        let cred = test_credential("inst-1", 1);
+        let mut replay = SecureEnvelopeReplayWindow::new(4)?;
+        let high = cred.seal_with_aad(b"frame-100", valid_aad(100))?;
+        ensure!(
+            open_for_test(&cred, &high, 0, &mut replay)? == b"frame-100",
+            "authenticated high sequence was not opened"
+        );
+        ensure!(
+            open_for_test(&cred, &high, 0, &mut replay) == Err(EnvelopeError::Replay),
+            "replayed high sequence was accepted"
+        );
+        let far = cred.seal_with_aad(b"frame-104", valid_aad(104))?;
+        ensure!(
+            open_for_test(&cred, &far, 0, &mut replay) == Err(EnvelopeError::SequenceTooFarAhead),
+            "out-of-window sequence was accepted"
         );
         Ok(())
     }
@@ -732,11 +784,10 @@ mod tests {
         let mut replay_window = SecureEnvelopeReplayWindow::default();
 
         ensure!(
-            cred.open_with_replay_window(&tampered, 0, &mut replay_window)
-                == Err(EnvelopeError::BadAead),
+            open_for_test(&cred, &tampered, 0, &mut replay_window) == Err(EnvelopeError::BadAead),
             "bad AEAD should not be accepted"
         );
-        let opened = cred.open_with_replay_window(&env, 0, &mut replay_window)?;
+        let opened = open_for_test(&cred, &env, 0, &mut replay_window)?;
         ensure!(
             opened == b"frame-0",
             "unexpected plaintext after bad AEAD: {opened:?}"
@@ -747,13 +798,10 @@ mod tests {
     #[test]
     fn replay_window_requires_session_aad_shape() -> anyhow::Result<()> {
         let cred = test_credential("inst-1", 1);
-        let env = cred.seal_with_aad(b"frame-0", EnvelopeAad::default())?;
-        let mut replay_window = SecureEnvelopeReplayWindow::default();
-
         ensure!(
-            cred.open_with_replay_window(&env, 0, &mut replay_window)
+            cred.seal_with_aad(b"frame-0", EnvelopeAad::default())
                 == Err(EnvelopeError::InvalidAad),
-            "invalid AAD shape should be rejected"
+            "invalid AAD shape should be rejected before sealing"
         );
         Ok(())
     }
@@ -772,6 +820,31 @@ mod tests {
             cred.open_with_replay_window_and_epoch_gate(&env, 0, &mut replay_window, &epoch_gate)
                 == Err(EnvelopeError::InvalidKeyEpoch),
             "old business frame should be rejected after rekey"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_epoch_does_not_consume_replay_sequence() -> anyhow::Result<()> {
+        let cred = test_credential("inst-1", 1);
+        let gate = SecureEnvelopeEpochGate::new(2);
+        let mut replay = SecureEnvelopeReplayWindow::default();
+        let mut old_aad = valid_aad(7);
+        old_aad.key_epoch = 1;
+        old_aad.frame_type = "invoke".into();
+        let old = cred.seal_with_aad(b"old", old_aad)?;
+        ensure!(
+            cred.open_with_replay_window_and_epoch_gate(&old, 0, &mut replay, &gate)
+                == Err(EnvelopeError::InvalidKeyEpoch)
+        );
+
+        let mut current_aad = valid_aad(7);
+        current_aad.key_epoch = 2;
+        current_aad.frame_type = "invoke".into();
+        let current = cred.seal_with_aad(b"current", current_aad)?;
+        ensure!(
+            cred.open_with_replay_window_and_epoch_gate(&current, 0, &mut replay, &gate)?
+                == b"current"
         );
         Ok(())
     }
@@ -810,6 +883,26 @@ mod tests {
             opened == b"ack",
             "unexpected config ack plaintext: {opened:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn epoch_gate_limits_config_ack_drain_to_previous_epoch() -> anyhow::Result<()> {
+        let cred = test_credential("inst-1", 1);
+        let gate = SecureEnvelopeEpochGate::new(3);
+        for (epoch, accepted) in [(3, true), (2, true), (1, false), (u64::MAX, false)] {
+            let mut aad = valid_aad(0);
+            aad.key_epoch = epoch;
+            aad.frame_type = "control.config_ack".into();
+            let envelope = cred.seal_with_aad(b"ack", aad)?;
+            let mut replay = SecureEnvelopeReplayWindow::default();
+            let result =
+                cred.open_with_replay_window_and_epoch_gate(&envelope, 0, &mut replay, &gate);
+            ensure!(
+                result.is_ok() == accepted,
+                "epoch {epoch} drain decision was wrong"
+            );
+        }
         Ok(())
     }
 }

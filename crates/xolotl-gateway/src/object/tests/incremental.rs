@@ -1,8 +1,9 @@
 use super::ports::{Gate, ProbeStore, WriteReply};
 use super::*;
+use sha2::Sha384;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use xolotl_types::{DType, FrameKind, Path, ResourceName};
+use xolotl_types::{BlobRef, DType, FrameKind, Path, ResourceName};
 
 fn ticket_request(modality: GatewayModality) -> IssueObjectUploadTicketRequest {
     IssueObjectUploadTicketRequest {
@@ -14,17 +15,24 @@ fn ticket_request(modality: GatewayModality) -> IssueObjectUploadTicketRequest {
         allowed_media_types: Vec::new(),
         expires_in_ms: Some(60_000),
         single_use: true,
+        max_objects: None,
+        max_total_bytes: None,
+        max_record_bytes: None,
     }
 }
 
-fn ensure_staging_empty(fixture: &Fixture) -> anyhow::Result<()> {
+async fn ensure_staging_empty(fixture: &Fixture) -> anyhow::Result<()> {
     ensure!(fixture.files.pending_uploads() == 0);
-    ensure!(
-        std::fs::read_dir(fixture._directory.path().join("staging"))?
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while std::fs::read_dir(fixture._directory.path().join("staging"))?
             .next()
-            .is_none(),
-        "upload left staging files"
-    );
+            .is_some()
+        {
+            tokio::task::yield_now().await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
     Ok(())
 }
 
@@ -33,10 +41,10 @@ async fn ensure_unpublished(
     ticket: &GatewayObjectUploadTicket,
     bytes: &[u8],
 ) -> anyhow::Result<()> {
-    ensure_staging_empty(fixture)?;
-    ensure!(!fixture.record(ticket.ticket_id()).await?.committed);
+    ensure_staging_empty(fixture).await?;
+    ensure!(!fixture.record(ticket.ticket_id()).await?.is_committed());
     let blob = BlobRef {
-        hash: blake3::hash(bytes).to_hex().to_string(),
+        hash: content_digest(bytes),
         size: bytes.len() as u64,
         mime: None,
     };
@@ -63,22 +71,25 @@ async fn dyn_gateway_uploads_and_reads_multimegabyte_content_with_a_reused_buffe
                 ticket_id: ticket.ticket_id().into(),
                 media_type: Some("application/octet-stream".into()),
                 submission_token: None,
+
+                expected_size: None,
+                expected_digest: None,
             },
         )
         .await?;
     let mut buffer = [0_u8; 32 * 1024 + 13];
-    let mut expected = blake3::Hasher::new();
+    let mut expected = Sha384::new();
     let mut size = 0_u64;
     for round in 0..97 {
         for (index, byte) in buffer.iter_mut().enumerate() {
             *byte = ((index * 31 + round * 17) & 0xff) as u8;
         }
-        expected.update(&buffer);
+        expected.update(buffer);
         size += buffer.len() as u64;
         ensure!(upload.write(&buffer).await? == size);
     }
     let response = upload.commit(GatewayObjectKind::Blob).await?;
-    let digest = expected.finalize().to_hex().to_string();
+    let digest = BlobRef::sha384_hex(&expected.finalize().into());
     ensure!(size > 3 * 1024 * 1024);
     ensure!(response.size == size && response.digest == digest);
     let blob = response.item.backing_blob().context("missing blob")?;
@@ -87,12 +98,12 @@ async fn dyn_gateway_uploads_and_reads_multimegabyte_content_with_a_reused_buffe
     ensure!(probe.max_write_bytes.load(Ordering::Relaxed) == UPLOAD_CHUNK_BYTES.get());
     ensure!(probe.writes.load(Ordering::Relaxed) > 97);
     let record = fixture.record(ticket.ticket_id()).await?;
-    ensure!(record.committed && !record.used);
-    ensure!(record.expected_size == Some(size));
-    ensure!(record.expected_digest.as_deref() == Some(digest.as_str()));
-    ensure_staging_empty(&fixture)?;
+    ensure!(record.is_committed() && !record.used_by.is_some());
+    ensure!(record.committed_items.len() == 1);
+    ensure!(record.committed_items[0].item == response.item);
+    ensure_staging_empty(&fixture).await?;
 
-    let mut received = blake3::Hasher::new();
+    let mut received = Sha384::new();
     let mut offset = 0_u64;
     loop {
         let read = fixture
@@ -110,7 +121,7 @@ async fn dyn_gateway_uploads_and_reads_multimegabyte_content_with_a_reused_buffe
             break;
         }
     }
-    ensure!(offset == size && received.finalize().to_hex().as_str() == digest);
+    ensure!(offset == size && BlobRef::sha384_hex(&received.finalize().into()) == digest);
     Ok(())
 }
 
@@ -123,9 +134,9 @@ async fn empty_upload_commits_and_explicit_abort_removes_staging() -> anyhow::Re
     let upload = fixture.begin(&ticket, None).await?;
     let response = upload.commit(GatewayObjectKind::Blob).await?;
     ensure!(response.size == 0);
-    ensure!(response.digest == blake3::hash(b"").to_hex().as_str());
+    ensure!(response.digest == content_digest(b""));
     ensure!(probe.writes.load(Ordering::Relaxed) == 0);
-    ensure!(fixture.record(ticket.ticket_id()).await?.committed);
+    ensure!(fixture.record(ticket.ticket_id()).await?.is_committed());
     let mut buffer = [0_u8; 17];
     let read = fixture
         .gateway
@@ -137,7 +148,7 @@ async fn empty_upload_commits_and_explicit_abort_removes_staging() -> anyhow::Re
         )
         .await?;
     ensure!(read.bytes_read == 0 && read.end);
-    ensure_staging_empty(&fixture)?;
+    ensure_staging_empty(&fixture).await?;
 
     let ticket = fixture.issue(true).await?;
     let mut upload = fixture.begin(&ticket, None).await?;
@@ -163,7 +174,7 @@ async fn unknown_length_tensors_and_frames_receive_canonical_references_at_eof()
         let mut upload = fixture
             .begin(&ticket, Some("application/octet-stream"))
             .await?;
-        let mut expected = blake3::Hasher::new();
+        let mut expected = Sha384::new();
         let mut size = 0_u64;
         for bytes in [b"sensor".as_slice(), b"-sample", b" bytes"] {
             expected.update(bytes);
@@ -194,7 +205,7 @@ async fn unknown_length_tensors_and_frames_receive_canonical_references_at_eof()
             .item
             .backing_blob()
             .context("missing typed backing blob")?;
-        ensure!(blob.hash == expected.finalize().to_hex().as_str() && blob.size == size);
+        ensure!(blob.hash == BlobRef::sha384_hex(&expected.finalize().into()) && blob.size == size);
         ensure!(blob.mime.as_deref() == Some("application/octet-stream"));
         ensure!(response.digest == blob.hash && response.size == blob.size);
         let metadata = fixture
@@ -204,9 +215,31 @@ async fn unknown_length_tensors_and_frames_receive_canonical_references_at_eof()
             .await?
             .context("typed object was not published")?;
         ensure!(metadata.blob == *blob);
-        ensure!(fixture.record(ticket.ticket_id()).await?.committed);
-        ensure_staging_empty(&fixture)?;
+        ensure!(fixture.record(ticket.ticket_id()).await?.is_committed());
+        ensure_staging_empty(&fixture).await?;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_tensor_descriptor_is_rejected_before_object_publication() -> anyhow::Result<()> {
+    let fixture = Fixture::new().await?;
+    let ticket = fixture
+        .gateway
+        .issue_object_upload_ticket(&fixture.session, ticket_request(GatewayModality::Tensor))
+        .await?;
+    let mut upload = fixture.begin(&ticket, None).await?;
+    upload.write(b"tensor").await?;
+    let error = upload
+        .commit(GatewayObjectKind::Tensor {
+            dtype: DType::U8,
+            shape: vec![1; ticket::MAX_TICKET_TENSOR_DIMENSIONS + 1],
+        })
+        .await
+        .err()
+        .context("oversized tensor descriptor should fail")?;
+    ensure!(matches!(error, GatewayError::Rejected(_)));
+    ensure_unpublished(&fixture, &ticket, b"tensor").await?;
     Ok(())
 }
 
@@ -259,7 +292,7 @@ async fn declared_size_and_digest_mismatches_never_publish_content() -> anyhow::
     for (expected_size, expected_digest, overflow) in [
         (Some(bytes.len() as u64 - 1), None, true),
         (Some(bytes.len() as u64 + 1), None, false),
-        (None, Some("a".repeat(64)), false),
+        (None, Some("a".repeat(96)), false),
     ] {
         let mut request = ticket_request(GatewayModality::Bytes);
         request.expected_size = expected_size;

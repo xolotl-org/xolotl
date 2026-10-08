@@ -45,7 +45,15 @@ impl<'a> Children<'a> {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "unbounded projection cannot exceed address space without allocation failure"
+)]
 pub(super) fn entry_text(entry: &Value) -> String {
+    entry_text_bounded(entry, usize::MAX).expect("text projection fits address space")
+}
+
+pub(super) fn entry_text_bounded(entry: &Value, limit: usize) -> Option<String> {
     let mut rendered = String::new();
     let mut frames = Vec::new();
     let mut next = Some(entry);
@@ -53,6 +61,10 @@ pub(super) fn entry_text(entry: &Value) -> String {
         if let Some(value) = next.take() {
             match value.view() {
                 ValueView::Str(text) if !text.trim().is_empty() => {
+                    let separator = usize::from(!rendered.is_empty());
+                    if text.len() > limit.checked_sub(rendered.len() + separator)? {
+                        return None;
+                    }
                     if !rendered.is_empty() {
                         rendered.push('\n');
                     }
@@ -71,7 +83,7 @@ pub(super) fn entry_text(entry: &Value) -> String {
             frames.pop();
         }
         if next.is_none() {
-            return rendered;
+            return Some(rendered);
         }
     }
 }
@@ -81,6 +93,21 @@ mod tests {
     use super::*;
     use anyhow::ensure;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn text_admission_charges_utf8_and_separators_before_appending() {
+        let value = Value::list(vec![Value::string("é".into()), Value::string("x".into())]);
+        assert_eq!(entry_text_bounded(&value, 4).as_deref(), Some("é\nx"));
+        assert_eq!(entry_text_bounded(&value, 3), None);
+        assert_eq!(
+            entry_text_bounded(&Value::string(" ".into()), 0),
+            Some(String::new())
+        );
+        assert_eq!(
+            entry_text_bounded(&Value::string("x".repeat(4096)), 4095),
+            None
+        );
+    }
 
     #[test]
     fn selected_fields_keep_order_and_repeated_content() -> anyhow::Result<()> {

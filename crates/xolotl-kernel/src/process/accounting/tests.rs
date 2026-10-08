@@ -34,13 +34,17 @@ fn concurrent_free_siblings_share_the_ancestor_inflight_limit() -> anyhow::Resul
         running(&table, Some(parent))?,
         running(&table, Some(parent))?,
     ];
-    ensure!(table.set_budget_spec(
-        parent,
-        BudgetSpec {
-            max_inflight_ops: Some(1),
-            ..BudgetSpec::default()
-        }
-    ));
+    ensure!(
+        table
+            .set_budget_spec(
+                parent,
+                BudgetSpec {
+                    max_inflight_ops: Some(1),
+                    ..BudgetSpec::default()
+                }
+            )
+            .is_ok()
+    );
     let barrier = std::sync::Barrier::new(3);
     let results = std::thread::scope(|scope| {
         let calls = children.map(|child| {
@@ -83,20 +87,24 @@ fn ancestor_rejection_rolls_back_only_the_current_reservation() -> anyhow::Resul
     let root = running(&table, None)?;
     let parent = running(&table, Some(root))?;
     let child = running(&table, Some(parent))?;
-    ensure!(table.set_budget_spec(
-        root,
-        BudgetSpec {
-            daily_micro_usd: Some(10),
-            ..BudgetSpec::default()
-        }
-    ));
+    ensure!(
+        table
+            .set_budget_spec(
+                root,
+                BudgetSpec {
+                    max_micro_usd: Some(10),
+                    ..BudgetSpec::default()
+                }
+            )
+            .is_ok()
+    );
     ensure!(table.reserve(parent, 9, 4).is_ok());
     let before = [
         budget(&table, root)?,
         budget(&table, parent)?,
         budget(&table, child)?,
     ];
-    ensure!(table.reserve(child, 2, 3) == Err("daily_micro_usd".into()));
+    ensure!(table.reserve(child, 2, 3) == Err("micro_usd".into()));
     for (id, expected) in [root, parent, child].into_iter().zip(before) {
         ensure!(budget(&table, id)? == expected);
     }
@@ -111,19 +119,23 @@ fn completed_ancestors_keep_limits_for_independent_descendants() -> anyhow::Resu
     let table = ProcessTable::new();
     let parent = running(&table, None)?;
     let child = running(&table, Some(parent))?;
-    ensure!(table.set_budget_spec(
-        parent,
-        BudgetSpec {
-            daily_micro_usd: Some(50),
-            ..BudgetSpec::default()
-        }
-    ));
+    ensure!(
+        table
+            .set_budget_spec(
+                parent,
+                BudgetSpec {
+                    max_micro_usd: Some(50),
+                    ..BudgetSpec::default()
+                }
+            )
+            .is_ok()
+    );
     complete(&table, parent)?;
     ensure!(table.reserve(child, 40, 3).is_ok());
     table.settle(child, 40, 35, 3, 2);
     ensure!(budget(&table, parent)? == budget(&table, child)?);
     ensure!(budget(&table, parent)?.spent_micro_usd == 35);
-    ensure!(table.reserve(child, 20, 0) == Err("daily_micro_usd".into()));
+    ensure!(table.reserve(child, 20, 0) == Err("micro_usd".into()));
     ensure!(table.reserve(parent, 0, 0) == Err("process_unavailable".into()));
     ensure!(table.reserve(ProcessId::new(u64::MAX), 0, 0) == Err("process_unavailable".into()));
     Ok(())

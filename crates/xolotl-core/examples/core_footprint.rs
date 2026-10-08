@@ -32,7 +32,6 @@ fn main() -> anyhow::Result<()> {
         entry: 0,
         bindings: 0,
         imports: 0,
-        durable: false,
     };
     let mut tasks = [Task::default()];
     let mut frames = [];

@@ -14,8 +14,8 @@ workspace = true
 [features]
 default = ["standard"]
 standard = ["standard-core"]
-standard-core = ["proc", "dep:blake3", "dep:getrandom", "dep:half", "tokio/time"]
-fetch = ["standard-core", "dep:reqwest", "dep:url"]
+standard-core = ["proc", "dep:aws-lc-rs", "dep:blake3", "dep:getrandom", "dep:half", "dep:libc", "tokio/time"]
+fetch = ["standard-core", "dep:reqwest", "dep:url", "dep:rustls", "dep:rustls-platform-verifier"]
 fs = ["standard-core", "dep:glob", "tokio/fs"]
 http-inference = [
     "openai-responses",
@@ -24,37 +24,46 @@ http-inference = [
     "gemini-generate-content",
 ]
 http-stream = ["dep:bytes", "dep:futures-util"]
-openai-responses = ["standard-core", "dep:reqwest", "http-stream"]
-openai-chat = ["standard-core", "dep:reqwest", "http-stream"]
-anthropic-messages = ["standard-core", "dep:reqwest", "http-stream"]
-gemini-generate-content = ["standard-core", "dep:reqwest", "http-stream"]
+openai-responses = ["standard-core", "dep:reqwest", "http-stream", "dep:rustls", "dep:rustls-platform-verifier"]
+openai-chat = ["standard-core", "dep:reqwest", "http-stream", "dep:rustls", "dep:rustls-platform-verifier"]
+anthropic-messages = ["standard-core", "dep:reqwest", "http-stream", "dep:rustls", "dep:rustls-platform-verifier"]
+gemini-generate-content = ["standard-core", "dep:reqwest", "http-stream", "dep:rustls", "dep:rustls-platform-verifier"]
 proc = ["tokio/io-util", "tokio/process"]
 terminal = ["standard-core", "tokio/io-util", "tokio/process"]
 value-objects = ["dep:xolotl-value-codec", "dep:xolotl-value-object", "xolotl-value-object/cbor"]
 
 [dependencies]
 async-trait = { workspace = true, default-features = false }
+aws-lc-rs = { workspace = true, default-features = false, features = ["non-fips"], optional = true }
 bytes = { workspace = true, features = ["std"], optional = true }
 futures-util = { workspace = true, default-features = false, features = ["std"], optional = true }
 blake3 = { workspace = true, default-features = false, features = ["std"], optional = true }
 getrandom = { workspace = true, default-features = false, optional = true }
 glob = { workspace = true, default-features = false, optional = true }
 half = { workspace = true, default-features = false, optional = true }
+libc = { workspace = true, optional = true }
 xolotl-graph.workspace = true
 xolotl-kernel = { workspace = true, features = ["host"] }
 xolotl-state.workspace = true
+xolotl-source.workspace = true
 xolotl-types.workspace = true
 xolotl-value-codec = { workspace = true, optional = true }
 xolotl-value-object = { workspace = true, optional = true }
 parking_lot = { workspace = true, default-features = false }
 reqwest = { workspace = true, default-features = false, features = ["rustls", "stream"], optional = true }
+rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "std"], optional = true }
+rustls-platform-verifier = { version = "0.7.1", default-features = false, optional = true }
 serde = { workspace = true, default-features = false, features = ["derive", "std"] }
 serde_json = { workspace = true, default-features = false, features = ["std"] }
 thiserror = { workspace = true, default-features = false, features = ["std"] }
+zeroize = { workspace = true, features = ["alloc"] }
 tokio = { workspace = true, default-features = false, features = ["rt", "sync", "macros"] }
 url = { workspace = true, default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
+sha2 = { workspace = true, default-features = false }
+xolotl-kernel = { workspace = true, features = ["memory"] }
+xolotl-state = { workspace = true, features = ["memory"] }
 xolotl-storage-fs.workspace = true
 anyhow = { workspace = true, default-features = false, features = ["std"] }
 criterion = { workspace = true, default-features = false, features = ["cargo_bench_support"] }
@@ -63,3 +72,4 @@ tempfile = { workspace = true, default-features = false, features = ["getrandom"
 [[bench]]
 name = "standard_drivers"
 harness = false
+required-features = ["standard-core"]

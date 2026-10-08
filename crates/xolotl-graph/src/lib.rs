@@ -6,7 +6,7 @@
 //! [`DoNode`] and native continuations compile to [`ExecutionGraph`], which the
 //! hosted executor lowers to `xolotl-core` instructions. [`portable`] programs
 //! compile directly to core images with explicit portable imports. Both paths
-//! use the same core control flow; durable checkpoints require portable imports.
+//! use the same core control flow within a running host lifecycle.
 //!
 //! This crate sits **below** the kernel and **above** `xolotl-types`,
 //! and is wasm-safe: the Do→Graph compiler can run in the browser.
@@ -29,10 +29,11 @@ pub mod r#do;
 mod fingerprint;
 pub mod graph;
 pub mod portable;
+mod source_release;
 
 pub use actor_spec::{
     ActorBindError, ActorSpec, CapabilityQueryError, LintFinding, LintSeverity, capability_covers,
-    lint, lint_actor, operation_capability_verb,
+    lint, lint_actor,
 };
 pub use compile::{CompileError, compile_do, compile_do_at};
 pub use r#do::{DoNode, bind_process_self_capability};

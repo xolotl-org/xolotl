@@ -1,0 +1,29 @@
+[package]
+name = "xolotl-federation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Optional node federation contracts and state transitions"
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "outbound_pages"
+harness = false
+test = false
+
+[dependencies]
+aws-lc-rs = { workspace = true, default-features = false, features = ["non-fips"] }
+sha2 = { workspace = true, default-features = false }
+zeroize.workspace = true
+thiserror = { workspace = true, default-features = false, features = ["std"] }
+xolotl-state = { workspace = true, features = ["std"] }
+xolotl-types.workspace = true
+
+[dev-dependencies]
+anyhow = { workspace = true, default-features = false, features = ["std"] }
+tokio = { workspace = true, default-features = false, features = ["macros", "rt"] }

@@ -12,6 +12,9 @@
 //! still goes through [`xolotl_gateway::Gateway`], so authentication, Process
 //! creation, schema checks, policy, taint, Fact recording, budget, and audit use
 //! the shared Gateway path.
+//! Gateway-local observations are optional when the host has no observation
+//! storage. Installed storage failures remain visible, independently of the
+//! authorization and truthful submission-receipt contracts.
 //!
 //! JSON-RPC responses project typed values into ordinary JSON under configurable
 //! [`McpOutputLimits`]. Admission accounts for shared descendants before JSON
@@ -22,6 +25,7 @@
 //! finite MCP response budgets do not constrain cumulative kernel streams.
 
 mod content;
+mod delivery;
 mod error;
 mod jsonrpc;
 mod output;
@@ -33,7 +37,10 @@ mod uri_template;
 mod validation;
 
 pub use error::McpGatewayError;
-pub use jsonrpc::{McpJsonRpcError, McpJsonRpcRequest, McpJsonRpcResponse};
+pub use jsonrpc::{
+    JSONRPC_EXECUTION_FAILED, JSONRPC_OUTCOME_UNKNOWN, McpJsonRpcError, McpJsonRpcRequest,
+    McpJsonRpcResponse,
+};
 pub use output::{MAX_MCP_JSON_VALUE_DEPTH, McpOutputLimits};
 pub use publication::{
     MCP_PUBLICATION_KIND_PROMPT, MCP_PUBLICATION_KIND_RESOURCE,

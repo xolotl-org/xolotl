@@ -9,7 +9,7 @@ pub const IMAGE_VERSION: u32 = 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Fault {
-    /// An image or checkpoint uses an unsupported format.
+    /// An image uses an unsupported format.
     Version,
     /// A control-flow index falls outside the image.
     InvalidNode,
@@ -37,12 +37,10 @@ pub enum Fault {
     StaleEvent,
     /// Request identifiers cannot advance without wrapping.
     SequenceExhausted,
-    /// The image requires journal barriers unavailable in this host.
-    DurableUnavailable,
-    /// A checkpoint or response was paired with another image.
+    /// A suspended execution or response was paired with another image.
     ImageMismatch,
-    /// Checkpoint structure or storage layout is invalid.
-    InvalidCheckpoint,
+    /// Live machine storage is inconsistent.
+    InvalidState,
     /// A linked handle failed ownership, generation, or method validation.
     Authority,
 }
@@ -161,8 +159,6 @@ pub struct Node<V, E> {
     pub kind: NodeKind<V, E>,
     /// Optional continuation receiving a successful result.
     pub next: Option<u32>,
-    /// Optional producer slot used by linked graph data dependencies.
-    pub save: Option<u32>,
     /// Stable source position, separate from a particular dynamic invocation.
     pub position: u64,
 }
@@ -173,7 +169,6 @@ impl<V, E> Node<V, E> {
         Self {
             kind,
             next: None,
-            save: None,
             position,
         }
     }
@@ -251,7 +246,6 @@ impl<V, E> Node<V, E> {
         Ok(Node {
             kind,
             next: self.next,
-            save: self.save,
             position: self.position,
         })
     }
@@ -305,7 +299,6 @@ impl<V, E> Node<V, E> {
         Ok(Node {
             kind,
             next: self.next,
-            save: self.save,
             position: self.position,
         })
     }
@@ -315,7 +308,7 @@ impl<V, E> Node<V, E> {
 pub struct ProgramImage<'a, V, E> {
     /// Instruction format accepted at admission.
     pub version: u32,
-    /// Content identity computed by the compiler, checked when restoring state.
+    /// Content identity computed by the compiler, checked when resuming live state.
     pub id: [u8; 32],
     /// Immutable instructions, addressed by slice index.
     pub nodes: &'a [Node<V, E>],
@@ -325,8 +318,6 @@ pub struct ProgramImage<'a, V, E> {
     pub bindings: usize,
     /// Number of imports the host must resolve.
     pub imports: usize,
-    /// Require a host that provides persistent execution barriers.
-    pub durable: bool,
 }
 
 impl<V, E> ProgramImage<'_, V, E> {

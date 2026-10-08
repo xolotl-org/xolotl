@@ -2,7 +2,7 @@
 
 use super::{ProcessTable, TaskAttachment};
 use crate::handle::HandleTable;
-use parking_lot::RwLock;
+use crate::host::AbortTask;
 use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
@@ -12,7 +12,6 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 use tokio::sync::{Notify, oneshot};
-use tokio::task::AbortHandle;
 use xolotl_types::{ExecutionOutput, Failure, Outcome, ProcessId, ProcessStatus};
 
 tokio::task_local! {
@@ -120,6 +119,8 @@ pub(crate) fn outcome_status(outcome: &Outcome) -> ProcessStatus {
 
 #[async_trait::async_trait]
 pub(crate) trait ProcessPublication: Send + Sync + 'static {
+    fn released(&self, _status: ProcessStatus, _outcome: Option<&ExecutionOutput>) {}
+
     async fn publish(
         &self,
         state: &xolotl_state::Backend,
@@ -130,7 +131,7 @@ pub(crate) trait ProcessPublication: Send + Sync + 'static {
 }
 
 pub(super) struct TaskRecord {
-    abort: AbortHandle,
+    abort: Arc<dyn AbortTask>,
     state: Arc<TaskState>,
 }
 
@@ -140,29 +141,15 @@ struct TaskState {
     abandoned: AtomicBool,
     exited: AtomicBool,
     changed: Notify,
-}
-
-#[derive(Clone, Copy)]
-enum DropPolicy {
-    Finalize,
-    #[cfg(feature = "durable")]
-    RetainCheckpoint,
-}
-
-#[derive(Clone, Copy)]
-enum AttachmentMode {
-    Body,
-    #[cfg(feature = "durable")]
-    CheckpointCleanup,
+    output: parking_lot::Mutex<Option<Arc<ExecutionOutput>>>,
 }
 
 /// Owns a task body. Drop requests cleanup; the enclosing task confirms exit.
 pub(crate) struct TaskOwner {
     table: ProcessTable,
-    handles: Arc<RwLock<HandleTable>>,
+    handles: HandleTable,
     process: ProcessId,
     state: Arc<TaskState>,
-    policy: DropPolicy,
     owned: bool,
 }
 
@@ -170,6 +157,7 @@ impl TaskOwner {
     /// The caller must drop its body future before transferring to finalization.
     pub(crate) fn finish(mut self, outcome: ExecutionOutput) -> Option<Arc<ExecutionOutput>> {
         let retained = self.table.retain_outcome(self.process, outcome);
+        *self.state.output.lock() = retained.clone();
         self.release();
         retained
     }
@@ -205,17 +193,11 @@ impl Drop for TaskOwner {
         if !accepted {
             return;
         }
-        match self.policy {
-            DropPolicy::Finalize => {
-                for process in self.table.request_cleanup_tree(self.process) {
-                    if process != self.process {
-                        self.table.abort_task(process);
-                    }
-                    self.revoke(process);
-                }
+        for process in self.table.request_cleanup_tree(self.process) {
+            if process != self.process {
+                self.table.abort_task(process);
             }
-            #[cfg(feature = "durable")]
-            DropPolicy::RetainCheckpoint => self.revoke(self.process),
+            self.revoke(process);
         }
     }
 }
@@ -224,10 +206,62 @@ struct TaskExit {
     table: ProcessTable,
     process: ProcessId,
     state: Arc<TaskState>,
+    publication: Option<Arc<dyn ProcessPublication>>,
+    // Last field: publication callbacks and native capture destructors must
+    // finish before cleanup observation and reaping can acknowledge this task.
+    _captures: ManagedCaptures,
+}
+
+struct ManagedCaptures {
+    table: ProcessTable,
+    process: ProcessId,
+}
+
+impl Drop for ManagedCaptures {
+    fn drop(&mut self) {
+        {
+            let mut inner = self.table.inner.state.write();
+            if let Some(entry) = inner.procs.get_mut(&self.process) {
+                entry.managed_captures -= 1;
+            }
+            inner.queue_reap_if_eligible(self.process);
+        }
+        self.table.inner.changed.notify_waiters();
+    }
 }
 
 impl Drop for TaskExit {
     fn drop(&mut self) {
+        // ManagedTask has already dropped every body and finalizer capture.
+        // Retain the notification through successful publication too: completing
+        // the process record alone does not acknowledge release of task captures.
+        if let Some(publication) = &self.publication {
+            let output = self
+                .state
+                .output
+                .lock()
+                .take()
+                .or_else(|| self.table.finalization_outcome(self.process));
+            let status = self
+                .table
+                .finalization_status(self.process)
+                .or_else(|| {
+                    output
+                        .as_ref()
+                        .map(|output| outcome_status(&output.outcome))
+                })
+                .unwrap_or(ProcessStatus::Cancelled);
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                publication.released(status, output.as_deref());
+            }))
+            .is_err()
+            {
+                tracing::error!(
+                    process = self.process.get(),
+                    "process release notification panicked"
+                );
+            }
+        }
         self.table.release_task(self.process, &self.state);
     }
 }
@@ -260,109 +294,49 @@ impl ProcessTable {
     pub(crate) fn spawn_task<F, Fut>(
         &self,
         process: ProcessId,
-        handles: Arc<RwLock<HandleTable>>,
+        handles: HandleTable,
         run: F,
     ) -> Result<(), TaskAttachment>
     where
         F: FnOnce(TaskOwner) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.spawn_managed_task(
-            process,
-            handles,
-            DropPolicy::Finalize,
-            AttachmentMode::Body,
-            run,
-        )
-    }
-
-    #[cfg(feature = "durable")]
-    pub(crate) fn spawn_recovery_task<F, Fut>(
-        &self,
-        process: ProcessId,
-        handles: Arc<RwLock<HandleTable>>,
-        run: F,
-    ) -> Result<(), TaskAttachment>
-    where
-        F: FnOnce(TaskOwner) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        self.spawn_managed_task(
-            process,
-            handles,
-            DropPolicy::RetainCheckpoint,
-            AttachmentMode::Body,
-            run,
-        )
-    }
-
-    /// Attach terminal checkpoint cleanup without permitting another process body.
-    #[cfg(feature = "durable")]
-    pub(crate) fn spawn_checkpoint_cleanup_task<F, Fut>(
-        &self,
-        process: ProcessId,
-        handles: Arc<RwLock<HandleTable>>,
-        run: F,
-    ) -> Result<(), TaskAttachment>
-    where
-        F: FnOnce(TaskOwner) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        self.spawn_managed_task(
-            process,
-            handles,
-            DropPolicy::RetainCheckpoint,
-            AttachmentMode::CheckpointCleanup,
-            run,
-        )
-    }
-
-    fn spawn_managed_task<F, Fut>(
-        &self,
-        process: ProcessId,
-        handles: Arc<RwLock<HandleTable>>,
-        policy: DropPolicy,
-        mode: AttachmentMode,
-        run: F,
-    ) -> Result<(), TaskAttachment>
-    where
-        F: FnOnce(TaskOwner) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        let runtime =
-            tokio::runtime::Handle::try_current().map_err(|_missing| TaskAttachment::NoRuntime)?;
+        let captures = self.capture_task(process)?;
         let state = Arc::new(TaskState::default());
         let owner = TaskOwner {
             table: self.clone(),
             handles,
             process,
             state: state.clone(),
-            policy,
             owned: true,
         };
         let (start, started) = oneshot::channel();
-        let task = runtime.spawn(ManagedTask {
-            future: Some(Box::pin(BODY_PROCESS.scope(
-                (self.clone(), Cell::new(Some(process))),
-                async move {
-                    if started.await.is_ok() {
-                        run(owner).await;
-                    }
+        let task = self
+            .host_runtime()
+            .spawn(Box::pin(ManagedTask {
+                future: Some(Box::pin(BODY_PROCESS.scope(
+                    (self.clone(), Cell::new(Some(process))),
+                    async move {
+                        if started.await.is_ok() {
+                            run(owner).await;
+                        }
+                    },
+                ))),
+                _exit: TaskExit {
+                    table: self.clone(),
+                    process,
+                    state: state.clone(),
+                    publication: self.publication(process),
+                    _captures: captures,
                 },
-            ))),
-            _exit: TaskExit {
-                table: self.clone(),
-                process,
-                state: state.clone(),
-            },
-        });
+            }))
+            .map_err(|_error| TaskAttachment::NoRuntime)?;
         let attachment = self.attach_managed_task(
             process,
             TaskRecord {
-                abort: task.abort_handle(),
+                abort: task.clone(),
                 state,
             },
-            mode,
         );
         if attachment != TaskAttachment::Attached {
             task.abort();
@@ -372,25 +346,24 @@ impl ProcessTable {
         Ok(())
     }
 
-    fn attach_managed_task(
-        &self,
-        process: ProcessId,
-        task: TaskRecord,
-        mode: AttachmentMode,
-    ) -> TaskAttachment {
+    fn capture_task(&self, process: ProcessId) -> Result<ManagedCaptures, TaskAttachment> {
+        let mut inner = self.inner.state.write();
+        let Some(entry) = inner.procs.get_mut(&process) else {
+            return Err(TaskAttachment::NoSuchProcess);
+        };
+        entry.managed_captures += 1;
+        Ok(ManagedCaptures {
+            table: self.clone(),
+            process,
+        })
+    }
+
+    fn attach_managed_task(&self, process: ProcessId, task: TaskRecord) -> TaskAttachment {
         let mut inner = self.inner.state.write();
         let Some(entry) = inner.procs.get(&process) else {
             return TaskAttachment::NoSuchProcess;
         };
-        let accepts = match mode {
-            AttachmentMode::Body => entry.accepts_children(),
-            #[cfg(feature = "durable")]
-            AttachmentMode::CheckpointCleanup => {
-                entry.checkpoint != super::CheckpointState::None
-                    && !entry.scope.finalized()
-                    && !entry.scope.finalizer_active()
-            }
-        };
+        let accepts = entry.accepts_children();
         if !accepts
             || task.state.abandoned.load(Ordering::Acquire)
             || task.state.exited.load(Ordering::Acquire)
@@ -405,7 +378,12 @@ impl ProcessTable {
         TaskAttachment::Attached
     }
 
-    pub(crate) fn has_task(&self, process: ProcessId) -> bool {
+    /// Whether a managed body task still owns this process.
+    /// An abort retains the slot until body captures drop. Normal body completion
+    /// releases the slot before handing off to finalization. Use a cleanup ticket
+    /// to observe full lifecycle and capture release. This advisory observation
+    /// neither acquires a lease nor prevents subsequent admission or exit.
+    pub fn has_task(&self, process: ProcessId) -> bool {
         self.inner.state.read().tasks.contains_key(&process)
     }
 
@@ -466,6 +444,7 @@ impl ProcessTable {
         };
         drop(removed);
         state.changed.notify_waiters();
+        self.inner.changed.notify_waiters();
     }
 }
 
@@ -473,7 +452,7 @@ impl ProcessTable {
 mod tests {
     use super::*;
     use crate::driver::DriverPlan;
-    use crate::handle::{FastPath, Handle, HandleState};
+    use crate::handle::{FastPath, Handle};
     use crate::process::ProcessEntry;
     use anyhow::ensure;
     use std::time::Duration;
@@ -482,14 +461,15 @@ mod tests {
         Value,
     };
 
-    fn fixture() -> anyhow::Result<(ProcessTable, Arc<RwLock<HandleTable>>, ProcessId, HandleId)> {
+    fn fixture() -> anyhow::Result<(ProcessTable, HandleTable, ProcessId, HandleId)> {
         let table = ProcessTable::new();
         let process = table.fresh_id()?;
         let mut entry = ProcessEntry::new(process, None, IdentityRef::ROOT);
         entry.scope.start();
         table.insert(entry);
-        let handles = Arc::new(RwLock::new(HandleTable::new()));
+        let handles = HandleTable::new();
         let handle = handles.write().insert(Handle {
+            open_verb: "perform".into(),
             id: HandleId::new(0, 0),
             process,
             acting: IdentityRef::ROOT,
@@ -497,7 +477,6 @@ mod tests {
             rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
             driver_plan: DriverPlan::new(DriverId::new(1), None, 0),
             fast_path: FastPath::Unconditional,
-            state: HandleState::Active,
             bound_path: None,
         })?;
         Ok((table, handles, process, handle))
@@ -683,6 +662,7 @@ mod tests {
                     let retained = owner.finish(ExecutionOutput {
                         outcome: Outcome::Done(Value::integer(42)),
                         taint: TaintSet::author(),
+                        unresolved_operations: Default::default(),
                     });
                     let released = current_process(&finished_table).is_none()
                         && !finished_table.has_task(process);
@@ -757,6 +737,7 @@ mod tests {
                     drop(owner.finish(ExecutionOutput {
                         outcome: Outcome::Done(Value::null()),
                         taint: TaintSet::pristine(),
+                        unresolved_operations: Default::default(),
                     }));
                     let _sent = finished.send(
                         body_matches
@@ -768,114 +749,6 @@ mod tests {
                 .is_ok()
         );
         ensure!(observed.await?);
-        Ok(())
-    }
-
-    #[cfg(feature = "durable")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn checkpoint_cleanup_attaches_to_finalizing_and_remains_retryable_after_abort()
-    -> anyhow::Result<()> {
-        let (table, handles, process, handle) = fixture()?;
-        let lifecycle = xolotl_types::ExecutionId::FIRST;
-        ensure!(table.initialize_lifecycle(process, lifecycle) == Some(lifecycle));
-        ensure!(
-            table.begin_finalizing(process, ProcessStatus::Failed)
-                == crate::process::FinalizeStart::Started
-        );
-        let guard = table.finalization_guard(process);
-        drop(guard);
-        ensure!(
-            table.spawn_checkpoint_cleanup_task(process, handles.clone(), |_owner| {
-                std::future::pending()
-            }) == Err(TaskAttachment::AlreadyTerminal)
-        );
-        table.require_checkpoint(process, lifecycle)?;
-        ensure!(
-            table.spawn_recovery_task(process, handles.clone(), |_owner| std::future::pending())
-                == Err(TaskAttachment::AlreadyTerminal)
-        );
-        let (started, observed) = oneshot::channel();
-        ensure!(
-            table
-                .spawn_checkpoint_cleanup_task(process, handles.clone(), move |owner| async move {
-                    let _owner = owner;
-                    let _started = started.send(());
-                    std::future::pending::<()>().await;
-                })
-                .is_ok()
-        );
-        observed.await?;
-        ensure!(table.has_task(process));
-        ensure!(
-            table.spawn_checkpoint_cleanup_task(process, handles.clone(), |_owner| {
-                std::future::pending()
-            }) == Err(TaskAttachment::AlreadyAttached)
-        );
-        ensure!(table.abort_task(process));
-        tokio::time::timeout(Duration::from_secs(2), table.wait_for_task_exit(process)).await?;
-        ensure!(!table.has_task(process));
-        ensure!(table.status(process) == Some(ProcessStatus::Finalizing));
-        ensure!(table.finalization_status(process) == Some(ProcessStatus::Failed));
-        ensure!(table.checkpoint_required(process) == Some(true));
-        ensure!(table.checkpoint_retired(process) == Some(false));
-        ensure!(handles.read().get(handle).is_none());
-        let (retried, observed) = oneshot::channel();
-        ensure!(
-            table
-                .spawn_checkpoint_cleanup_task(process, handles, move |owner| async move {
-                    let _owner = owner;
-                    let _retried = retried.send(());
-                })
-                .is_ok()
-        );
-        observed.await?;
-        tokio::time::timeout(Duration::from_secs(2), table.wait_for_task_exit(process)).await?;
-        ensure!(table.finalization_status(process) == Some(ProcessStatus::Failed));
-        Ok(())
-    }
-
-    #[cfg(feature = "durable")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn aborted_recovery_task_leaves_checkpoint_lifecycle_open() -> anyhow::Result<()> {
-        let (table, handles, process, handle) = fixture()?;
-        ensure!(
-            table
-                .spawn_recovery_task(process, handles.clone(), |owner| async move {
-                    let _owner = owner;
-                    std::future::pending::<()>().await;
-                })
-                .is_ok()
-        );
-        table.abort_task(process);
-        tokio::time::timeout(Duration::from_secs(2), table.wait_for_task_exit(process)).await?;
-        ensure!(table.status(process) == Some(ProcessStatus::Running));
-        ensure!(table.pending_cleanup().is_empty());
-        ensure!(table.finalization_status(process).is_none());
-        ensure!(handles.read().get(handle).is_none());
-        Ok(())
-    }
-
-    #[cfg(feature = "durable")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn completed_recovery_callback_releases_task_without_choosing_terminal_intent()
-    -> anyhow::Result<()> {
-        let (table, handles, process, _handle) = fixture()?;
-        let released_table = table.clone();
-        let (released, observed) = oneshot::channel();
-        ensure!(
-            table
-                .spawn_recovery_task(process, handles, move |owner| async move {
-                    let _owner = owner;
-                    let _sent = released.send(current_process(&released_table));
-                })
-                .is_ok()
-        );
-        ensure!(observed.await? == Some(process));
-        tokio::time::timeout(Duration::from_secs(2), table.wait_for_task_exit(process)).await?;
-        ensure!(!table.has_task(process));
-        ensure!(table.status(process) == Some(ProcessStatus::Running));
-        ensure!(table.finalization_status(process).is_none());
-        ensure!(table.pending_cleanup().is_empty());
         Ok(())
     }
 }

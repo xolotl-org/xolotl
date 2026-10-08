@@ -90,7 +90,11 @@ pub(crate) fn validate_ws_transport(
             if !peer.is_loopback() {
                 return Some("transport_not_local");
             }
-            if let Some(origin) = headers.get(header::ORIGIN) {
+            let mut origins = headers.get_all(header::ORIGIN).iter();
+            if let Some(origin) = origins.next() {
+                if origins.next().is_some() {
+                    return Some("origin_invalid");
+                }
                 let origin = match origin.to_str() {
                     Ok(origin) => origin,
                     Err(_) => return Some("origin_invalid"),
@@ -105,12 +109,17 @@ pub(crate) fn validate_ws_transport(
                 return Some("transport_untrusted_proxy");
             }
             if config.trusted_proxy.honor_x_forwarded_proto {
-                let proto = match headers.get("x-forwarded-proto") {
-                    Some(value) => match value.to_str() {
-                        Ok(value) => value,
-                        Err(_) => return Some("proto_invalid"),
-                    },
+                let mut values = headers.get_all("x-forwarded-proto").iter();
+                let value = match values.next() {
+                    Some(value) => value,
                     None => return Some("proto_required"),
+                };
+                if values.next().is_some() {
+                    return Some("proto_invalid");
+                }
+                let proto = match value.to_str() {
+                    Ok(value) => value,
+                    Err(_) => return Some("proto_invalid"),
                 };
                 if !matches!(proto, "https" | "wss") {
                     return Some("proto_denied");
@@ -137,4 +146,74 @@ fn clamp_or_default(value: usize, default: usize, hard: usize) -> usize {
 
 fn clamp_or_default_u64(value: u64, default: u64, hard: u64) -> u64 {
     if value == 0 { default } else { value.min(hard) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::ensure;
+    use axum::http::HeaderValue;
+    use std::net::Ipv4Addr;
+    use xolotl_gateway::GatewayTrustedProxyConfig;
+
+    #[test]
+    fn trusted_proxy_requires_one_unambiguous_secure_protocol() -> anyhow::Result<()> {
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let config = GatewayTransportSecurityConfig {
+            mode: GatewayTransportSecurityMode::TrustedReverseProxy,
+            trusted_proxy: GatewayTrustedProxyConfig {
+                peers: vec![peer],
+                ..GatewayTrustedProxyConfig::default()
+            },
+            ..GatewayTransportSecurityConfig::default()
+        };
+        let cases: &[(&[&str], Option<&str>)] = &[
+            (&[], Some("proto_required")),
+            (&["https"], None),
+            (&["wss"], None),
+            (&["http"], Some("proto_denied")),
+            (&["https, http"], Some("proto_denied")),
+            (&["http, https"], Some("proto_denied")),
+            (&["https", "http"], Some("proto_invalid")),
+            (&["http", "https"], Some("proto_invalid")),
+            (&["https", "https"], Some("proto_invalid")),
+            (&["https", "wss"], Some("proto_invalid")),
+        ];
+        for (values, expected) in cases {
+            let mut headers = HeaderMap::new();
+            for value in *values {
+                headers.append("x-forwarded-proto", HeaderValue::from_str(value)?);
+            }
+            let actual = validate_ws_transport(&headers, peer, &config);
+            ensure!(
+                actual == *expected,
+                "protocol values {values:?}: got {actual:?}, expected {expected:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn local_origin_must_be_a_single_valid_loopback_origin() -> anyhow::Result<()> {
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let config = GatewayTransportSecurityConfig::default();
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::ORIGIN,
+            HeaderValue::from_static("http://localhost:3000"),
+        );
+        ensure!(validate_ws_transport(&headers, peer, &config).is_none());
+        headers.append(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        );
+        ensure!(validate_ws_transport(&headers, peer, &config) == Some("origin_invalid"));
+        headers.clear();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        );
+        ensure!(validate_ws_transport(&headers, peer, &config) == Some("origin_denied"));
+        Ok(())
+    }
 }

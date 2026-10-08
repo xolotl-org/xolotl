@@ -84,7 +84,6 @@ fn image(nodes: &[Node<Tracked, Fault>]) -> ProgramImage<'_, Tracked, Fault> {
         entry: 0,
         bindings: 0,
         imports: 2,
-        durable: false,
     }
 }
 
@@ -144,7 +143,7 @@ fn straight_line_payload_copies_do_not_grow_with_program_length() -> anyhow::Res
         )?;
         let output = drive(&mut execution, &image, &mut values, |_| Err(Fault::Type))?;
         ensure!(output.payload == vec![0x5a; 65_536] && output.sources == 2);
-        // Done returns an owned copy while retaining a checkpointable result.
+        // Done returns an owned copy while retaining a inspectable result.
         ensure!(values.copied_bytes.get() == 65_536);
     }
     Ok(())
@@ -237,7 +236,7 @@ fn compact_control_preserves_catch_provenance_for_instruction_and_capacity_error
 }
 
 #[test]
-fn finally_and_restored_scopes_keep_full_inputs() -> anyhow::Result<()> {
+fn finally_and_suspended_scopes_keep_full_inputs() -> anyhow::Result<()> {
     let nodes = [
         Node::new(
             NodeKind::Finally {
@@ -271,20 +270,14 @@ fn finally_and_restored_scopes_keep_full_inputs() -> anyhow::Result<()> {
         anyhow::bail!("scope did not request authorization");
     };
     ensure!(request.input.payload == vec![0x5a; 65_536] && request.input.sources == 2);
-    let mut restored_tasks = [Task::default()];
-    let mut restored_frames = core::array::from_fn::<_, 4, _>(|_| None);
-    let mut restored = Execution::restore(
-        &image,
-        &execution.checkpoint(),
-        &mut restored_tasks,
-        &mut restored_frames,
-        &mut [],
-        false,
-    )?;
+    let meta = execution.suspend();
+    let copied = values.copied_bytes.get();
+    let mut restored = Execution::resume(&image, meta, &mut tasks, &mut frames, &mut [])?;
+    ensure!(values.copied_bytes.get() == copied);
     let resumed = restored
         .pending_requests(&image)
         .next()
-        .context("restoration lost the pending scope")?;
+        .context("live suspension lost the pending scope")?;
     ensure!(resumed.input.payload == request.input.payload && resumed.input.sources == 2);
     restored.complete(
         resumed.task,
@@ -411,7 +404,7 @@ fn in_place_resume_preserves_values_tickets_and_active_continuations() -> anyhow
     frames.resize_with(1, || None);
     meta.limits.frames_per_task = 1;
     let copied = values.copied_bytes.get();
-    let mut execution = Execution::resume(&image, meta, &mut tasks, &mut frames, &mut [], false)?;
+    let mut execution = Execution::resume(&image, meta, &mut tasks, &mut frames, &mut [])?;
     ensure!(values.copied_bytes.get() == copied);
     ensure!(execution.is_pending(request.task, request.ticket));
     execution.complete(
@@ -429,11 +422,19 @@ fn in_place_resume_preserves_values_tickets_and_active_continuations() -> anyhow
         Advance::Yielded
     ));
     ensure!(execution.continuation_entries().collect::<Vec<_>>() == [1]);
+    ensure!(execution.view().continuations().eq([(0, 1)]));
+    ensure!(
+        execution
+            .view()
+            .instruction_indices()
+            .any(|index| index == 1)
+    );
+    ensure!(execution.view().contexts().all(|context| context == 7));
     let copied = values.copied_bytes.get();
     let meta = execution.suspend();
-    let mut execution = Execution::resume(&image, meta, &mut tasks, &mut frames, &mut [], false)?;
+    let mut execution = Execution::resume(&image, meta, &mut tasks, &mut frames, &mut [])?;
     ensure!(values.copied_bytes.get() == copied);
-    ensure!(execution.checkpoint().meta.steps == meta.steps);
+    ensure!(execution.view().meta.steps == meta.steps);
     ensure!(execution.continuation_entries().collect::<Vec<_>>() == [1]);
     let output = drive(&mut execution, &image, &mut values, |request| {
         Ok(request.input)
@@ -467,7 +468,7 @@ fn retired_binding_values_are_released_in_every_task_without_cloning() -> anyhow
         *binding = Some(values.value(vec![1; 1024], 1));
     }
     let references = Rc::strong_count(&values.copied_bytes);
-    let mut execution = Execution::resume(&image, meta, &mut tasks, &mut [], &mut bindings, false)?;
+    let mut execution = Execution::resume(&image, meta, &mut tasks, &mut [], &mut bindings)?;
     let reversed = core::ops::Range { start: 2, end: 1 };
     for invalid in [reversed, 0..4, usize::MAX..usize::MAX] {
         ensure!(execution.clear_bindings(invalid) == Err(Fault::InvalidBinding));
@@ -476,7 +477,7 @@ fn retired_binding_values_are_released_in_every_task_without_cloning() -> anyhow
     execution.clear_bindings(1..2)?;
     ensure!(Rc::strong_count(&values.copied_bytes) == references - 3);
     ensure!(values.copied_bytes.get() == 0);
-    for row in execution.checkpoint().bindings.as_chunks::<3>().0 {
+    for row in execution.view().bindings.as_chunks::<3>().0 {
         ensure!(row[0].is_some() && row[1].is_none() && row[2].is_some());
     }
     execution.clear_bindings(3..3)?;

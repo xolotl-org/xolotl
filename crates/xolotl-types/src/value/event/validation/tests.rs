@@ -4,6 +4,7 @@ use crate::{
     TensorRef, Value,
 };
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::string::ToString;
 use anyhow::{Context, ensure};
 use core::num::NonZeroUsize;
 
@@ -781,17 +782,11 @@ fn fragmented_path_identifiers_agree_with_checked_path_builders() -> anyhow::Res
 }
 
 #[test]
-fn all_six_reserved_cluster_names_and_only_complete_wildcards_keep_their_rules()
--> anyhow::Result<()> {
+fn scheme_named_clusters_and_complete_wildcards_keep_their_rules() -> anyhow::Result<()> {
     for scheme in ["state", "effect", "process", "proc", "blob", "tensor"] {
-        rejected(
-            path_document(Some(scheme), "state", &[], 1),
-            ValidationError::Path,
-        )?;
-        ensure!(matches!(
-            Path::try_new("state")?.try_with_cluster(scheme),
-            Err(crate::PathError::ReservedCluster(_))
-        ));
+        validate(path_document(Some(scheme), "state", &[], 1))?;
+        let path = Path::try_new("state")?.try_with_cluster(scheme)?;
+        ensure!(Path::parse(&path.to_string())? == path);
         validate(path_document(None, scheme, &["*", "**", "a.b:c"], 1))?;
     }
     for invalid in ["***", "*a", "a*", "a**"] {

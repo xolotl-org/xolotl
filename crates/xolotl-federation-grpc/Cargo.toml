@@ -1,0 +1,43 @@
+[package]
+name = "xolotl-federation-grpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Authenticated gRPC transport for Xolotl federation"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+aws-lc-rs = { workspace = true, default-features = false }
+futures-util = { workspace = true, default-features = false, features = ["std"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+xolotl-federation = { path = "../xolotl-federation" }
+xolotl-kernel = { workspace = true, features = ["host"] }
+xolotl-proto = { workspace = true, features = ["transport"] }
+xolotl-types = { workspace = true }
+prost = { workspace = true, default-features = false, features = ["derive", "std"] }
+rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "std"] }
+sha2 = { workspace = true, default-features = false }
+serde_json = { workspace = true }
+tokio = { workspace = true, default-features = false, features = ["io-util", "rt", "sync", "time"] }
+tokio-rustls = { workspace = true, features = ["aws-lc-rs"] }
+tokio-stream = { workspace = true, default-features = false, features = ["sync"] }
+tonic = { workspace = true, default-features = false, features = ["codegen", "router", "transport", "tls-aws-lc"] }
+tower = { workspace = true, default-features = false, features = ["util"] }
+tracing = { workspace = true, default-features = false, features = ["std"] }
+
+[dev-dependencies]
+xolotl-state = { workspace = true }
+anyhow = { workspace = true, default-features = false, features = ["std"] }
+openssl = { workspace = true }
+redb = { workspace = true }
+tempfile = { workspace = true, default-features = false, features = ["getrandom"] }
+xolotl-storage-redb = { workspace = true, features = ["federation"] }
+tokio = { workspace = true, default-features = false, features = ["macros", "rt-multi-thread", "net"] }
+tokio-stream = { workspace = true, default-features = false, features = ["net"] }
+tower = { workspace = true, default-features = false, features = ["util"] }

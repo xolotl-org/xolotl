@@ -4,15 +4,16 @@ use super::wait_for_shutdown;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::watch;
-use xolotl_gateway::{GatewayProfile, GatewayProfileDocument, GatewayRuntime};
+use xolotl_gateway::{
+    GatewayProfile, GatewayProfileDocument, GatewayRuntime, gateway_profile_path,
+};
 use xolotl_gateway_grpc::ApplicationGrpcService;
 use xolotl_state::host::Backend;
 use xolotl_state::{StateEvent, StateStream};
 use xolotl_types::{Path, Value};
 
 pub(super) fn profile_path(name: &str) -> Result<Path> {
-    Path::parse("state://kernel/gateway/profiles")?
-        .try_push_literal(name)
+    gateway_profile_path(name)
         .context("application_gateway.profile must be one literal State path segment")
 }
 
@@ -48,42 +49,46 @@ pub(super) async fn watch_profile(
     runtime: Arc<GatewayRuntime>,
     service: ApplicationGrpcService,
     shutdown: watch::Sender<bool>,
-) {
+) -> Result<()> {
     let mut stopping = shutdown.subscribe();
-    loop {
+    let result = loop {
         let event = tokio::select! {
             biased;
-            () = wait_for_shutdown(&mut stopping) => break,
+            () = wait_for_shutdown(&mut stopping) => break Ok(()),
             event = events.recv() => event,
         };
         match event {
             Ok(event) if event.path() != &path => continue,
             Ok(StateEvent::Delete { .. }) => {
                 tracing::warn!(%path, "application Gateway profile deleted; listener closing");
-                break;
+                break Ok(());
             }
             Ok(_) => {}
             Err(error) => {
                 // Lost events can include a delete followed by recreation. A
                 // snapshot alone cannot prove the active authority is still valid.
                 tracing::error!(%path, %error, "application Gateway profile watch lost; listener closing");
-                break;
+                break Err(
+                    anyhow::Error::from(error).context("application Gateway profile watch lost")
+                );
             }
         }
         let value = tokio::select! {
             biased;
-            () = wait_for_shutdown(&mut stopping) => break,
+            () = wait_for_shutdown(&mut stopping) => break Ok(()),
             value = state.read(&path) => value,
         };
         let value = match value {
             Ok(Some(value)) => value,
             Ok(None) => {
                 tracing::warn!(%path, "application Gateway profile missing; listener closing");
-                break;
+                break Ok(());
             }
             Err(error) => {
                 tracing::error!(%path, %error, "application Gateway profile read failed; listener closing");
-                break;
+                break Err(
+                    anyhow::Error::from(error).context("application Gateway profile read failed")
+                );
             }
         };
         let document = match decode_profile(value, &name) {
@@ -114,7 +119,8 @@ pub(super) async fn watch_profile(
                 tracing::warn!(%path, version, %error, "application Gateway profile reload rejected");
             }
         }
-    }
+    };
     service.shutdown();
     shutdown.send_replace(true);
+    result
 }

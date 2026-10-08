@@ -28,6 +28,13 @@ pub enum StateError {
     /// A backend reported an operation failure.
     #[error("backend: {0}")]
     Backend(String),
+    /// An accepted write or history trim may have reached storage commit, but
+    /// the backend cannot prove whether it became durable. Reconcile before
+    /// retrying a non-idempotent mutation such as append or merge. If a worker
+    /// lost its result, the attached taint is only a known lower bound; it may
+    /// have observed current-row sources that could not be returned.
+    #[error("state commit outcome is unknown: {0}")]
+    CommitUncertain(String),
     /// The host did not install this capability.
     #[error("state capability is not installed: {0}")]
     MissingCapability(&'static str),
@@ -37,9 +44,32 @@ pub enum StateError {
     /// A cursor or query does not belong to the requested scan.
     #[error("invalid state query: {0}")]
     InvalidQuery(String),
+    /// The requested historical time precedes the retained history floor.
+    #[error("state history before {retained_from_millis} milliseconds was trimmed")]
+    HistoryTrimmed {
+        /// Earliest timestamp for which history and historical reads are valid.
+        retained_from_millis: i64,
+    },
+    /// The protected vault namespace intentionally has no mutation history.
+    #[error("historical state is unavailable for the protected vault namespace")]
+    HistoryExcluded,
+    /// An explicit history trim exceeded its caller-supplied work budget.
+    /// A size-only rejection may leave the offending record's provenance
+    /// unknown even when earlier inspected sources are attached to the failure.
+    #[error("state history trim exceeds its event or encoded byte budget")]
+    HistoryTrimLimit {
+        /// Whether the offending record's provenance was inspected.
+        provenance_observed: bool,
+    },
     /// The caller may retry this row with more space or explicitly continue after it.
     #[error("state row exceeds page byte budget")]
     RowTooLarge(Box<crate::StateRowTooLarge>),
+    /// One exact-path current record exceeds a bounded read or conditional
+    /// mutation budget.
+    /// Inspect `provenance_observed`: a size-only rejection cannot supply
+    /// provenance and must not justify an untainted fallback.
+    #[error("current state record exceeds encoded byte budget")]
+    PointTooLarge(Box<crate::StatePointTooLarge>),
 }
 
 impl fmt::Debug for StateError {
@@ -50,10 +80,15 @@ impl fmt::Debug for StateError {
             Self::CasFailed { .. } => "CasFailed",
             Self::Serde(_) => "Serde",
             Self::Backend(_) => "Backend",
+            Self::CommitUncertain(_) => "CommitUncertain",
             Self::MissingCapability(_) => "MissingCapability",
             Self::Unsupported(_) => "Unsupported",
             Self::InvalidQuery(_) => "InvalidQuery",
+            Self::HistoryTrimmed { .. } => "HistoryTrimmed",
+            Self::HistoryExcluded => "HistoryExcluded",
+            Self::HistoryTrimLimit { .. } => "HistoryTrimLimit",
             Self::RowTooLarge(_) => "RowTooLarge",
+            Self::PointTooLarge(_) => "PointTooLarge",
         })
     }
 }
@@ -64,7 +99,9 @@ impl fmt::Debug for StateError {
 /// attach those sources inside the same lock or transaction that observed it;
 /// a later point read cannot recover an earlier observation's provenance.
 /// Consumers must retain these sources even when handling an error and returning
-/// a successful fallback. Display text is diagnostic, not a provenance channel.
+/// a successful fallback. `CommitUncertain` after a lost worker is different:
+/// its taint may be incomplete, so a fallback cannot infer pristine provenance.
+/// Display text is diagnostic, not a provenance channel.
 #[derive(Error)]
 #[error("{error}")]
 pub struct StateFailure {

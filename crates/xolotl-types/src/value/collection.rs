@@ -20,6 +20,9 @@ pub enum CollectionError {
     /// The resulting number of members exceeds [`usize::MAX`].
     #[error("collection member count exceeds usize::MAX")]
     LengthOverflow,
+    /// The requested prefix exceeds the sequence's member count.
+    #[error("collection prefix exceeds member count")]
+    PrefixOutOfBounds,
     /// A sequential map entry is not strictly greater than the previous UTF-8 key.
     #[error("sequential map keys must be unique and strictly increasing by UTF-8 bytes")]
     KeyOrder,

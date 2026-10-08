@@ -3,19 +3,26 @@
 //! Context assembly selects prompt material within a finite token budget.
 //! Callers provide prepared layers; this driver renders them in priority order
 //! and keeps persona/environment anchors even under tight budgets.
+//! Known layers are validated and their rendered byte lengths memoized by live
+//! resident identity before selection. Rejected shared graphs are never expanded.
+//! List separators depend on preceding rendered bytes, including empty children;
+//! malformed known layers fail even when they would not fit the budget.
+//! Length arithmetic saturates at the platform maximum; such non-anchor layers
+//! are rejected. Selected layers require checked prompt sizing and fallible
+//! buffer reservation, with no intermediate per-layer text copies.
 
 use async_trait::async_trait;
-use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use xolotl_kernel::{Driver, DriverContext, DriverError, DriverOutput, MethodSpec};
 use xolotl_types::{MethodId, Outcome, OutputMode, Purity, Value};
-use xolotl_types::{ValueMap, ValueView};
+use xolotl_types::{ValueIdentity, ValueMap, ValueView};
 
 /// Method names for `effect://context/assemble`; the public method is `invoke`
 /// after standard installation. Pure: assembly is a deterministic function of
 /// its input layers (no I/O).
 pub(crate) const CONTEXT_METHODS: &[MethodSpec] = &[MethodSpec::new(
     "assemble",
+    xolotl_types::MethodAuthority::Perform,
     Purity::Pure,
     MethodSpec::UNARY_ASYNC,
 )];
@@ -33,39 +40,128 @@ const LAYER_ORDER: &[&str] = &[
 ];
 const NEVER_EVICT: usize = 2; // persona + environment
 
-/// Estimate tokens for a text fragment.
-fn est_tokens(s: &str) -> usize {
-    s.len().div_ceil(4)
+fn allocation_error(error: impl std::fmt::Display) -> DriverError {
+    DriverError::InvalidInput(format!("context materialization failed: {error}"))
 }
 
-/// Render one layer's value to its text contribution.
-fn layer_text<'a>(mut value: &'a Value, layer: &str) -> Result<Cow<'a, str>, DriverError> {
-    while let ValueView::Map(map) = value.view() {
-        value = map.get("text").ok_or_else(|| {
-            DriverError::InvalidInput(format!("context layer {layer:?} missing text"))
-        })?;
+#[derive(Default)]
+struct Lengths {
+    memo: HashMap<ValueIdentity, usize>,
+    #[cfg(test)]
+    visits: usize,
+    #[cfg(test)]
+    rendered: usize,
+}
+
+impl Lengths {
+    fn measure(&mut self, root: &Value, layer: &str) -> Result<usize, DriverError> {
+        let mut frames: Vec<(&Value, Option<xolotl_types::value::ListIter<'_>>, usize)> =
+            Vec::new();
+        let mut next = Some(root);
+        let mut length = 0;
+        loop {
+            if let Some(value) = next.take() {
+                if let Some(cached) = value.identity().and_then(|key| self.memo.get(&key)) {
+                    length = *cached;
+                } else {
+                    #[cfg(test)]
+                    {
+                        self.visits += 1;
+                    }
+                    match value.view() {
+                        ValueView::Str(text) => length = text.len(),
+                        ValueView::List(items) => {
+                            let mut children = items.iter();
+                            if let Some(child) = children.next() {
+                                frames.try_reserve(1).map_err(allocation_error)?;
+                                frames.push((value, Some(children), 0));
+                                next = Some(child);
+                                continue;
+                            }
+                            length = 0;
+                        }
+                        ValueView::Map(map) => {
+                            let child = map.get("text").ok_or_else(|| {
+                                DriverError::InvalidInput(format!(
+                                    "context layer {layer:?} missing text"
+                                ))
+                            })?;
+                            frames.try_reserve(1).map_err(allocation_error)?;
+                            frames.push((value, None, 0));
+                            next = Some(child);
+                            continue;
+                        }
+                        _ => {
+                            return Err(DriverError::InvalidInput(format!(
+                                "context layer {layer:?} must be text, list, or map with text"
+                            )));
+                        }
+                    }
+                    self.remember(value, length)?;
+                }
+            }
+            loop {
+                let Some((value, children, accumulated)) = frames.last_mut() else {
+                    return Ok(length);
+                };
+                if let Some(children) = children {
+                    *accumulated = accumulated.saturating_add(length);
+                    if let Some(child) = children.next() {
+                        if *accumulated > 0 {
+                            *accumulated = accumulated.saturating_add(1);
+                        }
+                        next = Some(child);
+                        break;
+                    }
+                    length = *accumulated;
+                }
+                self.remember(value, length)?;
+                frames.pop();
+            }
+        }
     }
-    if let ValueView::Str(text) = value.view() {
-        return Ok(Cow::Borrowed(text));
+
+    fn remember(&mut self, value: &Value, length: usize) -> Result<(), DriverError> {
+        if let Some(key) = value.identity() {
+            self.memo.try_reserve(1).map_err(allocation_error)?;
+            self.memo.insert(key, length);
+        }
+        Ok(())
     }
-    let mut rendered = String::new();
+}
+
+fn render_into(
+    root: &Value,
+    rendered: &mut String,
+    lengths: &mut Lengths,
+) -> Result<(), DriverError> {
     let mut frames = Vec::new();
-    let mut next = Some(value);
+    let mut next = Some(root);
     loop {
         if let Some(value) = next.take() {
+            #[cfg(test)]
+            {
+                lengths.rendered += 1;
+            }
+            if value.identity().and_then(|key| lengths.memo.get(&key)) == Some(&0) {
+                continue;
+            }
             match value.view() {
                 ValueView::Str(text) => rendered.push_str(text),
-                ValueView::List(items) => frames.push((items.iter(), rendered.len())),
+                ValueView::List(items) => {
+                    frames.try_reserve(1).map_err(allocation_error)?;
+                    frames.push((items.iter(), rendered.len()));
+                }
                 ValueView::Map(map) => {
                     next = Some(map.get("text").ok_or_else(|| {
-                        DriverError::InvalidInput(format!("context layer {layer:?} missing text"))
+                        DriverError::InvalidInput("validated context layer lost text".into())
                     })?);
                     continue;
                 }
                 _ => {
-                    return Err(DriverError::InvalidInput(format!(
-                        "context layer {layer:?} must be text, list, or map with text"
-                    )));
+                    return Err(DriverError::InvalidInput(
+                        "validated context layer must be text, list, or map with text".into(),
+                    ));
                 }
             }
         }
@@ -81,7 +177,7 @@ fn layer_text<'a>(mut value: &'a Value, layer: &str) -> Result<Cow<'a, str>, Dri
             frames.pop();
         }
     }
-    Ok(Cow::Owned(rendered))
+    Ok(())
 }
 
 fn parse_budget(value: Option<&Value>) -> Result<usize, DriverError> {
@@ -141,39 +237,54 @@ impl Driver for ContextDriver {
         let layers = required_layers(&m)?;
 
         // Fill layers high-priority-first until the budget is exhausted.
-        let mut included: Vec<(&str, Cow<'_, str>, usize)> = Vec::new();
+        let mut included = Vec::new();
+        included
+            .try_reserve(LAYER_ORDER.len())
+            .map_err(allocation_error)?;
+        let mut lengths = Lengths::default();
         let mut used = 0usize;
         for (i, layer) in LAYER_ORDER.iter().enumerate() {
             let Some(v) = layers.get(layer) else {
                 continue;
             };
-            let text = layer_text(v, layer)?;
-            if text.as_ref().is_empty() {
+            let length = lengths.measure(v, layer)?;
+            if length == 0 {
                 continue;
             }
-            let cost = est_tokens(text.as_ref());
+            let cost = if length == usize::MAX {
+                usize::MAX
+            } else {
+                length.div_ceil(4)
+            };
             if i < NEVER_EVICT {
                 // Anchors are always included even if they alone exceed budget.
-                included.push((*layer, text, cost));
-                used += cost;
-            } else if used + cost <= budget {
-                included.push((*layer, text, cost));
-                used += cost;
+                included.push((*layer, v, length));
+                used = used.saturating_add(cost);
+            } else if cost <= budget.saturating_sub(used) && used <= budget {
+                included.push((*layer, v, length));
+                used = used.saturating_add(cost);
             }
             // else: this lower-priority layer doesn't fit; skip it (it would be
             // the first evicted anyway).
         }
 
-        // If anchors alone overflowed, evict from the back of the non-anchor
-        // layers until within budget.
-        while used > budget && included.len() > NEVER_EVICT {
-            if let Some((_, _, cost)) = included.pop() {
-                used = used.saturating_sub(cost);
-            }
-        }
-
         // Compose the one-shot prompt in priority order.
+        let capacity =
+            included
+                .iter()
+                .enumerate()
+                .try_fold(0usize, |total, (index, (name, _, length))| {
+                    total
+                        .checked_add(if index == 0 { 0 } else { 2 })
+                        .and_then(|total| total.checked_add(4))
+                        .and_then(|total| total.checked_add(name.len()))
+                        .and_then(|total| total.checked_add(*length))
+                        .ok_or_else(|| allocation_error("rendered length overflow"))
+                })?;
         let mut prompt = String::new();
+        prompt
+            .try_reserve_exact(capacity)
+            .map_err(allocation_error)?;
         for (name, text, _) in &included {
             if !prompt.is_empty() {
                 prompt.push_str("\n\n");
@@ -181,7 +292,7 @@ impl Driver for ContextDriver {
             prompt.push_str("## ");
             prompt.push_str(name);
             prompt.push('\n');
-            prompt.push_str(text.as_ref());
+            render_into(text, &mut prompt, &mut lengths)?;
         }
         let layers_used: Vec<Value> = included
             .iter()
@@ -190,8 +301,14 @@ impl Driver for ContextDriver {
 
         let mut out = BTreeMap::new();
         out.insert("prompt".into(), Value::string(prompt));
-        out.insert("token_count".into(), Value::integer(used as i64));
-        out.insert("budget".into(), Value::integer(budget as i64));
+        out.insert(
+            "token_count".into(),
+            Value::integer(i64::try_from(used).unwrap_or(i64::MAX)),
+        );
+        out.insert(
+            "budget".into(),
+            Value::integer(i64::try_from(budget).unwrap_or(i64::MAX)),
+        );
         out.insert("layers_used".into(), Value::list(layers_used));
         Ok(DriverOutput::new(Outcome::Done(Value::map(out))))
     }
@@ -204,6 +321,89 @@ mod tests {
     use xolotl_types::{IdentityRef, ProcessId};
 
     #[test]
+    fn shared_graph_lengths_visit_resident_nodes_not_occurrences() -> Result<()> {
+        let mut value = Value::string("x".into());
+        for _ in 0..60 {
+            value = Value::list(vec![value.clone(), value]);
+        }
+        let mut lengths = Lengths::default();
+        let measured = lengths.measure(&value, "recall")?;
+        ensure!(measured > 1_000_000);
+        ensure!(lengths.visits == 61);
+        ensure!(lengths.rendered == 0);
+        ensure!(lengths.measure(&value, "tools")? == measured);
+        ensure!(lengths.visits == 61, "memo missed shared layer root");
+        Ok(())
+    }
+
+    #[test]
+    fn empty_shared_graph_rendering_skips_zero_length_expansion() -> Result<()> {
+        let mut value = Value::string(String::new());
+        for _ in 0..60 {
+            value = Value::list(vec![value.clone(), value]);
+        }
+        let mut lengths = Lengths::default();
+        ensure!(lengths.measure(&value, "recall")? == 0);
+        let mut rendered = String::new();
+        render_into(&value, &mut rendered, &mut lengths)?;
+        ensure!(rendered.is_empty() && lengths.rendered == 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_overflowing_graph_is_validated_without_materialization() -> Result<()> {
+        let mut value = Value::string("x".into());
+        for _ in 0..100 {
+            value = Value::list(vec![value.clone(), value]);
+        }
+        let layers = BTreeMap::from([
+            ("persona".into(), Value::string("anchor".into())),
+            ("recall".into(), value.clone()),
+            ("tools".into(), Value::string("ok".into())),
+        ]);
+        let input = Value::map(BTreeMap::from([
+            ("token_budget".into(), Value::integer(3)),
+            ("layers".into(), Value::map(layers)),
+        ]));
+        let output = output_map(
+            ContextDriver::new()
+                .call(MethodId::new(0), input, OutputMode::Unary, &ctx())
+                .await?,
+        )?;
+        ensure!(
+            output.get("prompt").and_then(Value::as_str)
+                == Some("## persona\nanchor\n\n## tools\nok")
+        );
+        let malformed = Value::list(vec![value, Value::integer(1)]);
+        let mut lengths = Lengths::default();
+        ensure!(lengths.measure(&malformed, "recall").is_err());
+        ensure!(lengths.visits <= 103 && lengths.rendered == 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overflowing_anchor_fails_before_expansion() -> Result<()> {
+        let mut anchor = Value::string("x".into());
+        for _ in 0..100 {
+            anchor = Value::list(vec![anchor.clone(), anchor]);
+        }
+        let input = Value::map(BTreeMap::from([
+            ("token_budget".into(), Value::integer(0)),
+            (
+                "layers".into(),
+                Value::map(BTreeMap::from([("environment".into(), anchor)])),
+            ),
+        ]));
+        let error = ContextDriver::new()
+            .call(MethodId::new(0), input, OutputMode::Unary, &ctx())
+            .await
+            .err()
+            .context("overflowing anchor was materialized")?;
+        ensure!(error.to_string().contains("rendered length overflow"));
+        Ok(())
+    }
+
+    #[test]
     fn nested_empty_layers_preserve_separator_behavior() -> Result<()> {
         let value = Value::list(vec![
             Value::string(String::new()),
@@ -214,7 +414,12 @@ mod tests {
             Value::list(vec![]),
             Value::map(BTreeMap::from([("text".into(), Value::string("b".into()))])),
         ]);
-        ensure!(layer_text(&value, "recall")? == "a\n\n\nb");
+        let mut lengths = Lengths::default();
+        ensure!(lengths.measure(&value, "recall")? == 5);
+        let mut rendered = String::new();
+        rendered.try_reserve_exact(5)?;
+        render_into(&value, &mut rendered, &mut lengths)?;
+        ensure!(rendered == "a\n\n\nb");
         Ok(())
     }
 

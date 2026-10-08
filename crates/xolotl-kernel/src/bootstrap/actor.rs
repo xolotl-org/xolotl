@@ -45,10 +45,11 @@ impl Bootstrap {
         spec: &ActorSpec,
         steps: StepModule,
     ) -> Result<SpawnedActor, BootstrapError> {
+        self.kernel().identities().verify(identity)?;
         validate_actor_segment("actor name", &spec.name)?;
         validate_actor_segment("actor identity segment", identity_segment)?;
         validate_actor_steps(spec, &steps)?;
-        let child = self.kernel.processes.fresh_id()?;
+        let child = self.kernel().processes().fresh_id()?;
         let spec = spec.bind_process_local_refs(child).map_err(|source| {
             BootstrapError::ActorAdmission {
                 actor: spec.name.clone(),
@@ -68,7 +69,7 @@ impl Bootstrap {
             })?;
         }
 
-        let lint_message = actor_lint_message(&spec);
+        let lint_message = actor_lint_message(&spec, self.kernel().registry());
         if let Some(message) = lint_message {
             return Err(BootstrapError::ActorLint {
                 actor: spec.name.clone(),
@@ -83,7 +84,7 @@ impl Bootstrap {
                 ResourceSelector::parse(literal)
                     .map(|selector| ParsedRequestGrantTemplate {
                         selector,
-                        methods: None,
+                        rights: None,
                     })
                     .map_err(|source| BootstrapError::Selector {
                         literal: literal.clone(),
@@ -95,7 +96,7 @@ impl Bootstrap {
         let directory = actor_directory_path(identity_segment, &spec.name)?;
         let inbox = actor_inbox_path(identity_segment, &spec.name)?;
         let planned = self.plan_request_grants(anchor, &parsed)?;
-        let execution = self.kernel.execution_ids().allocate()?;
+        let execution = self.kernel().execution_ids().allocate()?;
         let initial =
             actor_directory_value(&spec, child, execution, ProcessStatus::Running, &inbox);
         let mut entry = self.request_process_entry(child, anchor, identity, planned);
@@ -107,25 +108,29 @@ impl Bootstrap {
             execution,
             initial: initial.clone(),
         }));
-        self.kernel.processes.admit_child(entry)?;
+        self.kernel().processes().admit_child(entry)?;
 
-        let scope = self.own_process(child);
+        let scope = self.own_process(child)?;
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
         let task_directory = directory.clone();
         let boot = self.clone();
-        self.kernel
-            .processes
+        self.kernel()
+            .processes()
             .spawn_task(
                 child,
-                self.kernel.handles.clone(),
+                self.kernel().handles().clone(),
                 move |owner| async move {
                     let admission = AssertUnwindSafe(async {
-                        boot.kernel
-                            .state
+                        boot.kernel()
+                            .state()
                             .write_cas(&task_directory, None, initial)
                             .await?;
-                        if !boot.kernel.processes.activate_child(child, spec.finalizers) {
+                        if !boot
+                            .kernel()
+                            .processes()
+                            .activate_child(child, spec.finalizers)
+                        {
                             return Err(BootstrapError::ProcessUnavailable { process: anchor });
                         }
                         Ok(())
@@ -158,7 +163,7 @@ impl Bootstrap {
                                 )
                             } else {
                                 match AssertUnwindSafe(
-                                    boot.kernel.executor_for(child).eval(&spec.body),
+                                    boot.kernel().executor_for(child).eval(&spec.body),
                                 )
                                 .catch_unwind()
                                 .await
@@ -205,9 +210,14 @@ impl Bootstrap {
         })
     }
 }
-fn actor_lint_message(spec: &ActorSpec) -> Option<String> {
+fn actor_lint_message(spec: &ActorSpec, registry: &crate::Registry) -> Option<String> {
     let mut messages = Vec::new();
-    for finding in lint_actor(spec) {
+    for finding in lint_actor(spec, |operation| {
+        let resource = registry.resolve_resource(&operation.target).ok()?;
+        registry
+            .resource_method(resource, &operation.method)
+            .map(|(_, method)| method.authority)
+    }) {
         if finding.severity == LintSeverity::Error {
             messages.push(finding.message);
         }
@@ -263,28 +273,38 @@ fn collect_step_names(
     node: &DoNode,
     out: &mut BTreeSet<String>,
 ) -> Result<(), BootstrapError> {
-    match node {
-        DoNode::AndThen { d, then } => {
-            collect_step_names(actor, d, out)?;
-            insert_step_name(actor, &then.name, out)
-        }
-        DoNode::OrElse { d, or } => {
-            collect_step_names(actor, d, out)?;
-            insert_step_name(actor, &or.name, out)
-        }
-        DoNode::Both(left, right) | DoNode::Race(left, right) => {
-            collect_step_names(actor, left, out)?;
-            collect_step_names(actor, right, out)
-        }
-        DoNode::Let { value, body, .. } => {
-            collect_step_names(actor, value, out)?;
-            collect_step_names(actor, body, out)
-        }
-        DoNode::Acting { body, .. } => collect_step_names(actor, body, out),
-        DoNode::Pure(_) | DoNode::Use(_) | DoNode::Fail(_) | DoNode::Wait(_) | DoNode::Op(_) => {
-            Ok(())
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        match node {
+            DoNode::AndThen { d, then } => {
+                insert_step_name(actor, &then.name, out)?;
+                pending.push(d);
+            }
+            DoNode::OrElse { d, or } => {
+                insert_step_name(actor, &or.name, out)?;
+                pending.push(d);
+            }
+            DoNode::Both(left, right) | DoNode::Race(left, right) => {
+                pending.push(right);
+                pending.push(left);
+            }
+            DoNode::Finally { body, cleanup } => {
+                pending.push(cleanup);
+                pending.push(body);
+            }
+            DoNode::Let { value, body, .. } => {
+                pending.push(body);
+                pending.push(value);
+            }
+            DoNode::Acting { body, .. } => pending.push(body),
+            DoNode::Pure(_)
+            | DoNode::Use(_)
+            | DoNode::Fail(_)
+            | DoNode::Wait(_)
+            | DoNode::Op(_) => {}
         }
     }
+    Ok(())
 }
 
 fn insert_step_name(
@@ -388,8 +408,9 @@ impl ProcessPublication for ActorDirectory {
         for _ in 0..8 {
             let previous = state.read_tainted(&self.path).await?;
             let Some(mut updated) = previous
+                .value
                 .as_ref()
-                .map_or(&self.initial, |previous| &previous.value)
+                .unwrap_or(&self.initial)
                 .as_map()
                 .cloned()
             else {
@@ -401,16 +422,12 @@ impl ProcessPublication for ActorDirectory {
                 return Ok(());
             }
             let status = Value::string(process_status_label(status).into());
-            let mut taint = previous
-                .as_ref()
-                .map(|previous| previous.taint.clone())
-                .unwrap_or_default();
+            let mut taint = previous.taint.clone();
             if let Some(outcome) = outcome {
                 taint.union(&outcome.taint);
             }
-            if previous
-                .as_ref()
-                .is_some_and(|previous| previous.taint == taint)
+            if previous.value.is_some()
+                && previous.taint == taint
                 && updated.get("status") == Some(&status)
             {
                 return Ok(());
@@ -422,7 +439,7 @@ impl ProcessPublication for ActorDirectory {
                 }
             })?);
             // A terminal reservation also blocks a late initial CAS after cancellation.
-            let expected = previous.map(|previous| previous.value);
+            let expected = previous.value;
             match state
                 .write_cas_tainted(&self.path, expected, Value::from(updated), taint)
                 .await

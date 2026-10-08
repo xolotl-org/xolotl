@@ -18,7 +18,12 @@ pub(in crate::application) fn event_to_pb(
             taint,
         })
     } else {
-        pb::submit_output_response::Event::Completed(completion(output, object, taint)?)
+        pb::submit_output_response::Event::Completed(completion(
+            output,
+            object,
+            taint,
+            &mut budget,
+        )?)
     };
     bounded_response(
         pb::SubmitOutputResponse { event: Some(event) },
@@ -43,7 +48,12 @@ pub(in crate::application) fn submit_to_pb(
     bounded_response(
         pb::SubmitResponse {
             accepted,
-            completion: Some(completion(output, object, taint)?),
+            terminal: Some(pb::submit_response::Terminal::Completion(completion(
+                output,
+                object,
+                taint,
+                &mut budget,
+            )?)),
         },
         max_frame_bytes,
     )
@@ -53,6 +63,7 @@ fn completion(
     output: &GatewayExternalizedOutput,
     object: pb::EncodedOutputObject,
     taint: Option<common::TaintSet>,
+    budget: &mut ConversionBudget,
 ) -> Result<pb::SubmissionCompletion, Status> {
     use pb::output_outcome::Kind;
     let kind = match output.kind() {
@@ -68,10 +79,16 @@ fn completion(
         Some(CompletionOrigin::CachedOutcome) => pb::CompletionOrigin::CachedOutcome,
         None => return Err(Status::internal("completion origin is missing")),
     } as i32;
+    let GatewayOutputEvent::Complete(result) = output.original_event() else {
+        return Err(Status::internal("chunk has no final reconciliation state"));
+    };
     Ok(pb::SubmissionCompletion {
         outcome: Some(pb::OutputOutcome { kind: Some(kind) }),
         origin,
         taint,
+        unresolved_operations: Some(
+            budget.unresolved_operations(&result.output.unresolved_operations)?,
+        ),
     })
 }
 

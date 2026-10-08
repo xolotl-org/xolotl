@@ -59,7 +59,7 @@ fn unary_and_stream_completion_share_required_lineage_and_cache_origin() -> Resu
                 anyhow::bail!("missing submission result");
             };
             let unary = submit_response_to_pb(&result, 1024)?;
-            ensure!(unary.completion.as_ref() == Some(&done));
+            ensure!(unary.completion() == Some(&done));
             ensure!(
                 done.origin
                     == match origin {
@@ -70,6 +70,7 @@ fn unary_and_stream_completion_share_required_lineage_and_cache_origin() -> Resu
                     }
             );
             ensure!(done.taint.context("lineage missing")?.sources.len() == taint.sources().len());
+            ensure!(done.unresolved_operations.is_some());
         }
     }
     Ok(())

@@ -2,21 +2,25 @@
 
 use crate::Fault;
 
-mod mapping;
-
 const NONE: u32 = u32::MAX;
 
 /// A continuation slot in the caller-owned shared frame pool.
 #[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Frame<V, E> {
     pub(crate) kind: FrameKind<V, E>,
     pub(crate) previous: u32,
-    owner: u32,
+}
+
+impl<V, E> Frame<V, E> {
+    pub(crate) fn saved_context(&self) -> Option<u64> {
+        match &self.kind {
+            FrameKind::Context(context) => Some(*context),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub(crate) enum FrameKind<V, E> {
     Vacant,
     Finish(u32),
@@ -61,7 +65,6 @@ pub(crate) enum FrameKind<V, E> {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub(crate) struct Stack {
     pub(crate) top: u32,
     pub(crate) depth: u32,
@@ -76,11 +79,9 @@ impl Default for Stack {
     }
 }
 
-/// Shared frame allocation metadata, persisted with tasks and frame slots.
-/// Restoration validates ownership, free links and all counters before use.
+/// Shared live frame allocation metadata retained during storage growth.
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct FramePoolMeta {
+pub(crate) struct FramePoolMeta {
     next_unused: u32,
     free_head: u32,
     free_count: u32,
@@ -124,7 +125,6 @@ impl<'a, V, E> FramePool<'a, V, E> {
 
     pub(crate) fn push(
         &mut self,
-        task: usize,
         stack: &mut Stack,
         kind: FrameKind<V, E>,
         max_depth: usize,
@@ -143,7 +143,7 @@ impl<'a, V, E> FramePool<'a, V, E> {
             let index = self.meta.free_head;
             self.meta.free_head = self.slots[index as usize]
                 .as_ref()
-                .ok_or(Fault::InvalidCheckpoint)?
+                .ok_or(Fault::InvalidState)?
                 .previous;
             self.meta.free_count -= 1;
             index
@@ -151,7 +151,6 @@ impl<'a, V, E> FramePool<'a, V, E> {
         self.slots[index as usize] = Some(Frame {
             kind,
             previous: stack.top,
-            owner: task as u32,
         });
         stack.top = index;
         stack.depth += 1;
@@ -173,70 +172,9 @@ impl<'a, V, E> FramePool<'a, V, E> {
         self.slots[index] = Some(Frame {
             kind: FrameKind::Vacant,
             previous: self.meta.free_head,
-            owner: NONE,
         });
         self.meta.free_head = index as u32;
         self.meta.free_count += 1;
         Some(frame.kind)
     }
-}
-
-pub(crate) fn validate<'a, V, E>(
-    slots: &[Option<Frame<V, E>>],
-    meta: FramePoolMeta,
-    stacks: impl Iterator<Item = &'a Stack>,
-    max_depth: usize,
-) -> Result<(), Fault> {
-    let used = usize::try_from(meta.next_unused).map_err(|_error| Fault::InvalidCheckpoint)?;
-    if slots.len() > NONE as usize || used > slots.len() || meta.free_count > meta.next_unused {
-        return Err(Fault::InvalidCheckpoint);
-    }
-    let mut live = 0usize;
-    for (owner, stack) in stacks.enumerate() {
-        let depth = usize::try_from(stack.depth).map_err(|_error| Fault::InvalidCheckpoint)?;
-        if depth > max_depth {
-            return Err(Fault::InvalidCheckpoint);
-        }
-        let mut index = stack.top;
-        for _ in 0..depth {
-            if index >= meta.next_unused {
-                return Err(Fault::InvalidCheckpoint);
-            }
-            let frame = slots[index as usize]
-                .as_ref()
-                .ok_or(Fault::InvalidCheckpoint)?;
-            if frame.owner != owner as u32 || matches!(frame.kind, FrameKind::Vacant) {
-                return Err(Fault::InvalidCheckpoint);
-            }
-            live = live.checked_add(1).ok_or(Fault::InvalidCheckpoint)?;
-            if live > used {
-                return Err(Fault::InvalidCheckpoint);
-            }
-            index = frame.previous;
-        }
-        if index != NONE {
-            return Err(Fault::InvalidCheckpoint);
-        }
-    }
-    let mut index = meta.free_head;
-    for _ in 0..meta.free_count {
-        if index >= meta.next_unused {
-            return Err(Fault::InvalidCheckpoint);
-        }
-        let frame = slots[index as usize]
-            .as_ref()
-            .ok_or(Fault::InvalidCheckpoint)?;
-        if frame.owner != NONE || !matches!(frame.kind, FrameKind::Vacant) {
-            return Err(Fault::InvalidCheckpoint);
-        }
-        index = frame.previous;
-    }
-    // Exact list lengths and distinct owners exclude cycles, aliases and orphan slots.
-    if index != NONE
-        || live + meta.free_count as usize != used
-        || slots[used..].iter().any(Option::is_some)
-    {
-        return Err(Fault::InvalidCheckpoint);
-    }
-    Ok(())
 }

@@ -73,7 +73,7 @@ impl ReadProbe {
         Self {
             metadata: RwLock::new(Some(ObjectMetadata {
                 blob: BlobRef {
-                    hash: "a".repeat(64),
+                    hash: "a".repeat(96),
                     size,
                     mime: Some("application/octet-stream".into()),
                 },
@@ -177,12 +177,21 @@ impl Fixture {
         let boot = Arc::new(Bootstrap::in_memory());
         let name = boot.register_effect(
             "effect://echo/say",
-            &[MethodSpec::unary_async("invoke", Purity::Pure)],
+            &[MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                Purity::Pure,
+                MethodSpec::UNARY_ASYNC,
+            )],
             Arc::new(EchoDriver),
         )?;
         let probe = Arc::new(probe);
-        let gateway = GatewayRuntime::new(boot.clone(), echo_profile(name)?)?
-            .with_object_store(ObjectStore::new().with_read(probe.clone()));
+        let gateway = GatewayRuntime::new(
+            boot.clone(),
+            echo_profile(name)?,
+            Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+        )?
+        .with_object_store(ObjectStore::new().with_read(probe.clone()));
         let session = gateway
             .authenticate(PresentedCredential::bearer(TEST_TOKEN))
             .await?;
@@ -272,7 +281,7 @@ async fn partial_ranges_borrow_payload_and_keep_each_chunks_sources_separate() -
     ensure!(header_taint.sources().contains(&TaintSource::ModelOutput));
     ensure!(header_taint.sources().contains(&source("export")));
     ensure!(header_taint.sources().contains(&source("open")));
-    let handles = fixture.boot.kernel.handles.read().len();
+    let handles = fixture.boot.kernel().handles().len();
     let mut buffer = [0; 32];
     for (index, length) in [3, 3, 1].into_iter().enumerate() {
         let offset = download.next_offset();
@@ -292,7 +301,7 @@ async fn partial_ranges_borrow_payload_and_keep_each_chunks_sources_separate() -
         );
         ensure!(fixture.probe.buffer_address.load(Ordering::Relaxed) == buffer.as_ptr() as usize);
         ensure!(fixture.probe.reads.load(Ordering::Relaxed) == index + 1);
-        ensure!(fixture.boot.kernel.handles.read().len() == handles);
+        ensure!(fixture.boot.kernel().handles().len() == handles);
     }
     ensure!(download.is_complete() && download.next_offset() == 12);
     let end = download.read(&mut buffer).await?;
@@ -481,7 +490,7 @@ async fn missing_grants_and_changed_metadata_fail_before_reading_payload() -> an
     for field in ["hash", "size", "mime", "missing"] {
         let mut changed = canonical.clone();
         match field {
-            "hash" => changed.blob.hash = "b".repeat(64),
+            "hash" => changed.blob.hash = "b".repeat(96),
             "size" => changed.blob.size += 1,
             "mime" => changed.blob.mime = None,
             _ => {}

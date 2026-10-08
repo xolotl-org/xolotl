@@ -1,14 +1,15 @@
 //! Immediately durable execution-id reservations, independent of retained records.
 
 use crate::EXECUTION_ID_META_TABLE;
-use redb::{Database, Durability, ReadableTable};
+use crate::database::Database;
+use redb::{Durability, ReadableTable};
 use std::{num::NonZeroU64, sync::Arc};
 use xolotl_kernel::{ExecutionIdError, ExecutionIdRange, ExecutionIdSource};
 use xolotl_types::ExecutionId;
 
 use crate::schema::EXECUTION_HIGH_WATER as HIGH_WATER_KEY;
 
-/// Execution allocator source that can be retained independently of facts or checkpoints.
+/// Execution allocator source that can be retained independently of facts.
 #[derive(Clone)]
 pub struct RedbExecutionIdSource {
     pub(crate) db: Arc<Database>,
@@ -23,6 +24,17 @@ impl ExecutionIdSource for RedbExecutionIdSource {
 pub(crate) fn reserve(
     db: &Database,
     count: NonZeroU64,
+) -> Result<ExecutionIdRange, ExecutionIdError> {
+    reserve_with_guard(db, count, || Ok(()))
+}
+
+/// Acquire a caller's commit guard after redb's writer, then retain it through
+/// commit. A Fact adapter uses this to reject reservations after an uncertain
+/// Fact commit without reversing the writer/notification lock order.
+pub(crate) fn reserve_with_guard<G>(
+    db: &Database,
+    count: NonZeroU64,
+    before_commit: impl FnOnce() -> Result<G, ExecutionIdError>,
 ) -> Result<ExecutionIdRange, ExecutionIdError> {
     let mut txn = db.begin_write().map_err(reservation_error)?;
     txn.set_durability(Durability::Immediate)
@@ -47,6 +59,8 @@ pub(crate) fn reserve(
             .map_err(reservation_error)?;
         range
     };
+    let _notification = txn.defer_notifications();
+    let _guard = before_commit()?;
     txn.commit().map_err(reservation_error)?;
     Ok(range)
 }
@@ -98,17 +112,16 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "durable")]
     #[test]
-    fn fact_checkpoint_and_explicit_sources_share_one_namespace() -> anyhow::Result<()> {
+    fn fact_and_independent_allocator_handles_share_one_namespace() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let store = RedbStore::open(dir.path().join("execution-ids.redb"))?;
         let facts = ExecutionIds::new(Arc::new(store.fact_store()?));
-        let checkpoints = ExecutionIds::new(Arc::new(store.checkpoint_store()));
-        let explicit = ExecutionIds::new(Arc::new(store.execution_id_source()));
+        let first = ExecutionIds::new(Arc::new(store.execution_id_source()));
+        let second = ExecutionIds::new(Arc::new(store.execution_id_source()));
         ensure!(facts.allocate()?.get() == 1);
-        ensure!(checkpoints.allocate()?.get() == 257);
-        ensure!(explicit.allocate()?.get() == 513);
+        ensure!(first.allocate()?.get() == 257);
+        ensure!(second.allocate()?.get() == 513);
         ensure!(facts.allocate()?.get() == 2);
         Ok(())
     }

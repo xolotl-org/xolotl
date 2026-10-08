@@ -1,7 +1,12 @@
 #![cfg(feature = "host")]
 
+#[path = "support/signal.rs"]
+mod signal;
+
+use signal::{install_signal_resource, signal_grant};
 use xolotl_sdk::{
-    Expression as E, IdentityRef, Outcome, Program, TaintedValue, Transform, Value, Xolotl,
+    Bootstrap, Expression as E, IdentityRef, Outcome, Program, TaintedValue, Transform, Value,
+    Xolotl,
 };
 macro_rules! assert {
     ($condition:expr $(,)?) => {
@@ -21,15 +26,18 @@ macro_rules! assert_eq {
 
 async fn evaluate(program: Program, input: Value) -> anyhow::Result<Outcome> {
     let compiled = program.compile()?;
-    Ok(Xolotl::new()
-        .run_program(
-            IdentityRef::ROOT,
-            &[],
-            &compiled,
-            TaintedValue::pristine(input),
-        )
-        .await?
-        .outcome)
+    Ok(
+        Xolotl::new(xolotl_state::InMemoryBackend::new().into_backend())
+            .run_program(
+                IdentityRef::ROOT,
+                &[],
+                &compiled,
+                TaintedValue::pristine(input),
+            )
+            .await?
+            .output
+            .outcome,
+    )
 }
 
 #[tokio::test]
@@ -94,7 +102,7 @@ async fn long_nested_sequences_use_bounded_stack_space() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn disjoint_lexical_scopes_reuse_one_binding_slot() -> anyhow::Result<()> {
-    use xolotl_sdk::{ExecutionConfig, PreparedProgram, XolotlBuilder};
+    use xolotl_sdk::{ExecutionConfig, KernelBuilder, PreparedProgram};
     let stage = E::Let {
         name: "current".into(),
         value: Box::new(E::Input),
@@ -115,12 +123,14 @@ async fn disjoint_lexical_scopes_reuse_one_binding_slot() -> anyhow::Result<()> 
     let layout = prepared.layout(&ExecutionConfig::default())?;
     assert_eq!(layout.bindings_per_task, 1);
     assert_eq!(layout.frames_per_task, 2);
-    let runtime = XolotlBuilder::new()
-        .with_execution_config(ExecutionConfig {
-            bindings_per_task: 1,
-            ..ExecutionConfig::default()
-        })
-        .build();
+    let runtime = Xolotl::from_kernel(
+        KernelBuilder::new(xolotl_state::InMemoryBackend::new().into_backend())
+            .with_execution_config(ExecutionConfig {
+                bindings_per_task: 1,
+                ..ExecutionConfig::default()
+            })
+            .build(),
+    );
     assert_eq!(
         runtime
             .run_prepared(
@@ -130,6 +140,7 @@ async fn disjoint_lexical_scopes_reuse_one_binding_slot() -> anyhow::Result<()> 
                 TaintedValue::pristine(Value::integer(0))
             )
             .await?
+            .output
             .outcome,
         Outcome::Done(Value::integer(2048))
     );
@@ -138,7 +149,7 @@ async fn disjoint_lexical_scopes_reuse_one_binding_slot() -> anyhow::Result<()> 
 
 #[tokio::test]
 async fn sequential_forks_fit_peak_storage_budget() -> anyhow::Result<()> {
-    use xolotl_sdk::{ExecutionConfig, PreparedProgram, XolotlBuilder};
+    use xolotl_sdk::{ExecutionConfig, KernelBuilder, PreparedProgram};
     let compiled = Program::new(E::Sequence {
         steps: vec![E::literal(1).both(E::literal(2)); 64],
     })
@@ -147,12 +158,14 @@ async fn sequential_forks_fit_peak_storage_budget() -> anyhow::Result<()> {
     let layout = prepared.layout(&ExecutionConfig::default())?;
     assert_eq!(layout.tasks, 3);
     assert_eq!(layout.frames_per_task, 0);
-    let runtime = XolotlBuilder::new()
-        .with_execution_config(ExecutionConfig {
-            max_storage_bytes: 1024,
-            ..ExecutionConfig::default()
-        })
-        .build();
+    let runtime = Xolotl::from_kernel(
+        KernelBuilder::new(xolotl_state::InMemoryBackend::new().into_backend())
+            .with_execution_config(ExecutionConfig {
+                max_storage_bytes: 1024,
+                ..ExecutionConfig::default()
+            })
+            .build(),
+    );
     assert_eq!(
         runtime
             .run_prepared(
@@ -162,6 +175,7 @@ async fn sequential_forks_fit_peak_storage_budget() -> anyhow::Result<()> {
                 TaintedValue::pristine(Value::null())
             )
             .await?
+            .output
             .outcome,
         Outcome::Done(Value::list(vec![Value::integer(1), Value::integer(2)]))
     );
@@ -170,7 +184,7 @@ async fn sequential_forks_fit_peak_storage_budget() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn shared_frames_and_reusable_buffers_support_independent_requests() -> anyhow::Result<()> {
-    use xolotl_sdk::{ExecutionBuffers, ExecutionConfig, PreparedProgram, XolotlBuilder};
+    use xolotl_sdk::{ExecutionBuffers, ExecutionConfig, KernelBuilder, PreparedProgram};
     let source = Program::new(
         (0..32)
             .fold(E::Input, |body, _| body.finally(E::Input))
@@ -186,7 +200,11 @@ async fn shared_frames_and_reusable_buffers_support_independent_requests() -> an
     assert_eq!(layout.tasks, 3);
     assert_eq!(layout.frames_per_task, 64);
     assert_eq!(layout.frames, 64);
-    let runtime = XolotlBuilder::new().with_execution_config(config).build();
+    let runtime = Xolotl::from_kernel(
+        KernelBuilder::new(xolotl_state::InMemoryBackend::new().into_backend())
+            .with_execution_config(config)
+            .build(),
+    );
     let mut buffers = ExecutionBuffers::default();
     buffers.reserve_for(&prepared, &config)?;
     let retained = buffers.retained_bytes();
@@ -199,7 +217,8 @@ async fn shared_frames_and_reusable_buffers_support_independent_requests() -> an
                 TaintedValue::pristine(Value::integer(input)),
                 &mut buffers,
             )
-            .await?;
+            .await?
+            .output;
         assert_eq!(
             result.outcome,
             Outcome::Done(Value::list(vec![
@@ -216,7 +235,7 @@ async fn shared_frames_and_reusable_buffers_support_independent_requests() -> an
 
 #[tokio::test]
 async fn reused_bindings_preserve_callers_during_parallelism_and_recovery() -> anyhow::Result<()> {
-    use xolotl_sdk::{ExecutionConfig, PreparedProgram, XolotlBuilder};
+    use xolotl_sdk::{ExecutionConfig, KernelBuilder, PreparedProgram};
     let call = E::Call {
         function: "worker".into(),
     };
@@ -261,7 +280,11 @@ async fn reused_bindings_preserve_callers_during_parallelism_and_recovery() -> a
     let layout = prepared.layout(&config)?;
     assert_eq!(layout.tasks, 3);
     assert!(layout.frames_per_task < config.frames_per_task);
-    let runtime = XolotlBuilder::new().with_execution_config(config).build();
+    let runtime = Xolotl::from_kernel(
+        KernelBuilder::new(xolotl_state::InMemoryBackend::new().into_backend())
+            .with_execution_config(config)
+            .build(),
+    );
     assert_eq!(
         runtime
             .run_prepared(
@@ -271,6 +294,7 @@ async fn reused_bindings_preserve_callers_during_parallelism_and_recovery() -> a
                 TaintedValue::pristine(Value::null())
             )
             .await?
+            .output
             .outcome,
         Outcome::Done(Value::list(vec![Value::integer(10), Value::integer(20)]))
     );
@@ -282,7 +306,7 @@ async fn typed_constants_and_operation_inputs_survive_json_roundtrips() -> anyho
     use xolotl_sdk::{OperationTemplate, Path, ResourceName};
     use xolotl_types::{BlobRef, DType, FloatBits, FrameKind, StreamMarker};
     let blob = BlobRef {
-        hash: "a".repeat(64),
+        hash: "a".repeat(96),
         size: 4,
         mime: None,
     };
@@ -374,24 +398,15 @@ async fn catch_and_finally_preserve_the_body_result() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn durable_programs_cannot_silently_run_in_memory() -> anyhow::Result<()> {
-    let mut program = Program::new(E::literal(1));
-    program.durable = true;
-    let result = evaluate(program, Value::null()).await?;
-    assert!(matches!(result, Outcome::Fail(_)));
-    Ok(())
-}
-
-#[tokio::test]
 async fn prepared_programs_reuse_code_with_independent_input_and_storage_limits()
 -> anyhow::Result<()> {
-    use xolotl_sdk::{ExecutionConfig, PreparedProgram, XolotlBuilder};
+    use xolotl_sdk::{ExecutionConfig, KernelBuilder, PreparedProgram};
     let compiled = Program::new(E::Transform {
         operation: Transform::Add { value: 2 },
     })
     .compile()?;
     let prepared = PreparedProgram::new(&compiled)?;
-    let runtime = Xolotl::new();
+    let runtime = Xolotl::new(xolotl_state::InMemoryBackend::new().into_backend());
     for input in [1, 40] {
         assert_eq!(
             runtime
@@ -402,16 +417,19 @@ async fn prepared_programs_reuse_code_with_independent_input_and_storage_limits(
                     TaintedValue::pristine(Value::integer(input))
                 )
                 .await?
+                .output
                 .outcome,
             Outcome::Done(Value::integer(input + 2))
         );
     }
-    let bounded = XolotlBuilder::new()
-        .with_execution_config(ExecutionConfig {
-            max_storage_bytes: 1,
-            ..ExecutionConfig::default()
-        })
-        .build();
+    let bounded = Xolotl::from_kernel(
+        KernelBuilder::new(xolotl_state::InMemoryBackend::new().into_backend())
+            .with_execution_config(ExecutionConfig {
+                max_storage_bytes: 1,
+                ..ExecutionConfig::default()
+            })
+            .build(),
+    );
     let result = bounded
         .run_prepared(
             IdentityRef::ROOT,
@@ -419,19 +437,22 @@ async fn prepared_programs_reuse_code_with_independent_input_and_storage_limits(
             &prepared,
             TaintedValue::pristine(Value::integer(1)),
         )
-        .await?;
+        .await?
+        .output;
     assert!(
         matches!(result.outcome, Outcome::Fail(xolotl_sdk::Failure::PolicyViolation { ref detail, .. }) if detail.contains("storage budget"))
     );
-    let boot = XolotlBuilder::new()
-        .with_execution_config(ExecutionConfig {
-            max_storage_bytes: 1,
-            ..ExecutionConfig::default()
-        })
-        .build_bootstrap();
+    let boot = Bootstrap::from_kernel(
+        KernelBuilder::new(xolotl_state::InMemoryBackend::new().into_backend())
+            .with_execution_config(ExecutionConfig {
+                max_storage_bytes: 1,
+                ..ExecutionConfig::default()
+            })
+            .build(),
+    );
     let result = boot
-        .kernel
-        .executor_for(boot.root)
+        .kernel()
+        .executor_for(boot.root())
         .eval_program(&compiled, TaintedValue::pristine(Value::integer(1)))
         .await;
     assert!(matches!(result.outcome, Outcome::Fail(_)));
@@ -477,21 +498,23 @@ async fn recursive_parallel_calls_use_configured_task_capacity() -> anyhow::Resu
 async fn cancellation_wakes_a_waiting_program() -> anyhow::Result<()> {
     use xolotl_graph::WaitSpec;
     use xolotl_sdk::Path;
-    let runtime = Xolotl::new();
+    let runtime = Xolotl::new(xolotl_state::InMemoryBackend::new().into_backend());
     let boot = runtime.bootstrap();
+    install_signal_resource(boot)?;
+    let path = Path::parse("state://signal/never")?;
     let process = boot.spawn_request_process_under_with_compiled_request_grants(
-        boot.root,
+        boot.root(),
         IdentityRef::ROOT,
-        &[],
+        &[signal_grant(&path)?],
     )?;
     let compiled = Program::new(
         E::Wait {
-            wait: WaitSpec::Signal(Path::parse("state://signal/never")?),
+            wait: WaitSpec::Signal(path),
         }
         .finally(E::literal(1)),
     )
     .compile()?;
-    let executor = boot.kernel.executor_for(process);
+    let executor = boot.kernel().executor_for(process);
     let run = executor.eval_program(&compiled, TaintedValue::pristine(Value::null()));
     tokio::pin!(run);
     tokio::select! {
@@ -537,7 +560,8 @@ async fn dropping_prepared_request_cleans_lifecycle_and_releases_buffers() -> an
     use std::task::Poll;
     use xolotl_graph::WaitSpec;
     use xolotl_sdk::{ExecutionBuffers, Path, PreparedProgram};
-    let runtime = Xolotl::new();
+    let runtime = Xolotl::new(xolotl_state::InMemoryBackend::new().into_backend());
+    install_signal_resource(runtime.bootstrap())?;
     let prepared = PreparedProgram::new(
         &Program::new(E::Wait {
             wait: WaitSpec::Signal(Path::parse("state://signal/drop-prepared")?),
@@ -547,7 +571,7 @@ async fn dropping_prepared_request_cleans_lifecycle_and_releases_buffers() -> an
     let mut buffers = ExecutionBuffers::default();
     let mut run = Box::pin(runtime.run_prepared_with_buffers(
         IdentityRef::ROOT,
-        &[],
+        &["state://signal/drop-prepared"],
         &prepared,
         TaintedValue::pristine(Value::null()),
         &mut buffers,
@@ -559,29 +583,20 @@ async fn dropping_prepared_request_cleans_lifecycle_and_releases_buffers() -> an
     );
     let boot = runtime.bootstrap();
     let process = boot
-        .kernel
-        .processes
-        .children_of(boot.root)
+        .kernel()
+        .processes()
+        .children_of(boot.root())
         .into_iter()
         .next()
         .context("missing request")?;
     drop(run);
     assert_eq!(
-        boot.kernel.processes.status(process),
+        boot.kernel().processes().status(process),
         Some(xolotl_types::ProcessStatus::Cancelled)
     );
     let report = runtime.drain_cleanup().await;
     assert!(report.failures.is_empty());
-    let marker = Path::parse(&format!(
-        "state://kernel/process/{}/{}/finalized",
-        process.get(),
-        boot.kernel
-            .processes
-            .lifecycle_execution(process)
-            .context("missing lifecycle scope")?
-            .get()
-    ))?;
-    assert!(boot.kernel.state.read(&marker).await?.is_some());
+    assert!(boot.cleanup_ticket(process)?.is_complete());
 
     let next = PreparedProgram::new(&Program::new(E::Input).compile()?)?;
     assert_eq!(
@@ -594,6 +609,7 @@ async fn dropping_prepared_request_cleans_lifecycle_and_releases_buffers() -> an
                 &mut buffers,
             )
             .await?
+            .output
             .outcome,
         Outcome::Done(Value::integer(41))
     );
@@ -604,7 +620,10 @@ async fn dropping_prepared_request_cleans_lifecycle_and_releases_buffers() -> an
 #[tokio::test]
 async fn portable_effects_use_existing_resource_authority() -> anyhow::Result<()> {
     use xolotl_sdk::{OperationTemplate, Path, ResourceName, StandardConfig};
-    let runtime = Xolotl::with_standard(&StandardConfig::default())?;
+    let runtime = Xolotl::with_standard(
+        xolotl_state::InMemoryBackend::new().into_backend(),
+        &StandardConfig::default(),
+    )?;
     let program = Program::new(E::Invoke {
         operation: OperationTemplate {
             target: ResourceName::new(Path::parse("effect://time/now")?),
@@ -624,6 +643,7 @@ async fn portable_effects_use_existing_resource_authority() -> anyhow::Result<()
                 TaintedValue::pristine(Value::null())
             )
             .await?
+            .output
             .outcome,
         Outcome::Fail(_)
     ));
@@ -636,6 +656,7 @@ async fn portable_effects_use_existing_resource_authority() -> anyhow::Result<()
                 TaintedValue::pristine(Value::null())
             )
             .await?
+            .output
             .outcome,
         Outcome::Done(_)
     ));

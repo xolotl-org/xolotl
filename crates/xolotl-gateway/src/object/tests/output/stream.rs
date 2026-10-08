@@ -44,7 +44,12 @@ async fn fixture() -> anyhow::Result<(Fixture, Arc<EmittingDriver>)> {
         count: 3,
     });
     let fixture = Fixture::with_driver(
-        MethodSpec::new("invoke", Purity::Effectful, MethodSpec::STREAM_ASYNC),
+        MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Effectful,
+            MethodSpec::STREAM_ASYNC,
+        ),
         driver.clone(),
     )
     .await?;
@@ -60,6 +65,11 @@ async fn open(fixture: &Fixture) -> anyhow::Result<GatewayOutputStream> {
                 .with_requested_output(OutputMode::Stream)
                 .with_options(crate::SubmitOptions {
                     idempotency_key: Some("structured-output-stream".into()),
+                    expected_request_scope: Some(crate::tests::test_request_scope(
+                        &fixture.gateway,
+                        &fixture.session,
+                        "echo",
+                    )?),
                     ..crate::SubmitOptions::default()
                 }),
             StreamWindow {

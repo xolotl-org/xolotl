@@ -20,6 +20,17 @@ pub enum StateWatchError {
     /// Callers may reread authoritative state before continuing consumption.
     #[error("state subscription lost {0} events")]
     Lagged(u64),
+    /// A storage commit may have changed State without a reliable event, or
+    /// the backend could not retain a notification for this subscription.
+    /// This stream is closed after the error. For notification loss alone,
+    /// reread State and resubscribe. If a storage commit outcome is unknown,
+    /// follow the backend's recovery contract before authoritative
+    /// reconciliation or resubscribing: a live reread need not reflect the
+    /// durable outcome and cannot by itself establish rollback.
+    #[error(
+        "state subscription invalidated by a notification gap; recover authoritative state before resubscribing"
+    )]
+    Invalidated,
     /// The subscription adapter failed with a backend-specific diagnostic.
     #[error("state subscription failed: {0}")]
     Backend(String),
@@ -36,7 +47,9 @@ pub trait StateSubscription {
     ) -> Poll<Result<Option<StateEvent>, StateWatchError>>;
 }
 
-/// Optional subscription capability. Establish before reading current state to avoid lost wakeups.
+/// Optional subscription capability. For signal waits, registration and the
+/// initial read must observe one commit domain; the shared host installs that
+/// stronger pairing separately through `Backend::with_signal`.
 pub trait StateWatch {
     /// Owned subscription whose destruction releases its registration.
     type Subscription: StateSubscription;
@@ -59,7 +72,8 @@ impl StateStream {
     }
 
     /// Wait for the next event. End-of-stream becomes [`StateWatchError::Closed`];
-    /// loss and backend errors are forwarded without being hidden as closure.
+    /// loss, invalidation, and backend errors are forwarded without being
+    /// hidden as closure.
     pub async fn recv(&mut self) -> Result<StateEvent, StateWatchError> {
         core::future::poll_fn(|cx| self.poll_next(cx))
             .await?

@@ -50,13 +50,13 @@ async fn tensor_write_pipes_directly_into_blob_read() -> Result<()> {
             )
             .with_object_store(FileObjectStore::open(directory.path())?.into_object_store()),
     )?;
-    let executor = boot.kernel.executor_for(boot.root);
+    let executor = boot.kernel().executor_for(boot.root());
     let invoke = |path| -> Result<Expression> {
         let target = ResourceName::new(Path::parse(path)?);
         let handle = boot
-            .open_for(boot.root, &target, "perform")
+            .open_for(boot.root(), &target, "perform")
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        executor.bind_handle(target.clone(), handle);
+        executor.bind_handle(target.clone(), handle)?;
         Ok(Expression::Invoke {
             operation: OperationTemplate {
                 target,

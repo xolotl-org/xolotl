@@ -1,7 +1,8 @@
 use super::*;
 use crate::OpenObjectReadRequest;
+use redb::TableDefinition;
 use std::path::Path as FsPath;
-use xolotl_kernel::{EchoDriver, FactSink, Kernel, MethodSpec};
+use xolotl_kernel::{EchoDriver, FactSink, KernelBuilder, MethodSpec};
 use xolotl_storage_redb::RedbStore;
 use xolotl_types::{Path, Purity, TaintedValue};
 
@@ -9,18 +10,28 @@ async fn reopen(
     directory: &FsPath,
 ) -> anyhow::Result<(GatewayRuntime, GatewaySession, ObjectStore)> {
     let state = RedbStore::open(directory.join("gateway.redb"))?;
-    let boot = Arc::new(Bootstrap::from_kernel(Kernel::with_backends(
-        state.state_backend().into_backend(),
-        FactSink::new(Arc::new(state.fact_store()?)),
-    )));
+    let boot = Arc::new(Bootstrap::from_kernel(
+        KernelBuilder::new(state.state_backend().into_backend())
+            .with_fact_sink(FactSink::new(Arc::new(state.fact_store()?)))
+            .build(),
+    ));
     let objects = FileObjectStore::open(directory.join("content"))?.into_object_store();
     let target = boot.register_effect(
         "effect://echo/say",
-        &[MethodSpec::unary_async("invoke", Purity::Pure)],
+        &[MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Pure,
+            MethodSpec::UNARY_ASYNC,
+        )],
         Arc::new(EchoDriver),
     )?;
-    let gateway =
-        GatewayRuntime::new(boot, echo_profile(target)?)?.with_object_store(objects.clone());
+    let gateway = GatewayRuntime::new(
+        boot,
+        echo_profile(target)?,
+        Arc::new(crate::MemoryGatewayIdempotencyStore::default()),
+    )?
+    .with_object_store(objects.clone());
     let session = gateway
         .authenticate(PresentedCredential::bearer(TEST_TOKEN))
         .await?;
@@ -33,6 +44,198 @@ fn open(grant: &GatewayObjectReadGrant) -> OpenObjectReadRequest {
         offset: grant.offset(),
         length: Some(grant.length()),
     }
+}
+
+#[tokio::test]
+async fn multi_object_ticket_members_survive_redb_restart_and_consume_together()
+-> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (ticket_id, first, second, provenance) = {
+        let (gateway, session, _) = reopen(directory.path()).await?;
+        let ticket = gateway
+            .issue_object_upload_ticket(
+                &session,
+                IssueObjectUploadTicketRequest {
+                    surface_id: "echo".into(),
+                    submission_token: None,
+                    modality: GatewayModality::Value,
+                    expected_size: None,
+                    expected_digest: None,
+                    allowed_media_types: Vec::new(),
+                    expires_in_ms: Some(60_000),
+                    single_use: true,
+                    max_objects: Some(2),
+                    max_total_bytes: Some(1024),
+                    max_record_bytes: None,
+                },
+            )
+            .await?;
+        let mut upload = gateway
+            .begin_object_upload(
+                &session,
+                BeginObjectUploadRequest {
+                    ticket_id: ticket.ticket_id().into(),
+                    media_type: None,
+                    submission_token: None,
+                    expected_size: Some(3),
+                    expected_digest: None,
+                },
+            )
+            .await?;
+        upload.write(b"one").await?;
+        let first = upload.commit(GatewayObjectKind::Blob).await?;
+        let mut upload = gateway
+            .begin_object_upload(
+                &session,
+                BeginObjectUploadRequest {
+                    ticket_id: ticket.ticket_id().into(),
+                    media_type: None,
+                    submission_token: None,
+                    expected_size: Some(3),
+                    expected_digest: None,
+                },
+            )
+            .await?;
+        upload.write(b"two").await?;
+        let second = upload.commit(GatewayObjectKind::Blob).await?;
+        (
+            ticket.ticket_id().to_owned(),
+            first.item,
+            second.item,
+            first.provenance,
+        )
+    };
+    let (gateway, session, _) = reopen(directory.path()).await?;
+    let value = gateway
+        .boot
+        .kernel()
+        .state()
+        .read(&upload_ticket_path(&ticket_id)?)
+        .await?
+        .context("ticket after restart")?;
+    let record = GatewayObjectUploadTicket::from_value(&value)?;
+    ensure!(record.committed_items.len() == 2);
+    let payload = Value::list(vec![first, second]);
+    let mut submission = direct_input_with_provenance("echo", payload.clone(), provenance);
+    submission.options.expected_request_scope = Some(crate::tests::test_request_scope(
+        &gateway, &session, "echo",
+    )?);
+    let result = gateway.submit(&session, submission).await?;
+    ensure!(result.output.outcome == Outcome::Done(payload));
+    Ok(())
+}
+
+#[tokio::test]
+async fn expired_upload_ticket_is_reclaimed_after_redb_restart() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let ticket_id = {
+        let (gateway, session, _objects) = reopen(directory.path()).await?;
+        let ticket = gateway
+            .issue_object_upload_ticket(
+                &session,
+                IssueObjectUploadTicketRequest {
+                    surface_id: "echo".into(),
+                    submission_token: None,
+                    modality: GatewayModality::Bytes,
+                    expected_size: None,
+                    expected_digest: None,
+                    allowed_media_types: Vec::new(),
+                    expires_in_ms: Some(60_000),
+                    single_use: true,
+
+                    max_objects: None,
+                    max_total_bytes: None,
+                    max_record_bytes: None,
+                },
+            )
+            .await?;
+        let path = upload_ticket_path(ticket.ticket_id())?;
+        let mut record = ticket.clone();
+        record.expires_at_ms = now_millis() - 1;
+        gateway
+            .boot
+            .kernel()
+            .state()
+            .write_set(&path, record.to_value()?)
+            .await?;
+        ticket.ticket_id().to_owned()
+    };
+    let (gateway, _session, _objects) = reopen(directory.path()).await?;
+    let state = gateway.boot.kernel().state();
+    let batch = ticket::maintain_upload_tickets_batch(state, None, now_millis()).await?;
+    ensure!(batch.removed == 1);
+    ensure!(
+        state
+            .read(&upload_ticket_path(&ticket_id)?)
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_provenance_header_does_not_hide_preceding_ticket_cleanup() -> anyhow::Result<()>
+{
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("gateway.redb");
+    let (first, second) = {
+        let (gateway, session, _) = reopen(directory.path()).await?;
+        let ticket = gateway
+            .issue_object_upload_ticket(
+                &session,
+                IssueObjectUploadTicketRequest {
+                    surface_id: "echo".into(),
+                    submission_token: None,
+                    modality: GatewayModality::Bytes,
+                    expected_size: None,
+                    expected_digest: None,
+                    allowed_media_types: Vec::new(),
+                    expires_in_ms: Some(60_000),
+                    single_use: true,
+
+                    max_objects: None,
+                    max_total_bytes: None,
+                    max_record_bytes: None,
+                },
+            )
+            .await?;
+        let state = gateway.boot.kernel().state();
+        let original = upload_ticket_path(ticket.ticket_id())?;
+        let mut expired = ticket;
+        expired.expires_at_ms = now_millis() - 1;
+        let first = upload_ticket_path("aaa")?;
+        expired.ticket_id = "aaa".into();
+        state.write_set(&first, expired.to_value()?).await?;
+        let second = upload_ticket_path("bbb")?;
+        expired.ticket_id = "bbb".into();
+        state.write_set(&second, expired.to_value()?).await?;
+        state.write_delete(&original).await?;
+        (first, second)
+    };
+    {
+        const VALUES: TableDefinition<&str, &[u8]> = TableDefinition::new("state_values");
+        let db = redb::Database::create(&database)?;
+        let txn = db.begin_write()?;
+        let oversized = upload_ticket_path("ccc")?.to_string();
+        let mut row = b"XSV1".to_vec();
+        row.extend_from_slice(&(ticket::TICKET_MAINTENANCE_PAGE_BYTES as u64).to_le_bytes());
+        row.resize(row.len() + ticket::TICKET_MAINTENANCE_PAGE_BYTES, b' ');
+        row.extend_from_slice(b"null");
+        txn.open_table(VALUES)?
+            .insert(oversized.as_str(), row.as_slice())?;
+        txn.commit()?;
+    }
+
+    let (gateway, _, _) = reopen(directory.path()).await?;
+    let state = gateway.boot.kernel().state();
+    let preceding = ticket::maintain_upload_tickets_batch(state, None, now_millis()).await?;
+    ensure!(preceding.removed == 2 && preceding.examined == 3);
+    ensure!(state.read(&first).await?.is_none());
+    ensure!(state.read(&second).await?.is_none());
+    let skipped =
+        ticket::maintain_upload_tickets_batch(state, preceding.next, now_millis()).await?;
+    ensure!(skipped.skipped_oversized == 1 && skipped.examined == 1);
+    Ok(())
 }
 
 #[test]

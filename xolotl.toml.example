@@ -7,18 +7,156 @@
 [storage]
 kind = "redb"           # "redb" (persistent) or "memory" (non-persistent)
 path = "xolotl.db"       # single redb file for state and FactStore tables
+state_history = "current_only" # current_only (default) or full (excluding state://vault/**); redb mode fixed at creation
+source_stream_limit = 4096 # global retained ordered Source stream identities; 1..65536
+source_retention_limit = 65536 # retained Source event/receipt pairs plus rate records
 # object_path = "xolotl.objects" # object files; defaults beside the database, independent of state kind
+
+# Optional finite observation history; disabled when this section is absent.
+# Execution identities and business persistence do not depend on observations.
+# Full capacity rejects selected recording; records are not silently evicted.
+# [storage.observations]
+# max_records = 4096
+# max_encoded_bytes = 67108864
+# max_record_bytes = 1048576
+
+# Required with redb. Generate a separate raw 32-byte key (for example,
+# `openssl rand -out /etc/xolotl/external-credentials.key 32`) and chmod 600.
+# The key file is distinct from the Console credential key and the encrypted
+# vault beside storage.path. Memory storage does not need this section.
+[external_credentials]
+key_file = "/etc/xolotl/external-credentials.key"
+
+# Optional only with state_history = "full". Without this section, full history
+# remains until a host explicitly trims it. Choose the window only after checking
+# audit/replay readers; the daemon has no active-reader pins.
+# [storage.history_maintenance]
+# retain_for_ms = 86400000 # required, positive; keep at least 24h of timestamps
+# interval_ms = 10000 # 1000..3600000
+# max_attempts_per_tick = 16 # 1..64
+# max_batches_per_tick = 4 # 1..16, <= attempts
+# events_per_batch = 4096 # 1..4096
+# encoded_bytes_per_batch = 16777216 # 1..16777216
+
+[kernel]
+max_handle_slots = 65536 # allocated indices, including vacant/retired slots; does not cap driver payloads
 
 [server]
 console_addr = "127.0.0.1:9000"
 external_grpc_addr = "127.0.0.1:9444"
 external_websocket_addr = "127.0.0.1:9200"
 # application_grpc_addr = "127.0.0.1:9445" # optional application-grpc feature; provision profile first
+# federation_grpc_addr = "127.0.0.1:9446" # optional inbound listener; outbound-only nodes omit it
+
+# Federation starts when a listener or an explicit peer dial route is set.
+# Set storage.state_history = "full" for the stock State publication source.
+# Registered publisher pins permit history maintenance only below their safe
+# consumption bounds. Fixed business pages and retry epochs resume after reopen;
+# they are not execution checkpoints. Removing a publication config retains its
+# pin: a trusted host must settle pending pages and explicitly release its exact
+# completed cursor before source history can be reclaimed past that bound.
+# The four identity files are binary and must be absolute-path private regular
+# files (0600, no symlinks). Keep the root signing key offline: only its public
+# descriptor and its signature over the online authorization are loaded here.
+# Peer trust, online generation/digest admission and export access must be
+# provisioned explicitly in the same redb database. No peer is trusted by default.
+# [federation]
+# root_descriptor_path = "/etc/xolotl/federation/root.bin"
+# online_key_path = "/etc/xolotl/federation/online.pk8"
+# online_authorization_path = "/etc/xolotl/federation/online-authorization.bin"
+# online_authorization_signature_path = "/etc/xolotl/federation/online-authorization.sig"
+# [[federation.peers]]
+# node_id = "<96 hex digits: peer FederationRoot.node_id>"
+# enabled = true
+# minimum_online_generation = 1
+# allowed_authorization_digests = ["<96 hex digits: SHA-384 of canonical online authorization>"]
+# expected_revision = 1 # only when changing an existing peer row; omit on creation
+# admission_expected_revision = 1 # only when changing its existing online policy
+# [[federation.peers.exports]]
+# name = "notes"
+# serve = true
+# receive = false
+# expected_revision = 1 # only when changing an existing export row
+# [[federation.peers.subscriptions]]
+# stream_id = "<32 hex digits: a stream declared by this peer>"
+# generation = 0 # bump when intentionally replacing this delivery contract
+# When this peer dials us, the subscription uses its incoming Session; no
+# listener is required on that peer. To dial it ourselves, configure:
+# [federation.peers.dial]
+# uri = "http://peer.example:9446" # internal h2 authority; TLS is mandatory
+# server_name = "peer.example"
+# trust_root_path = "/etc/xolotl/federation/peer-ca.pem"
+# [[federation.streams]]
+# id = "<32 hex digits: stable stream ID>"
+# export = "notes"
+# [[federation.state_history_publications]]
+# prefix = "state://federation/public/notes" # only pristine events under this explicit namespace
+# stream_id = "<same 32 hex digits>"
+# Explicitly retire a removed State source at its saved completed cursor or
+# pending-window high. Keep its stream/access policies if serving old records.
+# [[federation.state_history_publication_retirements]]
+# prefix = "state://federation/public/notes"
+# stream_id = "<same existing 32 hex digits>"
+# expected_cursor = 1800000000000
+# A federated method binds an exact local contract to a prepared live program.
+# The JSON program file must be private (0600), with no unbound native Module imports.
+# [[federation.methods]]
+# export = "tools"
+# path = "/echo"
+# method = "echo"
+# program_path = "/etc/xolotl/federation/echo.json"
+# program_id = "<64 hex digits: compiled portable program ID>"
+# contract_digest = "<64 hex digits: digest of target, program, identity, codec and grants>"
+# identity_path = "identity://federation/echo"
+# codec = "bytes_v1"
+# [[federation.methods.grants]]
+# selector = "perform://effect/echo"
+# methods = ["invoke"]
+# flags = []
+# A method alone grants nothing. Peer/export serve access and this exact
+# subject/presenter/target grant are both required before Prepare.
+# [[federation.call_authorities]]
+# presenter = "<96 hex digits: authenticated peer node ID>"
+# subject = { kind = "node" } # or { kind="hosted", issuer="<96 hex>", namespace="app", subject="alice" }
+# export = "tools"
+# path = "/echo"
+# method = "echo"
+# contract_digest = "<same 64 hex digits as the method>"
+# enabled = true
+# expires_ms = 1900000000000
+# max_input_bytes = 65536
+# max_prepare_window_ms = 30000
+# max_result_retention_ms = 86400000
+# expected_revision = 1 # only when changing an existing exact rule
+# Hosted subjects also require an explicit issuer and holder proof on Session.
+# [[federation.subject_issuers]]
+# issuer = "<96 hex digits: ML-DSA-65 issuer ID>"
+# namespace = "app"
+# presenter = "<96 hex digits: authenticated peer node ID>"
+# purposes = ["invoke"] # discover, sync, invoke, object_read
+# [federation.grpc]
+# max_frame_bytes = 1048576
+# max_batch_bytes = 1048576 # stock State records need >= 512 KiB; frames need 4 KiB headroom
+# max_sessions = 64
+# max_blocking_verifications = 8
+# hello_timeout_ms = 10000
+# tls_handshake_timeout_ms = 5000
+# response_timeout_ms = 30000
+# [federation.grpc.transport_security]
+# mode = "production_tls" # production_tls or mtls only; no plaintext/proxy modes
+# certificate_chain_path = "/etc/xolotl/federation/tls-cert.pem"
+# private_key_path = "/etc/xolotl/federation/tls-key.pem"
+# client_trust_roots = ["/etc/xolotl/federation/client-ca.pem"] # required for mtls only
 
 # Application authorization lives at state://kernel/gateway/profiles/<profile>.
 # Create it through Console config.write_cas before enabling the listener.
 # [application_gateway]
 # profile = "tasks"
+# [application_gateway.request_storage]
+# max_records = 4096
+# max_bytes = 67108864
+# max_record_bytes = 1048576
+# retry_epoch_ms = 900000 # host retry-range closure, independent of result retention
 # [application_gateway.grpc]
 # max_frame_bytes = 65536 # complete protobuf frame, not cumulative upload size
 # max_concurrent_uploads = 8
@@ -32,6 +170,11 @@ external_websocket_addr = "127.0.0.1:9200"
 # [application_gateway.grpc.transport_security]
 # mode = "local_trusted"
 # TLS and proxy fields are the same as external_gateway.grpc.transport_security.
+
+[external_gateway.source_maintenance]
+# Runs on startup and while idle. Each batch examines at most 8 event-id claims.
+interval_ms = 10000
+max_batches_per_tick = 64 # global budget shared across installed Source projections
 
 [external_gateway.grpc]
 # External gRPC accepts Provider and Source role sessions.
@@ -84,26 +227,56 @@ mode = "local_trusted" # trusted_reverse_proxy | local_trusted | unsafe_plaintex
 # honor_x_forwarded_for = true
 # unsafe_relaxations = ["ignore_origin_port"]
 
+# Persistent Console credentials require a separate host-owned 32-byte raw key
+# file. Create it with a private mode (for example: umask 077; openssl rand 32 >
+# /absolute/path/console-credentials.key), and keep it with database backups.
+[console.credentials]
+active_key_id = "host-1"
+active_key_file = "/absolute/path/console-credentials.key"
+# Retain old keys while their records may still exist. Records re-encrypt under
+# the active key only when a credential update writes them; there is no bulk rekey.
+# [[console.credentials.previous]]
+# key_id = "host-0"
+# key_file = "/absolute/path/old-console-credentials.key"
+
 # Optional root bootstrap.
 # If omitted and state://kernel/console/users/* is empty, xolotld creates root
-# with a random one-time password printed to stderr.
+# with a random one-time password printed to stderr only when it is a TTY.
+# Non-interactive deployments must set password_hash, password, or pubkeys below.
 [console.root]
+# Only when creating root: extend both its capabilities and delegation ceiling.
+additional_grants = []            # e.g. ["perform://effect/example/**"]
 # password_hash = "$argon2id$v=19$m=65536,t=3,p=2$..."
 # password — plaintext root password; validated against the backend password
 #   policy and hashed at bootstrap. Use this OR password_hash, not both.
 #   Prefer password_hash for production; if password is used, restrict file
 #   permissions and remove or rotate it after bootstrap.
 # password = "correct-horse-battery-staple-9qL"
-# pubkeys = ["ed25519:..."]
+# pubkeys = ["ml-dsa-65:..."]
 
+# Console endpoints use /api/console/v1 (auth, session, credentials, calls, ws).
 # Console authentication/session limits.
 [console.auth]
 session_ttl_ms = 86400000          # 24h absolute session TTL
 idle_ttl_ms = 7200000              # 2h idle TTL
-max_sessions_per_user = 5
+max_sessions_per_account = 5
 global_session_limit = 10000
 # argon2_concurrency defaults to available CPU parallelism.
+# Verification runs on the blocking pool; full capacity rejects immediately.
+# A canceled request retains its slot until password verification exits.
 # argon2_concurrency = 4
+# Host-provided external assertion verification and binding lookup concurrency.
+# Full capacity rejects immediately; canceled work releases its slot on exit.
+# max_external_verifications = 32
+
+# Shared persisted limits across public-key, Passkey and MFA authentication.
+# In-flight work, including canceled work until it exits, still occupies capacity.
+# Expired entries are reclaimed on admission; concurrent hosts must use equal limits.
+[console.auth.challenges]
+max_pending_global = 256
+max_pending_per_user = 8
+max_pending_per_source = 32
+max_bytes = 1048576
 
 # Passkey/WebAuthn relying-party settings. Enable only when the externally
 # visible origin and RP id are stable for console clients.
@@ -113,6 +286,42 @@ rp_id = "console.example.com"
 rp_origin = "https://console.example.com"
 rp_name = "Xolotl Console"
 challenge_ttl_ms = 60000
+
+# MFA: pending setup is bound to a session; management requires recent verification.
+# Enrollment/freshness windows are clamped to 30 seconds through 15 minutes.
+[console.auth.mfa]
+issuer = "Xolotl Console"
+enrollment_ttl_ms = 300000
+recent_auth_ttl_ms = 300000
+# One fixed deadline for selection and every interaction round: 30 seconds..5 minutes.
+authentication_ttl_ms = 120000
+# Actual provider calls, including begin: 1..32. Early polling does not spend a call.
+max_authentication_steps = 16
+# 100..30000 ms. Provider waits can be longer, within the original deadline.
+min_poll_interval_ms = 500
+# Continuations are not sessions; step-up still requires the initiating SID's bearer.
+# Canceled/crashed in-flight work retains capacity until retirement or original expiry.
+# False omits the built-in provider; enrolled factors and their MFA requirement remain.
+# Rust hosts install native providers with separate enrollment/direct/interaction schemas.
+# This file cannot load code or install a push approval service.
+install_totp = true
+
+# Host use restrictions; omitted providers and omitted fields default to true.
+# Installation, enrollment and authentication are independent decisions.
+# This example preserves normal TOTP use; set only allow_enrollment=false
+# to stop new enrollment while allowing existing factors to authenticate.
+[console.auth.mfa.provider_usage.totp]
+allow_enrollment = true
+allow_authentication = true
+
+# RFC 6238. Existing factors retain the settings used at enrollment.
+# Parameter compatibility is checked when install_totp = true.
+# Configuration still requires valid field types and algorithm names when disabled.
+[console.auth.mfa.totp]
+algorithm = "SHA1"                 # SHA1 | SHA256 | SHA512
+digits = 6                         # 6 | 8
+period_seconds = 30                # 15..120
+clock_skew_steps = 1               # 0..2
 
 # Console transport security. The daemon console listener is plain.
 # Use local_trusted for loopback development or trusted_reverse_proxy when
@@ -125,18 +334,89 @@ mode = "local_trusted" # production_tls | trusted_reverse_proxy | local_trusted 
 # honor_x_forwarded_for = true
 # unsafe_relaxations = ["ignore_origin_port"]
 
+# Shared action and authentication capacity across HTTP, Rust and WebSocket callers.
+[console]
+max_concurrent_calls = 64
+max_concurrent_authentications = 64
+request_body_timeout_ms = 30000 # HTTP body receive only; bounded to 1s..5min
+
+# General resource invocation and portable Program execution. Exposure only narrows
+# existing user/kernel authority. Kernel/vault/Fact management stays in typed actions.
+[console.runtime]
+enabled = false
+capabilities = []                 # e.g. ["perform://effect/external/example/**", "read://state/app/**"]
+max_source_bytes = 262144
+max_input_nodes = 16384          # Logical occurrences, including shared Value descendants
+max_input_depth = 128
+max_input_inline_bytes = 4194304 # Input payload and metadata charge, not RSS or wire size
+max_instructions = 8192
+max_expression_depth = 64
+max_operations = 128
+max_identities = 128             # Distinct Acting identities, including module dependencies
+max_modules = 64                # Transitive host modules; daemon catalog is empty
+max_steps = 100000
+max_tasks = 33
+max_storage_bytes = 4194304       # Interpreter containers, excluding driver/value payloads
+max_duration_ms = 30000
+max_collect_items = 256
+max_output_streams = 16          # Concurrent ports, including outputs awaiting delivery
+stream_window_chunks = 16       # Kernel-resident chunks per port
+stream_window_bytes = 262144    # Tagged inline bytes per port
+
+# Per-execution tree limits. Omit dimensions for no additional ceiling; zero is
+# a real limit. Children share the ancestor account; spending has no calendar reset.
+# Costs/tokens accept integers or decimal strings; discovery returns strings.
+[console.runtime.budget]
+# max_micro_usd = "1000000"      # $1 in estimated/reserved and settled charges
+# max_inflight_ops = 16          # Operations, distinct from interpreter task slots
+# max_inference_tokens = "100000"
+
+# Explicit submissions survive disconnect/logout within the running host.
+[console.runtime.executions]
+# Submissions can create async_process children when both runtime
+# capabilities and user grants include spawn-with://<scheme>/<path>, alongside
+# the method capability. Children share these quotas and the original deadline.
+enabled = false
+max_concurrent = 32
+max_concurrent_per_account = 8
+max_records = 256
+max_records_per_account = 64
+max_authority_bytes = 32768
+max_result_bytes = 262144
+max_finalization_bytes = 65536
+max_output_event_bytes = 16384      # Retained Stream event, encoded bytes
+max_output_page_bytes = 131072      # Output reads; must fit an event plus metadata
+max_output_events = 1024           # Per execution, including terminal
+max_output_bytes_per_execution = 1048576
+max_output_bytes_total = 33554432  # Admission-reserved across Stream executions
+retention_ms = 900000
+cleanup_timeout_ms = 5000
+authority_poll_ms = 1000           # Interval between live authority checks
+authority_timeout_ms = 1000        # Deadline for one account-authority check
+
+# Shared Rust/WebSocket subscription admission, independent of connection limits.
+[console.streams]
+max_subscriptions_global = 1024 # Bounded to 1..65536
+max_subscriptions_per_account = 64 # Bounded to 1..4096
+max_event_bytes = 1048576       # Canonical protobuf envelope; bounded to 1 KiB..4 MiB
+
+# Query budgets are independent of transport limits.
+[console.queries]
+max_state_list_limit = 512
+max_fact_limit = 256
+max_trace_limit = 512
+max_process_limit = 256
+max_page_bytes = 131072
+
 # Console WebSocket limits.
 [console.ws]
 max_frame_bytes = 1048576          # Incoming and outgoing; hard max 4 MiB
 max_connections_global = 256
 max_connections_per_source = 32
-max_connections_per_user = 8
+max_connections_per_account = 8
 idle_timeout_secs = 7200           # 2h
 max_frames_per_second = 64
 max_bytes_per_second = 4194304     # 4 MiB/s
 max_subscriptions = 32
-max_state_list_limit = 512
-max_fact_limit = 256
-max_trace_limit = 512
 max_pending_event_bytes = 1048576  # Per session; hard max 16 MiB
 send_timeout_ms = 5000            # All outgoing frames

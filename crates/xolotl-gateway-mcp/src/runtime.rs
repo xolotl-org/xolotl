@@ -1,13 +1,15 @@
+use crate::delivery::{ResultFormat, submission_response};
 use crate::jsonrpc::{
     JSONRPC_INVALID_PARAMS, JSONRPC_INVALID_REQUEST, JSONRPC_METHOD_NOT_FOUND, JSONRPC_PARSE_ERROR,
     JSONRPC_RESOURCE_NOT_FOUND, JSONRPC_VERSION, McpJsonRpcRequest, McpJsonRpcResponse,
-    jsonrpc_error, jsonrpc_gateway_error, jsonrpc_invalid_params, jsonrpc_invalid_request,
-    jsonrpc_ok, mcp_initialize_result, select_mcp_protocol_version,
+    jsonrpc_error, jsonrpc_invalid_params, jsonrpc_invalid_request, jsonrpc_ok,
+    mcp_initialize_result, select_mcp_protocol_version,
 };
 use crate::params::{
-    McpCompletionReference, jsonrpc_cancelled_params_valid, jsonrpc_params_absent_or_empty_object,
-    parse_completion_complete_params, parse_initialize_protocol_version, parse_list_params,
-    parse_prompts_get_params, parse_resources_read_params, parse_tools_call_params,
+    McpCompletionReference, McpParamError, jsonrpc_cancelled_params_valid,
+    jsonrpc_params_absent_or_empty_object, parse_completion_complete_params,
+    parse_initialize_protocol_version, parse_list_params, parse_prompts_get_params,
+    parse_resources_read_params, parse_tools_call_params,
 };
 use crate::publication::{
     McpPromptDescriptor, McpResourceRoute, mcp_prompt_descriptors_from_gateway,
@@ -16,9 +18,8 @@ use crate::publication::{
     resolve_mcp_resource_template_descriptor, resolve_mcp_tool_surface_id,
 };
 use crate::render::{
-    mcp_completion_result_json, mcp_prompt_result_json, mcp_prompts_page_json,
-    mcp_resource_result_json, mcp_resource_templates_page_json, mcp_resources_page_json,
-    mcp_tool_outcome_result_json, mcp_tools_page_json,
+    mcp_completion_result_json, mcp_prompts_page_json, mcp_resource_templates_page_json,
+    mcp_resources_page_json, mcp_tools_page_json,
 };
 use crate::{
     McpGatewayError, McpResourceDescriptor, McpResourceTemplateDescriptor, McpToolDescriptor,
@@ -27,10 +28,11 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use xolotl_gateway::{
-    Gateway, GatewayDescriptor, GatewaySession, GatewaySubmission, PresentedCredential,
+    Gateway, GatewayDescriptor, GatewayError, GatewayPreparation, GatewaySession,
+    GatewaySubmissionHead, GatewaySubmitResult, PresentedCredential,
 };
 use xolotl_kernel::GatewayAudit;
-use xolotl_types::{Outcome, Value};
+use xolotl_types::Value;
 
 /// Transport-neutral MCP server adapter over a shared Xolotl Gateway.
 pub struct McpGateway<G: Gateway> {
@@ -50,7 +52,7 @@ impl<G: Gateway> McpGateway<G> {
     /// Configure finite ordinary-JSON response budgets for this adapter.
     /// Kernel execution and direct typed return values keep their own policies.
     /// A response can exceed its delivery budget after execution has completed;
-    /// rejection does not roll back effects already performed by that call.
+    /// an indeterminate delivery does not roll back effects already performed.
     pub fn with_output_limits(
         mut self,
         limits: crate::McpOutputLimits,
@@ -110,8 +112,18 @@ impl<G: Gateway> McpGateway<G> {
         bearer_token: impl Into<String>,
         tool: &str,
         args: Value,
-    ) -> Result<Outcome, McpGatewayError> {
-        let identity = self.authenticate_session(bearer_token.into()).await?;
+    ) -> Result<GatewaySubmitResult, McpGatewayError> {
+        self.call_tool_with_input(bearer_token.into(), tool, || Ok(args))
+            .await
+    }
+
+    async fn call_tool_with_input(
+        &self,
+        bearer_token: String,
+        tool: &str,
+        input: impl FnOnce() -> Result<Value, McpGatewayError>,
+    ) -> Result<GatewaySubmitResult, McpGatewayError> {
+        let identity = self.authenticate_session(bearer_token).await?;
         let descriptor = self.describe_session(&identity)?;
         let surface_id = match resolve_mcp_tool_surface_id(&descriptor, tool) {
             Ok(surface_id) => surface_id,
@@ -121,7 +133,12 @@ impl<G: Gateway> McpGateway<G> {
             }
             Err(error) => return Err(error),
         };
-        self.submit_direct(&identity, surface_id, args, "mcp_tool_call")
+        let preparation = self.gateway.prepare_submission(
+            &identity,
+            GatewaySubmissionHead::direct_input(surface_id),
+            None,
+        )?;
+        self.submit_direct(&identity, preparation, input()?, "mcp_tool_call")
             .await
     }
 
@@ -130,17 +147,17 @@ impl<G: Gateway> McpGateway<G> {
         &self,
         bearer_token: impl Into<String>,
         uri: &str,
-    ) -> Result<Outcome, McpGatewayError> {
+    ) -> Result<GatewaySubmitResult, McpGatewayError> {
         self.read_resource_with_route(bearer_token.into(), uri)
             .await
-            .map(|(outcome, _)| outcome)
+            .map(|(result, _)| result)
     }
 
     async fn read_resource_with_route(
         &self,
         bearer_token: String,
         uri: &str,
-    ) -> Result<(Outcome, McpResourceRoute), McpGatewayError> {
+    ) -> Result<(GatewaySubmitResult, McpResourceRoute), McpGatewayError> {
         let identity = self.authenticate_session(bearer_token).await?;
         let descriptor = self.describe_session(&identity)?;
         let route = match resolve_mcp_resource_route(&descriptor, uri) {
@@ -151,16 +168,16 @@ impl<G: Gateway> McpGateway<G> {
             }
             Err(error) => return Err(error),
         };
+        let preparation = self.gateway.prepare_submission(
+            &identity,
+            GatewaySubmissionHead::direct_input(route.surface_id.clone()),
+            None,
+        )?;
         let input = mcp_resource_read_input(uri, route.uri_template.as_deref());
-        let outcome = self
-            .submit_direct(
-                &identity,
-                route.surface_id.clone(),
-                input,
-                "mcp_resource_read",
-            )
+        let result = self
+            .submit_direct(&identity, preparation, input, "mcp_resource_read")
             .await?;
-        Ok((outcome, route))
+        Ok((result, route))
     }
 
     /// Translate one MCP `prompts/get` into a standard Gateway submission.
@@ -169,18 +186,18 @@ impl<G: Gateway> McpGateway<G> {
         bearer_token: impl Into<String>,
         prompt: &str,
         args: Value,
-    ) -> Result<Outcome, McpGatewayError> {
-        self.get_prompt_with_descriptor(bearer_token.into(), prompt, args)
+    ) -> Result<GatewaySubmitResult, McpGatewayError> {
+        self.get_prompt_with_descriptor(bearer_token.into(), prompt, || Ok(args))
             .await
-            .map(|(outcome, _)| outcome)
+            .map(|(result, _)| result)
     }
 
     async fn get_prompt_with_descriptor(
         &self,
         bearer_token: String,
         prompt: &str,
-        args: Value,
-    ) -> Result<(Outcome, McpPromptDescriptor), McpGatewayError> {
+        input: impl FnOnce() -> Result<Value, McpGatewayError>,
+    ) -> Result<(GatewaySubmitResult, McpPromptDescriptor), McpGatewayError> {
         let identity = self.authenticate_session(bearer_token).await?;
         let descriptor = self.describe_session(&identity)?;
         let prompt_descriptor = match resolve_mcp_prompt_descriptor(&descriptor, prompt) {
@@ -191,19 +208,19 @@ impl<G: Gateway> McpGateway<G> {
             }
             Err(error) => return Err(error),
         };
+        let preparation = self.gateway.prepare_submission(
+            &identity,
+            GatewaySubmissionHead::direct_input(prompt_descriptor.surface_id.clone()),
+            None,
+        )?;
         let input = Value::map(BTreeMap::from([
             ("name".into(), Value::from(prompt)),
-            ("arguments".into(), args),
+            ("arguments".into(), input()?),
         ]));
-        let outcome = self
-            .submit_direct(
-                &identity,
-                prompt_descriptor.surface_id.clone(),
-                input,
-                "mcp_prompt_get",
-            )
+        let result = self
+            .submit_direct(&identity, preparation, input, "mcp_prompt_get")
             .await?;
-        Ok((outcome, prompt_descriptor))
+        Ok((result, prompt_descriptor))
     }
 
     async fn complete(
@@ -329,7 +346,7 @@ impl<G: Gateway> McpGateway<G> {
     ) -> McpJsonRpcResponse {
         let response = self.dispatch_jsonrpc_request(bearer_token, request).await;
         if let Err(error) = self.output_limits.check_message(&response) {
-            let mut rejected = jsonrpc_gateway_error(response.id, "mcp_output_budget", error);
+            let mut rejected = self.gateway_error(response.id, "mcp_output_budget", error);
             if self.output_limits.check_message(&rejected).is_err() {
                 rejected.id = serde_json::Value::Null;
             }
@@ -381,28 +398,31 @@ impl<G: Gateway> McpGateway<G> {
                     Ok(descriptors) => {
                         match mcp_tools_page_json(descriptors, cursor, self.output_limits) {
                             Ok(result) => jsonrpc_ok(id, result),
-                            Err(error) => {
-                                jsonrpc_gateway_error(id, "mcp_tools_list_serialize", error)
-                            }
+                            Err(error) => self.gateway_error(id, "mcp_tools_list_serialize", error),
                         }
                     }
-                    Err(error) => jsonrpc_gateway_error(id, "mcp_tools_list", error),
+                    Err(error) => self.gateway_error(id, "mcp_tools_list", error),
                 }
             }
             "tools/call" => match parse_tools_call_params(request.params) {
-                Ok((tool, args)) => match self.call_tool(bearer_token, &tool, args).await {
-                    Ok(outcome) => {
-                        match mcp_tool_outcome_result_json(outcome, self.output_limits) {
-                            Ok(result) => jsonrpc_ok(id, result),
-                            Err(error) => {
-                                jsonrpc_gateway_error(id, "mcp_tool_result_serialize", error)
-                            }
-                        }
+                Ok((tool, args)) => match self
+                    .call_tool_with_input(bearer_token, &tool, || {
+                        serde_json::from_value(args).map_err(Into::into)
+                    })
+                    .await
+                {
+                    Ok(result) => {
+                        submission_response(id, result, ResultFormat::Tool, self.output_limits)
                     }
                     Err(McpGatewayError::UnknownTool(_)) => {
                         jsonrpc_error(id, JSONRPC_INVALID_PARAMS)
                     }
-                    Err(error) => jsonrpc_gateway_error(id, "mcp_tool_call", error),
+                    Err(McpGatewayError::Serialize(_)) => jsonrpc_invalid_params(
+                        id,
+                        "mcp_tool_call_params",
+                        McpParamError::BadArguments,
+                    ),
+                    Err(error) => self.gateway_error(id, "mcp_tool_call", error),
                 },
                 Err(error) => jsonrpc_invalid_params(id, "mcp_tool_call_params", error),
             },
@@ -418,11 +438,11 @@ impl<G: Gateway> McpGateway<G> {
                         match mcp_resources_page_json(descriptors, cursor, self.output_limits) {
                             Ok(result) => jsonrpc_ok(id, result),
                             Err(error) => {
-                                jsonrpc_gateway_error(id, "mcp_resources_list_serialize", error)
+                                self.gateway_error(id, "mcp_resources_list_serialize", error)
                             }
                         }
                     }
-                    Err(error) => jsonrpc_gateway_error(id, "mcp_resources_list", error),
+                    Err(error) => self.gateway_error(id, "mcp_resources_list", error),
                 }
             }
             "resources/templates/list" => {
@@ -444,38 +464,31 @@ impl<G: Gateway> McpGateway<G> {
                             self.output_limits,
                         ) {
                             Ok(result) => jsonrpc_ok(id, result),
-                            Err(error) => jsonrpc_gateway_error(
+                            Err(error) => self.gateway_error(
                                 id,
                                 "mcp_resource_templates_list_serialize",
                                 error,
                             ),
                         }
                     }
-                    Err(error) => jsonrpc_gateway_error(id, "mcp_resource_templates_list", error),
+                    Err(error) => self.gateway_error(id, "mcp_resource_templates_list", error),
                 }
             }
             "resources/read" => match parse_resources_read_params(request.params) {
                 Ok(uri) => match self.read_resource_with_route(bearer_token, &uri).await {
-                    Ok((Outcome::Done(value), route)) | Ok((Outcome::Short(value), route)) => {
-                        match mcp_resource_result_json(
-                            value,
-                            &uri,
-                            route.mime_type.as_deref(),
-                            self.output_limits,
-                        ) {
-                            Ok(result) => jsonrpc_ok(id, result),
-                            Err(error) => {
-                                jsonrpc_gateway_error(id, "mcp_resource_read_serialize", error)
-                            }
-                        }
-                    }
-                    Ok((Outcome::Fail(failure), _)) => {
-                        jsonrpc_gateway_error(id, "mcp_resource_read_outcome", failure)
-                    }
+                    Ok((result, route)) => submission_response(
+                        id,
+                        result,
+                        ResultFormat::Resource {
+                            uri: &uri,
+                            mime_type: route.mime_type.as_deref(),
+                        },
+                        self.output_limits,
+                    ),
                     Err(McpGatewayError::UnknownResource(_)) => {
                         jsonrpc_error(id, JSONRPC_RESOURCE_NOT_FOUND)
                     }
-                    Err(error) => jsonrpc_gateway_error(id, "mcp_resource_read", error),
+                    Err(error) => self.gateway_error(id, "mcp_resource_read", error),
                 },
                 Err(error) => jsonrpc_invalid_params(id, "mcp_resource_read_params", error),
             },
@@ -491,35 +504,35 @@ impl<G: Gateway> McpGateway<G> {
                         match mcp_prompts_page_json(descriptors, cursor, self.output_limits) {
                             Ok(result) => jsonrpc_ok(id, result),
                             Err(error) => {
-                                jsonrpc_gateway_error(id, "mcp_prompts_list_serialize", error)
+                                self.gateway_error(id, "mcp_prompts_list_serialize", error)
                             }
                         }
                     }
-                    Err(error) => jsonrpc_gateway_error(id, "mcp_prompts_list", error),
+                    Err(error) => self.gateway_error(id, "mcp_prompts_list", error),
                 }
             }
             "prompts/get" => match parse_prompts_get_params(request.params) {
                 Ok((prompt, args)) => match self
-                    .get_prompt_with_descriptor(bearer_token, &prompt, args)
+                    .get_prompt_with_descriptor(bearer_token, &prompt, || {
+                        serde_json::from_value(args).map_err(Into::into)
+                    })
                     .await
                 {
-                    Ok((Outcome::Done(value), prompt_descriptor))
-                    | Ok((Outcome::Short(value), prompt_descriptor)) => {
-                        match mcp_prompt_result_json(value, &prompt_descriptor, self.output_limits)
-                        {
-                            Ok(result) => jsonrpc_ok(id, result),
-                            Err(error) => {
-                                jsonrpc_gateway_error(id, "mcp_prompt_get_serialize", error)
-                            }
-                        }
-                    }
-                    Ok((Outcome::Fail(failure), _)) => {
-                        jsonrpc_gateway_error(id, "mcp_prompt_get_outcome", failure)
-                    }
+                    Ok((result, prompt_descriptor)) => submission_response(
+                        id,
+                        result,
+                        ResultFormat::Prompt(&prompt_descriptor),
+                        self.output_limits,
+                    ),
                     Err(McpGatewayError::UnknownPrompt(_)) => {
                         jsonrpc_error(id, JSONRPC_INVALID_PARAMS)
                     }
-                    Err(error) => jsonrpc_gateway_error(id, "mcp_prompt_get", error),
+                    Err(McpGatewayError::Serialize(_)) => jsonrpc_invalid_params(
+                        id,
+                        "mcp_prompt_get_params",
+                        McpParamError::BadArguments,
+                    ),
+                    Err(error) => self.gateway_error(id, "mcp_prompt_get", error),
                 },
                 Err(error) => jsonrpc_invalid_params(id, "mcp_prompt_get_params", error),
             },
@@ -533,7 +546,7 @@ impl<G: Gateway> McpGateway<G> {
                     | Err(McpGatewayError::UnknownResource(_)) => {
                         jsonrpc_error(id, JSONRPC_INVALID_PARAMS)
                     }
-                    Err(error) => jsonrpc_gateway_error(id, "mcp_completion_complete", error),
+                    Err(error) => self.gateway_error(id, "mcp_completion_complete", error),
                 },
                 Err(error) => jsonrpc_invalid_params(id, "mcp_completion_complete_params", error),
             },
@@ -590,6 +603,15 @@ impl<G: Gateway> McpGateway<G> {
         }
     }
 
+    fn gateway_error(
+        &self,
+        id: serde_json::Value,
+        label: &'static str,
+        error: McpGatewayError,
+    ) -> McpJsonRpcResponse {
+        crate::delivery::gateway_error_response(id, label, error, self.output_limits)
+    }
+
     fn describe_session(
         &self,
         session: &GatewaySession,
@@ -606,22 +628,40 @@ impl<G: Gateway> McpGateway<G> {
     async fn submit_direct(
         &self,
         session: &GatewaySession,
-        surface_id: String,
+        preparation: GatewayPreparation,
         input: Value,
         audit_label: &'static str,
-    ) -> Result<Outcome, McpGatewayError> {
-        match self
-            .gateway
-            .submit(session, GatewaySubmission::direct_input(surface_id, input))
-            .await
-        {
-            Ok(result) => Ok(result.output.outcome),
+    ) -> Result<GatewaySubmitResult, McpGatewayError> {
+        match self.gateway.submit_prepared(preparation, input, None).await {
+            Ok(result) => {
+                self.validate_delivery_access(session, &result.accepted.surface_id)?;
+                Ok(result)
+            }
             Err(error) => {
-                record_mcp_audit(&*self.gateway, Some(session), error.audit_outcome())?;
+                if let GatewayError::SubmissionIndeterminate(evidence) = &error {
+                    self.validate_delivery_access(session, &evidence.accepted.surface_id)?;
+                }
+                if let Err(audit_error) =
+                    record_mcp_audit(&*self.gateway, Some(session), error.audit_outcome())
+                {
+                    tracing::warn!(audit_label, error = ?audit_error, "mcp submission failure audit failed");
+                }
                 tracing::debug!(audit_label, error = ?error, "mcp gateway submission failed");
                 Err(error.into())
             }
         }
+    }
+
+    fn validate_delivery_access(
+        &self,
+        session: &GatewaySession,
+        surface_id: &str,
+    ) -> Result<(), McpGatewayError> {
+        self.gateway
+            .validate_submission_access(session, surface_id)
+            .map_err(|_access_error| {
+                GatewayError::Indeterminate("submission delivery access unavailable".into()).into()
+            })
     }
 }
 
@@ -639,12 +679,11 @@ fn record_mcp_audit<G: Gateway>(
     outcome: &'static str,
 ) -> Result<(), McpGatewayError> {
     gateway
-        .record_gateway_audit(GatewayAudit {
+        .record_optional_gateway_audit(GatewayAudit {
             event: "gateway_mcp",
             username: session.map(GatewaySession::identity_path),
             source_addr: None,
             outcome,
-            mfa_level: None,
             details: None,
         })
         .map_err(McpGatewayError::Audit)

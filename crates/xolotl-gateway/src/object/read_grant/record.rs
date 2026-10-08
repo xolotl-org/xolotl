@@ -123,13 +123,25 @@ pub(in crate::object) fn decode(
     grant_id: &str,
     envelope: &TaintedValue,
 ) -> Result<(ReadGrantScope, GatewayObjectReadGrant), GatewayError> {
+    let (scope, grant) = decode_unbound(envelope)?;
+    if grant.grant_id != grant_id {
+        return Err(GatewayError::Rejected(
+            "object read grant identity or version mismatch".into(),
+        ));
+    }
+    Ok((scope, grant))
+}
+
+pub(in crate::object) fn decode_unbound(
+    envelope: &TaintedValue,
+) -> Result<(ReadGrantScope, GatewayObjectReadGrant), GatewayError> {
     let encoded = envelope.value.as_str().ok_or_else(|| {
         GatewayError::Rejected("object read grant record must be encoded metadata".into())
     })?;
     let record: Record = serde_json::from_str(encoded).map_err(|error| {
         GatewayError::Rejected(format!("invalid object read grant record: {error}"))
     })?;
-    if record.schema != SCHEMA || record.grant_id != grant_id {
+    if record.schema != SCHEMA {
         return Err(GatewayError::Rejected(
             "object read grant identity or version mismatch".into(),
         ));

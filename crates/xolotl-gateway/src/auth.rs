@@ -1,4 +1,7 @@
-use crate::{GatewayError, GatewayGeneration, GatewayProfileRev, MIN_BEARER_TOKEN_BYTES};
+use crate::{
+    GatewayError, GatewayGeneration, GatewayProfileRev, MAX_BEARER_TOKEN_BYTES,
+    MIN_BEARER_TOKEN_BYTES,
+};
 use sha2::Digest;
 
 /// Credentials presented by an inbound protocol adapter. They are untrusted
@@ -8,7 +11,7 @@ pub enum PresentedCredential {
     /// A bearer secret presented through a transport credential channel.
     Bearer(BearerToken),
     /// A TLS client certificate verified by the listener and matched by DER
-    /// SHA-256 fingerprint.
+    /// SHA-384 fingerprint.
     ClientCertificate(ClientCertificateCredential),
 }
 
@@ -57,6 +60,11 @@ impl BearerTokenHash {
                 "bearer tokens must be at least {MIN_BEARER_TOKEN_BYTES} bytes"
             )));
         }
+        if token.len() > MAX_BEARER_TOKEN_BYTES {
+            return Err(GatewayError::InvalidProfile(format!(
+                "bearer tokens must be at most {MAX_BEARER_TOKEN_BYTES} bytes"
+            )));
+        }
         Ok(Self(hash_bearer_token(token)))
     }
 
@@ -89,48 +97,48 @@ impl std::fmt::Debug for BearerTokenHash {
 /// TLS client certificate credential material presented by a transport.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientCertificateCredential {
-    pub(crate) der_sha256: ClientCertificateDerSha256,
+    pub(crate) der_sha384: ClientCertificateDerSha384,
 }
 
 impl ClientCertificateCredential {
     /// Hash a leaf certificate DER to its profile matcher.
     pub fn from_der(der: impl AsRef<[u8]>) -> Self {
         Self {
-            der_sha256: ClientCertificateDerSha256::from_der(der),
+            der_sha384: ClientCertificateDerSha384::from_der(der),
         }
     }
 }
 
-/// SHA-256 fingerprint of a client certificate DER.
+/// SHA-384 fingerprint of a client certificate DER.
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ClientCertificateDerSha256(pub(crate) String);
+pub struct ClientCertificateDerSha384(pub(crate) String);
 
-impl ClientCertificateDerSha256 {
+impl ClientCertificateDerSha384 {
     /// Hash certificate DER bytes for use in a gateway profile.
     pub fn from_der(der: impl AsRef<[u8]>) -> Self {
-        let digest = sha2::Sha256::digest(der.as_ref());
+        let digest = sha2::Sha384::digest(der.as_ref());
         Self(hex_lower(&digest))
     }
 
-    /// Use a precomputed lowercase hex SHA-256 fingerprint from deployment config.
+    /// Use a precomputed lowercase hex SHA-384 fingerprint from deployment config.
     pub fn from_hex(hash: impl Into<String>) -> Result<Self, GatewayError> {
         let hash = hash.into();
-        let ok = hash.len() == 64
+        let ok = hash.len() == 96
             && hash
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
         if !ok {
             return Err(GatewayError::InvalidProfile(
-                "client certificate DER SHA-256 must be a 64-character lowercase hex string".into(),
+                "client certificate DER SHA-384 must be a 96-character lowercase hex string".into(),
             ));
         }
         Ok(Self(hash))
     }
 }
 
-impl std::fmt::Debug for ClientCertificateDerSha256 {
+impl std::fmt::Debug for ClientCertificateDerSha384 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ClientCertificateDerSha256(<redacted>)")
+        f.write_str("ClientCertificateDerSha384(<redacted>)")
     }
 }
 
@@ -189,18 +197,18 @@ impl GatewayCredential {
         }
     }
 
-    /// Accept a TLS client certificate by DER SHA-256 fingerprint.
-    pub fn client_certificate_der_sha256(
+    /// Accept a TLS client certificate by DER SHA-384 fingerprint.
+    pub fn client_certificate_der_sha384(
         credential_id: impl Into<String>,
         principal_id: impl Into<String>,
-        der_sha256: ClientCertificateDerSha256,
+        der_sha384: ClientCertificateDerSha384,
     ) -> Self {
         Self {
             credential_id: credential_id.into(),
             principal_id: principal_id.into(),
             enabled: true,
             generation: 1,
-            kind: GatewayCredentialKind::ClientCertificate { der_sha256 },
+            kind: GatewayCredentialKind::ClientCertificate { der_sha384 },
         }
     }
 
@@ -225,10 +233,10 @@ pub(crate) enum GatewayCredentialKind {
         /// BLAKE3 hash of the high-entropy bearer token.
         token_hash: BearerTokenHash,
     },
-    /// TLS client certificate checked by DER SHA-256 fingerprint.
+    /// TLS client certificate checked by DER SHA-384 fingerprint.
     ClientCertificate {
-        /// SHA-256 fingerprint of the leaf certificate DER.
-        der_sha256: ClientCertificateDerSha256,
+        /// SHA-384 fingerprint of the leaf certificate DER.
+        der_sha384: ClientCertificateDerSha384,
     },
 }
 
@@ -238,7 +246,7 @@ pub(crate) enum GatewayCredentialKind {
 pub struct GatewayIdentityMapping {
     /// Verified external principal id.
     pub(crate) principal_id: String,
-    /// Xolotl identity path, usually `process://<account-or-agent>`.
+    /// Concrete `identity://...` path in the Kernel's shared identity directory.
     pub(crate) identity_path: String,
     /// Whether this principal mapping is active in the profile snapshot.
     pub(crate) enabled: bool,

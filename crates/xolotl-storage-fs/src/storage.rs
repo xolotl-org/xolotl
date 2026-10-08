@@ -5,20 +5,38 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use xolotl_state::object::{ObjectMetadata, ObjectReadChunk};
 use xolotl_state::{StateError, StateFailure, StateResult};
-use xolotl_types::TaintSet;
+use xolotl_types::{BlobRef, TaintSet};
 
 mod metadata;
+
+pub(crate) fn create_root(root: &Path) -> StateResult<()> {
+    let root = std::path::absolute(root).map_err(io_error)?;
+    let mut missing = Vec::new();
+    let mut candidate = root.as_path();
+    while !candidate.try_exists().map_err(io_error)? {
+        missing.push(candidate.to_owned());
+        let Some(parent) = candidate.parent() else {
+            break;
+        };
+        candidate = parent;
+    }
+    std::fs::create_dir_all(root.join("objects")).map_err(io_error)?;
+    std::fs::create_dir_all(root.join("staging")).map_err(io_error)?;
+    sync_directory_platform(&root)?;
+    for directory in missing {
+        if let Some(parent) = directory.parent() {
+            sync_directory_platform(parent)?;
+        }
+    }
+    Ok(())
+}
 
 pub(crate) fn io_error(error: std::io::Error) -> StateFailure {
     StateError::Backend(error.to_string()).into()
 }
 
 pub(crate) fn validate_hash(hash: &str) -> StateResult<&str> {
-    if hash.len() != 64
-        || !hash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if !BlobRef::is_valid_hash(hash) {
         return Err(StateError::Backend("invalid object hash".into()).into());
     }
     Ok(hash)
@@ -87,15 +105,53 @@ pub(crate) fn read_chunk(
     ))
 }
 
+fn sync_directory(shared: &Shared, directory: &Path) -> StateResult<()> {
+    #[cfg(test)]
+    if directory.parent() == Some(shared.root.join("objects").as_path())
+        && shared
+            .probe
+            .metadata_sync_failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+    {
+        return Err(io_error(std::io::Error::other(
+            "injected metadata directory sync failure",
+        )));
+    }
+    #[cfg(test)]
+    if directory == shared.root.join("objects") {
+        shared
+            .probe
+            .objects_sync_calls
+            .fetch_add(1, Ordering::Relaxed);
+        if shared
+            .probe
+            .objects_sync_failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(io_error(std::io::Error::other(
+                "injected object directory sync failure",
+            )));
+        }
+    }
+    let _shared = shared;
+    sync_directory_platform(directory)
+}
+
 #[cfg(unix)]
-fn sync_directory(directory: &Path) -> StateResult<()> {
+fn sync_directory_platform(directory: &Path) -> StateResult<()> {
     File::open(directory)
         .and_then(|file| file.sync_all())
         .map_err(io_error)
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_directory: &Path) -> StateResult<()> {
+fn sync_directory_platform(_directory: &Path) -> StateResult<()> {
     Ok(())
 }
 
@@ -135,23 +191,33 @@ fn publish_inner(
             if existing.blob.size != result.blob.size {
                 return Err(StateError::Backend("conflicting object length".into()).into());
             }
-            existing.taint.union(&result.taint);
-            metadata::write(
-                &destination,
-                &existing,
-                shared.options.max_metadata_bytes.get(),
-            )?;
+            if existing.taint.contains_all(&result.taint) {
+                metadata::confirm(shared, &destination)?;
+            } else {
+                existing.taint.union(&result.taint);
+                metadata::write(
+                    shared,
+                    &destination,
+                    &existing,
+                    shared.options.max_metadata_bytes.get(),
+                )?;
+            }
             result = existing;
         }
         None => {
-            metadata::write(staging, &result, shared.options.max_metadata_bytes.get())?;
+            metadata::write(
+                shared,
+                staging,
+                &result,
+                shared.options.max_metadata_bytes.get(),
+            )?;
             if cancelled.load(Ordering::Acquire) {
                 return Err(StateError::Backend("upload was cancelled".into()).into());
             }
             std::fs::rename(staging, &destination).map_err(io_error)?;
-            sync_directory(&objects)?;
         }
     }
+    sync_directory(shared, &objects)?;
     // Read the published metadata while still holding the publication lock.
     // The receipt reflects durable sources, including the deduplicated object's
     // previous floor; locally decorating a receipt cannot establish that fact.
@@ -185,10 +251,11 @@ pub(crate) fn delete(shared: &Shared, hash: &str) -> StateResult<()> {
             objects.join(validate_hash(hash)?),
             retired.path().join("object"),
         ) {
-            Ok(()) => sync_directory(&objects)?,
+            Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error(error)),
         }
+        sync_directory(shared, &objects)?;
     }
     retired.close().map_err(io_error)
 }

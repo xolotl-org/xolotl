@@ -1,7 +1,7 @@
 //! Compare shared decisions under the same externally ordered completions.
 
 use super::*;
-use crate::{Bootstrap, LinkedExecution, MethodSpec, PendingCall, PreparedProgram, RequestDriver};
+use crate::{LinkedExecution, MethodSpec, PendingCall, PreparedProgram, RequestDriver};
 use anyhow::{Context as _, ensure};
 use core::num::NonZeroU32;
 use parking_lot::Mutex;
@@ -18,6 +18,91 @@ use xolotl_graph::{
     portable::{Expression as E, Program},
 };
 use xolotl_types::{ExecutionOutput, Path, Purity, TaintedFailure, TaintedValue};
+
+#[tokio::test]
+async fn hosted_and_portable_completions_agree_on_sink_projection_and_billing() -> anyhow::Result<()>
+{
+    for outcome in [
+        Outcome::Done(Value::string("retained response".into())),
+        Outcome::Short(Value::string("retained response".into())),
+        Outcome::Fail(Failure::InvalidInput {
+            reason: "source failure".into(),
+        }),
+    ] {
+        for mode in [OutputMode::Unary, OutputMode::SinkOnly] {
+            let mut script = Script::new(false)?;
+            script.outputs[0].outcome = outcome.clone();
+            script.outputs[0].origin = CompletionOrigin::CachedOutcome;
+            script.release(1);
+            let script = Arc::new(script);
+            let mut method = contract();
+            method.supports |= OutputModeSet::SINK_ONLY;
+            let mut op = operation();
+            op.output = mode;
+            op.taint = TaintSet::author();
+            let mut plan = crate::driver::DriverPlan::new(xolotl_types::DriverId::new(1), None, 0);
+            plan.insert(
+                op.method,
+                method,
+                Arc::new(Endpoint {
+                    script: script.clone(),
+                    slot: 0,
+                }),
+            );
+            let handles = crate::HandleTable::new();
+            op.handle = handles.insert(crate::Handle {
+                open_verb: "perform".into(),
+                id: op.handle,
+                process: op.process,
+                acting: op.acting,
+                resource: grant(method).resource,
+                rights: grant(method).rights,
+                driver_plan: plan,
+                fast_path: crate::handle::FastPath::Unconditional,
+                bound_path: None,
+            })?;
+            let processes = crate::process::ProcessTable::new();
+            let mut entry = crate::process::ProcessEntry::new(op.process, None, op.acting);
+            ensure!(entry.scope.start());
+            processes.insert(entry);
+            let (facts, _store) = crate::FactSink::in_memory();
+            let hosted = crate::DataPlane::new(
+                handles,
+                facts,
+                xolotl_state::InMemoryBackend::new().into_backend(),
+            )
+            .with_host_runtime(processes.host_runtime().clone())?
+            .with_processes(processes.clone())?;
+            let expected = match (mode, outcome.clone()) {
+                (OutputMode::SinkOnly, Outcome::Done(_)) => Outcome::Done(Value::null()),
+                (OutputMode::SinkOnly, Outcome::Short(_)) => Outcome::Short(Value::null()),
+                (_, outcome) => outcome,
+            };
+            let events = Events::default();
+            let accounts = Accounts::new(&events);
+            let recorder = Recorder::new(&events);
+            let portable = invoke(
+                op.clone(),
+                grant(method),
+                options(true),
+                CallContext::Body,
+                script.as_ref(),
+                &recorder,
+                &accounts,
+            )?
+            .await;
+            let result = hosted.execute(&op, options(true)).await;
+            ensure!(portable.output.outcome == expected && portable == result);
+            ensure!(portable.completion_error.is_none());
+            ensure!(accounts.completions.borrow()[0].2 == result.output);
+            ensure!(
+                processes.budget_mut(op.process, |budget| budget.clone())
+                    == Some(accounts.budget())
+            );
+        }
+    }
+    Ok(())
+}
 
 struct Script {
     outputs: [DriverOutput; 2],
@@ -143,15 +228,25 @@ struct Portable<'a> {
 struct PortableCall<'a>(Result<InvocationCall<'a, Script, Recorder, Accounts>, TaintedFailure>);
 
 impl Future for PortableCall<'_> {
-    type Output = HostEvent<TaintedValue, TaintedFailure>;
+    type Output = crate::RequestCompletion;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Poll::Ready(HostEvent::Complete(match &mut self.get_mut().0 {
-            Ok(call) => core::task::ready!(Pin::new(call).poll(cx))
-                .output
-                .into_result(),
+        Poll::Ready(Ok(HostEvent::Complete(match &mut self.get_mut().0 {
+            Ok(call) => {
+                let operation = call.operation();
+                let result = core::task::ready!(Pin::new(call).poll(cx));
+                if let Some(error) = result.completion_error
+                    && error.requires_interruption()
+                {
+                    return Poll::Ready(Err(TaintedFailure::new(
+                        error.outcome_unknown(operation),
+                        result.output.taint,
+                    )));
+                }
+                result.output.into_result()
+            }
             Err(failure) => Err(failure.clone()),
-        }))
+        })))
     }
 }
 
@@ -160,6 +255,27 @@ impl RequestDriver for Portable<'_> {
         = PortableCall<'a>
     where
         Self: 'a;
+
+    fn collect_evidence<'a>(
+        &'a self,
+        call: &Self::Call<'a>,
+        completion: Option<&crate::RequestCompletion>,
+        unresolved: &mut xolotl_types::UnresolvedOperations,
+    ) {
+        if let Some(Err(failure) | Ok(HostEvent::Complete(Err(failure)))) = completion
+            && let Failure::OutcomeUnknown { operation_ids, .. } = &failure.failure
+        {
+            for operation in operation_ids {
+                unresolved.record(operation);
+            }
+        }
+        if let Ok(invocation) = &call.0
+            && (completion.is_none() || matches!(completion, Some(Err(_))))
+            && invocation.effect_may_have_started()
+        {
+            unresolved.record(&invocation.operation().to_string());
+        }
+    }
 
     fn call(&self, resource: u32, request: Request<TaintedValue>) -> Self::Call<'_> {
         let mut operation = operation();
@@ -176,7 +292,7 @@ impl RequestDriver for Portable<'_> {
         let call = invoke(
             operation.clone(),
             admitted,
-            options(false),
+            options(true),
             CallContext::Body,
             self.script,
             self.recorder,
@@ -187,7 +303,7 @@ impl RequestDriver for Portable<'_> {
                 &operation,
                 Some(ResourceId::new(u64::from(resource))),
                 contract.replay,
-                options(false).now_millis,
+                options(true),
                 DecisionTag::Denied,
             ));
             TaintedFailure::new(failure, operation.taint)
@@ -196,18 +312,24 @@ impl RequestDriver for Portable<'_> {
     }
 }
 
-fn poll_until_boundary<F: Future<Output = ExecutionOutput>>(
+async fn poll_until_boundary<F: Future<Output = ExecutionOutput>>(
     mut run: Pin<&mut F>,
     script: &Script,
     starts: usize,
 ) -> anyhow::Result<Poll<ExecutionOutput>> {
-    for _ in 0..128 {
-        let output = run.as_mut().poll(&mut Context::from_waker(Waker::noop()));
-        if output.is_ready() || script.inputs.lock().len() >= starts {
-            return Ok(output);
-        }
-    }
-    anyhow::bail!("execution did not reach its scripted boundary")
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        std::future::poll_fn(|cx| {
+            let output = run.as_mut().poll(cx);
+            if output.is_ready() || script.inputs.lock().len() >= starts {
+                Poll::Ready(output)
+            } else {
+                Poll::Pending
+            }
+        }),
+    )
+    .await
+    .context("execution did not reach its scripted boundary")
 }
 
 type FactDecision = (DecisionTag, ReplayClass, Value, TaintSet, Option<Value>);
@@ -233,14 +355,19 @@ fn decisions(facts: &[Fact]) -> Vec<FactDecision> {
 async fn ordered_failures_share_recovery_authority_usage_and_fact_decisions() -> anyhow::Result<()>
 {
     for protected in [false, true] {
-        let boot = Bootstrap::in_memory();
+        let boot = crate::fact::testing::observing_bootstrap();
         let hosted_script = Arc::new(Script::new(protected)?);
         let mut expressions = Vec::new();
         for (slot, path) in ["effect://parity/source", "effect://parity/recover"]
             .into_iter()
             .enumerate()
         {
-            let mut spec = MethodSpec::unary_async("invoke", Purity::Effectful);
+            let mut spec = MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                Purity::Effectful,
+                MethodSpec::UNARY_ASYNC,
+            );
             if slot == 1 {
                 spec = spec.unprotected_input();
             }
@@ -313,26 +440,40 @@ async fn ordered_failures_share_recovery_authority_usage_and_fact_decisions() ->
             input.clone(),
             IdentityRef::ROOT.get(),
         )?;
+        let mut unresolved = xolotl_types::UnresolvedOperations::default();
         let mut portable = LinkedExecution::new(
             machine,
             &linked,
             &mut handles,
             &adapter,
             &mut pending,
+            &mut unresolved,
             NonZeroU32::MIN.saturating_add(31),
         )?;
-        let executor = boot.kernel.executor_for(boot.root);
+        let executor = boot
+            .kernel()
+            .executor_for(boot.root())
+            .with_fact_recording(true);
         let mut hosted = Box::pin(executor.eval_prepared(&prepared, input));
-        ensure!(poll_until_boundary(Pin::new(&mut portable), &portable_script, 1)?.is_pending());
-        ensure!(poll_until_boundary(hosted.as_mut(), &hosted_script, 1)?.is_pending());
+        ensure!(
+            poll_until_boundary(Pin::new(&mut portable), &portable_script, 1)
+                .await?
+                .is_pending()
+        );
+        ensure!(
+            poll_until_boundary(hosted.as_mut(), &hosted_script, 1)
+                .await?
+                .is_pending()
+        );
         ensure!(accounts.budget().inflight_ops == 1);
         let mut result = None;
         for released in 1..=2 {
             portable_script.release(released);
             hosted_script.release(released);
             let portable =
-                poll_until_boundary(Pin::new(&mut portable), &portable_script, released + 1)?;
-            let hosted = poll_until_boundary(hosted.as_mut(), &hosted_script, released + 1)?;
+                poll_until_boundary(Pin::new(&mut portable), &portable_script, released + 1)
+                    .await?;
+            let hosted = poll_until_boundary(hosted.as_mut(), &hosted_script, released + 1).await?;
             match (portable, hosted) {
                 (Poll::Ready(portable), Poll::Ready(hosted)) => {
                     ensure!(
@@ -365,15 +506,15 @@ async fn ordered_failures_share_recovery_authority_usage_and_fact_decisions() ->
         ensure!(*portable_script.dropped.lock() == *hosted_script.dropped.lock());
         ensure!(portable_script.inputs.lock().len() == if protected { 1 } else { 2 });
         let hosted_budget = boot
-            .kernel
-            .processes
-            .budget_mut(boot.root, |budget| budget.clone())
+            .kernel()
+            .processes()
+            .budget_mut(boot.root(), |budget| budget.clone())
             .context("hosted account")?;
         ensure!(accounts.budget() == hosted_budget);
         ensure!(hosted_budget.inflight_ops == 0);
         ensure!(hosted_budget.spent_micro_usd == if protected { 24 } else { 39 });
         ensure!(hosted_budget.inference_tokens == if protected { 5 } else { 6 });
-        let hosted_facts = boot.kernel.facts.facts_of(boot.root)?;
+        let hosted_facts = boot.kernel().facts().facts_of(boot.root())?;
         let portable_facts = recorder.facts.borrow();
         let portable_decisions = decisions(&portable_facts);
         let hosted_decisions = decisions(&hosted_facts);

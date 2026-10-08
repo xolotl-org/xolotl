@@ -122,6 +122,7 @@ mod tests {
             ),
             schema_version: Fact::SCHEMA_VERSION,
             caller: process,
+            caller_identity: Some(IdentityRef::ROOT),
             acting: IdentityRef::ROOT,
             handle: HandleId::new(0, 1),
             resource: ResourceId::new(1),

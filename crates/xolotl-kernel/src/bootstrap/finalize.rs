@@ -1,7 +1,10 @@
-//! Resume process finalizers and commit stable lifecycle records.
+//! Finish live process finalizers and release their owned resources.
 
 use super::*;
 use crate::process::{FinalizationGuard, FinalizeStart, ProcessTable};
+
+#[cfg(test)]
+mod tests;
 
 impl Bootstrap {
     /// Close a process tree, aborting and awaiting its bodies before finalization.
@@ -9,7 +12,8 @@ impl Bootstrap {
     /// Finished ancestors still close any independently running descendants.
     /// To let a body run lexical cleanup, cancel it and await its normal outcome.
     pub async fn finalize_process(&self, process: ProcessId) -> Result<(), BootstrapError> {
-        let processes = &self.kernel.processes;
+        let processes = self.kernel().processes();
+        let ticket = self.cleanup_ticket(process)?;
         let current = processes
             .status(process)
             .ok_or(BootstrapError::NoSuchProcess { process })?;
@@ -19,8 +23,18 @@ impl Bootstrap {
         } else {
             ProcessStatus::Cancelled
         };
+        // Select members and retain their cleanup owners in the same transition
+        // that closes tree admission, before any cancellation observer runs.
+
+        let selection = processes
+            .request_tree_cleanup_selection(&ticket)
+            .map_err(|_error| BootstrapError::NoSuchProcess { process })?;
+        let descendants: Vec<_> = selection
+            .tickets()
+            .iter()
+            .map(crate::process::CleanupTicket::process)
+            .collect();
         let guard = acquire_finalization(processes, process, status).await?;
-        let descendants = processes.request_cleanup_tree(process);
         for descendant in &descendants {
             processes.abort_task(*descendant);
         }
@@ -36,10 +50,10 @@ impl Bootstrap {
             let result =
                 match acquire_finalization(processes, descendant, ProcessStatus::Cancelled).await {
                     Ok(Some(guard)) => {
-                        finish_process_terminal_attempt(&self.kernel, descendant, guard).await
+                        finish_process_terminal_attempt(self.kernel(), descendant, guard).await
                     }
                     Ok(None) => {
-                        self.kernel.handles.write().revoke_owned_by(descendant);
+                        self.kernel().handles().write().revoke_owned_by(descendant);
                         Ok(())
                     }
                     Err(error) => Err(error),
@@ -52,9 +66,9 @@ impl Bootstrap {
             return Err(error);
         }
         if let Some(guard) = guard {
-            finish_process_terminal_attempt(&self.kernel, process, guard).await?;
+            finish_process_terminal_attempt(self.kernel(), process, guard).await?;
         } else {
-            self.kernel.handles.write().revoke_owned_by(process);
+            self.kernel().handles().write().revoke_owned_by(process);
         }
         Ok(())
     }
@@ -62,8 +76,8 @@ impl Bootstrap {
     /// Request cancellation at the process's next execution boundary.
     /// Use tree finalization when descendants must also stop.
     pub fn cancel_process(&self, process: ProcessId) -> Result<bool, BootstrapError> {
-        self.kernel
-            .processes
+        self.kernel()
+            .processes()
             .cancel_if_non_terminal(process)
             .ok_or(BootstrapError::NoSuchProcess { process })
     }
@@ -79,6 +93,7 @@ impl Bootstrap {
             process,
             crate::process::outcome_status(&output.outcome),
             &output.taint,
+            Some(&output.unresolved_operations),
         )
         .await
     }
@@ -91,7 +106,7 @@ impl Bootstrap {
         process: ProcessId,
         status: ProcessStatus,
     ) -> Result<(), BootstrapError> {
-        self.finish_process_with_control(process, status, &xolotl_types::TaintSet::pristine())
+        self.finish_process_with_control(process, status, &xolotl_types::TaintSet::pristine(), None)
             .await
     }
 
@@ -100,26 +115,27 @@ impl Bootstrap {
         process: ProcessId,
         status: ProcessStatus,
         taint: &xolotl_types::TaintSet,
+        unresolved_operations: Option<&xolotl_types::UnresolvedOperations>,
     ) -> Result<(), BootstrapError> {
         if !status.is_terminal() {
             return Err(BootstrapError::NonterminalStatus { process, status });
         }
-        reject_self_wait(&self.kernel.processes, process, false)?;
-        let Some(guard) = acquire_finalization(&self.kernel.processes, process, status).await?
+        reject_self_wait(self.kernel().processes(), process, false)?;
+        let Some(guard) = acquire_finalization(self.kernel().processes(), process, status).await?
         else {
             return Ok(());
         };
-        self.kernel
-            .processes
-            .retain_finalization_control(process, taint)
+        self.kernel()
+            .processes()
+            .retain_finalization_control(process, taint, unresolved_operations)
             .ok_or(BootstrapError::NoSuchProcess { process })?;
-        self.kernel.processes.abort_task(process);
-        self.kernel.processes.wait_for_task_exit(process).await;
-        finish_process_terminal_attempt(&self.kernel, process, guard).await
+        self.kernel().processes().abort_task(process);
+        self.kernel().processes().wait_for_task_exit(process).await;
+        finish_process_terminal_attempt(self.kernel(), process, guard).await
     }
 }
 
-fn reject_self_wait(
+pub(super) fn reject_self_wait(
     processes: &ProcessTable,
     process: ProcessId,
     tree: bool,
@@ -136,11 +152,73 @@ fn reject_self_wait(
     Ok(())
 }
 
+pub(super) fn reject_cleanup_self_wait(
+    processes: &ProcessTable,
+    process: ProcessId,
+    selection: &crate::process::CleanupSelection,
+) -> Result<(), BootstrapError> {
+    let body = crate::process::current_process(processes).filter(|id| processes.has_task(*id));
+    if [body, crate::process::current_finalizer(processes)]
+        .into_iter()
+        .flatten()
+        .any(|owner| selection.contains(owner))
+    {
+        return Err(BootstrapError::ProcessBusy { process });
+    }
+    Ok(())
+}
+
+/// Retry a pinned selection without selecting another native process tree.
+/// Cleanup owners and identity pins outlive task termination and finalization.
+pub(super) async fn finish_cleanup_selection(
+    kernel: &Kernel,
+    process: ProcessId,
+    selection: &crate::process::CleanupSelection,
+) -> Result<(), BootstrapError> {
+    let processes = kernel.processes();
+    reject_cleanup_self_wait(processes, process, selection)?;
+    for ticket in selection.tickets() {
+        processes.abort_task(ticket.process());
+    }
+    for ticket in selection.tickets() {
+        processes.wait_for_task_exit(ticket.process()).await;
+    }
+    let mut failure = None;
+    for ticket in selection.tickets() {
+        let member = ticket.process();
+        // A tree owner's lifecycle follows its selected descendants. Continue
+        // cleaning siblings after a failure, but leave this owner unpublished
+        // until a later retry finishes all selected descendant attempts.
+        if member == process
+            && let Some(error) = failure.take()
+        {
+            return Err(error);
+        }
+        let status = ticket
+            .terminal_status()
+            .ok_or(BootstrapError::ProcessUnavailable { process: member })?;
+        let result = match acquire_finalization(processes, member, status).await {
+            Ok(Some(guard)) => finish_process_terminal_attempt(kernel, member, guard).await,
+            Ok(None) => {
+                // A completed Local owner may since have selected Tree. Honor
+                // the saved handle closure even when its lifecycle stays closed.
+                close_process_handles(processes, kernel.handles(), member);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            failure.get_or_insert(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
 pub(crate) async fn acquire_finalization(
     processes: &ProcessTable,
     process: ProcessId,
     status: ProcessStatus,
-) -> Result<Option<FinalizationGuard<'_>>, BootstrapError> {
+) -> Result<Option<FinalizationGuard>, BootstrapError> {
     loop {
         match processes.begin_finalizing(process, status) {
             FinalizeStart::Started => {
@@ -164,36 +242,12 @@ pub(crate) async fn acquire_finalization(
 pub(super) async fn finish_process_terminal_attempt(
     kernel: &Kernel,
     process: ProcessId,
-    guard: FinalizationGuard<'_>,
-) -> Result<(), BootstrapError> {
-    finish_process_terminal_attempt_with_journal(
-        kernel,
-        process,
-        guard,
-        #[cfg(feature = "durable")]
-        None,
-    )
-    .await
-}
-
-async fn finish_process_terminal_attempt_with_journal(
-    kernel: &Kernel,
-    process: ProcessId,
-    guard: FinalizationGuard<'_>,
-    #[cfg(feature = "durable")] journal: Option<
-        &mut (dyn crate::executor::durable::CheckpointJournal + 'static),
-    >,
+    guard: FinalizationGuard,
 ) -> Result<(), BootstrapError> {
     crate::process::scope_finalizer(
-        &kernel.processes,
+        kernel.processes(),
         process,
-        finish_terminal(
-            kernel,
-            process,
-            guard,
-            #[cfg(feature = "durable")]
-            journal,
-        ),
+        finish_terminal(kernel, process, guard),
     )
     .await
 }
@@ -201,47 +255,45 @@ async fn finish_process_terminal_attempt_with_journal(
 async fn finish_terminal(
     kernel: &Kernel,
     process: ProcessId,
-    _guard: FinalizationGuard<'_>,
-    #[cfg(feature = "durable")] journal: Option<
-        &mut (dyn crate::executor::durable::CheckpointJournal + 'static),
-    >,
+    guard: FinalizationGuard,
 ) -> Result<(), BootstrapError> {
-    #[cfg(feature = "durable")]
-    let mut owned_journal = if journal.is_none()
-        && kernel.processes.checkpoint_required(process) == Some(true)
-        && kernel.processes.checkpoint_retired(process) != Some(true)
-    {
-        let store = kernel.checkpoint_store.as_ref().ok_or_else(|| {
-            checkpoint_error(xolotl_types::Failure::policy(
-                "checkpoint",
-                "missing lifecycle journal store",
-            ))
-        })?;
-        Some(store.acquire(process).map_err(checkpoint_error)?)
-    } else {
-        None
-    };
-    #[cfg(feature = "durable")]
-    let journal = match journal {
-        Some(journal) => Some(journal),
-        None => owned_journal.as_mut().map(|journal| journal.as_mut()),
-    };
-    if kernel.processes.lifecycle_execution(process).is_none() {
+    let deadline = kernel
+        .host_runtime()
+        .deadline_after(kernel.execution_config().cleanup_timeout);
+    if kernel.processes().lifecycle_execution(process).is_none() {
         let execution = kernel.execution_ids().allocate()?;
         kernel
-            .processes
+            .processes()
             .initialize_lifecycle(process, execution)
             .ok_or(BootstrapError::NoSuchProcess { process })?;
     }
-    while kernel.processes.has_finalizers(process) {
+    while kernel.processes().has_finalizers(process) {
         // Reserve before consuming the finalizer so allocation failures remain retryable.
         let execution = kernel.execution_ids().allocate()?;
         let body = kernel
-            .processes
+            .processes()
             .next_finalizer(process)
             .ok_or(BootstrapError::NoSuchProcess { process })?;
-        let ex = kernel.executor_for(process).with_finalizer_mode();
-        let output = ex.eval_finalizer(&body, execution).await;
+        let mut ex = kernel.executor_for(process).with_finalizer_mode();
+        if let Some(authorizer) = kernel.processes().request_authorizer(process) {
+            ex = ex.with_request_authorizer(authorizer);
+        }
+        let output = match deadline {
+            Some(deadline) => match ex.with_deadline(deadline) {
+                Ok(ex) => ex.eval_finalizer(&body, execution).await,
+                Err(error) => xolotl_types::ExecutionOutput::new(
+                    xolotl_types::Outcome::Fail(error.into()),
+                    xolotl_types::TaintSet::pristine(),
+                ),
+            },
+            None => xolotl_types::ExecutionOutput::new(
+                xolotl_types::Outcome::Fail(xolotl_types::Failure::policy(
+                    "cleanup",
+                    "host clock cannot represent the configured cleanup allowance",
+                )),
+                xolotl_types::TaintSet::pristine(),
+            ),
+        };
         if let xolotl_types::Outcome::Fail(failure) = &output.outcome {
             tracing::warn!(
                 process = process.get(),
@@ -250,18 +302,16 @@ async fn finish_terminal(
             );
         }
         kernel
-            .processes
+            .processes()
             .finish_finalizer(process, output)
             .ok_or(BootstrapError::NoSuchProcess { process })?;
     }
     commit_process_terminal(
-        &kernel.processes,
-        &kernel.handles,
-        &kernel.facts,
-        &kernel.state,
+        kernel.processes(),
+        kernel.handles(),
+        kernel.state(),
         process,
-        #[cfg(feature = "durable")]
-        journal,
+        guard,
     )
     .await
 }
@@ -270,209 +320,72 @@ async fn finish_terminal(
 /// This path needs no registry, compiler, executor or identity allocator.
 pub(crate) async fn commit_process_terminal(
     processes: &ProcessTable,
-    handles: &parking_lot::RwLock<crate::HandleTable>,
-    facts: &crate::FactSink,
+    handles: &crate::HandleTable,
     state: &xolotl_state::Backend,
     process: ProcessId,
-    #[cfg(feature = "durable")] journal: Option<
-        &mut (dyn crate::executor::durable::CheckpointJournal + 'static),
-    >,
+    guard: FinalizationGuard,
 ) -> Result<(), BootstrapError> {
-    let lifecycle_execution = processes
-        .lifecycle_execution(process)
-        .ok_or(BootstrapError::NoSuchProcess { process })?;
+    let owned_processes = processes.clone();
+    let owned_handles = handles.clone();
+    let work = processes
+        .host_runtime()
+        .dispatch_blocking(move || {
+            let record = commit_process_terminal_record(&owned_processes, &owned_handles, process);
+            (guard, record)
+        })
+        .map_err(BootstrapError::TerminalRecordScheduling)?;
+    // The accepted disposal job retains its finalization owner even if the waiter exits.
+    let (_guard, record) = work.await.map_err(BootstrapError::TerminalRecordUnknown)?;
+    let actual_status = record?;
+    // Handle release precedes publication. Publication failure remains retryable.
+    if let Some(publication) = processes.publication(process) {
+        let outcome = processes.finalization_outcome(process);
+        publication
+            .publish(state, process, actual_status, outcome.as_deref())
+            .await?;
+    }
+    processes
+        .complete_finalization(process)
+        .ok_or(BootstrapError::NoSuchProcess { process })
+}
+
+fn commit_process_terminal_record(
+    processes: &ProcessTable,
+    handles: &crate::HandleTable,
+    process: ProcessId,
+) -> Result<ProcessStatus, BootstrapError> {
     let terminal_status = processes
         .finalization_status(process)
         .ok_or(BootstrapError::NoSuchProcess { process })?;
-    let finalizer_failures = processes
-        .finalizer_failures(process)
-        .ok_or(BootstrapError::NoSuchProcess { process })?;
-    let taint = processes
-        .finalization_taint(process)
-        .ok_or(BootstrapError::NoSuchProcess { process })?;
 
-    let (released, revoked) = close_process_handles(processes, handles, process)
+    close_process_handles(processes, handles, process)
         .ok_or(BootstrapError::NoSuchProcess { process })?;
-    let (finalized, closed) = if let Some(record) = processes.finalization_record(process) {
-        record
-    } else {
-        let closed = released + revoked;
-        let finalizer_failure_count = finalizer_failures.len();
-        let finalized = Fact {
-            id: xolotl_types::OperationId::new(
-                process,
-                lifecycle_execution,
-                xolotl_types::InvocationId::new(0),
-                FINALIZED_NODE,
-                0,
-            ),
-            schema_version: Fact::SCHEMA_VERSION,
-            caller: process,
-            acting: processes
-                .identity(process)
-                .ok_or(BootstrapError::NoSuchProcess { process })?,
-            handle: xolotl_types::HandleId::new(0, 0),
-            resource: xolotl_types::ResourceId::new(0),
-            method: xolotl_types::MethodId::new(0),
-            input: xolotl_types::Value::null(),
-            taint,
-            decision: xolotl_types::DecisionTag::Ok,
-            outcome: Some(xolotl_types::Value::map({
-                let mut m = BTreeMap::new();
-                m.insert(
-                    "event".into(),
-                    xolotl_types::Value::string("ProcessFinalized".into()),
-                );
-                m.insert(
-                    "status".into(),
-                    xolotl_types::Value::string(process_status_label(terminal_status).into()),
-                );
-                m.insert(
-                    "released_handles".into(),
-                    xolotl_types::Value::integer(released as i64),
-                );
-                m.insert(
-                    "revoked_handles".into(),
-                    xolotl_types::Value::integer(revoked as i64),
-                );
-                m.insert(
-                    "finalizer_failure_count".into(),
-                    xolotl_types::Value::integer(finalizer_failure_count as i64),
-                );
-                if !finalizer_failures.is_empty() {
-                    m.insert(
-                        "finalizer_failures".into(),
-                        xolotl_types::Value::list(finalizer_failures),
-                    );
-                }
-                m
-            })),
-            batch: None,
-            replay: xolotl_types::ReplayClass::Observation,
-            timestamp: xolotl_types::Timestamp::millis(crate::executor::now_millis()),
-        };
-        processes
-            .retain_finalization_record(process, finalized.clone(), closed)
-            .ok_or(BootstrapError::NoSuchProcess { process })?;
-        (finalized, closed)
-    };
-    let taint = finalized.taint.clone();
-    facts.complete(finalized)?;
     let actual_status = processes
         .mark_terminal_status(process, terminal_status)
         .ok_or(BootstrapError::NoSuchProcess { process })?;
 
-    let marker_path = finalized_marker_path(process, lifecycle_execution).map_err(|source| {
-        BootstrapError::Path {
-            literal: format!(
-                "state://kernel/process/{}/{}/finalized",
-                process.get(),
-                lifecycle_execution.get()
-            ),
-            source,
-        }
-    })?;
-    let marker_result = state
-        .write_set_tainted(
-            &marker_path,
-            xolotl_types::Value::integer(closed as i64),
-            taint,
-        )
-        .await
-        .map_err(BootstrapError::from);
-    let publication_result = match processes.publication(process) {
-        Some(publication) => {
-            let outcome = processes.finalization_outcome(process);
-            publication
-                .publish(state, process, actual_status, outcome.as_deref())
-                .await
-        }
-        None => Ok(()),
-    };
-
-    match (marker_result, publication_result) {
-        (Ok(_commit), Ok(())) => {
-            #[cfg(feature = "durable")]
-            if processes.checkpoint_required(process) == Some(true)
-                && processes.checkpoint_retired(process) != Some(true)
-            {
-                let journal = journal.ok_or_else(|| {
-                    checkpoint_error(xolotl_types::Failure::policy(
-                        "checkpoint",
-                        "terminal cleanup requires its journal lease",
-                    ))
-                })?;
-                journal.retire().map_err(checkpoint_error)?;
-                processes
-                    .retire_checkpoint(process, lifecycle_execution)
-                    .map_err(|error| {
-                        checkpoint_error(xolotl_types::Failure::policy(
-                            "checkpoint",
-                            error.to_string(),
-                        ))
-                    })?;
-            }
-            processes
-                .complete_finalization(process)
-                .ok_or(BootstrapError::NoSuchProcess { process })
-        }
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_commit), Err(error)) => Err(error),
-        (Err(primary), Err(secondary)) => {
-            tracing::error!(
-                process = process.get(),
-                error = %secondary,
-                "process terminal publication failed after finalize marker failure"
-            );
-            Err(primary)
-        }
-    }
+    Ok(actual_status)
 }
 
 /// Honor the retained cleanup scope even when a completion attempt is retried.
 pub(super) fn close_process_handles(
     processes: &ProcessTable,
-    handles: &parking_lot::RwLock<crate::HandleTable>,
+    handles: &crate::HandleTable,
     process: ProcessId,
 ) -> Option<(usize, usize)> {
     let (tree, _) = processes.cleanup_scope(process)?;
-    let (released, revoked) = {
+    let ((released, revoked), retired) = {
         let mut handles = handles.write();
-        if tree {
+        let counts = if tree {
             (0, handles.revoke_owned_by(process))
         } else {
             (handles.release_owned_by(process), 0)
-        }
-    };
-    processes.record_handle_cleanup(process, released, revoked)
-}
-
-#[cfg(feature = "durable")]
-fn checkpoint_error(error: xolotl_types::Failure) -> BootstrapError {
-    BootstrapError::Checkpoint(Box::new(error))
-}
-
-#[cfg(feature = "durable")]
-impl Bootstrap {
-    /// The caller owns the recovery body and its journal until this attempt ends.
-    /// It must finish interpreter work before entering this path; external cleanup
-    /// still aborts and joins that body through the ordinary finalization entry point.
-    pub(super) async fn finish_checkpoint_terminal(
-        &self,
-        process: ProcessId,
-        status: ProcessStatus,
-        taint: &xolotl_types::TaintSet,
-        journal: &mut (dyn crate::executor::durable::CheckpointJournal + 'static),
-    ) -> Result<(), BootstrapError> {
-        let Some(guard) = acquire_finalization(&self.kernel.processes, process, status).await?
-        else {
-            return Ok(());
         };
-        self.kernel
-            .processes
-            .retain_finalization_control(process, taint)
-            .ok_or(BootstrapError::NoSuchProcess { process })?;
-        finish_process_terminal_attempt_with_journal(&self.kernel, process, guard, Some(journal))
-            .await
-    }
+        (counts, handles.into_retired())
+    };
+    let recorded = processes.record_handle_cleanup(process, released, revoked);
+    // Native payload destructors can panic. Retain the closure count first,
+    // with neither HandleTable nor ProcessTable locked during their Drop.
+    drop(retired);
+    recorded
 }

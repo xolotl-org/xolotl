@@ -175,20 +175,97 @@ fn append_and_history_share_type_validation_and_provenance() -> anyhow::Result<(
         item: Value::integer(2),
         taint: second_taint,
     };
-    let mut replay = Some(current);
+    let mut replay = crate::StateObservation::from(current);
     crate::apply_history_event(&mut replay, &event)?;
-    ensure!(replay == Some(appended));
-    let mut invalid = Some(TaintedValue::pristine(Value::integer(9)));
+    ensure!(replay == crate::StateObservation::from(appended));
+    let mut invalid = crate::StateObservation::from(TaintedValue::pristine(Value::integer(9)));
     let before = invalid.clone();
     ensure!(crate::apply_history_event(&mut invalid, &event).is_err());
     ensure!(invalid == before);
     ensure!(matches!(
         invalid
+            .value
             .as_ref()
             .context("retained invalid value")?
-            .value
             .view(),
         ValueView::Int(9)
     ));
+    Ok(())
+}
+
+#[test]
+fn prefix_drop_transformation_matches_history_across_index_boundaries() -> anyhow::Result<()> {
+    let path = Path::parse("state://sequence/pruned")?;
+    let earlier = TaintSet::from_recorded_sources(vec![
+        TaintSource::ModelOutput,
+        TaintSource::AuthorConstant,
+        TaintSource::ModelOutput,
+    ]);
+    let incoming = TaintSet::from_recorded_sources(vec![
+        TaintSource::AuthorConstant,
+        TaintSource::AuthorConstant,
+    ]);
+    let original = TaintedValue::new(
+        Value::list((0..1_025).map(Value::integer).collect()),
+        earlier.clone(),
+    );
+    for removed in [0, 1, 31, 32, 33, 512, 1_024, 1_025] {
+        let stored = drop_prefix_append_value(
+            &path,
+            Some(&original),
+            removed,
+            Value::integer(1_025),
+            incoming.clone(),
+        )?;
+        let event = crate::StateEvent::DropPrefixAppend {
+            path: path.clone(),
+            removed,
+            item: Value::integer(1_025),
+            taint: stored.taint.clone(),
+        };
+        let mut replay = crate::StateObservation::from(original.clone());
+        crate::apply_history_event(&mut replay, &event)?;
+        ensure!(replay == crate::StateObservation::from(stored));
+        ensure!(replay.taint == earlier.clone().merged(&incoming));
+        ensure!(original.value.as_list().context("original List")?.len() == 1_025);
+    }
+    Ok(())
+}
+
+#[test]
+fn prefix_drop_append_replays_exact_count_and_preserves_provenance() -> anyhow::Result<()> {
+    let path = Path::parse("state://sequence/window")?;
+    let earlier = TaintSet::of(TaintSource::ModelOutput);
+    let incoming = TaintSet::author();
+    let current = TaintedValue::new(
+        Value::list((0..5).map(Value::integer).collect()),
+        earlier.clone(),
+    );
+    let event = crate::StateEvent::DropPrefixAppend {
+        path,
+        removed: 4,
+        item: Value::integer(5),
+        taint: earlier.merged(&incoming),
+    };
+    let mut replay = crate::StateObservation::from(current);
+    crate::apply_history_event(&mut replay, &event)?;
+    let result = replay.value.as_ref().context("replayed list is absent")?;
+    ensure!(result == &Value::list(vec![Value::integer(4), Value::integer(5)]));
+    ensure!(replay.taint == *event.taint());
+    let unchanged = replay.clone();
+    for invalid in [6, u64::MAX] {
+        let mut event = event.clone();
+        if let crate::StateEvent::DropPrefixAppend { removed, .. } = &mut event {
+            *removed = invalid;
+        }
+        ensure!(crate::apply_history_event(&mut replay, &event).is_err());
+        ensure!(replay == unchanged);
+    }
+    let mut missing = crate::StateObservation::default();
+    ensure!(crate::apply_history_event(&mut missing, &event).is_err());
+    ensure!(missing.value.is_none());
+    let mut scalar = crate::StateObservation::from(TaintedValue::pristine(Value::integer(1)));
+    ensure!(crate::apply_history_event(&mut scalar, &event).is_err());
+    ensure!(scalar.value.as_ref().and_then(Value::as_int) == Some(1));
     Ok(())
 }

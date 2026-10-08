@@ -2,6 +2,7 @@
 
 use parking_lot::RwLock;
 use std::sync::Arc;
+use xolotl_kernel::host::HostRuntime;
 use xolotl_types::{CompletionOrigin, Outcome, TaintSet, TaintedValue, Value};
 use xolotl_value_codec::validation::KeyStore;
 use xolotl_value_object::EncodedValueRef;
@@ -9,7 +10,7 @@ use xolotl_value_object::EncodedValueRef;
 use super::{GatewayObjectReadGrant, IssueObjectReadGrantRequest};
 use crate::{
     GatewayAccepted, GatewayError, GatewayOutputEvent, GatewayRuntime, GatewayRuntimeState,
-    GatewaySession, now_millis, validate_current_session,
+    GatewaySession, validate_current_session,
 };
 
 mod adapter;
@@ -48,6 +49,9 @@ pub struct GatewayOutputObjectOptions {
 pub struct GatewayOutputExternalizationError {
     /// Encoding, storage, or disclosure failure. External transports should use
     /// its redacted public message rather than raw storage diagnostics.
+    /// Uncertain publication and invalid post-commit receipts are Indeterminate,
+    /// never a known pre-commit rejection. This describes export delivery, not
+    /// the original request's settlement, which remains unchanged.
     pub error: GatewayError,
     /// Input, commit, and subsequently inspected canonical object sources.
     pub taint: TaintSet,
@@ -71,6 +75,7 @@ pub struct GatewayExternalizedOutput {
     grant: GatewayObjectReadGrant,
     session: GatewaySession,
     runtime_state: Arc<RwLock<GatewayRuntimeState>>,
+    runtime: HostRuntime,
 }
 
 impl GatewayExternalizedOutput {
@@ -112,7 +117,7 @@ impl GatewayExternalizedOutput {
     /// Opening the object still checks the retained grant in State.
     pub fn validate(&self) -> Result<(), GatewayError> {
         validate_current_session(&self.runtime_state.read().profile, &self.session)?;
-        if self.grant.expires_at_ms() <= now_millis() {
+        if self.grant.expires_at_ms() <= self.runtime.now_millis() {
             return Err(GatewayError::Rejected("output read grant expired".into()));
         }
         validate_event(&self.event)
@@ -195,6 +200,7 @@ impl GatewayRuntime {
             grant,
             session: session.clone(),
             runtime_state: self.state.clone(),
+            runtime: self.boot.kernel().host_runtime().clone(),
         };
         output
             .validate()

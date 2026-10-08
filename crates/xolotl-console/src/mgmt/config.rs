@@ -1,606 +1,289 @@
-//! Management-domain admission for declared runtime configuration.
+//! Host-owned admission for versioned kernel State configuration.
 
-use serde::de::DeserializeOwned;
-use std::collections::BTreeSet;
+use std::{fmt, sync::Arc};
 use thiserror::Error;
-use xolotl_gateway::GatewayProfileDocument;
-use xolotl_types::external::{ExternalInstallationDef, ManifestDef};
-use xolotl_types::in_process_projection::InProcessProjectionDef;
-use xolotl_types::inference::{
-    InferenceBackendDef, InferenceGroupDef, InferenceModelDef, InferenceRoutingDef,
-};
-use xolotl_types::{Path, TrustLevel, Value, ValueView};
+use xolotl_types::{Path, Value};
 
-/// Result of checking a kernel config path.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KernelConfigAdmission {
-    /// The path is known and the value passed admission.
-    Admitted,
-    /// The path is not handled by this shared registry.
-    Unhandled,
+pub(crate) type ConfigValidator = dyn Fn(&Path, &Value) -> Result<(), String> + Send + Sync;
+
+/// One host-owned configuration namespace. The validator receives the exact
+/// requested path and the versioned value immediately before its State CAS.
+/// It must reject malformed descendants of its namespace itself. Its error
+/// string is returned to the caller and must never include secret values.
+/// The callback must be pure and bounded: Console runs it on the host's
+/// blocking-work port, and cancellation after admission cannot stop it.
+#[derive(Clone)]
+pub struct ConfigNamespaceAdmission {
+    namespace: Path,
+    validator: Arc<ConfigValidator>,
 }
 
-/// Errors raised by shared kernel config admission.
-#[derive(Clone, Debug, Eq, PartialEq, Error)]
-pub enum KernelConfigAdmissionError {
-    /// The path was not a local kernel state path.
-    #[error("path is not a state://kernel path: {0}")]
-    NotKernelState(String),
-    /// A required path segment was missing.
-    #[error("missing {0}")]
-    MissingSegment(&'static str),
-    /// A value could not be decoded as the expected config declaration.
-    #[error("{label} is malformed: {message}")]
-    Decode {
-        /// Expected declaration type.
-        label: &'static str,
-        /// Decode error message.
-        message: String,
-    },
-    /// A declaration field did not match the state path.
-    #[error("{label}.{field} {value:?} does not match path segment {path:?}")]
-    PathMismatch {
-        /// Declaration type.
-        label: &'static str,
-        /// Field name.
-        field: &'static str,
-        /// Value from the declaration.
-        value: String,
-        /// Value from the path.
-        path: String,
-    },
-    /// A declaration failed its own admission rule.
-    #[error("{label} admission failed: {message}")]
-    Rejected {
-        /// Declaration type.
-        label: &'static str,
-        /// Rejection message.
-        message: String,
-    },
-}
-
-/// Admit a shared kernel config declaration.
-///
-/// Console-owned paths such as `state://kernel/console/*` are intentionally
-/// left to the console crate.
-pub fn admit_kernel_config(
-    path: &Path,
-    value: &Value,
-) -> Result<KernelConfigAdmission, KernelConfigAdmissionError> {
-    let segs = path.segments();
-    if path.scheme() != "state"
-        || path.cluster().is_some()
-        || segs.first().map(|s| s.as_str()) != Some("kernel")
-    {
-        return Err(KernelConfigAdmissionError::NotKernelState(path.to_string()));
+impl ConfigNamespaceAdmission {
+    /// Claim a namespace and its descendants for one immutable host validator.
+    /// Invalid, protected, and overlapping namespaces are rejected when the
+    /// Console host is assembled.
+    pub fn new(
+        namespace: Path,
+        validator: impl Fn(&Path, &Value) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            namespace,
+            validator: Arc::new(validator),
+        }
     }
 
-    match segs {
-        s if is_path(s, &["kernel", "gateway", "profiles"]) => {
-            let name = required_tail(s, "gateway profile name")?;
-            admit_gateway_profile(name, value)?;
-            Ok(KernelConfigAdmission::Admitted)
-        }
-        s if is_path(s, &["kernel", "external-installations"]) => {
-            let id = required_tail(s, "external installation id")?;
-            admit_external_installation(id, value)?;
-            Ok(KernelConfigAdmission::Admitted)
-        }
-        s if is_path(s, &["kernel", "manifests"]) => {
-            let platform = required_tail(s, "manifest platform")?;
-            admit_manifest(platform, value)?;
-            Ok(KernelConfigAdmission::Admitted)
-        }
-        s if is_path(s, &["kernel", "projections", "in-process"]) => {
-            let id = required_tail(s, "in-process projection id")?;
-            admit_in_process_projection(id, value)?;
-            Ok(KernelConfigAdmission::Admitted)
-        }
-        s if is_path(s, &["kernel", "inference", "backends"]) => {
-            let id = required_tail(s, "inference backend id")?;
-            admit_inference_backend(id, value)?;
-            Ok(KernelConfigAdmission::Admitted)
-        }
-        s if is_path(s, &["kernel", "inference", "models"]) => {
-            let id = required_tail(s, "inference model id")?;
-            admit_inference_model(id, value)?;
-            Ok(KernelConfigAdmission::Admitted)
-        }
-        s if is_path(s, &["kernel", "inference", "groups"]) => {
-            let name = required_tail(s, "inference group name")?;
-            admit_inference_group(name, value)?;
-            Ok(KernelConfigAdmission::Admitted)
-        }
-        s if is_exact_path(s, &["kernel", "routing", "inference"]) => {
-            admit_inference_routing(value)?;
-            Ok(KernelConfigAdmission::Admitted)
-        }
-        _ => Ok(KernelConfigAdmission::Unhandled),
+    /// The path prefix exclusively owned by this validator.
+    pub fn namespace(&self) -> &Path {
+        &self.namespace
     }
 }
 
-fn is_path<S: AsRef<str>>(segs: &[S], prefix: &[&str]) -> bool {
-    segs.len() == prefix.len() + 1
-        && segs
+impl fmt::Debug for ConfigNamespaceAdmission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfigNamespaceAdmission")
+            .field("namespace", &self.namespace)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Invalid ownership declarations fail host assembly before serving requests.
+#[derive(Debug, Error)]
+pub enum ConfigAdmissionConfigError {
+    /// Admissions can only own concrete descendants of local `state://kernel`.
+    #[error("config admission namespace must be a concrete local state://kernel descendant: {0}")]
+    InvalidNamespace(Path),
+    /// Only declared configuration spaces can be claimed. Runtime and Console
+    /// private State subtrees are never configuration namespaces.
+    #[error("path is not a claimable config admission namespace: {0}")]
+    ReservedNamespace(Path),
+    /// A path must never have two possible validation owners.
+    #[error("config admission namespaces overlap: {first} and {second}")]
+    OverlappingNamespaces {
+        /// Namespace already claimed by an admission.
+        first: Box<Path>,
+        /// Conflicting namespace in the same host assembly.
+        second: Box<Path>,
+    },
+}
+
+/// Fixed at host assembly so write admission has no mutable routing state.
+#[derive(Default)]
+pub(crate) struct ConfigAdmissionRegistry {
+    entries: Vec<ConfigNamespaceAdmission>,
+}
+
+impl ConfigAdmissionRegistry {
+    pub(crate) fn new(
+        mut entries: Vec<ConfigNamespaceAdmission>,
+    ) -> Result<Self, ConfigAdmissionConfigError> {
+        for entry in &entries {
+            let path = entry.namespace();
+            if path.scheme() != "state"
+                || path.cluster().is_some()
+                || !path.is_concrete()
+                || path
+                    .segments()
+                    .first()
+                    .is_none_or(|segment| segment != "kernel")
+                || path.segments().len() < 2
+            {
+                return Err(ConfigAdmissionConfigError::InvalidNamespace(path.clone()));
+            }
+            if !is_claimable_namespace(path) {
+                return Err(ConfigAdmissionConfigError::ReservedNamespace(path.clone()));
+            }
+        }
+        entries.sort_by(|left, right| left.namespace.cmp(&right.namespace));
+        for (index, left) in entries.iter().enumerate() {
+            for right in entries.iter().skip(index + 1) {
+                if left.namespace.is_prefix_of(&right.namespace)
+                    || right.namespace.is_prefix_of(&left.namespace)
+                {
+                    return Err(ConfigAdmissionConfigError::OverlappingNamespaces {
+                        first: Box::new(left.namespace.clone()),
+                        second: Box::new(right.namespace.clone()),
+                    });
+                }
+            }
+        }
+        Ok(Self { entries })
+    }
+
+    pub(crate) fn validator(&self, path: &Path) -> Result<Arc<ConfigValidator>, String> {
+        self.entries
             .iter()
-            .take(prefix.len())
-            .zip(prefix.iter())
-            .all(|(actual, expected)| actual.as_ref() == *expected)
-}
-
-fn is_exact_path<S: AsRef<str>>(segs: &[S], expected: &[&str]) -> bool {
-    segs.len() == expected.len()
-        && segs
-            .iter()
-            .zip(expected.iter())
-            .all(|(actual, expected)| actual.as_ref() == *expected)
-}
-
-fn required_tail<'a, S: AsRef<str>>(
-    segs: &'a [S],
-    label: &'static str,
-) -> Result<&'a str, KernelConfigAdmissionError> {
-    segs.last()
-        .map(|s| s.as_ref())
-        .filter(|s| !s.is_empty())
-        .ok_or(KernelConfigAdmissionError::MissingSegment(label))
-}
-
-fn decode_config_value<T: DeserializeOwned>(
-    value: &Value,
-    label: &'static str,
-) -> Result<T, KernelConfigAdmissionError> {
-    let json = serde_json::to_value(value).map_err(|error| KernelConfigAdmissionError::Decode {
-        label,
-        message: error.to_string(),
-    })?;
-    serde_json::from_value(json).map_err(|error| KernelConfigAdmissionError::Decode {
-        label,
-        message: error.to_string(),
-    })
-}
-
-fn admit_external_installation(
-    path_id: &str,
-    value: &Value,
-) -> Result<(), KernelConfigAdmissionError> {
-    let def: ExternalInstallationDef = decode_config_value(value, "ExternalInstallationDef")?;
-    ensure_path_match("ExternalInstallationDef", "id", &def.id, path_id)?;
-    admit_json_schema(&def.config_schema, "ExternalInstallationDef.config_schema")?;
-    def.validate_admission()
-        .map_err(|error| KernelConfigAdmissionError::Rejected {
-            label: "ExternalInstallationDef",
-            message: error.to_string(),
-        })
-}
-
-fn admit_gateway_profile(path_name: &str, value: &Value) -> Result<(), KernelConfigAdmissionError> {
-    let document: GatewayProfileDocument = decode_config_value(value, "GatewayProfileDocument")?;
-    ensure_path_match(
-        "GatewayProfileDocument",
-        "profile_name",
-        document.profile_name(),
-        path_name,
-    )?;
-    document
-        .validate_admission(path_name)
-        .map_err(|error| rejected("GatewayProfileDocument", error.to_string()))
-}
-
-fn admit_manifest(path_platform: &str, value: &Value) -> Result<(), KernelConfigAdmissionError> {
-    let def: ManifestDef = decode_config_value(value, "ManifestDef")?;
-    ensure_path_match("ManifestDef", "platform", &def.platform, path_platform)?;
-    if def.platform.trim().is_empty() {
-        return Err(rejected("ManifestDef", "platform must not be empty"));
+            .find(|entry| entry.namespace.is_prefix_of(path))
+            .map(|entry| Arc::clone(&entry.validator))
+            .ok_or_else(|| format!("no console write admission rule for {path}"))
     }
-    if def.version == 0 {
-        return Err(rejected(
-            "ManifestDef",
-            "version must be a positive config revision",
-        ));
-    }
-    admit_json_schema(&def.config_schema, "ManifestDef.config_schema")?;
-    if def.supported_transports.is_empty() {
-        return Err(rejected(
-            "ManifestDef",
-            "supported_transports must not be empty",
-        ));
-    }
-    if !def
-        .supported_transports
-        .iter()
-        .any(|transport| transport == &def.default_transport)
-    {
-        return Err(rejected(
-            "ManifestDef",
-            "default_transport must be listed in supported_transports",
-        ));
-    }
-    if def.projections.is_empty() {
-        return Err(rejected("ManifestDef", "projections must not be empty"));
-    }
-    let mut seen = BTreeSet::new();
-    for projection in &def.projections {
-        if !seen.insert(projection.id.clone()) {
-            return Err(rejected(
-                "ManifestDef",
-                format!("duplicate projection id {:?}", projection.id),
-            ));
-        }
-        projection
-            .validate_admission(&def.platform, TrustLevel::Sandboxed, &def.default_transport)
-            .map_err(|error| KernelConfigAdmissionError::Rejected {
-                label: "ManifestDef",
-                message: format!("projection admission failed: {error}"),
-            })?;
-        for cap in &projection.provides {
-            admit_manifest_effect(&cap.effect_path)?;
-        }
-    }
-    Ok(())
-}
 
-fn admit_in_process_projection(
-    path_id: &str,
-    value: &Value,
-) -> Result<(), KernelConfigAdmissionError> {
-    let def: InProcessProjectionDef = decode_config_value(value, "InProcessProjectionDef")?;
-    def.validate_admission(path_id)
-        .map_err(|error| KernelConfigAdmissionError::Rejected {
-            label: "InProcessProjectionDef",
-            message: error.to_string(),
+    /// Whether an installed owner can admit at least one path under a known
+    /// action's collection. Paths are compared by components, not text prefix.
+    pub(crate) fn overlaps_collection(&self, segments: &[&str]) -> bool {
+        self.entries.iter().any(|entry| {
+            entry
+                .namespace
+                .segments()
+                .iter()
+                .zip(segments)
+                .all(|(actual, expected)| actual.as_str() == *expected)
         })
-}
+    }
 
-fn admit_inference_backend(path_id: &str, value: &Value) -> Result<(), KernelConfigAdmissionError> {
-    let def: InferenceBackendDef = decode_config_value(value, "InferenceBackendDef")?;
-    def.validate_admission(path_id)
-        .map_err(|error| KernelConfigAdmissionError::Rejected {
-            label: "InferenceBackendDef",
-            message: error.to_string(),
-        })
-}
-
-fn admit_inference_model(path_id: &str, value: &Value) -> Result<(), KernelConfigAdmissionError> {
-    let def: InferenceModelDef = decode_config_value(value, "InferenceModelDef")?;
-    def.validate_admission(path_id)
-        .map_err(|error| KernelConfigAdmissionError::Rejected {
-            label: "InferenceModelDef",
-            message: error.to_string(),
-        })
-}
-
-fn admit_inference_group(path_name: &str, value: &Value) -> Result<(), KernelConfigAdmissionError> {
-    let def: InferenceGroupDef = decode_config_value(value, "InferenceGroupDef")?;
-    def.validate_admission(path_name)
-        .map_err(|error| KernelConfigAdmissionError::Rejected {
-            label: "InferenceGroupDef",
-            message: error.to_string(),
-        })
-}
-
-fn admit_inference_routing(value: &Value) -> Result<(), KernelConfigAdmissionError> {
-    let def: InferenceRoutingDef = decode_config_value(value, "InferenceRoutingDef")?;
-    def.validate_admission()
-        .map_err(|error| KernelConfigAdmissionError::Rejected {
-            label: "InferenceRoutingDef",
-            message: error.to_string(),
-        })
-}
-
-fn ensure_path_match(
-    label: &'static str,
-    field: &'static str,
-    value: &str,
-    path: &str,
-) -> Result<(), KernelConfigAdmissionError> {
-    if value == path {
-        Ok(())
-    } else {
-        Err(KernelConfigAdmissionError::PathMismatch {
-            label,
-            field,
-            value: value.to_string(),
-            path: path.to_string(),
+    /// Whether an installed owner can admit the exact path of a singleton
+    /// action, rather than merely one of its descendants.
+    pub(crate) fn covers_path(&self, segments: &[&str]) -> bool {
+        self.entries.iter().any(|entry| {
+            let namespace = entry.namespace.segments();
+            namespace.len() <= segments.len()
+                && namespace
+                    .iter()
+                    .zip(segments)
+                    .all(|(actual, expected)| actual.as_str() == *expected)
         })
     }
 }
 
-fn admit_json_schema(
-    schema: &Value,
-    label: &'static str,
-) -> Result<(), KernelConfigAdmissionError> {
-    match schema.view() {
-        ValueView::Null | ValueView::Map(_) => Ok(()),
-        _ => Err(rejected(label, "must be null or a JSON object")),
-    }
-}
-
-fn admit_manifest_effect(effect_path: &str) -> Result<(), KernelConfigAdmissionError> {
-    let effect =
-        Path::parse(effect_path).map_err(|error| KernelConfigAdmissionError::Rejected {
-            label: "ManifestDef",
-            message: format!("projection effect path is malformed: {error}"),
-        })?;
-    if effect.scheme() != "effect" || effect.segments().is_empty() {
-        return Err(rejected(
-            "ManifestDef",
-            "projection effects must be effect:// paths",
-        ));
-    }
-    if effect.segments().first().map(|s| s.as_str()) == Some("kernel") {
-        return Err(rejected(
-            "ManifestDef",
-            "projection effects must not target effect://kernel/*",
-        ));
-    }
-    Ok(())
-}
-
-fn rejected(label: &'static str, message: impl Into<String>) -> KernelConfigAdmissionError {
-    KernelConfigAdmissionError::Rejected {
-        label,
-        message: message.into(),
+fn is_claimable_namespace(path: &Path) -> bool {
+    let segments = path.segments();
+    let namespace = segments.get(1).map(|segment| segment.as_str());
+    let collection = segments.get(2).map(|segment| segment.as_str());
+    let direct_entry = |collection_len: usize| {
+        segments.len() == collection_len
+            || (segments.len() == collection_len + 1
+                && segments
+                    .last()
+                    .is_some_and(|id| xolotl_types::path::is_simple_id_segment(id)))
+    };
+    match (namespace, collection) {
+        // Existing v1 declaration addresses remain available, while their
+        // document shapes belong entirely to the installed host validators.
+        (Some("gateway"), Some("profiles")) | (Some("projections"), Some("in-process")) => true,
+        // These addresses can only be written by dedicated actions. Reject
+        // owners that cannot cover any path those actions can construct.
+        (Some("manifests"), _) => direct_entry(2),
+        (Some("inference"), None) => true,
+        (Some("inference"), Some("backends" | "models" | "groups")) => direct_entry(3),
+        (Some("routing"), Some("inference")) => segments.len() == 3,
+        // New owners use a dedicated subtree instead of claiming arbitrary
+        // Kernel runtime records, including future private namespaces.
+        (Some("config"), Some(owner)) => xolotl_types::path::is_simple_id_segment(owner),
+        _ => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::{Context, Result, bail, ensure};
-    use std::collections::BTreeMap;
-    use xolotl_types::external::ExternalProjectionDef;
-    use xolotl_types::{
-        EffectCapability, InProcessProjectionDef, InferenceApiDialect, InferenceAuthRef, Purity,
-        Role, Transport,
-    };
+    use anyhow::ensure;
 
-    fn path(value: &str) -> Result<Path> {
-        Path::parse(value).with_context(|| format!("parse {value}"))
-    }
-
-    fn value_from<T: serde::Serialize>(value: &T) -> Result<Value> {
-        let json = serde_json::to_value(value).context("serialize value")?;
-        serde_json::from_value(json).context("convert value")
-    }
-
-    fn backend(id: &str) -> Result<Value> {
-        value_from(&InferenceBackendDef {
-            id: id.into(),
-            dialect: InferenceApiDialect::OpenAiChatCompletions,
-            base_url: "https://api.deepseek.com".into(),
-            auth: InferenceAuthRef::BearerToken {
-                token_ref: path("state://vault/inference/deepseek/api_key")?,
+    fn entry(path: &str) -> anyhow::Result<ConfigNamespaceAdmission> {
+        Ok(ConfigNamespaceAdmission::new(
+            Path::parse(path)?,
+            |path, _value| {
+                (path.segments().len() == 4)
+                    .then_some(())
+                    .ok_or_else(|| "expected a direct child".into())
             },
-            default_headers: BTreeMap::new(),
-            request_overrides: BTreeMap::new(),
-            api_version: None,
-            io_window_bytes: None,
-            response_limits: Default::default(),
-            version: 1,
-        })
-    }
-
-    fn installation(id: &str) -> Result<Value> {
-        value_from(&ExternalInstallationDef {
-            id: id.into(),
-            platform: id.into(),
-            transport: Transport::Stdio {
-                command: Some(format!("{id}-plugin")),
-                args: Vec::new(),
-            },
-            trust: TrustLevel::Sandboxed,
-            config_schema: Value::null(),
-            config: Value::null(),
-            projections: vec![ExternalProjectionDef {
-                id: "provider".into(),
-                role: Role::Provider,
-                namespace: Some(path(&format!("effect://external-provider/{id}"))?),
-                provides: vec![EffectCapability::new(
-                    format!("effect://external-provider/{id}/search"),
-                    Purity::Idempotent,
-                )],
-                emits: None,
-                version: 1,
-            }],
-            version: 1,
-        })
-    }
-
-    fn in_process_projection(id: &str) -> Result<Value> {
-        value_from(&InProcessProjectionDef {
-            id: id.into(),
-            role: Role::Provider,
-            implementation: "standard.fetch".into(),
-            provides: vec![EffectCapability::new(
-                "effect://fetch/get",
-                Purity::Effectful,
-            )],
-            emits: None,
-            config: Value::null(),
-            version: 1,
-        })
+        ))
     }
 
     #[test]
-    fn admits_inference_backend_declaration() -> Result<()> {
-        let result = admit_kernel_config(
-            &path("state://kernel/inference/backends/deepseek")?,
-            &backend("deepseek")?,
-        )
-        .context("admit inference backend")?;
-
-        ensure!(
-            result == KernelConfigAdmission::Admitted,
-            "admission result: {result:?}"
-        );
+    fn rejects_invalid_and_protected_ownership() -> anyhow::Result<()> {
+        for path in [
+            "state://kernel",
+            "state://kernel/custom/**",
+            "path://remote/state/kernel/custom",
+        ] {
+            ensure!(matches!(
+                ConfigAdmissionRegistry::new(vec![entry(path)?]),
+                Err(ConfigAdmissionConfigError::InvalidNamespace(_))
+            ));
+        }
+        for path in [
+            "state://kernel/console/custom",
+            "state://kernel/audit",
+            "state://kernel/external-installations",
+            "state://kernel/idemp",
+            "state://kernel/bootstrap",
+            "state://kernel/approvals",
+            "state://kernel/process",
+            "state://kernel/source-events",
+            "state://kernel/rate-limit",
+            "state://kernel/config",
+        ] {
+            ensure!(matches!(
+                ConfigAdmissionRegistry::new(vec![entry(path)?]),
+                Err(ConfigAdmissionConfigError::ReservedNamespace(_))
+            ));
+        }
         Ok(())
     }
 
     #[test]
-    fn gateway_profile_admission_is_explicit_and_path_bound() -> Result<()> {
-        let profile = value_from(&serde_json::json!({
-            "profile_name": "app",
-            "version": 1,
-            "surfaces": [{"surface_id": "inspect", "target": "effect://blob/stat"}]
-        }))?;
-        ensure!(
-            admit_kernel_config(&path("state://kernel/gateway/profiles/app")?, &profile)?
-                == KernelConfigAdmission::Admitted
-        );
-        ensure!(matches!(
-            admit_kernel_config(&path("state://kernel/gateway/profiles/other")?, &profile),
-            Err(KernelConfigAdmissionError::PathMismatch { .. })
-        ));
-        ensure!(
-            admit_kernel_config(&path("state://kernel/gateway/other/app")?, &profile)?
-                == KernelConfigAdmission::Unhandled
-        );
+    fn rejects_duplicate_and_nested_owners() -> anyhow::Result<()> {
+        for other in [
+            "state://kernel/config/custom",
+            "state://kernel/config/custom/items",
+        ] {
+            ensure!(matches!(
+                ConfigAdmissionRegistry::new(vec![
+                    entry("state://kernel/config/custom")?,
+                    entry(other)?
+                ]),
+                Err(ConfigAdmissionConfigError::OverlappingNamespaces { .. })
+            ));
+        }
         Ok(())
     }
 
     #[test]
-    fn gateway_profile_admission_rejects_unknown_fields_and_invalid_bindings() -> Result<()> {
-        let profile = value_from(&serde_json::json!({
-            "profile_name": "app", "version": 1, "allow_all": true
-        }))?;
-        ensure!(matches!(
-            admit_kernel_config(&path("state://kernel/gateway/profiles/app")?, &profile),
-            Err(KernelConfigAdmissionError::Decode { .. })
-        ));
-        let profile = value_from(&serde_json::json!({
-            "profile_name": "app", "version": 1,
-            "principal_surface_bindings": [{"principal_id": "unmapped"}]
-        }))?;
-        ensure!(matches!(
-            admit_kernel_config(&path("state://kernel/gateway/profiles/app")?, &profile),
-            Err(KernelConfigAdmissionError::Rejected { .. })
-        ));
+    fn dedicated_owners_must_cover_an_addressable_action_path() -> anyhow::Result<()> {
+        for path in [
+            "state://kernel/manifests/bad.id",
+            "state://kernel/manifests/acme/child",
+            "state://kernel/inference/unknown",
+            "state://kernel/inference/backends/bad.id",
+            "state://kernel/inference/backends/acme/child",
+            "state://kernel/routing/inference/child",
+        ] {
+            ensure!(
+                matches!(
+                    ConfigAdmissionRegistry::new(vec![entry(path)?]),
+                    Err(ConfigAdmissionConfigError::ReservedNamespace(_))
+                ),
+                "unreachable owner {path} was accepted"
+            );
+        }
+        for path in [
+            "state://kernel/manifests",
+            "state://kernel/manifests/acme",
+            "state://kernel/inference",
+            "state://kernel/inference/backends",
+            "state://kernel/inference/backends/acme",
+            "state://kernel/routing/inference",
+        ] {
+            ensure!(
+                ConfigAdmissionRegistry::new(vec![entry(path)?]).is_ok(),
+                "addressable owner {path} was rejected"
+            );
+        }
         Ok(())
     }
 
     #[test]
-    fn rejects_unknown_inference_backend_fields() -> Result<()> {
-        let Some(mut value) = backend("deepseek")?.into_map() else {
-            bail!("backend helper must return a map");
-        };
-        value.insert(
-            "anthropic_version".into(),
-            Value::string("2023-06-01".into()),
-        )?;
-        let result = admit_kernel_config(
-            &path("state://kernel/inference/backends/deepseek")?,
-            &Value::from(value),
-        );
-
+    fn routes_only_to_the_claimed_namespace_and_rejects_unknown_children() -> anyhow::Result<()> {
+        let registry = ConfigAdmissionRegistry::new(vec![entry("state://kernel/config/custom")?])?;
+        let child = Path::parse("state://kernel/config/custom/a")?;
+        let validate_child = registry.validator(&child).map_err(anyhow::Error::msg)?;
+        ensure!(validate_child(&child, &Value::null()).is_ok());
+        let nested = Path::parse("state://kernel/config/custom/a/extra")?;
+        let validate_nested = registry.validator(&nested).map_err(anyhow::Error::msg)?;
+        ensure!(validate_nested(&nested, &Value::null()).is_err());
         ensure!(
-            matches!(
-                result,
-                Err(KernelConfigAdmissionError::Decode {
-                    label: "InferenceBackendDef",
-                    ..
-                })
-            ),
-            "expected decode rejection, got {result:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_inference_path_mismatch() -> Result<()> {
-        let result = admit_kernel_config(
-            &path("state://kernel/inference/backends/other")?,
-            &backend("deepseek")?,
-        );
-
-        ensure!(
-            matches!(
-                result,
-                Err(KernelConfigAdmissionError::Rejected {
-                    label: "InferenceBackendDef",
-                    ..
-                })
-            ),
-            "expected path mismatch rejection, got {result:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn admits_external_installation_declaration() -> Result<()> {
-        let result = admit_kernel_config(
-            &path("state://kernel/external-installations/acme")?,
-            &installation("acme")?,
-        )
-        .context("admit external installation")?;
-
-        ensure!(
-            result == KernelConfigAdmission::Admitted,
-            "admission result: {result:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn admits_in_process_projection_declaration() -> Result<()> {
-        let result = admit_kernel_config(
-            &path("state://kernel/projections/in-process/fetch")?,
-            &in_process_projection("fetch")?,
-        )
-        .context("admit in-process projection")?;
-
-        ensure!(
-            result == KernelConfigAdmission::Admitted,
-            "admission result: {result:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_clustered_kernel_config_path() -> Result<()> {
-        let result = admit_kernel_config(
-            &path("path://remote/state/kernel/projections/in-process/fetch")?,
-            &in_process_projection("fetch")?,
-        );
-
-        ensure!(
-            matches!(result, Err(KernelConfigAdmissionError::NotKernelState(_))),
-            "expected clustered path rejection, got {result:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_in_process_projection_path_mismatch() -> Result<()> {
-        let result = admit_kernel_config(
-            &path("state://kernel/projections/in-process/other")?,
-            &in_process_projection("fetch")?,
-        );
-
-        ensure!(
-            matches!(
-                result,
-                Err(KernelConfigAdmissionError::Rejected {
-                    label: "InProcessProjectionDef",
-                    ..
-                })
-            ),
-            "expected path mismatch rejection, got {result:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn leaves_console_paths_to_console() -> Result<()> {
-        let result = admit_kernel_config(
-            &path("state://kernel/console/users/root")?,
-            &Value::map(BTreeMap::new()),
-        )
-        .context("admit console path")?;
-
-        ensure!(
-            result == KernelConfigAdmission::Unhandled,
-            "admission result: {result:?}"
+            registry
+                .validator(&Path::parse("state://kernel/config/foobar/a")?)
+                .is_err()
         );
         Ok(())
     }

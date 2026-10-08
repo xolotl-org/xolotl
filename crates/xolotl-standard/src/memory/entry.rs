@@ -466,16 +466,6 @@ pub(super) fn hash_operation_id(hasher: &mut blake3::Hasher, op_id: xolotl_types
     hasher.update(&op_id.to_bytes());
 }
 
-pub(super) fn overlap(query: &str, text: &str) -> f64 {
-    let q: BTreeSet<&str> = query.split_whitespace().collect();
-    if q.is_empty() {
-        return 0.0;
-    }
-    let t: BTreeSet<&str> = text.split_whitespace().collect();
-    let hits = q.iter().filter(|w| t.contains(*w)).count();
-    hits as f64 / q.len() as f64
-}
-
 pub(super) fn overfetch(k: usize) -> i64 {
     i64::try_from(k.saturating_mul(8)).unwrap_or(i64::MAX)
 }

@@ -1,10 +1,30 @@
 use super::*;
 use anyhow::{Context, ensure};
+use sha2::{Digest as _, Sha384};
 use std::time::Duration;
 use xolotl_types::{TaintSet, TaintSource};
 
 mod commit;
+mod lifecycle;
 mod metadata;
+
+#[derive(Default)]
+pub(super) struct IoProbe {
+    pub(super) objects_sync_calls: std::sync::atomic::AtomicUsize,
+    pub(super) objects_sync_failures: std::sync::atomic::AtomicUsize,
+    pub(super) metadata_sync_failures: std::sync::atomic::AtomicUsize,
+    pub(super) upload_creations: std::sync::atomic::AtomicUsize,
+    pub(super) upload_open_failures: std::sync::atomic::AtomicUsize,
+    pub(super) metadata_writes: std::sync::atomic::AtomicUsize,
+    pub(super) cleanup_gate: Mutex<()>,
+    pub(super) cleanup_attempts: std::sync::atomic::AtomicUsize,
+    pub(super) cleanup_failures: std::sync::atomic::AtomicUsize,
+    pub(super) cleanup_exits: std::sync::atomic::AtomicUsize,
+}
+
+fn content_digest(bytes: &[u8]) -> String {
+    BlobRef::sha384_hex(&Sha384::digest(bytes).into())
+}
 
 fn options(chunk_bytes: usize) -> anyhow::Result<FileObjectOptions> {
     Ok(FileObjectOptions {
@@ -41,6 +61,20 @@ async fn wait_for_io(store: &FileObjectStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn wait_for_cleanup(store: &FileObjectStore) -> anyhow::Result<()> {
+    let permits = tokio::time::timeout(
+        Duration::from_secs(2),
+        store
+            .shared
+            .upload_slots
+            .clone()
+            .acquire_many_owned(u32::try_from(store.options().max_uploads.get())?),
+    )
+    .await??;
+    drop(permits);
+    Ok(())
+}
+
 #[tokio::test]
 async fn objects_publish_only_after_size_validation_and_roundtrip_after_reopen()
 -> anyhow::Result<()> {
@@ -54,7 +88,7 @@ async fn objects_publish_only_after_size_validation_and_roundtrip_after_reopen()
         })
         .await?;
     let blob = BlobRef {
-        hash: blake3::hash(b"abcdef").to_hex().to_string(),
+        hash: content_digest(b"abcdef"),
         size: 6,
         mime: None,
     };
@@ -106,9 +140,7 @@ async fn chunk_retries_are_idempotent_and_conflicts_leave_the_upload_intact() ->
     let overlap = store.write_chunk(&upload, 1, b"bcdef").await?;
     ensure!(overlap.next_offset == 6 && overlap.bytes_written == 5);
     let metadata = store.commit_upload(&upload, &TaintSet::pristine()).await?;
-    ensure!(
-        metadata.blob.size == 6 && metadata.blob.hash == blake3::hash(b"abcdef").to_hex().as_str()
-    );
+    ensure!(metadata.blob.size == 6 && metadata.blob.hash == content_digest(b"abcdef"));
     Ok(())
 }
 
@@ -138,7 +170,7 @@ async fn old_chunk_replays_compose_with_bounded_host_writes_and_append_once() ->
         .commit_upload(&upload, &TaintSet::pristine())
         .await?;
     ensure!(metadata.blob.size == expected.len() as u64);
-    ensure!(metadata.blob.hash == blake3::hash(expected).to_hex().as_str());
+    ensure!(metadata.blob.hash == content_digest(expected));
     let mut buffer = [0; 3];
     let mut offset = 0;
     while offset < expected.len() {
@@ -161,19 +193,19 @@ async fn uploads_larger_than_the_chunk_window_use_incremental_hashing_and_reads(
     let root = tempfile::tempdir()?;
     let store = FileObjectStore::with_options(root.path(), options(4096)?)?;
     let upload = store.begin_upload(UploadOptions::default()).await?;
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = Sha384::new();
     let mut offset = 0;
     for index in 0..1024u64 {
         let bytes = [index as u8; 4096];
-        hasher.update(&bytes);
+        hasher.update(bytes);
         let chunk = store.write_chunk(&upload, offset, &bytes).await?;
         ensure!(chunk.bytes_written == bytes.len());
         offset = chunk.next_offset;
     }
     let metadata = store.commit_upload(&upload, &TaintSet::pristine()).await?;
     ensure!(metadata.blob.size == 4 * 1024 * 1024);
-    ensure!(metadata.blob.hash == hasher.finalize().to_hex().as_str());
-    let mut read_hash = blake3::Hasher::new();
+    ensure!(metadata.blob.hash == BlobRef::sha384_hex(&hasher.finalize().into()));
+    let mut read_hash = Sha384::new();
     let mut buffer = [0; 16_384];
     let mut offset = 0;
     loop {
@@ -190,7 +222,7 @@ async fn uploads_larger_than_the_chunk_window_use_incremental_hashing_and_reads(
     }
     ensure!(
         offset == metadata.blob.size
-            && read_hash.finalize().to_hex().as_str() == metadata.blob.hash
+            && BlobRef::sha384_hex(&read_hash.finalize().into()) == metadata.blob.hash
     );
     Ok(())
 }
@@ -269,6 +301,7 @@ async fn upload_ownership_cleans_staging_on_the_last_lease_drop() -> anyhow::Res
     drop(upload);
     ensure!(store.pending_uploads() == 1 && staged(&store)? == 1);
     drop(retained);
+    wait_for_cleanup(&store).await?;
     ensure!(store.pending_uploads() == 0 && staged(&store)? == 0);
 
     let upload = store.begin_upload(UploadOptions::default()).await?;
@@ -277,6 +310,99 @@ async fn upload_ownership_cleans_staging_on_the_last_lease_drop() -> anyhow::Res
     ensure!(store.pending_uploads() == 0 && staged(&store)? == 0);
     ensure!(store.write_chunk(&upload, 0, b"late").await.is_err());
     Ok(())
+}
+
+#[tokio::test]
+async fn cold_open_reclaims_abandoned_staging_without_touching_live_uploads() -> anyhow::Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let staging = root.path().join("staging");
+    std::fs::create_dir_all(staging.join("upload-abandoned"))?;
+    std::fs::write(staging.join("upload-abandoned/data"), b"old bytes")?;
+    std::fs::create_dir_all(staging.join("retired-abandoned"))?;
+    std::fs::create_dir_all(staging.join("application-owned"))?;
+
+    let first = FileObjectStore::open(root.path())?;
+    ensure!(!staging.join("upload-abandoned").exists());
+    ensure!(!staging.join("retired-abandoned").exists());
+    ensure!(staging.join("application-owned").exists());
+
+    let upload = first.begin_upload(UploadOptions::default()).await?;
+    write_all(&first, &upload, b"active bytes").await?;
+    let live = staging.join(upload.as_str());
+    let second = FileObjectStore::open(root.path())?;
+    ensure!(live.join("data").exists());
+    ensure!(first.pending_uploads() == 1);
+    first.commit_upload(&upload, &TaintSet::pristine()).await?;
+
+    std::fs::create_dir_all(staging.join("upload-after-open"))?;
+    drop(upload);
+    drop(second);
+    drop(first);
+    let _reopened = FileObjectStore::open(root.path())?;
+    ensure!(!staging.join("upload-after-open").exists());
+    ensure!(staging.join("application-owned").exists());
+    Ok(())
+}
+
+#[test]
+fn abrupt_process_exit_releases_staging_ownership_for_recovery() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut child = std::process::Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("tests::staging_owner_child")
+        .arg("--nocapture")
+        .env("XOLOTL_STAGING_CHILD_ROOT", root.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let ready = root.path().join("staging-child-ready");
+    let observed = (|| -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
+        while !ready.exists() {
+            ensure!(
+                child.try_wait()?.is_none(),
+                "staging child exited before creating its upload"
+            );
+            ensure!(
+                started.elapsed() < Duration::from_secs(10),
+                "staging child did not create its upload"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ensure!(std::fs::read_dir(root.path().join("staging"))?.count() == 1);
+        Ok(())
+    })();
+    drop(child.kill());
+    child.wait()?;
+    observed?;
+    let reopened = FileObjectStore::open(root.path())?;
+    ensure!(staged(&reopened)? == 0);
+    Ok(())
+}
+
+#[test]
+fn staging_owner_child() -> anyhow::Result<()> {
+    let Some(root) = std::env::var_os("XOLOTL_STAGING_CHILD_ROOT") else {
+        return Ok(());
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let store = FileObjectStore::open(&root)?;
+    let upload = runtime.block_on(async {
+        let upload = store.begin_upload(UploadOptions::default()).await?;
+        write_all(&store, &upload, b"uncommitted process bytes").await?;
+        Ok::<_, anyhow::Error>(upload)
+    })?;
+    std::fs::write(
+        std::path::Path::new(&root).join("staging-child-ready"),
+        b"ready",
+    )?;
+    loop {
+        std::hint::black_box((&store, &upload));
+        std::thread::park();
+    }
 }
 
 #[tokio::test]
@@ -326,11 +452,12 @@ async fn upload_capacity_is_released_by_commit_abort_and_drop() -> anyhow::Resul
     ensure!(store.begin_upload(UploadOptions::default()).await.is_err());
     ensure!(staged(&store)? == 1);
     let empty = store.commit_upload(&upload, &TaintSet::pristine()).await?;
-    ensure!(empty.blob.size == 0 && empty.blob.hash == blake3::hash(&[]).to_hex().as_str());
+    ensure!(empty.blob.size == 0 && empty.blob.hash == content_digest(&[]));
     let upload = store.begin_upload(UploadOptions::default()).await?;
     store.abort_upload(&upload).await?;
     let upload = store.begin_upload(UploadOptions::default()).await?;
     drop(upload);
+    wait_for_cleanup(&store).await?;
     ensure!(store.pending_uploads() == 0 && staged(&store)? == 0);
     Ok(())
 }
@@ -401,6 +528,7 @@ fn cancelled_begin_releases_staging_that_was_never_delivered() -> anyhow::Result
         release.send(())?;
         blocker.await??;
         wait_for_io(&store).await?;
+        wait_for_cleanup(&store).await?;
         ensure!(store.pending_uploads() == 0 && staged(&store)? == 0);
         Ok(())
     })
@@ -428,6 +556,7 @@ async fn interrupted_commit_can_retry_but_a_dropped_upload_cannot_publish() -> a
             drop(upload);
             drop(barrier);
             wait_for_io(&store).await?;
+            wait_for_cleanup(&store).await?;
             ensure!(store.pending_uploads() == 0 && staged(&store)? == 0);
             ensure!(
                 std::fs::read_dir(root.path().join("objects"))?
@@ -439,7 +568,7 @@ async fn interrupted_commit_can_retry_but_a_dropped_upload_cannot_publish() -> a
             wait_for_io(&store).await?;
             ensure!(store.pending_uploads() == 1);
             let metadata = store.commit_upload(&upload, &final_taint).await?;
-            ensure!(metadata.blob.hash == blake3::hash(b"committed bytes").to_hex().as_str());
+            ensure!(metadata.blob.hash == content_digest(b"committed bytes"));
             ensure!(store.pending_uploads() == 0 && staged(&store)? == 0);
             ensure!(std::fs::read_dir(root.path().join("objects"))?.count() == 1);
         }

@@ -5,20 +5,52 @@
 //! generation counters, schemas, limits, and state reservations before a frame
 //! reaches the daemon.
 
-use super::secure_envelope::SecureEnvelope;
+use super::secure_envelope::{EnvelopeAad, SecureEnvelope};
+use prost::Message;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use xolotl_kernel::{CheckCtx, PolicyDecision, PolicySnapshot};
-use xolotl_state::{Backend, StateError};
+use xolotl_source::{
+    SourceClaim, SourceClaimId, SourceCommit, SourceCommitOutcome, SourceCommitRejection,
+    SourceIngress, SourceStoreError, SourceStreamOpen, SourceStreamOpenOutcome,
+    SourceStreamPosition, SourceStreamRetire, SourceStreamRetireOutcome, SourceStreamScope,
+};
 use xolotl_types::ErrorInfo;
 use xolotl_types::external::{
     AckStatus, CommandResult, ControlFrame, EventAck, ExternalProjectionDef, InboundEvent, Invoke,
-    InvokeResult, JsonSchema, ObservedGenerations, OutboundCommand, OverflowPolicy, Role,
-    RoleReady, RoleSessionClientHello, SessionContext, SourceRateLimit,
+    InvokeResult, JsonSchema, ObservedGenerations, OutboundCommand, Role, RoleReady,
+    RoleSessionClientHello, SessionContext, SourceStreamOperation, SourceStreamOutcome,
+    SourceStreamRejectCode, SourceStreamRejected, SourceStreamRequest, SourceStreamResult,
+    SourceStreamSnapshot as ExternalSourceStreamSnapshot,
+    SourceStreamState as ExternalSourceStreamState,
 };
 use xolotl_types::{
     IdentityRef, Path, ResourceId, TaintSet, TaintSource, Value, ValueMap, ValueView,
 };
+
+const EXTERNAL_TRANSCRIPT_DOMAIN: &[u8] = b"xolotl/external/session-transcript/v1\0";
+
+/// Hash the canonical v1 Hello and daemon-selected Context for AEAD binding.
+///
+/// Both sides convert their validated frames to the typed v1 model before
+/// encoding; protobuf field order and unknown wire fields do not affect the
+/// transcript. This is evaluated once per connection, outside the data path.
+pub fn external_session_transcript_hash(
+    hello: &RoleSessionClientHello,
+    context: &SessionContext,
+) -> [u8; 32] {
+    let hello = xolotl_proto::role_session_client_hello_to_pb(hello).encode_to_vec();
+    let context = xolotl_proto::session_context_to_pb(context).encode_to_vec();
+    let mut hash = Sha256::new();
+    hash.update(EXTERNAL_TRANSCRIPT_DOMAIN);
+    for frame in [&hello, &context] {
+        hash.update((frame.len() as u64).to_be_bytes());
+        hash.update(frame);
+    }
+    hash.finalize().into()
+}
 
 /// Daemon-to-external sender for one ready Provider or Source session.
 #[async_trait::async_trait]
@@ -34,6 +66,10 @@ pub trait ExternalSessionOutbound: Send + Sync + 'static {
 
     /// Send one control frame to the connected endpoint.
     async fn send_control(&self, frame: ControlFrame) -> Result<(), Self::Error>;
+
+    /// Enqueue best-effort cancellation synchronously without spawning a task.
+    /// Admission does not confirm delivery; full or closed queues reject it.
+    fn enqueue_cancel(&self, frame: ControlFrame) -> Result<(), Self::Error>;
 }
 
 /// Runtime hooks for one external Provider or Source session.
@@ -58,8 +94,10 @@ pub trait ExternalSessionHandler: Send + Sync + 'static {
         outbound: Arc<dyn ExternalSessionOutbound<Error = Self::OutboundError>>,
     ) -> Result<(), Self::Error>;
 
-    /// Close a ready role session.
-    async fn on_closed(
+    /// Release local session registrations synchronously, without network work.
+    /// Called once for any selected context, including partial handshakes and
+    /// cancellation or dropped transport futures. Must not block or spawn.
+    fn on_closed(
         &self,
         session: &EndpointSession,
         context: SessionContext,
@@ -70,15 +108,24 @@ pub trait ExternalSessionHandler: Send + Sync + 'static {
         &self,
         event: InboundEvent,
         session: &EndpointSession,
-        context: SessionContext,
+        context: &SessionContext,
     ) -> Result<EventAck, Self::Error>;
+
+    /// Handle one Source ordered-stream lifecycle request and return a
+    /// correlated result without tying logical stream life to the connection.
+    async fn on_source_stream_request(
+        &self,
+        request: SourceStreamRequest,
+        session: &EndpointSession,
+        context: &SessionContext,
+    ) -> Result<SourceStreamResult, Self::Error>;
 
     /// Handle a Source command result.
     async fn on_command_result(
         &self,
         result: CommandResult,
         session: &EndpointSession,
-        context: SessionContext,
+        context: &SessionContext,
     ) -> Result<(), Self::Error>;
 
     /// Handle a Provider invocation result.
@@ -86,7 +133,7 @@ pub trait ExternalSessionHandler: Send + Sync + 'static {
         &self,
         result: InvokeResult,
         session: &EndpointSession,
-        context: SessionContext,
+        context: &SessionContext,
     ) -> Result<(), Self::Error>;
 
     /// Handle a control frame.
@@ -94,7 +141,7 @@ pub trait ExternalSessionHandler: Send + Sync + 'static {
         &self,
         frame: ControlFrame,
         session: &EndpointSession,
-        context: SessionContext,
+        context: &SessionContext,
     ) -> Result<(), Self::Error>;
 
     /// Open one encrypted external envelope.
@@ -102,8 +149,16 @@ pub trait ExternalSessionHandler: Send + Sync + 'static {
         &self,
         envelope: &SecureEnvelope,
         session: &EndpointSession,
-        context: SessionContext,
+        context: &SessionContext,
     ) -> Result<Vec<u8>, Self::Error>;
+
+    /// Authenticate and encrypt one daemon-to-endpoint frame for a ready session.
+    async fn seal_secure_envelope(
+        &self,
+        plaintext: Vec<u8>,
+        aad: EnvelopeAad,
+        context: &SessionContext,
+    ) -> Result<SecureEnvelope, Self::OutboundError>;
 }
 
 fn saturating_i64_from_u64(value: u64, label: &'static str) -> i64 {
@@ -186,6 +241,9 @@ pub enum SourceIngestError {
     /// Event id could not be represented as a durable path segment.
     #[error("source event id is not a valid path segment")]
     InvalidEventId,
+    /// The event id was previously committed with a different request identity.
+    #[error("source event id conflicts with a different request")]
+    EventIdConflict,
     /// Stream id could not be represented as a durable path segment.
     #[error("source stream id is not a valid path segment")]
     InvalidStreamId,
@@ -229,9 +287,34 @@ pub enum SourceIngestError {
     /// Source stream is above its backpressure threshold.
     #[error("source event stream is backpressured")]
     Backpressured,
+    /// The Source commit result is unknown; a trusted host can inspect its
+    /// private claim receipt, and the same event id remains safe to retry.
+    #[error("source event commit outcome is unknown")]
+    CommitOutcomeUnknown,
     /// Source stream capacity has been reached.
     #[error("source event stream capacity exceeded")]
     CapacityExceeded,
+    /// The storage owner cannot retain another decision/receipt or rate record.
+    #[error("source event retention capacity exceeded")]
+    RetentionCapacityExceeded,
+    /// Ordered event targeted a stream that has not been opened or was retired.
+    #[error("source ordered stream is not active")]
+    StreamInactive,
+    /// Ordered event targeted a prior incarnation of the stream name.
+    #[error("source ordered stream epoch mismatch: active={active_epoch}")]
+    StreamEpochMismatch {
+        /// Current active stream incarnation.
+        active_epoch: u64,
+    },
+    /// Source scope was retired or replaced after this session became ready.
+    #[error("source scope is no longer active")]
+    ScopeInactive,
+    /// Commit parameters no longer match the active Source declaration.
+    #[error("source event does not match the active declaration")]
+    DeclarationMismatch,
+    /// The declared sink currently holds a value other than a sequence.
+    #[error("source event sink is not a sequence")]
+    SinkTypeMismatch,
     /// State write or dedup bookkeeping failed.
     #[error("state write failed: {0}")]
     State(String),
@@ -282,6 +365,9 @@ pub enum ProviderInvocationError {
     /// In-flight invocation limit has been reached.
     #[error("provider invocation in-flight limit exceeded")]
     InFlightLimitExceeded,
+    /// This registry can no longer assign a distinct registration identity.
+    #[error("provider invocation registration identities exhausted")]
+    RegistrationIdsExhausted,
 }
 
 /// In-flight Provider invocation registry.
@@ -292,10 +378,12 @@ pub enum ProviderInvocationError {
 #[derive(Debug, Default)]
 pub struct ProviderInvocationRegistry {
     entries: BTreeMap<String, ProviderInvocationEntry>,
+    next_registration_id: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProviderInvocationEntry {
+    registration_id: u64,
     installation_id: String,
     projection_id: String,
     session_id: String,
@@ -331,6 +419,21 @@ impl ProviderInvocationRegistry {
         self.entries.remove(invocation_id).is_some()
     }
 
+    /// Remove only the registration owned by one invocation future. A result
+    /// may already have freed the id for another invocation before that future
+    /// is dropped, so cancellation must not remove the newer entry.
+    pub fn remove_if(&mut self, invocation_id: &str, registration_id: u64) -> bool {
+        if self
+            .entries
+            .get(invocation_id)
+            .is_none_or(|entry| entry.registration_id != registration_id)
+        {
+            return false;
+        }
+        self.entries.remove(invocation_id);
+        true
+    }
+
     /// Remove all in-flight invocations registered to one Provider session.
     pub fn drain_for_session(&mut self, context: &SessionContext) -> Vec<String> {
         self.entries
@@ -347,7 +450,7 @@ impl ProviderInvocationRegistry {
     pub fn register(
         &mut self,
         req: ProviderInvocationRegister<'_>,
-    ) -> Result<(), ProviderInvocationError> {
+    ) -> Result<u64, ProviderInvocationError> {
         let ctx = provider_context(
             req.session,
             req.current_registry_hash,
@@ -396,9 +499,15 @@ impl ProviderInvocationRegistry {
         {
             return Err(ProviderInvocationError::DeadlineExceeded);
         }
+        let registration_id = self
+            .next_registration_id
+            .checked_add(1)
+            .ok_or(ProviderInvocationError::RegistrationIdsExhausted)?;
+        self.next_registration_id = registration_id;
         self.entries.insert(
             req.invoke.invocation_id.clone(),
             ProviderInvocationEntry {
+                registration_id,
                 installation_id: ctx.installation_id.clone(),
                 projection_id: ctx.projection_id.clone(),
                 session_id: ctx.session_id.clone(),
@@ -413,7 +522,7 @@ impl ProviderInvocationRegistry {
                 output_schema: req.output_schema.cloned(),
             },
         );
-        Ok(())
+        Ok(registration_id)
     }
 
     /// Admit a Provider result and remove its in-flight entry.
@@ -616,6 +725,12 @@ pub enum SourceCommandError {
     /// Command dispatch rate limit has been reached.
     #[error("source command rate limit exceeded")]
     RateLimited,
+    /// Shared pending and retained metadata capacity has been exhausted.
+    #[error("source command retention capacity exceeded")]
+    RetentionCapacityExceeded,
+    /// This registry can no longer assign a distinct registration identity.
+    #[error("source command registration identities exhausted")]
+    RegistrationIdsExhausted,
 }
 
 /// In-flight Source outbound command registry.
@@ -623,15 +738,30 @@ pub enum SourceCommandError {
 /// The daemon registers an [`OutboundCommand`] before sending it to a Source.
 /// A returned [`CommandResult`] is accepted only if it matches a registered
 /// command and the session generations still match the ready Source context.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SourceCommandRegistry {
     entries: BTreeMap<String, SourceCommandEntry>,
     retained_ids: BTreeMap<String, i64>,
     rate_windows: BTreeMap<SourceCommandRateKey, SourceCommandRateWindow>,
+    maintenance: SourceCommandMaintenance,
+    capacity: NonZeroUsize,
+    next_registration_id: u64,
+}
+
+/// Default shared capacity for pending commands, terminal ids, and rate rows.
+pub const DEFAULT_SOURCE_COMMAND_LIMIT: NonZeroUsize = NonZeroUsize::MIN.saturating_add(65_535);
+
+const SOURCE_COMMAND_MAINTENANCE_BATCH: usize = 64;
+
+impl Default for SourceCommandRegistry {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_SOURCE_COMMAND_LIMIT)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceCommandEntry {
+    registration_id: u64,
     installation_id: String,
     projection_id: String,
     session_id: String,
@@ -659,10 +789,165 @@ struct SourceCommandRateWindow {
     count: usize,
 }
 
+#[derive(Debug, Default)]
+struct SourceCommandMaintenance {
+    phase: SourceCommandSweepPhase,
+    next_expiration: Option<i64>,
+    scanned_expiration: Option<i64>,
+}
+
+#[derive(Debug, Default)]
+enum SourceCommandSweepPhase {
+    #[default]
+    Idle,
+    Ids(Option<String>),
+    Rates(Option<SourceCommandRateKey>),
+}
+
+/// Progress of one bounded pass over retained command metadata.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SourceCommandMaintenanceReport {
+    /// Retained ID and rate rows examined, including rows not yet expired.
+    pub examined: usize,
+    /// Capacity units released by this pass.
+    pub removed: usize,
+    /// This sweep completed, or no sweep is currently due.
+    pub reached_end: bool,
+}
+
+impl SourceCommandMaintenance {
+    fn observe(&mut self, until: i64) {
+        self.next_expiration = Some(
+            self.next_expiration
+                .map_or(until, |current| current.min(until)),
+        );
+        if !matches!(self.phase, SourceCommandSweepPhase::Idle) {
+            self.scanned_expiration = Some(
+                self.scanned_expiration
+                    .map_or(until, |current| current.min(until)),
+            );
+        }
+    }
+
+    fn expire(
+        &mut self,
+        retained_ids: &mut BTreeMap<String, i64>,
+        rate_windows: &mut BTreeMap<SourceCommandRateKey, SourceCommandRateWindow>,
+        now_millis: i64,
+    ) -> SourceCommandMaintenanceReport {
+        let mut report = SourceCommandMaintenanceReport::default();
+        if matches!(self.phase, SourceCommandSweepPhase::Idle) {
+            if self.next_expiration.is_none_or(|until| until > now_millis) {
+                report.reached_end = true;
+                return report;
+            }
+            self.phase = SourceCommandSweepPhase::Ids(None);
+            self.scanned_expiration = None;
+        }
+        while report.examined < SOURCE_COMMAND_MAINTENANCE_BATCH {
+            let limit = SOURCE_COMMAND_MAINTENANCE_BATCH - report.examined;
+            let batch = match &mut self.phase {
+                SourceCommandSweepPhase::Ids(cursor) => sweep_source_command_rows(
+                    retained_ids,
+                    cursor,
+                    &mut self.scanned_expiration,
+                    now_millis,
+                    limit,
+                    |until| *until,
+                ),
+                SourceCommandSweepPhase::Rates(cursor) => sweep_source_command_rows(
+                    rate_windows,
+                    cursor,
+                    &mut self.scanned_expiration,
+                    now_millis,
+                    limit,
+                    |window| window.retained_until_ms,
+                ),
+                SourceCommandSweepPhase::Idle => break,
+            };
+            report.examined += batch.examined;
+            report.removed += batch.removed;
+            if batch.reached_end {
+                match self.phase {
+                    SourceCommandSweepPhase::Ids(_) => {
+                        self.phase = SourceCommandSweepPhase::Rates(None)
+                    }
+                    SourceCommandSweepPhase::Rates(_) => {
+                        self.phase = SourceCommandSweepPhase::Idle;
+                        self.next_expiration = self.scanned_expiration.take();
+                        report.reached_end = true;
+                        break;
+                    }
+                    SourceCommandSweepPhase::Idle => break,
+                }
+            }
+        }
+        report
+    }
+}
+
+fn sweep_source_command_rows<Key: Ord + Clone, Row>(
+    rows: &mut BTreeMap<Key, Row>,
+    cursor: &mut Option<Key>,
+    earliest: &mut Option<i64>,
+    now_millis: i64,
+    limit: usize,
+    deadline: impl Fn(&Row) -> i64,
+) -> SourceCommandMaintenanceReport {
+    use std::ops::Bound;
+    let start = cursor.as_ref().map_or(Bound::Unbounded, Bound::Excluded);
+    let mut expired = Vec::new();
+    let mut last = None;
+    let mut examined = 0;
+    for (key, row) in rows.range((start, Bound::Unbounded)).take(limit) {
+        let until = deadline(row);
+        if until <= now_millis {
+            expired.push(key.clone());
+        } else {
+            *earliest = Some(earliest.map_or(until, |current| current.min(until)));
+        }
+        last = Some(key);
+        examined += 1;
+    }
+    *cursor = last.cloned();
+    let removed = expired.len();
+    for key in expired {
+        rows.remove(&key);
+    }
+    SourceCommandMaintenanceReport {
+        examined,
+        removed,
+        reached_end: examined < limit,
+    }
+}
+
 impl SourceCommandRegistry {
     /// Create an empty command registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Bound all pending commands, terminal ids, and projection rate rows.
+    pub fn with_capacity(capacity: NonZeroUsize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            retained_ids: BTreeMap::new(),
+            rate_windows: BTreeMap::new(),
+            maintenance: SourceCommandMaintenance::default(),
+            capacity,
+            next_registration_id: 0,
+        }
+    }
+
+    /// Capacity units held across active commands and retained metadata.
+    pub fn occupied(&self) -> usize {
+        self.entries.len() + self.retained_ids.len() + self.rate_windows.len()
+    }
+
+    /// Examine at most 64 retained ids or rate rows and report sweep progress.
+    pub fn expire_retained(&mut self, now_millis: i64) -> SourceCommandMaintenanceReport {
+        self.maintenance
+            .expire(&mut self.retained_ids, &mut self.rate_windows, now_millis)
     }
 
     /// Number of registered in-flight commands.
@@ -675,9 +960,31 @@ impl SourceCommandRegistry {
         self.entries.is_empty()
     }
 
-    /// Remove one in-flight command without admitting a result.
-    pub fn remove(&mut self, id: &str) -> bool {
-        self.entries.remove(id).is_some()
+    /// Remove only the pending registration owned by one dispatch attempt.
+    /// Use this before publication is possible; removal does not retain the id.
+    pub fn remove_if(&mut self, id: &str, registration_id: u64) -> bool {
+        if self
+            .entries
+            .get(id)
+            .is_none_or(|entry| entry.registration_id != registration_id)
+        {
+            return false;
+        }
+        self.entries.remove(id);
+        true
+    }
+
+    /// Retire the exact registration when delivery or execution may have
+    /// occurred. The retained id fences late results and ambiguous retries.
+    pub fn retire_if(&mut self, id: &str, registration_id: u64, now_millis: i64) -> bool {
+        if self
+            .entries
+            .get(id)
+            .is_none_or(|entry| entry.registration_id != registration_id)
+        {
+            return false;
+        }
+        self.terminal_remove(id, now_millis)
     }
 
     /// Remove all in-flight commands registered to one Source session.
@@ -703,11 +1010,13 @@ impl SourceCommandRegistry {
         F: FnMut(&SourceCommandEntry) -> bool,
     {
         let retained_ids = &mut self.retained_ids;
+        let maintenance = &mut self.maintenance;
         self.entries
             .extract_if(.., |_, entry| pred(entry))
             .map(|(id, entry)| {
                 retain_source_command_id(
                     retained_ids,
+                    maintenance,
                     &id,
                     now_millis,
                     entry.idempotency_window_ms,
@@ -718,8 +1027,8 @@ impl SourceCommandRegistry {
     }
 
     /// Register one daemon-to-Source command before it is sent.
-    pub fn register(&mut self, req: SourceCommandRegister<'_>) -> Result<(), SourceCommandError> {
-        self.prune_retained(req.now_millis);
+    pub fn register(&mut self, req: SourceCommandRegister<'_>) -> Result<u64, SourceCommandError> {
+        self.expire_retained(req.now_millis);
         let ctx = source_command_context(
             req.session,
             req.current_registry_hash,
@@ -734,8 +1043,11 @@ impl SourceCommandRegistry {
         if self.entries.contains_key(&req.command.id) {
             return Err(SourceCommandError::DuplicateCommandId);
         }
-        if self.retained_ids.contains_key(&req.command.id) {
-            return Err(SourceCommandError::DuplicateCommandId);
+        if let Some(until) = self.retained_ids.get(req.command.id.as_str()).copied() {
+            if until > req.now_millis {
+                return Err(SourceCommandError::DuplicateCommandId);
+            }
+            self.retained_ids.remove(req.command.id.as_str());
         }
         if let Some(max) = req.max_in_flight
             && self
@@ -755,18 +1067,30 @@ impl SourceCommandRegistry {
         if let Err(error) = validate_json_schema(req.command_schema, &req.command.action) {
             return Err(SourceCommandError::Schema(error));
         }
+        let registration_id = self
+            .next_registration_id
+            .checked_add(1)
+            .ok_or(SourceCommandError::RegistrationIdsExhausted)?;
+        let rate_key = SourceCommandRateKey {
+            installation_id: ctx.installation_id.clone(),
+            projection_id: ctx.projection_id.clone(),
+        };
+        self.expire_rate(&rate_key, req.now_millis);
+        let needed = 1 + usize::from(!self.rate_windows.contains_key(&rate_key));
+        if needed > self.capacity.get().saturating_sub(self.occupied()) {
+            return Err(SourceCommandError::RetentionCapacityExceeded);
+        }
         self.admit_rate(
-            &SourceCommandRateKey {
-                installation_id: ctx.installation_id.clone(),
-                projection_id: ctx.projection_id.clone(),
-            },
+            rate_key,
             req.now_millis,
             req.rate_limit_window_ms,
             req.rate_limit_max_commands,
         )?;
+        self.next_registration_id = registration_id;
         self.entries.insert(
             req.command.id.clone(),
             SourceCommandEntry {
+                registration_id,
                 installation_id: ctx.installation_id.clone(),
                 projection_id: ctx.projection_id.clone(),
                 session_id: ctx.session_id.clone(),
@@ -781,7 +1105,7 @@ impl SourceCommandRegistry {
                 idempotency_window_ms: req.idempotency_window_ms,
             },
         );
-        Ok(())
+        Ok(registration_id)
     }
 
     /// Admit a Source command result and remove its in-flight entry.
@@ -834,25 +1158,33 @@ impl SourceCommandRegistry {
         let Some(entry) = self.entries.remove(id) else {
             return false;
         };
-        retain_source_command_id(
-            &mut self.retained_ids,
-            id,
-            now_millis,
-            entry.idempotency_window_ms,
-        );
+        self.retain_id(id, now_millis, entry.idempotency_window_ms);
         true
     }
 
-    fn prune_retained(&mut self, now_millis: i64) {
-        self.retained_ids
-            .retain(|_, retained_until| *retained_until > now_millis);
-        self.rate_windows
-            .retain(|_, window| window.retained_until_ms > now_millis);
+    fn retain_id(&mut self, id: &str, now_millis: i64, window_ms: u64) {
+        retain_source_command_id(
+            &mut self.retained_ids,
+            &mut self.maintenance,
+            id,
+            now_millis,
+            window_ms,
+        );
+    }
+
+    fn expire_rate(&mut self, key: &SourceCommandRateKey, now_millis: i64) {
+        if self
+            .rate_windows
+            .get(key)
+            .is_some_and(|window| window.retained_until_ms <= now_millis)
+        {
+            self.rate_windows.remove(key);
+        }
     }
 
     fn admit_rate(
         &mut self,
-        key: &SourceCommandRateKey,
+        key: SourceCommandRateKey,
         now_millis: i64,
         window_ms: u64,
         max_commands: usize,
@@ -864,7 +1196,7 @@ impl SourceCommandRegistry {
         let retained_until_ms = now_millis.saturating_add(window_ms);
         let window = self
             .rate_windows
-            .entry(key.clone())
+            .entry(key)
             .or_insert(SourceCommandRateWindow {
                 window_start_ms: now_millis,
                 retained_until_ms,
@@ -881,6 +1213,7 @@ impl SourceCommandRegistry {
             return Err(SourceCommandError::RateLimited);
         }
         window.count = window.count.saturating_add(1);
+        self.maintenance.observe(window.retained_until_ms);
         Ok(())
     }
 }
@@ -898,6 +1231,7 @@ fn source_command_entry_matches_context(entry: &SourceCommandEntry, ctx: &Sessio
 
 fn retain_source_command_id(
     retained_ids: &mut BTreeMap<String, i64>,
+    maintenance: &mut SourceCommandMaintenance,
     id: &str,
     now_millis: i64,
     window_ms: u64,
@@ -905,8 +1239,12 @@ fn retain_source_command_id(
     if window_ms == 0 {
         return;
     }
-    let window_ms = saturating_i64_from_u64(window_ms, "source command idempotency window");
-    retained_ids.insert(id.to_string(), now_millis.saturating_add(window_ms));
+    let until = now_millis.saturating_add(saturating_i64_from_u64(
+        window_ms,
+        "source command idempotency window",
+    ));
+    retained_ids.insert(id.to_owned(), until);
+    maintenance.observe(until);
 }
 
 /// Context for registering one Source outbound command.
@@ -1005,8 +1343,9 @@ fn source_command_context<'a>(
 
 /// Runtime authority required to admit one inbound Source event.
 pub struct SourceIngest<'a> {
-    /// State backend used for dedup and event append.
-    pub state: Backend,
+    /// Source-private atomic commit port, paired with the declared sink's
+    /// State backend by the host assembly.
+    pub store: &'a dyn SourceIngress,
     /// Ready endpoint session that gates this frame.
     pub session: &'a EndpointSession,
     /// Installation id the frame claims to belong to.
@@ -1031,8 +1370,168 @@ pub struct SourceIngest<'a> {
     pub target: ResourceId,
     /// Wall-clock timestamp used by residual policy checks.
     pub now_millis: i64,
+    /// Clock sampled by the Source owner after acquiring its commit boundary.
+    pub decision_clock: Arc<dyn xolotl_source::SourceClock>,
     /// Event id dedupe retention window in milliseconds.
     pub dedupe_window_ms: u64,
+}
+
+/// Execute a stream lifecycle operation through the Source storage owner.
+/// The host must first gate the ready session against current installation,
+/// projection and credential authority; the store rechecks the scope epoch in
+/// its own serializable domain before changing any stream state.
+pub async fn operate_source_stream(
+    store: &dyn SourceIngress,
+    context: &SessionContext,
+    request: SourceStreamRequest,
+) -> SourceStreamResult {
+    let SourceStreamRequest {
+        request_id,
+        stream_id,
+        operation,
+    } = request;
+    let rejected = |code| {
+        SourceStreamOutcome::Rejected(SourceStreamRejected {
+            code,
+            current_revision: None,
+            active_epoch: None,
+            current: None,
+        })
+    };
+    let outcome = if context.role != Role::Source || context.scope_epoch == 0 {
+        rejected(SourceStreamRejectCode::ScopeInactive)
+    } else if validate_source_segment(&request_id, SourcePathError::StreamId).is_err() {
+        rejected(SourceStreamRejectCode::InvalidRequestId)
+    } else if validate_source_segment(&stream_id, SourcePathError::StreamId).is_err() {
+        rejected(SourceStreamRejectCode::InvalidStreamId)
+    } else {
+        let stream = SourceStreamScope {
+            installation_id: &context.installation_id,
+            projection_id: &context.projection_id,
+            scope_epoch: context.scope_epoch,
+            stream_id: &stream_id,
+        };
+        match operation {
+            SourceStreamOperation::Inspect => match store.inspect_stream(stream).await {
+                Ok(Some(snapshot)) => {
+                    SourceStreamOutcome::Inspected(external_source_stream_snapshot(snapshot))
+                }
+                Ok(None) => rejected(SourceStreamRejectCode::ScopeInactive),
+                Err(error) => source_stream_store_error(error),
+            },
+            SourceStreamOperation::Open { expected_revision } => {
+                match store
+                    .open_stream(SourceStreamOpen {
+                        stream,
+                        open_id: &request_id,
+                        expected_revision,
+                    })
+                    .await
+                {
+                    Ok(SourceStreamOpenOutcome::Opened(snapshot)) => {
+                        SourceStreamOutcome::Opened(external_source_stream_snapshot(snapshot))
+                    }
+                    Ok(SourceStreamOpenOutcome::AlreadyOpen(snapshot)) => {
+                        SourceStreamOutcome::Rejected(SourceStreamRejected {
+                            code: SourceStreamRejectCode::AlreadyOpen,
+                            current_revision: None,
+                            active_epoch: None,
+                            current: Some(external_source_stream_snapshot(snapshot)),
+                        })
+                    }
+                    Ok(SourceStreamOpenOutcome::RevisionConflict { current_revision }) => {
+                        SourceStreamOutcome::Rejected(SourceStreamRejected {
+                            code: SourceStreamRejectCode::RevisionConflict,
+                            current_revision: Some(current_revision),
+                            active_epoch: None,
+                            current: None,
+                        })
+                    }
+                    Ok(SourceStreamOpenOutcome::QuotaExceeded) => {
+                        rejected(SourceStreamRejectCode::QuotaExceeded)
+                    }
+                    Ok(SourceStreamOpenOutcome::ScopeInactive) => {
+                        rejected(SourceStreamRejectCode::ScopeInactive)
+                    }
+                    Err(error) => source_stream_store_error(error),
+                }
+            }
+            SourceStreamOperation::Retire { stream_epoch: 0 } => {
+                rejected(SourceStreamRejectCode::InvalidEpoch)
+            }
+            SourceStreamOperation::Retire { stream_epoch } => {
+                match store
+                    .retire_stream(SourceStreamRetire {
+                        stream,
+                        stream_epoch,
+                    })
+                    .await
+                {
+                    Ok(SourceStreamRetireOutcome::Retired { revision }) => {
+                        SourceStreamOutcome::Retired { revision }
+                    }
+                    Ok(SourceStreamRetireOutcome::Inactive { revision }) => {
+                        SourceStreamOutcome::Rejected(SourceStreamRejected {
+                            code: SourceStreamRejectCode::Inactive,
+                            current_revision: Some(revision),
+                            active_epoch: None,
+                            current: None,
+                        })
+                    }
+                    Ok(SourceStreamRetireOutcome::Stale { active_epoch }) => {
+                        SourceStreamOutcome::Rejected(SourceStreamRejected {
+                            code: SourceStreamRejectCode::StaleEpoch,
+                            current_revision: None,
+                            active_epoch: Some(active_epoch),
+                            current: None,
+                        })
+                    }
+                    Ok(SourceStreamRetireOutcome::ScopeInactive) => {
+                        rejected(SourceStreamRejectCode::ScopeInactive)
+                    }
+                    Err(error) => source_stream_store_error(error),
+                }
+            }
+        }
+    };
+    SourceStreamResult {
+        request_id,
+        stream_id,
+        outcome,
+    }
+}
+
+fn external_source_stream_snapshot(
+    snapshot: xolotl_source::SourceStreamSnapshot,
+) -> ExternalSourceStreamSnapshot {
+    ExternalSourceStreamSnapshot {
+        revision: snapshot.revision,
+        active: snapshot.active.map(|active| ExternalSourceStreamState {
+            stream_epoch: active.stream_epoch,
+            last_seq: active.last_seq,
+            open_id: active.open_id,
+            opened_at_revision: active.opened_at_revision,
+        }),
+    }
+}
+
+fn source_stream_store_error(error: SourceStoreError) -> SourceStreamOutcome {
+    let code = match error {
+        SourceStoreError::Aborted(message) => {
+            tracing::warn!(%message, "Source stream lifecycle storage operation aborted");
+            SourceStreamRejectCode::StorageUnavailable
+        }
+        SourceStoreError::Indeterminate(message) => {
+            tracing::error!(%message, "Source stream lifecycle outcome requires inspection");
+            SourceStreamRejectCode::OutcomeUnknown
+        }
+    };
+    SourceStreamOutcome::Rejected(SourceStreamRejected {
+        code,
+        current_revision: None,
+        active_epoch: None,
+        current: None,
+    })
 }
 
 /// Authoritative daemon ingest for one [`InboundEvent`]. This is the
@@ -1044,582 +1543,144 @@ pub async fn ingest_source_event(
     event: InboundEvent,
 ) -> Result<EventAck, SourceIngestError> {
     let emits = admit_source_ingest(&req, &event).await?;
-    prune_source_dedup_window(
-        &req.state,
-        req.installation_id,
-        &req.projection.id,
-        req.now_millis,
-        req.dedupe_window_ms,
-    )
-    .await?;
+    validate_source_segment(&event.id, SourcePathError::EventId)?;
+    let stream = source_stream_position(&event)?;
+    let stream_epoch = stream.map(|position| position.stream_epoch);
+    let scope_epoch = req
+        .session
+        .context()
+        .ok_or(SourceIngestError::Session(SessionReject::NotReady))?
+        .scope_epoch;
+    check_source_policy(&req, &event).await?;
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy)
+        .map_err(|_error| SourceIngestError::State("source claim entropy unavailable".into()))?;
+    let claim_id = SourceClaimId::from_bytes(entropy);
     let source_key = source_projection_key(req.installation_id, &req.projection.id);
-    let dedup = source_event_dedup_path(req.installation_id, &req.projection.id, &event.id)?;
-
-    let dedup = match reserve_source_dedup(&req.state, dedup, req.now_millis).await? {
-        SourceDedupReservation::Reserved(reservation) => reservation,
-        SourceDedupReservation::Duplicate => {
-            return Ok(EventAck {
-                id: event.id,
-                status: AckStatus::Duplicate,
-                reject_reason: None,
-            });
-        }
-    };
-
-    let sequence = match reserve_source_sequence(&req, &event).await {
-        Ok(sequence) => sequence,
-        Err(e) => {
-            return Err(rollback_source_ingest_after_error(&req.state, dedup, None, None, e).await);
-        }
-    };
-
-    if let Err(e) = check_source_policy(&req, &event).await {
-        return Err(rollback_source_ingest_after_error(&req.state, dedup, sequence, None, e).await);
-    }
-
-    let rate = match reserve_source_event_rate(&req, emits.rate_limit.as_ref()).await {
-        Ok(rate) => rate,
-        Err(e) => {
-            return Err(
-                rollback_source_ingest_after_error(&req.state, dedup, sequence, None, e).await,
-            );
-        }
-    };
-
     let taint = TaintSet::of(TaintSource::Inbound {
         source: format!("source/{source_key}").into(),
         channel: emits.sink.to_string().into(),
     });
-    if let Err(e) = append_source_event(&req, emits, &event, taint).await {
-        return Err(rollback_source_ingest_after_error(&req.state, dedup, sequence, rate, e).await);
-    }
-    commit_source_dedup(&req.state, dedup, req.now_millis).await?;
-
+    let result = req
+        .store
+        .commit(SourceCommit {
+            claim: SourceClaim {
+                installation_id: req.installation_id,
+                projection_id: &req.projection.id,
+                event_id: &event.id,
+                claim_id,
+                scope_epoch,
+                stream_epoch,
+            },
+            received_at_ms: req.now_millis,
+            decision_clock: req.decision_clock.clone(),
+            dedupe_window_ms: req.dedupe_window_ms,
+            sink: &emits.sink,
+            capacity: &emits.capacity,
+            max_inline_payload_bytes: emits.max_inline_payload_bytes,
+            payload: &event.payload,
+            taint: &taint,
+            stream,
+            rate_limit: emits.rate_limit.as_ref(),
+        })
+        .await
+        .map_err(|error| {
+            if matches!(error, SourceStoreError::Indeterminate(_)) {
+                tracing::error!(
+                    installation_id = req.installation_id,
+                    projection_id = %req.projection.id,
+                    scope_epoch,
+                    ?stream_epoch,
+                    event_id = %event.id,
+                    %claim_id,
+                    "Source atomic commit result requires host evidence inspection"
+                );
+            }
+            match error {
+                SourceStoreError::Aborted(message) => SourceIngestError::State(message),
+                SourceStoreError::Indeterminate(_) => SourceIngestError::CommitOutcomeUnknown,
+            }
+        })?;
+    let status = match result {
+        SourceCommitOutcome::Accepted => AckStatus::Accepted,
+        SourceCommitOutcome::Duplicate => AckStatus::Duplicate,
+        SourceCommitOutcome::Rejected(SourceCommitRejection::Backpressured) => {
+            return Err(SourceIngestError::Backpressured);
+        }
+        SourceCommitOutcome::Rejected(SourceCommitRejection::CapacityExceeded) => {
+            return Err(SourceIngestError::CapacityExceeded);
+        }
+        SourceCommitOutcome::Rejected(SourceCommitRejection::RetentionCapacityExceeded) => {
+            return Err(SourceIngestError::RetentionCapacityExceeded);
+        }
+        SourceCommitOutcome::Rejected(SourceCommitRejection::EventIdConflict) => {
+            return Err(SourceIngestError::EventIdConflict);
+        }
+        SourceCommitOutcome::Rejected(SourceCommitRejection::PayloadTooLarge) => {
+            return Err(SourceIngestError::PayloadTooLarge);
+        }
+        SourceCommitOutcome::Rejected(SourceCommitRejection::StreamInactive) => {
+            return Err(SourceIngestError::StreamInactive);
+        }
+        SourceCommitOutcome::Rejected(SourceCommitRejection::StreamEpochMismatch {
+            active_epoch,
+        }) => {
+            return Err(SourceIngestError::StreamEpochMismatch { active_epoch });
+        }
+        SourceCommitOutcome::Rejected(SourceCommitRejection::ScopeInactive) => {
+            return Err(SourceIngestError::ScopeInactive);
+        }
+        SourceCommitOutcome::Rejected(SourceCommitRejection::DeclarationMismatch) => {
+            return Err(SourceIngestError::DeclarationMismatch);
+        }
+        SourceCommitOutcome::Rejected(SourceCommitRejection::SinkTypeMismatch) => {
+            return Err(SourceIngestError::SinkTypeMismatch);
+        }
+        SourceCommitOutcome::Rejected(SourceCommitRejection::RateLimited) => {
+            return Err(SourceIngestError::RateLimited);
+        }
+        SourceCommitOutcome::Rejected(SourceCommitRejection::SequenceReplay { last, seq }) => {
+            return Err(SourceIngestError::SequenceReplay { last, seq });
+        }
+        SourceCommitOutcome::Rejected(SourceCommitRejection::SequenceGap { expected, seq }) => {
+            return Err(SourceIngestError::SequenceGap { expected, seq });
+        }
+    };
     Ok(EventAck {
         id: event.id,
-        status: AckStatus::Accepted,
+        status,
         reject_reason: None,
+        stream_epoch,
     })
 }
 
-#[derive(Clone)]
-struct SourceDedupEntry {
-    path: Path,
-    pending: Value,
-}
-
-enum SourceDedupReservation {
-    Reserved(SourceDedupEntry),
-    Duplicate,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SourceDedupStatus {
-    Pending,
-    Accepted,
-}
-
-async fn reserve_source_dedup(
-    state: &Backend,
-    path: Path,
-    now_millis: i64,
-) -> Result<SourceDedupReservation, SourceIngestError> {
-    let pending = source_dedup_record(SourceDedupStatus::Pending, now_millis);
-    match state.write_cas(&path, None, pending.clone()).await {
-        Ok(_commit) => Ok(SourceDedupReservation::Reserved(SourceDedupEntry {
-            path,
-            pending,
-        })),
-        Err(xolotl_state::StateFailure {
-            error: StateError::CasFailed { actual, .. },
-            ..
-        }) => match source_dedup_status(actual.as_deref())? {
-            Some(SourceDedupStatus::Accepted) => Ok(SourceDedupReservation::Duplicate),
-            Some(SourceDedupStatus::Pending) => Err(SourceIngestError::Backpressured),
-            None => Err(SourceIngestError::State(
-                "source dedup reservation changed unexpectedly".into(),
-            )),
-        },
-        Err(e) => Err(SourceIngestError::State(e.to_string())),
-    }
-}
-
-async fn commit_source_dedup(
-    state: &Backend,
-    entry: SourceDedupEntry,
-    now_millis: i64,
-) -> Result<(), SourceIngestError> {
-    state
-        .write_cas(
-            &entry.path,
-            Some(entry.pending),
-            source_dedup_record(SourceDedupStatus::Accepted, now_millis),
-        )
-        .await
-        .map(|_commit| ())
-        .map_err(|e| SourceIngestError::State(e.to_string()))
-}
-
-async fn rollback_source_ingest_after_error(
-    state: &Backend,
-    dedup: SourceDedupEntry,
-    sequence: Option<SourceSequenceReservation>,
-    rate: Option<SourceRateReservation>,
-    error: SourceIngestError,
-) -> SourceIngestError {
-    if let Err(rollback) = rollback_source_rate_limit(state, rate).await {
-        return source_ingest_rollback_error(&error, rollback);
-    }
-    if let Err(rollback) = rollback_source_sequence(state, sequence).await {
-        return source_ingest_rollback_error(&error, rollback);
-    }
-    if let Err(rollback) = rollback_source_dedup(state, dedup).await {
-        return source_ingest_rollback_error(&error, rollback);
-    }
-    error
-}
-
-fn source_ingest_rollback_error(
-    original: &SourceIngestError,
-    rollback: SourceIngestError,
-) -> SourceIngestError {
-    SourceIngestError::State(format!(
-        "source event rollback failed after {original}: {rollback}"
-    ))
-}
-
-async fn rollback_source_dedup(
-    state: &Backend,
-    entry: SourceDedupEntry,
-) -> Result<(), SourceIngestError> {
-    let current = state
-        .read(&entry.path)
-        .await
-        .map_err(|e| SourceIngestError::State(e.to_string()))?;
-    if current == Some(entry.pending) {
-        state
-            .write_delete(&entry.path)
-            .await
-            .map_err(|e| SourceIngestError::State(e.to_string()))?;
-    }
-    Ok(())
-}
-
-fn source_dedup_record(status: SourceDedupStatus, received_at_ms: i64) -> Value {
-    let mut record = BTreeMap::new();
-    let status = match status {
-        SourceDedupStatus::Pending => "pending",
-        SourceDedupStatus::Accepted => "accepted",
-    };
-    record.insert("status".into(), Value::string(status.into()));
-    record.insert("received_at_ms".into(), Value::integer(received_at_ms));
-    Value::map(record)
-}
-
-fn source_dedup_status(
-    value: Option<&Value>,
-) -> Result<Option<SourceDedupStatus>, SourceIngestError> {
-    let Some(record) = value.and_then(Value::as_map) else {
-        return match value {
-            None => Ok(None),
-            Some(other) => Err(SourceIngestError::State(format!(
-                "source dedup record expected map, found {other:?}"
-            ))),
-        };
-    };
-    match record.get("status").and_then(Value::as_str) {
-        Some("pending") => Ok(Some(SourceDedupStatus::Pending)),
-        Some("accepted") => Ok(Some(SourceDedupStatus::Accepted)),
-        Some(other) => Err(SourceIngestError::State(format!(
-            "source dedup record has invalid status {other:?}"
-        ))),
-        None => Err(SourceIngestError::State(
-            "source dedup record missing status".into(),
-        )),
-    }
-}
-
-fn source_dedup_received_at(value: &Value) -> Result<i64, SourceIngestError> {
-    let Some(record) = value.as_map() else {
-        return Err(SourceIngestError::State(format!(
-            "source dedup record expected map, found {value:?}"
-        )));
-    };
-    match record.get("received_at_ms").map(Value::view) {
-        Some(ValueView::Int(ts)) => Ok(ts),
-        Some(other) => Err(SourceIngestError::State(format!(
-            "source dedup record timestamp expected integer, found {other:?}"
-        ))),
-        None => Err(SourceIngestError::State(
-            "source dedup record missing timestamp".into(),
-        )),
-    }
-}
-
-struct SourceSequenceReservation {
-    path: Path,
-    previous: Option<u64>,
-    seq: u64,
-}
-
-async fn reserve_source_sequence(
-    req: &SourceIngest<'_>,
+fn source_stream_position(
     event: &InboundEvent,
-) -> Result<Option<SourceSequenceReservation>, SourceIngestError> {
-    let (Some(stream_id), Some(seq)) = (event.stream_id.as_deref(), event.seq) else {
-        if event.stream_id.is_some() || event.seq.is_some() {
-            return Err(SourceIngestError::InvalidSequence);
-        }
-        return Ok(None);
-    };
-    if seq > i64::MAX as u64 {
-        return Err(SourceIngestError::InvalidSequence);
-    }
-    let path = source_stream_last_seq_path(req.installation_id, &req.projection.id, stream_id)?;
-    for _ in 0..8 {
-        let current = req
-            .state
-            .read(&path)
-            .await
-            .map_err(|e| SourceIngestError::State(e.to_string()))?;
-        let previous = match current.as_ref().map(Value::view) {
-            None => None,
-            Some(ValueView::Int(n)) if n >= 0 => Some(n as u64),
-            Some(_) => {
-                return Err(SourceIngestError::State(
-                    "source stream sequence state is not an integer".into(),
-                ));
-            }
-        };
-        let expected = previous.map_or(1, |last| last.saturating_add(1));
-        if seq < expected {
-            return Err(SourceIngestError::SequenceReplay {
-                last: previous.unwrap_or(0),
+) -> Result<Option<SourceStreamPosition<'_>>, SourceIngestError> {
+    match (event.stream_id.as_deref(), event.seq, event.stream_epoch) {
+        (None, None, None) => Ok(None),
+        (Some(stream_id), Some(seq), Some(stream_epoch))
+            if (1..=i64::MAX as u64).contains(&seq) && stream_epoch != 0 =>
+        {
+            validate_source_segment(stream_id, SourcePathError::StreamId)?;
+            Ok(Some(SourceStreamPosition {
+                stream_id,
+                stream_epoch,
                 seq,
-            });
+            }))
         }
-        if seq > expected {
-            return Err(SourceIngestError::SequenceGap { expected, seq });
-        }
-        let expected_value = previous.map(|last| Value::integer(last as i64));
-        match req
-            .state
-            .write_cas(&path, expected_value, Value::integer(seq as i64))
-            .await
-        {
-            Ok(_commit) => {
-                return Ok(Some(SourceSequenceReservation {
-                    path,
-                    previous,
-                    seq,
-                }));
-            }
-            Err(xolotl_state::StateFailure {
-                error: StateError::CasFailed { .. },
-                ..
-            }) => continue,
-            Err(e) => return Err(SourceIngestError::State(e.to_string())),
-        }
-    }
-    Err(SourceIngestError::State(
-        "source stream sequence reservation changed too often".into(),
-    ))
-}
-
-async fn rollback_source_sequence(
-    state: &Backend,
-    reservation: Option<SourceSequenceReservation>,
-) -> Result<(), SourceIngestError> {
-    let Some(reservation) = reservation else {
-        return Ok(());
-    };
-    let current = state
-        .read(&reservation.path)
-        .await
-        .map_err(|e| SourceIngestError::State(e.to_string()))?;
-    if current != Some(Value::integer(reservation.seq as i64)) {
-        return Ok(());
-    }
-    match reservation.previous {
-        Some(previous) => {
-            state
-                .write_cas(
-                    &reservation.path,
-                    Some(Value::integer(reservation.seq as i64)),
-                    Value::integer(previous as i64),
-                )
-                .await
-                .map_err(|e| SourceIngestError::State(e.to_string()))?;
-        }
-        None => {
-            state
-                .write_delete(&reservation.path)
-                .await
-                .map_err(|e| SourceIngestError::State(e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-struct SourceRateReservation {
-    path: Path,
-    previous: Option<Value>,
-    value: Value,
-}
-
-const SOURCE_RATE_CAS_ATTEMPTS: usize = 16;
-
-async fn reserve_source_event_rate(
-    req: &SourceIngest<'_>,
-    rate_limit: Option<&SourceRateLimit>,
-) -> Result<Option<SourceRateReservation>, SourceIngestError> {
-    let Some(rate_limit) = rate_limit else {
-        return Ok(None);
-    };
-    if rate_limit.window_ms == 0 || rate_limit.max_events == 0 {
-        return Err(SourceIngestError::RateLimited);
-    }
-    let window_ms = saturating_i64_from_u64(rate_limit.window_ms, "source event rate window");
-    let path = source_event_rate_path(req.installation_id, &req.projection.id)?;
-    for _ in 0..SOURCE_RATE_CAS_ATTEMPTS {
-        let current = req
-            .state
-            .read(&path)
-            .await
-            .map_err(|e| SourceIngestError::State(e.to_string()))?;
-        let mut hits = decode_source_rate_hits(current.as_ref())?;
-        let cutoff = req.now_millis.saturating_sub(window_ms);
-        hits.retain(|&t| t > cutoff);
-        hits.sort_unstable();
-
-        if hits.len() >= rate_limit.max_events as usize {
-            let new = encode_source_rate_hits(&hits);
-            if current.as_ref() == Some(&new) {
-                return Err(SourceIngestError::RateLimited);
-            }
-            match req.state.write_cas(&path, current, new).await {
-                Ok(_commit) => return Err(SourceIngestError::RateLimited),
-                Err(xolotl_state::StateFailure {
-                    error: StateError::CasFailed { .. },
-                    ..
-                }) => continue,
-                Err(e) => return Err(SourceIngestError::State(e.to_string())),
-            }
-        }
-
-        hits.push(req.now_millis);
-        hits.sort_unstable();
-        let new = encode_source_rate_hits(&hits);
-        match req
-            .state
-            .write_cas(&path, current.clone(), new.clone())
-            .await
-        {
-            Ok(_commit) => {
-                return Ok(Some(SourceRateReservation {
-                    path,
-                    previous: current,
-                    value: new,
-                }));
-            }
-            Err(xolotl_state::StateFailure {
-                error: StateError::CasFailed { .. },
-                ..
-            }) => continue,
-            Err(e) => return Err(SourceIngestError::State(e.to_string())),
-        }
-    }
-    Err(SourceIngestError::State(
-        "source event rate state changed too often".into(),
-    ))
-}
-
-async fn rollback_source_rate_limit(
-    state: &Backend,
-    reservation: Option<SourceRateReservation>,
-) -> Result<(), SourceIngestError> {
-    let Some(reservation) = reservation else {
-        return Ok(());
-    };
-    let current = state
-        .read(&reservation.path)
-        .await
-        .map_err(|e| SourceIngestError::State(e.to_string()))?;
-    if current.as_ref() != Some(&reservation.value) {
-        return Ok(());
-    }
-    match reservation.previous {
-        Some(previous) => {
-            state
-                .write_cas(&reservation.path, Some(reservation.value), previous)
-                .await
-                .map_err(|e| SourceIngestError::State(e.to_string()))?;
-        }
-        None => {
-            state
-                .write_delete(&reservation.path)
-                .await
-                .map_err(|e| SourceIngestError::State(e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-fn decode_source_rate_hits(value: Option<&Value>) -> Result<Vec<i64>, SourceIngestError> {
-    match value.map(Value::view) {
-        None => Ok(Vec::new()),
-        Some(ValueView::List(items)) => {
-            let mut hits = Vec::with_capacity(items.len());
-            for item in items {
-                match item.view() {
-                    ValueView::Int(t) => hits.push(t),
-                    other => {
-                        return Err(SourceIngestError::State(format!(
-                            "source event rate state expected integer timestamp, found {other:?}"
-                        )));
-                    }
-                }
-            }
-            Ok(hits)
-        }
-        Some(other) => Err(SourceIngestError::State(format!(
-            "source event rate state expected timestamp list, found {other:?}"
-        ))),
+        _ => Err(SourceIngestError::InvalidSequence),
     }
 }
 
-fn encode_source_rate_hits(hits: &[i64]) -> Value {
-    Value::list(hits.iter().copied().map(Value::integer).collect())
-}
-
-async fn append_source_event(
-    req: &SourceIngest<'_>,
-    emits: &xolotl_types::external::EventSource,
-    event: &InboundEvent,
-    taint: TaintSet,
-) -> Result<(), SourceIngestError> {
-    let max_events = emits.capacity.max_events as usize;
-    if max_events == 0 {
-        return Err(SourceIngestError::CapacityExceeded);
+fn validate_source_segment(segment: &str, error: SourcePathError) -> Result<(), SourceIngestError> {
+    if segment.is_empty() || segment.len() > 256 {
+        return Err(error.into_error());
     }
-    match &emits.capacity.on_overflow {
-        OverflowPolicy::DropOldest => {
-            append_source_event_drop_oldest(req, emits, event, taint, max_events).await
-        }
-        OverflowPolicy::Backpressure {
-            pause_threshold, ..
-        } => {
-            let current_len = source_sink_len(&req.state, &emits.sink).await?;
-            if current_len >= *pause_threshold as usize {
-                return Err(SourceIngestError::Backpressured);
-            }
-            append_source_event_item(&req.state, &emits.sink, event.payload.clone(), taint).await
-        }
-        OverflowPolicy::DisconnectBridge => {
-            let current_len = source_sink_len(&req.state, &emits.sink).await?;
-            if current_len >= max_events {
-                return Err(SourceIngestError::CapacityExceeded);
-            }
-            append_source_event_item(&req.state, &emits.sink, event.payload.clone(), taint).await
-        }
-    }
-}
-
-async fn append_source_event_drop_oldest(
-    req: &SourceIngest<'_>,
-    emits: &xolotl_types::external::EventSource,
-    event: &InboundEvent,
-    taint: TaintSet,
-    max_events: usize,
-) -> Result<(), SourceIngestError> {
-    let current = req
-        .state
-        .read_tainted(&emits.sink)
-        .await
-        .map_err(|e| SourceIngestError::State(e.to_string()))?;
-    let Some(current) = current else {
-        return append_source_event_item(&req.state, &emits.sink, event.payload.clone(), taint)
-            .await;
-    };
-    match current.value.view() {
-        ValueView::List(items) if items.len() < max_events => {
-            append_source_event_item(&req.state, &emits.sink, event.payload.clone(), taint).await
-        }
-        ValueView::List(items) => {
-            let keep = max_events.saturating_sub(1);
-            let start = items.len().saturating_sub(keep);
-            let mut next = items.iter().skip(start).cloned().collect::<Vec<_>>();
-            next.push(event.payload.clone());
-            let next_taint = current.taint.merged(&taint);
-            req.state
-                .write_set_tainted(&emits.sink, Value::list(next), next_taint)
-                .await
-                .map(|_commit| ())
-                .map_err(|e| SourceIngestError::State(e.to_string()))
-        }
-        other => Err(SourceIngestError::State(format!(
-            "source event sink expected list, found {other:?}"
-        ))),
-    }
-}
-
-async fn append_source_event_item(
-    state: &Backend,
-    sink: &Path,
-    payload: Value,
-    taint: TaintSet,
-) -> Result<(), SourceIngestError> {
-    state
-        .write_append_tainted(sink, payload, taint)
-        .await
-        .map(|_commit| ())
-        .map_err(|e| SourceIngestError::State(e.to_string()))
-}
-
-async fn source_sink_len(state: &Backend, sink: &Path) -> Result<usize, SourceIngestError> {
-    match state
-        .read(sink)
-        .await
-        .map_err(|e| SourceIngestError::State(e.to_string()))?
-        .as_ref()
-        .map(Value::view)
-    {
-        None => Ok(0),
-        Some(ValueView::List(items)) => Ok(items.len()),
-        Some(other) => Err(SourceIngestError::State(format!(
-            "source event sink expected list, found {other:?}"
-        ))),
-    }
-}
-
-async fn prune_source_dedup_window(
-    state: &Backend,
-    installation_id: &str,
-    projection_id: &str,
-    now_millis: i64,
-    window_ms: u64,
-) -> Result<(), SourceIngestError> {
-    let cutoff = now_millis.saturating_sub(saturating_i64_from_u64(
-        window_ms,
-        "source deduplication window",
-    ));
-    let prefix = source_event_dedup_prefix(installation_id, projection_id)?;
-    let mut pages = state.pages(xolotl_state::StateScan::new(prefix));
-    while let Some(page) = pages
-        .next()
-        .await
-        .map_err(|error| SourceIngestError::State(error.to_string()))?
-    {
-        for (path, value) in page.entries {
-            if source_dedup_received_at(&value.value)? < cutoff {
-                state
-                    .write_delete(&path)
-                    .await
-                    .map_err(|error| SourceIngestError::State(error.to_string()))?;
-            }
-        }
-    }
-    Ok(())
+    Path::try_new("state")
+        .and_then(|path| path.try_push_literal(segment))
+        .map(|_path| ())
+        .map_err(|_error| error.into_error())
 }
 
 async fn admit_source_ingest<'a>(
@@ -1664,10 +1725,7 @@ async fn admit_source_ingest<'a>(
         .emits
         .as_ref()
         .ok_or(SourceIngestError::MissingEmits)?;
-    if emits.max_inline_payload_bytes == 0
-        || crate::value_inspection::inline_bytes(&event.payload, emits.max_inline_payload_bytes)
-            .is_none()
-    {
+    if emits.max_inline_payload_bytes == 0 {
         return Err(SourceIngestError::PayloadTooLarge);
     }
     reject_source_forbidden_payload_fields(&event.payload)?;
@@ -1782,60 +1840,6 @@ async fn check_source_policy(
     }
 }
 
-fn source_event_dedup_path(
-    installation_id: &str,
-    projection_id: &str,
-    event_id: &str,
-) -> Result<Path, SourceIngestError> {
-    source_state_path(
-        "source-events",
-        installation_id,
-        projection_id,
-        Some(event_id),
-        SourcePathError::EventId,
-    )
-}
-
-fn source_event_dedup_prefix(
-    installation_id: &str,
-    projection_id: &str,
-) -> Result<Path, SourceIngestError> {
-    source_state_path(
-        "source-events",
-        installation_id,
-        projection_id,
-        None,
-        SourcePathError::EventId,
-    )
-}
-
-fn source_stream_last_seq_path(
-    installation_id: &str,
-    projection_id: &str,
-    stream_id: &str,
-) -> Result<Path, SourceIngestError> {
-    source_state_path(
-        "source-streams",
-        installation_id,
-        projection_id,
-        Some(stream_id),
-        SourcePathError::StreamId,
-    )
-}
-
-fn source_event_rate_path(
-    installation_id: &str,
-    projection_id: &str,
-) -> Result<Path, SourceIngestError> {
-    source_state_path(
-        "source-rates",
-        installation_id,
-        projection_id,
-        None,
-        SourcePathError::Rate,
-    )
-}
-
 fn source_projection_key(installation_id: &str, projection_id: &str) -> String {
     format!("{installation_id}/{projection_id}")
 }
@@ -1844,47 +1848,15 @@ fn source_projection_key(installation_id: &str, projection_id: &str) -> String {
 enum SourcePathError {
     EventId,
     StreamId,
-    Rate,
 }
 
 impl SourcePathError {
     fn into_error(self) -> SourceIngestError {
         match self {
-            SourcePathError::EventId => SourceIngestError::InvalidEventId,
-            SourcePathError::StreamId => SourceIngestError::InvalidStreamId,
-            SourcePathError::Rate => {
-                SourceIngestError::State("source event rate path has invalid segment".into())
-            }
+            Self::EventId => SourceIngestError::InvalidEventId,
+            Self::StreamId => SourceIngestError::InvalidStreamId,
         }
     }
-}
-
-fn source_state_path(
-    table: &str,
-    installation_id: &str,
-    projection_id: &str,
-    leaf: Option<&str>,
-    error: SourcePathError,
-) -> Result<Path, SourceIngestError> {
-    let mut path = Path::try_new("state")
-        .and_then(|path| path.try_push("kernel"))
-        .and_then(|path| path.try_push_literal(table))
-        .map_err(|e| SourceIngestError::State(format!("invalid source state path base: {e}")))?;
-    path = push_source_state_segment(path, installation_id, error)?;
-    path = push_source_state_segment(path, projection_id, error)?;
-    if let Some(leaf) = leaf {
-        path = push_source_state_segment(path, leaf, error)?;
-    }
-    Ok(path)
-}
-
-fn push_source_state_segment(
-    path: Path,
-    segment: &str,
-    error: SourcePathError,
-) -> Result<Path, SourceIngestError> {
-    path.try_push_literal(segment)
-        .map_err(|_error| error.into_error())
 }
 
 /// Validate a Xolotl value against the external schema subset.
@@ -1993,6 +1965,8 @@ pub struct EndpointSession {
     phase: SessionPhase,
     /// The daemon-adjudicated context sent after hello.
     context: Option<SessionContext>,
+    /// Canonical Hello/Context hash expected in authenticated frame AAD.
+    transcript_hash: Option<[u8; 32]>,
     /// The credential generation currently valid; frames on an older generation
     /// are rejected after a revoke.
     valid_credential_generation: u64,
@@ -2004,6 +1978,7 @@ impl EndpointSession {
         Self {
             phase: SessionPhase::AwaitingHello,
             context: None,
+            transcript_hash: None,
             valid_credential_generation: 0,
         }
     }
@@ -2022,6 +1997,11 @@ impl EndpointSession {
     /// Authoritative session context sent by the daemon after hello.
     pub fn context(&self) -> Option<&SessionContext> {
         self.context.as_ref()
+    }
+
+    /// Canonical Hello/Context hash for this negotiated session.
+    pub fn transcript_hash(&self) -> Option<&[u8; 32]> {
+        self.transcript_hash.as_ref()
     }
 
     /// Receive the role client's hello and return the daemon-adjudicated
@@ -2048,21 +2028,27 @@ impl EndpointSession {
             || hello.observed.presentation_config_generation
                 != context.presentation_config_generation
             || hello.observed.alias_catalog_generation != context.alias_catalog_generation
+            || context.installation_epoch == 0
+            || (context.role == Role::Source && context.scope_epoch == 0)
+            || (context.role == Role::Provider && context.scope_epoch != 0)
         {
             self.phase = SessionPhase::Closed;
             return Err(SessionReject::ContextMismatch);
         }
         self.valid_credential_generation = context.credential_generation;
+        self.transcript_hash = Some(external_session_transcript_hash(hello, &context));
         self.context = Some(context.clone());
         self.phase = SessionPhase::AwaitingReady;
         Ok(context)
     }
 
-    /// Confirm that the role client accepted the daemon-selected context.
+    /// Confirm an authenticated role client's acceptance of the daemon-selected context.
     ///
+    /// The transport must first open an AEAD envelope bound to this session,
+    /// validate its `role_ready` frame type, and only then call this method.
     /// Any divergence is fail-closed: the session moves to Closed and business
     /// frames never flow.
-    pub fn on_ready(&mut self, ready: &RoleReady) -> Result<(), SessionReject> {
+    pub fn on_authenticated_ready(&mut self, ready: &RoleReady) -> Result<(), SessionReject> {
         if self.phase == SessionPhase::Closed {
             return Err(SessionReject::Closed);
         }
@@ -2141,9 +2127,15 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use xolotl_kernel::{CompiledCheck, PolicyDecision};
+    use xolotl_source::{
+        ExternalInstallationAuthority, ExternalInstallationMutation, ExternalInstallationRecord,
+        SourceClaimEvidence, SourceClaimInspection, SourceEventCommit, SourceEvidenceInspection,
+        SourceFuture, SourceStreamLifecycle,
+    };
     use xolotl_state::InMemoryBackend;
     use xolotl_types::external::{
-        EventSource, OverflowPolicy, Role, SourceRateLimit, StreamCapacity,
+        EventSource, ExternalInstallationDef, OverflowPolicy, Role, SourceRateLimit,
+        StreamCapacity, Transport, TrustLevel,
     };
     use xolotl_types::{FloatBits, MethodId, Purity, TaintSource};
 
@@ -2174,6 +2166,9 @@ mod tests {
             presentation_config_generation: 2,
             alias_catalog_generation: 1,
             session_id: "session-1".into(),
+            scope_epoch: 1,
+            installation_epoch: 1,
+            key_epoch: 1,
         }
     }
 
@@ -2188,6 +2183,7 @@ mod tests {
         SessionContext {
             projection_id: "provider".into(),
             role: Role::Provider,
+            scope_epoch: 0,
             ..ctx()
         }
     }
@@ -2196,6 +2192,7 @@ mod tests {
         SessionContext {
             projection_id: "provider".into(),
             role: Role::Provider,
+            scope_epoch: 0,
             session_id: session_id.into(),
             ..ctx()
         }
@@ -2208,10 +2205,32 @@ mod tests {
     fn complete_handshake_with_session_id(session_id: &str) -> anyhow::Result<EndpointSession> {
         let mut s = EndpointSession::new();
         let sent = s.on_hello(&hello(), |_| ctx_with_session_id(session_id))?;
-        s.on_ready(&RoleReady {
+        s.on_authenticated_ready(&RoleReady {
             accepted_context: sent,
         })?;
         Ok(s)
+    }
+
+    fn complete_handshake_with_record(
+        record: &ExternalInstallationRecord,
+    ) -> anyhow::Result<EndpointSession> {
+        let scope_epoch = record.scope_epoch("source").context("Source scope epoch")?;
+        let projection = record
+            .definition
+            .projection("source")
+            .context("Source projection")?;
+        let mut session = EndpointSession::new();
+        let context = session.on_hello(&hello(), |_| SessionContext {
+            installation_epoch: record.installation_epoch,
+            installation_config_version: record.definition.version,
+            projection_version: projection.version,
+            scope_epoch,
+            ..ctx()
+        })?;
+        session.on_authenticated_ready(&RoleReady {
+            accepted_context: context,
+        })?;
+        Ok(session)
     }
 
     fn complete_provider_handshake() -> anyhow::Result<EndpointSession> {
@@ -2226,7 +2245,7 @@ mod tests {
         hello.projection_id = "provider".into();
         let mut s = EndpointSession::new();
         let sent = s.on_hello(&hello, |_| provider_ctx_with_session_id(session_id))?;
-        s.on_ready(&RoleReady {
+        s.on_authenticated_ready(&RoleReady {
             accepted_context: sent,
         })?;
         Ok(s)
@@ -2413,38 +2432,157 @@ mod tests {
             timestamp_ms: 123,
             stream_id: None,
             seq: None,
+            stream_epoch: None,
         }
     }
 
-    fn sequenced_event(stream_id: &str, seq: u64, id: &str, payload: Value) -> InboundEvent {
+    fn sequenced_event(
+        stream_id: &str,
+        stream_epoch: u64,
+        seq: u64,
+        id: &str,
+        payload: Value,
+    ) -> InboundEvent {
         InboundEvent {
             stream_id: Some(stream_id.into()),
             seq: Some(seq),
+            stream_epoch: Some(stream_epoch),
             ..event(id, payload)
         }
     }
 
+    async fn open_test_stream(
+        store: &dyn SourceIngress,
+        session: &EndpointSession,
+        stream_id: &str,
+    ) -> anyhow::Result<u64> {
+        let context = session.context().context("ready Source context")?;
+        let inspect = operate_source_stream(
+            store,
+            context,
+            SourceStreamRequest {
+                request_id: "inspect".into(),
+                stream_id: stream_id.into(),
+                operation: SourceStreamOperation::Inspect,
+            },
+        )
+        .await;
+        let SourceStreamOutcome::Inspected(snapshot) = inspect.outcome else {
+            bail!("stream inspection failed: {:?}", inspect.outcome);
+        };
+        let opened = operate_source_stream(
+            store,
+            context,
+            SourceStreamRequest {
+                request_id: format!("open-{}-{}", context.scope_epoch, snapshot.revision),
+                stream_id: stream_id.into(),
+                operation: SourceStreamOperation::Open {
+                    expected_revision: snapshot.revision,
+                },
+            },
+        )
+        .await;
+        let SourceStreamOutcome::Opened(snapshot) = opened.outcome else {
+            bail!("stream open failed: {:?}", opened.outcome);
+        };
+        Ok(snapshot
+            .active
+            .context("opened stream lacks state")?
+            .stream_epoch)
+    }
+
     fn source_req<'a>(
-        state: Backend,
+        store: &'a dyn SourceIngress,
         session: &'a EndpointSession,
         projection: &'a ExternalProjectionDef,
         policy: &'a PolicySnapshot,
     ) -> SourceIngest<'a> {
         SourceIngest {
-            state,
+            store,
             session,
             installation_id: "inst-1",
             projection,
             current_registry_hash: "h",
             credential_generation: 3,
             current_binding_generation: 1,
-            current_installation_config_version: 1,
+            current_installation_config_version: session
+                .context()
+                .map_or(1, |context| context.installation_config_version),
             policy,
             acting: IdentityRef::ROOT,
             target: ResourceId::new(1),
             now_millis: 123,
+            decision_clock: Arc::new(|| 123),
             dedupe_window_ms: 60_000,
         }
+    }
+
+    fn source_installation(projection: ExternalProjectionDef) -> ExternalInstallationDef {
+        ExternalInstallationDef {
+            id: "inst-1".into(),
+            platform: "test".into(),
+            transport: Transport::Grpc { endpoint: None },
+            trust: TrustLevel::Full,
+            config_schema: Value::map(Default::default()),
+            config: Value::null(),
+            projections: vec![projection],
+            version: 0,
+        }
+    }
+
+    async fn memory_source_with(
+        projection: ExternalProjectionDef,
+    ) -> anyhow::Result<(
+        xolotl_state::Backend,
+        Arc<InMemoryBackend>,
+        ExternalInstallationRecord,
+    )> {
+        memory_source_with_options(projection, xolotl_state::InMemoryOptions::default()).await
+    }
+
+    async fn memory_source_with_options(
+        projection: ExternalProjectionDef,
+        options: xolotl_state::InMemoryOptions,
+    ) -> anyhow::Result<(
+        xolotl_state::Backend,
+        Arc<InMemoryBackend>,
+        ExternalInstallationRecord,
+    )> {
+        let (state, store) = InMemoryBackend::with_options(options)?.into_source_parts();
+        let ExternalInstallationMutation::Applied(Some(record)) = store
+            .compare_install(source_installation(projection), None)
+            .await?
+        else {
+            bail!("initial Source installation did not apply");
+        };
+        Ok((state, store, record))
+    }
+
+    async fn memory_source() -> anyhow::Result<(
+        xolotl_state::Backend,
+        Arc<InMemoryBackend>,
+        ExternalInstallationRecord,
+    )> {
+        memory_source_with(source_projection(None)?).await
+    }
+
+    async fn replace_source_projection(
+        store: &InMemoryBackend,
+        projection: ExternalProjectionDef,
+    ) -> anyhow::Result<ExternalInstallationRecord> {
+        let current = store
+            .load_installation("inst-1")
+            .await?
+            .context("current Source installation")?;
+        let expected = current.revision();
+        let mut definition = current.definition;
+        definition.projections = vec![projection];
+        let ExternalInstallationMutation::Applied(Some(record)) =
+            store.compare_install(definition, Some(expected)).await?
+        else {
+            bail!("Source declaration replacement did not apply");
+        };
+        Ok(record)
     }
 
     async fn expect_source_ingest_error(
@@ -2519,12 +2657,49 @@ mod tests {
     }
 
     #[test]
+    fn handshake_rejects_missing_or_wrong_role_epochs() {
+        let mut provider_hello = hello();
+        provider_hello.role = Role::Provider;
+        provider_hello.projection_id = "provider".into();
+        for (hello, context) in [
+            (
+                hello(),
+                SessionContext {
+                    installation_epoch: 0,
+                    ..ctx()
+                },
+            ),
+            (
+                hello(),
+                SessionContext {
+                    scope_epoch: 0,
+                    ..ctx()
+                },
+            ),
+            (
+                provider_hello,
+                SessionContext {
+                    scope_epoch: 1,
+                    ..provider_ctx()
+                },
+            ),
+        ] {
+            let mut session = EndpointSession::new();
+            assert_eq!(
+                session.on_hello(&hello, |_| context),
+                Err(SessionReject::ContextMismatch)
+            );
+            assert_eq!(session.phase(), SessionPhase::Closed);
+        }
+    }
+
+    #[test]
     fn context_mismatch_is_fail_closed() -> anyhow::Result<()> {
         let mut s = EndpointSession::new();
         let _sent = s.on_hello(&hello(), |_| ctx())?;
         let mut wrong = ctx();
         wrong.credential_generation = 999;
-        let r = s.on_ready(&RoleReady {
+        let r = s.on_authenticated_ready(&RoleReady {
             accepted_context: wrong,
         });
         ensure!(
@@ -2569,7 +2744,7 @@ mod tests {
     fn out_of_order_ready_is_rejected() -> anyhow::Result<()> {
         let mut s = EndpointSession::new();
         ensure!(
-            s.on_ready(&RoleReady {
+            s.on_authenticated_ready(&RoleReady {
                 accepted_context: ctx()
             }) == Err(SessionReject::OutOfOrder),
             "ready before hello should be rejected"
@@ -2672,6 +2847,24 @@ mod tests {
         let resolved = registry.resolve(provider_resolve(&s, &result))?;
         ensure!(resolved == result, "unexpected result: {resolved:?}");
         ensure!(registry.is_empty(), "registry should be empty");
+        Ok(())
+    }
+
+    #[test]
+    fn provider_cancellation_only_removes_its_own_registration() -> anyhow::Result<()> {
+        let session = complete_provider_handshake()?;
+        let mut registry = ProviderInvocationRegistry::new();
+        let invocation = invoke("reused-id")?;
+        let old = registry.register(provider_register(&session, &invocation))?;
+        ensure!(registry.remove_if("reused-id", old));
+        ensure!(registry.is_empty());
+
+        let current = registry.register(provider_register(&session, &invocation))?;
+        ensure!(current != old);
+        ensure!(!registry.remove_if("reused-id", old));
+        ensure!(registry.len() == 1);
+        ensure!(registry.remove_if("reused-id", current));
+        ensure!(registry.is_empty());
         Ok(())
     }
 
@@ -2840,7 +3033,7 @@ mod tests {
         hello.role = Role::Provider;
         hello.projection_id = "other-provider".into();
         let sent = other_session.on_hello(&hello, |_| other)?;
-        other_session.on_ready(&RoleReady {
+        other_session.on_authenticated_ready(&RoleReady {
             accepted_context: sent,
         })?;
         ensure!(
@@ -2990,6 +3183,304 @@ mod tests {
         let resolved = registry.resolve(source_command_resolve(&s, &result))?;
         ensure!(resolved == result, "unexpected result: {resolved:?}");
         ensure!(registry.is_empty(), "registry should be empty");
+        Ok(())
+    }
+
+    #[test]
+    fn source_command_old_cleanup_cannot_remove_reused_id() -> anyhow::Result<()> {
+        let session = complete_handshake()?;
+        let mut registry = SourceCommandRegistry::new();
+        let command = outbound_command("reused-id", message_payload("send"));
+        let mut first = source_command_register(&session, &command);
+        first.idempotency_window_ms = 0;
+        let old_registration = registry.register(first)?;
+        ensure!(registry.remove_if("reused-id", old_registration));
+
+        let mut second = source_command_register(&session, &command);
+        second.idempotency_window_ms = 0;
+        let current_registration = registry.register(second)?;
+        ensure!(current_registration > old_registration);
+        ensure!(!registry.remove_if("reused-id", old_registration));
+        ensure!(!registry.retire_if("reused-id", old_registration, 124));
+        ensure!(registry.len() == 1);
+        ensure!(registry.retire_if("reused-id", current_registration, 124));
+        ensure!(registry.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn source_command_ambiguous_delivery_retains_id_until_window_end() -> anyhow::Result<()> {
+        let session = complete_handshake()?;
+        let mut registry = SourceCommandRegistry::new();
+        let command = outbound_command("ambiguous-id", message_payload("send"));
+        let mut first = source_command_register(&session, &command);
+        first.idempotency_window_ms = 500;
+        let registration_id = registry.register(first)?;
+
+        ensure!(registry.retire_if("ambiguous-id", registration_id, 200));
+        ensure!(!registry.retire_if("ambiguous-id", registration_id, 201));
+        let mut retry = source_command_register(&session, &command);
+        retry.now_millis = 699;
+        retry.deadline_ms = Some(1_000);
+        ensure!(
+            registry.register(retry) == Err(SourceCommandError::DuplicateCommandId),
+            "an uncertain dispatch must fence an immediate retry"
+        );
+        let mut after_window = source_command_register(&session, &command);
+        after_window.now_millis = 700;
+        after_window.deadline_ms = Some(1_000);
+        ensure!(registry.register(after_window)? > registration_id);
+        Ok(())
+    }
+
+    #[test]
+    fn source_command_exhausted_registration_ids_do_not_consume_rate() -> anyhow::Result<()> {
+        let session = complete_handshake()?;
+        let mut registry = SourceCommandRegistry::new();
+        registry.next_registration_id = u64::MAX;
+        let command = outbound_command("cmd", message_payload("send"));
+        ensure!(
+            registry.register(source_command_register(&session, &command))
+                == Err(SourceCommandError::RegistrationIdsExhausted)
+        );
+        ensure!(registry.is_empty());
+        ensure!(registry.rate_windows.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn source_command_terminal_ids_charge_admission_capacity() -> anyhow::Result<()> {
+        let session = complete_handshake()?;
+        let mut registry = SourceCommandRegistry::new();
+        registry.retained_ids = (0..65_536)
+            .map(|index| (format!("retained-{index}"), 60_000))
+            .collect();
+        registry.maintenance.observe(60_000);
+        let command = outbound_command("new-command", message_payload("send"));
+        ensure!(
+            registry.register(source_command_register(&session, &command))
+                == Err(SourceCommandError::RetentionCapacityExceeded)
+        );
+        ensure!(registry.is_empty());
+        ensure!(registry.rate_windows.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn source_command_capacity_is_reserved_through_terminal_and_cancel() -> anyhow::Result<()> {
+        let session = complete_handshake()?;
+        let mut registry =
+            SourceCommandRegistry::with_capacity(NonZeroUsize::MIN.saturating_add(2));
+        let first = outbound_command("first", message_payload("send"));
+        registry.register(source_command_register(&session, &first))?;
+        ensure!(registry.occupied() == 2);
+        registry.resolve(source_command_resolve(
+            &session,
+            &command_result("first", Value::null()),
+        ))?;
+        ensure!(registry.occupied() == 2);
+        let second = outbound_command("second", message_payload("send"));
+        let registration = registry.register(source_command_register(&session, &second))?;
+        ensure!(registry.occupied() == 3);
+        let rejected = outbound_command("rejected", message_payload("send"));
+        let rate_before = registry
+            .rate_windows
+            .values()
+            .next()
+            .context("missing command rate row")?
+            .count;
+        ensure!(
+            registry.register(source_command_register(&session, &rejected))
+                == Err(SourceCommandError::RetentionCapacityExceeded)
+        );
+        ensure!(
+            registry
+                .rate_windows
+                .values()
+                .next()
+                .context("missing command rate row after rejection")?
+                .count
+                == rate_before
+        );
+        ensure!(registry.retire_if("second", registration, 123));
+        ensure!(registry.occupied() == 3 && registry.is_empty());
+        ensure!(
+            registry.register(source_command_register(&session, &first))
+                == Err(SourceCommandError::DuplicateCommandId)
+        );
+        ensure!(registry.expire_retained(60_123).removed == 3);
+        ensure!(registry.occupied() == 0);
+        Ok(())
+    }
+
+    #[test]
+    fn source_command_presend_release_and_zero_window_keep_rate_charge() -> anyhow::Result<()> {
+        let session = complete_handshake()?;
+        let mut registry =
+            SourceCommandRegistry::with_capacity(NonZeroUsize::MIN.saturating_add(1));
+        let command = outbound_command("command", message_payload("send"));
+        let mut request = source_command_register(&session, &command);
+        request.idempotency_window_ms = 0;
+        let registration = registry.register(request)?;
+        ensure!(registry.occupied() == 2);
+        ensure!(!registry.remove_if("command", registration + 1));
+        ensure!(registry.remove_if("command", registration));
+        ensure!(registry.occupied() == 1);
+        let mut request = source_command_register(&session, &command);
+        request.idempotency_window_ms = 0;
+        registry.register(request)?;
+        registry.resolve(source_command_resolve(
+            &session,
+            &command_result("command", Value::null()),
+        ))?;
+        ensure!(registry.occupied() == 1);
+        ensure!(registry.retained_ids.is_empty());
+        ensure!(
+            registry
+                .rate_windows
+                .values()
+                .next()
+                .context("missing command rate row after terminal transition")?
+                .count
+                == 2
+        );
+        ensure!(registry.expire_retained(60_122).removed == 0);
+        ensure!(registry.expire_retained(60_123).removed == 1);
+        ensure!(registry.occupied() == 0);
+        Ok(())
+    }
+
+    #[test]
+    fn source_command_expiry_bounds_examined_rows_and_revisits_live_rows() -> anyhow::Result<()> {
+        let session = complete_handshake()?;
+        let mut registry =
+            SourceCommandRegistry::with_capacity(NonZeroUsize::MIN.saturating_add(199));
+        for index in 0..130 {
+            let id = format!("command-{index}");
+            let command = outbound_command(&id, message_payload("send"));
+            let registration = registry.register(source_command_register(&session, &command))?;
+            ensure!(registry.retire_if(&id, registration, 123 + index));
+        }
+        ensure!(registry.occupied() == 131);
+        ensure!(registry.expire_retained(60_123).removed == 1);
+        ensure!(!registry.retained_ids.contains_key("command-0"));
+        ensure!(registry.retained_ids.contains_key("command-1"));
+        let live_batch = registry.expire_retained(60_123);
+        ensure!(live_batch.examined == 64);
+        ensure!(live_batch.removed == 0 && !live_batch.reached_end);
+        let mut removed = 0;
+        for _ in 0..5 {
+            let report = registry.expire_retained(100_000);
+            ensure!(report.examined <= 64);
+            removed += report.removed;
+        }
+        ensure!(removed == 130);
+        ensure!(registry.expire_retained(100_000).reached_end);
+        ensure!(registry.occupied() == 0);
+        Ok(())
+    }
+
+    #[test]
+    fn source_command_expired_retry_preserves_new_fence_despite_cleanup_backlog()
+    -> anyhow::Result<()> {
+        let session = complete_handshake()?;
+        let mut registry =
+            SourceCommandRegistry::with_capacity(NonZeroUsize::MIN.saturating_add(199));
+        for index in 0..130 {
+            let command = outbound_command(&format!("command-{index:03}"), message_payload("send"));
+            let registration = registry.register(source_command_register(&session, &command))?;
+            ensure!(registry.retire_if(&command.id, registration, 123 + index));
+        }
+        let command = outbound_command("command-129", message_payload("send"));
+        let mut request = source_command_register(&session, &command);
+        request.now_millis = 61_000;
+        request.deadline_ms = Some(62_000);
+        let registration = registry.register(request)?;
+        ensure!(registry.retire_if(&command.id, registration, 61_000));
+        for _ in 0..3 {
+            registry.expire_retained(61_000);
+        }
+        ensure!(registry.occupied() == 2);
+        let mut request = source_command_register(&session, &command);
+        request.now_millis = 61_001;
+        request.deadline_ms = Some(62_000);
+        ensure!(registry.register(request) == Err(SourceCommandError::DuplicateCommandId));
+        ensure!(registry.expire_retained(121_000).removed == 2);
+        ensure!(registry.occupied() == 0);
+        Ok(())
+    }
+
+    #[test]
+    fn source_command_sweep_keeps_earlier_insertions_before_its_cursor() -> anyhow::Result<()> {
+        let session = complete_handshake()?;
+        let mut registry =
+            SourceCommandRegistry::with_capacity(NonZeroUsize::MIN.saturating_add(199));
+        for index in 0..130 {
+            let command = outbound_command(&format!("command-{index:03}"), message_payload("send"));
+            let mut request = source_command_register(&session, &command);
+            if index == 0 {
+                request.idempotency_window_ms = 1;
+            }
+            let registration = registry.register(request)?;
+            ensure!(registry.retire_if(&command.id, registration, 123));
+        }
+        ensure!(registry.expire_retained(124).removed == 1);
+        let command = outbound_command("aaa", message_payload("send"));
+        let mut request = source_command_register(&session, &command);
+        request.now_millis = 124;
+        request.idempotency_window_ms = 1;
+        let registration = registry.register(request)?;
+        ensure!(registry.retire_if(&command.id, registration, 124));
+        for _ in 0..3 {
+            registry.expire_retained(124);
+        }
+        ensure!(registry.expire_retained(125).removed == 1);
+        ensure!(!registry.retained_ids.contains_key("aaa"));
+        ensure!(registry.occupied() == 130);
+        Ok(())
+    }
+
+    #[test]
+    fn source_command_rate_refresh_updates_expiry_hint() -> anyhow::Result<()> {
+        let session = complete_handshake()?;
+        let mut registry =
+            SourceCommandRegistry::with_capacity(NonZeroUsize::MIN.saturating_add(1));
+        let command = outbound_command("command", message_payload("send"));
+        let registration = registry.register(source_command_register(&session, &command))?;
+        ensure!(registry.remove_if("command", registration));
+        let mut request = source_command_register(&session, &command);
+        request.now_millis = 100;
+        let registration = registry.register(request)?;
+        ensure!(registry.remove_if("command", registration));
+        ensure!(registry.expire_retained(60_099).removed == 0);
+        ensure!(registry.expire_retained(60_100).removed == 1);
+        ensure!(registry.occupied() == 0);
+        Ok(())
+    }
+
+    #[test]
+    fn source_command_capacity_is_global_across_projections() -> anyhow::Result<()> {
+        let first = complete_handshake()?;
+        let mut hello = hello();
+        hello.projection_id = "another".into();
+        let mut second = EndpointSession::new();
+        let context = second.on_hello(&hello, |_| SessionContext {
+            projection_id: "another".into(),
+            ..ctx()
+        })?;
+        second.on_authenticated_ready(&RoleReady {
+            accepted_context: context,
+        })?;
+        let mut registry =
+            SourceCommandRegistry::with_capacity(NonZeroUsize::MIN.saturating_add(2));
+        let first_command = outbound_command("first", message_payload("send"));
+        registry.register(source_command_register(&first, &first_command))?;
+        let second_command = outbound_command("second", message_payload("send"));
+        ensure!(
+            registry.register(source_command_register(&second, &second_command))
+                == Err(SourceCommandError::RetentionCapacityExceeded)
+        );
+        ensure!(registry.occupied() == 2 && registry.rate_windows.len() == 1);
         Ok(())
     }
 
@@ -3243,7 +3734,7 @@ mod tests {
         let mut hello = hello();
         hello.projection_id = "other-source".into();
         let sent = other_session.on_hello(&hello, |_| other)?;
-        other_session.on_ready(&RoleReady {
+        other_session.on_authenticated_ready(&RoleReady {
             accepted_context: sent,
         })?;
         ensure!(
@@ -3359,737 +3850,578 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_ingest_rejects_before_ready_and_writes_nothing() -> anyhow::Result<()> {
-        let mut s = EndpointSession::new();
-        s.on_hello(&hello(), |_| ctx())?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let def = source_projection(None)?;
+    async fn source_atomic_accept_dedup_and_taint() -> anyhow::Result<()> {
+        let projection = source_projection(Some(message_schema()))?;
+        let (state, store, record) = memory_source_with(projection.clone()).await?;
+        let session = complete_handshake_with_record(&record)?;
         let policy = PolicySnapshot::empty();
-        let err = expect_source_ingest_error(
-            source_req(state.clone(), &s, &def, &policy),
-            event("e1", message_payload("hello")),
+        let frame = event("evt-1", message_payload("one"));
+        let accepted = ingest_source_event(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            frame.clone(),
         )
         .await?;
-
-        ensure!(
-            err == SourceIngestError::Session(SessionReject::NotReady),
-            "unexpected ingest error: {err:?}"
-        );
-        let sink = source_event_sink()?;
-        let value = state.read(&sink).await?;
-        ensure!(value.is_none(), "unexpected source event value: {value:?}");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn source_ingest_accepts_taints_and_dedupes_event_id() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let def = source_projection(None)?;
-        let policy = PolicySnapshot::empty();
-        let first = ingest_source_event(
-            source_req(state.clone(), &s, &def, &policy),
-            event("evt-1", message_payload("hello")),
+        ensure!(accepted.status == AckStatus::Accepted);
+        let repeated = ingest_source_event(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            frame.clone(),
         )
         .await?;
-        let second = ingest_source_event(
-            source_req(state.clone(), &s, &def, &policy),
-            event("evt-1", message_payload("ignored")),
+        ensure!(repeated.status == AckStatus::Duplicate);
+        let conflict = expect_source_ingest_error(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            event("evt-1", message_payload("changed")),
         )
         .await?;
-
-        ensure!(
-            first.status == AckStatus::Accepted,
-            "unexpected first ack: {first:?}"
-        );
-        ensure!(
-            second.status == AckStatus::Duplicate,
-            "unexpected second ack: {second:?}"
-        );
-        let sink = source_event_sink()?;
-        let tv = state
-            .read_tainted(&sink)
+        ensure!(conflict == SourceIngestError::EventIdConflict);
+        let sink = state.read_tainted(&source_event_sink()?).await?;
+        let sink_value = sink.value.clone().context("sink missing")?;
+        ensure!(sink_value.as_list().is_some_and(|items| items.len() == 1));
+        ensure!(sink.taint.sources().iter().any(|source| matches!(source,
+            TaintSource::Inbound { source, .. } if source.as_str() == "source/inst-1/source"
+        )));
+        let installed = store
+            .load_installation("inst-1")
             .await?
-            .context("missing tainted source event")?;
-        let expected = Value::list(vec![message_payload("hello")]);
-        ensure!(
-            tv.value == expected,
-            "unexpected source event value: {:?}",
-            tv.value
-        );
-        ensure!(
-            tv.taint.sources().iter().any(|taint_source| {
-                matches!(
-                    taint_source,
-                    TaintSource::Inbound {
-                        source,
-                        channel
-                    } if source.as_str() == "source/inst-1/source"
-                        && channel.as_str() == "state://events/external/inst-1/source"
-                )
-            }),
-            "missing inbound taint source: {:?}",
-            tv.taint
-        );
+            .context("installed Source")?;
+        ensure!(matches!(
+            store.compare_retire("inst-1", installed.revision()).await?,
+            ExternalInstallationMutation::Applied(None)
+        ));
+        let stale = expect_source_ingest_error(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            frame,
+        )
+        .await?;
+        ensure!(stale == SourceIngestError::ScopeInactive);
         Ok(())
     }
 
     #[tokio::test]
-    async fn source_ingest_rejects_invalid_event_id_without_state_write() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let def = source_projection(None)?;
-        let policy = PolicySnapshot::empty();
-
-        for invalid_id in ["evt/1", "*"] {
-            let err = expect_source_ingest_error(
-                source_req(state.clone(), &s, &def, &policy),
-                event(invalid_id, message_payload("hello")),
-            )
-            .await?;
-            ensure!(
-                err == SourceIngestError::InvalidEventId,
-                "unexpected event id error for {invalid_id:?}: {err:?}"
-            );
-        }
-
-        let sink = source_event_sink()?;
-        let sink_value = state.read(&sink).await?;
-        ensure!(
-            sink_value.is_none(),
-            "unexpected source event value: {sink_value:?}"
-        );
-        let dedup_prefix = source_event_dedup_prefix("inst-1", "source")?;
-        let dedup_rows = state
-            .query(&xolotl_state::StateScan::new(dedup_prefix))
-            .await?
-            .entries;
-        ensure!(
-            dedup_rows.is_empty(),
-            "unexpected dedup rows: {dedup_rows:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn source_ingest_rejects_invalid_stream_id_and_rolls_back_dedup() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let def = source_projection(None)?;
-        let policy = PolicySnapshot::empty();
-
-        let err = expect_source_ingest_error(
-            source_req(state.clone(), &s, &def, &policy),
-            sequenced_event("chat/room", 1, "evt-stream", message_payload("hello")),
-        )
-        .await?;
-        ensure!(
-            err == SourceIngestError::InvalidStreamId,
-            "unexpected stream id error: {err:?}"
-        );
-
-        let sink = source_event_sink()?;
-        let sink_value = state.read(&sink).await?;
-        ensure!(
-            sink_value.is_none(),
-            "unexpected source event value: {sink_value:?}"
-        );
-        let dedup_prefix = source_event_dedup_prefix("inst-1", "source")?;
-        let dedup_rows = state
-            .query(&xolotl_state::StateScan::new(dedup_prefix))
-            .await?
-            .entries;
-        ensure!(
-            dedup_rows.is_empty(),
-            "dedup reservation was not rolled back: {dedup_rows:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn source_ingest_enforces_stream_sequence_order() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let def = source_projection(None)?;
-        let policy = PolicySnapshot::empty();
-
-        let gap = expect_source_ingest_error(
-            source_req(state.clone(), &s, &def, &policy),
-            sequenced_event("chat", 2, "evt-2", message_payload("gap")),
-        )
-        .await?;
-        let expected = SourceIngestError::SequenceGap {
-            expected: 1,
-            seq: 2,
-        };
-        ensure!(gap == expected, "unexpected gap error: {gap:?}");
-
-        let first = ingest_source_event(
-            source_req(state.clone(), &s, &def, &policy),
-            sequenced_event("chat", 1, "evt-1", message_payload("one")),
-        )
-        .await?;
-        ensure!(
-            first.status == AckStatus::Accepted,
-            "unexpected first ack: {first:?}"
-        );
-
-        let replay = expect_source_ingest_error(
-            source_req(state.clone(), &s, &def, &policy),
-            sequenced_event("chat", 1, "evt-replay", message_payload("again")),
-        )
-        .await?;
-        let expected = SourceIngestError::SequenceReplay { last: 1, seq: 1 };
-        ensure!(replay == expected, "unexpected replay error: {replay:?}");
-
-        let second = ingest_source_event(
-            source_req(state.clone(), &s, &def, &policy),
-            sequenced_event("chat", 2, "evt-2-ok", message_payload("two")),
-        )
-        .await?;
-        ensure!(
-            second.status == AckStatus::Accepted,
-            "unexpected second ack: {second:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn source_ingest_duplicate_event_id_wins_before_sequence_replay() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let def = source_projection(None)?;
-        let policy = PolicySnapshot::empty();
-        let first = ingest_source_event(
-            source_req(state.clone(), &s, &def, &policy),
-            sequenced_event("chat", 1, "evt-1", message_payload("one")),
-        )
-        .await?;
-        ensure!(
-            first.status == AckStatus::Accepted,
-            "unexpected first ack: {first:?}"
-        );
-
-        let duplicate = ingest_source_event(
-            source_req(state.clone(), &s, &def, &policy),
-            sequenced_event("chat", 1, "evt-1", message_payload("one")),
-        )
-        .await?;
-        ensure!(
-            duplicate.status == AckStatus::Duplicate,
-            "unexpected duplicate ack: {duplicate:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn source_ingest_drop_oldest_keeps_stream_within_capacity() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let mut def = source_projection(None)?;
-        def.emits.as_mut().context("missing emits")?.capacity =
-            source_capacity(2, OverflowPolicy::DropOldest);
-        let policy = PolicySnapshot::empty();
-
-        for (id, payload) in [
-            ("evt-1", message_payload("one")),
-            ("evt-2", message_payload("two")),
-            ("evt-3", message_payload("three")),
-        ] {
-            let ack = ingest_source_event(
-                source_req(state.clone(), &s, &def, &policy),
-                event(id, payload),
-            )
-            .await?;
-            ensure!(ack.status == AckStatus::Accepted, "unexpected ack: {ack:?}");
-        }
-
-        let sink = source_event_sink()?;
-        let value = state.read(&sink).await?;
-        let expected = Some(Value::list(vec![
-            message_payload("two"),
-            message_payload("three"),
-        ]));
-        ensure!(
-            value == expected,
-            "unexpected source event value: {value:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn source_ingest_backpressure_rolls_back_sequence_dedup_and_rate() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let mut def = source_projection(None)?;
-        let emits = def.emits.as_mut().context("missing emits")?;
-        emits.capacity = source_capacity(
-            2,
-            OverflowPolicy::Backpressure {
-                pause_threshold: 1,
-                resume_threshold: 0,
+    async fn source_retention_capacity_is_a_typed_rejection_and_preserves_duplicates()
+    -> anyhow::Result<()> {
+        let projection = source_projection(None)?;
+        let (state, store, record) = memory_source_with_options(
+            projection.clone(),
+            xolotl_state::InMemoryOptions {
+                source_retention_limit: std::num::NonZeroUsize::MIN,
+                ..xolotl_state::InMemoryOptions::default()
             },
+        )
+        .await?;
+        let session = complete_handshake_with_record(&record)?;
+        let policy = PolicySnapshot::empty();
+        let first = event("retained", message_payload("one"));
+        let accepted = ingest_source_event(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            first.clone(),
+        )
+        .await?;
+        ensure!(accepted.status == AckStatus::Accepted);
+        let before = state.read_tainted(&source_event_sink()?).await?;
+        let rejected = expect_source_ingest_error(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            event("new", message_payload("two")),
+        )
+        .await?;
+        ensure!(rejected == SourceIngestError::RetentionCapacityExceeded);
+        let repeated = ingest_source_event(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            first,
+        )
+        .await?;
+        ensure!(repeated.status == AckStatus::Duplicate);
+        ensure!(state.read_tainted(&source_event_sink()?).await? == before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_non_sequence_sink_is_typed_rejection_and_retryable() -> anyhow::Result<()> {
+        let (state, store, record) = memory_source().await?;
+        let session = complete_handshake_with_record(&record)?;
+        let projection = source_projection(None)?;
+        let policy = PolicySnapshot::empty();
+        let sink = source_event_sink()?;
+        let stream_epoch = open_test_stream(store.as_ref(), &session, "stream").await?;
+        state.write_set(&sink, Value::integer(7)).await?;
+        let frame = sequenced_event(
+            "stream",
+            stream_epoch,
+            1,
+            "non-sequence",
+            message_payload("one"),
         );
+        let error = expect_source_ingest_error(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            frame.clone(),
+        )
+        .await?;
+        ensure!(error == SourceIngestError::SinkTypeMismatch);
+        ensure!(state.read(&sink).await? == Some(Value::integer(7)));
+
+        state.write_set(&sink, Value::list(Vec::new())).await?;
+        let accepted = ingest_source_event(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            frame,
+        )
+        .await?;
+        ensure!(accepted.status == AckStatus::Accepted);
+        ensure!(
+            state
+                .read(&sink)
+                .await?
+                .and_then(|value| value.as_list().map(|items| items.len()))
+                == Some(1)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_stream_control_fences_retired_epochs_and_recovers_open_retry()
+    -> anyhow::Result<()> {
+        let (state, store, record) = memory_source().await?;
+        let session = complete_handshake_with_record(&record)?;
+        let context = session.context().context("ready Source context")?;
+        let projection = source_projection(None)?;
+        let policy = PolicySnapshot::empty();
+        let inspect = SourceStreamRequest {
+            request_id: "inspect-1".into(),
+            stream_id: "records".into(),
+            operation: SourceStreamOperation::Inspect,
+        };
+        let SourceStreamOutcome::Inspected(initial) =
+            operate_source_stream(store.as_ref(), context, inspect.clone())
+                .await
+                .outcome
+        else {
+            bail!("initial stream inspection failed");
+        };
+        ensure!(initial.revision == 0 && initial.active.is_none());
+
+        let open = SourceStreamRequest {
+            request_id: "open-1".into(),
+            stream_id: "records".into(),
+            operation: SourceStreamOperation::Open {
+                expected_revision: initial.revision,
+            },
+        };
+        let first = operate_source_stream(store.as_ref(), context, open.clone()).await;
+        let SourceStreamOutcome::Opened(opened) = first.outcome else {
+            bail!("stream open failed: {:?}", first.outcome);
+        };
+        let first_epoch = opened
+            .active
+            .as_ref()
+            .context("opened stream is inactive")?
+            .stream_epoch;
+        ensure!(first_epoch != 0 && opened.revision > initial.revision);
+        let retry = operate_source_stream(store.as_ref(), context, open.clone()).await;
+        ensure!(retry.outcome == SourceStreamOutcome::Opened(opened.clone()));
+
+        let accepted = ingest_source_event(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            sequenced_event("records", first_epoch, 1, "same-id", message_payload("old")),
+        )
+        .await?;
+        ensure!(accepted.status == AckStatus::Accepted);
+        ensure!(accepted.stream_epoch == Some(first_epoch));
+        let SourceStreamOutcome::Inspected(position) =
+            operate_source_stream(store.as_ref(), context, inspect.clone())
+                .await
+                .outcome
+        else {
+            bail!("stream position inspection failed");
+        };
+        ensure!(
+            position
+                .active
+                .as_ref()
+                .is_some_and(|state| state.last_seq == 1)
+        );
+
+        let retired = operate_source_stream(
+            store.as_ref(),
+            context,
+            SourceStreamRequest {
+                request_id: "retire-1".into(),
+                stream_id: "records".into(),
+                operation: SourceStreamOperation::Retire {
+                    stream_epoch: first_epoch,
+                },
+            },
+        )
+        .await;
+        let SourceStreamOutcome::Retired { revision } = retired.outcome else {
+            bail!("stream retirement failed: {:?}", retired.outcome);
+        };
+        let old_open_retry = operate_source_stream(store.as_ref(), context, open).await;
+        ensure!(matches!(
+            old_open_retry.outcome,
+            SourceStreamOutcome::Rejected(SourceStreamRejected {
+                code: SourceStreamRejectCode::RevisionConflict,
+                current_revision: Some(current),
+                ..
+            }) if current == revision
+        ));
+        let rejected = expect_source_ingest_error(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            sequenced_event(
+                "records",
+                first_epoch,
+                2,
+                "old-after-retire",
+                message_payload("old"),
+            ),
+        )
+        .await?;
+        ensure!(rejected == SourceIngestError::StreamInactive);
+
+        let reopened = operate_source_stream(
+            store.as_ref(),
+            context,
+            SourceStreamRequest {
+                request_id: "open-2".into(),
+                stream_id: "records".into(),
+                operation: SourceStreamOperation::Open {
+                    expected_revision: revision,
+                },
+            },
+        )
+        .await;
+        let SourceStreamOutcome::Opened(reopened) = reopened.outcome else {
+            bail!("same-name reopen failed: {:?}", reopened.outcome);
+        };
+        let new_epoch = reopened
+            .active
+            .context("reopened stream is inactive")?
+            .stream_epoch;
+        ensure!(new_epoch > first_epoch);
+        let stale = expect_source_ingest_error(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            sequenced_event("records", first_epoch, 1, "stale", message_payload("old")),
+        )
+        .await?;
+        ensure!(
+            matches!(stale, SourceIngestError::StreamEpochMismatch { active_epoch } if active_epoch == new_epoch)
+        );
+        let new_ack = ingest_source_event(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            sequenced_event("records", new_epoch, 1, "same-id", message_payload("new")),
+        )
+        .await?;
+        ensure!(new_ack.status == AckStatus::Accepted);
+        ensure!(new_ack.stream_epoch == Some(new_epoch));
+        ensure!(
+            state
+                .read(&source_event_sink()?)
+                .await?
+                .and_then(|value| value.as_list().map(|items| items.len()))
+                == Some(2)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_payload_limit_matches_backend_encoding_before_commit() -> anyhow::Result<()> {
+        let (state, store, record) = memory_source().await?;
+        let mut session = complete_handshake_with_record(&record)?;
+        let mut projection = source_projection(None)?;
+        let policy = PolicySnapshot::empty();
+        let sink = source_event_sink()?;
+
+        for (index, payload) in [Value::null(), Value::string("quoted \"text\"\n".into())]
+            .into_iter()
+            .enumerate()
+        {
+            let id = format!("measured-{index}");
+            let encoded_bytes = xolotl_state::host::encoded_size(
+                &xolotl_types::tagged_value::serializable(&payload),
+            )?;
+            ensure!(encoded_bytes > 1);
+            ensure!(
+                crate::value_inspection::inline_bytes(&payload, encoded_bytes - 1).is_some(),
+                "this payload must have passed the old logical-footprint check"
+            );
+            let before = state
+                .read(&sink)
+                .await?
+                .map_or(0, |value| value.as_list().map_or(0, |items| items.len()));
+            projection
+                .emits
+                .as_mut()
+                .context("source emits missing")?
+                .max_inline_payload_bytes = encoded_bytes - 1;
+            let error = expect_source_ingest_error(
+                source_req(store.as_ref(), &session, &projection, &policy),
+                event(&id, payload.clone()),
+            )
+            .await?;
+            ensure!(error == SourceIngestError::PayloadTooLarge);
+            let after_rejection = state
+                .read(&sink)
+                .await?
+                .map_or(0, |value| value.as_list().map_or(0, |items| items.len()));
+            ensure!(
+                after_rejection == before,
+                "rejection must precede the commit"
+            );
+
+            projection
+                .emits
+                .as_mut()
+                .context("source emits missing")?
+                .max_inline_payload_bytes = encoded_bytes;
+            let record = replace_source_projection(store.as_ref(), projection.clone()).await?;
+            session = complete_handshake_with_record(&record)?;
+            let accepted = ingest_source_event(
+                source_req(store.as_ref(), &session, &projection, &policy),
+                event(&id, payload),
+            )
+            .await?;
+            ensure!(accepted.status == AckStatus::Accepted);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_atomic_sequence_capacity_rate_and_drop_oldest() -> anyhow::Result<()> {
+        let mut projection = source_projection(None)?;
+        let emits = projection.emits.as_mut().context("emits missing")?;
+        emits.capacity = source_capacity(1, OverflowPolicy::DisconnectBridge);
         emits.rate_limit = Some(SourceRateLimit {
-            window_ms: 1_000,
+            window_ms: 1000,
             max_events: 2,
         });
+        let (state, store, record) = memory_source_with(projection.clone()).await?;
+        let mut session = complete_handshake_with_record(&record)?;
         let policy = PolicySnapshot::empty();
-
+        let mut stream_epoch = open_test_stream(store.as_ref(), &session, "stream").await?;
+        let gap = expect_source_ingest_error(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            sequenced_event("stream", stream_epoch, 2, "gap", message_payload("gap")),
+        )
+        .await?;
+        ensure!(matches!(
+            gap,
+            SourceIngestError::SequenceGap {
+                expected: 1,
+                seq: 2
+            }
+        ));
         let first = ingest_source_event(
-            source_req(state.clone(), &s, &def, &policy),
-            sequenced_event("chat", 1, "evt-1", message_payload("one")),
+            source_req(store.as_ref(), &session, &projection, &policy),
+            sequenced_event("stream", stream_epoch, 1, "one", message_payload("one")),
         )
         .await?;
-        ensure!(
-            first.status == AckStatus::Accepted,
-            "unexpected first ack: {first:?}"
-        );
-
-        let err = expect_source_ingest_error(
-            source_req(state.clone(), &s, &def, &policy),
-            sequenced_event("chat", 2, "evt-2", message_payload("two")),
+        ensure!(first.status == AckStatus::Accepted);
+        let full = expect_source_ingest_error(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            sequenced_event("stream", stream_epoch, 2, "two", message_payload("two")),
         )
         .await?;
-        ensure!(
-            err == SourceIngestError::Backpressured,
-            "unexpected backpressure error: {err:?}"
-        );
-
-        def.emits.as_mut().context("missing emits")?.capacity =
-            source_capacity(2, OverflowPolicy::DropOldest);
-        let second = ingest_source_event(
-            source_req(state.clone(), &s, &def, &policy),
-            sequenced_event("chat", 2, "evt-2", message_payload("two")),
-        )
-        .await?;
-        ensure!(
-            second.status == AckStatus::Accepted,
-            "unexpected second ack: {second:?}"
-        );
-
-        let sink = source_event_sink()?;
-        let value = state.read(&sink).await?;
-        let expected = Some(Value::list(vec![
-            message_payload("one"),
-            message_payload("two"),
-        ]));
-        ensure!(
-            value == expected,
-            "unexpected source event value: {value:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn source_ingest_disconnect_policy_rejects_at_capacity() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let mut def = source_projection(None)?;
-        def.emits.as_mut().context("missing emits")?.capacity =
-            source_capacity(1, OverflowPolicy::DisconnectBridge);
-        let policy = PolicySnapshot::empty();
-
-        let first = ingest_source_event(
-            source_req(state.clone(), &s, &def, &policy),
-            event("evt-1", message_payload("one")),
-        )
-        .await?;
-        ensure!(
-            first.status == AckStatus::Accepted,
-            "unexpected first ack: {first:?}"
-        );
-
-        let err = expect_source_ingest_error(
-            source_req(state.clone(), &s, &def, &policy),
-            event("evt-2", message_payload("two")),
-        )
-        .await?;
-        ensure!(
-            err == SourceIngestError::CapacityExceeded,
-            "unexpected capacity error: {err:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn source_ingest_rate_limit_is_durable_and_windowed() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let mut def = source_projection(None)?;
-        def.emits.as_mut().context("missing emits")?.rate_limit = Some(SourceRateLimit {
-            window_ms: 100,
-            max_events: 1,
-        });
-        let policy = PolicySnapshot::empty();
-        let mut first = source_req(state.clone(), &s, &def, &policy);
-        first.now_millis = 1_000;
-        let ack = ingest_source_event(first, event("evt-1", message_payload("one"))).await?;
-        ensure!(
-            ack.status == AckStatus::Accepted,
-            "unexpected first ack: {ack:?}"
-        );
-
-        let mut limited = source_req(state.clone(), &s, &def, &policy);
-        limited.now_millis = 1_050;
-        let err =
-            expect_source_ingest_error(limited, event("evt-2", message_payload("two"))).await?;
-        ensure!(
-            err == SourceIngestError::RateLimited,
-            "unexpected rate limit error: {err:?}"
-        );
-
-        let mut after_window = source_req(state.clone(), &s, &def, &policy);
-        after_window.now_millis = 1_101;
-        let ack = ingest_source_event(after_window, event("evt-2", message_payload("two"))).await?;
-        ensure!(
-            ack.status == AckStatus::Accepted,
-            "unexpected window ack: {ack:?}"
-        );
-
-        let path = source_event_rate_path("inst-1", "source")?;
-        let value = state.read(&path).await?;
-        let expected = Some(Value::list(vec![Value::integer(1_101)]));
-        ensure!(value == expected, "unexpected rate state: {value:?}");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn source_ingest_payload_limit_rejects_before_dedup_or_append() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let mut def = source_projection(None)?;
-        def.emits
+        ensure!(full == SourceIngestError::CapacityExceeded);
+        projection.emits.as_mut().context("emits missing")?.capacity =
+            source_capacity(1, OverflowPolicy::DropOldest);
+        projection
+            .emits
             .as_mut()
-            .context("missing emits")?
-            .max_inline_payload_bytes = 4;
-        let policy = PolicySnapshot::empty();
-
-        let err = expect_source_ingest_error(
-            source_req(state.clone(), &s, &def, &policy),
-            event("evt-big", message_payload("too-large")),
+            .context("emits missing")?
+            .rate_limit
+            .as_mut()
+            .context("source rate limit")?
+            .max_events = 1;
+        let record = replace_source_projection(store.as_ref(), projection.clone()).await?;
+        session = complete_handshake_with_record(&record)?;
+        stream_epoch = open_test_stream(store.as_ref(), &session, "stream").await?;
+        let second = ingest_source_event(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            sequenced_event("stream", stream_epoch, 1, "two", message_payload("two")),
         )
         .await?;
-
-        ensure!(
-            err == SourceIngestError::PayloadTooLarge,
-            "unexpected payload limit error: {err:?}"
-        );
-        let sink = source_event_sink()?;
-        let sink_value = state.read(&sink).await?;
-        ensure!(
-            sink_value.is_none(),
-            "unexpected source event value: {sink_value:?}"
-        );
-        let dedup_path = source_event_dedup_path("inst-1", "source", "evt-big")?;
-        let dedup_value = state.read(&dedup_path).await?;
-        ensure!(
-            dedup_value.is_none(),
-            "unexpected dedup value: {dedup_value:?}"
-        );
+        ensure!(second.status == AckStatus::Accepted);
+        let limited = expect_source_ingest_error(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            sequenced_event("stream", stream_epoch, 2, "three", message_payload("three")),
+        )
+        .await?;
+        ensure!(limited == SourceIngestError::RateLimited);
+        let sink = state
+            .read(&source_event_sink()?)
+            .await?
+            .context("sink missing")?;
+        let items = sink.as_list().context("sink not a list")?;
+        ensure!(items.len() == 1 && items.first() == Some(&message_payload("two")));
         Ok(())
     }
 
-    #[tokio::test]
-    async fn source_ingest_rejects_secret_and_taint_override_fields() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let def = source_projection(None)?;
-        let policy = PolicySnapshot::empty();
-        let mut nested = BTreeMap::new();
-        nested.insert("access-token".into(), Value::string("raw-token".into()));
-        let mut payload = BTreeMap::new();
-        payload.insert("metadata".into(), Value::map(nested));
-
-        let err = expect_source_ingest_error(
-            source_req(state.clone(), &s, &def, &policy),
-            event("evt-secret", Value::map(payload)),
-        )
-        .await?;
-        let expected = SourceIngestError::ForbiddenPayloadField {
-            field: "access-token".into(),
-        };
-        ensure!(err == expected, "unexpected secret field error: {err:?}");
-
-        let mut payload = BTreeMap::new();
-        payload.insert("taint".into(), Value::string("trusted".into()));
-        let err = expect_source_ingest_error(
-            source_req(state.clone(), &s, &def, &policy),
-            event("evt-taint", Value::map(payload)),
-        )
-        .await?;
-        let expected = SourceIngestError::ForbiddenPayloadField {
-            field: "taint".into(),
-        };
-        ensure!(err == expected, "unexpected taint field error: {err:?}");
-        let sink = source_event_sink()?;
-        let value = state.read(&sink).await?;
-        ensure!(value.is_none(), "unexpected source event value: {value:?}");
-        Ok(())
+    struct InjectUnknown {
+        inner: Arc<InMemoryBackend>,
+        after_commit: bool,
+        claim: std::sync::Mutex<Option<SourceClaimId>>,
     }
 
-    #[tokio::test]
-    async fn source_ingest_rejects_authority_override_fields() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let def = source_projection(None)?;
-        let policy = PolicySnapshot::empty();
+    impl SourceEventCommit for InjectUnknown {
+        fn commit<'a>(
+            &'a self,
+            request: SourceCommit<'a>,
+        ) -> SourceFuture<'a, SourceCommitOutcome> {
+            Box::pin(async move {
+                *self.claim.lock().map_err(|_error| {
+                    SourceStoreError::Aborted("test claim lock poisoned".into())
+                })? = Some(request.claim.claim_id);
+                if self.after_commit {
+                    let outcome = self.inner.commit(request).await?;
+                    if outcome != SourceCommitOutcome::Accepted {
+                        return Ok(outcome);
+                    }
+                }
+                Err(SourceStoreError::Indeterminate(
+                    "injected lost response".into(),
+                ))
+            })
+        }
+    }
 
-        for (event_id, field) in [
-            ("evt-authority", "authority"),
-            ("evt-identity", "acting-identity"),
-            ("evt-sink", "sink"),
-            ("evt-capability", "raw.capability"),
-            ("evt-credential", "credential_ref"),
-            ("evt-binding", "binding_generation"),
-            ("evt-policy", "policy_result"),
-        ] {
-            let mut nested = BTreeMap::new();
-            nested.insert(field.into(), Value::string("override".into()));
-            let payload = Value::map(BTreeMap::from([("metadata".into(), Value::map(nested))]));
-            let err = expect_source_ingest_error(
-                source_req(state.clone(), &s, &def, &policy),
-                event(event_id, payload),
-            )
-            .await?;
-            let expected = SourceIngestError::ForbiddenPayloadField {
-                field: field.into(),
-            };
-            ensure!(
-                err == expected,
-                "unexpected authority field error for {field}: {err:?}"
-            );
+    impl SourceStreamLifecycle for InjectUnknown {
+        fn inspect_stream<'a>(
+            &'a self,
+            stream: SourceStreamScope<'a>,
+        ) -> SourceFuture<'a, Option<xolotl_source::SourceStreamSnapshot>> {
+            self.inner.inspect_stream(stream)
         }
 
-        let sink = source_event_sink()?;
-        let value = state.read(&sink).await?;
-        ensure!(value.is_none(), "unexpected source event value: {value:?}");
-        Ok(())
+        fn open_stream<'a>(
+            &'a self,
+            request: SourceStreamOpen<'a>,
+        ) -> SourceFuture<'a, SourceStreamOpenOutcome> {
+            self.inner.open_stream(request)
+        }
+
+        fn retire_stream<'a>(
+            &'a self,
+            request: SourceStreamRetire<'a>,
+        ) -> SourceFuture<'a, SourceStreamRetireOutcome> {
+            self.inner.retire_stream(request)
+        }
     }
 
     #[tokio::test]
-    async fn source_ingest_prunes_old_dedup_records_within_window() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let def = source_projection(None)?;
-        let policy = PolicySnapshot::empty();
-        let old_path = source_event_dedup_path("inst-1", "source", "old")?;
-        state
-            .write_set(
-                &old_path,
-                source_dedup_record(SourceDedupStatus::Accepted, 1),
+    async fn source_unknown_commit_uses_private_evidence_without_replay() -> anyhow::Result<()> {
+        for after_commit in [false, true] {
+            let (state, store, record) = memory_source().await?;
+            let session = complete_handshake_with_record(&record)?;
+            let scope_epoch = record.scope_epoch("source").context("Source scope epoch")?;
+            let injected = InjectUnknown {
+                inner: store.clone(),
+                after_commit,
+                claim: std::sync::Mutex::new(None),
+            };
+            let projection = source_projection(None)?;
+            let policy = PolicySnapshot::empty();
+            let frame = event("uncertain", message_payload("one"));
+            let error = expect_source_ingest_error(
+                source_req(&injected, &session, &projection, &policy),
+                frame.clone(),
             )
-            .await
-            .context("seed old dedup")?;
-        let mut req = source_req(state.clone(), &s, &def, &policy);
-        req.now_millis = 10_000;
-        req.dedupe_window_ms = 100;
-
-        let ack = ingest_source_event(req, event("new", message_payload("hello"))).await?;
-
-        ensure!(ack.status == AckStatus::Accepted, "unexpected ack: {ack:?}");
-        let value = state.read(&old_path).await?;
-        ensure!(
-            value.is_none(),
-            "old dedup record was not pruned: {value:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn source_ingest_zero_dedup_window_still_prunes_old_records() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let def = source_projection(None)?;
-        let policy = PolicySnapshot::empty();
-        let old_path = source_event_dedup_path("inst-1", "source", "old")?;
-        state
-            .write_set(
-                &old_path,
-                source_dedup_record(SourceDedupStatus::Accepted, 1),
-            )
-            .await
-            .context("seed old dedup")?;
-        let mut req = source_req(state.clone(), &s, &def, &policy);
-        req.now_millis = 10_000;
-        req.dedupe_window_ms = 0;
-
-        let ack = ingest_source_event(req, event("new", message_payload("hello"))).await?;
-
-        ensure!(ack.status == AckStatus::Accepted, "unexpected ack: {ack:?}");
-        let value = state.read(&old_path).await?;
-        ensure!(
-            value.is_none(),
-            "old dedup record was not pruned: {value:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn source_ingest_dedup_uses_receipt_time_not_event_timestamp() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let def = source_projection(None)?;
-        let policy = PolicySnapshot::empty();
-        let mut req = source_req(state.clone(), &s, &def, &policy);
-        req.now_millis = 10_000;
-        req.dedupe_window_ms = 100;
-
-        let mut first = event("evt-old-clock", message_payload("hello"));
-        first.timestamp_ms = 1;
-        let ack = ingest_source_event(req, first).await?;
-        ensure!(
-            ack.status == AckStatus::Accepted,
-            "unexpected first ack: {ack:?}"
-        );
-
-        let dedup_path = source_event_dedup_path("inst-1", "source", "evt-old-clock")?;
-        let value = state.read(&dedup_path).await?;
-        let expected = Some(source_dedup_record(SourceDedupStatus::Accepted, 10_000));
-        ensure!(value == expected, "unexpected dedup record: {value:?}");
-
-        let mut req = source_req(state.clone(), &s, &def, &policy);
-        req.now_millis = 10_050;
-        req.dedupe_window_ms = 100;
-        let mut duplicate = event("evt-old-clock", message_payload("ignored"));
-        duplicate.timestamp_ms = 1;
-        let ack = ingest_source_event(req, duplicate).await?;
-        ensure!(
-            ack.status == AckStatus::Duplicate,
-            "unexpected duplicate ack: {ack:?}"
-        );
-
-        let sink = source_event_sink()?;
-        let tv = state
-            .read_tainted(&sink)
-            .await?
-            .context("missing tainted source event")?;
-        let expected = Value::list(vec![message_payload("hello")]);
-        ensure!(
-            tv.value == expected,
-            "unexpected source event value: {:?}",
-            tv.value
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn source_ingest_pending_dedup_does_not_ack_duplicate() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let def = source_projection(None)?;
-        let policy = PolicySnapshot::empty();
-        let dedup_path = source_event_dedup_path("inst-1", "source", "evt-pending")?;
-        state
-            .write_set(
-                &dedup_path,
-                source_dedup_record(SourceDedupStatus::Pending, 10_000),
-            )
-            .await
-            .context("seed pending dedup")?;
-
-        let err = expect_source_ingest_error(
-            source_req(state.clone(), &s, &def, &policy),
-            event("evt-pending", message_payload("retry")),
-        )
-        .await?;
-
-        ensure!(
-            err == SourceIngestError::Backpressured,
-            "unexpected pending dedup error: {err:?}"
-        );
-        let sink = source_event_sink()?;
-        let value = state.read(&sink).await?;
-        ensure!(value.is_none(), "unexpected source event value: {value:?}");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn source_ingest_rejects_schema_mismatch_and_policy_deny() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let def = source_projection(Some(message_schema()))?;
-        let policy = PolicySnapshot::empty();
-        let err = expect_source_ingest_error(
-            source_req(state.clone(), &s, &def, &policy),
-            event("evt-schema", Value::float(FloatBits(1.0))),
-        )
-        .await?;
-        ensure!(
-            matches!(err, SourceIngestError::Schema(_)),
-            "unexpected schema error: {err:?}"
-        );
-
-        let deny = PolicySnapshot::new(vec![Arc::new(DenyAll)]);
-        let err = expect_source_ingest_error(
-            source_req(state.clone(), &s, &def, &deny),
-            event("evt-deny", message_payload("hello")),
-        )
-        .await?;
-        let expected = SourceIngestError::Policy("blocked".into());
-        ensure!(err == expected, "unexpected policy error: {err:?}");
-        let sink = source_event_sink()?;
-        let value = state.read(&sink).await?;
-        ensure!(value.is_none(), "unexpected source event value: {value:?}");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn source_ingest_rejects_generation_mismatches() -> anyhow::Result<()> {
-        let s = complete_handshake()?;
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let def = source_projection(None)?;
-        let policy = PolicySnapshot::empty();
-        let mut req = source_req(state, &s, &def, &policy);
-        req.current_registry_hash = "other";
-        let err =
-            expect_source_ingest_error(req, event("evt-hash", message_payload("hello"))).await?;
-        ensure!(
-            err == SourceIngestError::RegistryHashMismatch,
-            "unexpected registry hash error: {err:?}"
-        );
-
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let mut req = source_req(state, &s, &def, &policy);
-        req.credential_generation = 4;
-        let err =
-            expect_source_ingest_error(req, event("evt-cred", message_payload("hello"))).await?;
-        ensure!(
-            err == SourceIngestError::CredentialGenerationMismatch,
-            "unexpected credential generation error: {err:?}"
-        );
-
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let mut req = source_req(state, &s, &def, &policy);
-        req.current_binding_generation = 2;
-        let err =
-            expect_source_ingest_error(req, event("evt-binding", message_payload("hello"))).await?;
-        ensure!(
-            err == SourceIngestError::BindingGenerationMismatch,
-            "unexpected binding generation error: {err:?}"
-        );
-
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let mut req = source_req(state, &s, &def, &policy);
-        req.current_installation_config_version = 2;
-        let err =
-            expect_source_ingest_error(req, event("evt-config", message_payload("hello"))).await?;
-        ensure!(
-            err == SourceIngestError::InstallationConfigVersionMismatch,
-            "unexpected installation config error: {err:?}"
-        );
-
-        let state: Backend = InMemoryBackend::new().into_backend();
-        let mut projection = source_projection(None)?;
-        projection.version = 2;
-        let req = source_req(state, &s, &projection, &policy);
-        let err =
-            expect_source_ingest_error(req, event("evt-projection", message_payload("hello")))
+            .await?;
+            ensure!(error == SourceIngestError::CommitOutcomeUnknown);
+            let claim_id = injected
+                .claim
+                .lock()
+                .map_err(|_error| anyhow!("claim lock poisoned"))?
+                .context("claim not recorded")?;
+            let evidence = store
+                .inspect(SourceEvidenceInspection {
+                    claim: SourceClaim {
+                        installation_id: "inst-1",
+                        projection_id: "source",
+                        event_id: "uncertain",
+                        claim_id,
+                        scope_epoch,
+                        stream_epoch: None,
+                    },
+                })
                 .await?;
-        ensure!(
-            err == SourceIngestError::ProjectionVersionMismatch,
-            "unexpected projection version error: {err:?}"
-        );
+            ensure!(matches!(evidence, SourceClaimEvidence::Committed(_)) == after_commit);
+            let retry = ingest_source_event(
+                source_req(store.as_ref(), &session, &projection, &policy),
+                frame,
+            )
+            .await?;
+            ensure!(
+                retry.status
+                    == if after_commit {
+                        AckStatus::Duplicate
+                    } else {
+                        AckStatus::Accepted
+                    }
+            );
+            let sink = state
+                .read(&source_event_sink()?)
+                .await?
+                .context("sink missing")?;
+            ensure!(sink.as_list().is_some_and(|items| items.len() == 1));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_invalid_frame_and_policy_never_call_store() -> anyhow::Result<()> {
+        let (state, store, record) = memory_source().await?;
+        let mut session = EndpointSession::new();
+        let scope_epoch = record.scope_epoch("source").context("Source scope epoch")?;
+        session.on_hello(&hello(), |_| SessionContext {
+            installation_epoch: record.installation_epoch,
+            scope_epoch,
+            ..ctx()
+        })?;
+        let projection = source_projection(Some(message_schema()))?;
+        let policy = PolicySnapshot::empty();
+        let unready = expect_source_ingest_error(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            event("unready", message_payload("one")),
+        )
+        .await?;
+        ensure!(matches!(
+            unready,
+            SourceIngestError::Session(SessionReject::NotReady)
+        ));
+        let session = complete_handshake_with_record(&record)?;
+        let schema = expect_source_ingest_error(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            event("bad-schema", Value::float(FloatBits(1.0))),
+        )
+        .await?;
+        ensure!(matches!(schema, SourceIngestError::Schema(_)));
+        let forbidden = expect_source_ingest_error(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            event(
+                "forbidden",
+                Value::map(BTreeMap::from([(
+                    "token".into(),
+                    Value::string("secret".into()),
+                )])),
+            ),
+        )
+        .await?;
+        ensure!(matches!(
+            forbidden,
+            SourceIngestError::ForbiddenPayloadField { .. }
+        ));
+        let bad_id = expect_source_ingest_error(
+            source_req(store.as_ref(), &session, &projection, &policy),
+            event("bad/id", message_payload("one")),
+        )
+        .await?;
+        ensure!(bad_id == SourceIngestError::InvalidEventId);
+        let deny = PolicySnapshot::new(vec![Arc::new(DenyAll)]);
+        let denied = expect_source_ingest_error(
+            source_req(store.as_ref(), &session, &projection, &deny),
+            event("denied", message_payload("one")),
+        )
+        .await?;
+        ensure!(denied == SourceIngestError::Policy("blocked".into()));
+        ensure!(state.read(&source_event_sink()?).await?.is_none());
         Ok(())
     }
 }

@@ -209,6 +209,7 @@ mod tests {
     use super::*;
     use crate::{Bootstrap, StepModule};
     use anyhow::{Context, ensure};
+    use std::future::Future;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -223,8 +224,8 @@ mod tests {
     async fn dormant_native_imports_and_sequential_steps_use_small_layouts() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
         let executor = boot
-            .kernel
-            .executor_for(boot.root)
+            .kernel()
+            .executor_for(boot.root())
             .with_execution_config(ExecutionConfig {
                 max_storage_bytes: 2048,
                 ..ExecutionConfig::default()
@@ -290,11 +291,11 @@ mod tests {
                 _ => DoNode::fail(machine_error("expected integer")),
             })?;
             let executor = boot
-                .kernel
-                .executor_for(boot.root)
+                .kernel()
+                .executor_for(boot.root())
                 .with_steps(steps)
                 .with_execution_config(ExecutionConfig {
-                    max_instructions: graph.nodes.len() + 2,
+                    max_instructions: graph.nodes.len() + 1 + 2 * usize::from(bound),
                     bindings_per_task: usize::from(bound),
                     max_storage_bytes: 2048,
                     ..ExecutionConfig::default()
@@ -314,6 +315,10 @@ mod tests {
     async fn retired_fragments_are_reused_while_a_later_fragment_waits() -> anyhow::Result<()> {
         for quantum in [1, 256] {
             let boot = Bootstrap::in_memory();
+            crate::executor::signal_tests::install_signal_resource(
+                &boot,
+                boot.kernel().state().clone(),
+            )?;
             let signal = Path::parse("state://signal/fragment-reuse")?;
             let completed = Arc::new(AtomicUsize::new(0));
             let count = Arc::clone(&completed);
@@ -348,11 +353,11 @@ mod tests {
                 DoNode::pure(Value::null()).and_then(StepRef::new("wait")),
             ))?;
             let executor = boot
-                .kernel
-                .executor_for(boot.root)
+                .kernel()
+                .executor_for(boot.root())
                 .with_steps(StepModule::compose([increment, wait])?)
                 .with_execution_config(ExecutionConfig {
-                    max_instructions: graph.nodes.len() + 5,
+                    max_instructions: graph.nodes.len() + 8,
                     bindings_per_task: 2,
                     quantum,
                     ..ExecutionConfig::default()
@@ -370,8 +375,8 @@ mod tests {
                 }
             }
             ensure!(completed.load(Ordering::Relaxed) == 64);
-            boot.kernel
-                .state
+            boot.kernel()
+                .state()
                 .write_set(&signal, Value::boolean(true))
                 .await?;
             let output = tokio::time::timeout(std::time::Duration::from_secs(1), run).await?;
@@ -387,7 +392,11 @@ mod tests {
     #[tokio::test]
     async fn native_growth_remaps_bindings_while_other_tasks_are_waiting() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        let executor = boot.kernel.executor_for(boot.root);
+        crate::executor::signal_tests::install_signal_resource(
+            &boot,
+            boot.kernel().state().clone(),
+        )?;
+        let executor = boot.kernel().executor_for(boot.root());
         let signal = Path::parse("state://signal/native-growth")?;
         let observed = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&observed);
@@ -424,19 +433,23 @@ mod tests {
         {
             let run = executor.eval_graph_with_buffers(&graph, &mut buffers);
             tokio::pin!(run);
-            for _ in 0..16 {
-                tokio::select! {
-                    biased;
-                    outcome = &mut run => anyhow::bail!("waiting branch ended early: {outcome:?}"),
-                    () = tokio::task::yield_now() => {}
-                }
-                if observed.load(Ordering::SeqCst) {
-                    break;
-                }
-            }
+            let state = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                std::future::poll_fn(|cx| {
+                    let state = run.as_mut().poll(cx);
+                    if state.is_ready() || observed.load(Ordering::SeqCst) {
+                        std::task::Poll::Ready(state)
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }),
+            )
+            .await
+            .context("native step did not reach the waiting boundary")?;
+            ensure!(state.is_pending(), "waiting branch ended early: {state:?}");
             ensure!(observed.load(Ordering::SeqCst));
-            boot.kernel
-                .state
+            boot.kernel()
+                .state()
                 .write_set(&signal, Value::boolean(true))
                 .await?;
             let output = run.await;
@@ -454,7 +467,7 @@ mod tests {
         }
         ensure!(buffers.tasks.capacity() == 5);
         ensure!(buffers.bindings.capacity() == 15);
-        ensure!(buffers.frames.capacity() == 2);
+        ensure!(buffers.frames.capacity() == 10);
         ensure!(
             buffers.tasks.is_empty() && buffers.frames.is_empty() && buffers.bindings.is_empty()
         );
@@ -465,9 +478,9 @@ mod tests {
     async fn growth_budget_failure_rolls_back_the_image_and_reaches_recovery() -> anyhow::Result<()>
     {
         let boot = Bootstrap::in_memory();
-        let root = boot.root;
+        let root = boot.root();
         let executor = boot
-            .kernel
+            .kernel()
             .executor_for(root)
             .with_execution_config(ExecutionConfig {
                 max_storage_bytes: buffer_bytes(1, 5, 0).context("layout overflow")?,
@@ -501,7 +514,11 @@ mod tests {
     #[tokio::test]
     async fn buffers_drop_all_values_on_success_failure_and_future_drop() -> anyhow::Result<()> {
         let boot = Bootstrap::in_memory();
-        let executor = boot.kernel.executor_for(boot.root);
+        crate::executor::signal_tests::install_signal_resource(
+            &boot,
+            boot.kernel().state().clone(),
+        )?;
+        let executor = boot.kernel().executor_for(boot.root());
         let mut buffers = ExecutionBuffers::default();
         let pending = PreparedProgram::new(
             &Program::new(E::Let {
@@ -522,11 +539,27 @@ mod tests {
                 &mut buffers,
             );
             tokio::pin!(run);
-            tokio::select! {
-                biased;
-                result = &mut run => anyhow::bail!("wait finished early: {result:?}"),
-                () = tokio::task::yield_now() => {}
-            }
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                std::future::poll_fn(|cx| match run.as_mut().poll(cx) {
+                    std::task::Poll::Ready(result) => std::task::Poll::Ready(Err(anyhow::anyhow!(
+                        "wait finished early: {result:?}"
+                    ))),
+                    // The lifecycle ID is installed before the same poll acquires
+                    // machine buffers; a pending result now means the Wait owns them.
+                    std::task::Poll::Pending
+                        if boot
+                            .kernel()
+                            .processes()
+                            .lifecycle_execution(boot.root())
+                            .is_some() =>
+                    {
+                        std::task::Poll::Ready(Ok(()))
+                    }
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }),
+            )
+            .await??;
         }
         ensure!(buffers.retained_bytes() > 0);
         ensure!(

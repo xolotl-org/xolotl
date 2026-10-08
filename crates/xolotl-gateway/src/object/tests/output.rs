@@ -87,9 +87,13 @@ impl GatewayOutputDisclosurePolicy for RecordingPolicy {
 }
 
 async fn grant_count(fixture: &Fixture) -> anyhow::Result<usize> {
-    let mut pages = fixture.boot.kernel.state.pages(StateScan::new(Path::parse(
-        "state://gateway/object-read-grant",
-    )?));
+    let mut pages = fixture
+        .boot
+        .kernel()
+        .state()
+        .pages(StateScan::new(Path::parse(
+            "state://gateway/object-read-grant",
+        )?));
     let mut count = 0;
     while let Some(page) = pages.next().await? {
         count += page.entries.len();
@@ -135,8 +139,8 @@ fn every_failure() -> anyhow::Result<Vec<Failure>> {
         },
         Failure::Timeout,
         Failure::Cancelled,
-        Failure::Quarantined {
-            op_id: "1/2/3/4/5".into(),
+        Failure::OutcomeUnknown {
+            operation_ids: vec!["1/2/3/4/5".into()],
             reason: "uncertain publication".into(),
         },
         Failure::InvalidInput {

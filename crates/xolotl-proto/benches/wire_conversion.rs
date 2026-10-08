@@ -106,8 +106,7 @@ fn bench_values(c: &mut Criterion) {
     group.bench_function("value_pb_to_value_map_256", |b| {
         let pb = value_to_pb(&complex_value(MAP_FIELDS));
         b.iter(|| {
-            let value = value_from_pb(black_box(&pb));
-            black_box(value);
+            observe(value_from_pb(black_box(&pb)).map_err(Into::into));
         });
     });
 
@@ -137,8 +136,7 @@ fn bench_programs(c: &mut Criterion) {
     group.bench_function("program_to_pb_256_ops", |b| match program(PROGRAM_OPS) {
         Ok(program) => {
             b.iter(|| {
-                let pb = program_to_pb(black_box(&program));
-                drop(black_box(pb));
+                observe(program_to_pb(black_box(&program)).map_err(Into::into));
             });
         }
         Err(error) => {
@@ -147,26 +145,26 @@ fn bench_programs(c: &mut Criterion) {
         }
     });
 
-    group.bench_function("program_pb_to_do_256_ops", |b| match program(PROGRAM_OPS) {
-        Ok(program) => {
-            let pb = program_to_pb(&program);
-            b.iter(|| {
-                observe(
-                    program_from_pb(black_box(&pb))
-                        .map_err(|error| anyhow!("program decode failed: {error}")),
-                );
-            });
-        }
-        Err(error) => {
-            let message = error.to_string();
-            b.iter(|| black_box(message.as_str()));
+    group.bench_function("program_pb_to_do_256_ops", |b| {
+        match program(PROGRAM_OPS).and_then(|program| Ok(program_to_pb(&program)?)) {
+            Ok(pb) => {
+                b.iter(|| {
+                    observe(
+                        program_from_pb(black_box(&pb))
+                            .map_err(|error| anyhow!("program decode failed: {error}")),
+                    );
+                });
+            }
+            Err(error) => {
+                let message = error.to_string();
+                b.iter(|| black_box(message.as_str()));
+            }
         }
     });
 
     group.bench_function("prost_encode_decode_program_256_ops", |b| {
-        match program(PROGRAM_OPS) {
-            Ok(program) => {
-                let pb = program_to_pb(&program);
+        match program(PROGRAM_OPS).and_then(|program| Ok(program_to_pb(&program)?)) {
+            Ok(pb) => {
                 b.iter_batched(
                     || pb.clone(),
                     |pb| {

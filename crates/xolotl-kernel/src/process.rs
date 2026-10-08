@@ -3,36 +3,36 @@
 //! A `ProcessEntry` tracks a live Process's status, parent, attached grants,
 //! budget, and finalizers. Spawn attenuates capabilities (a child's grant
 //! cannot exceed its parent's); finalize cancels children, runs finalizers in
-//! reverse, revokes handles, and writes a `ProcessFinalized` fact.
+//! reverse, revokes handles, and publishes lifecycle completion.
 
+use crate::host::HostRuntime;
+use crate::runtime_domain::RuntimeDomain;
 use crate::scope::{CleanupScope, Scope, ScopeFinalize};
 use crate::step::StepModule;
 use parking_lot::RwLock;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
+#[cfg(test)]
+use xolotl_types::Value;
 use xolotl_types::{
-    ExecutionId, ExecutionOutput, Fact, Failure, Grant, GrantId, IdentityRef, ProcessId,
-    ProcessStatus, TaintSet, TaintedFailure, Value,
+    ExecutionId, ExecutionOutput, Failure, Grant, GrantId, IdentityRef, ProcessId, ProcessStatus,
+    TaintSet, TaintedFailure, UnresolvedOperations,
 };
 
 mod accounting;
-#[cfg(feature = "durable")]
-mod checkpoint;
+mod cleanup;
+mod path;
+pub(crate) use cleanup::{CleanupAction, CleanupSelection, CleanupTicketError};
+pub use cleanup::{CleanupProgress, CleanupTicket};
+pub(crate) use path::state_cleanup_owner;
+mod observation;
+pub use observation::{ProcessObservation, ProcessPage};
 mod retention;
 mod task;
 
-#[cfg(feature = "durable")]
-use checkpoint::CheckpointState;
-#[cfg(feature = "durable")]
-pub use checkpoint::ProcessSnapshot;
-#[cfg(feature = "durable")]
-pub(crate) use checkpoint::{LeasedRequestState, RetainedFinalization};
-
 pub use retention::{ProcessAdmissionError, ProcessCapacityError};
 
-#[cfg(feature = "durable")]
-pub(crate) use task::TaskOwner;
 pub(crate) use task::{
     ProcessPublication, current_cleanup, current_finalizer, current_process, has_finalizer_context,
     outcome_status, scope_cleanup, scope_finalizer,
@@ -56,6 +56,25 @@ pub(crate) enum FinalizeStart {
     InvalidStatus,
 }
 
+/// One completed process's live cleanup evidence, retained until its entry is reaped.
+/// This is neither an audit history nor an execution recovery record. It retains
+/// no body result payload, native callback, grant or finalizer program.
+#[derive(Clone, Debug)]
+pub struct ProcessFinalizationReport {
+    /// Stable terminal status selected by the process lifecycle.
+    pub status: ProcessStatus,
+    /// Aggregate provenance of the body and all attempted finalizers.
+    pub taint: TaintSet,
+    /// Bounded host-observed effects still requiring external reconciliation.
+    pub unresolved_operations: UnresolvedOperations,
+    /// At most one typed failure per attempted finalizer, in execution order.
+    pub finalizer_failures: Vec<(usize, TaintedFailure)>,
+    /// Local handle payloads released by cleanup.
+    pub released_handles: usize,
+    /// Handle authority subtrees revoked by cleanup.
+    pub revoked_handles: usize,
+}
+
 /// Live bookkeeping for one Process. The serializable `Process` descriptor
 /// lives in `xolotl-types`; this is the runtime entry the kernel mutates.
 pub(crate) struct ProcessEntry {
@@ -71,18 +90,26 @@ pub(crate) struct ProcessEntry {
     pub(crate) on_finalize: Vec<xolotl_graph::DoNode>,
     /// Immutable native functions shared by body and finalizer executors.
     pub(crate) steps: StepModule,
+    /// Live host request authority shared by body, descendants and finalizers.
+    request_authorizer: Option<Arc<dyn crate::RequestAuthorizer>>,
     /// Retained lifecycle publication, released only after all writes succeed.
     pub(crate) publication: Option<Arc<dyn ProcessPublication>>,
     /// Progress survives errors or dropped finalization futures until committed.
     finalization: Option<Box<Finalization>>,
-    /// Creation pins cleanup; committed or retired journals also forbid a fresh execution.
-    #[cfg(feature = "durable")]
-    checkpoint: CheckpointState,
+    finalization_report: Option<Arc<ProcessFinalizationReport>>,
     /// Deduplicates the queue of committed, inactive leaves awaiting explicit reap.
     reap_queued: bool,
+    /// Host observation pins never retain their table or its publications.
+    cleanup_pin: std::sync::Weak<cleanup::CleanupPin>,
+    /// Managed callback captures can outlive the body task's finalization handoff.
+    managed_captures: usize,
 }
 
 impl ProcessEntry {
+    fn has_tree_cleanup(&self) -> bool {
+        self.scope.cleanup_scope() == Some(CleanupScope::Tree)
+    }
+
     /// Create a process entry in the `Created` state.
     pub(crate) fn new(id: ProcessId, parent: Option<ProcessId>, identity: IdentityRef) -> Self {
         Self {
@@ -92,11 +119,13 @@ impl ProcessEntry {
             attached_grants: Vec::new(),
             on_finalize: Vec::new(),
             steps: StepModule::default(),
+            request_authorizer: None,
             publication: None,
             finalization: None,
-            #[cfg(feature = "durable")]
-            checkpoint: CheckpointState::None,
+            finalization_report: None,
             reap_queued: false,
+            cleanup_pin: std::sync::Weak::new(),
+            managed_captures: 0,
         }
     }
 
@@ -105,14 +134,15 @@ impl ProcessEntry {
     }
 }
 
+#[derive(Clone)]
 struct Finalization {
     attempted: usize,
     active: Option<usize>,
     failures: Vec<(usize, TaintedFailure)>,
     completed_taint: TaintSet,
+    unresolved_operations: UnresolvedOperations,
     released: usize,
     revoked: usize,
-    record: Option<(Fact, usize)>,
     outcome: Option<Arc<ExecutionOutput>>,
 }
 
@@ -123,26 +153,27 @@ impl Finalization {
             active: None,
             failures: Vec::new(),
             completed_taint: TaintSet::pristine(),
+            unresolved_operations: UnresolvedOperations::default(),
             released: 0,
             revoked: 0,
-            record: None,
             outcome: None,
         }
     }
 }
 
 /// Owns one finalization attempt, including cancellation of the owning future.
-pub(crate) struct FinalizationGuard<'a> {
-    table: &'a ProcessTable,
+pub(crate) struct FinalizationGuard {
+    table: ProcessTable,
     process: ProcessId,
 }
 
-impl Drop for FinalizationGuard<'_> {
+impl Drop for FinalizationGuard {
     fn drop(&mut self) {
         self.table.release_finalizing(self.process);
     }
 }
 
+#[cfg(test)]
 fn finalizer_failure(index: usize, failure: &Failure) -> Value {
     Value::map(std::collections::BTreeMap::from([
         ("index".into(), Value::integer(index as i64)),
@@ -158,19 +189,21 @@ pub struct ProcessTable {
 }
 
 struct ProcessTableShared {
+    /// Present only for process tables assembled into a Kernel.
+    runtime_domain: Option<RuntimeDomain>,
     state: RwLock<ProcessTableInner>,
     changed: tokio::sync::Notify,
     root_initialization: OnceLock<()>,
+    host_runtime: HostRuntime,
 }
 
 struct ProcessTableInner {
     procs: HashMap<ProcessId, ProcessEntry>,
+    ordered_ids: BTreeSet<ProcessId>,
     children: HashMap<ProcessId, Vec<ProcessId>>,
     tasks: HashMap<ProcessId, task::TaskRecord>,
     capacity: Option<NonZeroUsize>,
     reap_ready: VecDeque<ProcessId>,
-    #[cfg(feature = "durable")]
-    recovery_closed: bool,
     next: u64,
     next_attached_grant: u64,
 }
@@ -179,12 +212,11 @@ impl Default for ProcessTableInner {
     fn default() -> Self {
         Self {
             procs: HashMap::new(),
+            ordered_ids: BTreeSet::new(),
             children: HashMap::new(),
             tasks: HashMap::new(),
             capacity: None,
             reap_ready: VecDeque::new(),
-            #[cfg(feature = "durable")]
-            recovery_closed: false,
             next: 1,
             next_attached_grant: 0,
         }
@@ -212,12 +244,11 @@ impl ProcessTableInner {
         let mut descendants = self.subtree_post_order(root);
         descendants.retain(|id| {
             if let Some(entry) = self.procs.get_mut(id) {
-                if !entry.scope.request_tree_cleanup() {
-                    return false;
+                if entry.scope.request_tree_cleanup() {
+                    entry
+                        .finalization
+                        .get_or_insert_with(|| Box::new(Finalization::new()));
                 }
-                entry
-                    .finalization
-                    .get_or_insert_with(|| Box::new(Finalization::new()));
                 true
             } else {
                 false
@@ -228,15 +259,37 @@ impl ProcessTableInner {
 }
 
 impl ProcessTable {
-    /// Create an empty process table.
+    /// Create an empty process table for isolated unit tests.
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_host_runtime_and_domain(HostRuntime::default(), None)
+    }
+
+    pub(crate) fn with_host_runtime_and_domain(
+        host_runtime: HostRuntime,
+        runtime_domain: Option<RuntimeDomain>,
+    ) -> Self {
         Self {
             inner: Arc::new(ProcessTableShared {
+                runtime_domain,
                 state: RwLock::new(ProcessTableInner::default()),
                 changed: tokio::sync::Notify::new(),
                 root_initialization: OnceLock::new(),
+                host_runtime,
             }),
         }
+    }
+
+    pub(crate) fn host_runtime(&self) -> &HostRuntime {
+        &self.inner.host_runtime
+    }
+
+    pub(crate) fn runtime_domain(&self) -> Option<RuntimeDomain> {
+        self.inner.runtime_domain.clone()
+    }
+
+    pub(crate) fn same_table(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     /// Allocate without ever reusing an id, including after reaping or exhaustion.
@@ -265,13 +318,62 @@ impl ProcessTable {
 
     /// Recheck identity and parent admission under the lock that links a child.
     pub(crate) fn admit_child(&self, entry: ProcessEntry) -> Result<(), ProcessAdmissionError> {
-        let removed = {
+        self.admit_child_inner(entry, |_, _| ())
+    }
+
+    pub(crate) fn admit_request(
+        &self,
+        entry: ProcessEntry,
+    ) -> Result<CleanupTicket, ProcessAdmissionError> {
+        self.admit_child_inner(entry, CleanupTicket::pin_entry)
+    }
+
+    fn admit_child_inner<Owner>(
+        &self,
+        mut entry: ProcessEntry,
+        acquire: impl FnOnce(&Arc<ProcessTableShared>, &mut ProcessEntry) -> Owner,
+    ) -> Result<Owner, ProcessAdmissionError> {
+        self.reclaim_for_admission();
+        let (removed, ticket) = {
             let mut inner = self.inner.state.write();
             inner.check_child_admission(entry.scope.process(), entry.parent)?;
-            inner.link_entry(entry)
+            let ticket = acquire(&self.inner, &mut entry);
+            let removed = inner.link_entry(entry);
+            (removed, ticket)
         };
         drop(removed);
-        Ok(())
+        Ok(ticket)
+    }
+
+    /// Roll back a new child whose scheduler rejected its body before attachment.
+    /// A concurrent observer may have changed its lifecycle; in that case the
+    /// normal cleanup path must retain and finalize the entry instead.
+    pub(crate) fn discard_unstarted_child(&self, id: ProcessId, parent: ProcessId) -> bool {
+        let removed = {
+            let mut inner = self.inner.state.write();
+            let safe = inner.procs.get(&id).is_some_and(|entry| {
+                entry.parent == Some(parent)
+                    && entry.scope.status() == ProcessStatus::Running
+                    && entry.scope.cleanup_scope().is_none()
+                    && entry.finalization.is_none()
+                    && entry.managed_captures == 0
+                    && entry.scope.budget().inflight_ops == 0
+                    && inner.children.get(&id).is_none_or(Vec::is_empty)
+                    && !inner.tasks.contains_key(&id)
+            });
+            if !safe {
+                return false;
+            }
+            let Some(entry) = inner.procs.remove(&id) else {
+                return false;
+            };
+            inner.ordered_ids.remove(&id);
+            inner.unlink_from_parent(&entry);
+            entry
+        };
+        drop(removed);
+        self.inner.changed.notify_waiters();
+        true
     }
 
     /// Register authority outside the table lock, then publish the system root.
@@ -329,7 +431,7 @@ impl ProcessTable {
             .map(|p| p.scope.status())
     }
 
-    /// Execution scope retained for administrative lifecycle records.
+    /// Execution scope retained for live cleanup and business request binding.
     pub fn lifecycle_execution(&self, id: ProcessId) -> Option<ExecutionId> {
         self.inner
             .state
@@ -360,6 +462,38 @@ impl ProcessTable {
             .unwrap_or_default()
     }
 
+    /// Retain the host's live request boundary until this process completes cleanup.
+    pub(crate) fn set_request_authorizer(
+        &self,
+        id: ProcessId,
+        authorizer: Arc<dyn crate::RequestAuthorizer>,
+    ) -> Option<()> {
+        let removed = {
+            let mut inner = self.inner.state.write();
+            let entry = inner.procs.get_mut(&id)?;
+            if entry.scope.finalized() {
+                return None;
+            }
+            entry.request_authorizer.replace(authorizer)
+        };
+        drop(removed);
+        Some(())
+    }
+
+    /// Share the same live boundary with a newly assembled body or finalizer executor.
+    pub(crate) fn request_authorizer(
+        &self,
+        id: ProcessId,
+    ) -> Option<Arc<dyn crate::RequestAuthorizer>> {
+        self.inner
+            .state
+            .read()
+            .procs
+            .get(&id)?
+            .request_authorizer
+            .clone()
+    }
+
     /// Move a process into Finalizing if no terminal/finalizing owner exists.
     pub(crate) fn begin_finalizing(&self, id: ProcessId, status: ProcessStatus) -> FinalizeStart {
         let mut inner = self.inner.state.write();
@@ -379,9 +513,9 @@ impl ProcessTable {
         FinalizeStart::Started
     }
 
-    pub(crate) fn finalization_guard(&self, process: ProcessId) -> FinalizationGuard<'_> {
+    pub(crate) fn finalization_guard(&self, process: ProcessId) -> FinalizationGuard {
         FinalizationGuard {
-            table: self,
+            table: self.clone(),
             process,
         }
     }
@@ -423,22 +557,33 @@ impl ProcessTable {
         let removed = {
             let mut inner = self.inner.state.write();
             let entry = inner.procs.get_mut(&id)?;
-            #[cfg(feature = "durable")]
-            if matches!(
-                entry.checkpoint,
-                CheckpointState::Creating | CheckpointState::Active
-            ) {
-                return None;
-            }
             if !entry.scope.complete_finalization() {
                 return None;
+            }
+            let mut finalization = entry.finalization.take();
+            if let Some(state) = finalization.as_mut() {
+                if let Some(output) = &state.outcome {
+                    state.completed_taint.union(&output.taint);
+                }
+                for (_, error) in &state.failures {
+                    state.completed_taint.union(&error.taint);
+                }
+                entry.finalization_report = Some(Arc::new(ProcessFinalizationReport {
+                    status: entry.scope.status(),
+                    taint: std::mem::take(&mut state.completed_taint),
+                    unresolved_operations: std::mem::take(&mut state.unresolved_operations),
+                    finalizer_failures: std::mem::take(&mut state.failures),
+                    released_handles: state.released,
+                    revoked_handles: state.revoked,
+                }));
             }
             let removed = (
                 std::mem::take(&mut entry.steps),
                 std::mem::take(&mut entry.attached_grants),
                 std::mem::take(&mut entry.on_finalize),
-                entry.finalization.take(),
+                finalization,
                 entry.publication.take(),
+                entry.request_authorizer.take(),
             );
             inner.queue_reap_if_eligible(id);
             removed
@@ -514,7 +659,7 @@ impl ProcessTable {
             .map(|p| p.scope.identity())
     }
 
-    /// Publication retained until lifecycle records are fully committed.
+    /// Business publication retained until its commit and local cleanup complete.
     pub(crate) fn publication(&self, id: ProcessId) -> Option<Arc<dyn ProcessPublication>> {
         self.inner
             .state
@@ -533,6 +678,27 @@ impl ProcessTable {
             .get(&id)
             .map(|p| p.attached_grants.clone())
             .unwrap_or_default()
+    }
+
+    /// New handles belong either to an open body scope or its trusted cleanup.
+    /// Call while holding the handle-table write lock through installation so
+    /// lifecycle cleanup cannot release the old set and miss a newly added slot.
+    pub(crate) fn admits_handles(&self, id: ProcessId) -> Option<bool> {
+        let inner = self.inner.state.read();
+        let entry = inner.procs.get(&id)?;
+        let scope = &entry.scope;
+        if scope.accepts_children() {
+            return Some(true);
+        }
+        let finalizer = current_finalizer(self) == Some(id)
+            && scope.finalizer_active()
+            && scope.status() == ProcessStatus::Finalizing;
+        let cleanup = current_cleanup(self) == Some(id)
+            && matches!(
+                scope.status(),
+                ProcessStatus::Running | ProcessStatus::Cancelled | ProcessStatus::Finalizing
+            );
+        Some(!scope.finalized() && (finalizer || cleanup))
     }
 
     /// All live process ids.
@@ -584,57 +750,65 @@ impl ProcessTable {
     }
 
     /// Finalizer failures retained across finalization retries.
+    #[cfg(test)]
     pub(crate) fn finalizer_failures(&self, id: ProcessId) -> Option<Vec<Value>> {
-        self.inner
-            .state
-            .read()
-            .procs
-            .get(&id)
-            .and_then(|entry| entry.finalization.as_ref())
-            .map(|state| {
-                state
-                    .failures
-                    .iter()
-                    .map(|(index, error)| finalizer_failure(*index, &error.failure))
-                    .collect()
-            })
-    }
-
-    /// Provenance of the body status and retained results of this finalization.
-    pub(crate) fn finalization_taint(&self, id: ProcessId) -> Option<TaintSet> {
         let inner = self.inner.state.read();
-        let state = inner.procs.get(&id)?.finalization.as_ref()?;
-        let mut taint = state.completed_taint.clone();
-        if let Some(output) = &state.outcome {
-            taint.union(&output.taint);
-        }
-        for (_, error) in &state.failures {
-            taint.union(&error.taint);
-        }
-        Some(taint)
+        let entry = inner.procs.get(&id)?;
+        let failures = if let Some(state) = &entry.finalization {
+            &state.failures
+        } else {
+            &entry.finalization_report.as_ref()?.finalizer_failures
+        };
+        Some(
+            failures
+                .iter()
+                .map(|(index, error)| finalizer_failure(*index, &error.failure))
+                .collect(),
+        )
     }
 
     pub(crate) fn retain_finalization_control(
         &self,
         id: ProcessId,
         taint: &TaintSet,
+        unresolved_operations: Option<&UnresolvedOperations>,
     ) -> Option<()> {
         let mut inner = self.inner.state.write();
-        inner
-            .procs
-            .get_mut(&id)?
-            .finalization
-            .as_mut()?
-            .completed_taint
-            .union(taint);
+        let state = inner.procs.get_mut(&id)?.finalization.as_mut()?;
+        state.completed_taint.union(taint);
+        if let Some(unresolved_operations) = unresolved_operations {
+            state.unresolved_operations.merge(unresolved_operations);
+        }
         Some(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finalization_unresolved_operations(
+        &self,
+        id: ProcessId,
+    ) -> Option<UnresolvedOperations> {
+        let inner = self.inner.state.read();
+        let entry = inner.procs.get(&id)?;
+        if let Some(state) = &entry.finalization {
+            Some(state.unresolved_operations.clone())
+        } else {
+            Some(
+                entry
+                    .finalization_report
+                    .as_ref()?
+                    .unresolved_operations
+                    .clone(),
+            )
+        }
     }
 
     pub(crate) fn finish_finalizer(&self, id: ProcessId, output: ExecutionOutput) -> Option<()> {
         let mut inner = self.inner.state.write();
         let state = inner.procs.get_mut(&id)?.finalization.as_mut()?;
         let index = state.active.take()?;
-        match output.into_result() {
+        let (result, unresolved_operations) = output.into_parts();
+        state.unresolved_operations.merge(&unresolved_operations);
+        match result {
             Ok(value) => state.completed_taint.union(&value.taint),
             Err(error) => state.failures.push((index, error)),
         }
@@ -642,13 +816,49 @@ impl ProcessTable {
     }
 
     pub(crate) fn finalization_status(&self, id: ProcessId) -> Option<ProcessStatus> {
+        let inner = self.inner.state.read();
+        let entry = inner.procs.get(&id)?;
+        entry.scope.terminal_intent().or_else(|| {
+            entry
+                .finalization_report
+                .as_ref()
+                .map(|report| report.status)
+        })
+    }
+
+    /// Share a completed cleanup report without retaining this table or process entry.
+    /// Returns `None` before completion or after explicit reap. Existing report
+    /// owners may keep its immutable evidence after the entry has been reaped.
+    pub fn finalization_report(&self, id: ProcessId) -> Option<Arc<ProcessFinalizationReport>> {
         self.inner
             .state
             .read()
             .procs
             .get(&id)?
-            .scope
-            .terminal_intent()
+            .finalization_report
+            .clone()
+    }
+
+    pub(crate) fn retain_body_completion(
+        &self,
+        id: ProcessId,
+        output: &ExecutionOutput,
+    ) -> Option<bool> {
+        let mut inner = self.inner.state.write();
+        let entry = inner.procs.get_mut(&id)?;
+        if !entry.scope.finish_body(outcome_status(&output.outcome)) {
+            return Some(false);
+        }
+        let state = entry
+            .finalization
+            .get_or_insert_with(|| Box::new(Finalization::new()));
+        state.completed_taint.union(&output.taint);
+        state
+            .unresolved_operations
+            .merge(&output.unresolved_operations);
+        drop(inner);
+        self.inner.changed.notify_waiters();
+        Some(true)
     }
 
     /// Retain the first body result without replacing an existing cleanup owner.
@@ -667,6 +877,9 @@ impl ProcessTable {
             .finalization
             .get_or_insert_with(|| Box::new(Finalization::new()));
         let retained = state.outcome.get_or_insert_with(|| outcome.clone()).clone();
+        state
+            .unresolved_operations
+            .merge(&retained.unresolved_operations);
         self.inner.changed.notify_waiters();
         Some(retained)
     }
@@ -681,35 +894,6 @@ impl ProcessTable {
             .as_ref()?
             .outcome
             .clone()
-    }
-
-    pub(crate) fn finalization_record(&self, id: ProcessId) -> Option<(Fact, usize)> {
-        self.inner
-            .state
-            .read()
-            .procs
-            .get(&id)?
-            .finalization
-            .as_ref()?
-            .record
-            .clone()
-    }
-
-    pub(crate) fn retain_finalization_record(
-        &self,
-        id: ProcessId,
-        fact: Fact,
-        closed: usize,
-    ) -> Option<()> {
-        self.inner
-            .state
-            .write()
-            .procs
-            .get_mut(&id)?
-            .finalization
-            .as_mut()?
-            .record = Some((fact, closed));
-        Some(())
     }
 
     pub(crate) fn record_revocation(&self, id: ProcessId, revoked: usize) -> Option<usize> {
@@ -763,12 +947,12 @@ impl ProcessTable {
                 entry.scope.cleanup_scope()?;
                 let mut parent = entry.parent;
                 while let Some(ancestor) = parent.and_then(|parent| inner.procs.get(&parent)) {
-                    if ancestor.scope.cleanup_scope() == Some(CleanupScope::Tree) {
+                    if ancestor.has_tree_cleanup() {
                         return None;
                     }
                     parent = ancestor.parent;
                 }
-                Some(*id)
+                (!inner.cleanup_is_complete(*id)).then_some(*id)
             })
             .collect()
     }
@@ -780,10 +964,7 @@ impl ProcessTable {
             .scope
             .terminal_intent()
             .unwrap_or(entry.scope.status());
-        Some((
-            entry.scope.cleanup_scope() == Some(CleanupScope::Tree),
-            status,
-        ))
+        Some((entry.has_tree_cleanup(), status))
     }
 
     pub(crate) async fn wait_for_finalization(&self, id: ProcessId) {
@@ -818,7 +999,7 @@ impl ProcessTable {
     }
 
     /// Whether a process id exists in the table.
-    #[cfg(any(test, feature = "durable"))]
+    #[cfg(test)]
     pub(crate) fn exists(&self, id: ProcessId) -> bool {
         self.inner.state.read().procs.contains_key(&id)
     }
@@ -828,6 +1009,185 @@ impl ProcessTable {
 mod tests {
     use super::*;
     use anyhow::{Context, ensure};
+
+    #[tokio::test]
+    async fn children_share_live_request_authority_until_their_own_cleanup() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Authorizer {
+            table: std::sync::Weak<ProcessTableShared>,
+            allowed: Arc<AtomicBool>,
+            released_without_lock: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::RequestAuthorizer for Authorizer {
+            async fn authorize(&self) -> Result<(), Failure> {
+                if self.allowed.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(Failure::policy("request", "revoked"))
+                }
+            }
+        }
+
+        impl Drop for Authorizer {
+            fn drop(&mut self) {
+                self.released_without_lock.store(
+                    self.table
+                        .upgrade()
+                        .is_some_and(|table| table.state.try_read().is_some()),
+                    Ordering::SeqCst,
+                );
+            }
+        }
+
+        let table = ProcessTable::new();
+        let root = table.fresh_id()?;
+        table.insert(ProcessEntry::new(root, None, IdentityRef::ROOT));
+        let allowed = Arc::new(AtomicBool::new(true));
+        let released_without_lock = Arc::new(AtomicBool::new(false));
+        let authorizer: Arc<dyn crate::RequestAuthorizer> = Arc::new(Authorizer {
+            table: Arc::downgrade(&table.inner),
+            allowed: allowed.clone(),
+            released_without_lock: released_without_lock.clone(),
+        });
+        let retained = Arc::downgrade(&authorizer);
+        table
+            .set_request_authorizer(root, authorizer.clone())
+            .context("parent authority")?;
+        let child = table.fresh_id()?;
+        table.admit_child(ProcessEntry::new(child, Some(root), IdentityRef::ROOT))?;
+        let child_authorizer = table
+            .request_authorizer(child)
+            .context("inherited authority")?;
+        ensure!(Arc::ptr_eq(&authorizer, &child_authorizer));
+        child_authorizer.authorize().await?;
+        allowed.store(false, Ordering::SeqCst);
+        ensure!(child_authorizer.authorize().await == Err(Failure::policy("request", "revoked")));
+        drop(child_authorizer);
+        drop(authorizer);
+        ensure!(table.begin_finalizing(root, ProcessStatus::Completed) == FinalizeStart::Started);
+        let guard = table.finalization_guard(root);
+        table.mark_terminal_status(root, ProcessStatus::Completed);
+        table
+            .complete_finalization(root)
+            .context("parent completion")?;
+        drop(guard);
+        ensure!(table.request_authorizer(root).is_none());
+        ensure!(table.request_authorizer(child).is_some());
+        ensure!(!released_without_lock.load(Ordering::SeqCst));
+        ensure!(table.begin_finalizing(child, ProcessStatus::Completed) == FinalizeStart::Started);
+        let guard = table.finalization_guard(child);
+        table.mark_terminal_status(child, ProcessStatus::Completed);
+        table
+            .complete_finalization(child)
+            .context("child completion")?;
+        drop(guard);
+        ensure!(table.request_authorizer(child).is_none());
+        ensure!(retained.upgrade().is_none());
+        ensure!(released_without_lock.load(Ordering::SeqCst));
+        ensure!(table.reap_finalized(1) == 1);
+        Ok(())
+    }
+
+    #[test]
+    fn completed_report_preserves_control_evidence_without_retaining_body_payload()
+    -> anyhow::Result<()> {
+        let table = ProcessTable::new();
+        let root = table.fresh_id()?;
+        table.insert(ProcessEntry::new(root, None, IdentityRef::ROOT));
+        let process = table.fresh_id()?;
+        let mut entry = ProcessEntry::new(process, Some(root), IdentityRef::ROOT);
+        entry
+            .on_finalize
+            .push(xolotl_graph::DoNode::pure(Value::null()));
+        table.insert(entry);
+        let mut body_unknown = UnresolvedOperations::default();
+        body_unknown.record("body-operation");
+        let output = table
+            .retain_outcome(
+                process,
+                ExecutionOutput::new(
+                    xolotl_types::Outcome::Done(Value::bytes(vec![1; 1024])),
+                    TaintSet::author(),
+                )
+                .with_unresolved_operations(body_unknown.clone()),
+            )
+            .context("body outcome")?;
+        let body_payload = Arc::downgrade(&output);
+        drop(output);
+        ensure!(table.finalization_report(process).is_none());
+        ensure!(
+            table.begin_finalizing(process, ProcessStatus::Completed) == FinalizeStart::Started
+        );
+        let guard = table.finalization_guard(process);
+        ensure!(table.next_finalizer(process).is_some());
+        let failure_taint = TaintSet::of(xolotl_types::TaintSource::ModelOutput);
+        let failure = Failure::OutcomeUnknown {
+            operation_ids: vec!["finalizer-operation".into()],
+            reason: "remote acknowledgement lost".into(),
+        };
+        let mut finalizer_unknown = UnresolvedOperations::default();
+        finalizer_unknown.record("finalizer-operation");
+        finalizer_unknown.identities_incomplete = true;
+        table
+            .finish_finalizer(
+                process,
+                ExecutionOutput::new(
+                    xolotl_types::Outcome::Fail(failure.clone()),
+                    failure_taint.clone(),
+                )
+                .with_unresolved_operations(finalizer_unknown),
+            )
+            .context("finalizer result")?;
+        table
+            .record_handle_cleanup(process, 2, 3)
+            .context("cleanup counts")?;
+        table.mark_terminal_status(process, ProcessStatus::Completed);
+        table.complete_finalization(process).context("completion")?;
+        drop(guard);
+        let report = table
+            .finalization_report(process)
+            .context("completed report")?;
+        ensure!(body_payload.upgrade().is_none());
+        ensure!(report.status == ProcessStatus::Completed);
+        ensure!(report.taint.contains_all(&TaintSet::author()));
+        ensure!(report.taint.contains_all(&failure_taint));
+        ensure!(
+            report.unresolved_operations.operation_ids == ["body-operation", "finalizer-operation"]
+        );
+        ensure!(report.unresolved_operations.identities_incomplete);
+        ensure!(report.finalizer_failures == [(0, TaintedFailure::new(failure, failure_taint))]);
+        ensure!((report.released_handles, report.revoked_handles) == (2, 3));
+        ensure!(
+            table
+                .finalization_report(process)
+                .context("missing report")?
+                .taint
+                == report.taint
+        );
+        ensure!(
+            table.finalization_unresolved_operations(process)
+                == Some(report.unresolved_operations.clone())
+        );
+        ensure!(table.finalizer_failures(process).context("failures")?.len() == 1);
+        ensure!(table.finalization_status(process) == Some(ProcessStatus::Completed));
+        table
+            .complete_finalization(process)
+            .context("repeat completion")?;
+        ensure!(Arc::ptr_eq(
+            &report,
+            &table.finalization_report(process).context("same report")?
+        ));
+        let retained = Arc::downgrade(&report);
+        ensure!(table.reap_finalized(1) == 1);
+        ensure!(table.finalization_report(process).is_none());
+        ensure!(retained.upgrade().is_some());
+        drop(report);
+        ensure!(retained.upgrade().is_none());
+        Ok(())
+    }
 
     #[test]
     fn native_captures_are_dropped_outside_the_process_lock() -> anyhow::Result<()> {
@@ -915,6 +1275,7 @@ mod tests {
                 ExecutionOutput {
                     outcome: Outcome::Done(Value::integer(7)),
                     taint: TaintSet::author(),
+                    unresolved_operations: Default::default(),
                 },
             )
             .context("missing retained outcome")?;
@@ -982,10 +1343,12 @@ mod tests {
             let table = ProcessTable::new();
             let parent = table.fresh_id()?;
             let mut entry = ProcessEntry::new(parent, None, IdentityRef::ROOT);
-            entry.scope.restore_lifecycle(
-                status,
-                (status == ProcessStatus::Finalizing).then_some(ProcessStatus::Cancelled),
-            )?;
+            if status == ProcessStatus::Finalizing {
+                ensure!(entry.scope.finish_body(ProcessStatus::Cancelled));
+            } else {
+                ensure!(entry.scope.finish_body(status));
+                entry.scope.mark_terminal_status(status);
+            }
             table.insert(entry);
             let child = table.fresh_id()?;
             ensure!(
@@ -1055,11 +1418,11 @@ mod tests {
         ))?;
         table.mark_finalized_terminal(parent, ProcessStatus::Completed);
 
-        ensure!(table.request_cleanup_tree(parent) == vec![descendant, child]);
+        ensure!(table.request_cleanup_tree(parent) == vec![descendant, child, parent]);
         ensure!(table.status(parent) == Some(ProcessStatus::Completed));
         ensure!(table.finalization_status(child) == Some(ProcessStatus::Cancelled));
         ensure!(table.finalization_status(descendant) == Some(ProcessStatus::Cancelled));
-        ensure!(table.pending_cleanup() == vec![child]);
+        ensure!(table.pending_cleanup() == vec![parent]);
         ensure!(table.is_in_tree(parent, descendant));
         ensure!(table.is_in_tree(parent, parent));
         ensure!(!table.is_in_tree(parent, ProcessId::new(100)));
@@ -1081,6 +1444,7 @@ mod tests {
                 ExecutionOutput {
                     outcome: Outcome::Done(Value::null()),
                     taint: TaintSet::pristine(),
+                    unresolved_operations: Default::default(),
                 },
             );
         }
@@ -1097,6 +1461,7 @@ mod tests {
             ExecutionOutput {
                 outcome: Outcome::Done(Value::null()),
                 taint: TaintSet::pristine(),
+                unresolved_operations: Default::default(),
             },
         );
         ensure!(table.pending_cleanup() == vec![parent]);
@@ -1119,6 +1484,7 @@ mod tests {
             ExecutionOutput {
                 outcome: Outcome::Done(Value::null()),
                 taint: TaintSet::pristine(),
+                unresolved_operations: Default::default(),
             },
         );
         ensure!(table.abandon_scope(parent) == vec![parent]);
@@ -1131,7 +1497,7 @@ mod tests {
         ensure!(table.abandon_scope(parent).is_empty());
         ensure!(table.pending_cleanup().is_empty());
         ensure!(table.status(child) == Some(ProcessStatus::Created));
-        ensure!(table.request_cleanup_tree(parent) == vec![child]);
+        ensure!(table.request_cleanup_tree(parent) == vec![child, parent]);
         ensure!(table.finalization_status(child) == Some(ProcessStatus::Cancelled));
         Ok(())
     }
@@ -1153,6 +1519,7 @@ mod tests {
                 ExecutionOutput {
                     outcome: Outcome::Done(Value::integer(7)),
                     taint: TaintSet::author(),
+                    unresolved_operations: Default::default(),
                 },
             )
             .context("missing retained outcome")?;
@@ -1162,6 +1529,7 @@ mod tests {
                 ExecutionOutput {
                     outcome: Outcome::Done(Value::integer(8)),
                     taint: TaintSet::pristine(),
+                    unresolved_operations: Default::default(),
                 },
             )
             .context("missing first outcome")?;

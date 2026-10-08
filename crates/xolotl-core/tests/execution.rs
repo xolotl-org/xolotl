@@ -58,7 +58,6 @@ fn image(nodes: &[Node<i64, Fault>], entry: u32) -> ProgramImage<'_, i64, Fault>
         entry,
         bindings: 2,
         imports: 4,
-        durable: false,
     }
 }
 
@@ -190,7 +189,7 @@ fn scheduling_quantum_is_not_a_lifetime_quota() -> anyhow::Result<()> {
             Advance::Yielded
         ));
     }
-    assert!(execution.checkpoint().meta.steps > 1_000_000);
+    assert!(execution.view().meta.steps > 1_000_000);
     execution.cancel();
     assert!(matches!(
         execution.advance(&image, &mut Numbers, 64),
@@ -217,18 +216,23 @@ fn explicit_lifetime_quota_still_cancels_execution() -> anyhow::Result<()> {
     let mut tasks = [Task::default()];
     let mut frames = core::array::from_fn::<_, 2, _>(|_| None);
     let mut bindings = [None; 2];
-    let limits = ExecutionLimits {
-        max_steps: Some(16),
-        bindings_per_task: 2,
-        ..ExecutionLimits::default()
-    };
-    let mut execution =
-        Execution::new(&image, &mut tasks, &mut frames, &mut bindings, limits, 1, 7)?;
-    assert!(matches!(
-        execution.advance(&image, &mut Numbers, 64),
-        Advance::Done(Err(Fault::Cancelled))
-    ));
-    assert_eq!(execution.checkpoint().meta.steps, 16);
+    for (cleanup_steps, expected) in [(0, Fault::Fuel), (4096, Fault::Cancelled)] {
+        let limits = ExecutionLimits {
+            max_steps: Some(16),
+            bindings_per_task: 2,
+            cleanup_steps,
+            ..ExecutionLimits::default()
+        };
+        let mut execution =
+            Execution::new(&image, &mut tasks, &mut frames, &mut bindings, limits, 1, 7)?;
+        let Advance::Done(result) = execution.advance(&image, &mut Numbers, 64) else {
+            anyhow::bail!("lifetime quota did not terminate execution");
+        };
+        assert_eq!(result, Err(expected));
+        let view = execution.view();
+        assert_eq!(view.meta.steps, 16);
+        assert!(view.pending_tickets().next().is_none());
+    }
     Ok(())
 }
 
@@ -458,7 +462,7 @@ fn recursive_calls_fail_at_frame_capacity() -> anyhow::Result<()> {
 }
 
 #[test]
-fn admission_rejects_invalid_unreachable_code_and_durability() -> anyhow::Result<()> {
+fn admission_rejects_invalid_unreachable_code() -> anyhow::Result<()> {
     let mut nodes = [
         Node::new(NodeKind::Input, 0),
         Node::new(NodeKind::Load(99), 1),
@@ -468,23 +472,54 @@ fn admission_rejects_invalid_unreachable_code_and_durability() -> anyhow::Result
     assert_eq!(image(&nodes, 0).validate(), Err(Fault::InvalidImport));
     nodes[1].kind = NodeKind::Call(99);
     assert_eq!(image(&nodes, 0).validate(), Err(Fault::InvalidNode));
-    nodes[1].kind = NodeKind::Input;
-    let mut image = image(&nodes, 0);
-    image.durable = true;
+    Ok(())
+}
+
+#[test]
+fn live_resume_rejects_different_images_and_truncated_storage() -> anyhow::Result<()> {
+    let nodes = [Node::new(NodeKind::Request(0), 0)];
+    let image = image(&nodes, 0);
     let mut tasks = [Task::default()];
     let mut frames = [None];
     let mut bindings = [None; 2];
+    let execution = Execution::new(
+        &image,
+        &mut tasks,
+        &mut frames,
+        &mut bindings,
+        ExecutionLimits {
+            frames_per_task: 1,
+            bindings_per_task: 2,
+            ..ExecutionLimits::default()
+        },
+        0,
+        0,
+    )?;
+    let meta = execution.suspend();
+    let different = ProgramImage {
+        id: [2; 32],
+        ..image
+    };
     assert!(matches!(
-        Execution::new(
-            &image,
-            &mut tasks,
-            &mut frames,
-            &mut bindings,
-            ExecutionLimits::default(),
-            0,
-            0
-        ),
-        Err(Fault::DurableUnavailable)
+        Execution::resume(&different, meta, &mut tasks, &mut frames, &mut bindings),
+        Err(Fault::ImageMismatch)
+    ));
+    assert!(matches!(
+        Execution::resume(&image, meta, &mut [], &mut frames, &mut bindings),
+        Err(Fault::Tasks)
+    ));
+    assert!(matches!(
+        Execution::resume(&image, meta, &mut tasks, &mut [], &mut bindings),
+        Err(Fault::Frames)
+    ));
+    assert!(matches!(
+        Execution::resume(&image, meta, &mut tasks, &mut frames, &mut bindings[..1]),
+        Err(Fault::InvalidBinding)
+    ));
+    let mut resumed = Execution::resume(&image, meta, &mut tasks, &mut frames, &mut bindings)?;
+    assert!(matches!(
+        resumed.advance(&image, &mut Numbers, 1),
+        Advance::Request(_)
     ));
     Ok(())
 }
@@ -525,113 +560,6 @@ fn revoking_a_delegation_parent_invalidates_descendants_without_leaking_slots() 
     table.revoke(leaf, 3)?;
     let child = table.derive(replacement, 1, 2, 1)?;
     assert_eq!(table.authorize(child, 2, 0)?, 9);
-    Ok(())
-}
-
-#[test]
-fn checkpoint_restores_pending_request_and_checks_image_identity() -> anyhow::Result<()> {
-    let nodes = [Node::new(NodeKind::Request(0), 0)];
-    let image = image(&nodes, 0);
-    let limits = ExecutionLimits {
-        frames_per_task: 2,
-        bindings_per_task: 2,
-        ..ExecutionLimits::default()
-    };
-    let mut tasks = [Task::default()];
-    let mut frames = [None, None];
-    let mut bindings = [None; 2];
-    let mut saved_tasks = [Task::default()];
-    let mut saved_frames = [None, None];
-    let mut saved_bindings = [None; 2];
-    let (meta, request) = {
-        let mut execution = Execution::new(
-            &image,
-            &mut tasks,
-            &mut frames,
-            &mut bindings,
-            limits,
-            42,
-            7,
-        )?;
-        let Advance::Request(request) = execution.advance(&image, &mut Numbers, 10) else {
-            anyhow::bail!("missing request");
-        };
-        let saved = execution.checkpoint();
-        saved_tasks.clone_from_slice(saved.tasks);
-        saved_frames.clone_from_slice(saved.frames);
-        saved_bindings.clone_from_slice(saved.bindings);
-        (saved.meta, request)
-    };
-    let checkpoint = Checkpoint {
-        meta,
-        tasks: &saved_tasks,
-        frames: &saved_frames,
-        bindings: &saved_bindings,
-    };
-    Execution::validate_checkpoint(&image, &checkpoint, false)?;
-    assert!(checkpoint.result().is_none());
-    assert!(checkpoint.pending_tickets().eq([request.ticket]));
-    let pending = checkpoint
-        .pending_requests(&image)
-        .next()
-        .ok_or(Fault::StaleEvent)?;
-    assert_eq!(
-        (
-            pending.ticket,
-            pending.import,
-            *pending.input,
-            pending.context
-        ),
-        (request.ticket, 0, 42, 7)
-    );
-    {
-        let mut restored = Execution::restore(
-            &image,
-            &checkpoint,
-            &mut tasks,
-            &mut frames,
-            &mut bindings,
-            false,
-        )?;
-        let pending = restored
-            .pending_requests(&image)
-            .next()
-            .ok_or(Fault::StaleEvent)?;
-        assert_eq!(
-            (pending.ticket, pending.input, pending.context),
-            (request.ticket, 42, 7)
-        );
-        restored.complete(
-            pending.task,
-            pending.ticket,
-            HostEvent::Complete(Ok(9)),
-            &image,
-            &mut Numbers,
-        )?;
-        assert!(matches!(
-            restored.advance(&image, &mut Numbers, 10),
-            Advance::Done(Ok(9))
-        ));
-        assert_eq!(restored.checkpoint().result(), Some(&Ok(9)));
-        assert_eq!(restored.checkpoint().pending_tickets().count(), 0);
-    }
-    let mut changed = image;
-    changed.id = [2; 32];
-    assert_eq!(
-        Execution::validate_checkpoint(&changed, &checkpoint, false),
-        Err(Fault::ImageMismatch)
-    );
-    assert!(matches!(
-        Execution::restore(
-            &changed,
-            &checkpoint,
-            &mut tasks,
-            &mut frames,
-            &mut bindings,
-            false
-        ),
-        Err(Fault::ImageMismatch)
-    ));
     Ok(())
 }
 
@@ -693,369 +621,5 @@ fn channel_backpressure_preserves_values_and_terminal_error() -> anyhow::Result<
     let mut empty = [];
     let mut channel = Channel::<_, Fault>::new(&mut empty);
     assert_eq!(channel.try_send(1), Err(SendError::Full(1)));
-    Ok(())
-}
-
-#[cfg(feature = "serde")]
-#[test]
-fn native_continuation_checkpoints_validate_entries_before_resuming() -> anyhow::Result<()> {
-    #[derive(serde::Deserialize)]
-    struct Saved {
-        meta: CheckpointMeta,
-        tasks: Vec<Task<i64, Fault>>,
-        frames: Vec<Option<Frame<i64, Fault>>>,
-        bindings: Vec<Option<i64>>,
-    }
-    let nodes = [
-        Node::new(NodeKind::Request(0), 0),
-        Node::new(NodeKind::Request(1), 1),
-        Node::new(NodeKind::Input, 2),
-    ];
-    let image = image(&nodes, 0);
-    let mut tasks = [Task::default()];
-    let mut frames = [None];
-    let mut bindings = [None, None];
-    let encoded = {
-        let mut execution = Execution::new(
-            &image,
-            &mut tasks,
-            &mut frames,
-            &mut bindings,
-            ExecutionLimits {
-                frames_per_task: 1,
-                bindings_per_task: 2,
-                ..ExecutionLimits::default()
-            },
-            42,
-            7,
-        )?;
-        let Advance::Request(request) = execution.advance(&image, &mut Numbers, 31) else {
-            anyhow::bail!("missing initial request");
-        };
-        execution.complete(
-            request.task,
-            request.ticket,
-            HostEvent::Continue { entry: 1, input: 9 },
-            &image,
-            &mut Numbers,
-        )?;
-        serde_json::to_value(execution.checkpoint())?
-    };
-    for case in ["valid", "entry", "caller", "version"] {
-        let mut value = encoded.clone();
-        let expected = match case {
-            "entry" => {
-                value["frames"][0]["kind"]["Continuation"]["entry"] = 99.into();
-                Some(Fault::InvalidNode)
-            }
-            "caller" => {
-                value["frames"][0]["kind"]["Continuation"]["node"] = 2.into();
-                Some(Fault::InvalidCheckpoint)
-            }
-            "version" => {
-                value["meta"]["version"] = (CHECKPOINT_VERSION - 1).into();
-                Some(Fault::Version)
-            }
-            _ => None,
-        };
-        let mut saved: Saved = serde_json::from_value(value)?;
-        let resumed = Execution::resume(
-            &image,
-            saved.meta,
-            &mut saved.tasks,
-            &mut saved.frames,
-            &mut saved.bindings,
-            false,
-        );
-        if let Some(expected) = expected {
-            assert_eq!(resumed.err(), Some(expected));
-        } else {
-            let mut execution = resumed?;
-            assert_eq!(execution.continuation_entries().collect::<Vec<_>>(), [1]);
-            let Advance::Request(request) = execution.advance(&image, &mut Numbers, 31) else {
-                anyhow::bail!("resumed body did not request its operation");
-            };
-            assert_eq!(request.input, 9);
-            assert_eq!(request.import, 1);
-            assert_eq!(request.ticket, 2);
-            execution.complete(
-                request.task,
-                request.ticket,
-                HostEvent::Complete(Ok(11)),
-                &image,
-                &mut Numbers,
-            )?;
-            assert!(matches!(
-                execution.advance(&image, &mut Numbers, 31),
-                Advance::Done(Ok(11))
-            ));
-            assert!(execution.continuation_entries().next().is_none());
-        }
-    }
-    Ok(())
-}
-
-#[cfg(feature = "serde")]
-#[test]
-fn serialized_checkpoint_preserves_pending_branches_and_rejects_corruption() -> anyhow::Result<()> {
-    #[derive(serde::Deserialize)]
-    struct Saved {
-        meta: CheckpointMeta,
-        tasks: Vec<Task<i64, Fault>>,
-        frames: Vec<Option<Frame<i64, Fault>>>,
-        bindings: Vec<Option<i64>>,
-    }
-    let nodes = [
-        Node::new(
-            NodeKind::Fork {
-                left: 1,
-                right: 2,
-                join: Join::All,
-            },
-            0,
-        ),
-        Node::new(NodeKind::Request(0), 1),
-        Node::new(NodeKind::Request(1), 2),
-    ];
-    let image = image(&nodes, 0);
-    let limits = ExecutionLimits {
-        frames_per_task: 2,
-        bindings_per_task: 2,
-        ..ExecutionLimits::default()
-    };
-    let mut tasks = core::array::from_fn::<_, 3, _>(|_| Task::default());
-    let mut frames = core::array::from_fn::<_, 6, _>(|_| None);
-    let mut bindings = [None; 6];
-    let encoded = {
-        let mut execution = Execution::new(
-            &image,
-            &mut tasks,
-            &mut frames,
-            &mut bindings,
-            limits,
-            42,
-            7,
-        )?;
-        assert!(matches!(
-            execution.advance(&image, &mut Numbers, 20),
-            Advance::Request(_)
-        ));
-        assert!(matches!(
-            execution.advance(&image, &mut Numbers, 20),
-            Advance::Request(_)
-        ));
-        serde_json::to_vec(&execution.checkpoint())?
-    };
-    let saved: Saved = serde_json::from_slice(&encoded)?;
-    let checkpoint = Checkpoint {
-        meta: saved.meta,
-        tasks: &saved.tasks,
-        frames: &saved.frames,
-        bindings: &saved.bindings,
-    };
-    {
-        let mut execution = Execution::restore(
-            &image,
-            &checkpoint,
-            &mut tasks,
-            &mut frames,
-            &mut bindings,
-            false,
-        )?;
-        let requests: Vec<_> = execution.pending_requests(&image).collect();
-        assert_eq!(requests.len(), 2);
-        for request in requests.into_iter().rev() {
-            execution.complete(
-                request.task,
-                request.ticket,
-                HostEvent::Complete(Ok(i64::from(request.import) + 1)),
-                &image,
-                &mut Numbers,
-            )?;
-        }
-        assert!(matches!(
-            execution.advance(&image, &mut Numbers, 20),
-            Advance::Done(Ok(102))
-        ));
-    }
-    for field in ["ticket", "parent"] {
-        let mut corrupt: serde_json::Value = serde_json::from_slice(&encoded)?;
-        if field == "ticket" {
-            corrupt["tasks"][2]["state"]["Waiting"]["ticket"] =
-                corrupt["tasks"][1]["state"]["Waiting"]["ticket"].clone();
-        } else {
-            corrupt["tasks"][1]["parent"] = serde_json::Value::Null;
-        }
-        let saved: Saved = serde_json::from_value(corrupt)?;
-        let checkpoint = Checkpoint {
-            meta: saved.meta,
-            tasks: &saved.tasks,
-            frames: &saved.frames,
-            bindings: &saved.bindings,
-        };
-        assert!(matches!(
-            Execution::restore(
-                &image,
-                &checkpoint,
-                &mut tasks,
-                &mut frames,
-                &mut bindings,
-                false
-            ),
-            Err(Fault::InvalidCheckpoint)
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "serde")]
-#[test]
-fn shared_frame_checkpoints_validate_owners_free_lists_and_unused_slots() -> anyhow::Result<()> {
-    use anyhow::Context;
-    #[derive(serde::Deserialize)]
-    struct Saved {
-        meta: CheckpointMeta,
-        tasks: Vec<Task<i64, Fault>>,
-        frames: Vec<Option<Frame<i64, Fault>>>,
-        bindings: Vec<Option<i64>>,
-    }
-    let nodes = [
-        Node::new(
-            NodeKind::Fork {
-                left: 1,
-                right: 4,
-                join: Join::All,
-            },
-            0,
-        ),
-        Node::new(
-            NodeKind::Finally {
-                body: 3,
-                cleanup: 3,
-            },
-            1,
-        ),
-        Node::new(NodeKind::Request(0), 2),
-        Node::new(NodeKind::Input, 3),
-        Node::new(
-            NodeKind::Finally {
-                body: 2,
-                cleanup: 3,
-            },
-            4,
-        ),
-    ];
-    let image = ProgramImage {
-        bindings: 0,
-        ..image(&nodes, 0)
-    };
-    let limits = ExecutionLimits {
-        frames_per_task: 2,
-        bindings_per_task: 0,
-        ..ExecutionLimits::default()
-    };
-    let mut tasks = core::array::from_fn::<_, 3, _>(|_| Task::default());
-    let mut frames = core::array::from_fn::<_, 7, _>(|_| None);
-    let mut bindings = [];
-    let encoded = {
-        let mut execution =
-            Execution::new(&image, &mut tasks, &mut frames, &mut bindings, limits, 7, 1)?;
-        assert!(matches!(
-            execution.advance(&image, &mut Numbers, 64),
-            Advance::Request(_)
-        ));
-        assert!(matches!(
-            execution.advance(&image, &mut Numbers, 64),
-            Advance::Waiting
-        ));
-        serde_json::to_value(execution.checkpoint())?
-    };
-    let top = encoded["tasks"][2]["stack"]["top"]
-        .as_u64()
-        .context("missing stack head")? as usize;
-    let free = encoded["meta"]["frame_pool"]["free_head"]
-        .as_u64()
-        .context("missing free head")? as usize;
-    assert!(free < frames.len());
-    for damage in [
-        "owner",
-        "cycle",
-        "alias",
-        "orphan",
-        "free_cycle",
-        "free_alias",
-        "unused",
-        "version",
-    ] {
-        let mut corrupt = encoded.clone();
-        match damage {
-            "owner" => corrupt["frames"][top]["owner"] = 1.into(),
-            "cycle" => corrupt["frames"][top]["previous"] = top.into(),
-            "alias" => corrupt["tasks"][1]["stack"] = corrupt["tasks"][2]["stack"].clone(),
-            "orphan" => {
-                corrupt["tasks"][2]["stack"]["depth"] = 0.into();
-                corrupt["tasks"][2]["stack"]["top"] = u32::MAX.into();
-            }
-            "free_cycle" => corrupt["frames"][free]["previous"] = free.into(),
-            "free_alias" => corrupt["meta"]["frame_pool"]["free_head"] = top.into(),
-            "unused" => corrupt["frames"][6] = corrupt["frames"][top].clone(),
-            _ => corrupt["meta"]["version"] = (CHECKPOINT_VERSION + 1).into(),
-        }
-        let saved: Saved = serde_json::from_value(corrupt)?;
-        let checkpoint = Checkpoint {
-            meta: saved.meta,
-            tasks: &saved.tasks,
-            frames: &saved.frames,
-            bindings: &saved.bindings,
-        };
-        let error = Execution::restore(
-            &image,
-            &checkpoint,
-            &mut tasks,
-            &mut frames,
-            &mut bindings,
-            false,
-        )
-        .err()
-        .context("corrupted checkpoint was accepted")?;
-        assert_eq!(
-            error,
-            if damage == "version" {
-                Fault::Version
-            } else {
-                Fault::InvalidCheckpoint
-            }
-        );
-    }
-    let saved: Saved = serde_json::from_value(encoded)?;
-    let checkpoint = Checkpoint {
-        meta: saved.meta,
-        tasks: &saved.tasks,
-        frames: &saved.frames,
-        bindings: &saved.bindings,
-    };
-    let mut execution = Execution::restore(
-        &image,
-        &checkpoint,
-        &mut tasks,
-        &mut frames,
-        &mut bindings,
-        false,
-    )?;
-    let pending = execution
-        .pending_requests(&image)
-        .next()
-        .context("missing request")?;
-    execution.complete(
-        pending.task,
-        pending.ticket,
-        HostEvent::Complete(Ok(1)),
-        &image,
-        &mut Numbers,
-    )?;
-    assert!(matches!(
-        execution.advance(&image, &mut Numbers, 64),
-        Advance::Done(Ok(701))
-    ));
     Ok(())
 }

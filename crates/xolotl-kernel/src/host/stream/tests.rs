@@ -95,7 +95,7 @@ async fn oversized_inline_chunks_are_distinct_from_large_object_references() -> 
         }) if value == large && *reason == StreamRejection::InlineBytesExceeded { limit: 1024 }
     ));
     let reference = TaintedValue::pristine(Value::blob(BlobRef {
-        hash: "a".repeat(64),
+        hash: "a".repeat(96),
         size: u64::MAX,
         mime: None,
     }));

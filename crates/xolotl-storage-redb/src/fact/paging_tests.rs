@@ -14,6 +14,12 @@ fn query(limit: usize, max_encoded_bytes: usize) -> anyhow::Result<FactQuery> {
 
 fn replace_bytes(store: &RedbFactStore, slot: u64, bytes: &[u8]) -> anyhow::Result<()> {
     let txn = store.db.begin_write()?;
+    let previous = {
+        let table = txn.open_table(FACTS_TABLE)?;
+        let stored = table.get(slot)?.context("replaced Fact missing")?;
+        stored.value().len()
+    };
+    store.charge(&txn, bytes.len(), Some(previous))?;
     txn.open_table(FACTS_TABLE)?.insert(slot, bytes)?;
     txn.commit()?;
     Ok(())
@@ -247,7 +253,9 @@ fn oversized_record_can_be_retried_without_skipping_its_slot() -> anyhow::Result
         let Err(error) = fs.scan(request) else {
             return Err(anyhow!("oversized first record was accepted"));
         };
-        ensure!(error.0.contains("slot 1") && error.0.contains("encoded byte limit"));
+        ensure!(
+            error.message().contains("slot 1") && error.message().contains("encoded byte limit")
+        );
         request.max_encoded_bytes = query(8, large_size)?.max_encoded_bytes;
         let page = fs.scan(request)?;
         ensure!(page.facts.as_slice() == std::slice::from_ref(&large));
@@ -279,7 +287,9 @@ fn reverse_byte_budget_retries_an_oversized_candidate_at_slot_zero() -> anyhow::
             .next_page(&page)
             .context("reverse byte continuation")?;
         let error = fs.scan(request).err().context("oversized oldest record")?;
-        ensure!(error.0.contains("slot 0") && error.0.contains("encoded byte limit"));
+        ensure!(
+            error.message().contains("slot 0") && error.message().contains("encoded byte limit")
+        );
         request.max_encoded_bytes = NonZeroUsize::new(large_size).context("encoded size")?;
         let page = fs.scan(request)?;
         ensure!(page.facts.as_slice() == std::slice::from_ref(&large));
@@ -307,11 +317,11 @@ fn byte_budget_uses_stored_encoding_and_is_checked_before_decoding() -> anyhow::
     let Err(error) = fs.scan(query(1, 1)?) else {
         return Err(anyhow!("oversized malformed record was accepted"));
     };
-    ensure!(error.0.contains("encoded byte limit"));
+    ensure!(error.message().contains("encoded byte limit"));
     let Err(error) = fs.scan(query(1, 64)?) else {
         return Err(anyhow!("malformed record was accepted"));
     };
-    ensure!(!error.0.contains("encoded byte limit"));
+    ensure!(!error.message().contains("encoded byte limit"));
     Ok(())
 }
 
@@ -464,12 +474,12 @@ fn bounded_lookup_checks_stored_size_before_decoding_and_observes_growth() -> an
         .get_bounded(pending.id, NonZeroUsize::MIN)
         .err()
         .context("oversized lookup")?;
-    ensure!(error.0.contains("encoded byte limit"));
+    ensure!(error.message().contains("encoded byte limit"));
     let error = fs
         .get_bounded(pending.id, NonZeroUsize::MAX)
         .err()
         .context("malformed lookup")?;
-    ensure!(!error.0.contains("encoded byte limit"));
+    ensure!(!error.message().contains("encoded byte limit"));
     Ok(())
 }
 
@@ -500,7 +510,7 @@ fn scoped_lookup_filters_before_checking_size_or_decoding() -> anyhow::Result<()
             })
             .err()
             .context("oversized matching record")?;
-        ensure!(error.0.contains("encoded byte limit"));
+        ensure!(error.message().contains("encoded byte limit"));
         ensure!(matches!(
             fs.lookup(FactLookup {
                 id: record.id,
@@ -531,7 +541,7 @@ fn scoped_lookup_filters_before_checking_size_or_decoding() -> anyhow::Result<()
         })
         .err()
         .context("malformed matching record")?;
-    ensure!(!error.0.contains("encoded byte limit"));
+    ensure!(!error.message().contains("encoded byte limit"));
     Ok(())
 }
 
@@ -582,7 +592,11 @@ fn dangling_indexes_are_errors_instead_of_missing_records() -> anyhow::Result<()
             })
             .err()
             .context("dangling operation index")?;
-        ensure!(error.0.contains("operation index points to missing slot 0"));
+        ensure!(
+            error
+                .message()
+                .contains("operation index points to missing slot 0")
+        );
     }
     let mut request = query(8, usize::MAX)?;
     ensure!(fs.scan(request).is_err());
@@ -616,7 +630,7 @@ fn global_scans_reject_missing_first_middle_and_last_slots() -> anyhow::Result<(
             let Err(error) = fs.scan(request) else {
                 return Err(anyhow!("global scan ignored missing slot {missing}"));
             };
-            ensure!(error.0.contains(&format!("missing slot {missing}")));
+            ensure!(error.message().contains(&format!("missing slot {missing}")));
         }
     }
     Ok(())
@@ -646,7 +660,7 @@ fn global_scan_rejects_a_head_beyond_the_primary_table_tail() -> anyhow::Result<
                 FactOrder::Forward => retained,
                 FactOrder::Reverse => 2,
             };
-            ensure!(error.0.contains(&format!("missing slot {missing}")));
+            ensure!(error.message().contains(&format!("missing slot {missing}")));
         }
     }
     Ok(())
@@ -678,7 +692,7 @@ fn continuation_reports_a_gap_after_a_valid_bounded_page() -> anyhow::Result<()>
         let Err(error) = fs.scan(request) else {
             return Err(anyhow!("continuation skipped missing slot 1"));
         };
-        ensure!(error.0.contains("missing slot 1"));
+        ensure!(error.message().contains("missing slot 1"));
 
         request.from = 0;
         request.before = Some(1);
@@ -717,7 +731,7 @@ fn mismatched_operation_index_is_an_error() -> anyhow::Result<()> {
         .context("mismatched operation index")?;
     ensure!(
         error
-            .0
+            .message()
             .contains("operation index does not match record at slot 1")
     );
     ensure!(fs.append(fact(1, 0, false)).is_err());
@@ -752,7 +766,10 @@ fn mismatched_process_index_slot_is_an_error() -> anyhow::Result<()> {
         })
         .err()
         .context("mismatched process index slot")?;
-    ensure!(error.0.contains("process index key") && error.0.contains("does not match slot 1"));
+    ensure!(
+        error.message().contains("process index key")
+            && error.message().contains("does not match slot 1")
+    );
     ensure!(fs.get(fact(1, 0, true).id)?.is_some());
     let mut request = query(8, usize::MAX)?;
     request.process = Some(ProcessId::new(1));
@@ -784,7 +801,7 @@ fn mismatched_process_index_caller_is_an_error() -> anyhow::Result<()> {
         .context("mismatched process index caller")?;
     ensure!(
         error
-            .0
+            .message()
             .contains("process index does not match record at slot 0")
     );
     let mut request = query(8, usize::MAX)?;

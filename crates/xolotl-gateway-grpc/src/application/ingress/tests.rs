@@ -16,6 +16,7 @@ struct TestBody {
     dropped: Option<Arc<AtomicBool>>,
     advance_on_poll: Option<Duration>,
     shutdown_on_poll: Option<watch::Sender<bool>>,
+    revoke_on_poll: Option<Arc<AtomicBool>>,
 }
 
 impl TestBody {
@@ -28,6 +29,7 @@ impl TestBody {
             dropped: None,
             advance_on_poll: None,
             shutdown_on_poll: None,
+            revoke_on_poll: None,
         }
     }
 }
@@ -52,6 +54,9 @@ impl Body for TestBody {
             && let Err(error) = advance_clock_without_timers(duration)
         {
             return Poll::Ready(Some(Err(error)));
+        }
+        if let Some(authority) = self.revoke_on_poll.take() {
+            authority.store(false, Ordering::Release);
         }
         if let Some(shutdown) = self.shutdown_on_poll.take() {
             shutdown.send_replace(true);
@@ -134,6 +139,97 @@ fn response_body(
     Ok((tonic::body::Body::new(body), outputs))
 }
 
+fn protected_response_body(
+    input: TestBody,
+    authority: Arc<AtomicBool>,
+) -> anyhow::Result<(tonic::body::Body, Arc<Semaphore>)> {
+    let outputs = Arc::new(Semaphore::new(1));
+    let permit = ResponsePermit::new(outputs.clone().try_acquire_owned()?).with_access(move || {
+        if authority.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition("reconcile before retrying"))
+        }
+    });
+    let body = ResponseBody {
+        inner: Some(tonic::body::Body::new(input)),
+        lifecycle: RequestLifecycle::new(None, None),
+        ended: false,
+        permit,
+    };
+    Ok((tonic::body::Body::new(body), outputs))
+}
+
+#[test]
+fn response_revocation_before_poll_or_during_encoding_withholds_the_frame() -> anyhow::Result<()> {
+    for during_poll in [false, true] {
+        for successful_trailer in [false, true] {
+            let authority = Arc::new(AtomicBool::new(true));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let frame = if successful_trailer {
+                let mut trailers = http::HeaderMap::new();
+                Status::ok("").add_header(&mut trailers)?;
+                Frame::trailers(trailers)
+            } else {
+                Frame::data(Bytes::from_static(b"protected output"))
+            };
+            let mut input = TestBody::new([Ok(frame)]);
+            input.dropped = Some(dropped.clone());
+            if during_poll {
+                input.revoke_on_poll = Some(authority.clone());
+            }
+            let (mut body, outputs) = protected_response_body(input, authority.clone())?;
+            if !during_poll {
+                authority.store(false, Ordering::Release);
+            }
+            let frame = ready_frame(&mut body)?;
+            ensure!(
+                frame
+                    .trailers_ref()
+                    .and_then(|headers| headers.get("grpc-status"))
+                    == Some(&http::HeaderValue::from_static("9"))
+            );
+            ensure!(dropped.load(Ordering::Acquire));
+            ensure!(matches!(poll_frame(&mut body), Poll::Ready(None)));
+            ensure!(outputs.available_permits() == 0);
+            drop(body);
+            ensure!(outputs.available_permits() == 1);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn response_revocation_after_data_withholds_completion_without_reclaiming_network_bytes()
+-> anyhow::Result<()> {
+    let authority = Arc::new(AtomicBool::new(true));
+    let mut trailers = http::HeaderMap::new();
+    Status::ok("").add_header(&mut trailers)?;
+    let input = TestBody::new([
+        Ok(Frame::data(Bytes::from_static(b"already handed off"))),
+        Ok(Frame::trailers(trailers)),
+    ]);
+    let (mut body, outputs) = protected_response_body(input, authority.clone())?;
+    let bytes = ready_frame(&mut body)?
+        .into_data()
+        .map_err(|_frame| anyhow::anyhow!("expected authorized data"))?;
+    authority.store(false, Ordering::Release);
+    let frame = ready_frame(&mut body)?;
+    ensure!(
+        frame
+            .trailers_ref()
+            .and_then(|headers| headers.get("grpc-status"))
+            == Some(&http::HeaderValue::from_static("9"))
+    );
+    drop(body);
+    ensure!(bytes.as_ref() == b"already handed off");
+    ensure!(Arc::strong_count(&authority) == 1);
+    ensure!(outputs.available_permits() == 0);
+    drop(bytes);
+    ensure!(outputs.available_permits() == 1);
+    Ok(())
+}
+
 #[test]
 fn grpc_timeout_accepts_protocol_units_and_rejects_ambiguous_values() -> anyhow::Result<()> {
     for (text, duration) in [
@@ -181,12 +277,27 @@ fn grpc_timeout_header_is_optional_and_must_be_unique() -> anyhow::Result<()> {
     let deadline = RpcDeadline::from_headers(&headers)?.context("missing deadline")?;
     ensure!(deadline.instant >= before + Duration::from_micros(1));
     ensure!(deadline.instant <= Instant::now() + Duration::from_micros(1));
-    ensure!(deadline.unix_ms() > 0);
+    ensure!(deadline.remaining() <= Duration::from_micros(1));
     headers.append("grpc-timeout", http::HeaderValue::from_static("1u"));
     ensure!(RpcDeadline::from_headers(&headers).is_err());
     headers.remove("grpc-timeout");
     headers.insert("grpc-timeout", http::HeaderValue::from_bytes(b"\xff")?);
     ensure!(RpcDeadline::from_headers(&headers).is_err());
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn grpc_timeout_remaining_tracks_the_original_admission_instant() -> anyhow::Result<()> {
+    let mut headers = http::HeaderMap::new();
+    headers.insert("grpc-timeout", http::HeaderValue::from_static("50m"));
+    let deadline = RpcDeadline::from_headers(&headers)?.context("missing deadline")?;
+    let before = deadline.remaining();
+    ensure!(before > Duration::from_millis(20));
+    tokio::time::advance(Duration::from_millis(20)).await;
+    let after = deadline.remaining();
+    ensure!(after < before && after <= Duration::from_millis(30));
+    tokio::time::advance(Duration::from_millis(31)).await;
+    ensure!(deadline.remaining().is_zero());
     Ok(())
 }
 
@@ -238,7 +349,6 @@ async fn response_deadline_drops_execution_and_emits_one_status_trailer() -> any
     input.dropped = Some(dropped.clone());
     let deadline = RpcDeadline {
         instant: Instant::now(),
-        unix_ms: 0,
     };
     let (mut body, outputs) = response_body(input, None, Some(deadline))?;
     let frame = poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
@@ -288,7 +398,6 @@ async fn shutdown_drops_execution_and_emits_one_unavailable_trailer() -> anyhow:
 async fn rpc_expiry_does_not_depend_on_timer_driver_readiness() -> anyhow::Result<()> {
     let deadline = RpcDeadline {
         instant: Instant::now() + Duration::from_millis(10),
-        unix_ms: 0,
     };
     let mut lifecycle = RequestLifecycle::new(None, Some(deadline));
     let mut cx = Context::from_waker(Waker::noop());
@@ -398,7 +507,6 @@ async fn output_generated_during_a_poll_that_crosses_the_deadline_is_discarded()
         input.advance_on_poll = Some(Duration::from_millis(11));
         let deadline = RpcDeadline {
             instant: Instant::now() + Duration::from_millis(10),
-            unix_ms: 0,
         };
         let (mut body, outputs) = response_body(input, None, Some(deadline))?;
         let frame = ready_frame(&mut body)?;

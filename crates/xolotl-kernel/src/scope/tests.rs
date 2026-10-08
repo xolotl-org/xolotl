@@ -27,7 +27,7 @@ fn completion_preserves_local_cleanup_and_retains_the_attempt_until_release() {
     );
     assert!(owner.complete_finalization());
     assert!(owner.finalized() && owner.finalizer_active());
-    assert_eq!(owner.cleanup_scope(), None);
+    assert_eq!(owner.cleanup_scope(), Some(CleanupScope::Local));
     owner.release_finalizing();
     assert!(!owner.finalizer_active());
     assert_eq!(
@@ -68,26 +68,27 @@ fn interrupted_normal_completion_keeps_its_cleanup_scope() {
 }
 
 #[test]
-fn inconsistent_restore_does_not_change_the_owner() -> anyhow::Result<()> {
+fn nonterminal_finalization_requests_leave_the_owner_unchanged() {
     let mut owner = scope();
-    for (status, terminal) in [
-        (ProcessStatus::Finalizing, None),
-        (ProcessStatus::Completed, Some(ProcessStatus::Failed)),
-        (ProcessStatus::Running, Some(ProcessStatus::Running)),
+    for status in [
+        ProcessStatus::Created,
+        ProcessStatus::Running,
+        ProcessStatus::Finalizing,
     ] {
-        anyhow::ensure!(
-            owner.restore_lifecycle(status, terminal)
-                == Err(ScopeRestoreError::InvalidTerminalIntent)
-        );
-        anyhow::ensure!(owner.status() == ProcessStatus::Created);
-        anyhow::ensure!(owner.accepts_children());
+        assert_eq!(owner.begin_finalizing(status), ScopeFinalize::InvalidStatus);
+        assert_eq!(owner.status(), ProcessStatus::Created);
+        assert_eq!(owner.terminal_intent(), None);
+        assert_eq!(owner.cleanup_scope(), None);
+        assert!(!owner.finalizer_active());
+        assert!(owner.accepts_children());
     }
-    owner.restore_lifecycle(ProcessStatus::Finalizing, Some(ProcessStatus::Completed))?;
-    anyhow::ensure!(owner.cleanup_scope() == Some(CleanupScope::Local));
-    anyhow::ensure!(!owner.finalizer_active());
-    anyhow::ensure!(owner.begin_finalizing(ProcessStatus::Failed) == ScopeFinalize::Started);
-    anyhow::ensure!(owner.terminal_intent() == Some(ProcessStatus::Completed));
-    Ok(())
+    assert!(owner.start());
+    assert_eq!(
+        owner.begin_finalizing(ProcessStatus::Running),
+        ScopeFinalize::InvalidStatus
+    );
+    assert_eq!(owner.status(), ProcessStatus::Running);
+    assert!(owner.accepts_children());
 }
 
 #[test]
@@ -149,4 +150,58 @@ fn trusted_machine_cleanup_ends_at_lifecycle_commit() {
         owner.mark_terminal_status(status);
         assert!(owner.reserve_cleanup(0, 0).is_err());
     }
+}
+
+#[test]
+fn cooperative_cancellation_does_not_select_cleanup() -> anyhow::Result<()> {
+    let mut owner = scope();
+    anyhow::ensure!(owner.start() && owner.cancel());
+    anyhow::ensure!(owner.status() == ProcessStatus::Cancelled);
+    anyhow::ensure!(owner.terminal_intent().is_none());
+    anyhow::ensure!(owner.cleanup_scope().is_none());
+    anyhow::ensure!(owner.abandon() == Some(CleanupScope::Tree));
+
+    Ok(())
+}
+
+#[test]
+fn completed_scope_keeps_tree_selection_without_reopening_its_lifecycle() {
+    let mut owner = scope();
+    assert!(owner.start());
+    assert_eq!(
+        owner.begin_finalizing(ProcessStatus::Completed),
+        ScopeFinalize::Started
+    );
+    assert!(owner.request_tree_cleanup());
+    assert_eq!(
+        owner.mark_terminal_status(ProcessStatus::Completed),
+        ProcessStatus::Completed
+    );
+    assert!(owner.complete_finalization());
+    owner.release_finalizing();
+    assert!(owner.finalized());
+    assert_eq!(owner.cleanup_scope(), Some(CleanupScope::Tree));
+    assert_eq!(owner.terminal_intent(), None);
+    assert_eq!(
+        owner.begin_finalizing(ProcessStatus::Cancelled),
+        ScopeFinalize::AlreadyTerminal
+    );
+    assert!(!owner.finish_body(ProcessStatus::Failed));
+    assert!(!owner.cancel() && !owner.start() && !owner.accepts_children());
+    assert_eq!(owner.status(), ProcessStatus::Completed);
+    assert_eq!(owner.cleanup_scope(), Some(CleanupScope::Tree));
+    assert_eq!(owner.abandon(), None);
+}
+
+#[test]
+fn completed_local_scope_can_select_tree_for_surviving_descendants() {
+    let mut owner = scope();
+    owner.mark_terminal_status(ProcessStatus::Completed);
+    assert!(owner.complete_finalization());
+    assert_eq!(owner.cleanup_scope(), Some(CleanupScope::Local));
+    assert!(!owner.request_tree_cleanup());
+    assert_eq!(owner.cleanup_scope(), Some(CleanupScope::Tree));
+    assert!(owner.finalized());
+    assert_eq!(owner.status(), ProcessStatus::Completed);
+    assert_eq!(owner.terminal_intent(), None);
 }

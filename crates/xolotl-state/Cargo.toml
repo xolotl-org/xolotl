@@ -13,13 +13,15 @@ workspace = true
 
 [features]
 default = ["memory"]
-std = ["dep:serde", "dep:serde_json", "thiserror/std"]
+std = ["dep:serde", "dep:serde_json", "dep:blake3", "thiserror/std"]
 tokio = ["std", "dep:tokio", "dep:tokio-stream", "dep:parking_lot"]
 memory = ["std", "tokio", "dep:parking_lot"]
 test-support = ["std"]
 
 [dependencies]
+xolotl-source.workspace = true
 xolotl-types.workspace = true
+blake3 = { workspace = true, optional = true }
 parking_lot = { workspace = true, default-features = false, optional = true }
 serde = { workspace = true, optional = true, features = ["derive", "std"] }
 serde_json = { workspace = true, default-features = false, features = ["std"], optional = true }

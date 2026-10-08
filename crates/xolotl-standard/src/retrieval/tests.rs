@@ -1,6 +1,7 @@
 use super::{Embedding, EmbeddingRepresentation};
 use crate::{inference::InferenceDriver, tensor::TensorDriver};
 use anyhow::{Context, Result, bail, ensure};
+use sha2::{Digest as _, Sha384};
 use std::collections::BTreeMap;
 use xolotl_kernel::{Driver, DriverContext};
 use xolotl_state::host::object::ObjectStore;
@@ -11,6 +12,10 @@ use xolotl_types::{
 };
 
 mod admission;
+
+fn content_digest(bytes: &[u8]) -> String {
+    xolotl_types::BlobRef::sha384_hex(&Sha384::digest(bytes).into())
+}
 
 fn context() -> DriverContext {
     DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
@@ -231,7 +236,7 @@ pub(crate) async fn assert_materialized_embedding(
         ensure!(tensor.dtype == dtype);
         ensure!(tensor.shape == [expected.len() as u64]);
         ensure!(tensor.blob.size == expected_bytes.len() as u64);
-        ensure!(tensor.blob.hash == blake3::hash(&expected_bytes).to_hex().as_str());
+        ensure!(tensor.blob.hash == content_digest(&expected_bytes));
         ensure!(tensor.blob.mime.as_deref() == Some("application/x-xolotl-tensor"));
 
         let metadata = objects

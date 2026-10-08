@@ -6,7 +6,7 @@ pub struct PortableProgram {
     /// UTF-8 source document, bounded and validated by the shared compiler.
     #[prost(bytes = "vec", tag = "1")]
     pub json_source: ::prost::alloc::vec::Vec<u8>,
-    /// Compiler identity of the source, exactly 32 bytes.
+    /// Identity of compiled instructions and effective imports, exactly 32 bytes.
     #[prost(bytes = "vec", tag = "2")]
     pub program_id: ::prost::alloc::vec::Vec<u8>,
 }
@@ -50,7 +50,10 @@ pub struct ObjectStoreProof {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DoNode {
     /// Selected instruction; checked conversion rejects an absent alternative.
-    #[prost(oneof = "do_node::Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
+    #[prost(
+        oneof = "do_node::Kind",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12"
+    )]
     pub kind: ::core::option::Option<do_node::Kind>,
 }
 
@@ -92,6 +95,9 @@ pub mod do_node {
         /// Invoke a resource method through capability admission.
         #[prost(message, tag = "11")]
         Op(super::OperationTemplate),
+        /// Run cleanup on every cooperative exit from the guarded body.
+        #[prost(message, tag = "12")]
+        Finally(super::Finally),
     }
 }
 
@@ -115,6 +121,17 @@ pub struct OrElse {
     /// Required recovery continuation receiving the host's failure representation.
     #[prost(message, optional, tag = "2")]
     pub or: ::core::option::Option<StepRef>,
+}
+
+/// Cleanup a guarded computation while preserving its result unless cleanup fails.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Finally {
+    /// Required guarded computation.
+    #[prost(message, optional, boxed, tag = "1")]
+    pub body: ::core::option::Option<::prost::alloc::boxed::Box<DoNode>>,
+    /// Required cleanup computation.
+    #[prost(message, optional, boxed, tag = "2")]
+    pub cleanup: ::core::option::Option<::prost::alloc::boxed::Box<DoNode>>,
 }
 
 /// Two required branches whose join behavior is selected by `Both` or `Race`.

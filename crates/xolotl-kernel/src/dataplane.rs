@@ -11,24 +11,61 @@ use crate::driver::{DriverContext, DriverError, DriverOutput, StreamSendError};
 use crate::fact::FactSink;
 use crate::handle::{FastPath, HandleTable};
 use crate::host::stream::DynStreamSink;
-use crate::invocation::{GrantedMethod, Invocation, InvocationOptions};
+use crate::host::{ClockDomainError, HostDeadline, HostRuntime};
+use crate::invocation::{
+    CompletionError, GrantedMethod, Invocation, InvocationOptions, InvocationResult,
+};
 use crate::policy::{CheckCtx, PolicyDecision};
+use crate::runtime_domain::{RuntimeAssemblyError, check_runtime_domains};
 use futures_util::FutureExt;
-use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use xolotl_types::{
     CompletionOrigin, DecisionTag, Failure, Operation, Outcome, OutputMode, OutputModeSet, Path,
     TaintSet, TaintedFailure, Value,
 };
 
 mod accounting;
+mod admission;
 mod async_process;
+mod fact_io;
 mod stream;
+pub use fact_io::FactIoMode;
+use fact_io::FactWriteError;
+pub(crate) use fact_io::FactWriteStage;
 #[cfg(test)]
 use stream::stream_path;
 use stream::{CollectedOutput, collect_driver_stream};
+
+#[derive(Default)]
+struct DispatchAttachments<'a> {
+    output_sink: Option<DynStreamSink>,
+    witness: Option<&'a AtomicBool>,
+    observations: Option<&'a parking_lot::Mutex<TaintSet>>,
+}
+
+struct IdempotentObservation {
+    outcome: Option<Outcome>,
+    taint: TaintSet,
+}
+
+fn may_have_external_effect(replay: xolotl_types::ReplayClass) -> bool {
+    matches!(
+        replay,
+        xolotl_types::ReplayClass::IdempotentEffect
+            | xolotl_types::ReplayClass::NonIdempotentEffect
+    )
+}
+
+/// Revalidate host-owned request authority before each resource invocation.
+/// Child calls inherit the same boundary; resource grants remain independently checked.
+#[async_trait::async_trait]
+pub trait RequestAuthorizer: Send + Sync {
+    /// Reject revoked or no-longer-valid request ownership before dispatch.
+    async fn authorize(&self) -> Result<(), Failure>;
+}
 
 /// The data plane: a handle table and a fact sink. Shared behind a lock;
 /// the lock is held only for the table lookup, released before the (async)
@@ -36,44 +73,224 @@ use stream::{CollectedOutput, collect_driver_stream};
 #[derive(Clone)]
 pub struct DataPlane {
     /// Shared handle table used for generational handle lookup.
-    pub handles: Arc<RwLock<HandleTable>>,
+    pub(crate) handles: HandleTable,
     /// Fact sink used to record operation attempts and completions.
     pub facts: FactSink,
     /// Idempotency dedup store: effective-key → cached outcome for
-    /// `IdempotentEffect` ops. Records are stored under `state://idemp/<hash>`,
+    /// `IdempotentEffect` ops. Records are stored under the kernel-reserved
+    /// `state://kernel/idemp/<hash>` subtree,
     /// where the hash is over the authenticated-context-bound key
     /// (`idempotency::derive_key`), so an injected Plan cannot forge or collide
     /// another identity's records.
     state: xolotl_state::Backend,
     /// Optional process table for the `AsyncProcess` adapter.
     processes: Option<crate::process::ProcessTable>,
+    async_process_host: Option<Arc<dyn crate::host::async_process::AsyncProcessHost>>,
+    deadline: Option<HostDeadline>,
+    host_runtime: HostRuntime,
+    fact_io_mode: FactIoMode,
+    request_authorizer: Option<Arc<dyn RequestAuthorizer>>,
 }
 
 impl DataPlane {
     /// Create a data plane over a handle table, fact sink, and state backend.
-    pub fn new(
-        handles: Arc<RwLock<HandleTable>>,
+    pub fn new(handles: HandleTable, facts: FactSink, state: xolotl_state::Backend) -> Self {
+        Self::new_with_host_runtime(handles, facts, state, HostRuntime::default())
+    }
+
+    /// Create a data plane using the host clock and scheduler selected for its owner.
+    pub fn new_with_host_runtime(
+        handles: HandleTable,
         facts: FactSink,
         state: xolotl_state::Backend,
+        host_runtime: HostRuntime,
     ) -> Self {
         Self {
             handles,
             facts,
             state,
             processes: None,
+            async_process_host: None,
+            deadline: None,
+            host_runtime,
+            fact_io_mode: FactIoMode::Inline,
+            request_authorizer: None,
         }
     }
 
-    /// Attach the process table used by async process outputs.
-    pub fn with_processes(mut self, processes: crate::process::ProcessTable) -> Self {
+    /// Shared handle table selected when this data plane was assembled.
+    pub fn handles(&self) -> &HandleTable {
+        &self.handles
+    }
+
+    /// Install the same scheduler and clock used by the owning Kernel.
+    pub fn with_host_runtime(mut self, runtime: HostRuntime) -> Result<Self, ClockDomainError> {
+        if let Some(deadline) = self.deadline {
+            runtime.validate_deadline(deadline)?;
+        }
+        if self
+            .processes
+            .as_ref()
+            .is_some_and(|processes| !runtime.shares_clock_with(processes.host_runtime()))
+        {
+            return Err(ClockDomainError);
+        }
+        self.host_runtime = runtime;
+        Ok(self)
+    }
+
+    /// The host clock and scheduler selected for this data plane.
+    pub fn host_runtime(&self) -> &HostRuntime {
+        &self.host_runtime
+    }
+
+    /// Select whether hosted Fact writes and accepted-replay reads run inline
+    /// or on the host's bounded blocking executor. Memory sinks normally use
+    /// the inline path.
+    pub fn with_fact_io_mode(mut self, mode: FactIoMode) -> Self {
+        self.fact_io_mode = mode;
+        self
+    }
+
+    /// Attach the process table used by async process outputs. Kernel-owned
+    /// handles and processes must come from the same runtime assembly.
+    pub fn with_processes(
+        mut self,
+        processes: crate::process::ProcessTable,
+    ) -> Result<Self, RuntimeAssemblyError> {
+        if self
+            .processes
+            .as_ref()
+            .is_some_and(|attached| !attached.same_table(&processes))
+        {
+            return Err(RuntimeAssemblyError::DifferentProcessTable);
+        }
+        check_runtime_domains(&[self.handles.runtime_domain(), processes.runtime_domain()])?;
+        if !self
+            .host_runtime
+            .shares_clock_with(processes.host_runtime())
+        {
+            return Err(RuntimeAssemblyError::DifferentClockDomain);
+        }
+        self.processes = Some(processes);
+        Ok(self)
+    }
+
+    /// Attach the ProcessTable owned by the Kernel that supplied these handles.
+    /// KernelBuilder establishes their common runtime domain before exposure.
+    pub(crate) fn with_kernel_processes(mut self, processes: crate::process::ProcessTable) -> Self {
         self.processes = Some(processes);
         self
     }
 
+    /// A standalone Executor's explicit identity is authoritative even if its
+    /// caller reused a data-plane view previously attached to a process table.
+    pub(crate) fn without_processes(mut self) -> Self {
+        self.processes = None;
+        self
+    }
+
+    /// Supply explicit admission, supervision and result custody for AsyncProcess.
+    /// Without a host, asynchronous process output is rejected before child creation.
+    pub fn with_async_process_host(
+        mut self,
+        host: Arc<dyn crate::host::async_process::AsyncProcessHost>,
+    ) -> Self {
+        self.async_process_host = Some(host);
+        self
+    }
+
+    /// Whether a child ownership service is installed; individual requests still
+    /// require propagation rights, process capacity and the service's admission.
+    pub fn has_async_process_host(&self) -> bool {
+        self.async_process_host.is_some()
+    }
+
+    pub(crate) fn with_request_authorizer(
+        mut self,
+        authorizer: Arc<dyn RequestAuthorizer>,
+    ) -> Self {
+        self.request_authorizer = Some(authorizer);
+        self
+    }
+
+    pub(crate) fn has_request_authorizer(&self) -> bool {
+        self.request_authorizer.is_some()
+    }
+
+    async fn authorize_request(&self, process: xolotl_types::ProcessId) -> Result<(), Failure> {
+        let Some(authorizer) = &self.request_authorizer else {
+            return Ok(());
+        };
+        let cancellation = async {
+            match &self.processes {
+                Some(processes) => {
+                    let cleanup = crate::process::current_finalizer(processes) == Some(process)
+                        || crate::process::current_cleanup(processes) == Some(process);
+                    processes.wait_for_cancellation(process, cleanup).await;
+                }
+                None => std::future::pending().await,
+            }
+        };
+        let deadline = async {
+            match self.deadline {
+                Some(deadline) => self
+                    .host_runtime
+                    .sleep_until(deadline)
+                    .await
+                    .map_err(Into::into),
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            () = cancellation => Err(Failure::Cancelled),
+            result = deadline => Err(result.err().unwrap_or(Failure::Timeout)),
+            result = AssertUnwindSafe(authorizer.authorize()).catch_unwind() => {
+                result.unwrap_or_else(|payload| Err(Failure::HandlerError {
+                    kind: "panic".into(),
+                    message: crate::bootstrap::panic_payload_message("request authorization", payload),
+                }))
+            }
+        }
+    }
+
+    /// Bound children created by this data plane. Repeated calls can only shorten
+    /// the deadline; ordinary invocation cancellation remains the caller's task.
+    pub fn with_deadline(mut self, deadline: HostDeadline) -> Result<Self, ClockDomainError> {
+        self.host_runtime.validate_deadline(deadline)?;
+        self.deadline = Some(match self.deadline {
+            Some(saved) => saved.earliest(deadline)?,
+            None => deadline,
+        });
+        Ok(self)
+    }
+
     /// Invoke one opened method through shared admission, accounting and Fact rules.
     /// Method rights, replay, costs and output support come from the frozen plan.
-    pub async fn execute(&self, op: &Operation, options: InvocationOptions) -> DriverOutput {
-        self.execute_inner(op, options, false, None).await
+    /// Completion errors retain the real output and must be checked before
+    /// acknowledging the request or advancing an interpreter.
+    pub async fn execute(&self, op: &Operation, options: InvocationOptions) -> InvocationResult {
+        self.execute_with_dispatch_witness(op, options, None).await
+    }
+
+    pub(crate) async fn execute_with_dispatch_witness(
+        &self,
+        op: &Operation,
+        options: InvocationOptions,
+        witness: Option<&AtomicBool>,
+    ) -> InvocationResult {
+        self.execute_inner(
+            op,
+            options,
+            false,
+            DispatchAttachments {
+                output_sink: None,
+                witness,
+                observations: None,
+            },
+        )
+        .await
     }
 
     /// Invoke with a dedicated output stream. Each invocation owns one terminal lifecycle.
@@ -82,11 +299,37 @@ impl DataPlane {
         op: &Operation,
         options: InvocationOptions,
         sink: DynStreamSink,
-    ) -> DriverOutput {
+    ) -> InvocationResult {
+        self.execute_stream_with_dispatch_witness(op, options, sink, None)
+            .await
+    }
+
+    pub(crate) async fn execute_stream_with_dispatch_witness(
+        &self,
+        op: &Operation,
+        options: InvocationOptions,
+        sink: DynStreamSink,
+        witness: Option<&AtomicBool>,
+    ) -> InvocationResult {
+        let dispatched = AtomicBool::new(false);
+        let dispatched = witness.unwrap_or(&dispatched);
+        let observations = parking_lot::Mutex::new(TaintSet::pristine());
         stream::run_streamed_invocation(
-            self.execute_inner(op, options, false, Some(sink.clone())),
+            self.execute_inner(
+                op,
+                options,
+                false,
+                DispatchAttachments {
+                    output_sink: Some(sink.clone()),
+                    witness: Some(dispatched),
+                    observations: Some(&observations),
+                },
+            ),
             sink,
+            op.id,
             &op.taint,
+            Some(&observations),
+            dispatched,
         )
         .await
     }
@@ -96,85 +339,98 @@ impl DataPlane {
         op: &Operation,
         options: InvocationOptions,
         async_child: bool,
-        output_sink: Option<DynStreamSink>,
-    ) -> DriverOutput {
+        attachments: DispatchAttachments<'_>,
+    ) -> InvocationResult {
+        // A Kernel-owned handle table must never be detached from its process
+        // ancestry, even through a manually assembled DataPlane or Executor.
+        if self.processes.is_none() && self.handles.runtime_domain().is_some() {
+            return InvocationResult::new(
+                DriverOutput::new(Outcome::Fail(Failure::policy(
+                    "process",
+                    "kernel-owned handles require their process table",
+                )))
+                .with_taint(op.taint.clone()),
+            );
+        }
+        if let Some(deadline) = self.deadline
+            && let Err(error) = self.host_runtime.validate_deadline(deadline)
+        {
+            return InvocationResult::new(
+                DriverOutput::new(Outcome::Fail(error.into())).with_taint(op.taint.clone()),
+            );
+        }
+        let DispatchAttachments {
+            output_sink,
+            witness: dispatch_witness,
+            observations,
+        } = attachments;
+        // Capture the caller before any admission branch or host callback. An installed
+        // process table is authoritative even when the caller no longer exists.
+        let options = InvocationOptions {
+            caller_identity: match &self.processes {
+                Some(processes) => processes.identity(op.process),
+                None => options.caller_identity,
+            },
+            ..options
+        };
         let InvocationOptions { now_millis, .. } = options;
-        let replay = xolotl_types::ReplayClass::Observation;
-        // Resolve the handle, clone the dispatch plan + fast-path, and capture
-        // the resource id — all under a short read lock. The driver call
-        // happens after the lock is dropped so concurrent ops on other handles
-        // overlap.
-        let (resolved, invocation) = {
-            let table = self.handles.read();
-            let Some(h) = table.get(op.handle) else {
-                return self.deny(
-                    op,
-                    None,
-                    replay,
-                    now_millis,
-                    DecisionTag::Denied,
-                    Failure::policy("handle", "stale or unknown handle"),
-                );
-            };
-            if !h.is_active() {
-                return self.deny(
-                    op,
-                    Some(h.resource),
-                    replay,
-                    now_millis,
-                    DecisionTag::Denied,
-                    Failure::policy("state", "handle not active"),
-                );
-            }
-            let Some(entry) = h.driver_plan.entry(op.method) else {
-                return self.deny(
-                    op,
-                    Some(h.resource),
-                    replay,
-                    now_millis,
-                    DecisionTag::Denied,
-                    Failure::policy("method", "method absent from opened dispatch plan"),
-                );
-            };
-            let contract = entry.contract;
-            let invocation = match Invocation::admit(
-                op,
-                GrantedMethod {
-                    owner: h.process,
-                    acting: h.acting,
-                    rights: h.rights,
-                    resource: h.resource,
-                    contract,
-                },
-                options,
-            ) {
-                Ok(invocation) => invocation,
-                Err(failure) => {
-                    return self.deny(
+        // Pure admission uses one table view. Even rejection callbacks run only
+        // after the resolver has released its guard and returned an owned result.
+        let (mut resolved, mut invocation) = match self.resolve_invocation(op, options, async_child)
+        {
+            Ok(admitted) => admitted,
+            Err(denied) => {
+                return self
+                    .deny(
                         op,
-                        Some(h.resource),
-                        contract.replay,
-                        now_millis,
+                        denied.resource,
+                        denied.replay,
+                        options,
                         DecisionTag::Denied,
-                        failure,
-                    );
-                }
-            };
-            (
-                Resolved {
-                    resource: h.resource,
-                    plan: h.driver_plan.clone(),
-                    fast_path: h.fast_path.clone(),
-                    bound_path: h.bound_path.clone(),
-                    input_admission: entry.input_admission,
-                },
-                invocation,
-            )
+                        denied.failure,
+                    )
+                    .await;
+            }
         };
         let contract = invocation.contract();
         let xolotl_types::MethodContract {
             replay, supports, ..
         } = contract;
+
+        let observe_lifecycle = || {
+            self.processes.as_ref().and_then(|processes| {
+                let finalizer = crate::process::current_finalizer(processes) == Some(op.process);
+                let cleanup = crate::process::current_cleanup(processes) == Some(op.process);
+                let status = processes.status(op.process);
+                let cleanup_only =
+                    finalizer || (cleanup && status != Some(xolotl_types::ProcessStatus::Running));
+                if cleanup_only && !contract.permits_cleanup(op.process) {
+                    return Some(Failure::policy(
+                        "finalizer",
+                        "method is not admitted for cleanup",
+                    ));
+                }
+                match status {
+                    Some(xolotl_types::ProcessStatus::Running) => None,
+                    Some(xolotl_types::ProcessStatus::Finalizing) if finalizer || cleanup => None,
+                    Some(xolotl_types::ProcessStatus::Cancelled) if cleanup => None,
+                    _ => Some(Failure::Cancelled),
+                }
+            })
+        };
+        let lifecycle_failure = observe_lifecycle();
+        if let Some(failure) = lifecycle_failure {
+            return self
+                .deny(
+                    op,
+                    Some(resolved.resource),
+                    replay,
+                    options,
+                    DecisionTag::Denied,
+                    failure,
+                )
+                .await;
+        }
 
         if let Some(admit) = resolved.input_admission {
             match std::panic::catch_unwind(AssertUnwindSafe(|| admit(&op.input))) {
@@ -182,62 +438,32 @@ impl DataPlane {
                 Ok(Err(rejection)) => {
                     let mut redacted = op.clone();
                     redacted.input = rejection.recorded_input;
-                    return self.deny(
-                        &redacted,
-                        Some(resolved.resource),
-                        replay,
-                        now_millis,
-                        DecisionTag::RejectedByPolicy,
-                        rejection.failure,
-                    );
+                    return self
+                        .deny(
+                            &redacted,
+                            Some(resolved.resource),
+                            replay,
+                            options,
+                            DecisionTag::RejectedByPolicy,
+                            rejection.failure,
+                        )
+                        .await;
                 }
                 Err(payload) => {
-                    return self.deny(
-                        op,
-                        Some(resolved.resource),
-                        replay,
-                        now_millis,
-                        DecisionTag::Denied,
-                        Failure::policy(
-                            "input",
-                            crate::bootstrap::panic_payload_message("input admission", payload),
-                        ),
-                    );
+                    return self
+                        .deny(
+                            op,
+                            Some(resolved.resource),
+                            replay,
+                            options,
+                            DecisionTag::Denied,
+                            Failure::policy(
+                                "input",
+                                crate::bootstrap::panic_payload_message("input admission", payload),
+                            ),
+                        )
+                        .await;
                 }
-            }
-        }
-
-        if let Some(processes) = &self.processes {
-            let finalizer = crate::process::current_finalizer(processes) == Some(op.process);
-            let cleanup = crate::process::current_cleanup(processes) == Some(op.process);
-            let status = processes.status(op.process);
-            let cleanup_only =
-                finalizer || (cleanup && status != Some(xolotl_types::ProcessStatus::Running));
-            if cleanup_only && !contract.permits_cleanup(op.process) {
-                return self.deny(
-                    op,
-                    Some(resolved.resource),
-                    replay,
-                    now_millis,
-                    DecisionTag::Denied,
-                    Failure::policy("finalizer", "method is not admitted for cleanup"),
-                );
-            }
-            let admitted = match status {
-                Some(xolotl_types::ProcessStatus::Running) => true,
-                Some(xolotl_types::ProcessStatus::Finalizing) if finalizer || cleanup => true,
-                Some(xolotl_types::ProcessStatus::Cancelled) if cleanup => true,
-                _ => false,
-            };
-            if !admitted {
-                return self.deny(
-                    op,
-                    Some(resolved.resource),
-                    replay,
-                    now_millis,
-                    DecisionTag::Denied,
-                    Failure::Cancelled,
-                );
             }
         }
 
@@ -257,14 +483,16 @@ impl DataPlane {
             match snapshot.check(&ctx).await {
                 PolicyDecision::Allow => {}
                 PolicyDecision::Deny { reason } => {
-                    return self.deny(
-                        op,
-                        Some(resolved.resource),
-                        replay,
-                        now_millis,
-                        DecisionTag::RejectedByPolicy,
-                        Failure::policy("residual", reason),
-                    );
+                    return self
+                        .deny(
+                            op,
+                            Some(resolved.resource),
+                            replay,
+                            options,
+                            DecisionTag::RejectedByPolicy,
+                            Failure::policy("residual", reason),
+                        )
+                        .await;
                 }
                 PolicyDecision::Ask {
                     approval_key,
@@ -275,108 +503,133 @@ impl DataPlane {
                     // because the effect did not happen, but returns the
                     // retryable `ApprovalPending` failure so re-execution can
                     // pass once the broker approves the key.
-                    return self.deny(
-                        op,
-                        Some(resolved.resource),
-                        replay,
-                        now_millis,
-                        DecisionTag::RejectedByPolicy,
-                        Failure::ApprovalPending {
-                            approval_key,
-                            reason,
-                        },
-                    );
+                    return self
+                        .deny(
+                            op,
+                            Some(resolved.resource),
+                            replay,
+                            options,
+                            DecisionTag::RejectedByPolicy,
+                            Failure::ApprovalPending {
+                                approval_key,
+                                reason,
+                            },
+                        )
+                        .await;
                 }
             }
         }
 
-        // Idempotency dedup: an `IdempotentEffect` op is keyed by its
+        let adapts_process = matches!(op.output, OutputMode::AsyncProcess) && !async_child;
+        // Process acceptance belongs to the host, independently of method replay.
+        // A method's business key may reuse a body result across executions, but
+        // must never reuse a process reference or bypass another owner's admission.
+        // Idempotency dedup: an `IdempotentEffect` body is keyed by its
         // authenticated-context-bound idempotency key. A second op with the same
         // effective key short-circuits to the cached outcome instead of
-        // re-issuing the effect — this is what makes crash-replay and explicit
-        // outbox retries safe. Non-idempotent ops are never deduped here (their
-        // safety comes from the write-ahead barrier + quarantine instead).
-        let idem_key = if matches!(replay, xolotl_types::ReplayClass::IdempotentEffect) {
+        // re-issuing the effect. Non-idempotent ops are never deduped here;
+        // interruptions retain the original operation identity as unknown.
+        let idem_key = if !adapts_process
+            && matches!(replay, xolotl_types::ReplayClass::IdempotentEffect)
+        {
             let key = xolotl_types::idempotency::derive_key(
                 op.id,
                 op.acting,
                 &input,
                 xolotl_types::idempotency::KeyScope {
                     resource: resolved.resource,
+                    target: resolved.bound_path.as_ref(),
                     method: op.method,
                     output: op.output,
-                    creates_process: matches!(op.output, OutputMode::AsyncProcess) && !async_child,
                 },
             );
-            match self.read_idempotent_outcome(&key).await {
-                Ok(Some(cached)) => {
+            let cached = match self.read_idempotent_outcome(&key).await {
+                Ok(cached) => cached,
+                Err(error) => {
+                    invocation.observe(&error.taint);
+                    if let Some(observations) = observations {
+                        *observations.lock() = error.taint.clone();
+                    }
+                    tracing::error!(?error, op = ?op.id, "idempotency state read failed; denying op");
+                    return self
+                        .deny_invocation(
+                            &invocation,
+                            DecisionTag::RejectedByPolicy,
+                            Failure::policy("idempotency", format!("state read failed: {error}")),
+                        )
+                        .await;
+                }
+            };
+            if let Some(observations) = observations {
+                *observations.lock() = cached.taint.clone();
+            }
+            match cached.outcome {
+                Some(outcome) => {
+                    if let Err(failure) = self.authorize_request(op.process).await {
+                        invocation.observe(&cached.taint);
+                        return self
+                            .deny_invocation(&invocation, DecisionTag::Denied, failure)
+                            .await;
+                    }
                     // Cache delivery changes origin, not the retained business outcome.
                     let output = crate::invocation::complete_output(
-                        DriverOutput::new(cached.outcome)
+                        DriverOutput::new(outcome)
                             .with_taint(cached.taint)
                             .with_origin(CompletionOrigin::CachedOutcome),
-                        &op.taint,
+                        invocation.taint(),
                     );
-                    if invocation.records_fact()
-                        && let Err(e) = self
-                            .facts
-                            .complete(invocation.completed_fact(DecisionTag::Ok, &output))
-                    {
-                        tracing::error!(?e, op = ?op.id, "idempotent-dedup fact record failed; denying op");
-                        return DriverOutput {
-                            outcome: Outcome::Fail(Failure::policy(
-                                "durability",
-                                format!("dedup fact record failed: {e}"),
-                            )),
-                            taint: output.taint,
-                            usage: None,
-                            origin: CompletionOrigin::CurrentAttempt,
-                        };
-                    }
-                    return output;
+                    let completion_error = if invocation.records_fact() {
+                        self.write_fact(
+                            FactWriteStage::Complete,
+                            invocation.completed_fact(DecisionTag::Ok, &output),
+                        )
+                        .await
+                        .err()
+                        .map(|error| fact_completion_error(error, op.id))
+                    } else {
+                        None
+                    };
+                    return InvocationResult {
+                        output,
+                        completion_error,
+                        effect_may_have_started: false,
+                    };
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::error!(?e, op = ?op.id, "idempotency state read failed; denying op");
-                    let mut fact = crate::invocation::denied_fact(
-                        op,
-                        Some(resolved.resource),
-                        replay,
-                        now_millis,
-                        DecisionTag::RejectedByPolicy,
-                    );
-                    fact.taint.union(&e.taint);
-                    return self.record_denial(
-                        fact,
-                        Failure::policy("idempotency", format!("state read failed: {e}")),
-                    );
-                }
+                None => invocation.observe(&cached.taint),
             }
             Some(key)
         } else {
             None
         };
 
-        // Begin the Fact *before* the effect as the write-ahead barrier for
-        // NonIdempotentEffect. Only Deterministic/Observation reads may
-        // skip when their output is not consumed. IdempotentEffect and
-        // NonIdempotentEffect are external side effects and must record even
-        // when their result is ignored.
+        if let Err(failure) = invocation.check_input_taint() {
+            return self
+                .deny_invocation(&invocation, DecisionTag::Denied, failure)
+                .await;
+        }
+
         let do_record = invocation.records_fact();
-        let adapts_process = matches!(op.output, OutputMode::AsyncProcess) && !async_child;
         let mut reservation = match &self.processes {
             Some(processes) if !adapts_process => {
-                match accounting::Reservation::reserve(processes, op, contract) {
+                match accounting::Reservation::reserve(
+                    processes,
+                    op,
+                    contract,
+                    resolved.bound_path.as_ref(),
+                ) {
                     Ok(reservation) => Some(reservation),
-                    Err(dim) => {
-                        return self.deny(
-                            op,
-                            Some(resolved.resource),
-                            replay,
-                            now_millis,
-                            DecisionTag::RejectedByPolicy,
-                            Failure::BudgetExhausted { dim },
-                        );
+                    Err(error @ Failure::BudgetExhausted { .. }) => {
+                        return self
+                            .deny_invocation(&invocation, DecisionTag::RejectedByPolicy, error)
+                            .await;
+                    }
+                    Err(error) => {
+                        return InvocationResult {
+                            output: DriverOutput::new(Outcome::Fail(error.clone()))
+                                .with_taint(invocation.taint().clone()),
+                            completion_error: Some(CompletionError::Dispatch(error)),
+                            effect_may_have_started: false,
+                        };
                     }
                 }
             }
@@ -384,20 +637,15 @@ impl DataPlane {
         };
         if do_record {
             let pending = invocation.pending_fact();
-            // Fail-closed: if we cannot durably record the intent, we must NOT
-            // issue the effect ( — the write-ahead barrier exists precisely
-            // to prevent an "already happened, never recorded" effect).
-            if let Err(e) = self.facts.begin(pending) {
-                tracing::error!(?e, op = ?op.id, "write-ahead fact append failed; denying op");
-                return DriverOutput {
-                    outcome: Outcome::Fail(Failure::policy(
-                        "durability",
-                        format!("write-ahead barrier failed: {e}"),
-                    )),
-                    taint: op.taint.clone(),
+            if let Err(e) = self.write_fact(FactWriteStage::Begin, pending).await {
+                tracing::error!(?e, op = ?op.id, "selected fact append failed; denying op");
+                let output = DriverOutput {
+                    outcome: Outcome::Fail(e.failure(op.id, FactWriteStage::Begin)),
+                    taint: invocation.taint().clone(),
                     usage: None,
                     origin: CompletionOrigin::CurrentAttempt,
                 };
+                return InvocationResult::new(output);
             }
         }
 
@@ -408,9 +656,31 @@ impl DataPlane {
         // path without a path ever entering the Operation/Fact.
         let mut ctx = DriverContext::new(op.acting, op.process)
             .with_operation_id(op.id)
-            .with_taint(op.taint.clone());
-        if let Some(p) = &resolved.bound_path {
-            ctx = ctx.with_target_path(p.clone());
+            .with_taint(invocation.taint().clone());
+        if let Some(deadline) = self.deadline {
+            // Sample wall time first, then the monotonic remainder, so the
+            // projection cannot extend the host deadline between reads.
+            let wall_now = self.host_runtime.now_millis();
+            let remaining = match deadline.saturating_duration_since(self.host_runtime.now()) {
+                Ok(remaining) => remaining,
+                Err(error) => {
+                    let failure = Failure::from(error);
+                    return InvocationResult {
+                        output: DriverOutput::new(Outcome::Fail(failure.clone()))
+                            .with_taint(invocation.taint().clone()),
+                        completion_error: Some(CompletionError::Dispatch(failure)),
+                        effect_may_have_started: false,
+                    };
+                }
+            };
+            let milliseconds = i64::try_from(remaining.as_millis()).unwrap_or(i64::MAX);
+            ctx = ctx.with_deadline_ms(wall_now.saturating_add(milliseconds));
+        }
+        // Ordinary dispatch transfers its owned target into the driver context.
+        // AsyncProcess uses the target for child admission and does not call this
+        // context's driver, so it retains the path in `resolved` instead.
+        if !adapts_process {
+            ctx.target_path = resolved.bound_path.take();
         }
         let mut dispatch_output = op.output;
         let mut collect_sink = None;
@@ -418,30 +688,24 @@ impl DataPlane {
             OutputMode::Stream => match self.attach_stream_sink(op, &mut ctx, output_sink) {
                 Ok(_) => {}
                 Err(error) => {
-                    return self.deny(
-                        op,
-                        Some(resolved.resource),
-                        replay,
-                        now_millis,
-                        DecisionTag::DriverError,
-                        error,
-                    );
+                    return self
+                        .deny_invocation(&invocation, DecisionTag::DriverError, error)
+                        .await;
                 }
             },
             OutputMode::Collect { limit } => {
                 if supports.contains(OutputModeSet::STREAM) {
                     dispatch_output = OutputMode::Stream;
                     let Some(sink) = self.attach_collect_sink(&mut ctx) else {
-                        return self.deny(
-                            op,
-                            Some(resolved.resource),
-                            replay,
-                            now_millis,
-                            DecisionTag::DriverError,
-                            Failure::InvalidInput {
-                                reason: "failed to construct collect stream sink".into(),
-                            },
-                        );
+                        return self
+                            .deny_invocation(
+                                &invocation,
+                                DecisionTag::DriverError,
+                                Failure::InvalidInput {
+                                    reason: "failed to construct collect stream sink".into(),
+                                },
+                            )
+                            .await;
                     };
                     collect_sink = Some((sink, limit));
                 } else {
@@ -450,20 +714,56 @@ impl DataPlane {
             }
             _ => {}
         };
+        if !adapts_process && let Err(failure) = self.authorize_request(op.process).await {
+            return self
+                .deny_invocation(&invocation, DecisionTag::Denied, failure)
+                .await;
+        }
         let async_result = if adapts_process {
-            Some(self.start_async_process(op, contract, &resolved))
+            Some(
+                self.start_async_process(op, contract, &resolved, options.record, dispatch_witness)
+                    .await,
+            )
         } else {
             None
         };
         let is_async = async_result.is_some();
-        if let Some(reservation) = &mut reservation {
-            reservation.dispatched();
+        let async_accepted = async_result.as_ref().is_some_and(Outcome::is_success);
+        if let Some(reservation) = &mut reservation
+            && let Err(dispatch) = reservation.dispatched()
+        {
+            let output = DriverOutput::new(Outcome::Fail(dispatch.failure.clone()))
+                .with_taint(invocation.taint().clone());
+            let completion_error = if do_record && !dispatch.may_have_started && !async_accepted {
+                self.write_fact(
+                    FactWriteStage::Complete,
+                    invocation.completed_fact(DecisionTag::Denied, &output),
+                )
+                .await
+                .err()
+                .map(|error| fact_completion_error(error, op.id))
+                .unwrap_or_else(|| CompletionError::Dispatch(dispatch.failure.clone()))
+            } else {
+                CompletionError::Dispatch(dispatch.failure.clone())
+            };
+            return InvocationResult {
+                output,
+                completion_error: Some(completion_error),
+                effect_may_have_started: dispatch.may_have_started || async_accepted,
+            };
         }
         let plan = &resolved.plan;
         let call = async move {
             let result = if is_async {
                 Ok(DriverOutput::new(Outcome::Done(Value::null())))
             } else {
+                // AsyncProcess and streamed calls can lose this future after an
+                // effectful driver starts. Mark the boundary before polling it.
+                if may_have_external_effect(replay)
+                    && let Some(witness) = dispatch_witness
+                {
+                    witness.store(true, Ordering::Relaxed);
+                }
                 match AssertUnwindSafe(plan.call(op.method, input, dispatch_output, &ctx))
                     .catch_unwind()
                     .await
@@ -479,7 +779,7 @@ impl DataPlane {
         };
         let (result, completed) = match collect_sink {
             Some((rx, limit)) => {
-                match collect_driver_stream(call, rx, limit, op.taint.clone()).await {
+                match collect_driver_stream(call, rx, limit, invocation.taint().clone()).await {
                     CollectedOutput::Complete(output) => (Ok(output), true),
                     CollectedOutput::Interrupted(output) => (Ok(output), false),
                 }
@@ -487,13 +787,13 @@ impl DataPlane {
             _ => (call.await, true),
         };
         // Output projection and cache failures do not change work already done.
-        if completed && let Some(reservation) = reservation.take() {
-            let charge = match &result {
+        let charge = reservation
+            .as_ref()
+            .filter(|_| completed)
+            .map(|reservation| match &result {
                 Ok(output) => reservation.actual(output),
                 Err(_) => reservation.actual(&DriverOutput::new(Outcome::Fail(Failure::Cancelled))),
-            };
-            reservation.settle(charge);
-        }
+            });
         let (result, driver_output_taint, usage, origin) = match result {
             Ok(output) => (
                 Ok(output.outcome),
@@ -501,6 +801,19 @@ impl DataPlane {
                 output.usage,
                 output.origin,
             ),
+            Err(DriverError::Stream(error))
+                if matches!(op.output, OutputMode::Stream) && may_have_external_effect(replay) =>
+            {
+                (
+                    Err(Failure::OutcomeUnknown {
+                        operation_ids: vec![op.id.to_string()],
+                        reason: "stream_output_rejected_after_dispatch".into(),
+                    }),
+                    error.into_inner().taint,
+                    None,
+                    CompletionOrigin::CurrentAttempt,
+                )
+            }
             Err(error) => {
                 let error = driver_err_to_failure(error);
                 (
@@ -527,7 +840,7 @@ impl DataPlane {
                         OutputMode::Collect { .. } if !supports.contains(OutputModeSet::STREAM) => {
                             collect_outcome(out, Vec::new(), op.output)
                         }
-                        OutputMode::SinkOnly => sink_outcome(out),
+                        OutputMode::SinkOnly => crate::invocation::sink_outcome(out),
                         _ => out,
                     };
                     (
@@ -550,21 +863,33 @@ impl DataPlane {
                 usage,
                 origin,
             },
-            &op.taint,
+            invocation.taint(),
         );
 
-        // Complete the Fact with the outcome (only if we began one). The effect
-        // has already been issued, so a completion-write failure cannot un-issue
-        // it: log it and let crash recovery reconcile from the begun (fsync'd)
-        // pending record. The caller still gets the real outcome.
-        if do_record
-            && completed
-            && let Err(e) = self
-                .facts
-                .complete(invocation.completed_fact(decision, &output))
-        {
-            tracing::error!(?e, op = ?op.id, "post-effect fact completion failed; recovery will reconcile");
+        let (output, settlement) = match (charge, reservation.take()) {
+            (Some(charge), Some(reservation)) => reservation.settle(charge, output),
+            _ => (output, Ok(())),
+        };
+        if let Err(error) = settlement {
+            return InvocationResult {
+                output,
+                completion_error: Some(CompletionError::Settlement(error)),
+                effect_may_have_started: true,
+            };
         }
+        // The effect cannot be undone by a failed completion write. Preserve
+        // its real output and surface the commit error to the request owner.
+        let completion_error = if do_record && completed {
+            self.write_fact(
+                FactWriteStage::Complete,
+                invocation.completed_fact(decision, &output),
+            )
+            .await
+            .err()
+            .map(|error| fact_completion_error(error, op.id))
+        } else {
+            None
+        };
 
         if completed
             && let Some(key) = idem_key.as_ref()
@@ -576,28 +901,37 @@ impl DataPlane {
             tracing::error!(?e, op = ?op.id, "idempotency cache write failed after completed effect");
         }
 
-        output
+        InvocationResult {
+            output,
+            completion_error,
+            effect_may_have_started: true,
+        }
     }
 
     async fn read_idempotent_outcome(
         &self,
         key: &str,
-    ) -> xolotl_state::StateResult<Option<DriverOutput>> {
+    ) -> xolotl_state::StateResult<IdempotentObservation> {
         let path = idempotency_path(key).map_err(|e| {
             xolotl_state::StateError::Backend(format!("invalid idempotency path: {e}"))
         })?;
-        match self.state.read_tainted(&path).await? {
+        let observation = self.state.read_tainted(&path).await?;
+        let outcome = match observation.value {
             Some(value) => {
-                let outcome = outcome_from_value(value.value).map_err(|error| {
+                let outcome = outcome_from_value(value).map_err(|error| {
                     xolotl_state::StateFailure::new(
                         xolotl_state::StateError::Backend(error),
-                        value.taint.clone(),
+                        observation.taint.clone(),
                     )
                 })?;
-                Ok(Some(DriverOutput::new(outcome).with_taint(value.taint)))
+                Some(outcome)
             }
-            None => Ok(None),
-        }
+            None => None,
+        };
+        Ok(IdempotentObservation {
+            outcome,
+            taint: observation.taint,
+        })
     }
 
     async fn write_idempotent_outcome(
@@ -614,36 +948,77 @@ impl DataPlane {
             .await
     }
 
-    fn deny(
+    async fn deny(
         &self,
         op: &Operation,
         resource: Option<xolotl_types::ResourceId>,
         replay: xolotl_types::ReplayClass,
-        now_millis: i64,
+        options: InvocationOptions,
         tag: DecisionTag,
         failure: Failure,
-    ) -> DriverOutput {
-        let fact = crate::invocation::denied_fact(op, resource, replay, now_millis, tag);
-        self.record_denial(fact, failure)
+    ) -> InvocationResult {
+        if !options.record {
+            return InvocationResult::new(
+                DriverOutput::new(Outcome::Fail(failure)).with_taint(op.taint.clone()),
+            );
+        }
+        let fact = crate::invocation::denied_fact(op, resource, replay, options, tag);
+        self.record_denial(fact, failure, true).await
     }
 
-    fn record_denial(&self, fact: xolotl_types::Fact, failure: Failure) -> DriverOutput {
-        // A denied or rejected effect attempt is still recorded because
-        // failures must record a Fact for why-not and retry decisions. A record
-        // failure on the deny path is logged; the effect was never issued, so
-        // there is nothing unsafe to reconcile.
-        let taint = fact.taint.clone();
-        let operation = fact.id;
-        if let Err(e) = self.facts.complete(fact) {
-            tracing::error!(?e, op = ?operation, "deny-path fact record failed");
+    async fn deny_invocation(
+        &self,
+        invocation: &Invocation<'_>,
+        tag: DecisionTag,
+        failure: Failure,
+    ) -> InvocationResult {
+        if !invocation.records_fact() {
+            return InvocationResult::new(
+                DriverOutput::new(Outcome::Fail(failure)).with_taint(invocation.taint().clone()),
+            );
         }
-        DriverOutput::new(Outcome::Fail(failure)).with_taint(taint)
+        self.record_denial(
+            invocation.denied_fact(tag),
+            failure,
+            invocation.records_fact(),
+        )
+        .await
     }
+
+    async fn record_denial(
+        &self,
+        fact: xolotl_types::Fact,
+        failure: Failure,
+        record: bool,
+    ) -> InvocationResult {
+        let taint = fact.taint.clone();
+        if !record {
+            return InvocationResult::new(
+                DriverOutput::new(Outcome::Fail(failure)).with_taint(taint),
+            );
+        }
+        let id = fact.id;
+        let completion_error = self
+            .write_fact(FactWriteStage::Complete, fact)
+            .await
+            .err()
+            .map(|error| fact_completion_error(error, id));
+        InvocationResult {
+            output: DriverOutput::new(Outcome::Fail(failure)).with_taint(taint),
+            completion_error,
+            effect_may_have_started: false,
+        }
+    }
+}
+
+fn fact_completion_error(error: FactWriteError, id: xolotl_types::OperationId) -> CompletionError {
+    CompletionError::Fact(error.failure(id, FactWriteStage::Complete))
 }
 
 fn idempotency_path(key: &str) -> Result<Path, xolotl_types::PathError> {
     let hash = blake3::hash(key.as_bytes());
     Path::try_new("state")?
+        .try_push("kernel")?
         .try_push("idemp")?
         .try_push_literal(hash.to_hex())
 }
@@ -709,13 +1084,6 @@ fn collect_outcome(outcome: Outcome, chunks: Vec<Value>, requested: OutputMode) 
     }
 }
 
-fn sink_outcome(outcome: Outcome) -> Outcome {
-    match outcome {
-        Outcome::Done(_) | Outcome::Short(_) => Outcome::Done(Value::null()),
-        Outcome::Fail(f) => Outcome::Fail(f),
-    }
-}
-
 struct Resolved {
     resource: xolotl_types::ResourceId,
     plan: crate::driver::DriverPlan,
@@ -734,6 +1102,13 @@ fn driver_err_to_failure(e: DriverError) -> TaintedFailure {
         DriverError::Transport(m) => Failure::HandlerError {
             kind: "transport".into(),
             message: m,
+        },
+        DriverError::OutcomeUnknown {
+            operation_id,
+            reason,
+        } => Failure::OutcomeUnknown {
+            operation_ids: vec![operation_id],
+            reason,
         },
         DriverError::Stream(error) => {
             let (message, value) = match error {

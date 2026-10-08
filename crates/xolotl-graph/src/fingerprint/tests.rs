@@ -80,14 +80,11 @@ fn program_fingerprints_do_not_expand_repeated_subgraphs() -> anyhow::Result<()>
 }
 
 #[test]
-fn portable_identity_binds_metadata_control_and_durability() -> anyhow::Result<()> {
+fn portable_identity_binds_metadata_and_control() -> anyhow::Result<()> {
     let program = Program::new(Expression::Invoke {
         operation: operation(Value::integer(1))?,
     });
     let original = program.compile()?.id();
-    let mut durable = program.clone();
-    durable.durable = true;
-    ensure!(original != durable.compile()?.id());
     let mut changed = operation(Value::integer(1))?;
     changed.method = "another".into();
     ensure!(

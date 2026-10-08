@@ -3,10 +3,11 @@
 //! These functions are the read/write projection for manageable
 //! `state://kernel/*` configuration. Broader protocol actions such as
 //! visibility, authority inspection, lineage, health, pairing, and stream
-//! dispatch live in `ws`/`protocol` and call into this module for kernel
+//! dispatch live in `service`/`protocol` and call into this module for kernel
 //! management state.
 
 use crate::auth::{self, ConsolePrincipal};
+use crate::paths as resource_paths;
 use crate::state::ConsoleState;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
@@ -14,7 +15,13 @@ use thiserror::Error;
 use xolotl_types::{AuditRules, Capability, Path, Value, ValueMap, ValueView};
 
 mod config;
-use config::{KernelConfigAdmission, admit_kernel_config as admit_declared_config};
+mod page;
+mod paths;
+
+pub(crate) use config::ConfigAdmissionRegistry;
+pub use config::{ConfigAdmissionConfigError, ConfigNamespaceAdmission};
+pub(crate) use page::{ListRequest, ManagementPage, encode_cursor, state_scan};
+pub(crate) use paths::is_dedicated_management_path;
 
 /// Errors raised by console management state helpers.
 #[derive(Debug, Error)]
@@ -33,47 +40,50 @@ pub(crate) enum MgmtError {
     Conflict {
         /// Version expected by the caller.
         expected: Option<u64>,
+        /// Version observed by the comparison, when representable.
+        current_version: Option<u64>,
+    },
+    /// An installation incarnation or its declaration version changed.
+    #[error("installation revision conflict: expected {expected:?}, current {current:?}")]
+    InstallationConflict {
+        /// Complete revision expected by the caller; `None` means absent.
+        expected: Option<xolotl_source::ExternalInstallationRevision>,
+        /// Complete revision observed by the storage owner.
+        current: Option<xolotl_source::ExternalInstallationRevision>,
     },
     /// Config admission rejected the proposed value.
     #[error("config admission rejected: {0}")]
     Admission(String),
+    /// No blocking-work slot was available before host validation started.
+    #[error("config validation capacity exceeded")]
+    ValidationAtCapacity,
+    /// Invalid or over-budget management query.
+    #[error("management query rejected: {0}")]
+    Query(String),
     /// Underlying state operation failed.
     #[error("operation failed: {0}")]
     Operation(String),
 }
 
-/// Only `state://kernel/*` is manageable from the console. The vault and fact
-/// prefixes are never writable here.
+/// Only local descendants of `state://kernel` are manageable here.
 fn ensure_manageable(path: &Path) -> Result<(), MgmtError> {
-    if !is_local_kernel_state_subtree(path) {
-        return Err(MgmtError::NotManageable(path.to_string()));
-    }
-    if xolotl_types::is_vault_reserved(path) {
+    if !paths::is_local_kernel_state_subtree(path) {
         return Err(MgmtError::NotManageable(path.to_string()));
     }
     Ok(())
-}
-
-fn is_local_kernel_state_subtree(path: &Path) -> bool {
-    let segs = path.segments();
-    path.scheme() == "state"
-        && path.cluster().is_none()
-        && segs.first().map(|s| s.as_str()) == Some("kernel")
-        && segs.len() > 1
 }
 
 /// Read a management config value.
 pub(crate) async fn inspect(
     state: &Arc<ConsoleState>,
     principal: &ConsolePrincipal,
-    path: &str,
+    path: &Path,
 ) -> Result<Option<Value>, MgmtError> {
-    let p = Path::parse(path)?;
-    ensure_manageable(&p)?;
-    auth::authorize_path(&state.state, principal, "read", &p, None).await?;
+    ensure_manageable(path)?;
+    auth::authorize_path(&state.state, principal, "read", path, None).await?;
     state
         .state
-        .read(&p)
+        .read(path)
         .await
         .map_err(|error| MgmtError::Operation(error.to_string()))
 }
@@ -82,10 +92,9 @@ pub(crate) async fn inspect(
 pub(crate) async fn inspect_config(
     state: &Arc<ConsoleState>,
     principal: &ConsolePrincipal,
-    path: &str,
+    path: &Path,
 ) -> Result<Option<Value>, MgmtError> {
-    let p = Path::parse(path)?;
-    reject_dedicated_runtime_config_path(&p)?;
+    reject_dedicated_management_path(path)?;
     inspect(state, principal, path).await
 }
 
@@ -93,36 +102,23 @@ pub(crate) async fn inspect_config(
 pub(crate) async fn inspect_prefix(
     state: &Arc<ConsoleState>,
     principal: &ConsolePrincipal,
-    prefix: &str,
-) -> Result<Vec<(String, Value)>, MgmtError> {
-    let p = Path::parse(prefix)?;
-    ensure_manageable(&p)?;
-    auth::authorize_path(&state.state, principal, "read", &p, None).await?;
-    let mut pages = state.state.pages(xolotl_state::StateScan::new(p));
-    let mut entries = Vec::new();
-    while let Some(page) = pages
-        .next()
-        .await
-        .map_err(|error| MgmtError::Operation(error.to_string()))?
-    {
-        entries.extend(
-            page.entries
-                .into_iter()
-                .map(|(path, value)| (path.to_string(), value.value)),
-        );
-    }
-    Ok(entries)
+    prefix: Path,
+    request: ListRequest,
+) -> Result<ManagementPage, MgmtError> {
+    ensure_manageable(&prefix)?;
+    auth::authorize_prefix_read(&state.state, principal, &prefix).await?;
+    page::read(state, principal, prefix, request).await
 }
 
 /// List config values through the generic config action family.
 pub(crate) async fn inspect_config_prefix(
     state: &Arc<ConsoleState>,
     principal: &ConsolePrincipal,
-    prefix: &str,
-) -> Result<Vec<(String, Value)>, MgmtError> {
-    let p = Path::parse(prefix)?;
-    reject_dedicated_runtime_config_prefix(&p)?;
-    inspect_prefix(state, principal, prefix).await
+    prefix: Path,
+    request: ListRequest,
+) -> Result<ManagementPage, MgmtError> {
+    reject_dedicated_management_prefix(&prefix)?;
+    inspect_prefix(state, principal, prefix, request).await
 }
 
 /// Change config with a CAS state write on the expected prior version.
@@ -132,34 +128,37 @@ pub(crate) async fn inspect_config_prefix(
 pub(crate) async fn write_config(
     state: &Arc<ConsoleState>,
     principal: &ConsolePrincipal,
-    path: &str,
+    path: Path,
     value: Value,
     expected_version: Option<u64>,
 ) -> Result<(), MgmtError> {
-    let p = Path::parse(path)?;
-    if is_dedicated_runtime_config_path(&p) {
+    if is_dedicated_management_path(&path) {
         return Err(MgmtError::Admission(
-            "runtime config path must use its dedicated console action".into(),
+            "management path must use its dedicated console action".into(),
         ));
     }
-    write_config_inner(state, principal, p, value, expected_version).await
+    write_config_inner(state, principal, path, value, expected_version).await
 }
 
 /// Change config for a path owned by a dedicated Console action family.
 pub(crate) async fn write_dedicated_config(
     state: &Arc<ConsoleState>,
     principal: &ConsolePrincipal,
-    path: &str,
+    path: Path,
     value: Value,
     expected_version: Option<u64>,
 ) -> Result<(), MgmtError> {
-    let p = Path::parse(path)?;
-    if !is_dedicated_runtime_config_path(&p) {
+    if paths::is_external_installation_subtree(&path) {
+        return Err(MgmtError::Admission(
+            "external installations are owned by the storage catalog".into(),
+        ));
+    }
+    if !is_dedicated_management_path(&path) {
         return Err(MgmtError::Admission(
             "dedicated console action cannot write generic config path".into(),
         ));
     }
-    write_config_inner(state, principal, p, value, expected_version).await
+    write_config_inner(state, principal, path, value, expected_version).await
 }
 
 async fn write_config_inner(
@@ -170,19 +169,34 @@ async fn write_config_inner(
     expected_version: Option<u64>,
 ) -> Result<(), MgmtError> {
     ensure_manageable(&p)?;
-    auth::authorize_path(&state.state, principal, "write", &p, Some(&value)).await?;
+    auth::authorize_path(&state.state, principal, "write", &p, None).await?;
 
     let current = state
         .state
         .read(&p)
         .await
         .map_err(|error| MgmtError::Operation(error.to_string()))?;
-    let current_version = current.as_ref().map(value_version).transpose()?.flatten();
+    // Host-installed records without a Console version start at revision zero.
+    // Create-only calls must not overwrite an existing record.
+    let current_version = current
+        .as_ref()
+        .map(|value| value_version(value).map(|version| version.unwrap_or(0)))
+        .transpose()?;
     if current_version != expected_version {
         return Err(MgmtError::Conflict {
             expected: expected_version,
+            current_version,
         });
     }
+
+    auth::prepare_user_config(
+        &p,
+        current.as_ref(),
+        &mut value,
+        principal,
+        state.boot.kernel().host_runtime().now_millis(),
+    )?;
+    auth::authorize_path(&state.state, principal, "write", &p, Some(&value)).await?;
 
     // Bump the version on the new value so the next edit must match it.
     let next = match expected_version {
@@ -197,11 +211,16 @@ async fn write_config_inner(
     match state.state.write_cas(&p, current, value).await {
         Ok(_) => {}
         Err(xolotl_state::StateFailure {
-            error: xolotl_state::StateError::CasFailed { .. },
+            error: xolotl_state::StateError::CasFailed { actual, .. },
             ..
         }) => {
             return Err(MgmtError::Conflict {
                 expected: expected_version,
+                // Use the commit's observation, never a later read. Malformed
+                // versions must not mask the conflict or expose the raw value.
+                current_version: actual
+                    .as_deref()
+                    .and_then(|value| value_version(value).ok().map(|v| v.unwrap_or(0))),
             });
         }
         Err(error) => return Err(MgmtError::Operation(error.to_string())),
@@ -209,57 +228,22 @@ async fn write_config_inner(
     Ok(())
 }
 
-pub(crate) fn is_dedicated_runtime_config_path(path: &Path) -> bool {
-    let segs = path.segments();
-    if path.scheme() != "state"
-        || path.cluster().is_some()
-        || segs.first().map(|s| s.as_str()) != Some("kernel")
-    {
-        return false;
-    }
-    matches!(
-        segs.get(1).map(|s| s.as_str()),
-        Some(
-            "console"
-                | "external-installations"
-                | "external-pairings"
-                | "external-sessions"
-                | "external-credential-revocations"
-                | "inference"
-                | "manifests"
-                | "projection-status"
-                | "procs"
-        )
-    ) || (segs.get(1).map(|s| s.as_str()) == Some("routing")
-        && segs.get(2).map(|s| s.as_str()) == Some("inference"))
-}
-
-fn reject_dedicated_runtime_config_path(path: &Path) -> Result<(), MgmtError> {
-    if is_dedicated_runtime_config_path(path) {
+fn reject_dedicated_management_path(path: &Path) -> Result<(), MgmtError> {
+    if is_dedicated_management_path(path) {
         return Err(MgmtError::Admission(
-            "runtime config path must use its dedicated console action".into(),
+            "management path must use its dedicated console action".into(),
         ));
     }
     Ok(())
 }
 
-fn reject_dedicated_runtime_config_prefix(path: &Path) -> Result<(), MgmtError> {
-    let segs = path.segments();
-    let contains_dedicated_subtree = if path.scheme() == "state" && path.cluster().is_none() {
-        match segs {
-            [kernel] => kernel.as_str() == "kernel",
-            [kernel, routing] => kernel.as_str() == "kernel" && routing.as_str() == "routing",
-            _ => false,
-        }
-    } else {
-        false
-    };
-    if contains_dedicated_subtree {
+fn reject_dedicated_management_prefix(path: &Path) -> Result<(), MgmtError> {
+    if paths::contains_dedicated_management_subtree(path) {
         return Err(MgmtError::Admission(
-            "runtime config path must use its dedicated console action".into(),
+            "management path must use its dedicated console action".into(),
         ));
     }
-    reject_dedicated_runtime_config_path(path)
+    Ok(())
 }
 
 fn value_version(v: &Value) -> Result<Option<u64>, MgmtError> {
@@ -277,43 +261,36 @@ fn value_version(v: &Value) -> Result<Option<u64>, MgmtError> {
 }
 
 fn set_version(v: &mut Value, version: u64) -> Result<(), MgmtError> {
-    if let Some(mut m) = v.as_map().cloned() {
-        let version = i64::try_from(version)
-            .map_err(|_error| MgmtError::Admission("config version exceeds i64".into()))?;
-        m.insert("version".into(), Value::integer(version))
-            .map_err(|error| MgmtError::Admission(error.to_string()))?;
-        *v = Value::from(m);
-    }
+    let mut map = v
+        .as_map()
+        .cloned()
+        .ok_or_else(|| MgmtError::Admission("versioned config must be an object".into()))?;
+    let version = i64::try_from(version)
+        .map_err(|_error| MgmtError::Admission("config version exceeds i64".into()))?;
+    map.insert("version".into(), Value::integer(version))
+        .map_err(|error| MgmtError::Admission(error.to_string()))?;
+    *v = Value::from(map);
     Ok(())
 }
 
 async fn admit_kernel_config(
-    _state: &Arc<ConsoleState>,
+    state: &Arc<ConsoleState>,
     path: &Path,
     value: &mut Value,
 ) -> Result<(), MgmtError> {
     let segs = path.segments();
-    if path.scheme() != "state"
-        || path.cluster().is_some()
-        || segs.first().map(|s| s.as_str()) != Some("kernel")
-    {
+    if !resource_paths::is_local_kernel_path(path) {
         return Err(MgmtError::NotManageable(path.to_string()));
     }
 
-    match admit_declared_config(path, value) {
-        Ok(KernelConfigAdmission::Admitted) => return Ok(()),
-        Ok(KernelConfigAdmission::Unhandled) => {}
-        Err(error) => return Err(MgmtError::Admission(error.to_string())),
-    }
-
     match segs {
-        s if is_path(s, &["kernel", "console", "users"]) => {
+        s if resource_paths::is_user_record_path(path) => {
             let username = required_tail(s, "console username")?;
             auth::validate_username(username)
                 .map_err(|e| MgmtError::Admission(format!("invalid console user path: {e}")))?;
             admit_console_user(username, value)
         }
-        s if is_path(s, &["kernel", "console", "roles"]) => {
+        s if resource_paths::is_role_record_path(path) => {
             let role = required_tail(s, "console role")?;
             auth::validate_username(role)
                 .map_err(|e| MgmtError::Admission(format!("invalid console role path: {e}")))?;
@@ -323,19 +300,36 @@ async fn admit_kernel_config(
             decode_config_value::<AuditRules>(value, "AuditRules")?;
             Ok(())
         }
-        _ => Err(MgmtError::Admission(format!(
-            "no console write admission rule for {path}"
-        ))),
+        _ => {
+            let validator = state
+                .config_admissions
+                .validator(path)
+                .map_err(MgmtError::Admission)?;
+            // Value clones share their immutable representation. The accepted
+            // worker owns its inputs even if this caller stops waiting; only
+            // this async path can perform the subsequent State CAS.
+            let owned_path = path.clone();
+            let owned_value = value.clone();
+            let validation =
+                xolotl_kernel::host::blocking::dispatch(state.blocking_spawner(), move || {
+                    validator(&owned_path, &owned_value)
+                })
+                .map_err(|error| match error {
+                    xolotl_kernel::host::BlockingSpawnError::AtCapacity => {
+                        MgmtError::ValidationAtCapacity
+                    }
+                    xolotl_kernel::host::BlockingSpawnError::Unavailable => {
+                        MgmtError::Operation("config validation worker is unavailable".into())
+                    }
+                })?;
+            validation
+                .await
+                .map_err(|error| {
+                    MgmtError::Operation(format!("config validation worker failed: {error}"))
+                })?
+                .map_err(MgmtError::Admission)
+        }
     }
-}
-
-fn is_path<S: AsRef<str>>(segs: &[S], prefix: &[&str]) -> bool {
-    segs.len() == prefix.len() + 1
-        && segs
-            .iter()
-            .take(prefix.len())
-            .zip(prefix.iter())
-            .all(|(actual, expected)| actual.as_ref() == *expected)
 }
 
 fn is_exact_path<S: AsRef<str>>(segs: &[S], expected: &[&str]) -> bool {
@@ -366,18 +360,27 @@ fn admit_console_user(_username: &str, value: &Value) -> Result<(), MgmtError> {
         &[
             "version",
             "identity_path",
+            "account_id",
+            "bootstrap_owner",
             "status",
-            "authn",
             "roles",
             "grants",
             "authority_ceiling",
             "created_by",
             "created_at",
-            "password_changed_at",
         ],
         "console user",
     )?;
     optional_nonnegative_int(map, "version", "console user")?;
+    required_string(map, "account_id", "console user")?;
+    if !matches!(
+        map.get("bootstrap_owner").map(Value::view),
+        Some(ValueView::Bool(_))
+    ) {
+        return Err(MgmtError::Admission(
+            "console user.bootstrap_owner must be a bool".into(),
+        ));
+    }
     let identity_path = required_string(map, "identity_path", "console user")?;
     let path = Path::parse(identity_path)
         .map_err(|e| MgmtError::Admission(format!("console user identity_path: {e}")))?;
@@ -396,7 +399,6 @@ fn admit_console_user(_username: &str, value: &Value) -> Result<(), MgmtError> {
             "console user status must be active, disabled, or locked".into(),
         ));
     }
-    admit_console_user_authn(required_value(map, "authn", "console user")?)?;
     for role in required_string_list(map, "roles", "console user")? {
         auth::validate_username(role)
             .map_err(|e| MgmtError::Admission(format!("console user role: {e}")))?;
@@ -405,26 +407,6 @@ fn admit_console_user(_username: &str, value: &Value) -> Result<(), MgmtError> {
     validate_required_capability_list(map, "authority_ceiling", "console user")?;
     required_string(map, "created_by", "console user")?;
     required_nonnegative_int(map, "created_at", "console user")?;
-    required_nonnegative_int(map, "password_changed_at", "console user")?;
-    Ok(())
-}
-
-fn admit_console_user_authn(value: &Value) -> Result<(), MgmtError> {
-    let map = require_map_ref(value, "console user authn")?;
-    validate_known_fields(map, &["password", "totp", "pubkeys"], "console user authn")?;
-    let password = required_map(map, "password", "console user authn")?;
-    validate_known_fields(password, &["hash_ref"], "console user password authn")?;
-    optional_string(password, "hash_ref", "console user password authn")?;
-    let totp = required_map(map, "totp", "console user authn")?;
-    validate_known_fields(
-        totp,
-        &["enabled", "seed_ref", "last_step"],
-        "console user totp authn",
-    )?;
-    optional_bool(totp, "enabled", "console user totp authn")?;
-    optional_string(totp, "seed_ref", "console user totp authn")?;
-    optional_nonnegative_int(totp, "last_step", "console user totp authn")?;
-    required_string_list(map, "pubkeys", "console user authn")?;
     Ok(())
 }
 
@@ -448,25 +430,6 @@ fn validate_known_fields(map: &ValueMap, allowed: &[&str], label: &str) -> Resul
     Ok(())
 }
 
-fn optional_string<'a>(
-    map: &'a ValueMap,
-    name: &str,
-    label: &str,
-) -> Result<Option<&'a str>, MgmtError> {
-    match map.get(name).map(Value::view) {
-        Some(ValueView::Str(value)) => Ok(Some(value)),
-        Some(_) => Err(MgmtError::Admission(format!(
-            "{label}.{name} must be a string"
-        ))),
-        None => Ok(None),
-    }
-}
-
-fn required_value<'a>(map: &'a ValueMap, name: &str, label: &str) -> Result<&'a Value, MgmtError> {
-    map.get(name)
-        .ok_or_else(|| MgmtError::Admission(format!("{label}.{name} is required")))
-}
-
 fn required_string<'a>(map: &'a ValueMap, name: &str, label: &str) -> Result<&'a str, MgmtError> {
     match map.get(name).map(Value::view) {
         Some(ValueView::Str(value)) if !value.is_empty() => Ok(value),
@@ -475,16 +438,6 @@ fn required_string<'a>(map: &'a ValueMap, name: &str, label: &str) -> Result<&'a
         ))),
         Some(_) => Err(MgmtError::Admission(format!(
             "{label}.{name} must be a string"
-        ))),
-        None => Err(MgmtError::Admission(format!("{label}.{name} is required"))),
-    }
-}
-
-fn required_map<'a>(map: &'a ValueMap, name: &str, label: &str) -> Result<&'a ValueMap, MgmtError> {
-    match map.get(name).map(Value::view) {
-        Some(ValueView::Map(value)) => Ok(value),
-        Some(_) => Err(MgmtError::Admission(format!(
-            "{label}.{name} must be an object"
         ))),
         None => Err(MgmtError::Admission(format!("{label}.{name} is required"))),
     }
@@ -604,18 +557,70 @@ mod tests {
     use crate::auth::{BootstrapOutcome, LoginRequest, RootProvisioning, bootstrap_root_account};
     use anyhow::{Context, bail, ensure};
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::sync::Notify;
     use xolotl_kernel::Bootstrap;
+    use xolotl_kernel::host::{BlockingJob, BlockingSpawnError, BlockingSpawner};
     use xolotl_standard::{StandardConfig, install_standard};
     use xolotl_types::{
-        EffectCapability, ExternalInstallationDef, ExternalProjectionDef, InProcessProjectionDef,
-        InferenceApiDialect, InferenceAuthRef, InferenceBackendDef, Purity, Role, Transport,
-        TrustLevel,
+        EffectCapability, InProcessProjectionDef, InferenceApiDialect, InferenceAuthRef,
+        InferenceBackendDef, Purity, Role,
     };
+
+    struct RejectBlockingWork;
+
+    impl BlockingSpawner for RejectBlockingWork {
+        fn spawn(&self, _job: BlockingJob) -> Result<(), BlockingSpawnError> {
+            Err(BlockingSpawnError::AtCapacity)
+        }
+    }
 
     fn console_state() -> anyhow::Result<Arc<ConsoleState>> {
         let boot = Arc::new(Bootstrap::in_memory());
         install_standard(&boot, &StandardConfig::default())?;
-        Ok(ConsoleState::shared(boot)?)
+        let config = crate::ConsoleConfig {
+            session_store: Some(std::sync::Arc::new(
+                crate::session_store::MemoryConsoleSessionStore::new(
+                    crate::session_store::ConsoleSessionPolicy::default(),
+                ),
+            )),
+            config_admissions: vec![
+                ConfigNamespaceAdmission::new(
+                    Path::parse("state://kernel/projections/in-process")?,
+                    |path, value| {
+                        let id = xolotl_types::in_process_projection::in_process_projection_declaration_id(path)
+                            .ok_or_else(|| "invalid projection path".to_string())?;
+                        let document: InProcessProjectionDef = serde_json::from_value(
+                            serde_json::to_value(value)
+                                .map_err(|error| format!("malformed projection: {error}"))?,
+                        )
+                        .map_err(|error| format!("malformed projection: {error}"))?;
+                        document
+                            .validate_admission(id)
+                            .map_err(|error| format!("invalid projection: {error}"))
+                    },
+                ),
+                ConfigNamespaceAdmission::new(
+                    Path::parse("state://kernel/inference/backends")?,
+                    |path, value| {
+                        let id = xolotl_types::inference::InferenceDeclarationKind::Backend
+                            .id(path)
+                            .ok_or_else(|| "invalid inference backend path".to_string())?;
+                        let document: InferenceBackendDef = serde_json::from_value(
+                            serde_json::to_value(value)
+                                .map_err(|error| format!("malformed inference backend: {error}"))?,
+                        )
+                        .map_err(|error| format!("malformed inference backend: {error}"))?;
+                        document
+                            .validate_admission(id)
+                            .map_err(|error| format!("invalid inference backend: {error}"))
+                    },
+                ),
+            ],
+            ..Default::default()
+        };
+        Ok(ConsoleState::with_config(boot, config)?)
     }
 
     fn obj(version: Option<u64>) -> Value {
@@ -627,64 +632,21 @@ mod tests {
         Value::map(m)
     }
 
-    fn complete_console_user(username: &str) -> anyhow::Result<Value> {
-        let password_ref = Path::try_new("state")
-            .and_then(|path| path.try_push("vault"))
-            .and_then(|path| path.try_push("console"))
-            .and_then(|path| path.try_push_literal(username))
-            .and_then(|path| path.try_push("password"))
-            .map(|path| path.to_string())?;
-        let mut password = BTreeMap::new();
-        password.insert("hash_ref".into(), Value::string(password_ref));
-        let mut totp = BTreeMap::new();
-        totp.insert("enabled".into(), Value::boolean(false));
-        let mut authn = BTreeMap::new();
-        authn.insert("password".into(), Value::map(password));
-        authn.insert("totp".into(), Value::map(totp));
-        authn.insert("pubkeys".into(), Value::list(Vec::new()));
-
+    fn complete_console_user(_username: &str) -> anyhow::Result<Value> {
         let mut user = BTreeMap::new();
+        user.insert("account_id".into(), Value::string("test-account".into()));
+        user.insert("bootstrap_owner".into(), Value::boolean(false));
         user.insert(
             "identity_path".into(),
-            Value::string(format!("identity://console/{username}")),
+            Value::string("identity://console/accounts/test-account".into()),
         );
         user.insert("status".into(), Value::string("active".into()));
-        user.insert("authn".into(), Value::map(authn));
         user.insert("roles".into(), Value::list(Vec::new()));
         user.insert("grants".into(), Value::list(Vec::new()));
         user.insert("authority_ceiling".into(), Value::list(Vec::new()));
         user.insert("created_by".into(), Value::string("test".into()));
         user.insert("created_at".into(), Value::integer(1));
-        user.insert("password_changed_at".into(), Value::integer(1));
         Ok(Value::map(user))
-    }
-
-    fn extension_installation(id: &str, version: u64) -> anyhow::Result<Value> {
-        let provider_namespace = Path::try_new("effect")?
-            .try_push("external-provider")?
-            .try_push_literal(id)?;
-        let search_effect = provider_namespace.clone().try_push("search")?.to_string();
-        let def = ExternalInstallationDef {
-            id: id.into(),
-            platform: id.into(),
-            transport: Transport::Stdio {
-                command: Some(format!("{id}-plugin")),
-                args: vec![],
-            },
-            trust: TrustLevel::Sandboxed,
-            config_schema: Value::null(),
-            config: Value::null(),
-            projections: vec![ExternalProjectionDef {
-                id: "provider".into(),
-                role: Role::Provider,
-                namespace: Some(provider_namespace),
-                provides: vec![EffectCapability::new(search_effect, Purity::Idempotent)],
-                emits: None,
-                version: 1,
-            }],
-            version,
-        };
-        Ok(serde_json::from_value(serde_json::to_value(def)?)?)
     }
 
     fn value_from<T: serde::Serialize>(value: &T) -> anyhow::Result<Value> {
@@ -723,60 +685,10 @@ mod tests {
         })
     }
 
-    fn instant_messaging_platform_installation(version: u64) -> anyhow::Result<Value> {
-        let def = xolotl_types::ExternalInstallationDef {
-            id: "instant_messaging_platform".into(),
-            platform: "instant_messaging_platform".into(),
-            transport: Transport::Grpc { endpoint: None },
-            trust: TrustLevel::Sandboxed,
-            config_schema: Value::null(),
-            config: Value::null(),
-            projections: vec![
-                xolotl_types::ExternalProjectionDef {
-                    id: "source".into(),
-                    role: Role::Source,
-                    namespace: None,
-                    provides: vec![],
-                    emits: Some(xolotl_types::EventSource {
-                        sink: xolotl_types::sandboxed_source_event_sink_path(
-                            "instant_messaging_platform",
-                            "source",
-                        )?,
-                        purity: Purity::Effectful,
-                        event_schema: None,
-                        max_inline_payload_bytes: 65_536,
-                        capacity: xolotl_types::external::StreamCapacity {
-                            max_events: 1024,
-                            on_overflow: xolotl_types::external::OverflowPolicy::DropOldest,
-                        },
-                        rate_limit: None,
-                        commands: false,
-                        command_schema: None,
-                        command_result_schema: None,
-                    }),
-                    version: 1,
-                },
-                xolotl_types::ExternalProjectionDef {
-                    id: "provider".into(),
-                    role: Role::Provider,
-                    namespace: Some(Path::parse(
-                        "effect://external-provider/instant_messaging_platform",
-                    )?),
-                    provides: vec![EffectCapability::new(
-                        "effect://external-provider/instant_messaging_platform/send_text",
-                        Purity::Effectful,
-                    )],
-                    emits: None,
-                    version: 1,
-                },
-            ],
-            version,
-        };
-        Ok(serde_json::from_value(serde_json::to_value(def)?)?)
-    }
-
     async fn root_principal(st: &Arc<ConsoleState>) -> anyhow::Result<ConsolePrincipal> {
-        let outcome = bootstrap_root_account(&st.boot, RootProvisioning::default()).await?;
+        let outcome =
+            bootstrap_root_account(&st.boot, st.blocking_spawner(), RootProvisioning::default())
+                .await?;
         let BootstrapOutcome::CreatedRandomPassword { password, .. } = outcome else {
             bail!("expected root bootstrap, got {outcome:?}");
         };
@@ -787,11 +699,14 @@ mod tests {
                 LoginRequest {
                     username: "root".into(),
                     password,
-                    totp_code: None,
+                    second_factor: None,
                 },
                 "test".into(),
             )
-            .await?;
+            .await?
+            .into_session()
+            .ok()
+            .context("authenticated session")?;
         Ok(st.auth.authenticate_token(&st.boot, &login.token).await?)
     }
 
@@ -826,28 +741,83 @@ mod tests {
     async fn non_kernel_paths_are_rejected() -> anyhow::Result<()> {
         let st = console_state()?;
         let root = root_principal(&st).await?;
-        expect_not_manageable(inspect(&st, &root, "state://memory/alice").await)?;
+        expect_not_manageable(inspect(&st, &root, &Path::parse("state://memory/alice")?).await)?;
         expect_not_manageable(
             inspect_config(
                 &st,
                 &root,
-                "path://remote/state/kernel/projections/in-process/fetch",
+                &Path::parse("path://remote/state/kernel/projections/in-process/fetch")?,
             )
             .await,
-        )?;
-        expect_not_manageable(
-            write_config(&st, &root, "state://vault/secret", obj(None), None).await,
         )?;
         expect_not_manageable(
             write_config(
                 &st,
                 &root,
-                "path://remote/state/kernel/projections/in-process/fetch",
+                Path::parse("state://vault/secret")?,
+                obj(None),
+                None,
+            )
+            .await,
+        )?;
+        expect_not_manageable(
+            write_config(
+                &st,
+                &root,
+                Path::parse("path://remote/state/kernel/projections/in-process/fetch")?,
                 in_process_projection("fetch", 0)?,
                 None,
             )
             .await,
         )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exact_prefix_read_cannot_list_descendants_or_receive_a_cursor() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let root = root_principal(&st).await?;
+        let prefix = Path::parse("state://kernel/config/list-boundary")?;
+        let child = Path::parse("state://kernel/config/list-boundary/private")?;
+        st.state
+            .write_set(&prefix, Value::string("public".into()))
+            .await?;
+        st.state
+            .write_set(&child, Value::string("private".into()))
+            .await?;
+
+        let mut exact = root.clone();
+        exact.grants =
+            xolotl_types::CapSet::from_strs(["read://state/kernel/config/list-boundary"])?;
+        ensure!(inspect(&st, &exact, &prefix).await? == Some(Value::string("public".into())));
+        ensure!(matches!(
+            inspect(&st, &exact, &child).await,
+            Err(MgmtError::Auth(auth::AuthError::PermissionDenied))
+        ));
+        ensure!(matches!(
+            inspect_config_prefix(
+                &st,
+                &exact,
+                prefix.clone(),
+                ListRequest {
+                    limit: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await,
+            Err(MgmtError::Auth(auth::AuthError::PermissionDenied))
+        ));
+
+        let mut subtree = root;
+        subtree.grants =
+            xolotl_types::CapSet::from_strs(["read://state/kernel/config/list-boundary/**"])?;
+        let page = inspect_config_prefix(&st, &subtree, prefix, ListRequest::default()).await?;
+        ensure!(
+            page.entries
+                .iter()
+                .any(|(path, _)| path == &child.to_string())
+        );
+        ensure!(page.next_cursor.is_none());
         Ok(())
     }
 
@@ -889,15 +859,11 @@ mod tests {
         let mut map = (complete_console_user("ops")?)
             .into_map()
             .context("expected map")?;
-        map.remove("authn");
-        let missing_authn = Value::from(map);
-        let err = match admit_console_user("ops", &missing_authn) {
-            Ok(()) => bail!("console user missing authn was admitted"),
-            Err(err) => err,
-        };
+        map.insert("authn".into(), Value::map(BTreeMap::new()))?;
+        let injected_credentials = Value::from(map);
         ensure!(
-            matches!(err, MgmtError::Admission(ref message) if message.contains("authn")),
-            "unexpected missing authn admission error: {err:?}"
+            admit_console_user("ops", &injected_credentials).is_err(),
+            "credential data must not be accepted by account metadata writes"
         );
 
         let mut map = (complete_console_user("ops")?)
@@ -962,23 +928,23 @@ mod tests {
             write_config(
                 &st,
                 &root,
-                "state://kernel/external-installations/acme",
-                extension_installation("acme", 0)?,
+                Path::parse("state://kernel/external-installations/acme")?,
+                obj(None),
                 None,
             )
             .await,
-            "runtime config path must use its dedicated console action",
+            "management path must use its dedicated console action",
         )?;
         expect_admission_message(
             write_config(
                 &st,
                 &root,
-                "state://kernel/projection-status/in-process/fetch",
+                Path::parse("state://kernel/projection-status/in-process/fetch")?,
                 obj(None),
                 None,
             )
             .await,
-            "runtime config path must use its dedicated console action",
+            "management path must use its dedicated console action",
         )?;
         Ok(())
     }
@@ -988,19 +954,212 @@ mod tests {
         let st = console_state()?;
         let root = root_principal(&st).await?;
         let path = "state://kernel/projections/in-process/fetch";
-        write_config(&st, &root, path, in_process_projection("fetch", 0)?, None).await?;
-        let value = inspect_config(&st, &root, path)
+        write_config(
+            &st,
+            &root,
+            Path::parse(path)?,
+            in_process_projection("fetch", 0)?,
+            None,
+        )
+        .await?;
+        let value = inspect_config(&st, &root, &Path::parse(path)?)
             .await?
             .context("in-process projection config missing")?;
         ensure!(
             value_version(&value)? == Some(1),
             "projection config version was not initialized"
         );
-        let entries = inspect_config_prefix(&st, &root, "state://kernel/projections").await?;
+        let entries = inspect_config_prefix(
+            &st,
+            &root,
+            Path::parse("state://kernel/projections")?,
+            ListRequest::default(),
+        )
+        .await?;
         ensure!(
-            entries.iter().any(|(entry_path, _)| entry_path == path),
+            entries
+                .entries
+                .iter()
+                .any(|(entry_path, _)| entry_path == path),
             "projection config prefix did not include written declaration"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn embedding_host_can_admit_its_own_config_namespace() -> anyhow::Result<()> {
+        let boot = Arc::new(Bootstrap::in_memory());
+        install_standard(&boot, &StandardConfig::default())?;
+        let st = ConsoleState::with_config(
+            boot,
+            crate::ConsoleConfig {
+                session_store: Some(std::sync::Arc::new(
+                    crate::session_store::MemoryConsoleSessionStore::new(
+                        crate::session_store::ConsoleSessionPolicy::default(),
+                    ),
+                )),
+                config_admissions: vec![ConfigNamespaceAdmission::new(
+                    Path::parse("state://kernel/config/example")?,
+                    |path, value| {
+                        if path.segments().len() != 4 {
+                            return Err("expected a direct config child".into());
+                        }
+                        if value
+                            .as_map()
+                            .and_then(|map| map.get("enabled"))
+                            .and_then(Value::as_bool)
+                            != Some(true)
+                        {
+                            return Err("enabled must be true".into());
+                        }
+                        Ok(())
+                    },
+                )],
+                ..crate::ConsoleConfig {
+                    session_store: Some(std::sync::Arc::new(
+                        crate::session_store::MemoryConsoleSessionStore::new(
+                            crate::session_store::ConsoleSessionPolicy::default(),
+                        ),
+                    )),
+                    ..Default::default()
+                }
+            },
+        )?;
+        let root = root_principal(&st).await?;
+        let path = Path::parse("state://kernel/config/example/feature")?;
+        let value = Value::map(BTreeMap::from([("enabled".into(), Value::boolean(true))]));
+        write_config(&st, &root, path.clone(), value.clone(), None).await?;
+        ensure!(
+            inspect_config(&st, &root, &path)
+                .await?
+                .and_then(|value| value_version(&value).ok().flatten())
+                == Some(1)
+        );
+        expect_admission_message(
+            write_config(
+                &st,
+                &root,
+                Path::parse("state://kernel/config/example/feature/child")?,
+                value.clone(),
+                None,
+            )
+            .await,
+            "expected a direct config child",
+        )?;
+        expect_admission_message(
+            write_config(
+                &st,
+                &root,
+                Path::parse("state://kernel/config/other/feature")?,
+                value,
+                None,
+            )
+            .await,
+            "no console write admission rule for state://kernel/config/other/feature",
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_config_validation_does_not_block_async_calls_or_write_on_rejection()
+    -> anyhow::Result<()> {
+        let base = console_state()?;
+        let root = root_principal(&base).await?;
+        let entered = Arc::new(Notify::new());
+        let (release, wait_for_release) = std::sync::mpsc::channel::<()>();
+        let wait_for_release = Mutex::new(wait_for_release);
+        let signaller = Arc::clone(&entered);
+        let state = ConsoleState::with_config(
+            Arc::clone(&base.boot),
+            crate::ConsoleConfig {
+                session_store: Some(std::sync::Arc::new(
+                    crate::session_store::MemoryConsoleSessionStore::new(
+                        crate::session_store::ConsoleSessionPolicy::default(),
+                    ),
+                )),
+                config_admissions: vec![ConfigNamespaceAdmission::new(
+                    Path::parse("state://kernel/config/example")?,
+                    move |_path, _value| {
+                        signaller.notify_one();
+                        wait_for_release
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .recv_timeout(Duration::from_secs(2))
+                            .map_err(|_error| "validation gate closed".to_string())?;
+                        Err("host rejected the value".into())
+                    },
+                )],
+                ..crate::ConsoleConfig {
+                    session_store: Some(std::sync::Arc::new(
+                        crate::session_store::MemoryConsoleSessionStore::new(
+                            crate::session_store::ConsoleSessionPolicy::default(),
+                        ),
+                    )),
+                    ..Default::default()
+                }
+            },
+        )?;
+        let path = Path::parse("state://kernel/config/example/feature")?;
+        let write = tokio::spawn({
+            let state = Arc::clone(&state);
+            let path = path.clone();
+            async move { write_config(&state, &root, path, Value::map(BTreeMap::new()), None).await }
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered.notified()).await?;
+        // This test has one async worker. Both the timer and a concurrent State
+        // read must still progress while the host's synchronous validator waits.
+        ensure!(
+            tokio::time::timeout(Duration::from_secs(1), state.state.read(&path))
+                .await??
+                .is_none()
+        );
+        release.send(())?;
+        let result = tokio::time::timeout(Duration::from_secs(3), write).await??;
+        ensure!(
+            matches!(result, Err(MgmtError::Admission(reason)) if reason == "host rejected the value")
+        );
+        ensure!(state.state.read(&path).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_config_validation_dispatch_does_not_write_state() -> anyhow::Result<()> {
+        let base = console_state()?;
+        let root = root_principal(&base).await?;
+        let state = ConsoleState::with_config(
+            Arc::clone(&base.boot),
+            crate::ConsoleConfig {
+                session_store: Some(std::sync::Arc::new(
+                    crate::session_store::MemoryConsoleSessionStore::new(
+                        crate::session_store::ConsoleSessionPolicy::default(),
+                    ),
+                )),
+                blocking_spawner: Some(Arc::new(RejectBlockingWork)),
+                config_admissions: vec![ConfigNamespaceAdmission::new(
+                    Path::parse("state://kernel/config/example")?,
+                    |_path, _value| Ok(()),
+                )],
+                ..crate::ConsoleConfig {
+                    session_store: Some(std::sync::Arc::new(
+                        crate::session_store::MemoryConsoleSessionStore::new(
+                            crate::session_store::ConsoleSessionPolicy::default(),
+                        ),
+                    )),
+                    ..Default::default()
+                }
+            },
+        )?;
+        let path = Path::parse("state://kernel/config/example/feature")?;
+        let result = write_config(
+            &state,
+            &root,
+            path.clone(),
+            Value::map(BTreeMap::new()),
+            None,
+        )
+        .await;
+        ensure!(matches!(result, Err(MgmtError::ValidationAtCapacity)));
+        ensure!(state.state.read(&path).await?.is_none());
         Ok(())
     }
 
@@ -1009,24 +1168,53 @@ mod tests {
         let st = console_state()?;
         let root = root_principal(&st).await?;
         expect_admission_message(
-            inspect_config(&st, &root, "state://kernel/external-installations/acme").await,
-            "runtime config path must use its dedicated console action",
+            inspect_config(
+                &st,
+                &root,
+                &Path::parse("state://kernel/external-installations/acme")?,
+            )
+            .await,
+            "management path must use its dedicated console action",
         )?;
         expect_admission_message(
-            inspect_config_prefix(&st, &root, "state://kernel/inference/backends").await,
-            "runtime config path must use its dedicated console action",
+            inspect_config_prefix(
+                &st,
+                &root,
+                Path::parse("state://kernel/inference/backends")?,
+                ListRequest::default(),
+            )
+            .await,
+            "management path must use its dedicated console action",
         )?;
         expect_admission_message(
-            inspect_config_prefix(&st, &root, "state://kernel").await,
-            "runtime config path must use its dedicated console action",
+            inspect_config_prefix(
+                &st,
+                &root,
+                Path::parse("state://kernel")?,
+                ListRequest::default(),
+            )
+            .await,
+            "management path must use its dedicated console action",
         )?;
         expect_admission_message(
-            inspect_config_prefix(&st, &root, "state://kernel/routing").await,
-            "runtime config path must use its dedicated console action",
+            inspect_config_prefix(
+                &st,
+                &root,
+                Path::parse("state://kernel/routing")?,
+                ListRequest::default(),
+            )
+            .await,
+            "management path must use its dedicated console action",
         )?;
         expect_admission_message(
-            inspect_config_prefix(&st, &root, "state://kernel/projection-status").await,
-            "runtime config path must use its dedicated console action",
+            inspect_config_prefix(
+                &st,
+                &root,
+                Path::parse("state://kernel/projection-status")?,
+                ListRequest::default(),
+            )
+            .await,
+            "management path must use its dedicated console action",
         )?;
         Ok(())
     }
@@ -1036,7 +1224,14 @@ mod tests {
         let st = console_state()?;
         let root = root_principal(&st).await?;
         expect_admission_message(
-            write_dedicated_config(&st, &root, "state://kernel/audit/rules", obj(None), None).await,
+            write_dedicated_config(
+                &st,
+                &root,
+                Path::parse("state://kernel/audit/rules")?,
+                obj(None),
+                None,
+            )
+            .await,
             "dedicated console action cannot write generic config path",
         )?;
         Ok(())
@@ -1046,42 +1241,301 @@ mod tests {
     async fn install_then_reconfigure_with_cas() -> anyhow::Result<()> {
         let st = console_state()?;
         let root = root_principal(&st).await?;
-        let path = "state://kernel/external-installations/acme";
-        write_dedicated_config(&st, &root, path, extension_installation("acme", 0)?, None).await?;
-        let v = inspect(&st, &root, path)
+        let path = "state://kernel/projections/in-process/fetch";
+        write_config(
+            &st,
+            &root,
+            Path::parse(path)?,
+            in_process_projection("fetch", 0)?,
+            None,
+        )
+        .await?;
+        let v = inspect(&st, &root, &Path::parse(path)?)
             .await?
             .context("installed config missing")?;
         ensure!(
             value_version(&v)? == Some(1),
             "initial install did not advance version to 1"
         );
-        write_dedicated_config(
+        write_config(
             &st,
             &root,
-            path,
-            extension_installation("acme", 1)?,
+            Path::parse(path)?,
+            in_process_projection("fetch", 1)?,
             Some(1),
         )
         .await?;
-        let v = inspect(&st, &root, path)
+        let v = inspect(&st, &root, &Path::parse(path)?)
             .await?
             .context("reconfigured config missing")?;
         ensure!(
             value_version(&v)? == Some(2),
             "reconfigure did not advance version to 2"
         );
-        let stale = write_dedicated_config(
+        let stale = write_config(
             &st,
             &root,
-            path,
-            extension_installation("acme", 1)?,
+            Path::parse(path)?,
+            in_process_projection("fetch", 1)?,
             Some(1),
         )
         .await;
         ensure!(
-            matches!(stale, Err(MgmtError::Conflict { .. })),
+            matches!(
+                stale,
+                Err(MgmtError::Conflict {
+                    current_version: Some(2),
+                    ..
+                })
+            ),
             "stale CAS write did not conflict"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conflict_uses_commit_observation_even_if_record_changes_again() -> anyhow::Result<()> {
+        use xolotl_state::{
+            Backend, InMemoryBackend, StateCommit, StateMutation, StateResult, StateWrite,
+            StateWriteExt,
+        };
+
+        struct ConcurrentWriter {
+            inner: Arc<InMemoryBackend>,
+            observed: Option<Value>,
+        }
+
+        impl StateWrite for ConcurrentWriter {
+            type Write<'a> = std::pin::Pin<
+                Box<dyn std::future::Future<Output = StateResult<StateCommit>> + Send + 'a>,
+            >;
+
+            fn mutate<'a>(&'a self, path: &'a Path, mutation: StateMutation) -> Self::Write<'a> {
+                Box::pin(async move {
+                    if path.to_string() == "state://kernel/projections/in-process/fetch"
+                        && matches!(&mutation, StateMutation::CompareSet { .. })
+                    {
+                        match &self.observed {
+                            Some(value) => {
+                                self.inner.write_set(path, value.clone()).await?;
+                            }
+                            None => {
+                                self.inner.write_delete(path).await?;
+                            }
+                        }
+                        let comparison = self.inner.mutate(path, mutation).await;
+                        self.inner.write_set(path, obj(Some(99))).await?;
+                        comparison
+                    } else {
+                        self.inner.mutate(path, mutation).await
+                    }
+                })
+            }
+        }
+
+        let malformed = Value::map(BTreeMap::from([(
+            "version".into(),
+            Value::string("private malformed value".into()),
+        )]));
+        for (observed, expected_hint) in [
+            (Some(obj(Some(2))), Some(2)),
+            (Some(obj(None)), Some(0)),
+            (None, None),
+            (Some(malformed), None),
+        ] {
+            let writer = Arc::new(ConcurrentWriter {
+                inner: Arc::new(InMemoryBackend::default()),
+                observed,
+            });
+            let backend = Backend::new()
+                .with_read(writer.inner.clone())
+                .with_bounded_read(writer.inner.clone())
+                .with_write(writer.clone())
+                .with_bounded_write(writer.inner.clone())
+                .with_query(writer.inner.clone());
+            let (facts, _) = xolotl_kernel::FactSink::in_memory();
+            let boot = Arc::new(Bootstrap::from_kernel(
+                xolotl_kernel::KernelBuilder::new(backend)
+                    .with_fact_sink(facts)
+                    .build(),
+            ));
+            install_standard(&boot, &StandardConfig::default())?;
+            let st = ConsoleState::with_config(
+                boot,
+                crate::ConsoleConfig {
+                    session_store: Some(std::sync::Arc::new(
+                        crate::session_store::MemoryConsoleSessionStore::new(
+                            crate::session_store::ConsoleSessionPolicy::default(),
+                        ),
+                    )),
+                    config_admissions: vec![ConfigNamespaceAdmission::new(
+                        Path::parse("state://kernel/projections/in-process")?,
+                        |_path, _value| Ok(()),
+                    )],
+                    ..crate::ConsoleConfig {
+                        session_store: Some(std::sync::Arc::new(
+                            crate::session_store::MemoryConsoleSessionStore::new(
+                                crate::session_store::ConsoleSessionPolicy::default(),
+                            ),
+                        )),
+                        ..Default::default()
+                    }
+                },
+            )?;
+            let root = root_principal(&st).await?;
+            let path = Path::parse("state://kernel/projections/in-process/fetch")?;
+            st.state
+                .write_set(&path, in_process_projection("fetch", 1)?)
+                .await?;
+            let error = write_config(
+                &st,
+                &root,
+                path.clone(),
+                in_process_projection("fetch", 1)?,
+                Some(1),
+            )
+            .await
+            .err()
+            .context("expected commit conflict")?;
+            let failure = crate::ConsoleFailure::from(crate::service::ConsoleError::from(error));
+            ensure!(failure.code == crate::ConsoleErrorCode::Conflict);
+            ensure!(failure.current_version == expected_hint);
+            ensure!(
+                value_version(&st.state.read(&path).await?.context("later write")?)? == Some(99)
+            );
+            ensure!(!serde_json::to_string(&failure)?.contains("private malformed value"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_only_cannot_overwrite_unversioned_record() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let root = root_principal(&st).await?;
+        let path = Path::parse("state://kernel/console/users/alice")?;
+        let existing = complete_console_user("alice")?;
+        st.state.write_cas(&path, None, existing.clone()).await?;
+        let result = write_dedicated_config(&st, &root, path.clone(), existing.clone(), None).await;
+        ensure!(matches!(
+            result,
+            Err(MgmtError::Conflict {
+                current_version: Some(0),
+                ..
+            })
+        ));
+        ensure!(st.state.read(&path).await? == Some(existing.clone()));
+        write_dedicated_config(&st, &root, path.clone(), existing, Some(0)).await?;
+        let value = st.state.read(&path).await?.context("missing user")?;
+        ensure!(value_version(&value)? == Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn management_pages_resume_without_loading_the_whole_prefix() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let root = root_principal(&st).await?;
+        let prefix = "state://kernel/paging-test";
+        for id in 0..5 {
+            st.state
+                .write_set(&Path::parse(&format!("{prefix}/{id}"))?, obj(Some(1)))
+                .await?;
+        }
+        let mut cursor = None;
+        let mut paths = Vec::new();
+        loop {
+            let page = inspect_config_prefix(
+                &st,
+                &root,
+                Path::parse(prefix)?,
+                ListRequest {
+                    limit: Some(2),
+                    cursor,
+                    ..Default::default()
+                },
+            )
+            .await?;
+            ensure!(page.entries.len() <= 2);
+            paths.extend(page.entries.into_iter().map(|(path, _)| path));
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        ensure!(
+            paths
+                == (0..5)
+                    .map(|id| format!("{prefix}/{id}"))
+                    .collect::<Vec<_>>()
+        );
+        for request in [
+            ListRequest {
+                limit: Some(0),
+                ..Default::default()
+            },
+            ListRequest {
+                max_bytes: Some(0),
+                ..Default::default()
+            },
+            ListRequest {
+                cursor: Some("%%%".into()),
+                ..Default::default()
+            },
+        ] {
+            ensure!(matches!(
+                inspect_config_prefix(&st, &root, Path::parse(prefix)?, request).await,
+                Err(MgmtError::Query(_))
+            ));
+        }
+        let first = inspect_config_prefix(
+            &st,
+            &root,
+            Path::parse(prefix)?,
+            ListRequest {
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await?;
+        ensure!(matches!(
+            inspect_config_prefix(
+                &st,
+                &root,
+                Path::parse("state://kernel/another-prefix")?,
+                ListRequest {
+                    cursor: first.next_cursor,
+                    ..Default::default()
+                }
+            )
+            .await,
+            Err(MgmtError::Query(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn management_pages_enforce_byte_budget() -> anyhow::Result<()> {
+        let st = console_state()?;
+        let root = root_principal(&st).await?;
+        let prefix = "state://kernel/paging-bytes";
+        st.state
+            .write_set(
+                &Path::parse(&format!("{prefix}/large"))?,
+                Value::string("x".repeat(4096)),
+            )
+            .await?;
+        ensure!(matches!(
+            inspect_config_prefix(
+                &st,
+                &root,
+                Path::parse(prefix)?,
+                ListRequest {
+                    max_bytes: Some(128),
+                    ..Default::default()
+                }
+            )
+            .await,
+            Err(MgmtError::Query(_))
+        ));
         Ok(())
     }
 
@@ -1089,21 +1543,19 @@ mod tests {
     async fn write_rejects_existing_negative_config_version() -> anyhow::Result<()> {
         let st = console_state()?;
         let root = root_principal(&st).await?;
-        let path = Path::parse("state://kernel/external-installations/acme")?;
-        let mut map = (extension_installation("acme", 0)?)
+        let path = Path::parse("state://kernel/projections/in-process/fetch")?;
+        let mut map = (in_process_projection("fetch", 0)?)
             .into_map()
             .context("expected map")?;
         map.insert("version".into(), Value::integer(-1))?;
         let existing = Value::from(map);
         st.state.write_cas(&path, None, existing).await?;
-        let path = path.to_string();
-
         expect_admission_message(
-            write_dedicated_config(
+            write_config(
                 &st,
                 &root,
-                &path,
-                extension_installation("acme", 1)?,
+                path,
+                in_process_projection("fetch", 1)?,
                 Some(1),
             )
             .await,
@@ -1113,50 +1565,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extension_installation_admission_supports_multi_projection_package()
-    -> anyhow::Result<()> {
+    async fn legacy_state_installation_write_is_rejected() -> anyhow::Result<()> {
         let st = console_state()?;
         let root = root_principal(&st).await?;
         let path = "state://kernel/external-installations/instant_messaging_platform";
-        write_dedicated_config(
-            &st,
-            &root,
-            path,
-            instant_messaging_platform_installation(0)?,
-            None,
-        )
-        .await?;
-        let v = inspect(&st, &root, path)
-            .await?
-            .context("multi-projection installation missing")?;
-        ensure!(
-            value_version(&v)? == Some(1),
-            "multi-projection install did not advance version"
-        );
-
-        let mut map = instant_messaging_platform_installation(0)?
-            .into_map()
-            .context("installation map")?;
-        let mut projections = map
-            .remove("projections")
-            .and_then(Value::into_list)
-            .context("projections")?;
-        let mut provider = projections
-            .get(1)
-            .and_then(Value::as_map)
-            .cloned()
-            .context("provider projection")?;
-        provider.insert(
-            "provides".into(),
-            Value::list(vec![serde_json::from_value(serde_json::json!({
-                "effect_path": "effect://external-provider/other/send_text",
-                "purity": "effectful"
-            }))?]),
+        expect_admission_message(
+            write_dedicated_config(&st, &root, Path::parse(path)?, Value::null(), None).await,
+            "external installations are owned by the storage catalog",
         )?;
-        projections.set(1, Value::from(provider))?;
-        map.insert("projections".into(), Value::from(projections))?;
-        let bad = Value::from(map);
-        expect_admission(write_dedicated_config(&st, &root, path, bad, Some(1)).await)?;
         Ok(())
     }
 
@@ -1168,7 +1584,7 @@ mod tests {
         write_dedicated_config(
             &st,
             &root,
-            "state://kernel/inference/backends/deepseek",
+            Path::parse("state://kernel/inference/backends/deepseek")?,
             inference_backend("deepseek")?,
             None,
         )
@@ -1178,7 +1594,7 @@ mod tests {
             write_dedicated_config(
                 &st,
                 &root,
-                "state://kernel/inference/backends/other",
+                Path::parse("state://kernel/inference/backends/other")?,
                 inference_backend("deepseek")?,
                 None,
             )
@@ -1200,7 +1616,7 @@ mod tests {
             write_dedicated_config(
                 &st,
                 &root,
-                "state://kernel/inference/backends/bad",
+                Path::parse("state://kernel/inference/backends/bad")?,
                 bad,
                 None,
             )
@@ -1214,7 +1630,14 @@ mod tests {
         let st = console_state()?;
         let root = root_principal(&st).await?;
         expect_admission(
-            write_config(&st, &root, "state://kernel/unknown/x", obj(None), None).await,
+            write_config(
+                &st,
+                &root,
+                Path::parse("state://kernel/unknown/x")?,
+                obj(None),
+                None,
+            )
+            .await,
         )?;
         Ok(())
     }

@@ -2,6 +2,67 @@ use super::*;
 use alloc::{collections::BTreeMap, string::String, vec};
 use anyhow::{Context, ensure};
 
+#[test]
+fn bounded_index_charges_shared_nodes_edges_keys_and_leaf_bytes() -> anyhow::Result<()> {
+    let leaf = Value::bytes(vec![7; 4]);
+    let shared = Value::list(vec![leaf.clone(), leaf]);
+    let mut table = ValueTableEncoder::new();
+    let root = table.intern_bounded(&shared, 8)?;
+    ensure!(table.node_count() == 2);
+    ensure!(
+        serde_json::to_vec(&table.serializable_root(root))?
+            == serde_json::to_vec(&serializable(&shared))?
+    );
+    ensure!(matches!(
+        ValueTableEncoder::new().intern_bounded(&shared, 7),
+        Err(ValueTableEncodeError::BudgetExceeded)
+    ));
+    let independent = Value::list(vec![Value::bytes(vec![7; 4]), Value::bytes(vec![7; 4])]);
+    ensure!(matches!(
+        ValueTableEncoder::new().intern_bounded(&independent, 8),
+        Err(ValueTableEncodeError::BudgetExceeded)
+    ));
+    let map = Value::map(BTreeMap::from([(String::from("abcd"), Value::null())]));
+    let mut table = ValueTableEncoder::new();
+    ensure!(matches!(
+        table.intern_bounded(&map, 5),
+        Err(ValueTableEncodeError::BudgetExceeded)
+    ));
+    ensure!(table.node_count() == 0);
+    ensure!(ValueTableEncoder::new().intern_bounded(&map, 7).is_ok());
+    for leaf in [Value::from("abcd"), Value::bytes(vec![1; 4])] {
+        ensure!(matches!(
+            ValueTableEncoder::new().intern_bounded(&leaf, 4),
+            Err(ValueTableEncodeError::BudgetExceeded)
+        ));
+        ensure!(ValueTableEncoder::new().intern_bounded(&leaf, 5).is_ok());
+    }
+    Ok(())
+}
+
+#[test]
+fn bounded_index_rejects_depth_and_width_before_indexing_descendants() {
+    let mut deep = Value::null();
+    for _depth in 0..4096 {
+        deep = Value::list(vec![deep]);
+    }
+    let wide = Value::list(vec![Value::null(); 4096]);
+    let wide_map = Value::map(
+        (0..4096)
+            .map(|index| (alloc::format!("key-{index}"), Value::null()))
+            .collect(),
+    );
+    let shared = Value::list(vec![Value::bytes(vec![1; 4096]); 4096]);
+    for root in [&deep, &wide, &wide_map, &shared] {
+        let mut table = ValueTableEncoder::new();
+        assert!(matches!(
+            table.intern_bounded(root, 16),
+            Err(ValueTableEncodeError::BudgetExceeded)
+        ));
+        assert_eq!(table.node_count(), 0);
+    }
+}
+
 #[derive(Serialize)]
 struct Record<'table, 'value> {
     values: &'table ValueTableEncoder<'value>,

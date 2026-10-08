@@ -9,6 +9,7 @@ message Program {
 }
 
 // Portable source uses the same versioned document as the Rust/JSON compiler.
+// Identity binds compiled instructions and effective imports, not recovery policy.
 // Transporting a program does not authorize its execution through a Gateway.
 message PortableProgram {
   bytes json_source = 1;
@@ -38,6 +39,7 @@ message DoNode {
     Failure fail = 9;
     WaitSpec wait = 10;
     OperationTemplate op = 11;
+    Finally finally = 12;
   }
 }
 
@@ -49,6 +51,11 @@ message AndThen {
 message OrElse {
   DoNode d = 1;
   StepRef or = 2;
+}
+
+message Finally {
+  DoNode body = 1;
+  DoNode cleanup = 2;
 }
 
 message Parallel {

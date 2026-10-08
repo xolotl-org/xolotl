@@ -1,7 +1,7 @@
 //! Canonical conversions between domain types and protobuf wire messages.
 //! Typed values, paths, capabilities, and composition trees retain their wire
 //! structure. Failures preserve their exact variants and recovery metadata.
-//! Checked decoders validate required fields and enum representations. They do
+//! Decoders validate required fields and enum representations. They do
 //! not replace execution admission or verify ownership of referenced objects.
 
 use crate::xolotl::v1 as pb;
@@ -50,7 +50,25 @@ pub enum ConvertError {
         /// Unsigned value received before conversion to the destination type.
         value: u64,
     },
+    /// Native composition exceeded the safe protobuf tree depth.
+    #[error("native program exceeded wire nesting depth {max}")]
+    ProgramDepth {
+        /// Maximum number of nested `DoNode`s, counting the root as one.
+        max: usize,
+    },
+    /// A nested value would exceed Prost's message recursion bound.
+    #[error("native program exceeded protobuf message nesting depth {max}")]
+    MessageDepth {
+        /// Maximum accepted protobuf message nesting depth.
+        max: usize,
+    },
 }
+
+/// Protobuf nesting adds a wrapper message for each native tree level. Prost
+/// rejects messages beyond 100 nested levels. Nested values are checked against
+/// the remaining message budget at each tree position.
+pub const MAX_WIRE_DO_DEPTH: usize = 48;
+const MAX_PROTO_MESSAGE_DEPTH: usize = 100;
 
 fn enum_value<T>(field: &'static str, value: i32) -> Result<T, ConvertError>
 where
@@ -88,41 +106,11 @@ pub fn value_to_pb(v: &Value) -> pb::Value {
     pb::Value { kind: Some(kind) }
 }
 
-/// Decode a wire value using permissive fallbacks. An absent oneof, invalid
-/// tensor/frame metadata, or invalid stream marker maps to `Null`; unrecognized
-/// null enum numbers are also accepted as null. Use [`value_from_pb_checked`]
-/// when invalid input must be reported rather than replaced.
-pub fn value_from_pb(v: &pb::Value) -> Value {
-    use pb::value::Kind;
-    match &v.kind {
-        None => Value::null(),
-        Some(Kind::NullVal(_)) => Value::null(),
-        Some(Kind::BoolVal(b)) => Value::boolean(*b),
-        Some(Kind::IntVal(i)) => Value::integer(*i),
-        Some(Kind::FloatVal(f)) => Value::float(FloatBits(*f)),
-        Some(Kind::StrVal(s)) => Value::string(s.clone()),
-        Some(Kind::BytesVal(b)) => Value::bytes(b.clone()),
-        Some(Kind::ListVal(l)) => Value::list(l.items.iter().map(value_from_pb).collect()),
-        Some(Kind::MapVal(m)) => Value::map(
-            m.entries
-                .iter()
-                .map(|(k, v)| (k.clone(), value_from_pb(v)))
-                .collect(),
-        ),
-        Some(Kind::BlobVal(b)) => Value::blob(blob_from_pb(b)),
-        Some(Kind::TensorVal(t)) => tensor_from_pb(t).map_or(Value::null(), Value::from),
-        Some(Kind::FrameVal(fr)) => frame_from_pb(fr).map_or(Value::null(), Value::from),
-        Some(Kind::StreamEndVal(m)) => {
-            stream_marker_from_pb(m).map_or(Value::null(), Value::stream_end)
-        }
-    }
-}
-
 /// Wire `Value` → `xolotl_types::Value` with canonical field validation.
 /// Recursively validates null enum numbers, tensor/frame metadata and stream
 /// markers. An absent outer value oneof still means null. Blob identifiers and
 /// declared lengths are retained without loading or authenticating stored data.
-pub fn value_from_pb_checked(v: &pb::Value) -> Result<Value, ConvertError> {
+pub fn value_from_pb(v: &pb::Value) -> Result<Value, ConvertError> {
     use pb::value::Kind;
     Ok(match &v.kind {
         None => Value::null(),
@@ -138,20 +126,94 @@ pub fn value_from_pb_checked(v: &pb::Value) -> Result<Value, ConvertError> {
         Some(Kind::ListVal(l)) => Value::list(
             l.items
                 .iter()
-                .map(value_from_pb_checked)
+                .map(value_from_pb)
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         Some(Kind::MapVal(m)) => Value::map(
             m.entries
                 .iter()
-                .map(|(k, v)| Ok((k.clone(), value_from_pb_checked(v)?)))
+                .map(|(k, v)| Ok((k.clone(), value_from_pb(v)?)))
                 .collect::<Result<_, ConvertError>>()?,
         ),
         Some(Kind::BlobVal(b)) => Value::blob(blob_from_pb(b)),
-        Some(Kind::TensorVal(t)) => Value::from(tensor_from_pb_checked(t)?),
-        Some(Kind::FrameVal(fr)) => Value::from(frame_from_pb_checked(fr)?),
-        Some(Kind::StreamEndVal(m)) => Value::stream_end(stream_marker_from_pb_checked(m)?),
+        Some(Kind::TensorVal(t)) => Value::from(tensor_from_pb(t)?),
+        Some(Kind::FrameVal(fr)) => Value::from(frame_from_pb(fr)?),
+        Some(Kind::StreamEndVal(m)) => Value::stream_end(stream_marker_from_pb(m)?),
     })
+}
+
+fn check_message_depth(depth: usize) -> Result<(), ConvertError> {
+    if depth > MAX_PROTO_MESSAGE_DEPTH {
+        Err(ConvertError::MessageDepth {
+            max: MAX_PROTO_MESSAGE_DEPTH,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn check_value_message_depth(value: &Value, base: usize) -> Result<(), ConvertError> {
+    let mut pending = vec![(value, base)];
+    while let Some((value, depth)) = pending.pop() {
+        check_message_depth(depth)?;
+        match value.view() {
+            ValueView::List(items) => {
+                check_message_depth(depth + 1)?;
+                pending.extend(items.iter().map(|item| (item, depth + 2)));
+            }
+            ValueView::Map(entries) => {
+                check_message_depth(depth + 1)?;
+                pending.extend(entries.values().map(|item| (item, depth + 3)));
+            }
+            ValueView::Blob(_) | ValueView::StreamEnd(_) => {
+                check_message_depth(depth + 1)?;
+            }
+            ValueView::Tensor(_) | ValueView::Frame(_) => {
+                check_message_depth(depth + 2)?;
+            }
+            ValueView::Null
+            | ValueView::Bool(_)
+            | ValueView::Int(_)
+            | ValueView::Float(_)
+            | ValueView::Str(_)
+            | ValueView::Bytes(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn check_pb_value_message_depth(value: &pb::Value, base: usize) -> Result<(), ConvertError> {
+    use pb::value::Kind;
+    let mut pending = vec![(value, base)];
+    while let Some((value, depth)) = pending.pop() {
+        check_message_depth(depth)?;
+        match &value.kind {
+            Some(Kind::ListVal(items)) => {
+                check_message_depth(depth + 1)?;
+                pending.extend(items.items.iter().map(|item| (item, depth + 2)));
+            }
+            Some(Kind::MapVal(entries)) => {
+                check_message_depth(depth + 1)?;
+                pending.extend(entries.entries.values().map(|item| (item, depth + 3)));
+            }
+            Some(Kind::BlobVal(_) | Kind::StreamEndVal(_)) => {
+                check_message_depth(depth + 1)?;
+            }
+            Some(Kind::TensorVal(_) | Kind::FrameVal(_)) => {
+                check_message_depth(depth + 2)?;
+            }
+            None
+            | Some(
+                Kind::NullVal(_)
+                | Kind::BoolVal(_)
+                | Kind::IntVal(_)
+                | Kind::FloatVal(_)
+                | Kind::StrVal(_)
+                | Kind::BytesVal(_),
+            ) => {}
+        }
+    }
+    Ok(())
 }
 
 // Multimodal reference conversions.
@@ -178,15 +240,7 @@ fn tensor_to_pb(t: &TensorRef) -> pb::TensorRef {
         shape: t.shape.clone(),
     }
 }
-fn tensor_from_pb(t: &pb::TensorRef) -> Option<TensorRef> {
-    Some(TensorRef {
-        blob: blob_from_pb(t.blob.as_ref()?),
-        dtype: dtype_from_str(&t.dtype)?,
-        shape: t.shape.clone(),
-    })
-}
-
-fn tensor_from_pb_checked(t: &pb::TensorRef) -> Result<TensorRef, ConvertError> {
+fn tensor_from_pb(t: &pb::TensorRef) -> Result<TensorRef, ConvertError> {
     Ok(TensorRef {
         blob: blob_from_pb(
             t.blob
@@ -205,15 +259,7 @@ fn frame_to_pb(fr: &FrameRef) -> pb::FrameRef {
         kind: frame_kind_str(fr.kind).to_string(),
     }
 }
-fn frame_from_pb(fr: &pb::FrameRef) -> Option<FrameRef> {
-    Some(FrameRef {
-        blob: blob_from_pb(fr.blob.as_ref()?),
-        ts_nanos: fr.ts_nanos,
-        kind: frame_kind_from_str(&fr.kind)?,
-    })
-}
-
-fn frame_from_pb_checked(fr: &pb::FrameRef) -> Result<FrameRef, ConvertError> {
+fn frame_from_pb(fr: &pb::FrameRef) -> Result<FrameRef, ConvertError> {
     Ok(FrameRef {
         blob: blob_from_pb(
             fr.blob
@@ -233,18 +279,7 @@ fn stream_marker_to_pb(m: &StreamMarker) -> pb::StreamMarker {
     };
     pb::StreamMarker { kind: Some(kind) }
 }
-fn stream_marker_from_pb(m: &pb::StreamMarker) -> Option<StreamMarker> {
-    use pb::stream_marker::Kind;
-    Some(match &m.kind {
-        Some(Kind::Done(true)) => StreamMarker::Done,
-        Some(Kind::Error(message)) => StreamMarker::Error {
-            message: message.clone(),
-        },
-        Some(Kind::Done(false)) | None => return None,
-    })
-}
-
-fn stream_marker_from_pb_checked(m: &pb::StreamMarker) -> Result<StreamMarker, ConvertError> {
+fn stream_marker_from_pb(m: &pb::StreamMarker) -> Result<StreamMarker, ConvertError> {
     use pb::stream_marker::Kind;
     match &m.kind {
         Some(Kind::Done(true)) => Ok(StreamMarker::Done),
@@ -341,6 +376,8 @@ pub fn capability_to_pb(c: &Capability) -> pb::Capability {
         scheme: c.scheme.clone(),
         segments: c.segments.iter().map(|s| s.to_string()).collect(),
         predicate: c.predicate.as_ref().map(|p| p.to_string()),
+        cluster: c.cluster.clone(),
+        method: c.method.clone(),
     }
 }
 
@@ -351,12 +388,19 @@ pub fn capability_from_pb(c: &pb::Capability) -> Result<Capability, ConvertError
         .as_deref()
         .map(xolotl_types::Predicate::parse)
         .transpose()?;
-    Ok(Capability::try_new(
+    let mut capability = Capability::try_new(
         c.verb.as_str(),
         c.scheme.as_str(),
         c.segments.iter().map(String::as_str),
         predicate,
-    )?)
+    )?;
+    if let Some(method) = &c.method {
+        capability = capability.try_with_method(method.clone())?;
+    }
+    match &c.cluster {
+        Some(cluster) => Ok(capability.try_with_cluster(cluster)?),
+        None => Ok(capability),
+    }
 }
 
 // Program and DoNode conversions.
@@ -391,12 +435,12 @@ pub fn portable_program_from_pb(
     Ok(source)
 }
 
-/// `DoNode` → wire `Program`.
-pub fn program_to_pb(root: &DoNode) -> pb::Program {
-    pb::Program {
-        root: Some(do_node_to_pb(root)),
+/// `DoNode` → wire `Program`, subject to the protobuf nesting bound.
+pub fn program_to_pb(root: &DoNode) -> Result<pb::Program, ConvertError> {
+    Ok(pb::Program {
+        root: Some(do_node_to_pb(root)?),
         provenance: None,
-    }
+    })
 }
 
 /// Decode the required program root using checked node conversion. Attached
@@ -410,61 +454,124 @@ pub fn program_from_pb(program: &pb::Program) -> Result<DoNode, ConvertError> {
     )
 }
 
-/// Recursively encode a native composition tree, retaining named step references
-/// and typed constants. Failure nodes preserve their structured metadata.
-pub fn do_node_to_pb(node: &DoNode) -> pb::DoNode {
+/// Encode a native tree within the protobuf nesting bound. Named steps,
+/// typed constants, and structured failures are preserved.
+pub fn do_node_to_pb(node: &DoNode) -> Result<pb::DoNode, ConvertError> {
+    do_node_to_pb_at(node, 1)
+}
+
+fn do_node_to_pb_at(node: &DoNode, depth: usize) -> Result<pb::DoNode, ConvertError> {
+    if depth > MAX_WIRE_DO_DEPTH {
+        return Err(ConvertError::ProgramDepth {
+            max: MAX_WIRE_DO_DEPTH,
+        });
+    }
+    match node {
+        DoNode::Pure(value) => check_value_message_depth(value, 2 * depth + 1)?,
+        DoNode::AndThen { then: step, .. } | DoNode::OrElse { or: step, .. } => {
+            if let Some(value) = &step.arg {
+                check_value_message_depth(value, 2 * depth + 3)?;
+            }
+        }
+        DoNode::Op(operation) => {
+            if let Some(value) = &operation.literal_input {
+                check_value_message_depth(value, 2 * depth + 2)?;
+            }
+        }
+        DoNode::Finally { .. }
+        | DoNode::Both(..)
+        | DoNode::Race(..)
+        | DoNode::Let { .. }
+        | DoNode::Use(_)
+        | DoNode::Acting { .. }
+        | DoNode::Fail(_)
+        | DoNode::Wait(_) => {}
+    }
     use pb::do_node::Kind;
     let kind = match node {
         DoNode::Pure(v) => Kind::Pure(value_to_pb(v)),
         DoNode::AndThen { d, then } => Kind::AndThen(pb::AndThen {
-            d: Some(Box::new(do_node_to_pb(d))),
+            d: Some(Box::new(do_node_to_pb_at(d, depth + 1)?)),
             then: Some(step_ref_to_pb(then)),
         }),
         DoNode::OrElse { d, or } => Kind::OrElse(pb::OrElse {
-            d: Some(Box::new(do_node_to_pb(d))),
+            d: Some(Box::new(do_node_to_pb_at(d, depth + 1)?)),
             or: Some(step_ref_to_pb(or)),
         }),
+        DoNode::Finally { body, cleanup } => Kind::Finally(pb::Finally {
+            body: Some(Box::new(do_node_to_pb_at(body, depth + 1)?)),
+            cleanup: Some(Box::new(do_node_to_pb_at(cleanup, depth + 1)?)),
+        }),
         DoNode::Both(a, b) => Kind::Both(pb::Parallel {
-            left: Some(Box::new(do_node_to_pb(a))),
-            right: Some(Box::new(do_node_to_pb(b))),
+            left: Some(Box::new(do_node_to_pb_at(a, depth + 1)?)),
+            right: Some(Box::new(do_node_to_pb_at(b, depth + 1)?)),
         }),
         DoNode::Race(a, b) => Kind::Race(pb::Parallel {
-            left: Some(Box::new(do_node_to_pb(a))),
-            right: Some(Box::new(do_node_to_pb(b))),
+            left: Some(Box::new(do_node_to_pb_at(a, depth + 1)?)),
+            right: Some(Box::new(do_node_to_pb_at(b, depth + 1)?)),
         }),
         DoNode::Let { name, value, body } => Kind::Let(pb::Let {
             name: name.clone(),
-            value: Some(Box::new(do_node_to_pb(value))),
-            body: Some(Box::new(do_node_to_pb(body))),
+            value: Some(Box::new(do_node_to_pb_at(value, depth + 1)?)),
+            body: Some(Box::new(do_node_to_pb_at(body, depth + 1)?)),
         }),
         DoNode::Use(name) => Kind::UseName(name.clone()),
         DoNode::Acting { identity, body } => Kind::Acting(pb::Acting {
             identity: Some(path_to_pb(identity)),
-            body: Some(Box::new(do_node_to_pb(body))),
+            body: Some(Box::new(do_node_to_pb_at(body, depth + 1)?)),
         }),
         DoNode::Fail(f) => Kind::Fail(failure_to_pb(f)),
         DoNode::Wait(spec) => Kind::Wait(wait_spec_to_pb(spec)),
         DoNode::Op(op) => Kind::Op(operation_template_to_pb(op)),
     };
-    pb::DoNode { kind: Some(kind) }
+    Ok(pb::DoNode { kind: Some(kind) })
 }
 
 /// Recursively decode a native composition tree, checking required children,
 /// canonical nonblank names, typed values, paths, and output modes. This does
-/// not resolve lexical names or native steps, impose a tree-size budget, or
+/// not resolve lexical names or native steps, impose a node-count budget, or
 /// authorize resource access; those checks belong to compilation and admission.
 pub fn do_node_from_pb(node: &pb::DoNode) -> Result<DoNode, ConvertError> {
+    do_node_from_pb_at(node, 1)
+}
+
+fn do_node_from_pb_at(node: &pb::DoNode, depth: usize) -> Result<DoNode, ConvertError> {
+    if depth > MAX_WIRE_DO_DEPTH {
+        return Err(ConvertError::ProgramDepth {
+            max: MAX_WIRE_DO_DEPTH,
+        });
+    }
     use pb::do_node::Kind;
+    match node.kind.as_ref() {
+        Some(Kind::Pure(value)) => check_pb_value_message_depth(value, 2 * depth + 1)?,
+        Some(Kind::AndThen(step)) => {
+            if let Some(value) = step.then.as_ref().and_then(|step| step.arg.as_ref()) {
+                check_pb_value_message_depth(value, 2 * depth + 3)?;
+            }
+        }
+        Some(Kind::OrElse(step)) => {
+            if let Some(value) = step.or.as_ref().and_then(|step| step.arg.as_ref()) {
+                check_pb_value_message_depth(value, 2 * depth + 3)?;
+            }
+        }
+        Some(Kind::Op(operation)) => {
+            if let Some(value) = &operation.literal_input {
+                check_pb_value_message_depth(value, 2 * depth + 2)?;
+            }
+        }
+        _ => {}
+    }
     Ok(
         match node
             .kind
             .as_ref()
             .ok_or(ConvertError::Missing("do_node.kind"))?
         {
-            Kind::Pure(v) => DoNode::Pure(value_from_pb_checked(v)?),
+            Kind::Pure(v) => DoNode::Pure(value_from_pb(v)?),
             Kind::AndThen(x) => DoNode::AndThen {
-                d: Box::new(do_node_from_pb(
+                d: Box::new(do_node_from_pb_at(
                     x.d.as_deref().ok_or(ConvertError::Missing("and_then.d"))?,
+                    depth + 1,
                 )?),
                 then: step_ref_from_pb(
                     x.then
@@ -473,44 +580,65 @@ pub fn do_node_from_pb(node: &pb::DoNode) -> Result<DoNode, ConvertError> {
                 )?,
             },
             Kind::OrElse(x) => DoNode::OrElse {
-                d: Box::new(do_node_from_pb(
+                d: Box::new(do_node_from_pb_at(
                     x.d.as_deref().ok_or(ConvertError::Missing("or_else.d"))?,
+                    depth + 1,
                 )?),
                 or: step_ref_from_pb(x.or.as_ref().ok_or(ConvertError::Missing("or_else.or"))?)?,
             },
+            Kind::Finally(x) => DoNode::Finally {
+                body: Box::new(do_node_from_pb_at(
+                    x.body
+                        .as_deref()
+                        .ok_or(ConvertError::Missing("finally.body"))?,
+                    depth + 1,
+                )?),
+                cleanup: Box::new(do_node_from_pb_at(
+                    x.cleanup
+                        .as_deref()
+                        .ok_or(ConvertError::Missing("finally.cleanup"))?,
+                    depth + 1,
+                )?),
+            },
             Kind::Both(x) => DoNode::Both(
-                Box::new(do_node_from_pb(
+                Box::new(do_node_from_pb_at(
                     x.left
                         .as_deref()
                         .ok_or(ConvertError::Missing("both.left"))?,
+                    depth + 1,
                 )?),
-                Box::new(do_node_from_pb(
+                Box::new(do_node_from_pb_at(
                     x.right
                         .as_deref()
                         .ok_or(ConvertError::Missing("both.right"))?,
+                    depth + 1,
                 )?),
             ),
             Kind::Race(x) => DoNode::Race(
-                Box::new(do_node_from_pb(
+                Box::new(do_node_from_pb_at(
                     x.left
                         .as_deref()
                         .ok_or(ConvertError::Missing("race.left"))?,
+                    depth + 1,
                 )?),
-                Box::new(do_node_from_pb(
+                Box::new(do_node_from_pb_at(
                     x.right
                         .as_deref()
                         .ok_or(ConvertError::Missing("race.right"))?,
+                    depth + 1,
                 )?),
             ),
             Kind::Let(x) => DoNode::Let {
                 name: required_nonblank(&x.name, "let.name")?,
-                value: Box::new(do_node_from_pb(
+                value: Box::new(do_node_from_pb_at(
                     x.value
                         .as_deref()
                         .ok_or(ConvertError::Missing("let.value"))?,
+                    depth + 1,
                 )?),
-                body: Box::new(do_node_from_pb(
+                body: Box::new(do_node_from_pb_at(
                     x.body.as_deref().ok_or(ConvertError::Missing("let.body"))?,
+                    depth + 1,
                 )?),
             },
             Kind::UseName(name) => DoNode::Use(required_nonblank(name, "use.name")?),
@@ -520,10 +648,11 @@ pub fn do_node_from_pb(node: &pb::DoNode) -> Result<DoNode, ConvertError> {
                         .as_ref()
                         .ok_or(ConvertError::Missing("acting.identity"))?,
                 )?,
-                body: Box::new(do_node_from_pb(
+                body: Box::new(do_node_from_pb_at(
                     x.body
                         .as_deref()
                         .ok_or(ConvertError::Missing("acting.body"))?,
+                    depth + 1,
                 )?),
             },
             Kind::Fail(f) => DoNode::Fail(failure_from_pb(f)?),
@@ -543,7 +672,7 @@ fn step_ref_to_pb(step: &StepRef) -> pb::StepRef {
 fn step_ref_from_pb(step: &pb::StepRef) -> Result<StepRef, ConvertError> {
     Ok(StepRef {
         name: required_nonblank(&step.name, "step.name")?,
-        arg: step.arg.as_ref().map(value_from_pb_checked).transpose()?,
+        arg: step.arg.as_ref().map(value_from_pb).transpose()?,
     })
 }
 
@@ -594,11 +723,7 @@ fn operation_template_from_pb(
                 .as_ref()
                 .ok_or(ConvertError::Missing("operation.output"))?,
         )?,
-        literal_input: op
-            .literal_input
-            .as_ref()
-            .map(value_from_pb_checked)
-            .transpose()?,
+        literal_input: op.literal_input.as_ref().map(value_from_pb).transpose()?,
     })
 }
 
@@ -652,7 +777,7 @@ pub fn failure_kind(f: &Failure) -> &'static str {
         Failure::ApprovalPending { .. } => "approval_pending",
         Failure::Timeout => "timeout",
         Failure::Cancelled => "cancelled",
-        Failure::Quarantined { .. } => "quarantined",
+        Failure::OutcomeUnknown { .. } => "outcome_unknown",
         Failure::InvalidInput { .. } => "invalid_input",
         Failure::HandlerError { .. } => "handler_error",
         Failure::KernelNamespaceProtected => "kernel_namespace_protected",
@@ -684,8 +809,11 @@ pub fn failure_to_pb(f: &Failure) -> pb::Failure {
         }),
         Failure::Timeout => Kind::Timeout(Marker {}),
         Failure::Cancelled => Kind::Cancelled(Marker {}),
-        Failure::Quarantined { op_id, reason } => Kind::Quarantined(wire::Quarantined {
-            op_id: op_id.clone(),
+        Failure::OutcomeUnknown {
+            operation_ids,
+            reason,
+        } => Kind::OutcomeUnknown(wire::OutcomeUnknown {
+            operation_ids: operation_ids.clone(),
             reason: reason.clone(),
         }),
         Failure::InvalidInput { reason } => Kind::InvalidInput(reason.clone()),
@@ -737,8 +865,8 @@ pub fn failure_from_pb(f: &pb::Failure) -> Result<Failure, ConvertError> {
             },
             Kind::Timeout(_) => Failure::Timeout,
             Kind::Cancelled(_) => Failure::Cancelled,
-            Kind::Quarantined(detail) => Failure::Quarantined {
-                op_id: detail.op_id.clone(),
+            Kind::OutcomeUnknown(detail) => Failure::OutcomeUnknown {
+                operation_ids: detail.operation_ids.clone(),
                 reason: detail.reason.clone(),
             },
             Kind::InvalidInput(reason) => Failure::InvalidInput {
@@ -791,7 +919,9 @@ use pb::external as ext;
 use xolotl_types::external::{
     AckStatus, ApplyStatus, CommandResult, ConfigAxis, ControlFrame, ErrorInfo, EventAck,
     FlowSignal, InboundEvent, Invoke, InvokeResult, OutboundCommand, RejectReason, Role, RoleReady,
-    RoleSessionClientHello, SessionContext,
+    RoleSessionClientHello, SessionContext, SourceStreamOperation, SourceStreamOutcome,
+    SourceStreamRejectCode, SourceStreamRejected, SourceStreamRequest, SourceStreamResult,
+    SourceStreamSnapshot, SourceStreamState,
 };
 
 fn required_value_from_pb(
@@ -800,7 +930,7 @@ fn required_value_from_pb(
 ) -> Result<Value, ConvertError> {
     value
         .ok_or(ConvertError::Missing(field))
-        .and_then(value_from_pb_checked)
+        .and_then(value_from_pb)
 }
 
 fn required_nonblank(value: &str, field: &'static str) -> Result<String, ConvertError> {
@@ -842,7 +972,7 @@ pub fn role_session_client_hello_from_pb(
         config_schema: hello
             .config_schema
             .as_ref()
-            .map(value_from_pb_checked)
+            .map(value_from_pb)
             .transpose()?,
     })
 }
@@ -861,6 +991,9 @@ pub fn session_context_to_pb(ctx: &SessionContext) -> ext::SessionContext {
         presentation_config_generation: ctx.presentation_config_generation,
         alias_catalog_generation: ctx.alias_catalog_generation,
         session_id: ctx.session_id.clone(),
+        scope_epoch: ctx.scope_epoch,
+        installation_epoch: ctx.installation_epoch,
+        key_epoch: ctx.key_epoch,
     }
 }
 
@@ -869,10 +1002,19 @@ pub fn session_context_from_pb(ctx: &ext::SessionContext) -> Result<SessionConte
     if ctx.session_id.trim().is_empty() {
         return Err(ConvertError::Missing("session_id"));
     }
+    let role = role_from_pb(ctx.role)?;
+    if ctx.installation_epoch == 0 {
+        return Err(ConvertError::Range("session_context.installation_epoch"));
+    }
+    if (role == Role::Source && ctx.scope_epoch == 0)
+        || (role == Role::Provider && ctx.scope_epoch != 0)
+    {
+        return Err(ConvertError::Range("session_context.scope_epoch"));
+    }
     Ok(SessionContext {
         installation_id: ctx.installation_id.clone(),
         projection_id: ctx.projection_id.clone(),
-        role: role_from_pb(ctx.role)?,
+        role,
         registry_hash: ctx.registry_hash.clone(),
         credential_generation: ctx.credential_generation,
         binding_generation: ctx.binding_generation,
@@ -881,6 +1023,9 @@ pub fn session_context_from_pb(ctx: &ext::SessionContext) -> Result<SessionConte
         presentation_config_generation: ctx.presentation_config_generation,
         alias_catalog_generation: ctx.alias_catalog_generation,
         session_id: ctx.session_id.clone(),
+        scope_epoch: ctx.scope_epoch,
+        installation_epoch: ctx.installation_epoch,
+        key_epoch: ctx.key_epoch,
     })
 }
 
@@ -912,6 +1057,7 @@ pub fn inbound_event_to_pb(event: &InboundEvent) -> ext::InboundEvent {
         observed: Some(observed_generations_to_pb(&event.observed)),
         stream_id: event.stream_id.clone(),
         seq: event.seq,
+        stream_epoch: event.stream_epoch,
     }
 }
 
@@ -929,6 +1075,212 @@ pub fn inbound_event_from_pb(event: &ext::InboundEvent) -> Result<InboundEvent, 
         ),
         stream_id: event.stream_id.clone(),
         seq: event.seq,
+        stream_epoch: event.stream_epoch,
+    })
+}
+
+/// Runtime Source stream lifecycle request to v1 wire form.
+pub fn source_stream_request_to_pb(request: &SourceStreamRequest) -> ext::SourceStreamRequest {
+    let operation = match request.operation {
+        SourceStreamOperation::Inspect => {
+            ext::source_stream_request::Operation::Inspect(ext::SourceStreamInspect {})
+        }
+        SourceStreamOperation::Open { expected_revision } => {
+            ext::source_stream_request::Operation::Open(ext::SourceStreamOpen { expected_revision })
+        }
+        SourceStreamOperation::Retire { stream_epoch } => {
+            ext::source_stream_request::Operation::Retire(ext::SourceStreamRetire { stream_epoch })
+        }
+    };
+    ext::SourceStreamRequest {
+        request_id: request.request_id.clone(),
+        stream_id: request.stream_id.clone(),
+        operation: Some(operation),
+    }
+}
+
+/// V1 wire Source stream lifecycle request to runtime form.
+pub fn source_stream_request_from_pb(
+    request: &ext::SourceStreamRequest,
+) -> Result<SourceStreamRequest, ConvertError> {
+    let operation = match request
+        .operation
+        .as_ref()
+        .ok_or(ConvertError::Missing("source_stream_request.operation"))?
+    {
+        ext::source_stream_request::Operation::Inspect(_) => SourceStreamOperation::Inspect,
+        ext::source_stream_request::Operation::Open(open) => SourceStreamOperation::Open {
+            expected_revision: open.expected_revision,
+        },
+        ext::source_stream_request::Operation::Retire(retire) => SourceStreamOperation::Retire {
+            stream_epoch: retire.stream_epoch,
+        },
+    };
+    Ok(SourceStreamRequest {
+        request_id: request.request_id.clone(),
+        stream_id: request.stream_id.clone(),
+        operation,
+    })
+}
+
+fn source_stream_snapshot_to_pb(snapshot: &SourceStreamSnapshot) -> ext::SourceStreamSnapshot {
+    ext::SourceStreamSnapshot {
+        revision: snapshot.revision,
+        active: snapshot
+            .active
+            .as_ref()
+            .map(|active| ext::SourceStreamState {
+                stream_epoch: active.stream_epoch,
+                last_seq: active.last_seq,
+                open_id: active.open_id.clone(),
+                opened_at_revision: active.opened_at_revision,
+            }),
+    }
+}
+
+fn source_stream_snapshot_from_pb(
+    snapshot: &ext::SourceStreamSnapshot,
+) -> Result<SourceStreamSnapshot, ConvertError> {
+    let active = snapshot
+        .active
+        .as_ref()
+        .map(|active| {
+            if active.stream_epoch == 0 {
+                return Err(ConvertError::Range("source_stream_state.stream_epoch"));
+            }
+            if active.last_seq > i64::MAX as u64 {
+                return Err(ConvertError::Range("source_stream_state.last_seq"));
+            }
+            Ok(SourceStreamState {
+                stream_epoch: active.stream_epoch,
+                last_seq: active.last_seq,
+                open_id: required_nonblank(&active.open_id, "source_stream_state.open_id")?,
+                opened_at_revision: active.opened_at_revision,
+            })
+        })
+        .transpose()?;
+    Ok(SourceStreamSnapshot {
+        revision: snapshot.revision,
+        active,
+    })
+}
+
+fn source_stream_reject_code_to_pb(code: SourceStreamRejectCode) -> ext::SourceStreamRejectCode {
+    match code {
+        SourceStreamRejectCode::InvalidStreamId => ext::SourceStreamRejectCode::InvalidStreamId,
+        SourceStreamRejectCode::InvalidRequestId => ext::SourceStreamRejectCode::InvalidRequestId,
+        SourceStreamRejectCode::InvalidEpoch => ext::SourceStreamRejectCode::InvalidEpoch,
+        SourceStreamRejectCode::ScopeInactive => ext::SourceStreamRejectCode::ScopeInactive,
+        SourceStreamRejectCode::RevisionConflict => ext::SourceStreamRejectCode::RevisionConflict,
+        SourceStreamRejectCode::AlreadyOpen => ext::SourceStreamRejectCode::AlreadyOpen,
+        SourceStreamRejectCode::QuotaExceeded => ext::SourceStreamRejectCode::QuotaExceeded,
+        SourceStreamRejectCode::Inactive => ext::SourceStreamRejectCode::Inactive,
+        SourceStreamRejectCode::StaleEpoch => ext::SourceStreamRejectCode::StaleEpoch,
+        SourceStreamRejectCode::StorageUnavailable => {
+            ext::SourceStreamRejectCode::StorageUnavailable
+        }
+        SourceStreamRejectCode::OutcomeUnknown => ext::SourceStreamRejectCode::OutcomeUnknown,
+    }
+}
+
+fn source_stream_reject_code_from_pb(code: i32) -> Result<SourceStreamRejectCode, ConvertError> {
+    Ok(
+        match ext::SourceStreamRejectCode::try_from(code)
+            .map_err(|_error| ConvertError::Enum("source_stream_rejected.code"))?
+        {
+            ext::SourceStreamRejectCode::Unspecified => {
+                return Err(ConvertError::Enum("source_stream_rejected.code"));
+            }
+            ext::SourceStreamRejectCode::InvalidStreamId => SourceStreamRejectCode::InvalidStreamId,
+            ext::SourceStreamRejectCode::InvalidRequestId => {
+                SourceStreamRejectCode::InvalidRequestId
+            }
+            ext::SourceStreamRejectCode::InvalidEpoch => SourceStreamRejectCode::InvalidEpoch,
+            ext::SourceStreamRejectCode::ScopeInactive => SourceStreamRejectCode::ScopeInactive,
+            ext::SourceStreamRejectCode::RevisionConflict => {
+                SourceStreamRejectCode::RevisionConflict
+            }
+            ext::SourceStreamRejectCode::AlreadyOpen => SourceStreamRejectCode::AlreadyOpen,
+            ext::SourceStreamRejectCode::QuotaExceeded => SourceStreamRejectCode::QuotaExceeded,
+            ext::SourceStreamRejectCode::Inactive => SourceStreamRejectCode::Inactive,
+            ext::SourceStreamRejectCode::StaleEpoch => SourceStreamRejectCode::StaleEpoch,
+            ext::SourceStreamRejectCode::StorageUnavailable => {
+                SourceStreamRejectCode::StorageUnavailable
+            }
+            ext::SourceStreamRejectCode::OutcomeUnknown => SourceStreamRejectCode::OutcomeUnknown,
+        },
+    )
+}
+
+/// Runtime Source stream lifecycle result to v1 wire form.
+pub fn source_stream_result_to_pb(result: &SourceStreamResult) -> ext::SourceStreamResult {
+    let outcome = match &result.outcome {
+        SourceStreamOutcome::Inspected(snapshot) => {
+            ext::source_stream_result::Outcome::Inspected(source_stream_snapshot_to_pb(snapshot))
+        }
+        SourceStreamOutcome::Opened(snapshot) => {
+            ext::source_stream_result::Outcome::Opened(source_stream_snapshot_to_pb(snapshot))
+        }
+        SourceStreamOutcome::Retired { revision } => {
+            ext::source_stream_result::Outcome::Retired(ext::SourceStreamRetired {
+                revision: *revision,
+            })
+        }
+        SourceStreamOutcome::Rejected(rejected) => {
+            ext::source_stream_result::Outcome::Rejected(ext::SourceStreamRejected {
+                code: source_stream_reject_code_to_pb(rejected.code) as i32,
+                current_revision: rejected.current_revision,
+                active_epoch: rejected.active_epoch,
+                current: rejected.current.as_ref().map(source_stream_snapshot_to_pb),
+            })
+        }
+    };
+    ext::SourceStreamResult {
+        request_id: result.request_id.clone(),
+        stream_id: result.stream_id.clone(),
+        outcome: Some(outcome),
+    }
+}
+
+/// V1 wire Source stream lifecycle result to runtime form.
+pub fn source_stream_result_from_pb(
+    result: &ext::SourceStreamResult,
+) -> Result<SourceStreamResult, ConvertError> {
+    let outcome = match result
+        .outcome
+        .as_ref()
+        .ok_or(ConvertError::Missing("source_stream_result.outcome"))?
+    {
+        ext::source_stream_result::Outcome::Inspected(snapshot) => {
+            SourceStreamOutcome::Inspected(source_stream_snapshot_from_pb(snapshot)?)
+        }
+        ext::source_stream_result::Outcome::Opened(snapshot) => {
+            let snapshot = source_stream_snapshot_from_pb(snapshot)?;
+            if snapshot.active.is_none() {
+                return Err(ConvertError::Missing("source_stream_result.opened.active"));
+            }
+            SourceStreamOutcome::Opened(snapshot)
+        }
+        ext::source_stream_result::Outcome::Retired(retired) => SourceStreamOutcome::Retired {
+            revision: retired.revision,
+        },
+        ext::source_stream_result::Outcome::Rejected(rejected) => {
+            SourceStreamOutcome::Rejected(SourceStreamRejected {
+                code: source_stream_reject_code_from_pb(rejected.code)?,
+                current_revision: rejected.current_revision,
+                active_epoch: rejected.active_epoch,
+                current: rejected
+                    .current
+                    .as_ref()
+                    .map(source_stream_snapshot_from_pb)
+                    .transpose()?,
+            })
+        }
+    };
+    Ok(SourceStreamResult {
+        request_id: result.request_id.clone(),
+        stream_id: result.stream_id.clone(),
+        outcome,
     })
 }
 
@@ -979,7 +1331,7 @@ pub fn invoke_result_to_pb(r: &InvokeResult) -> ext::InvokeResult {
 /// Wire `InvokeResult` → `InvokeResult`.
 pub fn invoke_result_from_pb(r: &ext::InvokeResult) -> Result<InvokeResult, ConvertError> {
     let outcome = match &r.outcome {
-        Some(ext::invoke_result::Outcome::Success(v)) => Ok(value_from_pb_checked(v)?),
+        Some(ext::invoke_result::Outcome::Success(v)) => Ok(value_from_pb(v)?),
         Some(ext::invoke_result::Outcome::Error(e)) => Err(error_info_from_pb(e)?),
         None => return Err(ConvertError::Missing("invoke_result.outcome")),
     };
@@ -1026,7 +1378,7 @@ pub fn command_result_to_pb(r: &CommandResult) -> ext::CommandResult {
 /// Wire `CommandResult` -> `CommandResult`.
 pub fn command_result_from_pb(r: &ext::CommandResult) -> Result<CommandResult, ConvertError> {
     let outcome = match &r.outcome {
-        Some(ext::command_result::Outcome::Success(v)) => Ok(value_from_pb_checked(v)?),
+        Some(ext::command_result::Outcome::Success(v)) => Ok(value_from_pb(v)?),
         Some(ext::command_result::Outcome::Error(e)) => Err(error_info_from_pb(e)?),
         None => return Err(ConvertError::Missing("command_result.outcome")),
     };
@@ -1042,6 +1394,7 @@ pub fn event_ack_to_pb(ack: &EventAck) -> ext::EventAck {
         id: ack.id.clone(),
         status: ack_status_to_pb(ack.status) as i32,
         reject_reason: ack.reject_reason.clone(),
+        stream_epoch: ack.stream_epoch,
     }
 }
 
@@ -1051,6 +1404,7 @@ pub fn event_ack_from_pb(ack: &ext::EventAck) -> Result<EventAck, ConvertError> 
         id: ack.id.clone(),
         status: ack_status_from_pb(ack.status)?,
         reject_reason: ack.reject_reason.clone(),
+        stream_epoch: ack.stream_epoch,
     })
 }
 
@@ -1216,6 +1570,7 @@ fn ack_status_to_pb(status: AckStatus) -> ext::AckStatus {
         AckStatus::Accepted => ext::AckStatus::Accepted,
         AckStatus::Duplicate => ext::AckStatus::Duplicate,
         AckStatus::Rejected => ext::AckStatus::Rejected,
+        AckStatus::OutcomeUnknown => ext::AckStatus::OutcomeUnknown,
     }
 }
 
@@ -1224,6 +1579,7 @@ fn ack_status_from_pb(status: i32) -> Result<AckStatus, ConvertError> {
         ext::AckStatus::Accepted => Ok(AckStatus::Accepted),
         ext::AckStatus::Duplicate => Ok(AckStatus::Duplicate),
         ext::AckStatus::Rejected => Ok(AckStatus::Rejected),
+        ext::AckStatus::OutcomeUnknown => Ok(AckStatus::OutcomeUnknown),
         ext::AckStatus::Unspecified => Err(ConvertError::Enum("ack.status")),
     }
 }

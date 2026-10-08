@@ -22,88 +22,50 @@
 #[cfg(feature = "application-grpc")]
 mod application;
 mod config;
-#[cfg(any(feature = "external-gateway", feature = "application-grpc"))]
+mod console_maintenance;
+#[cfg(any(feature = "external-grpc", feature = "external-websocket"))]
+mod external;
+#[cfg(feature = "federation-grpc")]
+mod federation;
+#[cfg(feature = "federation-grpc")]
+mod federation_cancellation;
+#[cfg(feature = "federation-grpc")]
+mod federation_catalog;
+#[cfg(feature = "federation-grpc")]
+mod federation_outbound;
+mod host_lifecycle;
+mod projection;
+#[cfg(any(feature = "external-grpc", feature = "external-websocket"))]
+mod source_maintenance;
+mod state_maintenance;
+#[cfg(any(
+    feature = "external-grpc",
+    feature = "external-websocket",
+    feature = "application-grpc",
+    feature = "federation-grpc"
+))]
 mod transport;
 
 use anyhow::Result;
-use config::XolotlConfig;
-#[cfg(feature = "external-gateway")]
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
-#[cfg(feature = "external-gateway")]
-use std::collections::HashMap;
-#[cfg(feature = "external-gateway")]
-use std::collections::btree_map::Entry;
+use config::{StorageHistoryMode, StorageKind, XolotlConfig};
 use std::fmt;
 use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
-#[cfg(feature = "external-gateway")]
-use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
-#[cfg(feature = "external-gateway")]
-use tokio::sync::oneshot;
 use xolotl_console::{
     BootstrapOutcome, ConsoleState, ConsoleTransportSecurityConfig, PairingSecretDisplay,
     RootProvisioning,
 };
-#[cfg(all(test, feature = "external-gateway"))]
-use xolotl_gateway::external::SourceCommandRegister;
-#[cfg(feature = "external-gateway")]
-use xolotl_gateway::external::{
-    EndpointSession, ExternalCredential, ExternalSessionHandler, ExternalSessionOutbound,
-    ProviderInvocationError, ProviderInvocationRegister, ProviderInvocationRegistry,
-    ProviderInvocationResolve, SecureEnvelope, SecureEnvelopeEpochGate, SecureEnvelopeReplayWindow,
-    SourceCommandError, SourceCommandRegistry, SourceCommandResolve, SourceIngest,
-    SourceIngestError, ingest_source_event, validate_json_schema,
-};
-#[cfg(feature = "external-websocket")]
-use xolotl_gateway_websocket::{ExternalWebSocketConfig, ExternalWebSocketService};
-#[cfg(feature = "external-gateway")]
-use xolotl_kernel::PolicySnapshot;
-#[cfg(feature = "external-gateway")]
-use xolotl_kernel::driver::{DriverDescriptor, DriverError, RemoteEndpoint, RemoteInvokeDispatch};
-#[cfg(feature = "external-gateway")]
-use xolotl_kernel::{EchoDriver, Registry, ResolveError};
-use xolotl_sdk::{Backend, Bootstrap, FactSink, Kernel};
+use xolotl_sdk::{Backend, Bootstrap, FactSink, InMemoryOptions, KernelBuilder, MemoryHistory};
+use xolotl_source::SourceStore;
 use xolotl_standard::{
-    InProcessProjectionInstallEntry, InProcessProjectionInstalled, InstallError,
-    PairingDisplayEdge, StandardConfig, install_declared_in_process_projections,
-    install_in_process_projection_value, install_standard,
+    PairingDisplayEdge, StandardConfig, install_declared_in_process_projections, install_standard,
 };
-use xolotl_state::StateEvent;
-use xolotl_storage_redb::RedbStore;
-#[cfg(feature = "external-gateway")]
-use xolotl_types::Value;
-#[cfg(all(test, feature = "external-gateway"))]
-use xolotl_types::external::ObservedGenerations;
-#[cfg(all(test, feature = "external-gateway"))]
-use xolotl_types::external::OutboundCommand;
-#[cfg(feature = "external-gateway")]
-use xolotl_types::external::{
-    AckStatus, EventAck, ExternalInstallationDef, ExternalProjectionDef, InboundEvent, Role,
-    RoleSessionClientHello, SessionContext,
-};
-#[cfg(feature = "external-gateway")]
-use xolotl_types::external::{
-    CommandResult, ConfigAxis, ControlFrame, EffectCapability, Invoke, InvokeResult,
-};
-#[cfg(feature = "external-gateway")]
-use xolotl_types::{
-    Binding, CostModel, DriverRef, Interface, InterfaceFamily, InterfaceSet, Metadata, Method,
-    MethodId, ModalitySet, OutputModeSet, Resource, ResourceDescriptor, ResourceKind, ResourceName,
-    ResourceSelector, SchemaId, Transport,
-};
-#[cfg(feature = "external-gateway")]
-use xolotl_types::{IdentityRef, ResourceId};
-use xolotl_types::{InProcessProjectionPhase, InProcessProjectionStatus, Path};
+use xolotl_storage_redb::{RedbHistory, RedbOptions, RedbStore};
 
 const CONSOLE_ADDR_ENV: &str = "XOLOTL_CONSOLE_ADDR";
-#[cfg(feature = "external-websocket")]
-const EXTERNAL_WEBSOCKET_ADDR_ENV: &str = "XOLOTL_EXTERNAL_WEBSOCKET_ADDR";
-#[cfg(feature = "external-grpc")]
-const EXTERNAL_GRPC_ADDR_ENV: &str = "XOLOTL_EXTERNAL_GRPC_ADDR";
 
 const USAGE: &str = "\
 xolotld — the Xolotl host process
@@ -215,263 +177,856 @@ async fn serve() -> Result<()> {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting xolotld");
 
     let cfg = XolotlConfig::load()?.unwrap_or_default();
+    #[cfg(feature = "federation-grpc")]
+    let federation_publisher = federation::prepare(&cfg)?;
+    let credential_sealer = cfg
+        .console
+        .load_credential_sealer(cfg.storage.kind == StorageKind::Redb)?;
+    let history_maintenance = cfg.storage.history_maintenance()?;
     #[cfg(not(feature = "application-grpc"))]
     if optional_env_var("XOLOTL_APPLICATION_GRPC_ADDR")?.is_some() {
         anyhow::bail!("XOLOTL_APPLICATION_GRPC_ADDR requires the application-grpc build feature");
     }
 
+    // Select one blocking admission domain for Kernel work and redb State reads.
+    let host_blocking = Arc::new(xolotl_kernel::host::TokioBlockingSpawner::default());
+    let host_runtime = xolotl_kernel::host::HostRuntime::tokio_with_blocking(host_blocking.clone());
     // Open the state backend and fact sink.
-    #[cfg(feature = "durable")]
-    let mut checkpoint_store = None;
-    let (state, facts): (Backend, FactSink) = match cfg.storage.kind.as_str() {
-        "memory" => {
-            tracing::info!("state + facts: in-memory (non-persistent)");
-            (
-                xolotl_sdk::InMemoryBackend::new().into_backend(),
-                FactSink::in_memory().0,
-            )
-        }
-        _ => {
-            let store = RedbStore::open(&cfg.storage.path)
-                .map_err(|e| anyhow::anyhow!("open storage '{}': {e}", cfg.storage.path))?;
-            #[cfg(feature = "durable")]
-            {
-                checkpoint_store = Some(
-                    Arc::new(store.checkpoint_store()) as Arc<dyn xolotl_sdk::CheckpointStore>
-                );
-            }
-            tracing::info!(path = %cfg.storage.path, "state + facts: redb");
-            let fact_store = store
-                .fact_store()
-                .map_err(|e| anyhow::anyhow!("open fact store: {e}"))?;
-            (
-                store.state_backend().into_backend(),
-                FactSink::new(Arc::new(fact_store)),
-            )
-        }
-    };
-
-    // Build the kernel, root Process, and standard providers.
-    let kernel = Kernel::with_backends(state, facts);
-    #[cfg(feature = "durable")]
-    let kernel = match checkpoint_store {
-        Some(store) => kernel.with_checkpoint_store(store),
-        None => kernel,
-    };
-    let boot = Arc::new(Bootstrap::from_kernel(kernel));
-    #[cfg(feature = "durable")]
-    boot.reserve_checkpoint_process_ids()?;
-    let pairing_display = PairingDisplayEdge::default();
-    let object_path = cfg
+    let mut identity_directory: Option<Arc<dyn xolotl_kernel::IdentityDirectory>> = None;
+    #[cfg(feature = "federation-grpc")]
+    let mut federation_store: Option<xolotl_storage_redb::RedbFederationStore> = None;
+    #[cfg(feature = "federation-grpc")]
+    let mut federation_public_follow_store: Option<
+        xolotl_storage_redb::RedbPublicFollowerStore,
+    > = None;
+    #[cfg(feature = "federation-grpc")]
+    let mut federation_guest_follow_store: Option<xolotl_storage_redb::RedbGuestFollowerStore> =
+        None;
+    #[cfg(feature = "federation-grpc")]
+    let mut federation_projection: Option<xolotl_storage_redb::RedbFederationStateProjection> =
+        None;
+    #[cfg(feature = "application-grpc")]
+    let application_requests: Arc<dyn xolotl_gateway::GatewayIdempotencyStore>;
+    let session_policy = cfg.console.auth.session_policy()?;
+    let console_sessions: Arc<dyn xolotl_console::session_store::ConsoleSessionStore>;
+    let observation_limits = cfg
         .storage
-        .object_path
-        .as_ref()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::Path::new(&cfg.storage.path).with_extension("objects"));
-    let objects = xolotl_storage_fs::FileObjectStore::open(&object_path).map_err(|error| {
-        anyhow::anyhow!("open object storage '{}': {error}", object_path.display())
-    })?;
-    let objects = objects.into_object_store();
-    #[cfg(feature = "application-grpc")]
-    let application_objects = objects.clone();
-    let standard_config = standard_config(pairing_display.clone()).with_object_store(objects);
-    install_standard(&boot, &standard_config)?;
-    let projection_report =
-        install_declared_in_process_projections(&boot, &standard_config).await?;
-    let declared_projections = projection_report.installed_count();
-    let rejected_projections = projection_report.rejected_count();
-    reconcile_in_process_projection_report_status(&boot, projection_report.entries).await?;
-    if declared_projections > 0 || rejected_projections > 0 {
-        tracing::info!(
-            projections = declared_projections,
-            rejected = rejected_projections,
-            "in-process projection declarations reconciled"
-        );
-    }
-    tracing::info!(
-        resources = boot.kernel.registry.resource_count(),
-        "kernel ready"
-    );
-
-    let root_provisioning = RootProvisioning {
-        password_hash: cfg.console.root.password_hash.clone(),
-        password: cfg.console.root.password.clone(),
-        pubkeys: cfg.console.root.pubkeys.clone(),
-    };
-    if xolotl_console::root_random_password_needed(&boot, &root_provisioning).await?
-        && !std::io::stderr().is_terminal()
-    {
-        anyhow::bail!(
-            "refusing to bootstrap root with a random password because stderr is not a TTY; set console.root.password_hash, console.root.password, or console.root.pubkeys in xolotl.toml"
-        );
-    }
-    let root_bootstrap = xolotl_console::bootstrap_root_account(&boot, root_provisioning).await?;
-    match root_bootstrap {
-        BootstrapOutcome::AlreadyPresent => {}
-        BootstrapOutcome::CreatedPreseeded { username } => {
-            tracing::info!(%username, "console root account bootstrapped from config");
+        .observations
+        .map(|settings| settings.limits())
+        .transpose()?;
+    let (state, facts, execution_ids, source_store): (
+        Backend,
+        FactSink,
+        xolotl_sdk::runtime::ExecutionIds,
+        Arc<dyn SourceStore>,
+    ) = match cfg.storage.kind {
+        StorageKind::Memory => {
+            console_sessions = Arc::new(
+                xolotl_console::session_store::MemoryConsoleSessionStore::new(session_policy),
+            );
+            #[cfg(feature = "application-grpc")]
+            {
+                application_requests =
+                    Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::new(
+                        cfg.application_gateway.request_storage.limits()?,
+                    )?);
+            }
+            tracing::info!(
+                observations = observation_limits.is_some(),
+                "state: in-memory (non-persistent)"
+            );
+            let history = match cfg.storage.state_history {
+                StorageHistoryMode::CurrentOnly => MemoryHistory::Disabled,
+                StorageHistoryMode::Full => MemoryHistory::Full,
+            };
+            let memory = xolotl_sdk::InMemoryBackend::with_options(InMemoryOptions {
+                history,
+                source_stream_limit: cfg.storage.source_stream_limit,
+                source_retention_limit: cfg.storage.source_retention_limit,
+                absence_limits: cfg.storage.absence_limits(),
+                ..InMemoryOptions::default()
+            })?;
+            let (state, source) = memory.into_source_parts();
+            let execution_ids = xolotl_sdk::runtime::ExecutionIds::new(Arc::new(
+                xolotl_sdk::runtime::InMemoryExecutionIdSource::default(),
+            ));
+            let facts = match observation_limits {
+                Some(limits) => FactSink::new(Arc::new(
+                    xolotl_sdk::runtime::InMemoryFactStore::with_limits(limits)?,
+                )),
+                None => FactSink::disabled(execution_ids.clone()),
+            };
+            (state, facts, execution_ids, source)
         }
-        BootstrapOutcome::CreatedFromProvisionedPassword { username } => {
-            tracing::info!(%username, "console root account bootstrapped from provisioned password");
-        }
-        BootstrapOutcome::CreatedRandomPassword { username, password } => {
-            write_bootstrap_credentials(&username, &password)?;
-        }
-    }
-
-    // Recover unfinished Processes from their Fact streams, quarantining unsafe
-    // non-idempotent replays.
-    let recovery = boot.recover_all().await?;
-    if recovery.skipped + recovery.retried + recovery.quarantined > 0 {
-        tracing::info!(
-            skipped = recovery.skipped,
-            retried = recovery.retried,
-            quarantined = recovery.quarantined,
-            schema_mismatched = recovery.schema_mismatched,
-            "recovery complete"
-        );
-    }
-
-    #[cfg(feature = "application-grpc")]
-    let application =
-        application::ApplicationGateway::start(&cfg, boot.clone(), application_objects).await?;
-
-    // Start gateways.
-    let mut handles = Vec::new();
-    #[cfg(feature = "durable")]
-    if boot.kernel.checkpoint_store().is_some() {
-        let mut programs = boot.checkpoint_recovery()?;
-        handles.push(tokio::spawn(async move {
-            loop {
-                match programs.advance().await {
-                    Ok(report) => {
-                        if report.resumed + report.quarantined > 0 {
-                            tracing::info!(
-                                resumed = report.resumed,
-                                quarantined = report.quarantined,
-                                deferred = report.deferred,
-                                "portable checkpoint recovery advanced"
-                            );
-                        }
-                        if report.complete {
-                            break;
-                        }
-                        if report.deferred != 0 {
-                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                        } else {
-                            tokio::task::yield_now().await;
-                        }
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "checkpoint recovery advance failed; retrying");
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
+        StorageKind::Redb => {
+            let history = match cfg.storage.state_history {
+                StorageHistoryMode::CurrentOnly => RedbHistory::CurrentOnly,
+                StorageHistoryMode::Full => RedbHistory::Full,
+            };
+            let store = RedbStore::open_with_options_and_spawner(
+                &cfg.storage.path,
+                RedbOptions {
+                    history,
+                    source_stream_limit: cfg.storage.source_stream_limit,
+                    source_retention_limit: cfg.storage.source_retention_limit,
+                    federation_publish_id_limit: cfg.storage.federation_publish_id_limit,
+                    absence_limits: cfg.storage.absence_limits(),
+                },
+                host_runtime.blocking_spawner(),
+            )
+            .map_err(|e| anyhow::anyhow!("open storage '{}': {e}", cfg.storage.path))?;
+            console_sessions = Arc::new(store.console_session_store(session_policy)?);
+            #[cfg(feature = "application-grpc")]
+            {
+                application_requests = Arc::new(store.gateway_idempotency_store(
+                    cfg.application_gateway.request_storage.limits()?,
+                )?);
+            }
+            #[cfg(feature = "federation-grpc")]
+            if let Some(publisher) = &federation_publisher {
+                federation_store = Some(store.federation_store(publisher.node_id())?);
+                if publisher.needs_public_follow_store() {
+                    federation_public_follow_store =
+                        Some(store.public_follower_store(publisher.node_id())?);
+                }
+                if publisher.needs_guest_follow_store() {
+                    federation_guest_follow_store =
+                        Some(store.guest_follower_store(publisher.node_id())?);
+                }
+                if publisher.needs_projection() {
+                    federation_projection =
+                        Some(store.federation_state_projection(publisher.node_id())?);
                 }
             }
-        }));
-    }
-    handles
-        .push(start_in_process_projection_reconciler(boot.clone(), standard_config.clone()).await?);
-
-    let console_addr = match cfg.server.console_addr.clone() {
-        Some(addr) => Some(addr),
-        None => optional_env_var(CONSOLE_ADDR_ENV)?,
+            identity_directory = Some(Arc::new(store.identity_directory()));
+            tracing::info!(path = %cfg.storage.path, observations = observation_limits.is_some(), "state: redb");
+            let execution_ids =
+                xolotl_sdk::runtime::ExecutionIds::new(Arc::new(store.execution_id_source()));
+            let facts = match observation_limits {
+                Some(limits) => FactSink::new(Arc::new(store.fact_store_with_limits(limits)?)),
+                None => FactSink::disabled(execution_ids.clone()),
+            };
+            let (state, source) = store.state_backend().into_source_parts();
+            (state, facts, execution_ids, source)
+        }
     };
-    if let Some(addr) = console_addr {
-        let security = cfg
-            .console
-            .transport_security
-            .validate_plain_listener("console", &addr)?;
-        let listener = TcpListener::bind(security.listen_addr).await?;
-        log_console_transport_security(&addr, &security.config);
-        let state = ConsoleState::shared_with_pairing_display_and_config(
-            boot.clone(),
-            Arc::new(StandardPairingSecretDisplay(pairing_display.clone())),
-            cfg.console.auth.clone().into(),
-            cfg.console.ws.clone().into(),
-            security.config,
-        )
-        .map_err(|e| anyhow::anyhow!("console auth initialization failed: {e}"))?;
-        tracing::info!(%addr, "console (management Gateway) listening");
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = xolotl_console::serve(listener, state).await {
-                tracing::error!(?e, "console exited");
+    if history_maintenance.is_some() && !state.has_history_retention() {
+        anyhow::bail!("configured State history maintenance requires a retention capability");
+    }
+    let maintenance_state = history_maintenance.map(|_| state.clone());
+    // Build the kernel, root Process, and standard providers.
+    let builder = KernelBuilder::new(state)
+        .with_handle_slot_limit(cfg.kernel.max_handle_slots.get())
+        .with_host_runtime(host_runtime)
+        .with_fact_sink(facts)
+        .with_execution_ids(execution_ids)
+        .with_fact_io_mode(match cfg.storage.kind {
+            StorageKind::Memory => xolotl_sdk::FactIoMode::Inline,
+            StorageKind::Redb => xolotl_sdk::FactIoMode::Blocking,
+        });
+    let builder = match identity_directory {
+        Some(directory) => builder.with_identity_directory(directory),
+        None => builder,
+    };
+    let boot = Arc::new(Bootstrap::from_kernel(builder.build()));
+    host_lifecycle::supervise_host(&boot, &host_blocking, async |services| {
+        boot.kernel().identities().validate()?;
+        #[cfg(any(feature = "external-grpc", feature = "external-websocket"))]
+        let shared_source_commands = external::SharedSourceCommands::new(
+            boot.kernel().state().clone(),
+            source_store.clone(),
+            boot.kernel().registry().clone(),
+            cfg.external_gateway.source_command_limit,
+        );
+        let pairing_display = match cfg.storage.kind {
+            StorageKind::Memory => PairingDisplayEdge::default(),
+            StorageKind::Redb => {
+                let path =
+                    std::path::Path::new(&cfg.storage.path).with_extension("external-credentials");
+                let key = cfg.external_credentials.load_key(&cfg.console)?;
+                PairingDisplayEdge::open(&path, &key).map_err(|error| {
+                    anyhow::anyhow!(
+                        "open external credential vault '{}': {error}",
+                        path.display()
+                    )
+                })?
             }
-        }));
-    } else {
-        tracing::info!("{CONSOLE_ADDR_ENV} unset; console disabled");
-    }
+        };
+        let object_path = cfg
+            .storage
+            .object_path
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(&cfg.storage.path).with_extension("objects"));
+        let objects = xolotl_storage_fs::FileObjectStore::open(&object_path).map_err(|error| {
+            anyhow::anyhow!("open object storage '{}': {error}", object_path.display())
+        })?;
+        let objects = objects.into_object_store();
+        #[cfg(feature = "application-grpc")]
+        let application_objects = objects.clone();
+        #[cfg(feature = "federation-grpc")]
+        let federation_objects = objects.clone();
+        let standard_config = standard_config(pairing_display.clone())
+            .with_object_store(objects)
+            .with_external_installations(source_store.clone());
+        #[cfg(feature = "terminal")]
+        let standard_config = standard_config.with_terminal_runtime(services.terminal.clone());
+        install_standard(&boot, &standard_config)?;
+        let projection_report =
+            install_declared_in_process_projections(&boot, &standard_config).await?;
+        let declared_projections = projection_report.installed_count();
+        let rejected_projections = projection_report.rejected_count();
+        projection::reconcile_in_process_projection_report_status(&boot, projection_report.entries)
+            .await?;
+        if declared_projections > 0 || rejected_projections > 0 {
+            tracing::info!(
+                projections = declared_projections,
+                rejected = rejected_projections,
+                "in-process projection declarations reconciled"
+            );
+        }
+        tracing::info!(
+            resources = boot.kernel().registry().resource_count(),
+            "kernel ready"
+        );
 
-    #[cfg(feature = "external-websocket")]
-    start_external_websocket(&cfg, &boot, &mut handles).await?;
-    #[cfg(feature = "external-grpc")]
-    start_external_grpc(&cfg, &boot, &mut handles).await?;
-    // Mark the daemon ready.
-    tracing::info!("xolotld ready");
-    let shutdown = wait_for_shutdown().await;
-    #[cfg(feature = "application-grpc")]
-    if let Some(application) = application {
-        application.shutdown().await;
-    }
-    let shutdown_report = shutdown_background_tasks(handles).await;
-    tracing::debug!(
-        completed = shutdown_report.completed,
-        cancelled = shutdown_report.cancelled,
-        failed = shutdown_report.failed,
-        "background task shutdown complete"
-    );
+        let root_provisioning = RootProvisioning {
+            credential_sealer: Some(credential_sealer.clone()),
+            password_hash: cfg.console.root.password_hash.clone(),
+            password: cfg.console.root.password.clone(),
+            pubkeys: cfg.console.root.pubkeys.clone(),
+            additional_grants: cfg.console.root.additional_grants.clone(),
+        };
+        if xolotl_console::root_random_password_needed(&boot, &root_provisioning).await?
+            && !std::io::stderr().is_terminal()
+        {
+            anyhow::bail!(
+                "refusing to bootstrap root with a random password because stderr is not a TTY; set console.root.password_hash, console.root.password, or console.root.pubkeys in xolotl.toml"
+            );
+        }
+        let blocking_spawner = boot.kernel().host_runtime().blocking_spawner();
+        let root_bootstrap =
+            xolotl_console::bootstrap_root_account(&boot, blocking_spawner.as_ref(), root_provisioning)
+                .await?;
+        match root_bootstrap {
+            BootstrapOutcome::AlreadyPresent => {}
+            BootstrapOutcome::CreatedPreseeded { username } => {
+                tracing::info!(%username, "console root account bootstrapped from config");
+            }
+            BootstrapOutcome::CreatedFromProvisionedPassword { username } => {
+                tracing::info!(%username, "console root account bootstrapped from provisioned password");
+            }
+            BootstrapOutcome::CreatedRandomPassword { username, password } => {
+                write_bootstrap_credentials(&username, &password)?;
+            }
+        }
+
+        #[cfg(feature = "federation-grpc")]
+        if let (Some(prepared), Some(store)) = (&federation_publisher, &federation_store) {
+            services.federation_runtime = Some(prepared.transport_runtime(boot.kernel().host_runtime())?);
+            prepared.install_outbound(&boot, store)?;
+        }
+        #[cfg(feature = "federation-grpc")]
+        let federation_retirement_cursor = if let Some(store) = federation_store.as_ref() {
+            federation::retire_completed_outbound_pages(
+                boot.kernel().host_runtime(),
+                store.clone(),
+                None,
+            )
+            .await?
+        } else {
+            None
+        };
+
+        #[cfg(feature = "application-grpc")]
+        {
+            services.application =
+                application::ApplicationGateway::start(
+                    &cfg,
+                    boot.clone(),
+                    application_objects,
+                    application_requests,
+                ).await?;
+        }
+
+        // Start gateways.
+        #[cfg(feature = "federation-grpc")]
+        if let Some(store) = federation_store.as_ref() {
+            services.background.push(
+                "federation outbound retirement",
+                federation::start_outbound_retirement(
+                    boot.kernel().host_runtime().clone(),
+                    store.clone(),
+                    federation_retirement_cursor,
+                ),
+            );
+            services.background.push(
+                "federation invitation retirement",
+                federation::start_invitation_retirement(
+                    boot.kernel().host_runtime().clone(),
+                    store.clone(),
+                ),
+            );
+            if let Some(publisher) = federation_publisher.as_ref() {
+                services.background.push(
+                    "federation cancellation retries",
+                    publisher.start_remote_cancellation_retries(
+                        boot.kernel().host_runtime().clone(),
+                        store.clone(),
+                    )?,
+                );
+            }
+        }
+        if let (Some(state), Some(settings)) = (maintenance_state, history_maintenance) {
+            services.background.push(
+                "State history maintenance",
+                state_maintenance::start(state, settings),
+            );
+        }
+        services.background.serve(
+            "in-process projection reconciler",
+            projection::start_in_process_projection_reconciler(boot.clone(), standard_config.clone())
+                .await?,
+        );
+        #[cfg(any(feature = "external-grpc", feature = "external-websocket"))]
+        services.background.push(
+            "Source maintenance",
+            source_maintenance::start(source_store.clone(), shared_source_commands.clone(), &cfg.external_gateway, {
+                let runtime = boot.kernel().host_runtime().clone();
+                Arc::new(move || runtime.now_millis())
+            }),
+        );
+
+        let console_addr = match cfg.server.console_addr.clone() {
+            Some(addr) => Some(addr),
+            None => optional_env_var(CONSOLE_ADDR_ENV)?,
+        };
+        if let Some(addr) = console_addr {
+            let retry_epoch_period = cfg.console.submission_retry_epoch_period()?;
+            let security = cfg
+                .console
+                .transport_security
+                .validate_plain_listener("console", &addr)?;
+            let listener = TcpListener::bind(security.listen_addr).await?;
+            log_console_transport_security(&addr, &security.config);
+            let state = ConsoleState::shared_with_pairing_display_and_config(
+                boot.clone(),
+                Arc::new(StandardPairingSecretDisplay(pairing_display.clone())),
+                xolotl_console::ConsoleConfig {
+                    session_store: Some(console_sessions.clone()),
+                    blocking_spawner: Some(Arc::clone(&blocking_spawner)),
+                    request_anchor: None,
+                    streams: cfg.console.streams.clone(),
+                    runtime: cfg.console.runtime.clone(),
+                    modules: Default::default(),
+                    auth: xolotl_console::ConsoleAuthConfig {
+                        credential_sealer: Some(credential_sealer.clone()),
+                        ..cfg.console.auth.clone().into()
+                    },
+                    queries: cfg.console.queries.clone(),
+                    max_concurrent_calls: cfg.console.max_concurrent_calls,
+                    max_concurrent_authentications: cfg.console.max_concurrent_authentications,
+                    // The stock daemon does not bundle an IdP verifier. Embedding
+                    // hosts can install one on ConsoleConfig before serving HTTP.
+                    external_authentication: None,
+                    account_authority: None,
+                    source_management: Some(source_store.clone()),
+                    federation_management: {
+                        #[cfg(feature = "federation-grpc")]
+                        {
+                            federation_store.as_ref().map(|store| {
+                                Arc::new(store.clone())
+                                    as Arc<dyn xolotl_federation::FederationManagement>
+                            })
+                        }
+                        #[cfg(not(feature = "federation-grpc"))]
+                        {
+                            None
+                        }
+                    },
+                    config_admissions: config::console_config_admissions()?,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("console initialization failed: {e}"))?;
+            let service = xolotl_console::ConsoleService::new(state.clone());
+            services.console = Some(service.clone());
+            services.background.serve(
+                "Console session expiry maintenance",
+                console_maintenance::start(
+                    service,
+                    console_sessions.clone(),
+                    boot.kernel().host_runtime().clone(),
+                    retry_epoch_period,
+                    cfg.console.runtime.enabled && cfg.console.runtime.executions.enabled,
+                ),
+            );
+            let adapter = xolotl_console::http::HttpState::new(
+                state,
+                xolotl_console::http::HttpConfig {
+                    request_body_timeout: std::time::Duration::from_millis(
+                        cfg.console.request_body_timeout_ms,
+                    ),
+                    ws: cfg.console.ws.clone().into(),
+                    transport_security: security.config,
+                    originless_clients: Default::default(),
+                },
+            );
+            tracing::info!(%addr, "console (management Gateway) listening");
+            services.background.serve(
+                "Console HTTP listener",
+                tokio::spawn(async move {
+                    xolotl_console::http::serve(listener, adapter).await?;
+                    Ok(())
+                }),
+            );
+        } else {
+            tracing::info!("{CONSOLE_ADDR_ENV} unset; console disabled");
+        }
+
+        #[cfg(feature = "external-websocket")]
+        external::start_external_websocket(
+            &cfg,
+            &boot,
+            source_store.clone(),
+            pairing_display.clone(),
+            shared_source_commands.clone(),
+            services.external_sessions.clone(),
+            &mut services.background,
+        )
+        .await?;
+        #[cfg(feature = "external-grpc")]
+        external::start_external_grpc(
+            &cfg,
+            &boot,
+            source_store,
+            pairing_display,
+            shared_source_commands,
+            services.external_sessions.clone(),
+            &mut services.background,
+        )
+        .await?;
+        #[cfg(feature = "federation-grpc")]
+        if let Some(publisher) = federation_publisher {
+            let store = federation_store
+                .ok_or_else(|| anyhow::anyhow!("federation redb store was not initialized"))?;
+            if let Some(follow_store) = federation_public_follow_store {
+                services.background.extend(
+                    "federation public follow",
+                    publisher.start_public_follows(
+                        boot.kernel().host_runtime(),
+                        store.clone(),
+                        follow_store,
+                    )?,
+                );
+            }
+            if let Some(guest_store) = federation_guest_follow_store {
+                services.background.extend(
+                    "federation guest follow",
+                    publisher.start_guest_follows(
+                        boot.kernel().host_runtime(),
+                        store.clone(),
+                        guest_store,
+                    )?,
+                );
+            }
+            let federation = federation::start_with_objects(
+                publisher,
+                store,
+                federation_projection,
+                boot.clone(),
+                federation_objects,
+            ).await?;
+            services.federation_calls = federation.calls;
+            services.federation_runtime = Some(federation.runtime);
+            services.background.serve("federation services", federation.task);
+        }
+        services.check_running().await?;
+        // Mark the daemon ready.
+        tracing::info!("xolotld ready");
+        services.wait_for_shutdown(wait_for_shutdown()).await
+    }).await?;
     tracing::info!("graceful shutdown");
-    shutdown?;
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct BackgroundTaskShutdownReport {
-    completed: usize,
-    cancelled: usize,
-    failed: usize,
+#[cfg(any(
+    feature = "external-grpc",
+    feature = "application-grpc",
+    feature = "federation-grpc"
+))]
+fn pqc_tls_crypto_provider() -> Result<rustls::crypto::CryptoProvider> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    // A TLS 1.2 handshake cannot select a suite without TLS 1.2 suites, even
+    // when a library uses rustls' default protocol-version list.
+    provider.cipher_suites.retain(|suite| {
+        matches!(
+            suite.suite(),
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
+                | rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+        )
+    });
+    provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768];
+    let algorithms = provider.signature_verification_algorithms.mapping;
+    let position = algorithms
+        .iter()
+        .position(|(scheme, _)| *scheme == rustls::SignatureScheme::ML_DSA_65)
+        .ok_or_else(|| anyhow::anyhow!("AWS-LC must support ML-DSA-65"))?;
+    provider.signature_verification_algorithms.mapping = &algorithms[position..position + 1];
+    provider.signature_verification_algorithms.all = algorithms[position].1;
+    Ok(provider)
 }
 
-async fn shutdown_background_tasks(
-    handles: Vec<tokio::task::JoinHandle<()>>,
-) -> BackgroundTaskShutdownReport {
-    for handle in &handles {
-        handle.abort();
-    }
-    let mut report = BackgroundTaskShutdownReport::default();
-    for (task_index, handle) in handles.into_iter().enumerate() {
-        match handle.await {
-            Ok(()) => {
-                report.completed = report.completed.saturating_add(1);
-                tracing::debug!(task_index, "background task exited before shutdown");
-            }
-            Err(error) if error.is_cancelled() => {
-                report.cancelled = report.cancelled.saturating_add(1);
-                tracing::debug!(task_index, "background task cancelled during shutdown");
-            }
-            Err(error) => {
-                report.failed = report.failed.saturating_add(1);
-                tracing::warn!(
-                    task_index,
-                    error = %error,
-                    "background task failed during shutdown"
-                );
+#[cfg(all(test, any(feature = "external-grpc", feature = "application-grpc")))]
+fn is_pqc_tls_crypto_provider(provider: &rustls::crypto::CryptoProvider) -> bool {
+    !provider.cipher_suites.is_empty()
+        && provider.cipher_suites.iter().all(|suite| {
+            matches!(
+                suite.suite(),
+                rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
+                    | rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+            )
+        })
+        && provider.kx_groups.len() == 1
+        && provider.kx_groups[0].name() == rustls::NamedGroup::X25519MLKEM768
+        && provider.signature_verification_algorithms.mapping.len() == 1
+        && provider.signature_verification_algorithms.mapping[0].0
+            == rustls::SignatureScheme::ML_DSA_65
+        && provider.signature_verification_algorithms.all.len() == 1
+}
+
+#[cfg(all(test, any(feature = "external-grpc", feature = "application-grpc")))]
+mod tls_crypto_provider_tests {
+    use std::io;
+    use std::io::Cursor;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use futures_util::StreamExt;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tonic::transport::server::{Connected, TcpConnectInfo};
+
+    const ML_DSA_CERT: &[u8] = include_bytes!("../tests/fixtures/ml-dsa-65-cert.pem");
+    const ML_DSA_KEY: &[u8] = include_bytes!("../tests/fixtures/ml-dsa-65-key.pem");
+    const ML_DSA_CA_CERT: &[u8] = include_bytes!("../tests/fixtures/ml-dsa-65-ca-cert.pem");
+    const ECDSA_CERT: &[u8] = include_bytes!("../tests/fixtures/ecdsa-cert.pem");
+    const ECDSA_KEY: &[u8] = include_bytes!("../tests/fixtures/ecdsa-key.pem");
+
+    struct MemoryConnection(tokio::io::DuplexStream);
+
+    impl Connected for MemoryConnection {
+        type ConnectInfo = TcpConnectInfo;
+
+        fn connect_info(&self) -> Self::ConnectInfo {
+            TcpConnectInfo {
+                local_addr: Some(([127, 0, 0, 1], 7443).into()),
+                remote_addr: Some(([127, 0, 0, 1], 50000).into()),
             }
         }
     }
-    report
+
+    impl AsyncRead for MemoryConnection {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_read(cx, buffer)
+        }
+    }
+
+    impl AsyncWrite for MemoryConnection {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().0).poll_write(cx, bytes)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        }
+    }
+
+    #[test]
+    fn grpc_tls_provider_and_server_disable_resumption() -> anyhow::Result<()> {
+        let previous = rustls::crypto::CryptoProvider::get_default().cloned();
+        let config = server_config()?;
+        anyhow::ensure!(super::is_pqc_tls_crypto_provider(config.crypto_provider()));
+        let current = rustls::crypto::CryptoProvider::get_default();
+        anyhow::ensure!(
+            match (previous.as_ref(), current) {
+                (None, None) => true,
+                (Some(previous), Some(current)) => Arc::ptr_eq(previous, current),
+                _ => false,
+            },
+            "TLS construction changed the process-global provider"
+        );
+        anyhow::ensure!(
+            config.send_tls13_tickets == 0
+                && config.max_tls13_tickets == 0
+                && config.max_early_data_size == 0
+                && !config.ticketer.enabled(),
+            "gRPC TLS resumed sessions or early data remain enabled"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tls_handshake_accepts_hybrid_and_rejects_classical_or_aes128() -> anyhow::Result<()> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from_pem_slice(ML_DSA_CA_CERT)?)?;
+
+        let hybrid = super::pqc_tls_crypto_provider()?;
+        let mut client = new_client(hybrid.clone(), roots.clone(), &[&rustls::version::TLS13])?;
+        let mut server = new_server()?;
+        negotiate(&mut client, &mut server)?;
+        anyhow::ensure!(
+            server.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3)
+                && client.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3)
+                && server.handshake_kind() == Some(rustls::HandshakeKind::Full)
+                && server.alpn_protocol() == Some(b"h2".as_slice())
+                && server
+                    .negotiated_key_exchange_group()
+                    .is_some_and(|group| group.name() == rustls::NamedGroup::X25519MLKEM768)
+                && client
+                    .negotiated_key_exchange_group()
+                    .is_some_and(|group| group.name() == rustls::NamedGroup::X25519MLKEM768),
+            "TLS peers did not negotiate TLS 1.3 X25519MLKEM768"
+        );
+
+        let mut classical = hybrid.clone();
+        classical.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519];
+        let mut client = new_client(classical, roots.clone(), &[&rustls::version::TLS13])?;
+        anyhow::ensure!(
+            negotiate(&mut client, &mut new_server()?).is_err(),
+            "classical X25519 unexpectedly negotiated"
+        );
+
+        let mut aes128 = hybrid;
+        aes128.cipher_suites =
+            vec![rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256];
+        let mut client = new_client(aes128, roots, &[&rustls::version::TLS13])?;
+        anyhow::ensure!(
+            negotiate(&mut client, &mut new_server()?).is_err(),
+            "AES-128-GCM unexpectedly negotiated"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn grpc_listener_requires_ml_dsa_identity_and_roots() -> anyhow::Result<()> {
+        let valid = super::transport::GatewayListenerTlsMaterial {
+            certificate_chain_pem: ML_DSA_CERT.to_vec(),
+            private_key_pem: ML_DSA_KEY.to_vec().into(),
+            client_trust_roots_pem: ML_DSA_CA_CERT.to_vec(),
+        };
+        let _tls =
+            super::transport::grpc_tls_server_config(&super::transport::GatewayListenerSecurity {
+                listen_addr: "127.0.0.1:0".parse()?,
+                config: xolotl_gateway::GatewayTransportSecurityConfig {
+                    mode: xolotl_gateway::GatewayTransportSecurityMode::MutualTls,
+                    ..Default::default()
+                },
+                tls: Some(valid.clone()),
+            })?;
+
+        let mut classical_key = valid.clone();
+        classical_key.private_key_pem = ECDSA_KEY.to_vec().into();
+        anyhow::ensure!(
+            super::transport::grpc_tls_server_config(&super::transport::GatewayListenerSecurity {
+                listen_addr: "127.0.0.1:0".parse()?,
+                config: Default::default(),
+                tls: Some(classical_key),
+            })
+            .is_err(),
+            "classical server private key unexpectedly accepted"
+        );
+
+        let mut classical_certificate = valid.clone();
+        classical_certificate.certificate_chain_pem = ECDSA_CERT.to_vec();
+        classical_certificate.private_key_pem = ECDSA_KEY.to_vec().into();
+        anyhow::ensure!(
+            super::transport::grpc_tls_server_config(&super::transport::GatewayListenerSecurity {
+                listen_addr: "127.0.0.1:0".parse()?,
+                config: Default::default(),
+                tls: Some(classical_certificate),
+            })
+            .is_err(),
+            "classical server certificate unexpectedly accepted"
+        );
+
+        let mut classical_root = valid;
+        classical_root.client_trust_roots_pem = ECDSA_CERT.to_vec();
+        anyhow::ensure!(
+            super::transport::grpc_tls_server_config(&super::transport::GatewayListenerSecurity {
+                listen_addr: "127.0.0.1:0".parse()?,
+                config: Default::default(),
+                tls: Some(classical_root),
+            })
+            .is_err(),
+            "classical client trust root unexpectedly accepted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outer_tls_admission_reports_verified_handshake_and_client_certificate()
+    -> anyhow::Result<()> {
+        for mutual in [false, true] {
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let address = "127.0.0.1:7443".parse()?;
+            let security = super::transport::GatewayListenerSecurity {
+                listen_addr: address,
+                config: xolotl_gateway::GatewayTransportSecurityConfig {
+                    mode: if mutual {
+                        xolotl_gateway::GatewayTransportSecurityMode::MutualTls
+                    } else {
+                        xolotl_gateway::GatewayTransportSecurityMode::ProductionTls
+                    },
+                    ..Default::default()
+                },
+                tls: Some(super::transport::GatewayListenerTlsMaterial {
+                    certificate_chain_pem: ML_DSA_CERT.to_vec(),
+                    private_key_pem: ML_DSA_KEY.to_vec().into(),
+                    client_trust_roots_pem: if mutual {
+                        ML_DSA_CA_CERT.to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                }),
+            };
+            let incoming = futures_util::stream::once(async {
+                Ok::<_, io::Error>(MemoryConnection(server_io))
+            });
+            let incoming = super::transport::incoming::grpc_incoming(
+                incoming,
+                super::transport::grpc_tls_server_config(&security)?,
+            );
+            tokio::pin!(incoming);
+
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(CertificateDer::from_pem_slice(ML_DSA_CA_CERT)?)?;
+            let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+                super::pqc_tls_crypto_provider()?,
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_root_certificates(roots);
+            let mut client_config = if mutual {
+                let certs = CertificateDer::pem_reader_iter(&mut Cursor::new(ML_DSA_CERT))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let key = PrivateKeyDer::from_pem_reader(&mut Cursor::new(ML_DSA_KEY))?;
+                builder.with_client_auth_cert(certs, key)?
+            } else {
+                builder.with_no_client_auth()
+            };
+            client_config.alpn_protocols = vec![b"h2".to_vec()];
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+            let client = async move {
+                let stream = connector
+                    .connect(ServerName::try_from("localhost")?, client_io)
+                    .await?;
+                Ok::<_, anyhow::Error>(stream)
+            };
+            let server = async {
+                let connection = tokio::time::timeout(Duration::from_secs(5), incoming.next())
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("gRPC incoming stream ended"))??;
+                Ok::<_, anyhow::Error>(connection)
+            };
+            let (client, server) = tokio::join!(client, server);
+            let client = client?;
+            let server = server?;
+            let (_, client_session) = client.get_ref();
+            anyhow::ensure!(
+                client_session
+                    .negotiated_key_exchange_group()
+                    .is_some_and(|group| group.name() == rustls::NamedGroup::X25519MLKEM768)
+            );
+            let info = server.connect_info();
+            anyhow::ensure!(info.remote_addr().is_some());
+            let tls = info
+                .tls
+                .ok_or_else(|| anyhow::anyhow!("TLS facts absent"))?;
+            anyhow::ensure!(!tls.peer_certificates().is_empty() == mutual);
+        }
+        Ok(())
+    }
+
+    fn new_server() -> anyhow::Result<rustls::ServerConnection> {
+        Ok(rustls::ServerConnection::new(server_config()?)?)
+    }
+
+    fn server_config() -> anyhow::Result<Arc<rustls::ServerConfig>> {
+        let security = super::transport::GatewayListenerSecurity {
+            listen_addr: "127.0.0.1:0".parse()?,
+            config: xolotl_gateway::GatewayTransportSecurityConfig {
+                mode: xolotl_gateway::GatewayTransportSecurityMode::ProductionTls,
+                ..Default::default()
+            },
+            tls: Some(super::transport::GatewayListenerTlsMaterial {
+                certificate_chain_pem: ML_DSA_CERT.to_vec(),
+                private_key_pem: ML_DSA_KEY.to_vec().into(),
+                client_trust_roots_pem: Vec::new(),
+            }),
+        };
+        super::transport::grpc_tls_server_config(&security)?
+            .ok_or_else(|| anyhow::anyhow!("gRPC TLS config absent"))
+    }
+
+    fn new_client(
+        provider: rustls::crypto::CryptoProvider,
+        roots: rustls::RootCertStore,
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> anyhow::Result<rustls::ClientConnection> {
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(versions)?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        Ok(rustls::ClientConnection::new(
+            Arc::new(config),
+            ServerName::try_from("localhost")?,
+        )?)
+    }
+
+    fn negotiate(
+        client: &mut rustls::ClientConnection,
+        server: &mut rustls::ServerConnection,
+    ) -> anyhow::Result<()> {
+        for _ in 0..16 {
+            let mut client_bytes = Vec::new();
+            client.write_tls(&mut client_bytes)?;
+            let mut from_client = client_bytes.as_slice();
+            while !from_client.is_empty() {
+                server.read_tls(&mut from_client)?;
+                server.process_new_packets()?;
+            }
+            let mut server_bytes = Vec::new();
+            server.write_tls(&mut server_bytes)?;
+            let mut from_server = server_bytes.as_slice();
+            while !from_server.is_empty() {
+                client.read_tls(&mut from_server)?;
+                client.process_new_packets()?;
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("TLS handshake did not complete")
+    }
 }
 
 fn standard_config(pairing_display: PairingDisplayEdge) -> StandardConfig {
     StandardConfig::default().with_pairing_display(pairing_display)
-}
-
-fn in_process_projection_watch_pattern() -> Result<Path, xolotl_types::PathError> {
-    Path::try_new("state")?
-        .try_push("kernel")?
-        .try_push("projections")?
-        .try_push("in-process")?
-        .try_push("**")
 }
 
 struct StandardPairingSecretDisplay(PairingDisplayEdge);
@@ -479,298 +1034,6 @@ struct StandardPairingSecretDisplay(PairingDisplayEdge);
 impl PairingSecretDisplay for StandardPairingSecretDisplay {
     fn take_display_secret(&self, pairing_id: &str) -> Option<String> {
         self.0.take_display_secret(pairing_id)
-    }
-}
-
-async fn start_in_process_projection_reconciler(
-    boot: Arc<Bootstrap>,
-    config: StandardConfig,
-) -> Result<tokio::task::JoinHandle<()>> {
-    let pattern = in_process_projection_watch_pattern()
-        .map_err(|error| anyhow::anyhow!("build in-process projection watch pattern: {error}"))?;
-    let mut events = boot.kernel.state.subscribe(&pattern).await?;
-    Ok(tokio::spawn(async move {
-        loop {
-            match events.recv().await {
-                Ok(StateEvent::Set { path, value, .. }) => {
-                    let id = in_process_projection_declaration_id(&path);
-                    let result = install_in_process_projection_value(&boot, &path, value, &config);
-                    if let Err(error) =
-                        write_in_process_projection_result_status(&boot, id.as_deref(), &result)
-                            .await
-                    {
-                        tracing::error!(path = %path, error = %error, "projection status write failed");
-                    }
-                    if let Err(error) = result {
-                        tracing::error!(
-                            path = %path,
-                            error = %error,
-                            "in-process projection declaration rejected"
-                        );
-                    }
-                }
-                Ok(StateEvent::Append { path, .. }) => {
-                    tracing::error!(
-                        path = %path,
-                        "in-process projection declaration path received append event"
-                    );
-                }
-                Ok(StateEvent::Delete { path, .. }) => {
-                    if let Err(error) = delete_in_process_projection_status(&boot, &path).await {
-                        tracing::error!(
-                            path = %path,
-                            error = %error,
-                            "projection delete status write failed"
-                        );
-                    }
-                    tracing::error!(
-                        path = %path,
-                        "in-process projection declaration was deleted; live registry entries remain until restart"
-                    );
-                }
-                Err(xolotl_sdk::StateWatchError::Lagged(skipped)) => {
-                    tracing::error!(
-                        skipped,
-                        "in-process projection declaration watcher lagged; reconciling declarations"
-                    );
-                    match install_declared_in_process_projections(&boot, &config).await {
-                        Ok(report) => {
-                            if let Err(error) =
-                                reconcile_in_process_projection_report_status(&boot, report.entries)
-                                    .await
-                            {
-                                tracing::error!(
-                                    error = %error,
-                                    "in-process projection status reconcile failed"
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                error = %error,
-                                "in-process projection declaration reconcile failed"
-                            );
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(%error, "in-process projection declaration watcher stopped");
-                    break;
-                }
-            }
-        }
-    }))
-}
-
-async fn reconcile_in_process_projection_report_status(
-    boot: &Bootstrap,
-    entries: Vec<InProcessProjectionInstallEntry>,
-) -> Result<()> {
-    let mut declared_ids = BTreeSet::new();
-    for entry in entries {
-        declared_ids.insert(entry.id.clone());
-        write_in_process_projection_entry_status(boot, entry).await?;
-    }
-    delete_stale_in_process_projection_statuses(boot, &declared_ids).await?;
-    Ok(())
-}
-
-async fn write_in_process_projection_entry_status(
-    boot: &Bootstrap,
-    entry: InProcessProjectionInstallEntry,
-) -> Result<()> {
-    let status = match entry.result {
-        Ok(installed) => active_projection_status(&installed),
-        Err(error) => rejected_projection_status(&entry.id, entry.desired.as_ref(), &error),
-    };
-    write_in_process_projection_status(boot, &status).await
-}
-
-async fn write_in_process_projection_result_status(
-    boot: &Bootstrap,
-    id: Option<&str>,
-    result: &Result<InProcessProjectionInstalled, InstallError>,
-) -> Result<()> {
-    let status = match result {
-        Ok(installed) => active_projection_status(installed),
-        Err(error) => {
-            let id = id
-                .ok_or_else(|| anyhow::anyhow!("invalid in-process projection declaration path"))?;
-            rejected_projection_status(id, None, error)
-        }
-    };
-    write_in_process_projection_status(boot, &status).await
-}
-
-async fn delete_in_process_projection_status(
-    boot: &Bootstrap,
-    declaration_path: &Path,
-) -> Result<()> {
-    let id = in_process_projection_declaration_id(declaration_path).ok_or_else(|| {
-        anyhow::anyhow!("invalid in-process projection declaration path {declaration_path}")
-    })?;
-    let path = in_process_projection_status_path(&id)?;
-    boot.kernel.state.write_delete(&path).await?;
-    Ok(())
-}
-
-async fn delete_stale_in_process_projection_statuses(
-    boot: &Bootstrap,
-    declared_ids: &BTreeSet<String>,
-) -> Result<()> {
-    let prefix = in_process_projection_status_prefix()?;
-    let mut pages = boot
-        .kernel
-        .state
-        .pages(xolotl_state::StateScan::new(prefix));
-    while let Some(page) = pages.next().await? {
-        for (path, _) in page.entries {
-            let Some(id) = in_process_projection_status_path_id(&path) else {
-                continue;
-            };
-            if !declared_ids.contains(&id) {
-                boot.kernel.state.write_delete(&path).await?;
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn write_in_process_projection_status(
-    boot: &Bootstrap,
-    status: &InProcessProjectionStatus,
-) -> Result<()> {
-    let path = in_process_projection_status_path(&status.id)?;
-    let value = status.to_value()?;
-    boot.kernel.state.write_set(&path, value).await?;
-    Ok(())
-}
-
-fn active_projection_status(installed: &InProcessProjectionInstalled) -> InProcessProjectionStatus {
-    InProcessProjectionStatus {
-        id: installed.id.clone(),
-        phase: InProcessProjectionPhase::Active,
-        implementation: Some(installed.implementation.clone()),
-        role: Some(installed.role),
-        desired_version: Some(installed.version),
-        active_version: Some(installed.version),
-        error_code: None,
-        error_message: None,
-        updated_at: now_millis(),
-    }
-}
-
-fn rejected_projection_status(
-    id: &str,
-    desired: Option<&InProcessProjectionInstalled>,
-    error: &InstallError,
-) -> InProcessProjectionStatus {
-    let (phase, code) = projection_error_phase_code(error);
-    InProcessProjectionStatus {
-        id: id.to_string(),
-        phase,
-        implementation: projection_error_implementation(error)
-            .or_else(|| desired.map(|value| value.implementation.clone())),
-        role: projection_error_role(error).or_else(|| desired.map(|value| value.role)),
-        desired_version: desired.map(|value| value.version),
-        active_version: None,
-        error_code: Some(code.into()),
-        error_message: Some(error.to_string()),
-        updated_at: now_millis(),
-    }
-}
-
-fn projection_error_phase_code(error: &InstallError) -> (InProcessProjectionPhase, &'static str) {
-    match error {
-        InstallError::FeatureNotEnabled { .. } => (
-            InProcessProjectionPhase::FeatureDisabled,
-            "feature_not_enabled",
-        ),
-        InstallError::ImplementationUnavailable { .. } => (
-            InProcessProjectionPhase::Unsupported,
-            "implementation_unavailable",
-        ),
-        InstallError::RoleUnsupported { .. } => {
-            (InProcessProjectionPhase::Unsupported, "role_unsupported")
-        }
-        InstallError::Decode { .. } => (InProcessProjectionPhase::Rejected, "decode_failed"),
-        InstallError::Declaration { .. } => {
-            (InProcessProjectionPhase::Rejected, "declaration_rejected")
-        }
-        InstallError::InvalidConfig { .. } => {
-            (InProcessProjectionPhase::Rejected, "config_rejected")
-        }
-        InstallError::InvalidProvides { .. } => {
-            (InProcessProjectionPhase::Rejected, "provides_rejected")
-        }
-        InstallError::Bootstrap(_) => (InProcessProjectionPhase::Rejected, "bootstrap_failed"),
-        InstallError::MethodNotFound { .. } => {
-            (InProcessProjectionPhase::Rejected, "method_not_found")
-        }
-        InstallError::Path { .. } => (InProcessProjectionPhase::Rejected, "path_invalid"),
-        InstallError::State(_) => (InProcessProjectionPhase::Rejected, "state_failed"),
-        InstallError::Assembly { .. } => (InProcessProjectionPhase::Rejected, "assembly_failed"),
-    }
-}
-
-fn projection_error_implementation(error: &InstallError) -> Option<String> {
-    match error {
-        InstallError::ImplementationUnavailable { implementation }
-        | InstallError::FeatureNotEnabled { implementation, .. }
-        | InstallError::RoleUnsupported { implementation, .. }
-        | InstallError::InvalidConfig { implementation, .. }
-        | InstallError::InvalidProvides { implementation, .. } => Some(implementation.clone()),
-        _ => None,
-    }
-}
-
-fn projection_error_role(error: &InstallError) -> Option<xolotl_types::Role> {
-    match error {
-        InstallError::RoleUnsupported { role, .. } => Some(*role),
-        _ => None,
-    }
-}
-
-fn in_process_projection_status_path(id: &str) -> Result<Path> {
-    Ok(in_process_projection_status_prefix()?.try_push_literal(id)?)
-}
-
-fn in_process_projection_status_prefix() -> Result<Path> {
-    Ok(Path::try_new("state")?
-        .try_push("kernel")?
-        .try_push("projection-status")?
-        .try_push("in-process")?)
-}
-
-fn in_process_projection_declaration_id(path: &Path) -> Option<String> {
-    let segments = path.segments();
-    match segments {
-        [kernel, projections, in_process, id]
-            if path.scheme() == "state"
-                && path.cluster().is_none()
-                && kernel.as_str() == "kernel"
-                && projections.as_str() == "projections"
-                && in_process.as_str() == "in-process" =>
-        {
-            Some(id.to_string())
-        }
-        _ => None,
-    }
-}
-
-fn in_process_projection_status_path_id(path: &Path) -> Option<String> {
-    let segments = path.segments();
-    match segments {
-        [kernel, projection_status, in_process, id]
-            if path.scheme() == "state"
-                && path.cluster().is_none()
-                && kernel.as_str() == "kernel"
-                && projection_status.as_str() == "projection-status"
-                && in_process.as_str() == "in-process" =>
-        {
-            Some(id.to_string())
-        }
-        _ => None,
     }
 }
 
@@ -785,1835 +1048,6 @@ fn write_bootstrap_credentials(username: &str, password: &str) -> std::io::Resul
     write_stderr_line(format_args!(""))
 }
 
-#[cfg(feature = "external-gateway")]
-fn external_registry_hash_value(
-    installation: &ExternalInstallationDef,
-    projection: &ExternalProjectionDef,
-) -> Result<String, serde_json::Error> {
-    let bytes = serde_json::to_vec(&(installation, projection))?;
-    Ok(blake3::hash(&bytes).to_hex().to_string())
-}
-
-#[cfg(feature = "external-websocket")]
-async fn start_external_websocket(
-    cfg: &XolotlConfig,
-    boot: &Arc<Bootstrap>,
-    handles: &mut Vec<tokio::task::JoinHandle<()>>,
-) -> Result<()> {
-    let external_websocket_addr = match cfg.server.external_websocket_addr.clone() {
-        Some(addr) => Some(addr),
-        None => optional_env_var(EXTERNAL_WEBSOCKET_ADDR_ENV)?,
-    };
-    let Some(addr) = external_websocket_addr else {
-        tracing::info!("{EXTERNAL_WEBSOCKET_ADDR_ENV} unset; external WebSocket gateway disabled");
-        return Ok(());
-    };
-    let external_cfg = cfg.external_gateway.websocket.clone().bounded();
-    let security = external_cfg
-        .transport_security
-        .validate_plain_listener("external WebSocket gateway", &addr)?;
-    let listen_addr = security.listen_addr;
-    transport::log_transport_security("external WebSocket gateway", &addr, &security.config);
-    let listener = TcpListener::bind(listen_addr).await?;
-    let handler = DaemonExternalSessionHandler::with_limits(
-        boot.kernel.state.clone(),
-        boot.kernel.registry.clone(),
-        external_cfg.session_limits(),
-    );
-    let mut ws_config: ExternalWebSocketConfig = external_cfg.transport.into();
-    ws_config.transport_security = security.config;
-    let service = Arc::new(ExternalWebSocketService::with_config(handler, ws_config));
-    tracing::info!(%addr, "external WebSocket gateway listening");
-    handles.push(tokio::spawn(async move {
-        if let Err(e) = xolotl_gateway_websocket::serve(service, listener).await {
-            tracing::error!(?e, "external WebSocket gateway exited");
-        }
-    }));
-    Ok(())
-}
-
-#[cfg(feature = "external-grpc")]
-async fn start_external_grpc(
-    cfg: &XolotlConfig,
-    boot: &Arc<Bootstrap>,
-    handles: &mut Vec<tokio::task::JoinHandle<()>>,
-) -> Result<()> {
-    let external_grpc_addr = match cfg.server.external_grpc_addr.clone() {
-        Some(addr) => Some(addr),
-        None => optional_env_var(EXTERNAL_GRPC_ADDR_ENV)?,
-    };
-    let Some(addr) = external_grpc_addr else {
-        tracing::info!("{EXTERNAL_GRPC_ADDR_ENV} unset; external gRPC gateway disabled");
-        return Ok(());
-    };
-    let external_cfg = cfg.external_gateway.grpc.clone().bounded();
-    let security = external_cfg
-        .transport_security
-        .validate_grpc_listener("external gRPC gateway", &addr)?;
-    let listen_addr = security.listen_addr;
-    transport::log_transport_security("external gRPC gateway", &addr, &security.config);
-    let handler = DaemonExternalSessionHandler::with_limits(
-        boot.kernel.state.clone(),
-        boot.kernel.registry.clone(),
-        external_cfg.session_limits(),
-    );
-    let service = xolotl_gateway_grpc::ExternalGrpcService::with_config(
-        handler,
-        xolotl_gateway_grpc::ExternalGrpcConfig {
-            transport_security: security.config.clone(),
-        },
-    );
-    tracing::info!(%addr, "external gRPC gateway listening");
-    let mut server = transport::grpc_server_builder(&security)?;
-    handles.push(tokio::spawn(async move {
-        if let Err(e) = server
-            .add_service(service.into_server())
-            .serve(listen_addr)
-            .await
-        {
-            tracing::error!(?e, "external gRPC server exited");
-        }
-    }));
-    Ok(())
-}
-
-#[cfg(feature = "external-gateway")]
-struct DaemonExternalSessionHandler {
-    state: Backend,
-    registry: Registry,
-    session_limits: config::ExternalGatewaySessionLimits,
-    provider_sessions: Arc<std::sync::Mutex<BTreeMap<ProviderSessionKey, ProviderSessionRecord>>>,
-    source_sessions: Arc<std::sync::Mutex<BTreeMap<SourceSessionKey, SourceSessionRecord>>>,
-    provider_invocations: Arc<std::sync::Mutex<ProviderInvocationRegistry>>,
-    provider_waiters: Arc<std::sync::Mutex<BTreeMap<String, oneshot::Sender<InvokeResult>>>>,
-    source_commands: Arc<std::sync::Mutex<SourceCommandRegistry>>,
-    source_waiters: Arc<std::sync::Mutex<BTreeMap<String, oneshot::Sender<CommandResult>>>>,
-    external_credentials: Arc<std::sync::Mutex<BTreeMap<(String, u64), ExternalCredential>>>,
-    secure_replay_windows:
-        Arc<std::sync::Mutex<BTreeMap<SecureReplayKey, SecureEnvelopeReplayWindow>>>,
-}
-
-#[cfg(feature = "external-gateway")]
-#[derive(Clone)]
-struct ExternalAuthority {
-    context: SessionContext,
-    projection: ExternalProjectionDef,
-    provider_capabilities: BTreeMap<Path, EffectCapability>,
-    key_epoch: u64,
-}
-
-#[cfg(feature = "external-gateway")]
-struct ExternalSessionState {
-    credential_generation: u64,
-    key_epoch: u64,
-}
-
-#[cfg(feature = "external-gateway")]
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ProviderSessionKey {
-    installation_id: String,
-    projection_id: String,
-    session_id: String,
-}
-
-#[cfg(feature = "external-gateway")]
-#[derive(Clone)]
-struct ProviderSessionRecord {
-    endpoint_id: xolotl_types::EndpointId,
-    context: SessionContext,
-    ready_endpoints: HashMap<ProviderEndpointKey, Path>,
-}
-
-#[cfg(feature = "external-gateway")]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct ProviderEndpointKey {
-    resource_id: ResourceId,
-    method_id: MethodId,
-    binding_generation: u64,
-}
-
-#[cfg(feature = "external-gateway")]
-#[derive(Clone)]
-struct ProviderBindingDeclaration {
-    path: Path,
-    purity: xolotl_types::Purity,
-    finalize_allowed: bool,
-    selector: ResourceSelector,
-}
-
-#[cfg(feature = "external-gateway")]
-impl ProviderEndpointKey {
-    fn from_dispatch(dispatch: RemoteInvokeDispatch) -> Self {
-        Self {
-            resource_id: dispatch.resource_id,
-            method_id: dispatch.method_id,
-            binding_generation: dispatch.binding_generation,
-        }
-    }
-}
-
-#[cfg(feature = "external-gateway")]
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct SourceSessionKey {
-    installation_id: String,
-    projection_id: String,
-    session_id: String,
-}
-
-#[cfg(feature = "external-gateway")]
-struct SourceSessionRecord {
-    context: SessionContext,
-    #[cfg(test)]
-    outbound: ExternalSessionOutboundHandle,
-}
-
-#[cfg(feature = "external-gateway")]
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct SecureReplayKey {
-    installation_id: String,
-    projection_id: String,
-    role: &'static str,
-    session_id: String,
-    key_epoch: u64,
-}
-
-#[cfg(feature = "external-gateway")]
-struct ProviderRoleEndpoint {
-    state: Backend,
-    context: SessionContext,
-    session: EndpointSession,
-    outbound: ExternalSessionOutboundHandle,
-    provider_invocations: Arc<std::sync::Mutex<ProviderInvocationRegistry>>,
-    provider_waiters: Arc<std::sync::Mutex<BTreeMap<String, oneshot::Sender<InvokeResult>>>>,
-    provider_sessions: Arc<std::sync::Mutex<BTreeMap<ProviderSessionKey, ProviderSessionRecord>>>,
-    session_limits: config::ExternalGatewaySessionLimits,
-}
-
-#[cfg(feature = "external-gateway")]
-type ExternalSessionOutboundHandle = Arc<dyn ExternalSessionOutbound<Error = tonic::Status>>;
-
-#[cfg(feature = "external-gateway")]
-#[async_trait::async_trait]
-impl RemoteEndpoint for ProviderRoleEndpoint {
-    async fn invoke(
-        &self,
-        dispatch: RemoteInvokeDispatch,
-        invoke: Invoke,
-    ) -> Result<InvokeResult, DriverError> {
-        let authority = load_external_authority(
-            &self.state,
-            &self.context.installation_id,
-            &self.context.projection_id,
-            Role::Provider,
-        )
-        .await
-        .map_err(status_to_driver_error)?;
-        if !context_matches_authority(&authority.context, &self.context) {
-            return Err(DriverError::Transport("provider authority changed".into()));
-        }
-        let capability = self.admit_invoke(dispatch, &invoke, &authority)?;
-        validate_json_schema(capability.input_schema.as_ref(), &invoke.input).map_err(|error| {
-            DriverError::Transport(format!("provider invoke input rejected: {error}"))
-        })?;
-        let output_schema = capability.output_schema.as_ref();
-        let invocation_id = invoke.invocation_id.clone();
-        let deadline_ms = invoke.deadline_ms;
-
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut invocations = self.provider_invocations.lock().map_err(|_error| {
-                DriverError::Transport("provider invocation registry unavailable".into())
-            })?;
-            invocations
-                .register(ProviderInvocationRegister {
-                    session: &self.session,
-                    invoke: &invoke,
-                    current_registry_hash: &authority.context.registry_hash,
-                    credential_generation: authority.context.credential_generation,
-                    current_binding_generation: authority.context.binding_generation,
-                    current_projection_version: authority.context.projection_version,
-                    now_millis: now_millis(),
-                    acting: dispatch.acting,
-                    max_in_flight: Some(self.session_limits.provider_max_in_flight_invocations),
-                    max_identity_in_flight: Some(
-                        self.session_limits.provider_max_in_flight_per_identity,
-                    ),
-                    max_effect_in_flight: Some(
-                        self.session_limits.provider_max_in_flight_per_effect,
-                    ),
-                    max_inline_result_bytes: Some(
-                        self.session_limits.provider_max_inline_result_bytes,
-                    ),
-                    output_schema,
-                })
-                .map_err(|error| DriverError::Transport(error.to_string()))?;
-        }
-        let waiter_inserted = self
-            .provider_waiters
-            .lock()
-            .map_err(|_error| {
-                DriverError::Transport("provider invocation waiter unavailable".into())
-            })
-            .and_then(|mut waiters| match waiters.entry(invocation_id.clone()) {
-                Entry::Vacant(entry) => {
-                    entry.insert(tx);
-                    Ok(())
-                }
-                Entry::Occupied(_) => Err(DriverError::Transport(
-                    "provider invocation waiter duplicate".into(),
-                )),
-            });
-        if let Err(error) = waiter_inserted {
-            remove_provider_invocation_registry_entry(&self.provider_invocations, &invocation_id)
-                .map_err(|cleanup| {
-                DriverError::Transport(format!(
-                    "{error}; provider invocation cleanup failed: {cleanup}"
-                ))
-            })?;
-            return Err(error);
-        }
-
-        if let Err(status) = self.outbound.send_invoke(invoke).await {
-            let invoke_error = status_to_driver_error(status);
-            remove_provider_invocation_pending(
-                &self.provider_invocations,
-                &self.provider_waiters,
-                &invocation_id,
-            )
-            .map_err(|cleanup| {
-                DriverError::Transport(format!(
-                    "{invoke_error}; provider invocation cleanup failed: {cleanup}"
-                ))
-            })?;
-            return Err(invoke_error);
-        }
-
-        match await_provider_result(rx, deadline_ms).await {
-            Ok(result) => Ok(result),
-            Err(error) => {
-                match error {
-                    ProviderAwaitError::DeadlineExceeded => {
-                        if let Err(status) = self
-                            .outbound
-                            .send_control(ControlFrame::ProviderCancel {
-                                invocation_id: invocation_id.clone(),
-                                reason: "deadline_exceeded".into(),
-                            })
-                            .await
-                        {
-                            tracing::warn!(
-                                ?status,
-                                %invocation_id,
-                                "provider invocation cancel frame was not delivered"
-                            );
-                        }
-                    }
-                    ProviderAwaitError::ProviderUnavailable => {}
-                }
-                remove_provider_invocation_pending(
-                    &self.provider_invocations,
-                    &self.provider_waiters,
-                    &invocation_id,
-                )
-                .map_err(|cleanup| {
-                    DriverError::Transport(format!(
-                        "{}; provider invocation cleanup failed: {cleanup}",
-                        error.into_driver_error()
-                    ))
-                })?;
-                Err(error.into_driver_error())
-            }
-        }
-    }
-}
-
-#[cfg(feature = "external-gateway")]
-impl ProviderRoleEndpoint {
-    fn admit_invoke<'a>(
-        &self,
-        dispatch: RemoteInvokeDispatch,
-        invoke: &Invoke,
-        authority: &'a ExternalAuthority,
-    ) -> Result<&'a EffectCapability, DriverError> {
-        if invoke.method_id != dispatch.method_id {
-            return Err(DriverError::Transport(
-                "provider invoke method rejected".into(),
-            ));
-        }
-        let sessions = self.provider_sessions.lock().map_err(|_error| {
-            DriverError::Transport("provider session registry unavailable".into())
-        })?;
-        let session = sessions
-            .get(&provider_session_key(&self.context))
-            .ok_or_else(|| DriverError::Transport("provider session not ready".into()))?;
-        if session.context != self.context {
-            return Err(DriverError::Transport(
-                "provider session context rejected".into(),
-            ));
-        }
-        if dispatch.endpoint_id != session.endpoint_id {
-            return Err(DriverError::Transport(
-                "provider invoke effect rejected".into(),
-            ));
-        }
-        let Some(ready_path) = session
-            .ready_endpoints
-            .get(&ProviderEndpointKey::from_dispatch(dispatch))
-        else {
-            if session.ready_endpoints.keys().any(|key| {
-                key.resource_id == dispatch.resource_id
-                    && key.binding_generation == dispatch.binding_generation
-            }) {
-                return Err(DriverError::Transport(
-                    "provider invoke method rejected".into(),
-                ));
-            }
-            return Err(DriverError::Transport(
-                "provider invoke effect rejected".into(),
-            ));
-        };
-        if ready_path != &invoke.effect_path {
-            return Err(DriverError::Transport(
-                "provider invoke effect rejected".into(),
-            ));
-        }
-        authority
-            .provider_capabilities
-            .get(ready_path)
-            .ok_or_else(|| DriverError::Transport("provider invoke effect rejected".into()))
-    }
-}
-
-#[cfg(feature = "external-gateway")]
-fn remove_provider_invocation_pending(
-    provider_invocations: &Arc<std::sync::Mutex<ProviderInvocationRegistry>>,
-    provider_waiters: &Arc<std::sync::Mutex<BTreeMap<String, oneshot::Sender<InvokeResult>>>>,
-    invocation_id: &str,
-) -> Result<(), DriverError> {
-    remove_provider_invocation_registry_entry(provider_invocations, invocation_id)?;
-    provider_waiters
-        .lock()
-        .map_err(|_error| DriverError::Transport("provider invocation waiter unavailable".into()))
-        .map(|mut waiters| {
-            waiters.remove(invocation_id);
-        })
-}
-
-#[cfg(feature = "external-gateway")]
-fn remove_provider_invocation_registry_entry(
-    provider_invocations: &Arc<std::sync::Mutex<ProviderInvocationRegistry>>,
-    invocation_id: &str,
-) -> Result<(), DriverError> {
-    provider_invocations
-        .lock()
-        .map_err(|_error| DriverError::Transport("provider invocation registry unavailable".into()))
-        .map(|mut invocations| {
-            invocations.remove(invocation_id);
-        })
-}
-
-#[cfg(feature = "external-gateway")]
-async fn await_provider_result(
-    rx: oneshot::Receiver<InvokeResult>,
-    deadline_ms: Option<i64>,
-) -> Result<InvokeResult, ProviderAwaitError> {
-    let Some(deadline_ms) = deadline_ms else {
-        return rx
-            .await
-            .map_err(|_error| ProviderAwaitError::ProviderUnavailable);
-    };
-    let now = now_millis();
-    if deadline_ms <= now {
-        return Err(ProviderAwaitError::DeadlineExceeded);
-    }
-    match tokio::time::timeout(Duration::from_millis((deadline_ms - now) as u64), rx).await {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(_)) => Err(ProviderAwaitError::ProviderUnavailable),
-        Err(_) => Err(ProviderAwaitError::DeadlineExceeded),
-    }
-}
-
-#[cfg(feature = "external-gateway")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProviderAwaitError {
-    DeadlineExceeded,
-    ProviderUnavailable,
-}
-
-#[cfg(feature = "external-gateway")]
-impl ProviderAwaitError {
-    fn into_driver_error(self) -> DriverError {
-        match self {
-            ProviderAwaitError::DeadlineExceeded => {
-                DriverError::Transport("provider invocation deadline exceeded".into())
-            }
-            ProviderAwaitError::ProviderUnavailable => {
-                DriverError::Transport("provider unavailable".into())
-            }
-        }
-    }
-}
-
-#[cfg(all(test, feature = "external-gateway"))]
-fn remove_source_command_pending(
-    source_commands: &Arc<std::sync::Mutex<SourceCommandRegistry>>,
-    source_waiters: &Arc<std::sync::Mutex<BTreeMap<String, oneshot::Sender<CommandResult>>>>,
-    command_id: &str,
-) -> Result<(), tonic::Status> {
-    remove_source_command_registry_entry(source_commands, command_id)?;
-    remove_source_command_waiter(source_waiters, command_id)
-}
-
-#[cfg(feature = "external-gateway")]
-fn remove_source_command_waiter(
-    source_waiters: &Arc<std::sync::Mutex<BTreeMap<String, oneshot::Sender<CommandResult>>>>,
-    command_id: &str,
-) -> Result<(), tonic::Status> {
-    source_waiters
-        .lock()
-        .map_err(|_error| tonic::Status::internal("source command waiter unavailable"))
-        .map(|mut waiters| {
-            waiters.remove(command_id);
-        })
-}
-
-#[cfg(all(test, feature = "external-gateway"))]
-fn remove_source_command_registry_entry(
-    source_commands: &Arc<std::sync::Mutex<SourceCommandRegistry>>,
-    command_id: &str,
-) -> Result<(), tonic::Status> {
-    source_commands
-        .lock()
-        .map_err(|_error| tonic::Status::internal("source command registry unavailable"))
-        .map(|mut commands| {
-            commands.remove(command_id);
-        })
-}
-
-#[cfg(all(test, feature = "external-gateway"))]
-fn remove_source_command_waiters(
-    source_waiters: &Arc<std::sync::Mutex<BTreeMap<String, oneshot::Sender<CommandResult>>>>,
-    command_ids: Vec<String>,
-) -> Result<(), tonic::Status> {
-    if command_ids.is_empty() {
-        return Ok(());
-    }
-    source_waiters
-        .lock()
-        .map_err(|_error| tonic::Status::internal("source command waiter unavailable"))
-        .map(|mut waiters| {
-            for command_id in command_ids {
-                waiters.remove(&command_id);
-            }
-        })
-}
-
-#[cfg(all(test, feature = "external-gateway"))]
-fn schedule_source_command_deadline(
-    source_commands: Arc<std::sync::Mutex<SourceCommandRegistry>>,
-    source_waiters: Arc<std::sync::Mutex<BTreeMap<String, oneshot::Sender<CommandResult>>>>,
-    deadline_ms: i64,
-) {
-    tokio::spawn(async move {
-        let now = now_millis();
-        if deadline_ms > now {
-            tokio::time::sleep(Duration::from_millis((deadline_ms - now) as u64)).await;
-        }
-        let expired = match source_commands.lock() {
-            Ok(mut commands) => commands.expire(now_millis()),
-            Err(_) => {
-                tracing::warn!("source command deadline registry unavailable");
-                return;
-            }
-        };
-        if let Err(status) = remove_source_command_waiters(&source_waiters, expired) {
-            tracing::warn!(?status, "source command deadline waiter cleanup failed");
-        }
-    });
-}
-
-#[cfg(feature = "external-gateway")]
-impl DaemonExternalSessionHandler {
-    #[cfg(all(test, feature = "external-grpc"))]
-    fn new(state: Backend, registry: Registry, source_dedupe_window_ms: u64) -> Self {
-        Self::with_limits(
-            state,
-            registry,
-            config::ExternalGatewaySessionLimits {
-                source_dedupe_window_ms,
-                ..Default::default()
-            },
-        )
-    }
-
-    fn with_limits(
-        state: Backend,
-        registry: Registry,
-        session_limits: config::ExternalGatewaySessionLimits,
-    ) -> Self {
-        let session_limits = session_limits.bounded();
-        Self {
-            state,
-            registry,
-            session_limits,
-            provider_sessions: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
-            source_sessions: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
-            provider_invocations: Arc::new(
-                std::sync::Mutex::new(ProviderInvocationRegistry::new()),
-            ),
-            provider_waiters: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
-            source_commands: Arc::new(std::sync::Mutex::new(SourceCommandRegistry::new())),
-            source_waiters: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
-            external_credentials: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
-            secure_replay_windows: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
-        }
-    }
-
-    #[cfg(all(test, feature = "external-grpc"))]
-    async fn register_provider_invoke(
-        &self,
-        invoke: &Invoke,
-        session: &EndpointSession,
-        context: &SessionContext,
-    ) -> Result<oneshot::Receiver<InvokeResult>, tonic::Status> {
-        let authority = self
-            .load_authority(
-                &context.installation_id,
-                &context.projection_id,
-                Role::Provider,
-            )
-            .await?;
-        let (tx, rx) = oneshot::channel();
-        let capability = authority
-            .provider_capabilities
-            .get(&invoke.effect_path)
-            .ok_or_else(|| tonic::Status::permission_denied("provider invocation rejected"))?;
-        validate_json_schema(capability.input_schema.as_ref(), &invoke.input).map_err(|error| {
-            tonic::Status::invalid_argument(format!("provider invocation rejected: {error}"))
-        })?;
-        let output_schema = capability.output_schema.as_ref();
-        {
-            let mut invocations = self.provider_invocations.lock().map_err(|_error| {
-                tonic::Status::internal("provider invocation registry unavailable")
-            })?;
-            invocations
-                .register(ProviderInvocationRegister {
-                    session,
-                    invoke,
-                    current_registry_hash: &authority.context.registry_hash,
-                    credential_generation: authority.context.credential_generation,
-                    current_binding_generation: authority.context.binding_generation,
-                    current_projection_version: authority.context.projection_version,
-                    now_millis: now_millis(),
-                    acting: IdentityRef::ROOT,
-                    max_in_flight: Some(self.session_limits.provider_max_in_flight_invocations),
-                    max_identity_in_flight: Some(
-                        self.session_limits.provider_max_in_flight_per_identity,
-                    ),
-                    max_effect_in_flight: Some(
-                        self.session_limits.provider_max_in_flight_per_effect,
-                    ),
-                    max_inline_result_bytes: Some(
-                        self.session_limits.provider_max_inline_result_bytes,
-                    ),
-                    output_schema,
-                })
-                .map_err(provider_invocation_status)?;
-        }
-        let waiter_inserted = self
-            .provider_waiters
-            .lock()
-            .map_err(|_error| tonic::Status::internal("provider invocation waiter unavailable"))
-            .and_then(
-                |mut waiters| match waiters.entry(invoke.invocation_id.clone()) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(tx);
-                        Ok(())
-                    }
-                    Entry::Occupied(_) => Err(tonic::Status::failed_precondition(
-                        "provider invocation waiter duplicate",
-                    )),
-                },
-            );
-        if let Err(error) = waiter_inserted {
-            remove_provider_invocation_registry_entry(
-                &self.provider_invocations,
-                &invoke.invocation_id,
-            )
-            .map_err(|cleanup| {
-                tonic::Status::internal(format!(
-                    "{}; provider invocation cleanup failed: {cleanup}",
-                    error.message()
-                ))
-            })?;
-            return Err(error);
-        }
-        Ok(rx)
-    }
-
-    #[cfg(test)]
-    async fn send_source_command(
-        &self,
-        mut command: OutboundCommand,
-        session: &EndpointSession,
-        context: &SessionContext,
-        deadline_ms: Option<i64>,
-    ) -> Result<oneshot::Receiver<CommandResult>, tonic::Status> {
-        let authority = self
-            .load_authority(
-                &context.installation_id,
-                &context.projection_id,
-                Role::Source,
-            )
-            .await?;
-        if !context_matches_authority(&authority.context, context) {
-            return Err(tonic::Status::permission_denied("source command rejected"));
-        }
-        let emits = authority
-            .projection
-            .emits
-            .as_ref()
-            .filter(|emits| emits.commands)
-            .ok_or_else(|| tonic::Status::permission_denied("source command rejected"))?;
-
-        let outbound = {
-            let sessions = self
-                .source_sessions
-                .lock()
-                .map_err(|_error| tonic::Status::internal("source session registry unavailable"))?;
-            let record = sessions
-                .get(&source_session_key(context))
-                .ok_or_else(|| tonic::Status::failed_precondition("source session not ready"))?;
-            if record.context != *context {
-                return Err(tonic::Status::permission_denied(
-                    "source session context rejected",
-                ));
-            }
-            record.outbound.clone()
-        };
-
-        command.observed = ObservedGenerations {
-            presentation_config_generation: context.presentation_config_generation,
-            alias_catalog_generation: context.alias_catalog_generation,
-        };
-        let command_id = command.id.clone();
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut commands = self
-                .source_commands
-                .lock()
-                .map_err(|_error| tonic::Status::internal("source command registry unavailable"))?;
-            commands
-                .register(SourceCommandRegister {
-                    session,
-                    command: &command,
-                    current_registry_hash: &authority.context.registry_hash,
-                    credential_generation: authority.context.credential_generation,
-                    current_binding_generation: authority.context.binding_generation,
-                    current_installation_config_version: authority
-                        .context
-                        .installation_config_version,
-                    current_projection_version: authority.context.projection_version,
-                    now_millis: now_millis(),
-                    deadline_ms,
-                    max_in_flight: Some(self.session_limits.source_max_in_flight_commands),
-                    max_inline_result_bytes: Some(
-                        self.session_limits.source_command_max_inline_result_bytes,
-                    ),
-                    idempotency_window_ms: self.session_limits.source_dedupe_window_ms,
-                    rate_limit_window_ms: self.session_limits.source_command_rate_limit_window_ms,
-                    rate_limit_max_commands: self.session_limits.source_command_rate_limit_max,
-                    command_schema: emits.command_schema.as_ref(),
-                    command_result_schema: emits.command_result_schema.as_ref(),
-                })
-                .map_err(source_command_dispatch_status)?;
-        }
-        let waiter_inserted = self
-            .source_waiters
-            .lock()
-            .map_err(|_error| tonic::Status::internal("source command waiter unavailable"))
-            .and_then(|mut waiters| match waiters.entry(command_id.clone()) {
-                Entry::Vacant(entry) => {
-                    entry.insert(tx);
-                    Ok(())
-                }
-                Entry::Occupied(_) => Err(tonic::Status::failed_precondition(
-                    "source command waiter duplicate",
-                )),
-            });
-        if let Err(error) = waiter_inserted {
-            remove_source_command_registry_entry(&self.source_commands, &command_id).map_err(
-                |cleanup| {
-                    tonic::Status::internal(format!(
-                        "{}; source command cleanup failed: {}",
-                        error.message(),
-                        cleanup.message()
-                    ))
-                },
-            )?;
-            return Err(error);
-        }
-
-        if let Err(status) = outbound.send_outbound_command(command).await {
-            remove_source_command_pending(&self.source_commands, &self.source_waiters, &command_id)
-                .map_err(|cleanup| {
-                    tonic::Status::internal(format!(
-                        "{}; source command cleanup failed: {}",
-                        status.message(),
-                        cleanup.message()
-                    ))
-                })?;
-            return Err(status);
-        }
-
-        if let Some(deadline_ms) = deadline_ms {
-            schedule_source_command_deadline(
-                self.source_commands.clone(),
-                self.source_waiters.clone(),
-                deadline_ms,
-            );
-        }
-
-        Ok(rx)
-    }
-}
-
-#[cfg(feature = "external-gateway")]
-impl DaemonExternalSessionHandler {
-    async fn adjudicate_external_session(
-        &self,
-        hello: &RoleSessionClientHello,
-    ) -> Result<SessionContext, tonic::Status> {
-        let mut authority = self
-            .load_authority(&hello.installation_id, &hello.projection_id, hello.role)
-            .await?
-            .context;
-        authority.session_id = new_external_session_id()?;
-        Ok(authority)
-    }
-
-    async fn close_external_session(
-        &self,
-        _session: &EndpointSession,
-        context: SessionContext,
-    ) -> Result<(), tonic::Status> {
-        match context.role {
-            Role::Provider => {
-                let key = provider_session_key(&context);
-                let mut sessions = self.provider_sessions.lock().map_err(|_error| {
-                    tonic::Status::internal("provider session registry unavailable")
-                })?;
-                if sessions
-                    .get(&key)
-                    .is_some_and(|record| record.context == context)
-                {
-                    let record = sessions.remove(&key);
-                    drop(sessions);
-                    if let Some(record) = record {
-                        self.registry.unregister_endpoint(record.endpoint_id);
-                    }
-                } else {
-                    drop(sessions);
-                }
-                let pending = self
-                    .provider_invocations
-                    .lock()
-                    .map_err(|_error| {
-                        tonic::Status::internal("provider invocation registry unavailable")
-                    })?
-                    .drain_for_session(&context);
-                if !pending.is_empty() {
-                    let mut waiters = self.provider_waiters.lock().map_err(|_error| {
-                        tonic::Status::internal("provider invocation waiter unavailable")
-                    })?;
-                    for invocation_id in pending {
-                        waiters.remove(&invocation_id);
-                    }
-                }
-            }
-            Role::Source => {
-                let key = source_session_key(&context);
-                let mut sessions = self.source_sessions.lock().map_err(|_error| {
-                    tonic::Status::internal("source session registry unavailable")
-                })?;
-                if sessions
-                    .get(&key)
-                    .is_some_and(|record| record.context == context)
-                {
-                    sessions.remove(&key);
-                }
-                drop(sessions);
-                let pending = self
-                    .source_commands
-                    .lock()
-                    .map_err(|_error| {
-                        tonic::Status::internal("source command registry unavailable")
-                    })?
-                    .drain_for_session(&context, now_millis());
-                if !pending.is_empty() {
-                    let mut waiters = self.source_waiters.lock().map_err(|_error| {
-                        tonic::Status::internal("source command waiter unavailable")
-                    })?;
-                    for command_id in pending {
-                        waiters.remove(&command_id);
-                    }
-                }
-            }
-        }
-        remove_secure_replay_windows_for_context(&self.secure_replay_windows, &context)?;
-        Ok(())
-    }
-
-    async fn handle_inbound_event(
-        &self,
-        event: InboundEvent,
-        session: &EndpointSession,
-        context: SessionContext,
-    ) -> Result<EventAck, tonic::Status> {
-        let authority = self
-            .load_authority(
-                &context.installation_id,
-                &context.projection_id,
-                Role::Source,
-            )
-            .await?;
-        let policy = PolicySnapshot::empty();
-        let event_id = event.id.clone();
-        match ingest_source_event(
-            SourceIngest {
-                state: self.state.clone(),
-                session,
-                installation_id: &context.installation_id,
-                projection: &authority.projection,
-                current_registry_hash: &authority.context.registry_hash,
-                credential_generation: authority.context.credential_generation,
-                current_binding_generation: authority.context.binding_generation,
-                current_installation_config_version: authority.context.installation_config_version,
-                policy: &policy,
-                acting: IdentityRef::ROOT,
-                target: ResourceId::new(0),
-                now_millis: now_millis(),
-                dedupe_window_ms: self.session_limits.source_dedupe_window_ms,
-            },
-            event,
-        )
-        .await
-        {
-            Ok(ack) => Ok(ack),
-            Err(error) => match source_ingest_rejection_ack(event_id, &error) {
-                Some(ack) => Ok(ack),
-                None => Err(source_ingest_status(error)),
-            },
-        }
-    }
-
-    async fn handle_command_result(
-        &self,
-        result: CommandResult,
-        session: &EndpointSession,
-        context: SessionContext,
-    ) -> Result<(), tonic::Status> {
-        let result_id = result.id.clone();
-        let authority = self
-            .load_authority(
-                &context.installation_id,
-                &context.projection_id,
-                Role::Source,
-            )
-            .await?;
-        let accepted = {
-            let mut commands = self
-                .source_commands
-                .lock()
-                .map_err(|_error| tonic::Status::internal("source command registry unavailable"))?;
-            match commands.resolve(SourceCommandResolve {
-                session,
-                result,
-                current_registry_hash: &authority.context.registry_hash,
-                credential_generation: authority.context.credential_generation,
-                current_binding_generation: authority.context.binding_generation,
-                current_installation_config_version: authority.context.installation_config_version,
-                current_projection_version: authority.context.projection_version,
-                now_millis: now_millis(),
-            }) {
-                Ok(accepted) => accepted,
-                Err(error) => {
-                    drop(commands);
-                    if source_command_error_removes_entry(&error) {
-                        remove_source_command_waiter(&self.source_waiters, &result_id)?;
-                    }
-                    return Err(source_command_status(error));
-                }
-            }
-        };
-        let waiter = self
-            .source_waiters
-            .lock()
-            .map_err(|_error| tonic::Status::internal("source command waiter unavailable"))?
-            .remove(&accepted.id)
-            .ok_or_else(|| tonic::Status::failed_precondition("source command waiter missing"))?;
-        waiter
-            .send(accepted)
-            .map_err(|_error| tonic::Status::unavailable("source command receiver closed"))
-    }
-
-    async fn handle_invoke_result(
-        &self,
-        result: InvokeResult,
-        session: &EndpointSession,
-        context: SessionContext,
-    ) -> Result<(), tonic::Status> {
-        let invocation_id = result.invocation_id.clone();
-        let authority = self
-            .load_authority(
-                &context.installation_id,
-                &context.projection_id,
-                Role::Provider,
-            )
-            .await?;
-        let accepted = {
-            let mut invocations = self.provider_invocations.lock().map_err(|_error| {
-                tonic::Status::internal("provider invocation registry unavailable")
-            })?;
-            match invocations.resolve(ProviderInvocationResolve {
-                session,
-                result,
-                current_registry_hash: &authority.context.registry_hash,
-                credential_generation: authority.context.credential_generation,
-                current_binding_generation: authority.context.binding_generation,
-                current_projection_version: authority.context.projection_version,
-                now_millis: now_millis(),
-            }) {
-                Ok(accepted) => accepted,
-                Err(error) => {
-                    drop(invocations);
-                    if provider_invocation_error_removes_entry(&error) {
-                        remove_provider_invocation_pending(
-                            &self.provider_invocations,
-                            &self.provider_waiters,
-                            &invocation_id,
-                        )
-                        .map_err(|cleanup| tonic::Status::internal(cleanup.to_string()))?;
-                    }
-                    return Err(provider_invocation_status(error));
-                }
-            }
-        };
-        let waiter = self
-            .provider_waiters
-            .lock()
-            .map_err(|_error| tonic::Status::internal("provider invocation waiter unavailable"))?
-            .remove(&accepted.invocation_id)
-            .ok_or_else(|| {
-                tonic::Status::failed_precondition("provider invocation waiter missing")
-            })?;
-        waiter
-            .send(accepted)
-            .map_err(|_error| tonic::Status::unavailable("provider invocation receiver closed"))
-    }
-
-    async fn handle_control(
-        &self,
-        frame: ControlFrame,
-        _session: &EndpointSession,
-        context: SessionContext,
-    ) -> Result<(), tonic::Status> {
-        let authority = self
-            .load_authority(
-                &context.installation_id,
-                &context.projection_id,
-                context.role,
-            )
-            .await?;
-        if !context_matches_authority(&authority.context, &context) {
-            return Err(tonic::Status::permission_denied(
-                "external control frame rejected",
-            ));
-        }
-        validate_external_control_frame(&frame, &context)
-    }
-
-    async fn open_external_secure_envelope(
-        &self,
-        envelope: &SecureEnvelope,
-        _session: &EndpointSession,
-        context: SessionContext,
-    ) -> Result<Vec<u8>, tonic::Status> {
-        let authority = self
-            .load_authority(
-                &context.installation_id,
-                &context.projection_id,
-                context.role,
-            )
-            .await?;
-        if !context_matches_authority(&authority.context, &context) {
-            return Err(tonic::Status::permission_denied("secure envelope rejected"));
-        }
-        let credential = self
-            .external_credentials
-            .lock()
-            .map_err(|_error| tonic::Status::internal("external credential store unavailable"))?
-            .get(&(
-                context.installation_id.clone(),
-                context.credential_generation,
-            ))
-            .cloned()
-            .ok_or_else(|| tonic::Status::unauthenticated("external credential unavailable"))?;
-        let replay_key = SecureReplayKey {
-            installation_id: context.installation_id.clone(),
-            projection_id: context.projection_id.clone(),
-            role: role_slug(context.role),
-            session_id: envelope.aad().session_id.clone(),
-            key_epoch: envelope.aad().key_epoch,
-        };
-        let mut replay_windows = self.secure_replay_windows.lock().map_err(|_error| {
-            tonic::Status::internal("secure envelope replay state unavailable")
-        })?;
-        let replay_window = replay_windows.entry(replay_key).or_default();
-        let epoch_gate = SecureEnvelopeEpochGate::new(authority.key_epoch);
-        credential
-            .open_with_replay_window_and_epoch_gate(
-                envelope,
-                authority.context.credential_generation,
-                replay_window,
-                &epoch_gate,
-            )
-            .map_err(|_error| tonic::Status::permission_denied("secure envelope rejected"))
-    }
-}
-
-#[cfg(feature = "external-gateway")]
-#[tonic::async_trait]
-impl ExternalSessionHandler for DaemonExternalSessionHandler {
-    type Error = tonic::Status;
-    type OutboundError = tonic::Status;
-
-    async fn adjudicate_session(
-        &self,
-        hello: &RoleSessionClientHello,
-    ) -> Result<SessionContext, tonic::Status> {
-        self.adjudicate_external_session(hello).await
-    }
-
-    async fn on_ready(
-        &self,
-        session: &EndpointSession,
-        context: SessionContext,
-        outbound: ExternalSessionOutboundHandle,
-    ) -> Result<(), tonic::Status> {
-        self.register_ready_session(session, context, outbound)
-            .await
-    }
-
-    async fn on_closed(
-        &self,
-        session: &EndpointSession,
-        context: SessionContext,
-    ) -> Result<(), tonic::Status> {
-        self.close_external_session(session, context).await
-    }
-
-    async fn on_inbound_event(
-        &self,
-        event: InboundEvent,
-        session: &EndpointSession,
-        context: SessionContext,
-    ) -> Result<EventAck, tonic::Status> {
-        self.handle_inbound_event(event, session, context).await
-    }
-
-    async fn on_command_result(
-        &self,
-        result: CommandResult,
-        session: &EndpointSession,
-        context: SessionContext,
-    ) -> Result<(), tonic::Status> {
-        self.handle_command_result(result, session, context).await
-    }
-
-    async fn on_invoke_result(
-        &self,
-        result: InvokeResult,
-        session: &EndpointSession,
-        context: SessionContext,
-    ) -> Result<(), tonic::Status> {
-        self.handle_invoke_result(result, session, context).await
-    }
-
-    async fn on_control(
-        &self,
-        frame: ControlFrame,
-        session: &EndpointSession,
-        context: SessionContext,
-    ) -> Result<(), tonic::Status> {
-        self.handle_control(frame, session, context).await
-    }
-
-    async fn open_secure_envelope(
-        &self,
-        envelope: &SecureEnvelope,
-        session: &EndpointSession,
-        context: SessionContext,
-    ) -> Result<Vec<u8>, tonic::Status> {
-        self.open_external_secure_envelope(envelope, session, context)
-            .await
-    }
-}
-
-#[cfg(feature = "external-gateway")]
-impl DaemonExternalSessionHandler {
-    async fn register_ready_session(
-        &self,
-        session: &EndpointSession,
-        context: SessionContext,
-        outbound: ExternalSessionOutboundHandle,
-    ) -> Result<(), tonic::Status> {
-        let authority = self
-            .load_authority(
-                &context.installation_id,
-                &context.projection_id,
-                context.role,
-            )
-            .await?;
-        if !context_matches_authority(&authority.context, &context) {
-            return Err(tonic::Status::permission_denied(
-                "external session context rejected",
-            ));
-        }
-        match context.role {
-            Role::Provider => {
-                let binding_declarations =
-                    validate_provider_projection_bindings(&authority.projection)?;
-                let mut provider_sessions = self.provider_sessions.lock().map_err(|_error| {
-                    tonic::Status::internal("provider session registry unavailable")
-                })?;
-                let endpoint_id = self.registry.next_endpoint_id();
-                let endpoint = ProviderRoleEndpoint {
-                    state: self.state.clone(),
-                    context: context.clone(),
-                    session: session.clone(),
-                    outbound,
-                    provider_invocations: self.provider_invocations.clone(),
-                    provider_waiters: self.provider_waiters.clone(),
-                    provider_sessions: self.provider_sessions.clone(),
-                    session_limits: self.session_limits,
-                };
-                self.registry
-                    .register_endpoint(endpoint_id, Arc::new(endpoint));
-                let ready_endpoints = match register_provider_bindings(
-                    &self.registry,
-                    &binding_declarations,
-                    endpoint_id,
-                    &context,
-                ) {
-                    Ok(ready_endpoints) => ready_endpoints,
-                    Err(error) => {
-                        self.registry.unregister_endpoint(endpoint_id);
-                        return Err(error);
-                    }
-                };
-                if let Some(old) = provider_sessions.insert(
-                    provider_session_key(&context),
-                    ProviderSessionRecord {
-                        endpoint_id,
-                        context,
-                        ready_endpoints,
-                    },
-                ) {
-                    self.registry.unregister_endpoint(old.endpoint_id);
-                }
-            }
-            Role::Source => {
-                self.source_sessions
-                    .lock()
-                    .map_err(|_error| {
-                        tonic::Status::internal("source session registry unavailable")
-                    })?
-                    .insert(
-                        source_session_key(&context),
-                        SourceSessionRecord {
-                            context,
-                            #[cfg(test)]
-                            outbound,
-                        },
-                    );
-            }
-        }
-        Ok(())
-    }
-
-    async fn load_authority(
-        &self,
-        installation_id: &str,
-        projection_id: &str,
-        role: Role,
-    ) -> Result<ExternalAuthority, tonic::Status> {
-        load_external_authority(&self.state, installation_id, projection_id, role).await
-    }
-}
-
-#[cfg(feature = "external-gateway")]
-async fn load_external_authority(
-    state: &Backend,
-    installation_id: &str,
-    projection_id: &str,
-    role: Role,
-) -> Result<ExternalAuthority, tonic::Status> {
-    let installation = load_external_installation(state, installation_id).await?;
-    let role_session = load_external_session(state, installation_id, role).await?;
-    let projection = installation
-        .projection(projection_id)
-        .cloned()
-        .ok_or_else(|| tonic::Status::not_found("external projection not found"))?;
-    if projection.role != role {
-        return Err(tonic::Status::permission_denied(
-            "external projection role mismatch",
-        ));
-    }
-    let provider_capabilities = provider_capability_index(&projection)?;
-    let registry_hash = external_registry_hash(&installation, &projection)?;
-    Ok(ExternalAuthority {
-        context: SessionContext {
-            installation_id: installation.id.clone(),
-            projection_id: projection.id.clone(),
-            role: projection.role,
-            registry_hash,
-            credential_generation: role_session.credential_generation,
-            binding_generation: projection.version,
-            installation_config_version: installation.version,
-            projection_version: projection.version,
-            presentation_config_generation: 0,
-            alias_catalog_generation: 0,
-            session_id: String::new(),
-        },
-        projection,
-        provider_capabilities,
-        key_epoch: role_session.key_epoch,
-    })
-}
-
-#[cfg(feature = "external-gateway")]
-fn provider_capability_index(
-    projection: &ExternalProjectionDef,
-) -> Result<BTreeMap<Path, EffectCapability>, tonic::Status> {
-    if projection.role != Role::Provider {
-        return Ok(BTreeMap::new());
-    }
-    let mut capabilities = BTreeMap::new();
-    for capability in &projection.provides {
-        let path = Path::parse(&capability.effect_path).map_err(|error| {
-            tonic::Status::failed_precondition(format!("external projection is invalid: {error}"))
-        })?;
-        if capabilities.insert(path, capability.clone()).is_some() {
-            return Err(tonic::Status::failed_precondition(
-                "external projection is invalid",
-            ));
-        }
-    }
-    Ok(capabilities)
-}
-
-#[cfg(feature = "external-gateway")]
-async fn load_external_installation(
-    state: &Backend,
-    installation_id: &str,
-) -> Result<ExternalInstallationDef, tonic::Status> {
-    validate_external_path_segment(installation_id, "external installation id")?;
-    let path =
-        external_state_path(&["external-installations", installation_id]).map_err(|error| {
-            tonic::Status::invalid_argument(format!("external installation id is invalid: {error}"))
-        })?;
-    let Some(value) = state.read(&path).await.map_err(|error| {
-        tonic::Status::unavailable(format!("external state read failed: {error}"))
-    })?
-    else {
-        return Err(tonic::Status::not_found("external installation not found"));
-    };
-    let json = serde_json::to_value(value).map_err(|error| {
-        tonic::Status::failed_precondition(format!("external state is invalid: {error}"))
-    })?;
-    let installation: ExternalInstallationDef = serde_json::from_value(json).map_err(|error| {
-        tonic::Status::failed_precondition(format!("external installation is invalid: {error}"))
-    })?;
-    if installation.id != installation_id {
-        return Err(tonic::Status::failed_precondition(
-            "external installation id mismatch",
-        ));
-    }
-    installation.validate_admission().map_err(|error| {
-        tonic::Status::failed_precondition(format!(
-            "external installation admission failed: {error}"
-        ))
-    })?;
-    Ok(installation)
-}
-
-#[cfg(feature = "external-gateway")]
-async fn load_external_session(
-    state: &Backend,
-    installation_id: &str,
-    role: Role,
-) -> Result<ExternalSessionState, tonic::Status> {
-    validate_external_path_segment(installation_id, "external installation id")?;
-    let role = role_slug(role);
-    let path =
-        external_state_path(&["external-sessions", installation_id, role]).map_err(|error| {
-            tonic::Status::invalid_argument(format!("external session id is invalid: {error}"))
-        })?;
-    let Some(value) = state.read(&path).await.map_err(|error| {
-        tonic::Status::unavailable(format!("external session state read failed: {error}"))
-    })?
-    else {
-        return Err(tonic::Status::unauthenticated(
-            "external session is not approved",
-        ));
-    };
-    let record = value
-        .as_map()
-        .ok_or_else(|| tonic::Status::failed_precondition("external session is invalid"))?;
-    if record.get("installation_id").and_then(Value::as_str) != Some(installation_id)
-        || record.get("role").and_then(Value::as_str) != Some(role)
-    {
-        return Err(tonic::Status::failed_precondition(
-            "external session mismatch",
-        ));
-    }
-    if record.get("state").and_then(Value::as_str) != Some("ready") {
-        return Err(tonic::Status::unauthenticated(
-            "external session is not ready",
-        ));
-    }
-    let generation = credential_generation_from_record(record)?;
-    ensure_external_not_revoked(state, installation_id, generation).await?;
-    let key_epoch = key_epoch_from_record(record)?;
-    Ok(ExternalSessionState {
-        credential_generation: generation,
-        key_epoch,
-    })
-}
-
-#[cfg(feature = "external-gateway")]
-async fn ensure_external_not_revoked(
-    state: &Backend,
-    installation_id: &str,
-    credential_generation: u64,
-) -> Result<(), tonic::Status> {
-    validate_external_path_segment(installation_id, "external installation id")?;
-    let path = external_state_path(&["external-credential-revocations", installation_id]).map_err(
-        |error| {
-            tonic::Status::invalid_argument(format!("external revocation id is invalid: {error}"))
-        },
-    )?;
-    let Some(value) = state.read(&path).await.map_err(|error| {
-        tonic::Status::unavailable(format!("external revocation state read failed: {error}"))
-    })?
-    else {
-        return Ok(());
-    };
-    let record = value.as_map().ok_or_else(|| {
-        tonic::Status::failed_precondition("external revocation state is invalid")
-    })?;
-    if let Some(id) = record.get("installation_id").and_then(Value::as_str)
-        && id != installation_id
-    {
-        return Err(tonic::Status::failed_precondition(
-            "external revocation id mismatch",
-        ));
-    }
-    if let Some(state) = record.get("state").and_then(Value::as_str)
-        && state != "revoked"
-    {
-        return Err(tonic::Status::failed_precondition(
-            "external revocation state is invalid",
-        ));
-    }
-    let floor = record
-        .get("credential_generation_floor")
-        .and_then(Value::as_int)
-        .ok_or_else(|| {
-            tonic::Status::failed_precondition("external revocation floor is invalid")
-        })?;
-    if floor < 0 {
-        return Err(tonic::Status::failed_precondition(
-            "external revocation floor is invalid",
-        ));
-    }
-    if credential_generation <= floor as u64 {
-        return Err(tonic::Status::unauthenticated(
-            "external credential revoked",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "external-gateway")]
-fn external_registry_hash(
-    installation: &ExternalInstallationDef,
-    projection: &ExternalProjectionDef,
-) -> Result<String, tonic::Status> {
-    external_registry_hash_value(installation, projection).map_err(|error| {
-        tonic::Status::failed_precondition(format!("external registry is invalid: {error}"))
-    })
-}
-
-#[cfg(feature = "external-gateway")]
-fn credential_generation_from_record(
-    record: &xolotl_types::ValueMap,
-) -> Result<u64, tonic::Status> {
-    let generation = record
-        .get("credential_generation")
-        .and_then(Value::as_int)
-        .ok_or_else(|| {
-            tonic::Status::failed_precondition("external session generation is invalid")
-        })?;
-    if generation <= 0 {
-        return Err(tonic::Status::failed_precondition(
-            "external session generation is invalid",
-        ));
-    }
-    Ok(generation as u64)
-}
-
-#[cfg(feature = "external-gateway")]
-fn key_epoch_from_record(record: &xolotl_types::ValueMap) -> Result<u64, tonic::Status> {
-    let Some(value) = record.get("key_epoch") else {
-        return Ok(0);
-    };
-    let Some(epoch) = value.as_int() else {
-        return Err(tonic::Status::failed_precondition(
-            "external session key epoch is invalid",
-        ));
-    };
-    if epoch < 0 {
-        return Err(tonic::Status::failed_precondition(
-            "external session key epoch is invalid",
-        ));
-    }
-    Ok(epoch as u64)
-}
-
-#[cfg(feature = "external-gateway")]
-fn role_slug(role: Role) -> &'static str {
-    match role {
-        Role::Provider => "provider",
-        Role::Source => "source",
-    }
-}
-
-#[cfg(feature = "external-gateway")]
-fn is_valid_external_path_segment(segment: &str) -> bool {
-    let mut chars = segment.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphanumeric() => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
-#[cfg(feature = "external-gateway")]
-fn validate_external_path_segment(segment: &str, label: &'static str) -> Result<(), tonic::Status> {
-    if is_valid_external_path_segment(segment) {
-        Ok(())
-    } else {
-        Err(tonic::Status::invalid_argument(format!(
-            "{label} is invalid"
-        )))
-    }
-}
-
-#[cfg(feature = "external-gateway")]
-fn external_state_path(segments: &[&str]) -> Result<Path, xolotl_types::PathError> {
-    let mut path = Path::try_new("state")?.try_push("kernel")?;
-    for segment in segments {
-        path = path.try_push_literal(segment)?;
-    }
-    Ok(path)
-}
-
-#[cfg(feature = "external-gateway")]
-fn provider_session_key(context: &SessionContext) -> ProviderSessionKey {
-    ProviderSessionKey {
-        installation_id: context.installation_id.clone(),
-        projection_id: context.projection_id.clone(),
-        session_id: context.session_id.clone(),
-    }
-}
-
-#[cfg(feature = "external-gateway")]
-fn source_session_key(context: &SessionContext) -> SourceSessionKey {
-    SourceSessionKey {
-        installation_id: context.installation_id.clone(),
-        projection_id: context.projection_id.clone(),
-        session_id: context.session_id.clone(),
-    }
-}
-
-#[cfg(feature = "external-gateway")]
-fn remove_secure_replay_windows_for_context(
-    replay_windows: &std::sync::Mutex<BTreeMap<SecureReplayKey, SecureEnvelopeReplayWindow>>,
-    context: &SessionContext,
-) -> Result<(), tonic::Status> {
-    let role = role_slug(context.role);
-    replay_windows
-        .lock()
-        .map_err(|_error| tonic::Status::internal("secure envelope replay state unavailable"))?
-        .retain(|key, _| {
-            key.installation_id != context.installation_id
-                || key.projection_id != context.projection_id
-                || key.role != role
-                || key.session_id != context.session_id
-        });
-    Ok(())
-}
-
-#[cfg(feature = "external-gateway")]
-fn context_matches_authority(authority: &SessionContext, context: &SessionContext) -> bool {
-    !context.session_id.trim().is_empty()
-        && authority.installation_id == context.installation_id
-        && authority.projection_id == context.projection_id
-        && authority.role == context.role
-        && authority.registry_hash == context.registry_hash
-        && authority.credential_generation == context.credential_generation
-        && authority.binding_generation == context.binding_generation
-        && authority.installation_config_version == context.installation_config_version
-        && authority.projection_version == context.projection_version
-        && authority.presentation_config_generation == context.presentation_config_generation
-        && authority.alias_catalog_generation == context.alias_catalog_generation
-}
-
-#[cfg(feature = "external-gateway")]
-fn new_external_session_id() -> Result<String, tonic::Status> {
-    let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).map_err(|error| {
-        tonic::Status::unavailable(format!("external session id unavailable: {error}"))
-    })?;
-    Ok(format!("s_{}", hex_lower(&bytes)))
-}
-
-#[cfg(feature = "external-gateway")]
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
-#[cfg(feature = "external-gateway")]
-fn validate_provider_projection_bindings(
-    projection: &ExternalProjectionDef,
-) -> Result<Vec<ProviderBindingDeclaration>, tonic::Status> {
-    if projection.role != Role::Provider {
-        return Err(tonic::Status::permission_denied(
-            "provider projection rejected",
-        ));
-    }
-    if projection.provides.is_empty() {
-        return Err(tonic::Status::failed_precondition(
-            "provider projection rejected",
-        ));
-    }
-
-    let mut seen = std::collections::BTreeSet::new();
-    let mut bindings = Vec::with_capacity(projection.provides.len());
-    for capability in &projection.provides {
-        let path = Path::parse(&capability.effect_path).map_err(|error| {
-            tonic::Status::invalid_argument(format!("provider binding rejected: {error}"))
-        })?;
-        if !seen.insert(path.clone()) {
-            return Err(tonic::Status::failed_precondition(
-                "provider binding rejected",
-            ));
-        }
-        let selector_literal = format!("perform://{}", strip_scheme(&path.to_string()));
-        let selector = ResourceSelector::parse(&selector_literal).map_err(|error| {
-            tonic::Status::failed_precondition(format!("provider binding rejected: {error}"))
-        })?;
-        bindings.push(ProviderBindingDeclaration {
-            path,
-            purity: capability.purity,
-            finalize_allowed: capability.finalize_allowed,
-            selector,
-        });
-    }
-    Ok(bindings)
-}
-
-#[cfg(feature = "external-gateway")]
-fn register_provider_bindings(
-    registry: &Registry,
-    declarations: &[ProviderBindingDeclaration],
-    endpoint_id: xolotl_types::EndpointId,
-    context: &SessionContext,
-) -> Result<HashMap<ProviderEndpointKey, Path>, tonic::Status> {
-    let mut ready_endpoints = HashMap::new();
-    for declaration in declarations {
-        let (key, path) = register_provider_binding(
-            registry,
-            declaration,
-            endpoint_id,
-            context.binding_generation,
-        )?;
-        if ready_endpoints.insert(key, path).is_some() {
-            return Err(tonic::Status::failed_precondition(
-                "provider binding rejected",
-            ));
-        }
-    }
-    Ok(ready_endpoints)
-}
-
-#[cfg(feature = "external-gateway")]
-fn register_provider_binding(
-    registry: &Registry,
-    declaration: &ProviderBindingDeclaration,
-    endpoint_id: xolotl_types::EndpointId,
-    binding_generation: u64,
-) -> Result<(ProviderEndpointKey, Path), tonic::Status> {
-    let effect_path = declaration.path.to_string();
-    let iface_id = registry.next_interface_id();
-    let interfaces = InterfaceSet::new(vec![iface_id]);
-    registry.register_interface(Interface {
-        id: iface_id,
-        family: InterfaceFamily::Callable,
-        methods: vec![Method {
-            id: MethodId::new(0),
-            name: "invoke".into(),
-            input: SchemaId::new(0),
-            output: SchemaId::new(0),
-            modality: ModalitySet::TEXT,
-            purity: declaration.purity,
-            replay: declaration.purity.replay_class(false),
-            supports: OutputModeSet::UNARY | OutputModeSet::ASYNC_PROCESS,
-            cost: CostModel::default(),
-            batchable: false,
-            finalize_allowed: declaration.finalize_allowed,
-            requires_unprotected_input: true,
-        }],
-        laws: Vec::new(),
-    });
-
-    let driver_id = registry.next_driver_id();
-    registry.register_driver(DriverDescriptor {
-        id: driver_id,
-        name: effect_path.clone(),
-        implements: interfaces.clone(),
-        transport: Transport::Grpc { endpoint: None },
-        driver: Arc::new(EchoDriver),
-    });
-
-    let binding_id = registry.next_binding_id();
-    registry
-        .admit_binding(Binding {
-            id: binding_id,
-            selector: declaration.selector.clone(),
-            interfaces: interfaces.clone(),
-            driver: DriverRef {
-                id: driver_id,
-                name: effect_path,
-            },
-            endpoint: Some(endpoint_id),
-            generation: binding_generation,
-        })
-        .map_err(|error| {
-            tonic::Status::failed_precondition(format!("provider binding rejected: {error}"))
-        })?;
-
-    let resource_name = ResourceName::new(declaration.path.clone());
-    let rid = match registry.resolve_resource(&resource_name) {
-        Ok(_) => registry
-            .relink_resource(&resource_name, interfaces, binding_id)
-            .map_err(|error| {
-                tonic::Status::failed_precondition(format!("provider binding rejected: {error}"))
-            })?,
-        Err(ResolveError::NoSuchResource(_)) => {
-            let rid = registry.next_resource_id();
-            registry
-                .admit_resource(
-                    Resource {
-                        id: rid,
-                        descriptor: ResourceDescriptor {
-                            name: resource_name,
-                            kind: ResourceKind::Effect,
-                            metadata: Metadata::default(),
-                        },
-                        interfaces,
-                        binding: binding_id,
-                    },
-                    true,
-                )
-                .map_err(|error| {
-                    tonic::Status::failed_precondition(format!(
-                        "provider binding rejected: {error}"
-                    ))
-                })?
-        }
-    };
-    Ok((
-        ProviderEndpointKey {
-            resource_id: rid,
-            method_id: MethodId::new(0),
-            binding_generation,
-        },
-        declaration.path.clone(),
-    ))
-}
-
-#[cfg(feature = "external-gateway")]
-fn strip_scheme(path: &str) -> String {
-    path.replacen("://", "/", 1)
-}
-
-#[cfg(feature = "external-gateway")]
-fn status_to_driver_error(status: tonic::Status) -> DriverError {
-    DriverError::Transport(status.message().to_string())
-}
-
-#[cfg(feature = "external-gateway")]
-fn validate_external_control_frame(
-    frame: &ControlFrame,
-    context: &SessionContext,
-) -> Result<(), tonic::Status> {
-    match frame {
-        ControlFrame::Heartbeat { timestamp_ms } if *timestamp_ms >= 0 => Ok(()),
-        ControlFrame::Heartbeat { .. } => Err(tonic::Status::invalid_argument(
-            "external control frame rejected",
-        )),
-        ControlFrame::FlowControl(_) => Err(tonic::Status::permission_denied(
-            "external control frame rejected",
-        )),
-        ControlFrame::PresentationProfileUpdate {
-            profile_generation: _,
-            profile_hash,
-            profile: _,
-        } if !profile_hash.trim().is_empty() => Ok(()),
-        ControlFrame::PresentationProfileUpdate { .. } => Err(tonic::Status::invalid_argument(
-            "external control frame rejected",
-        )),
-        ControlFrame::ConfigAck {
-            axis: ConfigAxis::InstallationConfig,
-            version,
-            status: _,
-        } if *version == context.installation_config_version => Ok(()),
-        ControlFrame::ConfigAck {
-            axis: ConfigAxis::PresentationConfig,
-            version,
-            status: _,
-        } if *version == context.presentation_config_generation => Ok(()),
-        ControlFrame::ConfigAck { .. } => Err(tonic::Status::permission_denied(
-            "external control frame rejected",
-        )),
-        ControlFrame::Shutdown { .. }
-        | ControlFrame::ProviderCancel { .. }
-        | ControlFrame::InstallationConfigUpdate { .. }
-        | ControlFrame::PresentationConfigUpdate { .. } => Err(tonic::Status::permission_denied(
-            "external control frame rejected",
-        )),
-    }
-}
-
 fn now_millis() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
@@ -2622,148 +1056,6 @@ fn now_millis() -> i64 {
             before_epoch.saturating_neg()
         }
     }
-}
-
-#[cfg(feature = "external-gateway")]
-fn source_ingest_status(error: SourceIngestError) -> tonic::Status {
-    let message = format!("source event rejected: {error}");
-    match error {
-        SourceIngestError::Session(_)
-        | SourceIngestError::ProjectionMismatch(_)
-        | SourceIngestError::RegistryHashMismatch
-        | SourceIngestError::CredentialGenerationMismatch
-        | SourceIngestError::BindingGenerationMismatch
-        | SourceIngestError::InstallationConfigVersionMismatch
-        | SourceIngestError::ProjectionVersionMismatch
-        | SourceIngestError::NotSource
-        | SourceIngestError::MissingEmits => tonic::Status::permission_denied(message),
-        SourceIngestError::InvalidEventId
-        | SourceIngestError::InvalidStreamId
-        | SourceIngestError::InvalidSequence
-        | SourceIngestError::SequenceReplay { .. }
-        | SourceIngestError::SequenceGap { .. }
-        | SourceIngestError::Schema(_)
-        | SourceIngestError::PayloadTooLarge
-        | SourceIngestError::ForbiddenPayloadField { .. }
-        | SourceIngestError::Policy(_) => tonic::Status::invalid_argument(message),
-        SourceIngestError::RateLimited
-        | SourceIngestError::Backpressured
-        | SourceIngestError::CapacityExceeded => tonic::Status::resource_exhausted(message),
-        SourceIngestError::State(_) => tonic::Status::unavailable(message),
-    }
-}
-
-#[cfg(feature = "external-gateway")]
-fn source_ingest_rejection_ack(event_id: String, error: &SourceIngestError) -> Option<EventAck> {
-    let reason = match error {
-        SourceIngestError::InvalidEventId => "invalid_event_id",
-        SourceIngestError::InvalidStreamId => "invalid_stream_id",
-        SourceIngestError::InvalidSequence
-        | SourceIngestError::SequenceReplay { .. }
-        | SourceIngestError::SequenceGap { .. } => "ordering_rejected",
-        SourceIngestError::Schema(_) => "schema_rejected",
-        SourceIngestError::PayloadTooLarge => "payload_too_large",
-        SourceIngestError::ForbiddenPayloadField { .. } => "forbidden_payload_field",
-        SourceIngestError::Policy(_) => "policy_rejected",
-        SourceIngestError::RateLimited => "rate_limited",
-        SourceIngestError::Backpressured => "backpressured",
-        SourceIngestError::CapacityExceeded => "capacity_exceeded",
-        SourceIngestError::Session(_)
-        | SourceIngestError::ProjectionMismatch(_)
-        | SourceIngestError::RegistryHashMismatch
-        | SourceIngestError::CredentialGenerationMismatch
-        | SourceIngestError::BindingGenerationMismatch
-        | SourceIngestError::InstallationConfigVersionMismatch
-        | SourceIngestError::ProjectionVersionMismatch
-        | SourceIngestError::NotSource
-        | SourceIngestError::MissingEmits
-        | SourceIngestError::State(_) => return None,
-    };
-    Some(EventAck {
-        id: event_id,
-        status: AckStatus::Rejected,
-        reject_reason: Some(reason.into()),
-    })
-}
-
-#[cfg(feature = "external-gateway")]
-fn provider_invocation_status(error: ProviderInvocationError) -> tonic::Status {
-    let message = format!("provider invocation result rejected: {error}");
-    match error {
-        ProviderInvocationError::InvocationNotFound
-        | ProviderInvocationError::SessionMismatch
-        | ProviderInvocationError::NotProvider
-        | ProviderInvocationError::RegistryHashMismatch
-        | ProviderInvocationError::CredentialGenerationMismatch
-        | ProviderInvocationError::BindingGenerationMismatch
-        | ProviderInvocationError::ProjectionVersionMismatch => {
-            tonic::Status::permission_denied(message)
-        }
-        ProviderInvocationError::Session(_) => tonic::Status::failed_precondition(message),
-        ProviderInvocationError::EmptyInvocationId
-        | ProviderInvocationError::DuplicateInvocationId
-        | ProviderInvocationError::Schema(_) => tonic::Status::invalid_argument(message),
-        ProviderInvocationError::DeadlineExceeded => tonic::Status::deadline_exceeded(message),
-        ProviderInvocationError::ResultTooLarge
-        | ProviderInvocationError::InFlightLimitExceeded => {
-            tonic::Status::resource_exhausted(message)
-        }
-    }
-}
-
-#[cfg(feature = "external-gateway")]
-fn provider_invocation_error_removes_entry(error: &ProviderInvocationError) -> bool {
-    matches!(
-        error,
-        ProviderInvocationError::DeadlineExceeded
-            | ProviderInvocationError::ResultTooLarge
-            | ProviderInvocationError::Schema(_)
-    )
-}
-
-#[cfg(feature = "external-gateway")]
-fn source_command_status(error: SourceCommandError) -> tonic::Status {
-    source_command_error_status(error, "source command result rejected")
-}
-
-#[cfg(all(test, feature = "external-gateway"))]
-fn source_command_dispatch_status(error: SourceCommandError) -> tonic::Status {
-    source_command_error_status(error, "source command rejected")
-}
-
-#[cfg(feature = "external-gateway")]
-fn source_command_error_status(error: SourceCommandError, message: &'static str) -> tonic::Status {
-    let message = format!("{message}: {error}");
-    match error {
-        SourceCommandError::CommandNotFound
-        | SourceCommandError::SessionMismatch
-        | SourceCommandError::NotSource
-        | SourceCommandError::RegistryHashMismatch
-        | SourceCommandError::CredentialGenerationMismatch
-        | SourceCommandError::BindingGenerationMismatch
-        | SourceCommandError::InstallationConfigVersionMismatch
-        | SourceCommandError::ProjectionVersionMismatch => {
-            tonic::Status::permission_denied(message)
-        }
-        SourceCommandError::Session(_) => tonic::Status::failed_precondition(message),
-        SourceCommandError::EmptyCommandId
-        | SourceCommandError::DuplicateCommandId
-        | SourceCommandError::Schema(_) => tonic::Status::invalid_argument(message),
-        SourceCommandError::DeadlineExceeded => tonic::Status::deadline_exceeded(message),
-        SourceCommandError::ResultTooLarge
-        | SourceCommandError::InFlightLimitExceeded
-        | SourceCommandError::RateLimited => tonic::Status::resource_exhausted(message),
-    }
-}
-
-#[cfg(feature = "external-gateway")]
-fn source_command_error_removes_entry(error: &SourceCommandError) -> bool {
-    matches!(
-        error,
-        SourceCommandError::DeadlineExceeded
-            | SourceCommandError::ResultTooLarge
-            | SourceCommandError::Schema(_)
-    )
 }
 
 fn log_console_transport_security(addr: &str, config: &ConsoleTransportSecurityConfig) {
@@ -2803,2480 +1095,4 @@ async fn wait_for_shutdown() -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use anyhow::Context as _;
-    #[cfg(feature = "external-gateway")]
-    use anyhow::bail;
-    #[cfg(feature = "external-grpc")]
-    use serde_json::json;
-    #[cfg(feature = "external-grpc")]
-    use std::sync::{Mutex, MutexGuard};
-    #[cfg(feature = "external-grpc")]
-    use xolotl_gateway::external::EnvelopeAad;
-
-    macro_rules! assert {
-        ($condition:expr $(,)?) => {
-            anyhow::ensure!($condition, "assertion failed: {}", stringify!($condition));
-        };
-        ($condition:expr, $($arg:tt)+) => {
-            anyhow::ensure!($condition, $($arg)+);
-        };
-    }
-
-    macro_rules! assert_eq {
-        ($left:expr, $right:expr $(,)?) => {
-            match (&$left, &$right) {
-                (left, right) => anyhow::ensure!(
-                    left == right,
-                    "assertion failed: left != right\nleft: {left:?}\nright: {right:?}"
-                ),
-            }
-        };
-        ($left:expr, $right:expr, $($arg:tt)+) => {
-            anyhow::ensure!($left == $right, $($arg)+);
-        };
-    }
-
-    #[cfg(feature = "external-gateway")]
-    macro_rules! assert_ne {
-        ($left:expr, $right:expr $(,)?) => {
-            match (&$left, &$right) {
-                (left, right) => anyhow::ensure!(
-                    left != right,
-                    "assertion failed: left == right\nleft: {left:?}\nright: {right:?}"
-                ),
-            }
-        };
-        ($left:expr, $right:expr, $($arg:tt)+) => {
-            anyhow::ensure!($left != $right, $($arg)+);
-        };
-    }
-
-    #[cfg(feature = "external-grpc")]
-    const TEST_EXTERNAL_PSK: [u8; 32] = [0x41; 32];
-
-    #[tokio::test]
-    async fn shutdown_background_tasks_awaits_completed_and_cancelled_tasks() -> anyhow::Result<()>
-    {
-        let completed = tokio::spawn(async {});
-        while !completed.is_finished() {
-            tokio::task::yield_now().await;
-        }
-        let cancelled = tokio::spawn(async {
-            std::future::pending::<()>().await;
-        });
-        let report = shutdown_background_tasks(vec![completed, cancelled]).await;
-        assert_eq!(report.completed, 1);
-        assert_eq!(report.cancelled, 1);
-        assert_eq!(report.failed, 0);
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    fn lock_test<'a, T>(mutex: &'a Mutex<T>, name: &str) -> anyhow::Result<MutexGuard<'a, T>> {
-        mutex
-            .lock()
-            .map_err(|_error| anyhow::anyhow!("{name} mutex poisoned"))
-    }
-
-    #[cfg(feature = "external-grpc")]
-    fn parse_test_path(path: &str) -> anyhow::Result<Path> {
-        Path::parse(path).map_err(|error| anyhow::anyhow!("parsing test path {path}: {error}"))
-    }
-
-    #[cfg(feature = "external-grpc")]
-    fn install_test_external_credential(
-        handler: &DaemonExternalSessionHandler,
-        credential: ExternalCredential,
-    ) -> anyhow::Result<()> {
-        let mut credentials = lock_test(&handler.external_credentials, "external_credentials")?;
-        credentials.insert(
-            (
-                credential.installation_id().to_owned(),
-                credential.generation(),
-            ),
-            credential,
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn kernel_boots_with_standard_providers() -> anyhow::Result<()> {
-        let boot = Arc::new(Bootstrap::in_memory());
-        install_standard(&boot, &StandardConfig::default())
-            .map_err(|error| anyhow::anyhow!("installing standard providers: {error}"))?;
-        assert!(boot.kernel.registry.resource_count() >= 5);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn projection_status_reconcile_deletes_stale_entries() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        write_in_process_projection_status(
-            &boot,
-            &InProcessProjectionStatus {
-                id: "stale".into(),
-                phase: InProcessProjectionPhase::Active,
-                implementation: Some("standard.fetch".into()),
-                role: Some(xolotl_types::Role::Provider),
-                desired_version: Some(1),
-                active_version: Some(1),
-                error_code: None,
-                error_message: None,
-                updated_at: 1,
-            },
-        )
-        .await?;
-
-        let installed = InProcessProjectionInstalled {
-            id: "fetch".into(),
-            implementation: "standard.fetch".into(),
-            role: xolotl_types::Role::Provider,
-            version: 1,
-        };
-        reconcile_in_process_projection_report_status(
-            &boot,
-            vec![InProcessProjectionInstallEntry {
-                id: installed.id.clone(),
-                path: Path::parse("state://kernel/projections/in-process/fetch")?,
-                desired: Some(installed.clone()),
-                result: Ok(installed),
-            }],
-        )
-        .await?;
-
-        let stale_path = in_process_projection_status_path("stale")?;
-        assert!(boot.kernel.state.read(&stale_path).await?.is_none());
-        let active_path = in_process_projection_status_path("fetch")?;
-        let active = boot
-            .kernel
-            .state
-            .read(&active_path)
-            .await?
-            .context("active projection status missing")?;
-        let status: InProcessProjectionStatus =
-            serde_json::from_value(serde_json::to_value(active)?)?;
-        assert_eq!(status.phase, InProcessProjectionPhase::Active);
-        assert_eq!(status.id, "fetch");
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    fn external_installation_value() -> anyhow::Result<Value> {
-        source_external_installation_value(false)
-    }
-
-    #[cfg(feature = "external-grpc")]
-    fn source_external_installation_value(commands: bool) -> anyhow::Result<Value> {
-        serde_json::from_value(source_external_installation_json(commands))
-            .context("building source external installation value")
-    }
-
-    #[cfg(feature = "external-grpc")]
-    fn source_external_installation_json(commands: bool) -> serde_json::Value {
-        json!({
-            "id": "chat",
-            "platform": "chat",
-            "transport": { "grpc": { "endpoint": null } },
-            "trust": "sandboxed",
-            "config_schema": null,
-            "config": null,
-            "projections": [{
-                "id": "source",
-                "role": "source",
-                "namespace": null,
-                "provides": [],
-                "emits": {
-                    "sink": "state://events/external/chat/source",
-                    "purity": "effectful",
-                    "event_schema": null,
-                    "max_inline_payload_bytes": 65536,
-                    "capacity": { "max_events": 1024, "on_overflow": "drop_oldest" },
-                    "rate_limit": null,
-                    "commands": commands,
-                    "command_schema": if commands { json!({ "type": "string" }) } else { serde_json::Value::Null },
-                    "command_result_schema": if commands { json!({ "type": "string" }) } else { serde_json::Value::Null }
-                },
-                "version": 7
-            }],
-            "version": 11
-        })
-    }
-
-    #[cfg(feature = "external-grpc")]
-    fn provider_external_installation_value() -> anyhow::Result<Value> {
-        serde_json::from_value(json!({
-            "id": "chat",
-            "platform": "chat",
-            "transport": { "grpc": { "endpoint": null } },
-            "trust": "sandboxed",
-            "config_schema": null,
-            "config": null,
-            "projections": [{
-                "id": "provider",
-                "role": "provider",
-                "namespace": "effect://external-provider/chat",
-                "provides": [{
-                    "effect_path": "effect://external-provider/chat/search",
-                    "purity": "idempotent",
-                    "input_schema": { "type": "string" },
-                    "output_schema": { "type": "string" }
-                }, {
-                    "effect_path": "effect://external-provider/chat/summarize",
-                    "purity": "effectful"
-                }],
-                "emits": null,
-                "version": 13
-            }],
-            "version": 17
-        }))
-        .context("building provider external installation value")
-    }
-
-    #[cfg(feature = "external-grpc")]
-    fn provider_external_installation_without_capabilities_value() -> anyhow::Result<Value> {
-        serde_json::from_value(json!({
-            "id": "chat",
-            "platform": "chat",
-            "transport": { "grpc": { "endpoint": null } },
-            "trust": "sandboxed",
-            "config_schema": null,
-            "config": null,
-            "projections": [{
-                "id": "provider",
-                "role": "provider",
-                "namespace": "effect://external-provider/chat",
-                "provides": [],
-                "emits": null,
-                "version": 13
-            }],
-            "version": 17
-        }))
-        .context("building provider installation without capabilities value")
-    }
-
-    #[cfg(feature = "external-grpc")]
-    async fn write_external_session(
-        state: &Backend,
-        installation_id: &str,
-        role: &str,
-        credential_generation: i64,
-    ) -> anyhow::Result<()> {
-        write_external_session_with_key_epoch(
-            state,
-            installation_id,
-            role,
-            credential_generation,
-            0,
-        )
-        .await
-    }
-
-    #[cfg(feature = "external-grpc")]
-    async fn write_external_session_with_key_epoch(
-        state: &Backend,
-        installation_id: &str,
-        role: &str,
-        credential_generation: i64,
-        key_epoch: i64,
-    ) -> anyhow::Result<()> {
-        state
-            .write_set(
-                &parse_test_path(&format!(
-                    "state://kernel/external-sessions/{installation_id}/{role}"
-                ))?,
-                serde_json::from_value(json!({
-                    "installation_id": installation_id,
-                    "role": role,
-                    "pairing_id": "pair-1",
-                    "credential_generation": credential_generation,
-                    "key_epoch": key_epoch,
-                    "state": "ready"
-                }))
-                .context("building external session state value")?,
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!("writing external session state: {error}"))?;
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    async fn write_chat_installation(state: &Backend, value: Value) -> anyhow::Result<()> {
-        state
-            .write_set(
-                &parse_test_path("state://kernel/external-installations/chat")?,
-                value,
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!("writing chat external installation: {error}"))?;
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    fn external_outbound_channel() -> (
-        ExternalSessionOutboundHandle,
-        tokio::sync::mpsc::Receiver<
-            Result<xolotl_proto::xolotl::v1::external::ExternalFrame, tonic::Status>,
-        >,
-    ) {
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        (Arc::new(TestExternalOutbound { tx }), rx)
-    }
-
-    #[cfg(feature = "external-grpc")]
-    async fn recv_external_frame(
-        rx: &mut tokio::sync::mpsc::Receiver<
-            Result<xolotl_proto::xolotl::v1::external::ExternalFrame, tonic::Status>,
-        >,
-        label: &'static str,
-    ) -> anyhow::Result<xolotl_proto::xolotl::v1::external::ExternalFrame> {
-        rx.recv()
-            .await
-            .with_context(|| format!("receiving {label} frame"))?
-            .map_err(|status| anyhow::anyhow!("receiving {label} frame: {status}"))
-    }
-
-    #[cfg(feature = "external-grpc")]
-    fn expect_outbound_command_frame(
-        frame: xolotl_proto::xolotl::v1::external::ExternalFrame,
-    ) -> anyhow::Result<xolotl_proto::xolotl::v1::external::OutboundCommand> {
-        match frame.frame {
-            Some(xolotl_proto::xolotl::v1::external::external_frame::Frame::OutboundCommand(
-                command,
-            )) => Ok(command),
-            Some(other) => bail!("expected source outbound command frame, got {other:?}"),
-            None => bail!("expected source outbound command frame, got empty frame"),
-        }
-    }
-
-    #[cfg(feature = "external-grpc")]
-    fn expect_invoke_frame(
-        frame: xolotl_proto::xolotl::v1::external::ExternalFrame,
-    ) -> anyhow::Result<xolotl_proto::xolotl::v1::external::Invoke> {
-        match frame.frame {
-            Some(xolotl_proto::xolotl::v1::external::external_frame::Frame::Invoke(invoke)) => {
-                Ok(invoke)
-            }
-            Some(other) => bail!("expected provider invoke frame, got {other:?}"),
-            None => bail!("expected provider invoke frame, got empty frame"),
-        }
-    }
-
-    #[cfg(feature = "external-grpc")]
-    fn expect_control_frame(
-        frame: xolotl_proto::xolotl::v1::external::ExternalFrame,
-    ) -> anyhow::Result<xolotl_proto::xolotl::v1::external::ControlFrame> {
-        match frame.frame {
-            Some(xolotl_proto::xolotl::v1::external::external_frame::Frame::Control(control)) => {
-                Ok(control)
-            }
-            Some(other) => bail!("expected provider control frame, got {other:?}"),
-            None => bail!("expected provider control frame, got empty frame"),
-        }
-    }
-
-    #[cfg(feature = "external-grpc")]
-    struct TestExternalOutbound {
-        tx: tokio::sync::mpsc::Sender<
-            Result<xolotl_proto::xolotl::v1::external::ExternalFrame, tonic::Status>,
-        >,
-    }
-
-    #[cfg(feature = "external-grpc")]
-    impl TestExternalOutbound {
-        async fn send_frame(
-            &self,
-            frame: xolotl_proto::xolotl::v1::external::external_frame::Frame,
-        ) -> Result<(), tonic::Status> {
-            self.tx
-                .send(Ok(xolotl_proto::xolotl::v1::external::ExternalFrame {
-                    frame: Some(frame),
-                }))
-                .await
-                .map_err(|_error| tonic::Status::unavailable("test external session closed"))
-        }
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tonic::async_trait]
-    impl ExternalSessionOutbound for TestExternalOutbound {
-        type Error = tonic::Status;
-
-        async fn send_invoke(&self, invoke: Invoke) -> Result<(), Self::Error> {
-            self.send_frame(
-                xolotl_proto::xolotl::v1::external::external_frame::Frame::Invoke(
-                    xolotl_proto::invoke_to_pb(&invoke),
-                ),
-            )
-            .await
-        }
-
-        async fn send_outbound_command(&self, command: OutboundCommand) -> Result<(), Self::Error> {
-            self.send_frame(
-                xolotl_proto::xolotl::v1::external::external_frame::Frame::OutboundCommand(
-                    xolotl_proto::outbound_command_to_pb(&command),
-                ),
-            )
-            .await
-        }
-
-        async fn send_control(&self, frame: ControlFrame) -> Result<(), Self::Error> {
-            self.send_frame(
-                xolotl_proto::xolotl::v1::external::external_frame::Frame::Control(
-                    xolotl_proto::control_frame_to_pb(&frame),
-                ),
-            )
-            .await
-        }
-    }
-
-    #[cfg(feature = "external-grpc")]
-    async fn write_external_revocation(
-        state: &Backend,
-        installation_id: &str,
-        credential_generation_floor: i64,
-    ) -> anyhow::Result<()> {
-        state
-            .write_set(
-                &parse_test_path(&format!(
-                    "state://kernel/external-credential-revocations/{installation_id}"
-                ))?,
-                serde_json::from_value(json!({
-                    "installation_id": installation_id,
-                    "state": "revoked",
-                    "credential_generation_floor": credential_generation_floor
-                }))
-                .context("building external revocation state value")?,
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!("writing external revocation state: {error}"))?;
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    fn hello_from_context(context: &SessionContext) -> RoleSessionClientHello {
-        RoleSessionClientHello {
-            role: context.role,
-            installation_id: context.installation_id.clone(),
-            projection_id: context.projection_id.clone(),
-            registry_hash: context.registry_hash.clone(),
-            observed: xolotl_types::external::ObservedGenerations {
-                presentation_config_generation: context.presentation_config_generation,
-                alias_catalog_generation: context.alias_catalog_generation,
-            },
-            config_schema: None,
-        }
-    }
-
-    #[cfg(feature = "external-grpc")]
-    struct ExternalTestFixture {
-        boot: Arc<Bootstrap>,
-        handler: DaemonExternalSessionHandler,
-        session: EndpointSession,
-        context: SessionContext,
-    }
-
-    #[cfg(feature = "external-grpc")]
-    async fn ready_source_fixture(
-        commands: bool,
-        limits: Option<config::ExternalGatewaySessionLimits>,
-    ) -> anyhow::Result<ExternalTestFixture> {
-        let boot = Arc::new(Bootstrap::in_memory());
-        write_chat_installation(
-            &boot.kernel.state,
-            source_external_installation_value(commands)?,
-        )
-        .await?;
-        write_external_session(&boot.kernel.state, "chat", "source", 5).await?;
-        ready_fixture(boot, Role::Source, "source", limits).await
-    }
-
-    #[cfg(feature = "external-grpc")]
-    async fn ready_provider_fixture(
-        installation: Value,
-        limits: Option<config::ExternalGatewaySessionLimits>,
-        key_epoch: i64,
-    ) -> anyhow::Result<ExternalTestFixture> {
-        let boot = Arc::new(Bootstrap::in_memory());
-        write_chat_installation(&boot.kernel.state, installation).await?;
-        write_external_session_with_key_epoch(&boot.kernel.state, "chat", "provider", 9, key_epoch)
-            .await?;
-        ready_fixture(boot, Role::Provider, "provider", limits).await
-    }
-
-    #[cfg(feature = "external-grpc")]
-    async fn ready_fixture(
-        boot: Arc<Bootstrap>,
-        role: Role,
-        projection_id: &'static str,
-        limits: Option<config::ExternalGatewaySessionLimits>,
-    ) -> anyhow::Result<ExternalTestFixture> {
-        let handler = match limits {
-            Some(limits) => DaemonExternalSessionHandler::with_limits(
-                boot.kernel.state.clone(),
-                boot.kernel.registry.clone(),
-                limits,
-            ),
-            None => DaemonExternalSessionHandler::new(
-                boot.kernel.state.clone(),
-                boot.kernel.registry.clone(),
-                60_000,
-            ),
-        };
-        let hello = hello_from_context(
-            &handler
-                .load_authority("chat", projection_id, role)
-                .await
-                .with_context(|| format!("loading {projection_id} authority"))?
-                .context,
-        );
-        let context = ExternalSessionHandler::adjudicate_session(&handler, &hello)
-            .await
-            .with_context(|| format!("adjudicating {projection_id} session"))?;
-        let mut session = EndpointSession::new();
-        session
-            .on_hello(&hello, |_| context.clone())
-            .with_context(|| format!("accepting {projection_id} hello"))?;
-        session
-            .on_ready(&xolotl_types::external::RoleReady {
-                accepted_context: context.clone(),
-            })
-            .with_context(|| format!("marking {projection_id} session ready"))?;
-        Ok(ExternalTestFixture {
-            boot,
-            handler,
-            session,
-            context,
-        })
-    }
-
-    #[cfg(feature = "external-grpc")]
-    fn secure_envelope_aad(context: &SessionContext, seq: u64) -> EnvelopeAad {
-        secure_envelope_aad_with(context, seq, "control.config_ack", 0)
-    }
-
-    #[cfg(feature = "external-grpc")]
-    fn secure_envelope_aad_with(
-        context: &SessionContext,
-        seq: u64,
-        frame_type: &str,
-        key_epoch: u64,
-    ) -> EnvelopeAad {
-        EnvelopeAad {
-            projection_id: context.projection_id.clone(),
-            role: role_slug(context.role).into(),
-            session_id: context.session_id.clone(),
-            seq,
-            frame_type: frame_type.into(),
-            binding_generation: context.binding_generation,
-            credential_generation: context.credential_generation,
-            transcript_hash: vec![0x42; 32],
-            key_epoch,
-            ..EnvelopeAad::default()
-        }
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_adjudicates_from_installation_state() -> anyhow::Result<()> {
-        let boot = Arc::new(Bootstrap::in_memory());
-        write_chat_installation(&boot.kernel.state, external_installation_value()?).await?;
-        write_external_session(&boot.kernel.state, "chat", "source", 5).await?;
-        let handler = DaemonExternalSessionHandler::new(
-            boot.kernel.state.clone(),
-            boot.kernel.registry.clone(),
-            60_000,
-        );
-
-        let hello = RoleSessionClientHello {
-            role: Role::Source,
-            installation_id: "chat".into(),
-            projection_id: "source".into(),
-            registry_hash: "client-observed".into(),
-            observed: Default::default(),
-            config_schema: None,
-        };
-        let context = ExternalSessionHandler::adjudicate_session(&handler, &hello)
-            .await
-            .context("adjudicating source session")?;
-
-        assert_eq!(context.installation_id, "chat");
-        assert_eq!(context.projection_id, "source");
-        assert_eq!(context.role, Role::Source);
-        assert_eq!(context.credential_generation, 5);
-        assert_eq!(context.binding_generation, 7);
-        assert_eq!(context.installation_config_version, 11);
-        assert_ne!(context.registry_hash, "client-observed");
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_requires_approved_role_session() -> anyhow::Result<()> {
-        let boot = Arc::new(Bootstrap::in_memory());
-        write_chat_installation(&boot.kernel.state, external_installation_value()?).await?;
-        let handler = DaemonExternalSessionHandler::new(
-            boot.kernel.state.clone(),
-            boot.kernel.registry.clone(),
-            60_000,
-        );
-
-        let hello = RoleSessionClientHello {
-            role: Role::Source,
-            installation_id: "chat".into(),
-            projection_id: "source".into(),
-            registry_hash: String::new(),
-            observed: Default::default(),
-            config_schema: None,
-        };
-        let err = match ExternalSessionHandler::adjudicate_session(&handler, &hello).await {
-            Ok(_context) => bail!("expected unauthenticated source session"),
-            Err(error) => error,
-        };
-
-        assert_eq!(err.code(), tonic::Code::Unauthenticated);
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_rejects_revoked_role_session() -> anyhow::Result<()> {
-        let boot = Arc::new(Bootstrap::in_memory());
-        write_chat_installation(&boot.kernel.state, external_installation_value()?).await?;
-        write_external_session(&boot.kernel.state, "chat", "source", 2).await?;
-        write_external_revocation(&boot.kernel.state, "chat", 2).await?;
-        let handler = DaemonExternalSessionHandler::new(
-            boot.kernel.state.clone(),
-            boot.kernel.registry.clone(),
-            60_000,
-        );
-
-        let hello = RoleSessionClientHello {
-            role: Role::Source,
-            installation_id: "chat".into(),
-            projection_id: "source".into(),
-            registry_hash: String::new(),
-            observed: Default::default(),
-            config_schema: None,
-        };
-        let err = match ExternalSessionHandler::adjudicate_session(&handler, &hello).await {
-            Ok(_context) => bail!("expected revoked source session rejection"),
-            Err(error) => error,
-        };
-
-        assert_eq!(err.code(), tonic::Code::Unauthenticated);
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_ingests_source_event() -> anyhow::Result<()> {
-        let boot = Arc::new(Bootstrap::in_memory());
-        write_chat_installation(&boot.kernel.state, external_installation_value()?).await?;
-        write_external_session(&boot.kernel.state, "chat", "source", 5).await?;
-        let handler = DaemonExternalSessionHandler::new(
-            boot.kernel.state.clone(),
-            boot.kernel.registry.clone(),
-            60_000,
-        );
-        let hello = hello_from_context(
-            &handler
-                .load_authority("chat", "source", Role::Source)
-                .await
-                .context("loading source authority")?
-                .context,
-        );
-        let context = ExternalSessionHandler::adjudicate_session(&handler, &hello)
-            .await
-            .context("adjudicating source session")?;
-        let mut session = EndpointSession::new();
-        session
-            .on_hello(&hello, |_| context.clone())
-            .context("accepting source hello")?;
-        session
-            .on_ready(&xolotl_types::external::RoleReady {
-                accepted_context: context.clone(),
-            })
-            .context("marking source session ready")?;
-
-        let ack = ExternalSessionHandler::on_inbound_event(
-            &handler,
-            InboundEvent {
-                id: "evt-1".into(),
-                payload: Value::string("hello".into()),
-                observed: Default::default(),
-                timestamp_ms: 1,
-                stream_id: None,
-                seq: None,
-            },
-            &session,
-            context,
-        )
-        .await
-        .context("ingesting source event")?;
-
-        assert_eq!(ack.status, xolotl_types::external::AckStatus::Accepted);
-        let rows = boot
-            .kernel
-            .state
-            .query(&xolotl_sdk::StateScan::new(parse_test_path(
-                "state://events/external/chat/source",
-            )?))
-            .await
-            .map_err(|error| anyhow::anyhow!("reading source event sink: {error}"))?;
-        assert_eq!(rows.entries.len(), 1);
-        assert!(rows.next.is_none());
-        assert_eq!(
-            rows.entries[0].1.value,
-            Value::list(vec![Value::string("hello".into())])
-        );
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[test]
-    fn source_ingest_event_errors_are_rejected_acks() -> anyhow::Result<()> {
-        let policy = source_ingest_rejection_ack(
-            "evt-1".into(),
-            &SourceIngestError::Policy("private detail".into()),
-        )
-        .context("policy ingest error should map to rejected ack")?;
-        assert_eq!(
-            policy,
-            EventAck {
-                id: "evt-1".into(),
-                status: AckStatus::Rejected,
-                reject_reason: Some("policy_rejected".into()),
-            }
-        );
-
-        assert_eq!(
-            source_ingest_rejection_ack("evt-2".into(), &SourceIngestError::RateLimited)
-                .context("rate limit ingest error should map to rejected ack")?
-                .reject_reason,
-            Some("rate_limited".into())
-        );
-        assert_eq!(
-            source_ingest_rejection_ack("evt-3".into(), &SourceIngestError::PayloadTooLarge)
-                .context("payload size ingest error should map to rejected ack")?
-                .reject_reason,
-            Some("payload_too_large".into())
-        );
-        assert_eq!(
-            source_ingest_rejection_ack(
-                "evt-4".into(),
-                &SourceIngestError::ForbiddenPayloadField {
-                    field: "access_token".into()
-                }
-            )
-            .context("forbidden field ingest error should map to rejected ack")?
-            .reject_reason,
-            Some("forbidden_payload_field".into())
-        );
-        assert_eq!(
-            source_ingest_rejection_ack("evt-5".into(), &SourceIngestError::RegistryHashMismatch),
-            None
-        );
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_returns_rejected_ack_for_source_schema_error()
-    -> anyhow::Result<()> {
-        let boot = Arc::new(Bootstrap::in_memory());
-        let mut install = source_external_installation_json(false);
-        install["projections"][0]["emits"]["event_schema"] = json!({ "type": "string" });
-        write_chat_installation(
-            &boot.kernel.state,
-            serde_json::from_value(install)
-                .context("building source installation with event schema")?,
-        )
-        .await?;
-        write_external_session(&boot.kernel.state, "chat", "source", 5).await?;
-        let handler = DaemonExternalSessionHandler::new(
-            boot.kernel.state.clone(),
-            boot.kernel.registry.clone(),
-            60_000,
-        );
-        let hello = hello_from_context(
-            &handler
-                .load_authority("chat", "source", Role::Source)
-                .await
-                .context("loading source authority")?
-                .context,
-        );
-        let context = ExternalSessionHandler::adjudicate_session(&handler, &hello)
-            .await
-            .context("adjudicating source session")?;
-        let mut session = EndpointSession::new();
-        session
-            .on_hello(&hello, |_| context.clone())
-            .context("accepting source hello")?;
-        session
-            .on_ready(&xolotl_types::external::RoleReady {
-                accepted_context: context.clone(),
-            })
-            .context("marking source session ready")?;
-
-        let ack = ExternalSessionHandler::on_inbound_event(
-            &handler,
-            InboundEvent {
-                id: "evt-schema".into(),
-                payload: Value::integer(1),
-                observed: Default::default(),
-                timestamp_ms: 1,
-                stream_id: None,
-                seq: None,
-            },
-            &session,
-            context,
-        )
-        .await
-        .context("ingesting schema-invalid source event")?;
-
-        assert_eq!(ack.status, AckStatus::Rejected);
-        assert_eq!(ack.reject_reason, Some("schema_rejected".into()));
-        assert_eq!(
-            boot.kernel
-                .state
-                .read(&parse_test_path("state://events/external/chat/source")?)
-                .await
-                .map_err(|error| anyhow::anyhow!("reading source event sink: {error}"))?,
-            None
-        );
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_gates_external_control_frames() -> anyhow::Result<()> {
-        let boot = Arc::new(Bootstrap::in_memory());
-        write_chat_installation(&boot.kernel.state, external_installation_value()?).await?;
-        write_external_session(&boot.kernel.state, "chat", "source", 5).await?;
-        let handler = DaemonExternalSessionHandler::new(
-            boot.kernel.state.clone(),
-            boot.kernel.registry.clone(),
-            60_000,
-        );
-        let hello = hello_from_context(
-            &handler
-                .load_authority("chat", "source", Role::Source)
-                .await
-                .context("loading source authority")?
-                .context,
-        );
-        let context = ExternalSessionHandler::adjudicate_session(&handler, &hello)
-            .await
-            .context("adjudicating source session")?;
-        let mut session = EndpointSession::new();
-        session
-            .on_hello(&hello, |_| context.clone())
-            .context("accepting source hello")?;
-        session
-            .on_ready(&xolotl_types::external::RoleReady {
-                accepted_context: context.clone(),
-            })
-            .context("marking source session ready")?;
-
-        ExternalSessionHandler::on_control(
-            &handler,
-            ControlFrame::Heartbeat { timestamp_ms: 10 },
-            &session,
-            context.clone(),
-        )
-        .await
-        .context("accepting heartbeat control frame")?;
-        ExternalSessionHandler::on_control(
-            &handler,
-            ControlFrame::ConfigAck {
-                axis: ConfigAxis::InstallationConfig,
-                version: context.installation_config_version,
-                status: xolotl_types::external::ApplyStatus::Applied,
-            },
-            &session,
-            context.clone(),
-        )
-        .await
-        .context("accepting matching config ack")?;
-
-        let err = match ExternalSessionHandler::on_control(
-            &handler,
-            ControlFrame::ConfigAck {
-                axis: ConfigAxis::InstallationConfig,
-                version: context.installation_config_version + 1,
-                status: xolotl_types::external::ApplyStatus::Applied,
-            },
-            &session,
-            context.clone(),
-        )
-        .await
-        {
-            Ok(()) => bail!("expected mismatched config ack rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-
-        let err = match ExternalSessionHandler::on_control(
-            &handler,
-            ControlFrame::InstallationConfigUpdate {
-                config_version: context.installation_config_version + 1,
-                config: Value::null(),
-            },
-            &session,
-            context.clone(),
-        )
-        .await
-        {
-            Ok(()) => bail!("expected installation config update rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-
-        let err = match ExternalSessionHandler::on_control(
-            &handler,
-            ControlFrame::Shutdown {
-                graceful: true,
-                timeout_ms: 1_000,
-            },
-            &session,
-            context.clone(),
-        )
-        .await
-        {
-            Ok(()) => bail!("expected shutdown control frame rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-
-        let err = match ExternalSessionHandler::on_control(
-            &handler,
-            ControlFrame::FlowControl(xolotl_types::external::FlowSignal::Pause),
-            &session,
-            context.clone(),
-        )
-        .await
-        {
-            Ok(()) => bail!("expected flow-control frame rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-
-        let err = match ExternalSessionHandler::on_control(
-            &handler,
-            ControlFrame::PresentationProfileUpdate {
-                profile_generation: 1,
-                profile_hash: String::new(),
-                profile: Value::null(),
-            },
-            &session,
-            context,
-        )
-        .await
-        {
-            Ok(()) => bail!("expected presentation update validation rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_resolves_only_registered_source_commands() -> anyhow::Result<()>
-    {
-        let ExternalTestFixture {
-            handler,
-            session,
-            context,
-            ..
-        } = ready_source_fixture(true, None).await?;
-        let (outbound, mut outbound_rx) = external_outbound_channel();
-        ExternalSessionHandler::on_ready(&handler, &session, context.clone(), outbound)
-            .await
-            .context("registering source outbound channel")?;
-
-        let command = xolotl_types::external::OutboundCommand {
-            id: "cmd-1".into(),
-            action: Value::string("sync".into()),
-            observed: Default::default(),
-        };
-        let receiver = handler
-            .send_source_command(command, &session, &context, None)
-            .await
-            .context("sending source command")?;
-        let sent = expect_outbound_command_frame(
-            recv_external_frame(&mut outbound_rx, "source command").await?,
-        )?;
-        let sent = xolotl_proto::outbound_command_from_pb(&sent)
-            .context("decoding outbound command frame")?;
-        assert_eq!(sent.id, "cmd-1");
-        assert_eq!(sent.action, Value::string("sync".into()));
-        assert_eq!(
-            sent.observed.presentation_config_generation,
-            context.presentation_config_generation
-        );
-
-        let expected = CommandResult {
-            id: "cmd-1".into(),
-            outcome: Ok(Value::string("ok".into())),
-        };
-        ExternalSessionHandler::on_command_result(
-            &handler,
-            expected.clone(),
-            &session,
-            context.clone(),
-        )
-        .await
-        .context("resolving source command result")?;
-        assert_eq!(
-            receiver.await.context("awaiting source command receiver")?,
-            expected
-        );
-
-        let err = match ExternalSessionHandler::on_command_result(
-            &handler,
-            CommandResult {
-                id: "cmd-1".into(),
-                outcome: Ok(Value::string("again".into())),
-            },
-            &session,
-            context.clone(),
-        )
-        .await
-        {
-            Ok(()) => bail!("expected duplicate command result rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-
-        let err = match handler
-            .send_source_command(
-                xolotl_types::external::OutboundCommand {
-                    id: "cmd-bad-action".into(),
-                    action: Value::integer(7),
-                    observed: Default::default(),
-                },
-                &session,
-                &context,
-                None,
-            )
-            .await
-        {
-            Ok(_receiver) => bail!("expected invalid source command action rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(outbound_rx.try_recv().is_err());
-
-        let receiver = handler
-            .send_source_command(
-                xolotl_types::external::OutboundCommand {
-                    id: "cmd-bad-result".into(),
-                    action: Value::string("sync".into()),
-                    observed: Default::default(),
-                },
-                &session,
-                &context,
-                None,
-            )
-            .await
-            .context("sending source command with invalid result payload")?;
-        recv_external_frame(&mut outbound_rx, "source command with invalid result").await?;
-        let err = match ExternalSessionHandler::on_command_result(
-            &handler,
-            CommandResult {
-                id: "cmd-bad-result".into(),
-                outcome: Ok(Value::integer(7)),
-            },
-            &session,
-            context.clone(),
-        )
-        .await
-        {
-            Ok(()) => bail!("expected invalid command result rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(receiver.await.is_err());
-        assert!(lock_test(&handler.source_commands, "source_commands")?.is_empty());
-        assert!(lock_test(&handler.source_waiters, "source_waiters")?.is_empty());
-
-        let receiver = handler
-            .send_source_command(
-                xolotl_types::external::OutboundCommand {
-                    id: "cmd-large-result".into(),
-                    action: Value::string("sync".into()),
-                    observed: Default::default(),
-                },
-                &session,
-                &context,
-                None,
-            )
-            .await
-            .context("sending source command with oversized result payload")?;
-        recv_external_frame(&mut outbound_rx, "source command with oversized result").await?;
-        let err = match ExternalSessionHandler::on_command_result(
-            &handler,
-            CommandResult {
-                id: "cmd-large-result".into(),
-                outcome: Ok(Value::string("x".repeat(
-                    config::DEFAULT_EXTERNAL_SOURCE_COMMAND_MAX_INLINE_RESULT_BYTES + 1,
-                ))),
-            },
-            &session,
-            context.clone(),
-        )
-        .await
-        {
-            Ok(()) => bail!("expected oversized command result rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
-        assert!(receiver.await.is_err());
-        assert!(lock_test(&handler.source_commands, "source_commands")?.is_empty());
-        assert!(lock_test(&handler.source_waiters, "source_waiters")?.is_empty());
-
-        let receiver = handler
-            .send_source_command(
-                xolotl_types::external::OutboundCommand {
-                    id: "cmd-large-error".into(),
-                    action: Value::string("sync".into()),
-                    observed: Default::default(),
-                },
-                &session,
-                &context,
-                None,
-            )
-            .await
-            .context("sending source command with oversized error result")?;
-        recv_external_frame(&mut outbound_rx, "source command with oversized error").await?;
-        let err = match ExternalSessionHandler::on_command_result(
-            &handler,
-            CommandResult {
-                id: "cmd-large-error".into(),
-                outcome: Err(xolotl_types::ErrorInfo {
-                    kind: "remote".into(),
-                    message: "x"
-                        .repeat(config::DEFAULT_EXTERNAL_SOURCE_COMMAND_MAX_INLINE_RESULT_BYTES),
-                }),
-            },
-            &session,
-            context.clone(),
-        )
-        .await
-        {
-            Ok(()) => bail!("expected oversized command error result rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
-        assert!(receiver.await.is_err());
-        assert!(lock_test(&handler.source_commands, "source_commands")?.is_empty());
-        assert!(lock_test(&handler.source_waiters, "source_waiters")?.is_empty());
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_expires_pending_source_commands() -> anyhow::Result<()> {
-        let ExternalTestFixture {
-            handler,
-            session,
-            context,
-            ..
-        } = ready_source_fixture(true, None).await?;
-        let (outbound, mut outbound_rx) = external_outbound_channel();
-        ExternalSessionHandler::on_ready(&handler, &session, context.clone(), outbound)
-            .await
-            .context("registering source outbound channel")?;
-
-        let deadline_ms = now_millis() + 200;
-        let receiver = handler
-            .send_source_command(
-                xolotl_types::external::OutboundCommand {
-                    id: "cmd-timeout".into(),
-                    action: Value::string("sync".into()),
-                    observed: Default::default(),
-                },
-                &session,
-                &context,
-                Some(deadline_ms),
-            )
-            .await
-            .context("sending source command with deadline")?;
-        let sent = expect_outbound_command_frame(
-            recv_external_frame(&mut outbound_rx, "timed source command").await?,
-        )?;
-        assert_eq!(
-            xolotl_proto::outbound_command_from_pb(&sent)
-                .context("decoding timed source command frame")?
-                .id,
-            "cmd-timeout"
-        );
-
-        assert!(receiver.await.is_err());
-        assert!(lock_test(&handler.source_commands, "source_commands")?.is_empty());
-        assert!(lock_test(&handler.source_waiters, "source_waiters")?.is_empty());
-
-        let err = match ExternalSessionHandler::on_command_result(
-            &handler,
-            CommandResult {
-                id: "cmd-timeout".into(),
-                outcome: Ok(Value::string("late".into())),
-            },
-            &session,
-            context.clone(),
-        )
-        .await
-        {
-            Ok(()) => bail!("expected late command result rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_enforces_source_command_in_flight_limit() -> anyhow::Result<()>
-    {
-        let ExternalTestFixture {
-            handler,
-            session,
-            context,
-            ..
-        } = ready_source_fixture(
-            true,
-            Some(config::ExternalGatewaySessionLimits {
-                source_dedupe_window_ms: 60_000,
-                source_max_in_flight_commands: 1,
-                ..Default::default()
-            }),
-        )
-        .await?;
-        let (outbound, mut outbound_rx) = external_outbound_channel();
-        ExternalSessionHandler::on_ready(&handler, &session, context.clone(), outbound)
-            .await
-            .context("registering source outbound channel")?;
-
-        let _receiver = handler
-            .send_source_command(
-                xolotl_types::external::OutboundCommand {
-                    id: "cmd-1".into(),
-                    action: Value::string("sync".into()),
-                    observed: Default::default(),
-                },
-                &session,
-                &context,
-                None,
-            )
-            .await
-            .context("sending first source command")?;
-        recv_external_frame(&mut outbound_rx, "first source command").await?;
-
-        let err = match handler
-            .send_source_command(
-                xolotl_types::external::OutboundCommand {
-                    id: "cmd-2".into(),
-                    action: Value::string("sync".into()),
-                    observed: Default::default(),
-                },
-                &session,
-                &context,
-                None,
-            )
-            .await
-        {
-            Ok(_receiver) => bail!("expected source command in-flight limit rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
-        assert_eq!(
-            lock_test(&handler.source_commands, "source_commands")?.len(),
-            1
-        );
-        assert_eq!(
-            lock_test(&handler.source_waiters, "source_waiters")?.len(),
-            1
-        );
-        assert!(outbound_rx.try_recv().is_err());
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_enforces_source_command_rate_limit() -> anyhow::Result<()> {
-        let ExternalTestFixture {
-            handler,
-            session,
-            context,
-            ..
-        } = ready_source_fixture(
-            true,
-            Some(config::ExternalGatewaySessionLimits {
-                source_dedupe_window_ms: 60_000,
-                source_command_rate_limit_window_ms: 60_000,
-                source_command_rate_limit_max: 1,
-                ..Default::default()
-            }),
-        )
-        .await?;
-        let (outbound, mut outbound_rx) = external_outbound_channel();
-        ExternalSessionHandler::on_ready(&handler, &session, context.clone(), outbound)
-            .await
-            .context("registering source outbound channel")?;
-
-        let _receiver = handler
-            .send_source_command(
-                xolotl_types::external::OutboundCommand {
-                    id: "cmd-1".into(),
-                    action: Value::string("sync".into()),
-                    observed: Default::default(),
-                },
-                &session,
-                &context,
-                None,
-            )
-            .await
-            .context("sending first source command")?;
-        recv_external_frame(&mut outbound_rx, "first source command").await?;
-
-        let err = match handler
-            .send_source_command(
-                xolotl_types::external::OutboundCommand {
-                    id: "cmd-2".into(),
-                    action: Value::string("sync".into()),
-                    observed: Default::default(),
-                },
-                &session,
-                &context,
-                None,
-            )
-            .await
-        {
-            Ok(_receiver) => bail!("expected source command rate limit rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
-        assert_eq!(
-            lock_test(&handler.source_commands, "source_commands")?.len(),
-            1
-        );
-        assert!(outbound_rx.try_recv().is_err());
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_rejects_source_commands_when_projection_disables_them()
-    -> anyhow::Result<()> {
-        let ExternalTestFixture {
-            handler,
-            session,
-            context,
-            ..
-        } = ready_source_fixture(false, None).await?;
-        let (outbound, _outbound_rx) = external_outbound_channel();
-        ExternalSessionHandler::on_ready(&handler, &session, context.clone(), outbound)
-            .await
-            .context("registering source outbound channel")?;
-
-        let err = match handler
-            .send_source_command(
-                xolotl_types::external::OutboundCommand {
-                    id: "cmd-1".into(),
-                    action: Value::string("sync".into()),
-                    observed: Default::default(),
-                },
-                &session,
-                &context,
-                None,
-            )
-            .await
-        {
-            Ok(_receiver) => bail!("expected disabled source commands rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_drains_source_commands_on_close() -> anyhow::Result<()> {
-        let ExternalTestFixture {
-            handler,
-            session,
-            context,
-            ..
-        } = ready_source_fixture(true, None).await?;
-        let (outbound, _outbound_rx) = external_outbound_channel();
-        ExternalSessionHandler::on_ready(&handler, &session, context.clone(), outbound)
-            .await
-            .context("registering source outbound channel")?;
-
-        let receiver = handler
-            .send_source_command(
-                xolotl_types::external::OutboundCommand {
-                    id: "cmd-close".into(),
-                    action: Value::string("sync".into()),
-                    observed: Default::default(),
-                },
-                &session,
-                &context,
-                None,
-            )
-            .await
-            .context("sending source command before close")?;
-
-        ExternalSessionHandler::on_closed(&handler, &session, context.clone())
-            .await
-            .context("closing source session")?;
-
-        assert!(receiver.await.is_err());
-        assert!(lock_test(&handler.source_sessions, "source_sessions")?.is_empty());
-        assert!(lock_test(&handler.source_commands, "source_commands")?.is_empty());
-        assert!(lock_test(&handler.source_waiters, "source_waiters")?.is_empty());
-
-        let err = match handler
-            .send_source_command(
-                xolotl_types::external::OutboundCommand {
-                    id: "cmd-after-close".into(),
-                    action: Value::string("sync".into()),
-                    observed: Default::default(),
-                },
-                &session,
-                &context,
-                None,
-            )
-            .await
-        {
-            Ok(_receiver) => bail!("expected source command after close rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_resolves_only_registered_provider_invocations()
-    -> anyhow::Result<()> {
-        let ExternalTestFixture {
-            handler,
-            session,
-            context,
-            ..
-        } = ready_provider_fixture(provider_external_installation_value()?, None, 0).await?;
-
-        let invoke = xolotl_types::external::Invoke {
-            invocation_id: "invoke-1".into(),
-            effect_path: parse_test_path("effect://external-provider/chat/search")?,
-            method_id: xolotl_types::MethodId::new(0),
-            input: Value::string("query".into()),
-            deadline_ms: None,
-            output_stream_to: None,
-        };
-        let receiver = handler
-            .register_provider_invoke(&invoke, &session, &context)
-            .await
-            .context("registering provider invocation")?;
-
-        let expected = InvokeResult {
-            invocation_id: "invoke-1".into(),
-            outcome: Ok(Value::string("result".into())),
-        };
-        ExternalSessionHandler::on_invoke_result(
-            &handler,
-            expected.clone(),
-            &session,
-            context.clone(),
-        )
-        .await
-        .context("resolving provider invocation result")?;
-        assert_eq!(
-            receiver
-                .await
-                .context("awaiting provider invocation receiver")?,
-            expected
-        );
-
-        let err = match ExternalSessionHandler::on_invoke_result(
-            &handler,
-            InvokeResult {
-                invocation_id: "invoke-1".into(),
-                outcome: Ok(Value::string("again".into())),
-            },
-            &session,
-            context.clone(),
-        )
-        .await
-        {
-            Ok(()) => bail!("expected duplicate provider invoke result rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-
-        let invoke = xolotl_types::external::Invoke {
-            invocation_id: "invoke-large".into(),
-            effect_path: parse_test_path("effect://external-provider/chat/search")?,
-            method_id: xolotl_types::MethodId::new(0),
-            input: Value::string("query".into()),
-            deadline_ms: None,
-            output_stream_to: None,
-        };
-        let receiver = handler
-            .register_provider_invoke(&invoke, &session, &context)
-            .await
-            .context("registering provider invocation with oversized result payload")?;
-        let err = match ExternalSessionHandler::on_invoke_result(
-            &handler,
-            InvokeResult {
-                invocation_id: "invoke-large".into(),
-                outcome: Ok(Value::string("x".repeat(
-                    config::DEFAULT_EXTERNAL_PROVIDER_MAX_INLINE_RESULT_BYTES + 1,
-                ))),
-            },
-            &session,
-            context.clone(),
-        )
-        .await
-        {
-            Ok(()) => bail!("expected oversized provider invoke result rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
-        assert!(receiver.await.is_err());
-        assert!(lock_test(&handler.provider_invocations, "provider_invocations")?.is_empty());
-        assert!(lock_test(&handler.provider_waiters, "provider_waiters")?.is_empty());
-
-        let invoke = xolotl_types::external::Invoke {
-            invocation_id: "invoke-large-error".into(),
-            effect_path: parse_test_path("effect://external-provider/chat/search")?,
-            method_id: xolotl_types::MethodId::new(0),
-            input: Value::string("query".into()),
-            deadline_ms: None,
-            output_stream_to: None,
-        };
-        let receiver = handler
-            .register_provider_invoke(&invoke, &session, &context)
-            .await
-            .context("registering provider invocation with oversized error result")?;
-        let err = match ExternalSessionHandler::on_invoke_result(
-            &handler,
-            InvokeResult {
-                invocation_id: "invoke-large-error".into(),
-                outcome: Err(xolotl_types::ErrorInfo {
-                    kind: "remote".into(),
-                    message: "x".repeat(config::DEFAULT_EXTERNAL_PROVIDER_MAX_INLINE_RESULT_BYTES),
-                }),
-            },
-            &session,
-            context.clone(),
-        )
-        .await
-        {
-            Ok(()) => bail!("expected oversized provider invoke error result rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
-        assert!(receiver.await.is_err());
-        assert!(lock_test(&handler.provider_invocations, "provider_invocations")?.is_empty());
-        assert!(lock_test(&handler.provider_waiters, "provider_waiters")?.is_empty());
-
-        let invoke = xolotl_types::external::Invoke {
-            invocation_id: "invoke-schema".into(),
-            effect_path: parse_test_path("effect://external-provider/chat/search")?,
-            method_id: xolotl_types::MethodId::new(0),
-            input: Value::string("query".into()),
-            deadline_ms: None,
-            output_stream_to: None,
-        };
-        let receiver = handler
-            .register_provider_invoke(&invoke, &session, &context)
-            .await
-            .context("registering provider invocation with invalid result payload")?;
-        let err = match ExternalSessionHandler::on_invoke_result(
-            &handler,
-            InvokeResult {
-                invocation_id: "invoke-schema".into(),
-                outcome: Ok(Value::integer(7)),
-            },
-            &session,
-            context,
-        )
-        .await
-        {
-            Ok(()) => bail!("expected invalid provider invoke result rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(receiver.await.is_err());
-        assert!(lock_test(&handler.provider_invocations, "provider_invocations")?.is_empty());
-        assert!(lock_test(&handler.provider_waiters, "provider_waiters")?.is_empty());
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_rolls_back_provider_invocation_on_waiter_duplicate()
-    -> anyhow::Result<()> {
-        let ExternalTestFixture {
-            handler,
-            session,
-            context,
-            ..
-        } = ready_provider_fixture(provider_external_installation_value()?, None, 0).await?;
-
-        let (stale_tx, _stale_rx) = oneshot::channel();
-        lock_test(&handler.provider_waiters, "provider_waiters")?
-            .insert("invoke-stale".into(), stale_tx);
-        let invoke = xolotl_types::external::Invoke {
-            invocation_id: "invoke-stale".into(),
-            effect_path: parse_test_path("effect://external-provider/chat/search")?,
-            method_id: xolotl_types::MethodId::new(0),
-            input: Value::string("query".into()),
-            deadline_ms: None,
-            output_stream_to: None,
-        };
-
-        let err = match handler
-            .register_provider_invoke(&invoke, &session, &context)
-            .await
-        {
-            Ok(_receiver) => bail!("expected duplicate provider waiter rejection"),
-            Err(error) => error,
-        };
-
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(lock_test(&handler.provider_invocations, "provider_invocations")?.is_empty());
-        assert_eq!(
-            lock_test(&handler.provider_waiters, "provider_waiters")?.len(),
-            1
-        );
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_enforces_provider_invocation_in_flight_limit()
-    -> anyhow::Result<()> {
-        let ExternalTestFixture {
-            handler,
-            session,
-            context,
-            ..
-        } = ready_provider_fixture(
-            provider_external_installation_value()?,
-            Some(config::ExternalGatewaySessionLimits {
-                source_dedupe_window_ms: 60_000,
-                provider_max_in_flight_invocations: 1,
-                ..Default::default()
-            }),
-            0,
-        )
-        .await?;
-
-        let first = xolotl_types::external::Invoke {
-            invocation_id: "invoke-1".into(),
-            effect_path: parse_test_path("effect://external-provider/chat/search")?,
-            method_id: xolotl_types::MethodId::new(0),
-            input: Value::string("query".into()),
-            deadline_ms: None,
-            output_stream_to: None,
-        };
-        let _receiver = handler
-            .register_provider_invoke(&first, &session, &context)
-            .await
-            .context("registering first provider invocation")?;
-
-        let second = xolotl_types::external::Invoke {
-            invocation_id: "invoke-2".into(),
-            effect_path: parse_test_path("effect://external-provider/chat/search")?,
-            method_id: xolotl_types::MethodId::new(0),
-            input: Value::string("query".into()),
-            deadline_ms: None,
-            output_stream_to: None,
-        };
-        let err = match handler
-            .register_provider_invoke(&second, &session, &context)
-            .await
-        {
-            Ok(_receiver) => bail!("expected provider invocation in-flight limit rejection"),
-            Err(error) => error,
-        };
-
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
-        assert_eq!(
-            lock_test(&handler.provider_invocations, "provider_invocations")?.len(),
-            1
-        );
-        assert_eq!(
-            lock_test(&handler.provider_waiters, "provider_waiters")?.len(),
-            1
-        );
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_enforces_provider_identity_in_flight_limit()
-    -> anyhow::Result<()> {
-        let ExternalTestFixture {
-            handler,
-            session,
-            context,
-            ..
-        } = ready_provider_fixture(
-            provider_external_installation_value()?,
-            Some(config::ExternalGatewaySessionLimits {
-                source_dedupe_window_ms: 60_000,
-                provider_max_in_flight_per_identity: 1,
-                ..Default::default()
-            }),
-            0,
-        )
-        .await?;
-
-        let first = xolotl_types::external::Invoke {
-            invocation_id: "invoke-1".into(),
-            effect_path: parse_test_path("effect://external-provider/chat/search")?,
-            method_id: xolotl_types::MethodId::new(0),
-            input: Value::string("query".into()),
-            deadline_ms: None,
-            output_stream_to: None,
-        };
-        let _receiver = handler
-            .register_provider_invoke(&first, &session, &context)
-            .await
-            .context("registering first provider invocation")?;
-
-        let second = xolotl_types::external::Invoke {
-            invocation_id: "invoke-2".into(),
-            effect_path: parse_test_path("effect://external-provider/chat/summarize")?,
-            method_id: xolotl_types::MethodId::new(0),
-            input: Value::string("query".into()),
-            deadline_ms: None,
-            output_stream_to: None,
-        };
-        let err = match handler
-            .register_provider_invoke(&second, &session, &context)
-            .await
-        {
-            Ok(_receiver) => bail!("expected provider identity in-flight limit rejection"),
-            Err(error) => error,
-        };
-
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
-        assert_eq!(
-            lock_test(&handler.provider_invocations, "provider_invocations")?.len(),
-            1
-        );
-        assert_eq!(
-            lock_test(&handler.provider_waiters, "provider_waiters")?.len(),
-            1
-        );
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_enforces_provider_effect_in_flight_limit() -> anyhow::Result<()>
-    {
-        let ExternalTestFixture {
-            handler,
-            session,
-            context,
-            ..
-        } = ready_provider_fixture(
-            provider_external_installation_value()?,
-            Some(config::ExternalGatewaySessionLimits {
-                source_dedupe_window_ms: 60_000,
-                provider_max_in_flight_per_effect: 1,
-                ..Default::default()
-            }),
-            0,
-        )
-        .await?;
-
-        let first = xolotl_types::external::Invoke {
-            invocation_id: "invoke-1".into(),
-            effect_path: parse_test_path("effect://external-provider/chat/search")?,
-            method_id: xolotl_types::MethodId::new(0),
-            input: Value::string("query".into()),
-            deadline_ms: None,
-            output_stream_to: None,
-        };
-        let _receiver = handler
-            .register_provider_invoke(&first, &session, &context)
-            .await
-            .context("registering first provider invocation")?;
-
-        let second = xolotl_types::external::Invoke {
-            invocation_id: "invoke-2".into(),
-            effect_path: parse_test_path("effect://external-provider/chat/search")?,
-            method_id: xolotl_types::MethodId::new(0),
-            input: Value::string("query".into()),
-            deadline_ms: None,
-            output_stream_to: None,
-        };
-        let err = match handler
-            .register_provider_invoke(&second, &session, &context)
-            .await
-        {
-            Ok(_receiver) => bail!("expected provider effect in-flight limit rejection"),
-            Err(error) => error,
-        };
-
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
-        assert_eq!(
-            lock_test(&handler.provider_invocations, "provider_invocations")?.len(),
-            1
-        );
-        assert_eq!(
-            lock_test(&handler.provider_waiters, "provider_waiters")?.len(),
-            1
-        );
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_opens_secure_envelope_with_installed_credential()
-    -> anyhow::Result<()> {
-        let ExternalTestFixture {
-            handler,
-            session,
-            context,
-            ..
-        } = ready_provider_fixture(provider_external_installation_value()?, None, 0).await?;
-        let credential =
-            ExternalCredential::new("chat", context.credential_generation, TEST_EXTERNAL_PSK);
-        let envelope = credential
-            .seal_with_aad(b"frame-bytes", secure_envelope_aad(&context, 0))
-            .context("sealing secure envelope")?;
-        install_test_external_credential(&handler, credential)?;
-
-        let plaintext = ExternalSessionHandler::open_secure_envelope(
-            &handler,
-            &envelope,
-            &session,
-            context.clone(),
-        )
-        .await
-        .context("opening secure envelope")?;
-        assert_eq!(plaintext, b"frame-bytes");
-
-        let err = match ExternalSessionHandler::open_secure_envelope(
-            &handler, &envelope, &session, context,
-        )
-        .await
-        {
-            Ok(_plaintext) => bail!("expected replayed secure envelope rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_rejects_old_epoch_business_envelope_after_rekey()
-    -> anyhow::Result<()> {
-        let ExternalTestFixture {
-            handler,
-            session,
-            context,
-            ..
-        } = ready_provider_fixture(provider_external_installation_value()?, None, 1).await?;
-        let credential =
-            ExternalCredential::new("chat", context.credential_generation, TEST_EXTERNAL_PSK);
-        let envelope = credential
-            .seal_with_aad(
-                b"frame-bytes",
-                secure_envelope_aad_with(&context, 0, "invoke", 0),
-            )
-            .context("sealing old-epoch invoke envelope")?;
-        let generic_control_envelope = credential
-            .seal_with_aad(
-                b"frame-bytes",
-                secure_envelope_aad_with(&context, 0, "control", 0),
-            )
-            .context("sealing old-epoch control envelope")?;
-        install_test_external_credential(&handler, credential)?;
-
-        let err = match ExternalSessionHandler::open_secure_envelope(
-            &handler, &envelope, &session, context,
-        )
-        .await
-        {
-            Ok(_plaintext) => bail!("expected old-epoch business envelope rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-
-        let session_context = session
-            .context()
-            .context("session context should remain available")?
-            .clone();
-        let err = match ExternalSessionHandler::open_secure_envelope(
-            &handler,
-            &generic_control_envelope,
-            &session,
-            session_context,
-        )
-        .await
-        {
-            Ok(_plaintext) => bail!("expected old-epoch generic control envelope rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_clears_secure_replay_state_on_close() -> anyhow::Result<()> {
-        let ExternalTestFixture {
-            handler,
-            session,
-            context,
-            ..
-        } = ready_provider_fixture(provider_external_installation_value()?, None, 0).await?;
-        let credential =
-            ExternalCredential::new("chat", context.credential_generation, TEST_EXTERNAL_PSK);
-        let envelope = credential
-            .seal_with_aad(b"frame-bytes", secure_envelope_aad(&context, 0))
-            .context("sealing secure envelope")?;
-        install_test_external_credential(&handler, credential)?;
-
-        ExternalSessionHandler::open_secure_envelope(
-            &handler,
-            &envelope,
-            &session,
-            context.clone(),
-        )
-        .await
-        .context("opening secure envelope")?;
-        assert_eq!(
-            lock_test(&handler.secure_replay_windows, "secure_replay_windows")?.len(),
-            1
-        );
-
-        ExternalSessionHandler::on_closed(&handler, &session, context)
-            .await
-            .context("closing provider session")?;
-        assert!(lock_test(&handler.secure_replay_windows, "secure_replay_windows")?.is_empty());
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_external_handler_rejects_secure_envelope_without_credential()
-    -> anyhow::Result<()> {
-        let ExternalTestFixture {
-            handler,
-            session,
-            context,
-            ..
-        } = ready_provider_fixture(provider_external_installation_value()?, None, 0).await?;
-        let credential =
-            ExternalCredential::new("chat", context.credential_generation, TEST_EXTERNAL_PSK);
-        let envelope = credential
-            .seal_with_aad(b"frame-bytes", secure_envelope_aad(&context, 0))
-            .context("sealing secure envelope")?;
-
-        let err = match ExternalSessionHandler::open_secure_envelope(
-            &handler, &envelope, &session, context,
-        )
-        .await
-        {
-            Ok(_plaintext) => bail!("expected missing credential rejection"),
-            Err(error) => error,
-        };
-        assert_eq!(err.code(), tonic::Code::Unauthenticated);
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_ready_provider_registers_declared_projection_bindings() -> anyhow::Result<()> {
-        let ExternalTestFixture {
-            boot,
-            handler,
-            session,
-            context,
-        } = ready_provider_fixture(provider_external_installation_value()?, None, 0).await?;
-        let (outbound, _rx) = external_outbound_channel();
-        ExternalSessionHandler::on_ready(&handler, &session, context.clone(), outbound)
-            .await
-            .context("registering provider outbound channel")?;
-
-        let search = ResourceName::new(parse_test_path("effect://external-provider/chat/search")?);
-        let summarize = ResourceName::new(parse_test_path(
-            "effect://external-provider/chat/summarize",
-        )?);
-        let admin = ResourceName::new(parse_test_path("effect://external-provider/chat/admin")?);
-
-        let search_id = boot
-            .kernel
-            .registry
-            .resolve_resource(&search)
-            .context("search resource should be registered")?;
-        let summarize_id = boot
-            .kernel
-            .registry
-            .resolve_resource(&summarize)
-            .context("summarize resource should be registered")?;
-        assert!(boot.kernel.registry.resolve_resource(&admin).is_err());
-
-        let search_binding = boot
-            .kernel
-            .registry
-            .binding(
-                boot.kernel
-                    .registry
-                    .resource(search_id)
-                    .context("search resource descriptor should exist")?
-                    .binding,
-            )
-            .context("search binding should exist")?;
-        let summarize_binding = boot
-            .kernel
-            .registry
-            .binding(
-                boot.kernel
-                    .registry
-                    .resource(summarize_id)
-                    .context("summarize resource descriptor should exist")?
-                    .binding,
-            )
-            .context("summarize binding should exist")?;
-        assert_eq!(search_binding.endpoint, summarize_binding.endpoint);
-        let endpoint_id = search_binding
-            .endpoint
-            .context("search binding should expose remote endpoint")?;
-        assert!(boot.kernel.registry.remote_endpoint(endpoint_id).is_some());
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[test]
-    fn daemon_provider_binding_relink_keeps_resource_id() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
-        let registry = &boot.kernel.registry;
-        let path = parse_test_path("effect://external-provider/chat/search")?;
-        let declaration = ProviderBindingDeclaration {
-            path: path.clone(),
-            purity: xolotl_types::Purity::Effectful,
-            finalize_allowed: true,
-            selector: ResourceSelector::parse("perform://effect/external-provider/chat/search")?,
-        };
-
-        let endpoint = registry.next_endpoint_id();
-        let (first, _) = register_provider_binding(registry, &declaration, endpoint, 1)
-            .map_err(|error| anyhow::anyhow!("first provider binding failed: {error}"))?;
-        let (second, _) = register_provider_binding(registry, &declaration, endpoint, 2)
-            .map_err(|error| anyhow::anyhow!("second provider binding failed: {error}"))?;
-
-        assert_eq!(first.resource_id, second.resource_id);
-        assert_eq!(second.binding_generation, 2);
-        let resource_name = ResourceName::new(path);
-        let resource_id = registry
-            .resolve_resource(&resource_name)
-            .context("provider resource should resolve after relink")?;
-        assert_eq!(resource_id, first.resource_id);
-        let binding = registry
-            .binding(
-                registry
-                    .resource(resource_id)
-                    .context("provider resource descriptor should exist")?
-                    .binding,
-            )
-            .context("provider binding should exist")?;
-        assert_eq!(binding.generation, 2);
-        let resource = registry
-            .resource(resource_id)
-            .context("provider resource descriptor should exist")?;
-        let iface_id = resource
-            .interfaces
-            .interfaces
-            .first()
-            .copied()
-            .context("provider resource should expose an interface")?;
-        let iface = registry
-            .interface(iface_id)
-            .context("provider interface should exist")?;
-        assert!(
-            iface
-                .methods
-                .first()
-                .is_some_and(|method| method.finalize_allowed),
-            "provider binding did not carry finalizer metadata"
-        );
-
-        let stale = register_provider_binding(registry, &declaration, endpoint, 1);
-        assert!(
-            stale.is_err(),
-            "stale provider binding generation should be rejected"
-        );
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_rejects_provider_projection_without_declared_bindings_before_ready()
-    -> anyhow::Result<()> {
-        let boot = Arc::new(Bootstrap::in_memory());
-        write_chat_installation(
-            &boot.kernel.state,
-            provider_external_installation_without_capabilities_value()?,
-        )
-        .await?;
-        write_external_session(&boot.kernel.state, "chat", "provider", 9).await?;
-        let handler = DaemonExternalSessionHandler::new(
-            boot.kernel.state.clone(),
-            boot.kernel.registry.clone(),
-            60_000,
-        );
-        let err = match handler
-            .load_authority("chat", "provider", Role::Provider)
-            .await
-        {
-            Ok(_authority) => bail!("expected provider projection admission failure"),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(lock_test(&handler.provider_sessions, "provider_sessions")?.is_empty());
-        let search = ResourceName::new(parse_test_path("effect://external-provider/chat/search")?);
-        assert!(boot.kernel.registry.resolve_resource(&search).is_err());
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_ready_provider_routes_declared_remote_endpoint_binding() -> anyhow::Result<()> {
-        let ExternalTestFixture {
-            boot,
-            handler,
-            session,
-            context,
-        } = ready_provider_fixture(provider_external_installation_value()?, None, 0).await?;
-        let (outbound, mut outbound_rx) = external_outbound_channel();
-        ExternalSessionHandler::on_ready(&handler, &session, context.clone(), outbound)
-            .await
-            .context("registering provider outbound channel")?;
-
-        let resource_name =
-            ResourceName::new(parse_test_path("effect://external-provider/chat/search")?);
-        let resource_id = boot
-            .kernel
-            .registry
-            .resolve_resource(&resource_name)
-            .context("search resource should be registered")?;
-        let resource = boot
-            .kernel
-            .registry
-            .resource(resource_id)
-            .context("search resource descriptor should exist")?;
-        let binding = boot
-            .kernel
-            .registry
-            .binding(resource.binding)
-            .context("search binding should exist")?;
-        let endpoint_id = binding
-            .endpoint
-            .context("search binding should expose remote endpoint")?;
-        let dispatch = RemoteInvokeDispatch {
-            endpoint_id,
-            resource_id,
-            method_id: MethodId::new(0),
-            binding_generation: binding.generation,
-            acting: IdentityRef::ROOT,
-        };
-        let endpoint = boot
-            .kernel
-            .registry
-            .remote_endpoint(endpoint_id)
-            .context("remote endpoint should be registered")?;
-
-        let invoke = Invoke {
-            invocation_id: "invoke-remote".into(),
-            effect_path: parse_test_path("effect://external-provider/chat/search")?,
-            method_id: MethodId::new(0),
-            input: Value::string("query".into()),
-            deadline_ms: None,
-            output_stream_to: None,
-        };
-        let pending = tokio::spawn(async move { endpoint.invoke(dispatch, invoke).await });
-        let sent =
-            expect_invoke_frame(recv_external_frame(&mut outbound_rx, "provider invoke").await?)?;
-        let sent = xolotl_proto::invoke_from_pb(&sent).context("decoding provider invoke frame")?;
-        assert_eq!(sent.invocation_id, "invoke-remote");
-        assert_eq!(
-            sent.effect_path,
-            parse_test_path("effect://external-provider/chat/search")?
-        );
-
-        let expected = InvokeResult {
-            invocation_id: "invoke-remote".into(),
-            outcome: Ok(Value::string("result".into())),
-        };
-        ExternalSessionHandler::on_invoke_result(
-            &handler,
-            expected.clone(),
-            &session,
-            context.clone(),
-        )
-        .await
-        .context("resolving remote provider invocation")?;
-        let pending = pending.await.context("joining remote invoke task")?;
-        assert_eq!(
-            pending.map_err(|error| anyhow::anyhow!("remote invoke failed: {error:?}"))?,
-            expected
-        );
-
-        let endpoint = boot
-            .kernel
-            .registry
-            .remote_endpoint(endpoint_id)
-            .context("remote endpoint should remain registered")?;
-        let err = match endpoint
-            .invoke(
-                dispatch,
-                Invoke {
-                    invocation_id: "invoke-undeclared-effect".into(),
-                    effect_path: parse_test_path("effect://external-provider/chat/admin")?,
-                    method_id: MethodId::new(0),
-                    input: Value::string("query".into()),
-                    deadline_ms: Some(now_millis() + 200),
-                    output_stream_to: None,
-                },
-            )
-            .await
-        {
-            Ok(result) => bail!("expected undeclared effect rejection, got {result:?}"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            err,
-            DriverError::Transport("provider invoke effect rejected".into())
-        );
-        assert!(outbound_rx.try_recv().is_err());
-
-        let endpoint = boot
-            .kernel
-            .registry
-            .remote_endpoint(endpoint_id)
-            .context("remote endpoint should remain registered")?;
-        let wrong_method_dispatch = RemoteInvokeDispatch {
-            method_id: MethodId::new(99),
-            ..dispatch
-        };
-        let err = match endpoint
-            .invoke(
-                wrong_method_dispatch,
-                Invoke {
-                    invocation_id: "invoke-wrong-method".into(),
-                    effect_path: parse_test_path("effect://external-provider/chat/search")?,
-                    method_id: MethodId::new(99),
-                    input: Value::string("query".into()),
-                    deadline_ms: Some(now_millis() + 200),
-                    output_stream_to: None,
-                },
-            )
-            .await
-        {
-            Ok(result) => bail!("expected wrong method rejection, got {result:?}"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            err,
-            DriverError::Transport("provider invoke method rejected".into())
-        );
-        assert!(outbound_rx.try_recv().is_err());
-
-        let endpoint = boot
-            .kernel
-            .registry
-            .remote_endpoint(endpoint_id)
-            .context("remote endpoint should remain registered")?;
-        let stale_generation_dispatch = RemoteInvokeDispatch {
-            binding_generation: binding.generation + 1,
-            ..dispatch
-        };
-        let err = match endpoint
-            .invoke(
-                stale_generation_dispatch,
-                Invoke {
-                    invocation_id: "invoke-stale-generation".into(),
-                    effect_path: parse_test_path("effect://external-provider/chat/search")?,
-                    method_id: MethodId::new(0),
-                    input: Value::string("query".into()),
-                    deadline_ms: Some(now_millis() + 200),
-                    output_stream_to: None,
-                },
-            )
-            .await
-        {
-            Ok(result) => bail!("expected stale generation rejection, got {result:?}"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            err,
-            DriverError::Transport("provider invoke effect rejected".into())
-        );
-        assert!(outbound_rx.try_recv().is_err());
-
-        let endpoint = boot
-            .kernel
-            .registry
-            .remote_endpoint(endpoint_id)
-            .context("remote endpoint should remain registered")?;
-        let err = match endpoint
-            .invoke(
-                dispatch,
-                Invoke {
-                    invocation_id: "invoke-bad-input".into(),
-                    effect_path: parse_test_path("effect://external-provider/chat/search")?,
-                    method_id: MethodId::new(0),
-                    input: Value::integer(7),
-                    deadline_ms: Some(now_millis() + 200),
-                    output_stream_to: None,
-                },
-            )
-            .await
-        {
-            Ok(result) => bail!("expected invalid input rejection, got {result:?}"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            err,
-            DriverError::Transport(message)
-                if message.starts_with("provider invoke input rejected:")
-                    && message.contains("expected `string`")
-        ));
-        assert!(outbound_rx.try_recv().is_err());
-        assert!(lock_test(&handler.provider_invocations, "provider_invocations")?.is_empty());
-        assert!(lock_test(&handler.provider_waiters, "provider_waiters")?.is_empty());
-
-        ExternalSessionHandler::on_closed(&handler, &session, context)
-            .await
-            .context("closing provider session")?;
-        assert!(boot.kernel.registry.remote_endpoint(endpoint_id).is_none());
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn daemon_provider_endpoint_times_out_pending_invocation() -> anyhow::Result<()> {
-        let ExternalTestFixture {
-            boot,
-            handler,
-            session,
-            context,
-        } = ready_provider_fixture(provider_external_installation_value()?, None, 0).await?;
-        let (outbound, mut outbound_rx) = external_outbound_channel();
-        ExternalSessionHandler::on_ready(&handler, &session, context.clone(), outbound)
-            .await
-            .context("registering provider outbound channel")?;
-
-        let resource_name =
-            ResourceName::new(parse_test_path("effect://external-provider/chat/search")?);
-        let resource_id = boot
-            .kernel
-            .registry
-            .resolve_resource(&resource_name)
-            .context("search resource should be registered")?;
-        let resource = boot
-            .kernel
-            .registry
-            .resource(resource_id)
-            .context("search resource descriptor should exist")?;
-        let binding = boot
-            .kernel
-            .registry
-            .binding(resource.binding)
-            .context("search binding should exist")?;
-        let endpoint_id = binding
-            .endpoint
-            .context("search binding should expose remote endpoint")?;
-        let dispatch = RemoteInvokeDispatch {
-            endpoint_id,
-            resource_id,
-            method_id: MethodId::new(0),
-            binding_generation: binding.generation,
-            acting: IdentityRef::ROOT,
-        };
-        let endpoint = boot
-            .kernel
-            .registry
-            .remote_endpoint(endpoint_id)
-            .context("remote endpoint should be registered")?;
-
-        let deadline_ms = now_millis() + 200;
-        let invoke = Invoke {
-            invocation_id: "invoke-timeout".into(),
-            effect_path: parse_test_path("effect://external-provider/chat/search")?,
-            method_id: MethodId::new(0),
-            input: Value::string("query".into()),
-            deadline_ms: Some(deadline_ms),
-            output_stream_to: None,
-        };
-        let pending = tokio::spawn(async move { endpoint.invoke(dispatch, invoke).await });
-        let sent = expect_invoke_frame(
-            recv_external_frame(&mut outbound_rx, "timed provider invoke").await?,
-        )?;
-        let sent =
-            xolotl_proto::invoke_from_pb(&sent).context("decoding timed provider invoke frame")?;
-        assert_eq!(sent.invocation_id, "invoke-timeout");
-        assert_eq!(sent.deadline_ms, Some(deadline_ms));
-
-        let error = match pending
-            .await
-            .context("joining timed provider invoke task")?
-        {
-            Ok(result) => bail!("expected provider invocation timeout, got {result:?}"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error,
-            DriverError::Transport("provider invocation deadline exceeded".into())
-        );
-        let control = expect_control_frame(
-            recv_external_frame(&mut outbound_rx, "provider cancel control").await?,
-        )?;
-        let control = xolotl_proto::control_frame_from_pb(&control)
-            .context("decoding provider cancel control frame")?;
-        assert_eq!(
-            control,
-            ControlFrame::ProviderCancel {
-                invocation_id: "invoke-timeout".into(),
-                reason: "deadline_exceeded".into(),
-            }
-        );
-        assert!(lock_test(&handler.provider_invocations, "provider_invocations")?.is_empty());
-        assert!(lock_test(&handler.provider_waiters, "provider_waiters")?.is_empty());
-        Ok(())
-    }
-
-    #[cfg(feature = "external-grpc")]
-    #[tokio::test]
-    async fn provider_waiter_drop_reports_provider_unavailable() -> anyhow::Result<()> {
-        let (tx, rx) = oneshot::channel();
-        drop(tx);
-
-        let error = match await_provider_result(rx, None).await {
-            Ok(result) => bail!("expected provider unavailable error, got {result:?}"),
-            Err(error) => error,
-        };
-
-        assert_eq!(
-            error.into_driver_error(),
-            DriverError::Transport("provider unavailable".into())
-        );
-        Ok(())
-    }
-}
+mod tests;

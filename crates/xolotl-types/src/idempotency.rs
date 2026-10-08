@@ -2,26 +2,28 @@
 //!
 //! Default keys retain the full operation identity. Business keys deliberately
 //! span executions, but remain bound to identity, call position, resource,
-//! method, output representation and adaptation phase. Creating an asynchronous
-//! process and executing its effect can never publish into the same cache slot.
+//! concrete target, method and output representation. Only body results enter this cache;
+//! asynchronous process acceptance and references belong to the host.
 
-use crate::{IdentityRef, MethodId, OperationId, OutputMode, ResourceId, Value};
-use alloc::string::String;
+use crate::{IdentityRef, MethodId, OperationId, OutputMode, Path, ResourceId, Value};
+use alloc::string::{String, ToString};
 
 /// Reserved input field for a business key shared across operation identities.
 pub const IDEM_KEY_FIELD: &str = "_idem_key";
 
 /// The opened target and result representation associated with a cached effect.
 #[derive(Clone, Copy, Debug)]
-pub struct KeyScope {
+pub struct KeyScope<'a> {
     /// Resource selected by the admitted handle.
     pub resource: ResourceId,
+    /// Concrete path bound at open, including its cluster. Prefix-resolved
+    /// targets share a resource ID but must not share business-key results.
+    /// `None` is for handles whose target is fully identified by the resource ID.
+    pub target: Option<&'a Path>,
     /// Method in that resource's interface.
     pub method: MethodId,
     /// Representation returned to the caller.
     pub output: OutputMode,
-    /// Whether this call publishes a process reference for a separately run effect.
-    pub creates_process: bool,
 }
 
 /// Derive canonical key material without reducing business keys to a short hash.
@@ -30,7 +32,7 @@ pub fn derive_key(
     op_id: OperationId,
     acting: IdentityRef,
     input: &Value,
-    scope: KeyScope,
+    scope: KeyScope<'_>,
 ) -> String {
     let output = match scope.output {
         OutputMode::Unary => "unary".into(),
@@ -39,17 +41,15 @@ pub fn derive_key(
         OutputMode::SinkOnly => "sink".into(),
         OutputMode::AsyncProcess => "process".into(),
     };
+    let target = scope.target.map(ToString::to_string).unwrap_or_default();
     let prefix = format!(
-        "xolotl-idem-v2/{}/{}/{}/{}/{}/",
+        "xolotl-idem-v1/{}/{}/{}/{}/{}/{}/",
         acting.get(),
         scope.resource.get(),
         scope.method.get(),
         output,
-        if scope.creates_process {
-            "spawn"
-        } else {
-            "call"
-        }
+        target.len(),
+        target,
     );
     match business_key(input) {
         Some(business) => format!(
@@ -85,12 +85,12 @@ mod tests {
         )
     }
 
-    fn scope() -> KeyScope {
+    fn scope() -> KeyScope<'static> {
         KeyScope {
             resource: ResourceId::new(8),
+            target: None,
             method: MethodId::new(2),
             output: OutputMode::Unary,
-            creates_process: false,
         }
     }
 
@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_method_representation_and_adapter_have_separate_namespaces() {
+    fn resource_method_and_representation_have_separate_namespaces() {
         let value = input("order-42");
         let key = derive_key(op(), IdentityRef::ROOT, &value, scope());
         for other in [
@@ -183,28 +183,57 @@ mod tests {
                 ..scope()
             },
             KeyScope {
-                creates_process: true,
+                output: OutputMode::AsyncProcess,
                 ..scope()
             },
         ] {
             assert_ne!(key, derive_key(op(), IdentityRef::ROOT, &value, other));
         }
-        let process = KeyScope {
-            output: OutputMode::AsyncProcess,
-            ..scope()
-        };
-        assert_ne!(
-            derive_key(op(), IdentityRef::ROOT, &value, process),
+    }
+
+    #[test]
+    fn concrete_targets_and_clusters_have_distinct_business_keys() -> anyhow::Result<()> {
+        let input = input("same-business-request");
+        let targets = [
+            Path::parse("effect://jobs/first")?,
+            Path::parse("effect://jobs/second")?,
+            Path::parse("path://remote/effect/jobs/first")?,
+        ];
+        let mut keys = alloc::collections::BTreeSet::new();
+        keys.insert(derive_key(op(), IdentityRef::ROOT, &input, scope()));
+        for target in &targets {
+            anyhow::ensure!(keys.insert(derive_key(
+                op(),
+                IdentityRef::ROOT,
+                &input,
+                KeyScope {
+                    target: Some(target),
+                    ..scope()
+                }
+            )));
+        }
+        anyhow::ensure!(targets[2].cluster() == Some("remote"));
+        let canonical = Path::parse(&targets[0].to_string())?;
+        anyhow::ensure!(
             derive_key(
                 op(),
                 IdentityRef::ROOT,
-                &value,
+                &input,
                 KeyScope {
-                    creates_process: true,
-                    ..process
+                    target: Some(&targets[0]),
+                    ..scope()
                 }
-            )
+            ) == derive_key(
+                op(),
+                IdentityRef::ROOT,
+                &input,
+                KeyScope {
+                    target: Some(&canonical),
+                    ..scope()
+                }
+            ),
         );
+        Ok(())
     }
 
     #[test]

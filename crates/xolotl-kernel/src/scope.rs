@@ -8,8 +8,18 @@ use xolotl_types::{BudgetSpec, BudgetState, ExecutionId, IdentityRef, ProcessId,
 pub enum CleanupScope {
     /// Release local handles and preserve independently delegated descendants.
     Local,
-    /// Revoke authority and stop the complete descendant tree.
+    /// Revoke authority and stop descendants within the owner's cleanup domain.
     Tree,
+}
+
+impl CleanupScope {
+    /// Combine independently retained choices without narrowing tree cleanup.
+    pub const fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Tree, _) | (_, Self::Tree) => Self::Tree,
+            (Self::Local, Self::Local) => Self::Local,
+        }
+    }
 }
 
 /// Admission of one finalization attempt.
@@ -23,37 +33,6 @@ pub enum ScopeFinalize {
     AlreadyTerminal,
     /// Finalization requires a terminal result.
     InvalidStatus,
-}
-
-/// A retained lifecycle cannot be reconstructed from inconsistent decisions.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ScopeRestoreError {
-    /// Only a newly created scope can import an execution status.
-    AlreadyStarted,
-    /// A finalizing status needs a terminal intent, and all terminal choices must agree.
-    InvalidTerminalIntent,
-}
-
-impl core::fmt::Display for ScopeRestoreError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(formatter, "{self:?}")
-    }
-}
-
-impl core::error::Error for ScopeRestoreError {}
-
-/// Reconcile terminal evidence without mutating a live owner.
-pub fn reconcile_terminal(
-    choices: impl IntoIterator<Item = ProcessStatus>,
-) -> Result<Option<ProcessStatus>, ScopeRestoreError> {
-    let mut terminal = None;
-    for choice in choices {
-        if !choice.is_terminal() || terminal.is_some_and(|chosen| chosen != choice) {
-            return Err(ScopeRestoreError::InvalidTerminalIntent);
-        }
-        terminal = Some(choice);
-    }
-    Ok(terminal)
 }
 
 /// Mutable state owned by one invocation scope. Scheduling, task handles,
@@ -160,6 +139,7 @@ impl Scope {
             return ScopeFinalize::AlreadyFinalizing;
         }
         self.choose_terminal(status);
+        self.cleanup.get_or_insert(CleanupScope::Local);
         self.finalizer_active = true;
         self.status = ProcessStatus::Finalizing;
         ScopeFinalize::Started
@@ -199,7 +179,7 @@ impl Scope {
         }
         self.finalized = true;
         self.terminal = None;
-        self.cleanup = None;
+        self.cleanup.get_or_insert(CleanupScope::Local);
         true
     }
 
@@ -213,14 +193,16 @@ impl Scope {
     }
 
     /// Close this scope's admission as part of an explicit tree shutdown.
+    /// A completed owner retains the selection for its surviving descendants;
+    /// the return value only indicates whether its own lifecycle needs cleanup.
     pub fn request_tree_cleanup(&mut self) -> bool {
+        self.cleanup = Some(CleanupScope::Tree);
         if self.finalized {
             return false;
         }
         if self.terminal.is_none() {
             self.status = self.choose_terminal(ProcessStatus::Cancelled);
         }
-        self.cleanup = Some(CleanupScope::Tree);
         true
     }
 
@@ -237,56 +219,10 @@ impl Scope {
         self.cleanup
     }
 
-    /// Pending cleanup selected by the owner. An actively owned attempt need not be queued.
+    /// Selected cleanup range, retained after lifecycle completion. A selection
+    /// alone does not imply pending work; the host also checks completion/owners.
     pub fn cleanup_scope(&self) -> Option<CleanupScope> {
         self.cleanup
-    }
-
-    /// Restore lifecycle decisions into a fresh scope without restoring a live task owner.
-    pub fn restore_lifecycle(
-        &mut self,
-        status: ProcessStatus,
-        terminal: Option<ProcessStatus>,
-    ) -> Result<(), ScopeRestoreError> {
-        if self.status != ProcessStatus::Created || !self.accepts_children() {
-            return Err(ScopeRestoreError::AlreadyStarted);
-        }
-        reconcile_terminal(
-            [terminal, status.is_terminal().then_some(status)]
-                .into_iter()
-                .flatten(),
-        )?;
-        if status == ProcessStatus::Finalizing && terminal.is_none() {
-            return Err(ScopeRestoreError::InvalidTerminalIntent);
-        }
-        self.status = status;
-        self.terminal = terminal;
-        if terminal.is_some() {
-            self.cleanup = Some(CleanupScope::Local);
-        }
-        Ok(())
-    }
-
-    /// Resume cleanup of a validated checkpoint while keeping existing terminal status.
-    pub fn resume_cleanup(&mut self, status: ProcessStatus) -> Result<(), ScopeRestoreError> {
-        if self.finalized {
-            return Err(ScopeRestoreError::AlreadyStarted);
-        }
-        reconcile_terminal(
-            [
-                Some(status),
-                self.terminal,
-                self.status.is_terminal().then_some(self.status),
-            ]
-            .into_iter()
-            .flatten(),
-        )?;
-        self.terminal = Some(status);
-        if !self.status.is_terminal() {
-            self.status = ProcessStatus::Finalizing;
-        }
-        self.cleanup.get_or_insert(CleanupScope::Local);
-        Ok(())
     }
 
     /// Current reservation and spending counters.
@@ -294,7 +230,7 @@ impl Scope {
         &self.budget
     }
 
-    /// Trusted host access for checkpoint import or accounting-window maintenance.
+    /// Trusted host access for accounting-window maintenance.
     pub fn budget_mut(&mut self) -> &mut BudgetState {
         &mut self.budget
     }

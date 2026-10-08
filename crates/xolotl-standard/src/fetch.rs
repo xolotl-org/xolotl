@@ -1,14 +1,15 @@
 //! Fetch provider: `effect://fetch/get`.
 //!
-//! Safety: URL admission runs before the request and on every redirect.
-//! Literal IPs that are loopback, private, link-local, or unspecified are
-//! rejected, as are `.local`/`.internal` names. `fetch` is `Effectful`.
+//! Safety: URL admission runs before the request and on every redirect. The
+//! resolver admits the actual connection addresses, rejecting a whole answer
+//! containing a non-public destination. Environment proxies are disabled.
+//! Hosts supply a separate Driver for internal-network or proxy access.
 //! Large responses are offloaded to a content-addressed [`xolotl_types::BlobRef`] so Facts
 //! never inline big payloads.
 
 use async_trait::async_trait;
 use std::collections::BTreeMap;
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use xolotl_kernel::{
     Driver, DriverContext, DriverError, DriverOutput, DriverUsage, MethodSpec, UsageDimension,
 };
@@ -22,8 +23,13 @@ use xolotl_types::{
 pub(crate) const INLINE_BODY_LIMIT: usize = 1 << 20;
 
 /// Method names in registration order for `effect://fetch/get`.
-pub(crate) const FETCH_METHODS: &[MethodSpec] =
-    &[MethodSpec::new("get", Purity::Effectful, MethodSpec::STREAM_ASYNC).unprotected_input()];
+pub(crate) const FETCH_METHODS: &[MethodSpec] = &[MethodSpec::new(
+    "get",
+    xolotl_types::MethodAuthority::Perform,
+    Purity::Effectful,
+    MethodSpec::STREAM_ASYNC,
+)
+.unprotected_input()];
 
 /// Drives `effect://fetch/get`.
 pub(crate) struct FetchDriver {
@@ -34,7 +40,17 @@ pub(crate) struct FetchDriver {
 impl FetchDriver {
     /// Create a fetch driver with explicit large-object storage capabilities.
     pub(crate) fn new(objects: ObjectStore) -> Result<Self, DriverError> {
-        let client = reqwest::Client::builder()
+        Self::with_resolver(objects, SystemResolver)
+    }
+
+    fn with_resolver(
+        objects: ObjectStore,
+        resolver: impl reqwest::dns::Resolve + 'static,
+    ) -> Result<Self, DriverError> {
+        let client = crate::http_tls::client_builder()
+            .map_err(|error| DriverError::Other(format!("fetch TLS init failed: {error}")))?
+            .no_proxy()
+            .dns_resolver(PublicResolver(resolver))
             .redirect(fetch_redirect_policy())
             .build()
             .map_err(|error| DriverError::Other(format!("fetch client init failed: {error}")))?;
@@ -59,8 +75,8 @@ fn validate_redirect_target(url: &url::Url, previous_len: usize) -> Result<(), S
     Ok(())
 }
 
-/// SSRF guard: reject non-http(s), loopback, private ranges, and
-/// internal TLDs. Returns the validated URL or an error.
+/// Admit an HTTP(S) URL. Literal addresses and DNS connection addresses use
+/// the same public-destination policy; URL admission alone is not DNS admission.
 pub(crate) fn validate_url(raw: &str) -> Result<url::Url, DriverError> {
     let u = url::Url::parse(raw).map_err(|e| DriverError::Other(format!("bad url: {e}")))?;
     match u.scheme() {
@@ -70,7 +86,7 @@ pub(crate) fn validate_url(raw: &str) -> Result<url::Url, DriverError> {
     let host = u
         .host_str()
         .ok_or_else(|| DriverError::Other("url has no host".into()))?;
-    if host.ends_with(".local") || host.ends_with(".internal") || host == "localhost" {
+    if !public_hostname(host) {
         return Err(DriverError::Other(
             "internal host not allowed (SSRF)".into(),
         ));
@@ -78,16 +94,12 @@ pub(crate) fn validate_url(raw: &str) -> Result<url::Url, DriverError> {
     // Classify literal IPs via the parsed `Host` so bracketed IPv6 authorities
     // (`http://[::1]/`) are recognized — `host_str` keeps the brackets.
     match u.host() {
-        Some(url::Host::Ipv4(ip))
-            if ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified() =>
-        {
+        Some(url::Host::Ipv4(ip)) if !public_address(IpAddr::V4(ip)) => {
             return Err(DriverError::Other(
                 "private/loopback IP not allowed (SSRF)".into(),
             ));
         }
-        Some(url::Host::Ipv6(ip))
-            if ip.is_loopback() || ip.is_unspecified() || is_private_ipv6(&ip) =>
-        {
+        Some(url::Host::Ipv6(ip)) if !public_address(IpAddr::V6(ip)) => {
             return Err(DriverError::Other(
                 "private/loopback IP not allowed (SSRF)".into(),
             ));
@@ -97,16 +109,122 @@ pub(crate) fn validate_url(raw: &str) -> Result<url::Url, DriverError> {
     Ok(u)
 }
 
-/// True for IPv6 ranges that must not be reachable from `fetch`:
-/// unique-local `fc00::/7` (covers `fc00::`/`fd00::`) and link-local
-/// `fe80::/10`. (Loopback `::1` and unspecified `::` are handled by the
-/// stdlib predicates at the call site.) Uses the first segment because the
-/// relevant stdlib predicates are still unstable.
-fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
-    let first = ip.segments()[0];
-    let unique_local = (first & 0xfe00) == 0xfc00; // fc00::/7
-    let link_local = (first & 0xffc0) == 0xfe80; // fe80::/10
-    unique_local || link_local
+fn public_hostname(host: &str) -> bool {
+    let normalized = host.trim_end_matches('.');
+    !normalized.is_empty()
+        && !["localhost", "local", "internal", "home.arpa"]
+            .iter()
+            .any(|suffix| {
+                normalized.eq_ignore_ascii_case(suffix)
+                    || normalized.len() > suffix.len()
+                        && normalized.as_bytes()[normalized.len() - suffix.len() - 1] == b'.'
+                        && normalized[normalized.len() - suffix.len()..]
+                            .eq_ignore_ascii_case(suffix)
+            })
+}
+
+fn ipv4_prefix(address: Ipv4Addr, prefix: [u8; 4], bits: u32) -> bool {
+    u32::from(address) >> (32 - bits) == u32::from_be_bytes(prefix) >> (32 - bits)
+}
+
+fn ipv6_prefix(address: Ipv6Addr, prefix: [u16; 8], bits: u32) -> bool {
+    u128::from(address) >> (128 - bits) == u128::from(Ipv6Addr::from(prefix)) >> (128 - bits)
+}
+
+/// Public unicast destinations, with IANA special-purpose exclusions. Mapped
+/// IPv4 and the well-known NAT64 prefix must also admit their embedded IPv4.
+fn public_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            if matches!(address.octets(), [192, 0, 0, 9 | 10]) {
+                return true;
+            }
+            ![
+                ([0, 0, 0, 0], 8),
+                ([10, 0, 0, 0], 8),
+                ([100, 64, 0, 0], 10),
+                ([127, 0, 0, 0], 8),
+                ([169, 254, 0, 0], 16),
+                ([172, 16, 0, 0], 12),
+                ([192, 0, 0, 0], 24),
+                ([192, 0, 2, 0], 24),
+                ([192, 88, 99, 0], 24),
+                ([192, 168, 0, 0], 16),
+                ([198, 18, 0, 0], 15),
+                ([198, 51, 100, 0], 24),
+                ([203, 0, 113, 0], 24),
+                ([224, 0, 0, 0], 4),
+                ([240, 0, 0, 0], 4),
+            ]
+            .iter()
+            .any(|(prefix, bits)| ipv4_prefix(address, *prefix, *bits))
+        }
+        IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return public_address(IpAddr::V4(mapped));
+            }
+            if ipv6_prefix(address, [0x64, 0xff9b, 0, 0, 0, 0, 0, 0], 96) {
+                let octets = address.octets();
+                return public_address(IpAddr::V4(Ipv4Addr::new(
+                    octets[12], octets[13], octets[14], octets[15],
+                )));
+            }
+            if !ipv6_prefix(address, [0x2000, 0, 0, 0, 0, 0, 0, 0], 3)
+                || ipv6_prefix(address, [0x2001, 0xdb8, 0, 0, 0, 0, 0, 0], 32)
+                || ipv6_prefix(address, [0x2002, 0, 0, 0, 0, 0, 0, 0], 16)
+                || ipv6_prefix(address, [0x3fff, 0, 0, 0, 0, 0, 0, 0], 20)
+            {
+                return false;
+            }
+            if ipv6_prefix(address, [0x2001, 0, 0, 0, 0, 0, 0, 0], 23) {
+                return matches!(address.segments(), [0x2001, 1, 0, 0, 0, 0, 0, 1..=3])
+                    || ipv6_prefix(address, [0x2001, 3, 0, 0, 0, 0, 0, 0], 32)
+                    || ipv6_prefix(address, [0x2001, 4, 0x112, 0, 0, 0, 0, 0], 48)
+                    || ipv6_prefix(address, [0x2001, 0x20, 0, 0, 0, 0, 0, 0], 28)
+                    || ipv6_prefix(address, [0x2001, 0x30, 0, 0, 0, 0, 0, 0], 28);
+            }
+            true
+        }
+    }
+}
+
+struct SystemResolver;
+
+impl reqwest::dns::Resolve for SystemResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let addresses = tokio::net::lookup_host((name.as_str().to_owned(), 0)).await?;
+            Ok(Box::new(addresses) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+struct PublicResolver<Resolver>(Resolver);
+
+impl<Resolver: reqwest::dns::Resolve> reqwest::dns::Resolve for PublicResolver<Resolver> {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        if !public_hostname(name.as_str()) {
+            return Box::pin(async {
+                Err(std::io::Error::other("non-public fetch hostname").into())
+            });
+        }
+        let resolving = self.0.resolve(name);
+        Box::pin(async move {
+            let mut admitted = Vec::new();
+            for address in resolving.await? {
+                if admitted.len() == 64 || !public_address(address.ip()) {
+                    return Err(
+                        std::io::Error::other("non-public or excessive fetch DNS answer").into(),
+                    );
+                }
+                admitted.push(address);
+            }
+            if admitted.is_empty() {
+                return Err(std::io::Error::other("empty fetch DNS answer").into());
+            }
+            Ok(Box::new(admitted.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 #[async_trait]
@@ -216,15 +334,28 @@ impl Driver for FetchDriver {
 mod tests {
     use super::*;
     use anyhow::{Context, Result, bail, ensure};
+    use sha2::{Digest as _, Sha384};
     use xolotl_types::{IdentityRef, ProcessId};
+
+    fn content_digest(bytes: &[u8]) -> String {
+        xolotl_types::BlobRef::sha384_hex(&Sha384::digest(bytes).into())
+    }
 
     #[test]
     fn ssrf_guard_blocks_internal_targets() -> Result<()> {
         for url in [
             "http://localhost/x",
+            "http://localhost./x",
+            "http://sub.localhost/x",
+            "http://foo.LOCAL./x",
+            "http://router.home.arpa/x",
             "http://127.0.0.1/x",
             "http://10.0.0.5/x",
             "http://192.168.1.1/x",
+            "http://100.64.0.1/x",
+            "http://198.18.0.1/x",
+            "http://224.0.0.1/x",
+            "http://203.0.113.1/x",
             "http://foo.internal/x",
             "file:///etc/passwd",
             "ftp://example.com/x",
@@ -251,6 +382,10 @@ mod tests {
             "http://[fc00::1]/x",
             "http://[fd12:3456::1]/x",
             "http://[fe80::1]/x",
+            "http://[::ffff:127.0.0.1]/x",
+            "http://[64:ff9b::a00:1]/x",
+            "http://[2001:db8::1]/x",
+            "http://[2002:7f00:1::1]/x",
         ] {
             ensure!(validate_url(url).is_err(), "url must be blocked: {url}");
         }
@@ -260,9 +395,123 @@ mod tests {
     #[test]
     fn ssrf_guard_allows_public_ipv6() -> Result<()> {
         ensure!(
-            validate_url("http://[2001:db8::1]/x").is_ok(),
+            validate_url("http://[2001:4860:4860::8888]/x").is_ok(),
             "public ipv6 url must be allowed"
         );
+        Ok(())
+    }
+
+    struct FixedResolver(Vec<std::net::SocketAddr>);
+
+    impl reqwest::dns::Resolve for FixedResolver {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let addresses = self.0.clone();
+            Box::pin(async move { Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs) })
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_resolver_rejects_non_public_and_excessive_answers() -> Result<()> {
+        use reqwest::dns::Resolve as _;
+        let public: std::net::SocketAddr = "93.184.215.14:0".parse()?;
+        let private: std::net::SocketAddr = "127.0.0.1:0".parse()?;
+        for addresses in [
+            vec![private],
+            vec![public, private],
+            vec![public; 65],
+            vec![],
+        ] {
+            ensure!(
+                PublicResolver(FixedResolver(addresses))
+                    .resolve("public.example".parse()?)
+                    .await
+                    .is_err()
+            );
+        }
+        let admitted = PublicResolver(FixedResolver(vec![public]))
+            .resolve("public.example".parse()?)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?
+            .collect::<Vec<_>>();
+        ensure!(admitted == vec![public]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn production_client_blocks_dns_loopback_before_connecting() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let directory = tempfile::tempdir()?;
+        let objects =
+            xolotl_storage_fs::FileObjectStore::open(directory.path())?.into_object_store();
+        let driver = FetchDriver::with_resolver(objects, FixedResolver(vec![address]))?;
+        let output = driver
+            .call(
+                MethodId::new(0),
+                Value::string(format!("http://public.example:{}/private", address.port())),
+                OutputMode::Unary,
+                &DriverContext::new(IdentityRef::ROOT, ProcessId::new(1)),
+            )
+            .await;
+        ensure!(output.is_err());
+        ensure!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn production_client_does_not_inherit_environment_proxy() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let proxy = format!("http://{}", listener.local_addr()?);
+        let connected = Arc::new(AtomicBool::new(false));
+        let observed = connected.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            observed.store(true, Ordering::SeqCst);
+            let mut request = [0_u8; 4096];
+            ensure!(socket.read(&mut request).await? > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let mut command = tokio::process::Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--exact",
+                "fetch::tests::production_client_blocks_dns_loopback_before_connecting",
+            ])
+            .kill_on_drop(true);
+        for key in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            command.env(key, &proxy);
+        }
+        command.env("NO_PROXY", "").env("no_proxy", "");
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await;
+        server.abort();
+        drop(server.await);
+        let output = output??;
+        ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        ensure!(!connected.load(Ordering::SeqCst));
         Ok(())
     }
 
@@ -347,7 +596,7 @@ mod tests {
                 let xolotl_types::ValueView::Blob(reference) = body.view() else {
                     bail!("expected blob")
                 };
-                ensure!(reference.hash == blake3::hash(&bytes).to_hex().to_string());
+                ensure!(reference.hash == content_digest(&bytes));
                 ensure!(reference.size == bytes.len() as u64);
                 ensure!(
                     objects

@@ -116,6 +116,20 @@ pub enum NodeKind {
     Step(StepRef),
     /// Failure compensation / conditional.
     Branch(BranchKind),
+    /// Run the second arm after the first succeeds, fails, or is cancelled.
+    Finally,
+    /// Run the first arm and pass its result to the second without retaining a binding.
+    Sequence,
+    /// Bind the first arm's result while evaluating the second arm.
+    Let {
+        /// Lexical slot, reused after the binding's body exits.
+        slot: u32,
+    },
+    /// Read a value from the enclosing lexical binding.
+    Load {
+        /// Slot selected by lexical name resolution.
+        slot: u32,
+    },
     /// Both (all complete) / Race (take first).
     Join(JoinKind),
     /// Block-level identity switch. Carries the identity
@@ -124,14 +138,6 @@ pub enum NodeKind {
     Acting(Path),
     /// Wait for a signal / deadline.
     Wait(WaitSpec),
-}
-
-impl NodeKind {
-    /// Whether this node can produce an external side effect (only
-    /// `Operation` does). Used by the recorder to decide Fact necessity.
-    pub fn is_side_effecting(&self) -> bool {
-        matches!(self, NodeKind::Operation(_))
-    }
 }
 
 /// A graph node, identified by its stable [`NodeId`] (= `CausalPosition`).
@@ -156,8 +162,6 @@ pub enum EdgeKind {
     Else,
     /// `to` is one parallel arm of a `Join` (`from` is the join node's source).
     Arm,
-    /// A `Use(id)` data dependency back to a `Let`-bound node (DAG edge).
-    Use,
 }
 
 /// A directed edge between two nodes.
@@ -177,12 +181,11 @@ pub struct Edge {
 pub struct ExecutionGraph {
     /// Nodes in stable id order as produced by the compiler.
     pub nodes: Vec<Node>,
-    /// Directed edges that encode value flow, continuations, arms, and uses.
+    /// Directed edges that encode value flow, continuations, and lexical arms.
     pub edges: Vec<Edge>,
-    /// The entry node (where execution / recovery begins).
+    /// The entry node where this execution begins.
     pub root: NodeId,
-    /// Content hash over the structure; the Process binds to this and recovery
-    /// re-binds the same product.
+    /// Content hash over the complete program structure.
     pub graph_hash: [u8; 32],
 }
 
@@ -220,31 +223,15 @@ impl ExecutionGraph {
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
-
-    /// Whether node `id`'s output is consumed by any other node: it has
-    /// an outgoing `Then` (continuation), `Use` (data dependency), or feeds a
-    /// `Join`/`Branch` arm result. An unconsumed pure-deterministic read need
-    /// not record a Fact — recovery can safely recompute it. This is the
-    /// compile-time data-flow signal the record-discipline uses, computed off
-    /// the graph (never on the hot path).
-    pub fn output_is_consumed(&self, id: NodeId) -> bool {
-        self.edges
-            .iter()
-            .any(|e| e.from == id && matches!(e.kind, EdgeKind::Then | EdgeKind::Use))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::{Context, anyhow, ensure};
+    use anyhow::{Context, ensure};
 
     fn s(name: &str) -> StepRef {
         StepRef::new(name)
-    }
-
-    fn p(path: &str) -> anyhow::Result<Path> {
-        Path::parse(path).map_err(|error| anyhow!("path parse failed for {path}: {error}"))
     }
 
     #[test]
@@ -293,30 +280,6 @@ mod tests {
         ensure!(g.node(NodeId::new(2)).is_none(), "unexpected third node");
         let edge_count = g.out_edges(NodeId::new(0)).count();
         ensure!(edge_count == 1, "unexpected edge count: {edge_count}");
-        Ok(())
-    }
-
-    #[test]
-    fn only_operation_is_side_effecting() -> anyhow::Result<()> {
-        ensure!(
-            NodeKind::Operation(OperationTemplate {
-                target: ResourceName::new(p("effect://x/post")?),
-                method: "invoke".into(),
-                method_id: None,
-                output: OutputMode::Unary,
-                literal_input: None,
-            })
-            .is_side_effecting(),
-            "operation should be side-effecting"
-        );
-        ensure!(
-            !NodeKind::Pure(Value::null()).is_side_effecting(),
-            "pure node should not be side-effecting"
-        );
-        ensure!(
-            !NodeKind::Step(s("s")).is_side_effecting(),
-            "step node should not be side-effecting"
-        );
         Ok(())
     }
 }

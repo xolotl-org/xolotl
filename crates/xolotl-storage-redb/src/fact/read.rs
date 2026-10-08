@@ -2,7 +2,6 @@
 
 use super::{NEXT_CURSOR_KEY, RedbFactStore, ensure_fact_schema, fact_err};
 use crate::{FACT_INDEX_TABLE, FACT_META_TABLE, FACT_PROCESS_INDEX_TABLE, FACTS_TABLE};
-use redb::ReadableDatabase;
 use std::num::NonZeroUsize;
 use xolotl_kernel::{FactError, FactLookup, FactLookupResult, FactOrder, FactPage, FactQuery};
 use xolotl_types::{Fact, OperationId, ProcessId};
@@ -16,10 +15,10 @@ impl RedbFactStore {
             .get(NEXT_CURSOR_KEY)
             .map_err(fact_err)?
             .map(|value| value.value())
-            .ok_or_else(|| FactError("fact cursor metadata missing".into()))?;
+            .ok_or_else(|| FactError::new("fact cursor metadata missing".into()))?;
         let end = query.before.unwrap_or(head).min(head);
         if query.from > end {
-            return Err(FactError("fact scan starts after its end".into()));
+            return Err(FactError::new("fact scan starts after its end".into()));
         }
         let mut page = FactPage {
             facts: Vec::new(),
@@ -48,7 +47,7 @@ impl RedbFactStore {
                 let slot = slot.value();
                 Self::validate_process_index(key.value(), process, slot)?;
                 let bytes = facts.get(slot).map_err(fact_err)?.ok_or_else(|| {
-                    FactError(format!("fact process index points to missing slot {slot}"))
+                    FactError::new(format!("fact process index points to missing slot {slot}"))
                 })?;
                 if consume_page_fact(&query, &mut page, slot, bytes.value())? {
                     return Ok(page);
@@ -87,7 +86,7 @@ impl RedbFactStore {
         let slot = slot.value();
         let facts = txn.open_table(FACTS_TABLE).map_err(fact_err)?;
         let bytes = facts.get(slot).map_err(fact_err)?.ok_or_else(|| {
-            FactError(format!(
+            FactError::new(format!(
                 "fact operation index points to missing slot {slot}"
             ))
         })?;
@@ -123,11 +122,11 @@ fn next_slot(query: &FactQuery, page: &FactPage) -> Option<u64> {
 }
 
 fn missing_slot(slot: u64) -> FactError {
-    FactError(format!("fact append interval is missing slot {slot}"))
+    FactError::new(format!("fact append interval is missing slot {slot}"))
 }
 
 fn byte_limit_error(slot: u64, max_encoded_bytes: NonZeroUsize) -> FactError {
-    FactError(format!(
+    FactError::new(format!(
         "fact at slot {slot} exceeds encoded byte limit {max_encoded_bytes}"
     ))
 }
@@ -140,7 +139,7 @@ pub(super) fn decode_fact(
     let fact: Fact = serde_json::from_slice(bytes).map_err(fact_err)?;
     ensure_fact_schema(&fact)?;
     if process.is_some_and(|process| process != fact.caller) {
-        return Err(FactError(format!(
+        return Err(FactError::new(format!(
             "fact process index does not match record at slot {slot}"
         )));
     }
@@ -155,7 +154,7 @@ pub(super) fn decode_indexed_fact(
 ) -> Result<Fact, FactError> {
     let fact = decode_fact(bytes, slot, process)?;
     if fact.id != id {
-        return Err(FactError(format!(
+        return Err(FactError::new(format!(
             "fact operation index does not match record at slot {slot}"
         )));
     }

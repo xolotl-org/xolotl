@@ -13,7 +13,7 @@ use xolotl_sdk::{
 };
 use xolotl_state::object::{ObjectMetadata, ObjectRead, ObjectWrite, UploadOptions};
 use xolotl_storage_fs::{FileObjectOptions, FileObjectStore};
-use xolotl_types::{MethodBitmap, OutputMode, ResourceSelector};
+use xolotl_types::{GrantMethods, GrantRights, OutputMode, ResourceSelector};
 
 pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
@@ -43,11 +43,14 @@ pub(super) fn request<'a>(
         .map(|literal| {
             Ok(CompiledRequestGrantTemplate {
                 selector: ResourceSelector::parse(literal)?,
-                methods: MethodBitmap::method(0),
+                rights: GrantRights::new(
+                    GrantMethods::name("invoke"),
+                    xolotl_types::RightFlags::empty(),
+                ),
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(boot.request_under(boot.root, IdentityRef::ROOT, &grants)?)
+    Ok(boot.request_under(boot.root(), IdentityRef::ROOT, &grants)?)
 }
 
 /// One operation owns one stream. A second open cannot reuse its terminal slot.

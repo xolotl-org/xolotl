@@ -45,11 +45,13 @@ pub enum Failure {
     Timeout,
     /// Operation or process was cancelled.
     Cancelled,
-    /// Recovery refused to replay the operation without operator action.
-    Quarantined {
-        /// Operation id held in quarantine.
-        op_id: String,
-        /// Quarantine reason.
+    /// An effect may have started, but the host cannot establish its outcome.
+    /// Repeating it without external reconciliation may duplicate the effect.
+    OutcomeUnknown {
+        /// Stable identities of logical operations whose outcomes need
+        /// reconciliation. A single remote command contributes one identity.
+        operation_ids: Vec<String>,
+        /// Host-classified cause, independent of untrusted handler error text.
         reason: String,
     },
     /// Input failed validation before reaching the handler.
@@ -108,7 +110,10 @@ impl core::fmt::Display for Failure {
             } => write!(f, "approval pending ({approval_key}): {reason}"),
             Failure::Timeout => write!(f, "timeout"),
             Failure::Cancelled => write!(f, "cancelled"),
-            Failure::Quarantined { reason, .. } => write!(f, "quarantined: {}", reason),
+            Failure::OutcomeUnknown {
+                operation_ids,
+                reason,
+            } => write!(f, "outcome unknown for {operation_ids:?}: {reason}"),
             Failure::InvalidInput { reason } => write!(f, "invalid input: {}", reason),
             Failure::HandlerError { message, .. } => write!(f, "handler: {}", message),
             Failure::KernelNamespaceProtected => write!(f, "kernel namespace protected"),
@@ -122,6 +127,12 @@ impl core::fmt::Display for Failure {
 }
 
 impl core::error::Error for Failure {}
+
+impl From<core::convert::Infallible> for Failure {
+    fn from(error: core::convert::Infallible) -> Self {
+        match error {}
+    }
+}
 
 impl Failure {
     /// Construct a policy violation failure.

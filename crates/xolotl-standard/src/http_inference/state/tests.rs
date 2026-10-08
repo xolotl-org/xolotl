@@ -46,7 +46,7 @@ async fn late_configuration_scan_failure_preserves_page_and_failure_observations
         last: last.clone(),
     }));
     let Err(HttpInferenceError::State(failure)) =
-        read_prefix_values(&state, "state://kernel/inference/backends").await
+        read_prefix_values(&state, InferenceDeclarationKind::Backend).await
     else {
         bail!("configuration scan lost its structured State failure");
     };

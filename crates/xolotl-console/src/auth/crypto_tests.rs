@@ -25,13 +25,9 @@ fn password_hash_encoding_preserves_parameters_and_raw_salt() -> anyhow::Result<
 }
 
 #[test]
-fn console_ed25519_v1_accepts_a_fixed_signature_with_canonical_base64() -> anyhow::Result<()> {
-    // Independently signed by Node/OpenSSL with the Ed25519 seed [7; 32].
-    const DESCRIPTOR: &str = "ed25519:6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw";
-    const SIGNATURE: &str = concat!(
-        "YXl6-fdCQqBP-tIKALyAameee61-iT13gdjIMB3lVsjHsSLpVRsHD6KhLhvnj4ZM",
-        "zza9LulrKsel4b7HJAKlDQ",
-    );
+fn console_ml_dsa_65_v1_accepts_a_signature_and_rejects_other_transcripts() -> anyhow::Result<()> {
+    let key = super::test_key::TestSigningKey::generate();
+    let descriptor = key.descriptor();
     let transcript = key_login_transcript(
         "alice",
         "challenge-v1",
@@ -40,38 +36,32 @@ fn console_ed25519_v1_accepts_a_fixed_signature_with_canonical_base64() -> anyho
     );
     ensure!(
         transcript
-            == "xolotl-console-ed25519-v1\nalice\nchallenge-v1\nnonce-v1\nhttps://console.example"
+            == "xolotl-console-ml-dsa-65-v1\nalice\nchallenge-v1\nnonce-v1\nhttps://console.example"
     );
-    let descriptors = [DESCRIPTOR.to_string()];
-    ensure!(verify_key_login(
-        &descriptors,
-        Some(DESCRIPTOR),
-        SIGNATURE,
-        &transcript,
-    )?);
+    let signature = URL_SAFE_NO_PAD.encode(key.sign(transcript.as_bytes()));
+    let descriptors = [descriptor.clone()];
+    ensure!(verify_key_login(&descriptors, &descriptor, &signature, &transcript,)?.is_some());
     let other_origin =
         key_login_transcript("alice", "challenge-v1", "nonce-v1", "https://other.example");
-    ensure!(!verify_key_login(
-        &descriptors,
-        Some(DESCRIPTOR),
-        SIGNATURE,
-        &other_origin,
-    )?);
-    ensure!(!verify_key_login(
-        &descriptors,
-        Some("ed25519:another-key"),
-        SIGNATURE,
-        &transcript,
-    )?);
-    // R preserves Q's data bits but sets a nonzero unused Base64 tail bit.
-    for invalid in [
-        format!("{SIGNATURE}="),
-        format!("{}R", &SIGNATURE[..SIGNATURE.len() - 1]),
-    ] {
+    ensure!(verify_key_login(&descriptors, &descriptor, &signature, &other_origin,)?.is_none());
+    ensure!(
+        verify_key_login(
+            &descriptors,
+            "ml-dsa-65:another-key",
+            &signature,
+            &transcript,
+        )?
+        .is_none()
+    );
+    for invalid in [format!("{signature}="), format!("{signature}A")] {
         ensure!(matches!(
-            verify_key_login(&descriptors, None, &invalid, &transcript),
+            verify_key_login(&descriptors, &descriptor, &invalid, &transcript),
             Err(AuthError::InvalidCredentials)
         ));
     }
+    ensure!(matches!(
+        credentials::canonical_public_key("ed25519:6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw"),
+        Err(AuthError::InvalidCredentialRequest)
+    ));
     Ok(())
 }

@@ -12,7 +12,44 @@ struct Report<'a, T> {
     target_arch: &'static str,
     target_os: &'static str,
     heap_instrumented: bool,
+    process_memory: ProcessMemory,
     measurement: T,
+}
+
+#[derive(Serialize)]
+struct RssSnapshot {
+    resident_bytes: u64,
+    high_water_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct ProcessMemory {
+    before_measurement: Option<RssSnapshot>,
+    after_teardown: Option<RssSnapshot>,
+}
+
+fn rss_snapshot() -> anyhow::Result<Option<RssSnapshot>> {
+    if !cfg!(target_os = "linux") {
+        return Ok(None);
+    }
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let bytes = |field: &str| -> anyhow::Result<u64> {
+        let line = status
+            .lines()
+            .find(|line| line.starts_with(field))
+            .ok_or_else(|| anyhow::anyhow!("missing process memory field {field}"))?;
+        let kib: u64 = line
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| anyhow::anyhow!("missing process memory size {field}"))?
+            .parse()?;
+        kib.checked_mul(1024)
+            .ok_or_else(|| anyhow::anyhow!("process memory size overflow"))
+    };
+    Ok(Some(RssSnapshot {
+        resident_bytes: bytes("VmRSS:")?,
+        high_water_bytes: bytes("VmHWM:")?,
+    }))
 }
 
 #[cfg(not(feature = "heap-profile"))]
@@ -33,13 +70,14 @@ pub fn run(config: Config) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let mut case = Case::new(&config)?;
+    let mut case = Case::new(&config, &runtime)?;
     for _ in 0..config.warmup {
         case.run_sample(&runtime, &config)?;
     }
+    let before_measurement = rss_snapshot()?;
     #[cfg(feature = "heap-profile")]
     {
-        heap(config, runtime, case)
+        heap(config, runtime, case, before_measurement)
     }
     #[cfg(not(feature = "heap-profile"))]
     {
@@ -77,11 +115,24 @@ pub fn run(config: Config) -> anyhow::Result<()> {
             latency_p95_ns: quantile(95),
             latency_p99_ns: quantile(99),
         };
-        output(&config, timing)
+        drop(case);
+        drop(runtime);
+        output(
+            &config,
+            timing,
+            ProcessMemory {
+                before_measurement,
+                after_teardown: rss_snapshot()?,
+            },
+        )
     }
 }
 
-fn output<T: Serialize>(config: &Config, measurement: T) -> anyhow::Result<()> {
+fn output<T: Serialize>(
+    config: &Config,
+    measurement: T,
+    process_memory: ProcessMemory,
+) -> anyhow::Result<()> {
     let mut out = std::io::stdout().lock();
     serde_json::to_writer(
         &mut out,
@@ -91,6 +142,7 @@ fn output<T: Serialize>(config: &Config, measurement: T) -> anyhow::Result<()> {
             target_arch: std::env::consts::ARCH,
             target_os: std::env::consts::OS,
             heap_instrumented: cfg!(feature = "heap-profile"),
+            process_memory,
             measurement,
         },
     )?;
@@ -99,7 +151,12 @@ fn output<T: Serialize>(config: &Config, measurement: T) -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "heap-profile")]
-fn heap(config: Config, runtime: tokio::runtime::Runtime, mut case: Case) -> anyhow::Result<()> {
+fn heap(
+    config: Config,
+    runtime: tokio::runtime::Runtime,
+    mut case: Case,
+    before_measurement: Option<RssSnapshot>,
+) -> anyhow::Result<()> {
     #[derive(Serialize)]
     struct Heap {
         scope: &'static str,
@@ -144,5 +201,12 @@ fn heap(config: Config, runtime: tokio::runtime::Runtime, mut case: Case) -> any
         live_bytes_after_teardown: released.curr_bytes,
     };
     drop(profiler);
-    output(&config, heap)
+    output(
+        &config,
+        heap,
+        ProcessMemory {
+            before_measurement,
+            after_teardown: rss_snapshot()?,
+        },
+    )
 }

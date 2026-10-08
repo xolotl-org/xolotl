@@ -5,6 +5,7 @@ use std::{io::Write, num::NonZeroUsize, path::PathBuf};
 pub const CASES: &[&str] = &[
     "core",
     "resident",
+    "executor-prepare",
     "portable",
     "hosted",
     "stream",
@@ -12,6 +13,13 @@ pub const CASES: &[&str] = &[
     "provider-stream",
     "object-file",
     "state-fact",
+    "source-fingerprint",
+    "source-fingerprint-deep-reject",
+    "source-fingerprint-wide-reject",
+    "source-fingerprint-shared-reject",
+    "plan-compile",
+    "plan-compile-reject",
+    "memory-consolidate",
 ];
 
 #[derive(Clone, Copy, Serialize)]
@@ -52,6 +60,10 @@ impl Config {
             heap_file: None,
         };
         let mut args = std::env::args().skip(1);
+        let mut width_explicit = false;
+        let mut depth_explicit = false;
+        let mut work_explicit = false;
+        let mut window_explicit = false;
         while let Some(flag) = args.next() {
             if flag == "--list" {
                 let mut out = std::io::stdout().lock();
@@ -82,10 +94,22 @@ impl Config {
                 }
                 "--samples" => config.samples = value.parse()?,
                 "--warmup" => config.warmup = value.parse()?,
-                "--work" => config.work = value.parse()?,
-                "--width" => config.width = value.parse()?,
-                "--depth" => config.depth = value.parse()?,
-                "--window" => config.window = value.parse()?,
+                "--work" => {
+                    config.work = value.parse()?;
+                    work_explicit = true;
+                }
+                "--width" => {
+                    config.width = value.parse()?;
+                    width_explicit = true;
+                }
+                "--depth" => {
+                    config.depth = value.parse()?;
+                    depth_explicit = true;
+                }
+                "--window" => {
+                    config.window = value.parse()?;
+                    window_explicit = true;
+                }
                 "--slow-every" => config.slow_every = value.parse()?,
                 "--delay-micros" => config.delay_micros = value.parse()?,
                 "--heap-file" => {
@@ -100,6 +124,36 @@ impl Config {
             "unknown workload {}",
             config.case
         );
+        // A prepared Executor needs only one registered resource for its default
+        // hot path. Other workloads keep the established width of 8192.
+        if config.case == "executor-prepare" && !width_explicit {
+            config.width = NonZeroUsize::MIN;
+        }
+        let bounded_defaults = match config.case.as_str() {
+            "source-fingerprint" => Some((100, 64, 1, 1024 * 1024)),
+            "source-fingerprint-deep-reject" => Some((1000, 1, 65_536, 1024)),
+            "source-fingerprint-wide-reject" | "source-fingerprint-shared-reject" => {
+                Some((1000, 65_536, 1, 1024))
+            }
+            "plan-compile" => Some((32, 64, 4, 4096)),
+            "plan-compile-reject" => Some((32, 1, 129, 4096)),
+            "memory-consolidate" => Some((16, 64, 8, 4096)),
+            _ => None,
+        };
+        if let Some((work, width, depth, window)) = bounded_defaults {
+            if !work_explicit {
+                config.work = NonZeroUsize::MIN.saturating_add(work - 1);
+            }
+            if !width_explicit {
+                config.width = NonZeroUsize::MIN.saturating_add(width - 1);
+            }
+            if !depth_explicit {
+                config.depth = NonZeroUsize::MIN.saturating_add(depth - 1);
+            }
+            if !window_explicit {
+                config.window = NonZeroUsize::MIN.saturating_add(window - 1);
+            }
+        }
         ensure!(
             config.heap_file.is_none() || matches!(config.mode, Mode::Heap),
             "--heap-file is only accepted in heap mode"

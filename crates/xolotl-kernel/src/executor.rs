@@ -2,14 +2,14 @@
 //!
 //! Both [`ExecutionGraph`] and portable programs lower to the same instructions.
 //! The core owns control flow; this adapter owns allocation, scheduling, I/O,
-//! authority and optional durable barriers. Execution scopes and dynamic invocation
-//! tickets survive restoration with the full checkpoint.
+//! authority and live execution scopes.
 //!
 //! Per node kind:
 //! - `Pure` / `Fail` yield a value / failure immediately.
-//! - `Operation` issues one data-plane call (records a Fact).
+//! - `Operation` issues one data-plane call (optionally records a Fact).
 //! - `Step` splices its produced subgraph at the cursor (run-time `AndThen`).
 //! - `Branch(OrElse)` runs its guarded arm; on failure routes into `recover`.
+//! - `Finally` runs cleanup after success, failure or cooperative cancellation.
 //! - `Join(Both)` runs both arms concurrently (async I/O overlap); `Join(Race)`
 //!   runs both and takes the first to finish, cancelling the loser.
 //! - `Acting` switches block-level identity for its arm.
@@ -17,17 +17,20 @@
 
 use crate::dataplane::DataPlane;
 use crate::execution_ids::ExecutionIds;
-use crate::open::{OpenRequest, open_resource_with_attached};
+use crate::host::{ClockDomainError, HostDeadline, HostRuntime};
+use crate::identity::IdentityRegistry;
+use crate::open::OpenRequest;
 use crate::registry::Registry;
+use crate::runtime_domain::{RuntimeAssemblyError, check_runtime_domains};
 use crate::step::StepModule;
-use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use xolotl_graph::{
     BranchKind, DoNode, EdgeKind, ExecutionGraph, JoinKind, NodeKind, OperationTemplate, StepRef,
-    WaitSpec, compile_do, operation_capability_verb,
+    WaitSpec, compile_do,
 };
-#[cfg(any(feature = "durable", test))]
+#[cfg(test)]
 use xolotl_types::ReplayClass;
 use xolotl_types::{
     DriverOutput, ExecutionId, ExecutionOutput, HandleId, IdentityRef, InvocationId, MethodBitmap,
@@ -37,6 +40,7 @@ use xolotl_types::{
 
 // Host assembly, admission and scheduling are separate from core control flow.
 mod buffers;
+mod cache;
 mod config;
 #[cfg(test)]
 mod identity_tests;
@@ -46,15 +50,15 @@ mod machine;
 mod module_tests;
 #[cfg(test)]
 mod provenance_tests;
+#[cfg(test)]
+pub(crate) mod signal_tests;
 pub use buffers::ExecutionBuffers;
+use cache::{
+    MethodHandle, MethodHandleKey, MethodHandleMap, MethodMetaKey, MethodMetaMap, OpenHandleKey,
+    OpenHandleMap,
+};
 pub use config::{ExecutionConfig, ExecutionLayout};
 pub use image::PreparedProgram;
-#[cfg(feature = "durable")]
-pub mod durable;
-
-type OpenHandleMap = HashMap<(ResourceName, IdentityRef), HandleId>;
-type MethodHandleMap = HashMap<(ResourceName, String, IdentityRef), HandleId>;
-type MethodMetaMap = HashMap<(ResourceName, String), MethodMeta>;
 
 fn machine_error(message: impl Into<String>) -> xolotl_types::Failure {
     xolotl_types::Failure::policy("executor", message)
@@ -73,17 +77,17 @@ pub struct Executor {
     registry: Registry,
     /// Immutable continuation module for this executor.
     steps: StepModule,
-    /// Optional state backend, used to resolve `Wait(Signal)` nodes.
-    /// `None` for executors that never wait on a signal path.
-    state: Option<xolotl_state::Backend>,
     /// Per-invocation stream destinations supplied by the embedding host.
     streams: Option<crate::host::stream::DynStreamRouter>,
+    record_facts: bool,
     /// Optional process table, used to observe cancellation at Operation
-    /// boundaries. `None` for standalone executors (tests) that
-    /// have no process lifecycle to honor.
+    /// boundaries. `None` for standalone executors with a caller supplied
+    /// identity and no process lifecycle to honor.
     processes: Option<crate::process::ProcessTable>,
+    standalone_identity: Option<IdentityRef>,
     execution_ids: ExecutionIds,
-    execution_ids_explicit: bool,
+    reserved_execution: AtomicU64,
+    identities: IdentityRegistry,
     /// Handles explicitly bound by host code. The acting identity is part of
     /// the key because open-time policy is identity-sensitive.
     open_handles: Arc<parking_lot::RwLock<OpenHandleMap>>,
@@ -96,27 +100,70 @@ pub struct Executor {
     method_cache: Arc<parking_lot::RwLock<MethodMetaMap>>,
     /// Whether this executor is running process finalizers.
     finalizer_mode: bool,
-    deadline: Option<tokio::time::Instant>,
+    deadline: Option<HostDeadline>,
+    host_runtime: HostRuntime,
     execution_config: ExecutionConfig,
-    #[cfg(feature = "durable")]
-    checkpoint_store: Option<Arc<dyn durable::CheckpointStore>>,
 }
 
 /// Compiled, cached metadata for one (resource, method): the bit position,
 /// id, replay class, supported output modes, and cost — everything the data
 /// plane needs to dispatch without touching the Registry again.
-#[derive(Clone)]
 struct MethodMeta {
     resource_id: xolotl_types::ResourceId,
+    contract: crate::registry::ResourceContract,
     method_index: u32,
-    method_id: xolotl_types::MethodId,
-    #[cfg(feature = "durable")]
-    replay: ReplayClass,
-    supports: xolotl_types::OutputModeSet,
-    #[cfg(feature = "durable")]
-    cost: xolotl_types::CostModel,
-    #[cfg(feature = "durable")]
-    batchable: bool,
+    method: xolotl_types::Method,
+}
+
+/// A host-supplied handle could not be bound to this executor's named import.
+#[derive(Debug, thiserror::Error)]
+pub enum HandleBindingError {
+    /// The executor's process was removed before binding.
+    #[error("execution process {0} no longer exists")]
+    NoSuchProcess(ProcessId),
+    /// The supplied generational handle has been revoked or released.
+    #[error("handle {0} is not live")]
+    NoSuchHandle(HandleId),
+    /// A live handle belongs to a different process.
+    #[error("handle {0} belongs to another process")]
+    WrongOwner(HandleId),
+    /// The handle resolves to a different resource or concrete path.
+    #[error("handle {0} does not bind the requested concrete resource path")]
+    WrongTarget(HandleId),
+    /// The resolved resource has no method with the requested name.
+    #[error("resource has no method named {0}")]
+    NoSuchMethod(String),
+    /// The handle lacks the frozen method declaration or rights.
+    #[error("handle {0} does not implement the requested method contract")]
+    WrongMethod(HandleId),
+    /// A new binding or method contract would exceed this Executor's quota.
+    #[error("executor {0} capacity exhausted")]
+    Capacity(&'static str),
+    /// The target name did not resolve to a resource.
+    #[error(transparent)]
+    Resolve(#[from] crate::registry::ResolveError),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum OpenForExecutorError {
+    #[error(transparent)]
+    Open(#[from] crate::open::OpenError),
+    #[error(transparent)]
+    Cache(#[from] CacheQuota),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("executor {0} budget exhausted")]
+struct CacheQuota(&'static str);
+
+impl From<CacheQuota> for xolotl_types::Failure {
+    fn from(quota: CacheQuota) -> Self {
+        cache_budget(quota.0)
+    }
+}
+
+fn cache_budget(dim: &'static str) -> xolotl_types::Failure {
+    xolotl_types::Failure::BudgetExhausted { dim: dim.into() }
 }
 
 /// Identity and provenance used at the operation boundary.
@@ -144,27 +191,111 @@ impl Env {
 }
 
 impl Executor {
-    /// Create a standalone executor with an explicit caller and host adapters.
-    /// Attach a process table with `with_processes` to enforce lifecycle cancellation.
-    pub fn new(process: ProcessId, data_plane: DataPlane, registry: Registry) -> Self {
+    fn check_cache_path(&self, name: &ResourceName) -> Result<(), CacheQuota> {
+        if name
+            .path()
+            .canonical_len()
+            .is_some_and(|bytes| bytes <= self.execution_config.max_cache_path_bytes)
+        {
+            Ok(())
+        } else {
+            Err(CacheQuota("executor.cache_path_bytes"))
+        }
+    }
+
+    fn check_cache_method(&self, method: &str) -> Result<(), CacheQuota> {
+        if method.len() <= self.execution_config.max_cache_method_name_bytes {
+            Ok(())
+        } else {
+            Err(CacheQuota("executor.cache_method_name_bytes"))
+        }
+    }
+
+    /// Create a standalone executor with an explicit process and acting identity.
+    /// The trusted host owns this process's lifecycle and cancellation.
+    pub fn new(
+        process: ProcessId,
+        identity: IdentityRef,
+        data_plane: DataPlane,
+        registry: Registry,
+    ) -> Result<Self, RuntimeAssemblyError> {
+        check_runtime_domains(&[
+            data_plane.handles.runtime_domain(),
+            registry.runtime_domain(),
+        ])?;
+        if data_plane.handles.runtime_domain().is_some() {
+            return Err(RuntimeAssemblyError::PartiallyBound);
+        }
+        Ok(Self::assemble(
+            process,
+            Some(identity),
+            data_plane.without_processes(),
+            registry,
+        ))
+    }
+
+    /// Bind an executor to the identity and lifecycle in a Kernel-owned process
+    /// table. Use the associated handle table, registry, and host clock; a
+    /// missing process fails closed instead of assuming a root identity.
+    pub fn from_process_table(
+        process: ProcessId,
+        processes: crate::process::ProcessTable,
+        data_plane: DataPlane,
+        registry: Registry,
+    ) -> Result<Self, RuntimeAssemblyError> {
+        let data_plane = data_plane.with_processes(processes.clone())?;
+        check_runtime_domains(&[processes.runtime_domain(), registry.runtime_domain()])?;
+        Ok(Self::assemble_process_bound(
+            process, processes, data_plane, registry,
+        ))
+    }
+
+    pub(crate) fn from_kernel(process: ProcessId, kernel: &crate::Kernel) -> Self {
+        Self::assemble_process_bound(
+            process,
+            kernel.processes().clone(),
+            kernel.data_plane(),
+            kernel.registry().clone(),
+        )
+    }
+
+    fn assemble_process_bound(
+        process: ProcessId,
+        processes: crate::process::ProcessTable,
+        data_plane: DataPlane,
+        registry: Registry,
+    ) -> Self {
+        let mut executor = Self::assemble(process, None, data_plane, registry);
+        executor.processes = Some(processes);
+        executor
+    }
+
+    fn assemble(
+        process: ProcessId,
+        standalone_identity: Option<IdentityRef>,
+        data_plane: DataPlane,
+        registry: Registry,
+    ) -> Self {
+        let host_runtime = data_plane.host_runtime().clone();
         Self {
             process,
             execution_ids: data_plane.facts.execution_ids(),
-            execution_ids_explicit: false,
+            reserved_execution: AtomicU64::new(0),
+            identities: IdentityRegistry::in_memory(),
             data_plane,
             registry,
             steps: StepModule::default(),
-            state: None,
             streams: None,
+            record_facts: false,
             processes: None,
-            open_handles: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            method_handles: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            method_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            standalone_identity,
+            open_handles: Arc::new(parking_lot::RwLock::new(OpenHandleMap::default())),
+            method_handles: Arc::new(parking_lot::RwLock::new(MethodHandleMap::default())),
+            method_cache: Arc::new(parking_lot::RwLock::new(MethodMetaMap::default())),
             finalizer_mode: false,
             deadline: None,
+            host_runtime,
             execution_config: ExecutionConfig::default(),
-            #[cfg(feature = "durable")]
-            checkpoint_store: None,
         }
     }
 
@@ -175,35 +306,56 @@ impl Executor {
         self
     }
 
-    /// Attach a state backend so `Wait(Signal)` nodes can resolve.
-    pub fn with_state(mut self, state: xolotl_state::Backend) -> Self {
-        self.state = Some(state);
-        self
-    }
-
     /// Open independent output ports for streamed operations in this executor.
     pub fn with_stream_router(mut self, streams: crate::host::stream::DynStreamRouter) -> Self {
         self.streams = Some(streams);
         self
     }
 
-    /// Select a retained identity namespace independently of host storage.
-    /// This explicit choice takes precedence over `with_checkpoint_store`.
-    pub fn with_execution_ids(mut self, ids: ExecutionIds) -> Self {
-        self.execution_ids = ids;
-        self.execution_ids_explicit = true;
+    /// Retain call observations for this executor. Disabled by default;
+    /// authorization, accounting and unknown-effect tracking are independent.
+    pub fn with_fact_recording(mut self, record: bool) -> Self {
+        self.record_facts = record;
         self
     }
 
-    /// Attach the process table so the executor honors cancellation at each
-    /// Operation boundary.
-    pub fn with_processes(mut self, processes: crate::process::ProcessTable) -> Self {
-        self.data_plane = self.data_plane.with_processes(processes.clone());
-        self.processes = Some(processes);
+    /// Revalidate request ownership on every resource call, including inherited children.
+    pub fn with_request_authorizer(
+        mut self,
+        authorizer: Arc<dyn crate::RequestAuthorizer>,
+    ) -> Self {
+        if let Some(processes) = &self.processes {
+            processes.set_request_authorizer(self.process, authorizer.clone());
+        }
+        self.data_plane = self.data_plane.with_request_authorizer(authorizer);
+        self
+    }
+
+    /// Route asynchronous child Operations to this request's host service.
+    /// The service owns admission, live authority checks and retained results.
+    pub fn with_async_process_host(
+        mut self,
+        host: Arc<dyn crate::host::async_process::AsyncProcessHost>,
+    ) -> Self {
+        self.data_plane = self.data_plane.with_async_process_host(host);
+        self
+    }
+
+    /// Select a retained identity namespace independently of host storage.
+    pub fn with_execution_ids(mut self, ids: ExecutionIds) -> Self {
+        self.execution_ids = ids;
+        self
+    }
+
+    /// Use the same identity namespace as other entry points in this host.
+    pub fn with_identity_registry(mut self, identities: IdentityRegistry) -> Self {
+        self.identities = identities;
         self
     }
 
     /// Bound interpreter storage and cooperative work before starting a program.
+    /// Set cache quotas before binding handles or preparing operations; reducing
+    /// a quota later does not evict already accepted frozen entries.
     pub fn with_execution_config(mut self, config: ExecutionConfig) -> Self {
         self.execution_config = config;
         self
@@ -211,37 +363,90 @@ impl Executor {
 
     /// Stop this evaluation at an absolute host deadline, preserving live provenance.
     /// The request owner remains responsible for asynchronous process finalization.
-    pub fn with_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+    /// Repeated calls may shorten that deadline but cannot extend or remove it.
+    pub fn with_deadline(mut self, deadline: HostDeadline) -> Result<Self, ClockDomainError> {
+        self.host_runtime.validate_deadline(deadline)?;
+        let deadline = match self.deadline {
+            Some(saved) => saved.earliest(deadline)?,
+            None => deadline,
+        };
         self.deadline = Some(deadline);
-        self
+        self.data_plane = self.data_plane.with_deadline(deadline)?;
+        Ok(self)
     }
 
     fn deadline_elapsed(&self) -> bool {
         self.deadline
-            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            .is_some_and(|deadline| deadline.elapsed_at(self.host_runtime.now()).unwrap_or(true))
     }
 
     fn failed(failure: xolotl_types::Failure, taint: TaintSet) -> ExecutionOutput {
         ExecutionOutput::new(Outcome::Fail(failure), taint)
     }
 
-    /// Enable durable programs through an exclusive, write-through checkpoint store.
-    /// Its identity source also serves volatile evaluations unless explicitly overridden.
-    /// Configure before running, preserving the source of any retained history.
-    #[cfg(feature = "durable")]
-    pub fn with_checkpoint_store(mut self, store: Arc<dyn durable::CheckpointStore>) -> Self {
-        if !self.execution_ids_explicit {
-            self.execution_ids = ExecutionIds::new(store.clone());
+    /// A cached range is local and cheap. Only a refill can call a persistent
+    /// source, so schedule that part through the host's bounded blocking port.
+    async fn allocate_execution_async(&self) -> Result<ExecutionId, xolotl_types::Failure> {
+        if let Some(execution) =
+            ExecutionId::new(self.reserved_execution.swap(0, Ordering::Relaxed))
+        {
+            return Ok(execution);
         }
-        self.checkpoint_store = Some(store);
-        self
+        let execution = if let Some(execution) = self.execution_ids.try_allocate_cached() {
+            execution
+        } else {
+            let ids = self.execution_ids.clone();
+            let worker = self
+                .host_runtime
+                .dispatch_blocking(move || ids.allocate())
+                .map_err(|error| machine_error(format!("execution ID scheduling: {error}")))?;
+            worker
+                .await
+                .map_err(|error| machine_error(format!("execution ID worker: {error}")))?
+                .map_err(|error| machine_error(error.to_string()))?
+        };
+        self.initialize_execution(execution)
     }
 
-    fn allocate_execution(&self) -> Result<ExecutionId, xolotl_types::Failure> {
-        let execution = self
-            .execution_ids
-            .allocate()
-            .map_err(|error| machine_error(error.to_string()))?;
+    /// Reserve this request's live lifecycle before binding an external service.
+    /// The first evaluation on this Executor consumes the same execution identity;
+    /// subsequent evaluations allocate distinct identities. No call is dispatched.
+    pub async fn reserve_lifecycle(&mut self) -> Result<ExecutionId, xolotl_types::Failure> {
+        if let Some(execution) = ExecutionId::new(*self.reserved_execution.get_mut()) {
+            return Ok(execution);
+        }
+        let Some(processes) = &self.processes else {
+            return Err(machine_error(
+                "lifecycle reservation requires a live process owner",
+            ));
+        };
+        if processes.lifecycle_execution(self.process).is_some() || self.is_cancelled() {
+            return Err(machine_error(
+                "request lifecycle is already initialized or unavailable",
+            ));
+        }
+        let execution = self.allocate_execution_async().await?;
+        if self.is_cancelled() {
+            return Err(xolotl_types::Failure::Cancelled);
+        }
+        if self
+            .processes
+            .as_ref()
+            .and_then(|processes| processes.lifecycle_execution(self.process))
+            != Some(execution)
+        {
+            return Err(machine_error(
+                "request lifecycle was initialized by another executor",
+            ));
+        }
+        *self.reserved_execution.get_mut() = execution.get();
+        Ok(execution)
+    }
+
+    fn initialize_execution(
+        &self,
+        execution: ExecutionId,
+    ) -> Result<ExecutionId, xolotl_types::Failure> {
         if let Some(processes) = &self.processes {
             processes
                 .initialize_lifecycle(self.process, execution)
@@ -270,31 +475,124 @@ impl Executor {
         }
     }
 
-    /// Pre-register a resolved handle for a resource name.
-    pub fn bind_handle(&self, name: ResourceName, handle: xolotl_types::HandleId) {
-        if let Some(acting) = self.default_acting() {
-            self.open_handles.write().insert((name, acting), handle);
+    /// Bind a live, process-owned handle to its concrete resource name.
+    ///
+    /// The handle's open-time acting identity selects the scope. In particular,
+    /// a handle opened for an `Acting` scope can be bound before entering it.
+    /// Binding does not authorize entering that scope or preserve a revoked handle.
+    pub fn bind_handle(
+        &self,
+        name: ResourceName,
+        handle: HandleId,
+    ) -> Result<(), HandleBindingError> {
+        let acting = self.binding_acting(&name, None, handle)?;
+        let mut bindings = self.open_handles.write();
+        if let Some(existing) = bindings.get_mut(&OpenHandleKey {
+            name: &name,
+            acting,
+        }) {
+            *existing = handle;
+            return Ok(());
         }
+        if bindings.len() >= self.execution_config.max_resource_bindings {
+            return Err(HandleBindingError::Capacity("resource bindings"));
+        }
+        self.check_cache_path(&name)
+            .map_err(|quota| HandleBindingError::Capacity(quota.0))?;
+        bindings.insert((ResourceName::new(name.path().clone()), acting), handle);
+        Ok(())
     }
 
-    /// Pre-register a resolved handle for one resource method.
+    /// Bind a live handle to one method under its open-time acting identity.
     pub fn bind_method_handle(
         &self,
         name: ResourceName,
         method: impl Into<String>,
-        handle: xolotl_types::HandleId,
-    ) {
-        if let Some(acting) = self.default_acting() {
-            self.method_handles
-                .write()
-                .insert((name, method.into(), acting), handle);
+        handle: HandleId,
+    ) -> Result<(), HandleBindingError> {
+        let method = method.into();
+        let acting = self.binding_acting(&name, Some(&method), handle)?;
+        let mut bindings = self.method_handles.write();
+        if let Some(existing) = bindings.get_mut(&MethodHandleKey {
+            name: &name,
+            method: &method,
+            acting,
+        }) {
+            *existing = MethodHandle::Bound(handle);
+            return Ok(());
         }
+        if bindings.len() >= self.execution_config.max_method_bindings {
+            return Err(HandleBindingError::Capacity("method bindings"));
+        }
+        self.check_cache_path(&name)
+            .and_then(|()| self.check_cache_method(&method))
+            .map_err(|quota| HandleBindingError::Capacity(quota.0))?;
+        let method = if method.capacity() <= self.execution_config.max_cache_method_name_bytes {
+            method
+        } else {
+            method.as_str().to_owned()
+        };
+        bindings.insert(
+            (ResourceName::new(name.path().clone()), method, acting),
+            MethodHandle::Bound(handle),
+        );
+        Ok(())
+    }
+
+    fn binding_acting(
+        &self,
+        name: &ResourceName,
+        method: Option<&str>,
+        handle: HandleId,
+    ) -> Result<IdentityRef, HandleBindingError> {
+        if self
+            .processes
+            .as_ref()
+            .is_some_and(|processes| processes.identity(self.process).is_none())
+        {
+            return Err(HandleBindingError::NoSuchProcess(self.process));
+        }
+        let resource = self.registry.resolve_resource(name)?;
+        let meta = method
+            .map(|method| {
+                self.resolve_meta(name, method)
+                    .map_err(|quota| HandleBindingError::Capacity(quota.0))?
+                    .ok_or_else(|| HandleBindingError::NoSuchMethod(method.to_owned()))
+            })
+            .transpose()?;
+        if meta
+            .as_ref()
+            .is_some_and(|meta| meta.resource_id != resource)
+        {
+            return Err(HandleBindingError::WrongTarget(handle));
+        }
+        let handles = self.data_plane.handles.read();
+        let live = handles
+            .get(handle)
+            .ok_or(HandleBindingError::NoSuchHandle(handle))?;
+        if !live.check_owner(self.process) {
+            return Err(HandleBindingError::WrongOwner(handle));
+        }
+        if live.resource != resource || live.bound_path.as_ref() != Some(name.path()) {
+            return Err(HandleBindingError::WrongTarget(handle));
+        }
+        if let Some(meta) = meta
+            && (live.open_verb != meta.method.authority.verb()
+                || !live.allows_method(meta.method_index)
+                || !live.driver_plan.entry(meta.method.id).is_some_and(|entry| {
+                    entry.contract.method_index == meta.method_index
+                        && entry.declaration() == Some(&meta.method)
+                }))
+        {
+            return Err(HandleBindingError::WrongMethod(handle));
+        }
+        Ok(live.acting)
     }
 
     fn default_acting(&self) -> Option<IdentityRef> {
         match &self.processes {
             Some(processes) => processes.identity(self.process),
-            None => Some(IdentityRef::ROOT),
+            None => self.standalone_identity,
         }
     }
 
@@ -325,8 +623,6 @@ impl Executor {
             TaintedValue::pristine(Value::null()),
             &mut ExecutionBuffers::default(),
             Some(execution),
-            #[cfg(feature = "durable")]
-            None,
         )
         .await
     }
@@ -354,8 +650,6 @@ impl Executor {
             std::borrow::Cow::Owned(program),
             TaintedValue::pristine(Value::null()),
             buffers,
-            None,
-            #[cfg(feature = "durable")]
             None,
         )
         .await
@@ -402,87 +696,126 @@ impl Executor {
         .await
     }
 
-    /// Await a deadline or a signal under the execution's cancellation scope.
+    /// Await a deadline under the execution's cancellation scope. Signal waits
+    /// are lowered to ordinary `subscribe` operations during preparation.
     async fn run_wait(&self, spec: &WaitSpec) -> xolotl_types::DriverOutput {
         match spec {
             WaitSpec::Deadline(at_millis) => {
                 loop {
-                    let now = now_millis();
+                    let now = self.host_runtime.now_millis();
                     if *at_millis <= now {
                         break;
                     }
-                    // Tokio's wheel and platform Instant have finite horizons.
+                    // Host timers may have finite horizons.
                     // Re-arm distant deadlines without narrowing the wall-clock domain.
                     let dur =
                         std::time::Duration::from_millis(at_millis.abs_diff(now).min(86_400_000));
-                    tokio::time::sleep(dur).await;
+                    if let Some(deadline) = self.host_runtime.deadline_after(dur) {
+                        if let Err(error) = self.host_runtime.sleep_until(deadline).await {
+                            return Outcome::Fail(error.into()).into();
+                        }
+                    } else {
+                        return Outcome::Fail(machine_error(
+                            "host clock cannot represent wait deadline",
+                        ))
+                        .into();
+                    }
                 }
                 Outcome::Done(Value::null()).into()
             }
-            WaitSpec::Signal(path) => match &self.state {
-                Some(state) => self.wait_signal(state, path).await,
-                None => Outcome::Fail(xolotl_types::Failure::policy(
-                    "executor",
-                    "Wait(Signal) needs a state backend (none bound)",
-                ))
-                .into(),
-            },
+            WaitSpec::Signal(_) => Outcome::Fail(machine_error(
+                "signal wait was not lowered to a subscribe operation",
+            ))
+            .into(),
         }
     }
-    /// Subscribe before reading the current value so a concurrent write cannot
-    /// fall between the snapshot and the live observation.
-    async fn wait_signal(
+
+    /// Resolve a resource method and open its process-owned handle without invoking
+    /// the driver. Hosts can preflight all imports before a program has effects.
+    /// This caches the same method metadata and handle used during execution;
+    /// input-dependent policies, revocation, quotas and deadlines still apply per call.
+    pub fn prepare_operation(
         &self,
-        state: &xolotl_state::Backend,
-        path: &xolotl_types::Path,
-    ) -> xolotl_types::DriverOutput {
-        use xolotl_state::StateEvent;
-        let mut rx = match state.subscribe(path).await {
-            Ok(rx) => rx,
-            Err(e) => {
-                return DriverOutput::new(Outcome::Fail(xolotl_types::Failure::policy(
-                    "executor",
-                    format!("wait subscribe failed: {e}"),
-                )))
-                .with_taint(e.taint);
+        template: &OperationTemplate,
+    ) -> Result<(), xolotl_types::Failure> {
+        if self.is_cancelled() {
+            return Err(xolotl_types::Failure::Cancelled);
+        }
+        let acting = self.default_acting().ok_or_else(|| {
+            xolotl_types::Failure::policy("open", "request process no longer exists")
+        })?;
+        self.prepare_operation_for(acting, template)
+    }
+
+    /// Resolve and pre-open an operation for a specific acting identity.
+    ///
+    /// This verifies the resource method and open-time policy. An `Acting` scope
+    /// still checks its `act-as` grant against the value entering that scope;
+    /// preflight does not authorize entry or skip per-call policy checks.
+    pub fn prepare_operation_for(
+        &self,
+        acting: IdentityRef,
+        template: &OperationTemplate,
+    ) -> Result<(), xolotl_types::Failure> {
+        if self.is_cancelled() {
+            return Err(xolotl_types::Failure::Cancelled);
+        }
+        if self.deadline_elapsed() {
+            return Err(xolotl_types::Failure::Timeout);
+        }
+        if self.default_acting().is_none() {
+            return Err(xolotl_types::Failure::policy(
+                "open",
+                "request process no longer exists",
+            ));
+        }
+        self.prepare_operation_as(template, acting).map(|_| ())
+    }
+
+    fn prepare_operation_as(
+        &self,
+        template: &OperationTemplate,
+        acting: IdentityRef,
+    ) -> Result<(HandleId, xolotl_types::MethodId), xolotl_types::Failure> {
+        let meta = self
+            .resolve_meta(&template.target, &template.method)?
+            .ok_or_else(|| xolotl_types::Failure::NoHandler {
+                path: template.target.path().clone(),
+            })?;
+        if !template.output.is_supported_by(meta.method.supports) {
+            return Err(xolotl_types::Failure::InvalidInput {
+                reason: format!(
+                    "method {} does not support output mode {:?}",
+                    template.method, template.output
+                ),
+            });
+        }
+        let flags = if template.output == xolotl_types::OutputMode::AsyncProcess {
+            if !self.data_plane.has_async_process_host() {
+                return Err(xolotl_types::Failure::policy(
+                    "async-process",
+                    "AsyncProcess requires a host owner",
+                ));
             }
+            RightFlags::SPAWN_WITH
+        } else {
+            RightFlags::empty()
         };
-        match state.read_tainted(path).await {
-            Ok(Some(value)) => {
-                return xolotl_types::DriverOutput::new(Outcome::Done(value.value))
-                    .with_taint(value.taint);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return DriverOutput::new(Outcome::Fail(machine_error(format!(
-                    "wait read failed: {error}"
-                ))))
-                .with_taint(error.taint);
-            }
-        }
-        loop {
-            match rx.recv().await {
-                Ok(StateEvent::Set {
-                    path: p,
-                    value,
-                    taint,
-                }) if &p == path => {
-                    return xolotl_types::DriverOutput::new(Outcome::Done(value)).with_taint(taint);
-                }
-                Ok(StateEvent::Append {
-                    path: p,
-                    item,
-                    taint,
-                }) if &p == path => {
-                    return xolotl_types::DriverOutput::new(Outcome::Done(item)).with_taint(taint);
-                }
-                Ok(_) => continue,
-                Err(error) => {
-                    return Outcome::Fail(machine_error(format!("wait signal failed: {error}")))
-                        .into();
-                }
-            }
-        }
+        let handle = self
+            .handle_for_or_open(&template.target, &template.method, acting, &meta, flags)
+            .map_err(|error| match error {
+                OpenForExecutorError::Cache(quota) => quota.into(),
+                OpenForExecutorError::Open(error) => xolotl_types::Failure::policy(
+                    "open",
+                    format!(
+                        "open {} method {} failed for {}: {error}",
+                        meta.method.authority.verb(),
+                        template.method,
+                        template.target.path()
+                    ),
+                ),
+            })?;
+        Ok((handle, meta.method.id))
     }
 
     /// Issue one Operation through the data plane, labelling it with its
@@ -496,76 +829,53 @@ impl Executor {
         env: &Env,
         id: OperationId,
         record: bool,
-    ) -> DriverOutput {
-        let effective_input = tmpl.literal_input.clone().unwrap_or(input);
-
-        let op_taint = env.taint.clone();
-
-        // Resolve compiled method metadata once and cache it: the hot path
-        // must not re-query the Registry per Operation. A cache miss resolves via
-        // the Registry and memoizes; a hit skips it entirely.
-        let Some(meta) = self.resolve_meta(&tmpl.target, &tmpl.method) else {
-            return DriverOutput::new(Outcome::Fail(xolotl_types::Failure::NoHandler {
-                path: tmpl.target.path().clone(),
-            }))
-            .with_taint(op_taint);
-        };
-        let MethodMeta {
-            resource_id,
-            method_index,
-            method_id,
-            supports,
-            ..
-        } = meta;
-
-        // The requested OutputMode must be in the method's supported set.
-        // Reject before opening a handle so invalid requests do not mutate the
-        // handle table.
-        if !tmpl.output.is_supported_by(supports) {
-            return DriverOutput::new(Outcome::Fail(xolotl_types::Failure::InvalidInput {
-                reason: format!(
-                    "method {} does not support output mode {:?}",
-                    tmpl.method, tmpl.output
-                ),
-            }))
-            .with_taint(op_taint);
-        }
-
-        let handle = match self.handle_for_or_open(
-            &tmpl.target,
-            &tmpl.method,
-            env.acting,
-            resource_id,
-            method_index,
-        ) {
-            Ok(handle) => handle,
-            Err(error) => {
-                return DriverOutput::new(Outcome::Fail(xolotl_types::Failure::policy(
-                    "open",
-                    format!(
-                        "open {} method {} failed for {}: {error}",
-                        operation_capability_verb(&tmpl.method),
-                        tmpl.method,
-                        tmpl.target.path()
-                    ),
-                )))
-                .with_taint(op_taint);
+        witness: Option<&std::sync::atomic::AtomicBool>,
+    ) -> crate::invocation::InvocationResult {
+        let (handle, method_id) = match self.prepare_operation_as(tmpl, env.acting) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                return crate::invocation::InvocationResult::new(
+                    DriverOutput::new(Outcome::Fail(failure)).with_taint(env.taint.clone()),
+                );
             }
         };
+        self.dispatch_operation(
+            self.operation(tmpl, input, env, id, (handle, method_id)),
+            record,
+            witness,
+        )
+        .await
+    }
 
-        let op = Operation {
+    fn operation(
+        &self,
+        tmpl: &OperationTemplate,
+        input: Value,
+        env: &Env,
+        id: OperationId,
+        prepared: (HandleId, xolotl_types::MethodId),
+    ) -> Operation {
+        Operation {
             id,
             process: self.process,
             acting: env.acting,
-            handle,
-            method: method_id,
-            input: effective_input,
-            taint: op_taint.clone(),
+            handle: prepared.0,
+            method: prepared.1,
+            input: tmpl.literal_input.clone().unwrap_or(input),
+            taint: env.taint.clone(),
             output: tmpl.output,
-        };
+        }
+    }
 
+    async fn dispatch_operation(
+        &self,
+        op: Operation,
+        record: bool,
+        witness: Option<&std::sync::atomic::AtomicBool>,
+    ) -> crate::invocation::InvocationResult {
         let options = crate::InvocationOptions {
-            now_millis: now_millis(),
+            caller_identity: self.default_acting(),
+            now_millis: self.host_runtime.now_millis(),
             record,
         };
         if matches!(op.output, xolotl_types::OutputMode::Stream) {
@@ -577,27 +887,37 @@ impl Executor {
             {
                 Ok(Some(sink)) => {
                     self.data_plane
-                        .execute_with_stream(&op, options, sink)
+                        .execute_stream_with_dispatch_witness(&op, options, sink, witness)
                         .await
                 }
-                Ok(None) => self.data_plane.execute(&op, options).await,
-                Err(error) => DriverOutput::new(Outcome::Fail(machine_error(error.to_string())))
-                    .with_taint(op_taint),
+                Ok(None) => {
+                    self.data_plane
+                        .execute_with_dispatch_witness(&op, options, witness)
+                        .await
+                }
+                Err(error) => crate::invocation::InvocationResult::new(
+                    DriverOutput::new(Outcome::Fail(machine_error(error.to_string())))
+                        .with_taint(op.taint.clone()),
+                ),
             }
         } else {
-            self.data_plane.execute(&op, options).await
+            self.data_plane
+                .execute_with_dispatch_witness(&op, options, witness)
+                .await
         }
     }
 
     /// Authorize an `Acting(identity)` switch. The process must hold a
     /// grant whose selector is `act-as://<identity>` (matched structurally) and
-    /// whose rights carry the `DELEGATE` flag. Returns false (deny) otherwise.
+    /// whose rights carry the `DELEGATE` flag. Selector and inherited constraints
+    /// evaluate against the value entering the scope and the current time.
+    /// Returns false (deny) otherwise.
     ///
     /// The omnipotent root grant (`*://**` + all flags) covers every identity,
     /// so kernel-internal Acting blocks pass; attenuated children only pass for
     /// identities they were explicitly delegated.
-    fn authorize_act_as(&self, identity: &xolotl_types::Path) -> bool {
-        let now = now_millis();
+    fn authorize_act_as(&self, identity: &xolotl_types::Path, input: &Value) -> bool {
+        let now = self.host_runtime.now_millis();
         let mut grants = self.registry.grants_of(self.process);
         if let Some(processes) = &self.processes {
             grants.extend(processes.attached_grants(self.process));
@@ -605,7 +925,10 @@ impl Executor {
         grants.into_iter().any(|g| {
             !g.expires.is_expired(now)
                 && g.rights.flags.contains(xolotl_types::RightFlags::DELEGATE)
-                && g.selector.matches("act-as", identity)
+                && g.selector
+                    .pattern
+                    .covers_with("act-as", identity, input, now)
+                && g.constraints.eval(input, now)
         })
     }
 
@@ -614,44 +937,88 @@ impl Executor {
         name: &ResourceName,
         method: &str,
         acting: IdentityRef,
-        resource_id: xolotl_types::ResourceId,
-        method_index: u32,
-    ) -> Option<xolotl_types::HandleId> {
-        let key = (name.clone(), method.to_string(), acting);
-        if let Some(handle) = self.method_handles.read().get(&key).copied()
-            && self.cached_handle_allows(handle, resource_id, method_index)
-        {
-            return Some(handle);
-        }
-        let handle = self
+        meta: &MethodMeta,
+        flags: RightFlags,
+    ) -> Result<Option<xolotl_types::HandleId>, crate::open::OpenError> {
+        let key = MethodHandleKey {
+            name,
+            method,
+            acting,
+        };
+        let method_binding = self.method_handles.read().get(&key).copied();
+        let resource_binding = self
             .open_handles
             .read()
-            .get(&(name.clone(), acting))
-            .copied()?;
-        if self.cached_handle_allows(handle, resource_id, method_index) {
-            Some(handle)
-        } else {
-            None
+            .get(&OpenHandleKey { name, acting })
+            .copied();
+        self.handle_for_candidates(method_binding, resource_binding, name, acting, meta, flags)
+    }
+
+    fn handle_for_candidates(
+        &self,
+        method_binding: Option<MethodHandle>,
+        resource_binding: Option<HandleId>,
+        name: &ResourceName,
+        acting: IdentityRef,
+        meta: &MethodMeta,
+        flags: RightFlags,
+    ) -> Result<Option<xolotl_types::HandleId>, crate::open::OpenError> {
+        if let Some(MethodHandle::Bound(handle)) = method_binding
+            && self.cached_handle_allows(handle, name, acting, meta, flags, false)?
+        {
+            return Ok(Some(handle));
         }
+        if let Some(handle) = resource_binding
+            && self.cached_handle_allows(handle, name, acting, meta, flags, false)?
+        {
+            return Ok(Some(handle));
+        }
+        if let Some(MethodHandle::Opened(handle)) = method_binding
+            && self.cached_handle_allows(handle, name, acting, meta, flags, true)?
+        {
+            return Ok(Some(handle));
+        }
+        Ok(None)
     }
 
     fn cached_handle_allows(
         &self,
         handle: xolotl_types::HandleId,
-        resource_id: xolotl_types::ResourceId,
-        method_index: u32,
-    ) -> bool {
-        self.data_plane
-            .handles
-            .read()
-            .get(handle)
-            .map(|handle| {
-                handle.check_owner(self.process)
-                    && handle.resource == resource_id
-                    && handle.is_active()
-                    && handle.allows_method(method_index)
+        name: &ResourceName,
+        acting: IdentityRef,
+        meta: &MethodMeta,
+        flags: RightFlags,
+        may_upgrade_flags: bool,
+    ) -> Result<bool, crate::open::OpenError> {
+        let handles = self.data_plane.handles.read();
+        let Some(live) = handles.get(handle) else {
+            // Revocation and generation reuse invalidate a cached slot; current
+            // authority may still admit a fresh open for this operation.
+            return Ok(false);
+        };
+        if live.check_owner(self.process)
+            && live.acting == acting
+            && live.resource == meta.resource_id
+            && live.bound_path.as_ref() == Some(name.path())
+            && live.open_verb == meta.method.authority.verb()
+            && live.allows_method(meta.method_index)
+            && live.driver_plan.entry(meta.method.id).is_some_and(|entry| {
+                entry.contract.method_index == meta.method_index
+                    && entry.declaration() == Some(&meta.method)
             })
-            .unwrap_or(false)
+        {
+            if live.rights.flags.contains(flags) {
+                Ok(true)
+            } else if may_upgrade_flags {
+                Ok(false)
+            } else {
+                Err(crate::open::OpenError::BoundHandleMismatch(handle))
+            }
+        } else {
+            // A live binding has a concrete meaning. Quietly opening another
+            // handle would substitute authority chosen by the embedding host.
+            Err(crate::open::OpenError::BoundHandleMismatch(handle))
+        }
     }
 
     fn handle_for_or_open(
@@ -659,56 +1026,172 @@ impl Executor {
         name: &ResourceName,
         method: &str,
         acting: IdentityRef,
-        resource_id: xolotl_types::ResourceId,
-        method_index: u32,
-    ) -> Result<xolotl_types::HandleId, crate::open::OpenError> {
-        if let Some(handle) = self.handle_for(name, method, acting, resource_id, method_index) {
+        meta: &MethodMeta,
+        flags: RightFlags,
+    ) -> Result<xolotl_types::HandleId, OpenForExecutorError> {
+        if let Some(handle) = self.handle_for(name, method, acting, meta, flags)? {
             return Ok(handle);
         }
-        let attached_grants = self
-            .processes
-            .as_ref()
-            .map(|processes| processes.attached_grants(self.process))
-            .unwrap_or_default();
-        let handle = {
-            let mut handles = self.data_plane.handles.write();
-            open_resource_with_attached(
+        let key = MethodHandleKey {
+            name,
+            method,
+            acting,
+        };
+        {
+            let cached = self.method_handles.read();
+            if !cached.contains_key(&key) {
+                if cached.len() >= self.execution_config.max_method_bindings {
+                    return Err(CacheQuota("executor.method_bindings").into());
+                }
+                self.check_cache_path(name)?;
+                self.check_cache_method(method)?;
+            }
+        }
+        // Automatic opens can re-prepare after control-plane churn. A prepared
+        // plan never skips its install-time dependency check, and each attempt
+        // refreshes process-attached authority and the current admission time.
+        // Bound retries so a host callback that always edits the registry cannot
+        // keep one request in preparation forever.
+        let mut retries = 0;
+        let handle = loop {
+            let attached_grants = self
+                .processes
+                .as_ref()
+                .map(|processes| processes.attached_grants(self.process))
+                .unwrap_or_default();
+            let prepared = crate::open::prepare_open_with_contract(
                 &self.registry,
-                &mut handles,
                 OpenRequest {
                     process: self.process,
-                    resource: resource_id,
-                    verb: operation_capability_verb(method).to_string(),
-                    rights: Rights::new(MethodBitmap::method(method_index), RightFlags::empty()),
+                    resource: meta.resource_id,
+                    verb: meta.method.authority.verb().to_string(),
+                    rights: Rights::new(MethodBitmap::method(meta.method_index), flags),
                     acting,
                     requested_path: Some(name.path().clone()),
-                    now_millis: now_millis(),
+                    now_millis: self.host_runtime.now_millis(),
                 },
                 &attached_grants,
-            )?
+                Some(&meta.contract),
+            );
+            let prepared = match prepared {
+                Err(crate::open::OpenError::RegistryChanged) if retries < 2 => {
+                    retries += 1;
+                    continue;
+                }
+                result => result?,
+            };
+            let installed = {
+                let mut handles = self.data_plane.handles.write();
+                match &self.processes {
+                    Some(processes) => prepared.install_for(&mut handles, processes),
+                    None => prepared.install_locked(&mut handles),
+                }
+            };
+            match installed {
+                Err(crate::open::OpenError::RegistryChanged) if retries < 2 => {
+                    retries += 1;
+                }
+                result => break result?,
+            }
         };
-        self.method_handles
-            .write()
-            .insert((name.clone(), method.to_string(), acting), handle);
-        Ok(handle)
+        // Preparation can run concurrently. Publish only after rechecking
+        // host bindings and another caller's automatic handle. A just-installed
+        // candidate is unpublished and safe to revoke; a published predecessor
+        // may already back an in-flight call or retained authority.
+        let selected = (|| {
+            let mut cached = self.method_handles.write();
+            let resources = self.open_handles.read();
+            let key = MethodHandleKey {
+                name,
+                method,
+                acting,
+            };
+            let method_binding = cached.get(&key).copied();
+            let resource_binding = resources.get(&OpenHandleKey { name, acting }).copied();
+            if let Some(existing) = self.handle_for_candidates(
+                method_binding,
+                resource_binding,
+                name,
+                acting,
+                meta,
+                flags,
+            )? {
+                return Ok(existing);
+            }
+            if !cached.contains_key(&key) {
+                if cached.len() >= self.execution_config.max_method_bindings {
+                    return Err(CacheQuota("executor.method_bindings").into());
+                }
+                self.check_cache_path(name)?;
+                self.check_cache_method(method)?;
+            }
+            if let Some(existing) = cached.get_mut(&key) {
+                *existing = MethodHandle::Opened(handle);
+            } else {
+                cached.insert(
+                    (name.clone(), method.to_string(), acting),
+                    MethodHandle::Opened(handle),
+                );
+            }
+            Ok(handle)
+        })();
+        if !matches!(selected, Ok(existing) if existing == handle) {
+            self.data_plane.handles.revoke(handle);
+        }
+        selected
     }
 
     /// Resolve cached [`MethodMeta`] for a (target, method). A cache miss
     /// walks the Registry once and memoizes; subsequent calls are pure cache
     /// reads, so the per-Operation hot path never re-queries the Registry.
-    /// Returns `None` if the target resource doesn't resolve.
-    fn resolve_meta(&self, target: &ResourceName, method_name: &str) -> Option<MethodMeta> {
-        let key = (target.clone(), method_name.to_string());
-        if let Some(m) = self.method_cache.read().get(&key) {
-            return Some(m.clone());
+    /// Returns `None` if the resource or method does not resolve while the
+    /// cache has room. A full cache rejects an uncached key before resolving
+    /// it: evicting a frozen contract could change its meaning.
+    fn resolve_meta(
+        &self,
+        target: &ResourceName,
+        method_name: &str,
+    ) -> Result<Option<Arc<MethodMeta>>, CacheQuota> {
+        let key = MethodMetaKey {
+            name: target,
+            method: method_name,
+        };
+        {
+            let cache = self.method_cache.read();
+            if let Some(meta) = cache.get(&key) {
+                return Ok(Some(Arc::clone(meta)));
+            }
+            // Avoid resolving and cloning a new method contract when this
+            // cache cannot admit another key. Publication still rechecks.
+            if cache.len() >= self.execution_config.max_method_metadata {
+                return Err(CacheQuota("executor.method_metadata"));
+            }
         }
+        self.check_cache_path(target)?;
+        self.check_cache_method(method_name)?;
         let resource_id = match self.registry.resolve_resource(target) {
             Ok(resource_id) => resource_id,
-            Err(crate::registry::ResolveError::NoSuchResource(_)) => return None,
+            Err(crate::registry::ResolveError::NoSuchResource(_)) => return Ok(None),
         };
-        let meta = self.compile_meta(resource_id, method_name)?;
-        self.method_cache.write().insert(key, meta.clone());
-        Some(meta)
+        let Some(compiled) = self.compile_meta(resource_id, method_name) else {
+            return Ok(None);
+        };
+        let mut cache = self.method_cache.write();
+        // Concurrent first users may compile while the Registry is changing.
+        // The first cached contract owns this Executor's frozen binding.
+        if let Some(meta) = cache.get(&key) {
+            return Ok(Some(Arc::clone(meta)));
+        }
+        if cache.len() >= self.execution_config.max_method_metadata {
+            return Err(CacheQuota("executor.method_metadata"));
+        }
+        if compiled.contract.interface_count() > self.execution_config.max_cache_interfaces {
+            return Err(CacheQuota("executor.cache_interfaces"));
+        }
+        let meta = cache
+            .entry((target.clone(), method_name.to_owned()))
+            .or_insert_with(|| Arc::new(compiled));
+        Ok(Some(Arc::clone(meta)))
     }
 
     /// Compile (method_index, method_id, replay class, supported output modes,
@@ -719,53 +1202,16 @@ impl Executor {
         resource_id: xolotl_types::ResourceId,
         method_name: &str,
     ) -> Option<MethodMeta> {
-        if let Some(resource) = self.registry.resource(resource_id) {
-            for iface_id in &resource.interfaces.interfaces {
-                if let Some(iface) = self.registry.interface(*iface_id)
-                    && let Some((idx, method)) = iface.method_index(method_name)
-                {
-                    return Some(MethodMeta {
-                        resource_id,
-                        method_index: idx,
-                        method_id: method.id,
-                        #[cfg(feature = "durable")]
-                        replay: method.replay,
-                        supports: method.supports,
-                        #[cfg(feature = "durable")]
-                        cost: method.cost,
-                        #[cfg(feature = "durable")]
-                        batchable: method.batchable,
-                    });
-                }
-            }
-        }
-        None
-    }
-}
-
-/// Intern an identity path to a stable [`IdentityRef`] by hashing. Public
-/// so Gateways map a request identity to the same ref the executor uses for
-/// `Acting` blocks.
-pub fn intern_identity(path: &xolotl_types::Path) -> IdentityRef {
-    let h = blake3::hash(path.to_string().as_bytes());
-    // blake3 digests are 32 bytes, so the first 8 always exist — copy them into
-    // a fixed-size array to derive the ref without a fallible slice conversion.
-    let mut head = [0u8; 8];
-    head.copy_from_slice(&h.as_bytes()[0..8]);
-    let n = u64::from_le_bytes(head);
-    // Reserve 0 for ROOT.
-    IdentityRef::new(n | 1)
-}
-
-/// Current wall clock in millis since epoch.
-pub fn now_millis() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
-        Err(error) => {
-            let before_epoch = i64::try_from(error.duration().as_millis()).unwrap_or(i64::MAX);
-            before_epoch.saturating_neg()
-        }
+        let resolved = self
+            .registry
+            .resolve_method_contract(resource_id, method_name)?;
+        let method = resolved.descriptor;
+        Some(MethodMeta {
+            resource_id,
+            contract: resolved.contract,
+            method_index: resolved.index,
+            method,
+        })
     }
 }
 
@@ -775,9 +1221,10 @@ mod tests {
     use crate::driver::{Driver, DriverContext, DriverDescriptor, DriverError, EchoDriver};
     use crate::fact::FactSink;
     use crate::handle::HandleTable;
+    use crate::host::{AbortTask, HostClock, TaskSpawnError, TaskSpawner};
     use crate::open::{OpenRequest, open_resource};
     use anyhow::{Context, bail, ensure};
-    use parking_lot::RwLock;
+    use std::sync::atomic::{AtomicI64, Ordering};
     use xolotl_state::{Backend, InMemoryBackend};
     use xolotl_types::{
         Binding, ConstraintSet, DriverRef, Expiry, Grant, Interface, InterfaceFamily, InterfaceSet,
@@ -790,14 +1237,52 @@ mod tests {
         InMemoryBackend::new().into_backend()
     }
 
+    struct ManualClock {
+        origin: std::time::Instant,
+        millis: AtomicI64,
+    }
+
+    impl HostClock for ManualClock {
+        fn monotonic_now(&self) -> std::time::Instant {
+            self.origin
+                + std::time::Duration::from_millis(self.millis.load(Ordering::SeqCst) as u64)
+        }
+
+        fn unix_millis(&self) -> i64 {
+            self.millis.load(Ordering::SeqCst)
+        }
+
+        fn sleep_until(
+            &self,
+            deadline: std::time::Instant,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                let millis = deadline.saturating_duration_since(self.origin).as_millis() as i64;
+                self.millis.fetch_max(millis, Ordering::SeqCst);
+            })
+        }
+    }
+
+    struct NoTasks;
+
+    impl TaskSpawner for NoTasks {
+        fn spawn(
+            &self,
+            _future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
+        ) -> Result<Arc<dyn AbortTask>, TaskSpawnError> {
+            Err(TaskSpawnError::Unavailable)
+        }
+    }
+
     fn executor() -> Executor {
         let (facts, _) = FactSink::in_memory();
-        let dp = DataPlane::new(
-            Arc::new(RwLock::new(HandleTable::new())),
-            facts,
-            test_state(),
-        );
-        Executor::new(ProcessId::new(1), dp, Registry::new())
+        let dp = DataPlane::new(HandleTable::new(), facts, test_state());
+        Executor::assemble(
+            ProcessId::new(1),
+            Some(IdentityRef::ROOT),
+            dp,
+            Registry::new(),
+        )
     }
 
     fn s(name: &str) -> StepRef {
@@ -834,20 +1319,20 @@ mod tests {
                 .read_tainted(&path)
                 .await
                 .map_err(|e| DriverError::Other(e.to_string()))?;
-            match tv {
-                Some(tv) => {
-                    Ok(crate::DriverOutput::new(Outcome::Done(tv.value)).with_taint(tv.taint))
-                }
-                None => Ok(crate::DriverOutput::new(Outcome::Done(Value::null()))),
-            }
+            Ok(
+                crate::DriverOutput::new(Outcome::Done(tv.value.unwrap_or_else(Value::null)))
+                    .with_taint(tv.taint),
+            )
         }
     }
 
     struct TestResourceSpec {
         path: &'static str,
         kind: ResourceKind,
+        addressing: xolotl_types::ResourceAddressing,
         family: InterfaceFamily,
         method_name: &'static str,
+        authority: xolotl_types::MethodAuthority,
         method_id: u64,
         purity: Purity,
         replay: ReplayClass,
@@ -868,6 +1353,7 @@ mod tests {
             methods: vec![Method {
                 id: MethodId::new(spec.method_id),
                 name: spec.method_name.into(),
+                authority: spec.authority,
                 input: SchemaId::new(0),
                 output: SchemaId::new(0),
                 modality: ModalitySet::TEXT,
@@ -880,7 +1366,7 @@ mod tests {
                 requires_unprotected_input: spec.requires_unprotected_input,
             }],
             laws: Vec::new(),
-        });
+        })?;
         let driver_id = reg.next_driver_id();
         reg.register_driver(DriverDescriptor {
             id: driver_id,
@@ -888,7 +1374,7 @@ mod tests {
             implements: InterfaceSet::new(vec![iface_id]),
             transport: Transport::InProcess,
             driver,
-        });
+        })?;
         let binding_id = reg.next_binding_id();
         reg.admit_binding(Binding {
             id: binding_id,
@@ -910,6 +1396,7 @@ mod tests {
                 descriptor: ResourceDescriptor {
                     name: name.clone(),
                     kind: spec.kind,
+                    addressing: spec.addressing,
                     metadata: Metadata::default(),
                 },
                 interfaces: InterfaceSet::new(vec![iface_id]),
@@ -934,7 +1421,16 @@ mod tests {
 
     #[tokio::test]
     async fn attached_missing_process_does_not_run_as_root() -> anyhow::Result<()> {
-        let ex = executor().with_processes(crate::process::ProcessTable::new());
+        let standalone = executor();
+        let ex = Executor::from_process_table(
+            ProcessId::new(1),
+            crate::process::ProcessTable::with_host_runtime_and_domain(
+                standalone.data_plane.host_runtime().clone(),
+                None,
+            ),
+            standalone.data_plane,
+            standalone.registry,
+        )?;
         let out = ex.eval(&DoNode::pure(Value::integer(5))).await;
         ensure!(
             matches!(
@@ -949,13 +1445,150 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn runtime_tables_reject_mixed_domains_without_restricting_independent_hosts()
+    -> anyhow::Result<()> {
+        let first = crate::Bootstrap::in_memory();
+        let second = crate::Bootstrap::in_memory();
+        let first_kernel = first.kernel();
+        let second_kernel = second.kernel();
+        let process = first.root();
+        ensure!(process == second.root());
+
+        ensure!(
+            Executor::from_process_table(
+                process,
+                first_kernel.processes().clone(),
+                first_kernel.data_plane(),
+                first_kernel.registry().clone(),
+            )
+            .is_ok()
+        );
+        ensure!(matches!(
+            Executor::new(
+                process,
+                IdentityRef::ROOT,
+                first_kernel.data_plane(),
+                first_kernel.registry().clone(),
+            ),
+            Err(RuntimeAssemblyError::PartiallyBound)
+        ));
+
+        ensure!(matches!(
+            Executor::from_process_table(
+                process,
+                first_kernel.processes().clone(),
+                first_kernel.data_plane(),
+                second_kernel.registry().clone(),
+            ),
+            Err(RuntimeAssemblyError::DifferentRuntime)
+        ));
+        ensure!(matches!(
+            Executor::new(
+                process,
+                IdentityRef::ROOT,
+                first_kernel.data_plane(),
+                second_kernel.registry().clone(),
+            ),
+            Err(RuntimeAssemblyError::DifferentRuntime)
+        ));
+        ensure!(matches!(
+            Executor::from_process_table(
+                process,
+                first_kernel.processes().clone(),
+                second_kernel.data_plane(),
+                first_kernel.registry().clone(),
+            ),
+            Err(RuntimeAssemblyError::DifferentProcessTable)
+        ));
+        ensure!(matches!(
+            first_kernel
+                .data_plane()
+                .with_processes(second_kernel.processes().clone()),
+            Err(RuntimeAssemblyError::DifferentProcessTable)
+        ));
+        ensure!(matches!(
+            DataPlane::new(
+                first_kernel.handles().clone(),
+                first_kernel.facts().clone(),
+                first_kernel.state().clone(),
+            )
+            .with_processes(second_kernel.processes().clone()),
+            Err(RuntimeAssemblyError::DifferentRuntime)
+        ));
+
+        let (facts, _) = FactSink::in_memory();
+        let independent = DataPlane::new(HandleTable::new(), facts, test_state());
+        ensure!(matches!(
+            Executor::from_process_table(
+                process,
+                crate::process::ProcessTable::new(),
+                independent,
+                Registry::new(),
+            ),
+            Err(RuntimeAssemblyError::DifferentClockDomain)
+        ));
+        let (facts, _) = FactSink::in_memory();
+        let independent = DataPlane::new(HandleTable::new(), facts, test_state());
+        let independent_processes = crate::process::ProcessTable::with_host_runtime_and_domain(
+            independent.host_runtime().clone(),
+            None,
+        );
+        ensure!(
+            Executor::from_process_table(
+                process,
+                independent_processes,
+                independent,
+                Registry::new(),
+            )
+            .is_ok()
+        );
+        let (facts, _) = FactSink::in_memory();
+        let independent = DataPlane::new(HandleTable::new(), facts, test_state());
+        ensure!(matches!(
+            Executor::from_process_table(
+                process,
+                first_kernel.processes().clone(),
+                independent,
+                first_kernel.registry().clone(),
+            ),
+            Err(RuntimeAssemblyError::PartiallyBound)
+        ));
+        ensure!(matches!(
+            DataPlane::new(
+                HandleTable::new(),
+                first_kernel.facts().clone(),
+                test_state()
+            )
+            .with_processes(first_kernel.processes().clone()),
+            Err(RuntimeAssemblyError::PartiallyBound)
+        ));
+
+        let upgraded = first_kernel
+            .handles()
+            .downgrade()
+            .upgrade()
+            .context("live handle table should upgrade")?;
+        ensure!(
+            DataPlane::new_with_host_runtime(
+                upgraded,
+                first_kernel.facts().clone(),
+                first_kernel.state().clone(),
+                first_kernel.host_runtime().clone(),
+            )
+            .with_processes(first_kernel.processes().clone())
+            .is_ok()
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn acting_denied_without_delegate_grant() -> anyhow::Result<()> {
         // Process 1 holds no grants (empty registry). An Acting block must be
         // denied fail-closed.
         let ex = executor();
         let prog = DoNode::acting(
-            xolotl_types::Path::parse("process/bob")?,
+            xolotl_types::Path::parse("identity://bob")?,
             DoNode::pure(Value::integer(1)),
         );
         match ex.eval(&prog).await.outcome {
@@ -969,25 +1602,27 @@ mod tests {
 
     #[tokio::test]
     async fn acting_allowed_with_delegate_grant() -> anyhow::Result<()> {
-        use xolotl_types::{Expiry, Grant, MethodBitmap, ResourceSelector, RightFlags, Rights};
+        use xolotl_types::{Expiry, Grant, ResourceSelector, RightFlags};
         let (facts, _) = FactSink::in_memory();
-        let dp = DataPlane::new(
-            Arc::new(RwLock::new(HandleTable::new())),
-            facts,
-            test_state(),
-        );
+        let dp = DataPlane::new(HandleTable::new(), facts, test_state());
         let reg = Registry::new();
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("act-as://process/bob")?,
-            rights: Rights::new(MethodBitmap::ALL, RightFlags::DELEGATE),
+            selector: ResourceSelector::parse("act-as://identity/bob")?,
+            rights: xolotl_types::GrantRights::new(
+                xolotl_types::GrantMethods::all(),
+                RightFlags::DELEGATE,
+            ),
             constraints: xolotl_types::ConstraintSet::empty(),
             expires: Expiry::Never,
         });
-        let ex = Executor::new(ProcessId::new(1), dp, reg);
+        let identities = IdentityRegistry::in_memory();
+        identities.resolve_or_register(&Path::parse("identity://bob")?)?;
+        let ex = Executor::new(ProcessId::new(1), IdentityRef::ROOT, dp, reg)?
+            .with_identity_registry(identities);
         let prog = DoNode::acting(
-            xolotl_types::Path::parse("process/bob")?,
+            xolotl_types::Path::parse("identity://bob")?,
             DoNode::pure(Value::integer(7)),
         );
         let out = ex.eval(&prog).await;
@@ -998,7 +1633,7 @@ mod tests {
         use xolotl_graph::portable::{Expression as E, Program};
         let compiled = Program::new(E::Catch {
             body: Box::new(E::Acting {
-                identity: Path::parse("process/bob")?,
+                identity: Path::parse("identity://bob")?,
                 body: Box::new(E::Input),
             }),
             recover: Box::new(E::Input),
@@ -1019,18 +1654,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_can_prebind_a_handle_for_an_acting_scope() -> anyhow::Result<()> {
+        let boot = crate::Bootstrap::in_memory();
+        let target = boot.register_effect(
+            "effect://acting/prebound",
+            &[crate::MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                Purity::Pure,
+                crate::MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(EchoDriver),
+        )?;
+        let identity = Path::parse("identity://bob")?;
+        let acting = boot.kernel().identities().resolve_or_register(&identity)?;
+        let bound = boot.open_for_as(boot.root(), acting, &target, "perform")?;
+        let executor = boot.kernel().executor_for(boot.root());
+        executor.bind_method_handle(target.clone(), "invoke", bound)?;
+        let operation = OperationTemplate {
+            target,
+            method: "invoke".into(),
+            method_id: None,
+            output: xolotl_types::OutputMode::Unary,
+            literal_input: Some(Value::integer(17)),
+        };
+        executor.prepare_operation_for(acting, &operation)?;
+        let handles_before = boot.kernel().handles().len();
+        let meta = executor
+            .resolve_meta(&operation.target, &operation.method)?
+            .context("prebound method metadata")?;
+        ensure!(
+            executor.handle_for(
+                &operation.target,
+                &operation.method,
+                acting,
+                &meta,
+                RightFlags::empty(),
+            )? == Some(bound)
+        );
+        let output = executor
+            .eval(&DoNode::acting(identity, DoNode::op(operation)))
+            .await;
+        ensure!(output.outcome == Outcome::Done(Value::integer(17)));
+        ensure!(boot.kernel().handles().len() == handles_before);
+        Ok(())
+    }
+
+    #[test]
+    fn binding_to_a_missing_process_returns_an_error() -> anyhow::Result<()> {
+        let standalone = executor();
+        let executor = Executor::from_process_table(
+            ProcessId::new(1),
+            crate::process::ProcessTable::with_host_runtime_and_domain(
+                standalone.data_plane.host_runtime().clone(),
+                None,
+            ),
+            standalone.data_plane,
+            standalone.registry,
+        )?;
+        let target = rn("effect://acting/missing-process")?;
+        ensure!(matches!(
+            executor.bind_handle(target, HandleId::new(0, 1)),
+            Err(HandleBindingError::NoSuchProcess(id)) if id == ProcessId::new(1)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cancelled_process_short_circuits_at_operation_boundary() -> anyhow::Result<()> {
         // A process marked Cancelled must not issue its Operation: the boundary
         // check short-circuits to Failure::Cancelled.
         use crate::process::{ProcessEntry, ProcessTable};
         use xolotl_graph::OperationTemplate;
         let (facts, _) = FactSink::in_memory();
-        let dp = DataPlane::new(
-            Arc::new(RwLock::new(HandleTable::new())),
-            facts,
-            test_state(),
-        );
-        let procs = ProcessTable::new();
+        let dp = DataPlane::new(HandleTable::new(), facts, test_state());
+        let procs = ProcessTable::with_host_runtime_and_domain(dp.host_runtime().clone(), None);
         procs.insert(ProcessEntry::new(
             ProcessId::new(1),
             None,
@@ -1038,7 +1736,7 @@ mod tests {
         ));
         let cancelled = procs.cancel_if_non_terminal(ProcessId::new(1));
         ensure!(cancelled == Some(true), "process should be cancelled");
-        let ex = Executor::new(ProcessId::new(1), dp, Registry::new()).with_processes(procs);
+        let ex = Executor::from_process_table(ProcessId::new(1), procs, dp, Registry::new())?;
         // A bare Operation node (target need not resolve — the cancel check fires
         // before resource resolution).
         let prog = DoNode::op(OperationTemplate {
@@ -1059,7 +1757,7 @@ mod tests {
     #[tokio::test]
     async fn bound_handle_must_match_target_resource() -> anyhow::Result<()> {
         let (facts, _) = FactSink::in_memory();
-        let handles = Arc::new(RwLock::new(HandleTable::new()));
+        let handles = HandleTable::new();
         let dp = DataPlane::new(handles.clone(), facts, test_state());
         let reg = Registry::new();
         let (first_resource, first_name) = register_test_resource(
@@ -1067,8 +1765,10 @@ mod tests {
             TestResourceSpec {
                 path: "effect://cache/first",
                 kind: ResourceKind::Effect,
+                addressing: xolotl_types::ResourceAddressing::Exact,
                 family: InterfaceFamily::Callable,
                 method_name: "invoke",
+                authority: xolotl_types::MethodAuthority::Perform,
                 method_id: 0,
                 purity: Purity::Effectful,
                 replay: ReplayClass::NonIdempotentEffect,
@@ -1083,8 +1783,10 @@ mod tests {
             TestResourceSpec {
                 path: "effect://cache/second",
                 kind: ResourceKind::Effect,
+                addressing: xolotl_types::ResourceAddressing::Exact,
                 family: InterfaceFamily::Callable,
                 method_name: "invoke",
+                authority: xolotl_types::MethodAuthority::Perform,
                 method_id: 0,
                 purity: Purity::Effectful,
                 replay: ReplayClass::NonIdempotentEffect,
@@ -1098,15 +1800,17 @@ mod tests {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
             selector: ResourceSelector::parse("perform://effect/cache/first")?,
-            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            rights: xolotl_types::GrantRights::new(
+                xolotl_types::GrantMethods::name("invoke"),
+                RightFlags::empty(),
+            ),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
         });
         let handle = {
-            let mut table = handles.write();
             open_resource(
                 &reg,
-                &mut table,
+                &handles,
                 OpenRequest {
                     process: ProcessId::new(1),
                     resource: first_resource,
@@ -1119,8 +1823,11 @@ mod tests {
             )
             .context("first resource open failed")?
         };
-        let ex = Executor::new(ProcessId::new(1), dp, reg);
-        ex.bind_handle(second_name.clone(), handle);
+        let ex = Executor::new(ProcessId::new(1), IdentityRef::ROOT, dp, reg)?;
+        ensure!(matches!(
+            ex.bind_handle(second_name.clone(), handle),
+            Err(HandleBindingError::WrongTarget(id)) if id == handle
+        ));
 
         let out = ex
             .eval(&DoNode::op(OperationTemplate {
@@ -1143,27 +1850,837 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acting_denied_when_grant_lacks_delegate_flag() -> anyhow::Result<()> {
-        use xolotl_types::{Expiry, Grant, MethodBitmap, ResourceSelector, RightFlags, Rights};
+    async fn bound_handle_cannot_change_a_prefix_resources_concrete_target() -> anyhow::Result<()> {
+        let state = test_state();
+        let requested = Path::parse("state://application/a")?;
+        let allowed = Path::parse("state://application/b")?;
+        state.write_set(&requested, Value::integer(11)).await?;
+        state.write_set(&allowed, Value::integer(22)).await?;
+
+        let registry = Registry::new();
+        let (resource, _) = register_test_resource(
+            &registry,
+            TestResourceSpec {
+                path: "state://",
+                kind: ResourceKind::State,
+                addressing: xolotl_types::ResourceAddressing::Prefix,
+                family: InterfaceFamily::Value,
+                method_name: "read",
+                authority: xolotl_types::MethodAuthority::Read,
+                method_id: 0,
+                purity: Purity::Pure,
+                replay: ReplayClass::Observation,
+                driver_name: "bound-state-read",
+                selector: "*://state/**",
+                requires_unprotected_input: false,
+            },
+            Arc::new(TestStateReadDriver {
+                state: state.clone(),
+            }),
+        )?;
+        registry.register_grant(Grant {
+            id: registry.next_grant_id(),
+            holder: ProcessId::new(1),
+            selector: ResourceSelector::parse("read://state/application/b")?,
+            rights: xolotl_types::GrantRights::new(
+                xolotl_types::GrantMethods::name("read"),
+                RightFlags::empty(),
+            ),
+            constraints: ConstraintSet::empty(),
+            expires: Expiry::Never,
+        });
+        // A fresh handle for `a` is authorized. A wrong explicit binding must
+        // fail during host assembly without contaminating the cache.
+        registry.register_grant(Grant {
+            id: registry.next_grant_id(),
+            holder: ProcessId::new(1),
+            selector: ResourceSelector::parse("read://state/application/a")?,
+            rights: xolotl_types::GrantRights::new(
+                xolotl_types::GrantMethods::name("read"),
+                RightFlags::empty(),
+            ),
+            constraints: ConstraintSet::empty(),
+            expires: Expiry::Never,
+        });
+        let handles = HandleTable::new();
+        let handle = open_resource(
+            &registry,
+            &handles,
+            OpenRequest {
+                process: ProcessId::new(1),
+                resource,
+                verb: "read".into(),
+                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+                acting: IdentityRef::ROOT,
+                requested_path: Some(allowed.clone()),
+                now_millis: 0,
+            },
+        )?;
         let (facts, _) = FactSink::in_memory();
-        let dp = DataPlane::new(
-            Arc::new(RwLock::new(HandleTable::new())),
-            facts,
-            test_state(),
+        let plane = DataPlane::new(handles, facts, state);
+        let target = ResourceName::new(requested);
+        let operation = OperationTemplate {
+            target: target.clone(),
+            method: "read".into(),
+            method_id: None,
+            output: xolotl_types::OutputMode::Unary,
+            literal_input: None,
+        };
+        for method_specific in [false, true] {
+            let executor = Executor::new(
+                ProcessId::new(1),
+                IdentityRef::ROOT,
+                plane.clone(),
+                registry.clone(),
+            )?;
+            let handles_before = plane.handles.len();
+            if method_specific {
+                ensure!(matches!(
+                    executor.bind_method_handle(target.clone(), "read", handle),
+                    Err(HandleBindingError::WrongTarget(id)) if id == handle
+                ));
+                ensure!(executor.method_handles.read().is_empty());
+            } else {
+                ensure!(matches!(
+                    executor.bind_handle(target.clone(), handle),
+                    Err(HandleBindingError::WrongTarget(id)) if id == handle
+                ));
+                ensure!(executor.open_handles.read().is_empty());
+            }
+            executor.prepare_operation(&operation)?;
+            let result = executor.eval(&DoNode::op(operation.clone())).await;
+            ensure!(
+                result.outcome == Outcome::Done(Value::integer(11)),
+                "the rejected binding changed the target: {result:?}"
+            );
+            ensure!(
+                plane.handles.len() == handles_before + 1,
+                "a fresh handle for a was not opened"
+            );
+        }
+        Ok(())
+    }
+
+    fn prefix_cache_executor(config: ExecutionConfig) -> anyhow::Result<Executor> {
+        let state = test_state();
+        let registry = Registry::new();
+        register_test_resource(
+            &registry,
+            TestResourceSpec {
+                path: "state://",
+                kind: ResourceKind::State,
+                addressing: xolotl_types::ResourceAddressing::Prefix,
+                family: InterfaceFamily::Value,
+                method_name: "read",
+                authority: xolotl_types::MethodAuthority::Read,
+                method_id: 0,
+                purity: Purity::Pure,
+                replay: ReplayClass::Observation,
+                driver_name: "cache-capacity-state-read",
+                selector: "*://state/**",
+                requires_unprotected_input: false,
+            },
+            Arc::new(TestStateReadDriver {
+                state: state.clone(),
+            }),
+        )?;
+        registry.register_grant(Grant {
+            id: registry.next_grant_id(),
+            holder: ProcessId::new(1),
+            selector: ResourceSelector::parse("read://state/**")?,
+            rights: xolotl_types::GrantRights::new(
+                xolotl_types::GrantMethods::name("read"),
+                RightFlags::empty(),
+            ),
+            constraints: ConstraintSet::empty(),
+            expires: Expiry::Never,
+        });
+        let (facts, _) = FactSink::in_memory();
+        let plane = DataPlane::new(HandleTable::new(), facts, state);
+        Ok(
+            Executor::new(ProcessId::new(1), IdentityRef::ROOT, plane, registry)?
+                .with_execution_config(config),
+        )
+    }
+
+    fn prefix_read(path: &str) -> anyhow::Result<OperationTemplate> {
+        Ok(OperationTemplate {
+            target: rn(path)?,
+            method: "read".into(),
+            method_id: None,
+            output: xolotl_types::OutputMode::Unary,
+            literal_input: None,
+        })
+    }
+
+    #[test]
+    fn cache_quotas_distinguish_missing_methods_from_exhausted_capacity() -> anyhow::Result<()> {
+        let executor = prefix_cache_executor(ExecutionConfig {
+            max_method_metadata: 1,
+            max_method_bindings: 1,
+            ..ExecutionConfig::default()
+        })?;
+        let first = prefix_read("state://application/first")?;
+        let second = prefix_read("state://application/second")?;
+        let missing = OperationTemplate {
+            method: "absent".into(),
+            ..second.clone()
+        };
+        ensure!(matches!(
+            executor.prepare_operation(&missing),
+            Err(xolotl_types::Failure::NoHandler { .. })
+        ));
+        executor.prepare_operation(&first)?;
+        ensure!(matches!(
+            executor.prepare_operation(&second),
+            Err(xolotl_types::Failure::BudgetExhausted { dim }) if dim == "executor.method_metadata"
+        ));
+        ensure!(matches!(
+            executor.prepare_operation_for(IdentityRef::new(42), &first),
+            Err(xolotl_types::Failure::BudgetExhausted { dim }) if dim == "executor.method_bindings"
+        ));
+        executor.prepare_operation(&first)?;
+        ensure!(executor.method_cache.read().len() == 1);
+        ensure!(executor.method_handles.read().len() == 1);
+        ensure!(executor.data_plane.handles.len() == 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cache_item_size_limits_reject_new_keys_and_frozen_contracts() -> anyhow::Result<()> {
+        let first = prefix_read("state://application/a")?;
+        let longer = prefix_read("state://application/a/longer")?;
+        let path_limit = first
+            .target
+            .path()
+            .canonical_len()
+            .context("path length overflow")?;
+        let executor = prefix_cache_executor(ExecutionConfig {
+            max_cache_path_bytes: path_limit,
+            ..ExecutionConfig::default()
+        })?;
+        executor.prepare_operation(&first)?;
+        ensure!(matches!(
+            executor.prepare_operation(&longer),
+            Err(xolotl_types::Failure::BudgetExhausted { dim }) if dim == "executor.cache_path_bytes"
+        ));
+        executor.prepare_operation(&first)?;
+        ensure!(executor.method_cache.read().len() == 1);
+        ensure!(executor.data_plane.handles.len() == 1);
+
+        let method_limited = prefix_cache_executor(ExecutionConfig {
+            max_cache_method_name_bytes: 3,
+            ..ExecutionConfig::default()
+        })?;
+        ensure!(matches!(
+            method_limited.prepare_operation(&first),
+            Err(xolotl_types::Failure::BudgetExhausted { dim }) if dim == "executor.cache_method_name_bytes"
+        ));
+        ensure!(method_limited.method_cache.read().is_empty());
+        ensure!(method_limited.data_plane.handles.len() == 0);
+
+        let interface_limited = prefix_cache_executor(ExecutionConfig {
+            max_cache_interfaces: 0,
+            ..ExecutionConfig::default()
+        })?;
+        ensure!(matches!(
+            interface_limited.prepare_operation(&first),
+            Err(xolotl_types::Failure::BudgetExhausted { dim }) if dim == "executor.cache_interfaces"
+        ));
+        ensure!(interface_limited.method_cache.read().is_empty());
+        ensure!(interface_limited.data_plane.handles.len() == 0);
+
+        let explicit = prefix_cache_executor(ExecutionConfig {
+            max_cache_path_bytes: 1,
+            ..ExecutionConfig::default()
+        })?;
+        let resource = explicit.registry.resolve_resource(&first.target)?;
+        let handle = open_resource(
+            &explicit.registry,
+            &explicit.data_plane.handles,
+            OpenRequest {
+                process: ProcessId::new(1),
+                resource,
+                verb: "read".into(),
+                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+                acting: IdentityRef::ROOT,
+                requested_path: Some(first.target.path().clone()),
+                now_millis: explicit.host_runtime.now_millis(),
+            },
+        )?;
+        ensure!(matches!(
+            explicit.bind_handle(first.target, handle),
+            Err(HandleBindingError::Capacity("executor.cache_path_bytes"))
+        ));
+        ensure!(explicit.open_handles.read().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_binding_quota_allows_replacement_but_not_new_keys() -> anyhow::Result<()> {
+        let executor = prefix_cache_executor(ExecutionConfig {
+            max_method_metadata: 2,
+            max_resource_bindings: 1,
+            max_method_bindings: 1,
+            ..ExecutionConfig::default()
+        })?;
+        let first = rn("state://application/first")?;
+        let second = rn("state://application/second")?;
+        let resource = executor.registry.resolve_resource(&first)?;
+        let open = |target: &ResourceName| {
+            open_resource(
+                &executor.registry,
+                &executor.data_plane.handles,
+                OpenRequest {
+                    process: ProcessId::new(1),
+                    resource,
+                    verb: "read".into(),
+                    rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+                    acting: IdentityRef::ROOT,
+                    requested_path: Some(target.path().clone()),
+                    now_millis: executor.host_runtime.now_millis(),
+                },
+            )
+        };
+        let first_handle = open(&first)?;
+        let replacement = open(&first)?;
+        let second_handle = open(&second)?;
+        executor.bind_handle(first.clone(), first_handle)?;
+        executor.bind_handle(first.clone(), replacement)?;
+        ensure!(matches!(
+            executor.bind_handle(second.clone(), second_handle),
+            Err(HandleBindingError::Capacity("resource bindings"))
+        ));
+        let mut oversized_capacity = String::with_capacity(4096);
+        oversized_capacity.push_str("read");
+        executor.bind_method_handle(first.clone(), oversized_capacity, first_handle)?;
+        ensure!(
+            executor.method_handles.read().keys().all(
+                |key| key.1.capacity() <= executor.execution_config.max_cache_method_name_bytes
+            )
         );
+        executor.bind_method_handle(first, "read", replacement)?;
+        ensure!(matches!(
+            executor.bind_method_handle(second, "read", second_handle),
+            Err(HandleBindingError::Capacity("method bindings"))
+        ));
+        ensure!(executor.open_handles.read().len() == 1);
+        ensure!(executor.method_handles.read().len() == 1);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_distinct_opens_compete_for_one_method_binding_slot() -> anyhow::Result<()> {
+        let executor = prefix_cache_executor(ExecutionConfig {
+            max_method_metadata: 2,
+            max_method_bindings: 1,
+            ..ExecutionConfig::default()
+        })?;
+        executor.registry.register_policy(Arc::new(MeetAtOpen {
+            arrivals: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        let first = prefix_read("state://application/first")?;
+        let second = prefix_read("state://application/second")?;
+        let results = std::thread::scope(|scope| {
+            let a = scope.spawn(|| executor.prepare_operation(&first));
+            let b = scope.spawn(|| executor.prepare_operation(&second));
+            (a.join(), b.join())
+        });
+        let a = results
+            .0
+            .map_err(|_panic| anyhow::anyhow!("first open panicked"))?;
+        let b = results
+            .1
+            .map_err(|_panic| anyhow::anyhow!("second open panicked"))?;
+        ensure!(
+            a.is_ok() != b.is_ok(),
+            "exactly one open must publish: {a:?}, {b:?}"
+        );
+        let failed = a.err().or_else(|| b.err()).context("one rejection")?;
+        ensure!(
+            matches!(failed, xolotl_types::Failure::BudgetExhausted { dim } if dim == "executor.method_bindings")
+        );
+        ensure!(executor.method_handles.read().len() == 1);
+        ensure!(executor.data_plane.handles.len() == 1);
+        Ok(())
+    }
+
+    struct ChangeRegistryOnce {
+        registry: std::sync::Weak<Registry>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::policy::PolicySource for ChangeRegistryOnce {
+        fn applies_to(&self, _: &crate::policy::OpenContext<'_>) -> bool {
+            true
+        }
+
+        fn compile(
+            &self,
+            _: &crate::policy::OpenContext<'_>,
+        ) -> Result<crate::policy::PolicySnapshot, crate::policy::PolicyCompileError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0
+                && let Some(registry) = self.registry.upgrade()
+            {
+                registry.register_grant(Grant {
+                    id: registry.next_grant_id(),
+                    holder: ProcessId::new(99),
+                    selector: ResourceSelector::all(),
+                    rights: xolotl_types::GrantRights::new(
+                        xolotl_types::GrantMethods::all(),
+                        RightFlags::all(),
+                    ),
+                    constraints: ConstraintSet::empty(),
+                    expires: Expiry::Never,
+                });
+            }
+            Ok(crate::policy::PolicySnapshot::empty())
+        }
+    }
+
+    #[test]
+    fn automatic_open_reprepares_after_one_unrelated_registry_change() -> anyhow::Result<()> {
+        let boot = crate::Bootstrap::in_memory();
+        let target = boot.register_effect(
+            "effect://cache/reprepare",
+            &[crate::MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                Purity::Pure,
+                crate::MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(EchoDriver),
+        )?;
+        let registry = Arc::new(boot.kernel().registry().clone());
+        let policy = Arc::new(ChangeRegistryOnce {
+            registry: Arc::downgrade(&registry),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        registry.register_policy(policy.clone());
+        let executor = boot.kernel().executor_for(boot.root());
+        executor.prepare_operation(&OperationTemplate {
+            target,
+            method: "invoke".into(),
+            method_id: None,
+            output: xolotl_types::OutputMode::Unary,
+            literal_input: None,
+        })?;
+        ensure!(policy.calls.load(Ordering::SeqCst) == 2);
+        ensure!(boot.kernel().handles().len() == 1);
+        Ok(())
+    }
+
+    struct UnusedAsyncHost;
+
+    #[async_trait::async_trait]
+    impl crate::host::async_process::AsyncProcessHost for UnusedAsyncHost {
+        async fn admit(
+            &self,
+            _: &crate::host::async_process::AsyncProcessRequest,
+        ) -> Result<crate::host::async_process::AsyncProcessAdmission, xolotl_types::Failure>
+        {
+            Err(xolotl_types::Failure::policy("test", "unused"))
+        }
+    }
+
+    struct MeetAtOpen {
+        arrivals: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::policy::PolicySource for MeetAtOpen {
+        fn applies_to(&self, _: &crate::policy::OpenContext<'_>) -> bool {
+            true
+        }
+
+        fn compile(
+            &self,
+            _: &crate::policy::OpenContext<'_>,
+        ) -> Result<crate::policy::PolicySnapshot, crate::policy::PolicyCompileError> {
+            use std::sync::atomic::Ordering;
+            self.arrivals.fetch_add(1, Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while self.arrivals.load(Ordering::SeqCst) < 2 {
+                if std::time::Instant::now() >= deadline {
+                    return Err(crate::policy::PolicyCompileError::DeniedAtOpen(
+                        "second concurrent open did not reach policy compilation".into(),
+                    ));
+                }
+                std::thread::yield_now();
+            }
+            Ok(crate::policy::PolicySnapshot::empty())
+        }
+    }
+
+    fn await_open_flag(
+        flag: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), crate::policy::PolicyCompileError> {
+        use std::sync::atomic::Ordering;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !flag.load(Ordering::SeqCst) {
+            if std::time::Instant::now() >= deadline {
+                return Err(crate::policy::PolicyCompileError::DeniedAtOpen(
+                    "concurrent open did not reach the expected phase".into(),
+                ));
+            }
+            std::thread::yield_now();
+        }
+        Ok(())
+    }
+
+    struct NarrowAfterWide {
+        narrow_entered: std::sync::atomic::AtomicBool,
+        wide_finished: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::policy::PolicySource for NarrowAfterWide {
+        fn applies_to(&self, _: &crate::policy::OpenContext<'_>) -> bool {
+            true
+        }
+
+        fn compile(
+            &self,
+            context: &crate::policy::OpenContext<'_>,
+        ) -> Result<crate::policy::PolicySnapshot, crate::policy::PolicyCompileError> {
+            use std::sync::atomic::Ordering;
+            if context.rights.flags.contains(RightFlags::SPAWN_WITH) {
+                await_open_flag(&self.narrow_entered)?;
+            } else {
+                self.narrow_entered.store(true, Ordering::SeqCst);
+                await_open_flag(&self.wide_finished)?;
+            }
+            Ok(crate::policy::PolicySnapshot::empty())
+        }
+    }
+
+    struct BindAtOpen {
+        executor: std::sync::Weak<Executor>,
+        target: ResourceName,
+        handle: HandleId,
+    }
+
+    impl crate::policy::PolicySource for BindAtOpen {
+        fn applies_to(&self, _: &crate::policy::OpenContext<'_>) -> bool {
+            true
+        }
+
+        fn compile(
+            &self,
+            _: &crate::policy::OpenContext<'_>,
+        ) -> Result<crate::policy::PolicySnapshot, crate::policy::PolicyCompileError> {
+            if let Some(executor) = self.executor.upgrade() {
+                executor
+                    .bind_handle(self.target.clone(), self.handle)
+                    .map_err(|error| {
+                        crate::policy::PolicyCompileError::DeniedAtOpen(error.to_string())
+                    })?;
+            }
+            Ok(crate::policy::PolicySnapshot::empty())
+        }
+    }
+
+    #[test]
+    fn concurrent_automatic_opens_publish_one_reusable_handle() -> anyhow::Result<()> {
+        let boot = crate::Bootstrap::in_memory();
+        let target = boot.register_effect(
+            "effect://cache/concurrent",
+            &[crate::MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                Purity::Pure,
+                crate::MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(EchoDriver),
+        )?;
+        boot.kernel()
+            .registry()
+            .register_policy(Arc::new(MeetAtOpen {
+                arrivals: std::sync::atomic::AtomicUsize::new(0),
+            }));
+        let executor = boot
+            .kernel()
+            .executor_for(boot.root())
+            .with_execution_config(ExecutionConfig {
+                max_method_metadata: 1,
+                max_method_bindings: 1,
+                ..ExecutionConfig::default()
+            });
+        let operation = OperationTemplate {
+            target: target.clone(),
+            method: "invoke".into(),
+            method_id: None,
+            output: xolotl_types::OutputMode::Unary,
+            literal_input: None,
+        };
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| executor.prepare_operation(&operation));
+            let second = scope.spawn(|| executor.prepare_operation(&operation));
+            match first.join() {
+                Ok(result) => result?,
+                Err(_) => anyhow::bail!("first open thread panicked"),
+            }
+            match second.join() {
+                Ok(result) => result?,
+                Err(_) => anyhow::bail!("second open thread panicked"),
+            }
+            anyhow::Ok(())
+        })?;
+        let key = (target, "invoke".to_owned(), IdentityRef::ROOT);
+        let cached = executor
+            .method_handles
+            .read()
+            .get(&key)
+            .copied()
+            .context("published handle")?
+            .id();
+        ensure!(boot.kernel().handles().get(cached).is_some());
+        ensure!(boot.kernel().handles().len() == 1);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_narrow_and_spawn_opens_keep_the_wider_binding() -> anyhow::Result<()> {
+        let boot = crate::Bootstrap::in_memory();
+        let target = boot.register_effect(
+            "effect://cache/concurrent-spawn",
+            &[crate::MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                Purity::Pure,
+                crate::MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(EchoDriver),
+        )?;
+        let policy = Arc::new(NarrowAfterWide {
+            narrow_entered: std::sync::atomic::AtomicBool::new(false),
+            wide_finished: std::sync::atomic::AtomicBool::new(false),
+        });
+        boot.kernel().registry().register_policy(policy.clone());
+        let executor = boot
+            .kernel()
+            .executor_for(boot.root())
+            .with_async_process_host(Arc::new(UnusedAsyncHost));
+        let unary = OperationTemplate {
+            target: target.clone(),
+            method: "invoke".into(),
+            method_id: None,
+            output: xolotl_types::OutputMode::Unary,
+            literal_input: None,
+        };
+        let asynchronous = OperationTemplate {
+            output: xolotl_types::OutputMode::AsyncProcess,
+            ..unary.clone()
+        };
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| executor.prepare_operation(&unary));
+            let second = scope.spawn(|| {
+                let result = executor.prepare_operation(&asynchronous);
+                policy
+                    .wide_finished
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                result
+            });
+            match first.join() {
+                Ok(result) => result?,
+                Err(_) => anyhow::bail!("unary open thread panicked"),
+            }
+            match second.join() {
+                Ok(result) => result?,
+                Err(_) => anyhow::bail!("async open thread panicked"),
+            }
+            anyhow::Ok(())
+        })?;
+        let key = (target, "invoke".to_owned(), IdentityRef::ROOT);
+        let cached = executor
+            .method_handles
+            .read()
+            .get(&key)
+            .copied()
+            .context("published handle")?
+            .id();
+        ensure!(
+            boot.kernel()
+                .handles()
+                .get(cached)
+                .context("live published handle")?
+                .rights
+                .flags
+                .contains(RightFlags::SPAWN_WITH)
+        );
+        executor.prepare_operation(&unary)?;
+        executor.prepare_operation(&asynchronous)?;
+        ensure!(boot.kernel().handles().len() == 1);
+        Ok(())
+    }
+
+    #[test]
+    fn resource_binding_arriving_during_open_wins_before_publication() -> anyhow::Result<()> {
+        let boot = crate::Bootstrap::in_memory();
+        let target = boot.register_effect(
+            "effect://cache/late-binding",
+            &[crate::MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                Purity::Pure,
+                crate::MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(EchoDriver),
+        )?;
+        let bound = boot.open_for(boot.root(), &target, "perform")?;
+        let executor = Arc::new(boot.kernel().executor_for(boot.root()));
+        boot.kernel()
+            .registry()
+            .register_policy(Arc::new(BindAtOpen {
+                executor: Arc::downgrade(&executor),
+                target: target.clone(),
+                handle: bound,
+            }));
+        let operation = OperationTemplate {
+            target: target.clone(),
+            method: "invoke".into(),
+            method_id: None,
+            output: xolotl_types::OutputMode::Unary,
+            literal_input: None,
+        };
+        executor.prepare_operation(&operation)?;
+        ensure!(
+            executor
+                .open_handles
+                .read()
+                .get(&(target, IdentityRef::ROOT))
+                == Some(&bound)
+        );
+        ensure!(executor.method_handles.read().is_empty());
+        ensure!(boot.kernel().handles().len() == 1);
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_method_handle_upgrades_only_when_needed_and_explicit_binding_cannot_upgrade()
+    -> anyhow::Result<()> {
+        let boot = crate::Bootstrap::in_memory();
+        let target = boot.register_effect(
+            "effect://cache/async",
+            &[crate::MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                Purity::Pure,
+                crate::MethodSpec::UNARY_ASYNC,
+            )],
+            Arc::new(EchoDriver),
+        )?;
+        let unary = OperationTemplate {
+            target: target.clone(),
+            method: "invoke".into(),
+            method_id: None,
+            output: xolotl_types::OutputMode::Unary,
+            literal_input: None,
+        };
+        let async_operation = OperationTemplate {
+            output: xolotl_types::OutputMode::AsyncProcess,
+            ..unary.clone()
+        };
+        let executor = boot
+            .kernel()
+            .executor_for(boot.root())
+            .with_async_process_host(Arc::new(UnusedAsyncHost));
+        executor.prepare_operation(&unary)?;
+        let key = (target.clone(), "invoke".to_owned(), IdentityRef::ROOT);
+        let first = executor
+            .method_handles
+            .read()
+            .get(&key)
+            .copied()
+            .context("automatically opened unary handle")?
+            .id();
+        ensure!(
+            !boot
+                .kernel()
+                .handles()
+                .get(first)
+                .context("live unary handle")?
+                .rights
+                .flags
+                .contains(RightFlags::SPAWN_WITH)
+        );
+        executor.prepare_operation(&async_operation)?;
+        let upgraded = executor
+            .method_handles
+            .read()
+            .get(&key)
+            .copied()
+            .context("automatically opened async handle")?
+            .id();
+        ensure!(first != upgraded);
+        ensure!(
+            boot.kernel()
+                .handles()
+                .get(upgraded)
+                .context("live async handle")?
+                .rights
+                .flags
+                .contains(RightFlags::SPAWN_WITH)
+        );
+        executor.prepare_operation(&unary)?;
+        let reused = executor
+            .method_handles
+            .read()
+            .get(&key)
+            .copied()
+            .context("automatically reused unary handle")?
+            .id();
+        ensure!(reused == upgraded);
+        ensure!(
+            boot.kernel()
+                .handles()
+                .get(reused)
+                .context("reused async handle")?
+                .rights
+                .flags
+                .contains(RightFlags::SPAWN_WITH)
+        );
+
+        executor.bind_handle(target.clone(), first)?;
+        ensure!(executor.prepare_operation(&async_operation).is_err());
+
+        let explicit = boot
+            .kernel()
+            .executor_for(boot.root())
+            .with_async_process_host(Arc::new(UnusedAsyncHost));
+        explicit.bind_method_handle(target.clone(), "invoke", first)?;
+        ensure!(explicit.prepare_operation(&async_operation).is_err());
+        ensure!(boot.kernel().handles().revoke(first));
+        explicit.prepare_operation(&async_operation)?;
+        ensure!(matches!(
+            explicit
+                .method_handles
+                .read()
+                .get(&(target, "invoke".to_owned(), IdentityRef::ROOT)),
+            Some(MethodHandle::Opened(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acting_denied_when_grant_lacks_delegate_flag() -> anyhow::Result<()> {
+        use xolotl_types::{Expiry, Grant, ResourceSelector, RightFlags};
+        let (facts, _) = FactSink::in_memory();
+        let dp = DataPlane::new(HandleTable::new(), facts, test_state());
         let reg = Registry::new();
-        // Selector matches act-as://process/bob but WITHOUT the DELEGATE flag.
+        // Selector matches act-as://identity/bob but WITHOUT the DELEGATE flag.
         reg.register_grant(Grant {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("act-as://process/bob")?,
-            rights: Rights::new(MethodBitmap::ALL, RightFlags::CLONE),
+            selector: ResourceSelector::parse("act-as://identity/bob")?,
+            rights: xolotl_types::GrantRights::new(
+                xolotl_types::GrantMethods::all(),
+                RightFlags::CLONE,
+            ),
             constraints: xolotl_types::ConstraintSet::empty(),
             expires: Expiry::Never,
         });
-        let ex = Executor::new(ProcessId::new(1), dp, reg);
+        let ex = Executor::new(ProcessId::new(1), IdentityRef::ROOT, dp, reg)?;
         let prog = DoNode::acting(
-            xolotl_types::Path::parse("process/bob")?,
+            xolotl_types::Path::parse("identity://bob")?,
             DoNode::pure(Value::integer(1)),
         );
         let out = ex.eval(&prog).await;
@@ -1201,9 +2718,10 @@ mod tests {
         let graph = compile_do(&DoNode::pure(Value::integer(21)).and_then(StepRef::new("double")))?;
         let other = Executor::new(
             ProcessId::new(2),
+            IdentityRef::ROOT,
             ex.data_plane.clone(),
             ex.registry.clone(),
-        );
+        )?;
         let out = other.eval_graph(&graph).await;
         ensure!(
             matches!(out.outcome, Outcome::Fail(xolotl_types::Failure::PolicyViolation { ref detail, .. }) if detail.contains("not found")),
@@ -1347,15 +2865,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_signal_resolves_on_write() -> anyhow::Result<()> {
-        let state = test_state();
-        let (facts, _) = FactSink::in_memory();
-        let dp = DataPlane::new(
-            Arc::new(RwLock::new(HandleTable::new())),
-            facts,
-            state.clone(),
+    async fn wall_wait_uses_the_installed_host_clock() -> anyhow::Result<()> {
+        let clock = Arc::new(ManualClock {
+            origin: std::time::Instant::now(),
+            millis: AtomicI64::new(1_000),
+        });
+        let runtime = HostRuntime::new(
+            clock.clone(),
+            Arc::new(NoTasks),
+            Arc::new(crate::host::TokioBlockingSpawner::default()),
         );
-        let ex = Executor::new(ProcessId::new(1), dp, Registry::new()).with_state(state.clone());
+        let (facts, _) = FactSink::in_memory();
+        let data_plane =
+            DataPlane::new(HandleTable::new(), facts, test_state()).with_host_runtime(runtime)?;
+        let executor = Executor::new(
+            ProcessId::new(1),
+            IdentityRef::ROOT,
+            data_plane,
+            Registry::new(),
+        )?;
+        let output = executor.run_wait(&WaitSpec::Deadline(1_500)).await;
+        ensure!(output.outcome == Outcome::Done(Value::null()));
+        ensure!(clock.unix_millis() == 1_500);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn installed_host_clock_controls_open_call_and_acting_authority() -> anyhow::Result<()> {
+        let clock = Arc::new(ManualClock {
+            origin: std::time::Instant::now(),
+            millis: AtomicI64::new(1_000),
+        });
+        let runtime = HostRuntime::new(
+            clock.clone(),
+            Arc::new(NoTasks),
+            Arc::new(crate::host::TokioBlockingSpawner::default()),
+        );
+        let (facts, _) = FactSink::in_memory();
+        let data_plane =
+            DataPlane::new(HandleTable::new(), facts, test_state()).with_host_runtime(runtime)?;
+        let registry = Registry::new();
+        let (_, target) = register_test_resource(
+            &registry,
+            TestResourceSpec {
+                path: "effect://clock/echo",
+                kind: ResourceKind::Effect,
+                addressing: xolotl_types::ResourceAddressing::Exact,
+                family: InterfaceFamily::Callable,
+                method_name: "invoke",
+                authority: xolotl_types::MethodAuthority::Perform,
+                method_id: 0,
+                purity: Purity::Pure,
+                replay: ReplayClass::Deterministic,
+                driver_name: "clock-echo",
+                selector: "perform://effect/clock/echo",
+                requires_unprotected_input: false,
+            },
+            Arc::new(EchoDriver),
+        )?;
+        for selector in ["perform://effect/clock/echo", "act-as://identity/bob"] {
+            registry.register_grant(Grant {
+                id: registry.next_grant_id(),
+                holder: ProcessId::new(1),
+                selector: ResourceSelector::parse(selector)?,
+                rights: xolotl_types::GrantRights::new(
+                    xolotl_types::GrantMethods::all(),
+                    RightFlags::DELEGATE,
+                ),
+                constraints: ConstraintSet::empty(),
+                expires: Expiry::At(2_000),
+            });
+        }
+        let identities = IdentityRegistry::in_memory();
+        let bob = Path::parse("identity://bob")?;
+        identities.resolve_or_register(&bob)?;
+        let executor = Executor::new(ProcessId::new(1), IdentityRef::ROOT, data_plane, registry)?
+            .with_identity_registry(identities);
+        let operation = OperationTemplate {
+            target,
+            method: "invoke".into(),
+            method_id: None,
+            output: xolotl_types::OutputMode::Unary,
+            literal_input: Some(Value::integer(17)),
+        };
+        executor.prepare_operation(&operation)?;
+        let output = executor.eval(&DoNode::op(operation)).await;
+        ensure!(
+            output.outcome == Outcome::Done(Value::integer(17)),
+            "call should use the installed clock: {output:?}"
+        );
+        let acting = DoNode::acting(bob.clone(), DoNode::pure(Value::integer(23)));
+        let output = executor.eval(&acting).await;
+        ensure!(
+            output.outcome == Outcome::Done(Value::integer(23)),
+            "acting should use the installed clock: {output:?}"
+        );
+        clock.millis.store(2_001, Ordering::SeqCst);
+        ensure!(!executor.authorize_act_as(&bob, &Value::null()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_signal_resolves_on_write() -> anyhow::Result<()> {
+        let boot = crate::Bootstrap::in_memory();
+        let state = boot.kernel().state().clone();
+        super::signal_tests::install_signal_resource(&boot, state.clone())?;
+        let ex = boot.kernel().executor_for(boot.root());
         let signal = xolotl_types::Path::parse("state://stream/1/sig")?;
         // Write the signal after a short delay; the Wait must observe it.
         let writer = {
@@ -1379,13 +2994,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_signal_without_state_fails() -> anyhow::Result<()> {
-        let ex = executor(); // no state backend bound
+    async fn wait_signal_without_subscribe_resource_fails() -> anyhow::Result<()> {
+        let ex = executor(); // no subscribe method installed
         let signal = xolotl_types::Path::parse("state://stream/1/sig")?;
         let out = ex.eval(&DoNode::wait_signal(signal)).await;
         ensure!(
             matches!(out.outcome, Outcome::Fail(_)),
-            "wait without state should fail, got {out:?}"
+            "wait without a subscribe resource should fail, got {out:?}"
         );
         Ok(())
     }
@@ -1419,10 +3034,16 @@ mod tests {
         let bootstrap = crate::Bootstrap::in_memory();
         let target = bootstrap.register_effect(
             "effect://arbitrary/capability",
-            &[crate::MethodSpec::unary_async("invoke", Purity::Effectful).unprotected_input()],
+            &[crate::MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                Purity::Effectful,
+                crate::MethodSpec::UNARY_ASYNC,
+            )
+            .unprotected_input()],
             Arc::new(EchoDriver),
         )?;
-        let ex = bootstrap.kernel.executor_for(bootstrap.root);
+        let ex = bootstrap.kernel().executor_for(bootstrap.root());
         let env = Env::root(IdentityRef::ROOT).with_taint(xolotl_types::TaintSet::of(
             xolotl_types::TaintSource::Protected {
                 path: xolotl_types::Path::parse("state://vault/alice/x")?,
@@ -1441,16 +3062,17 @@ mod tests {
                 Value::string("secret".into()),
                 &env,
                 OperationId::new(
-                    bootstrap.root,
+                    bootstrap.root(),
                     ExecutionId::FIRST,
                     InvocationId::new(1),
                     NodeId::new(0),
                     0,
                 ),
                 true,
+                None,
             )
             .await;
-        match out.outcome {
+        match out.output.outcome {
             Outcome::Fail(xolotl_types::Failure::PolicyViolation { policy, .. }) => {
                 ensure!(policy == "taint", "unexpected policy: {policy}");
             }
@@ -1476,7 +3098,10 @@ mod tests {
             id: reg.next_grant_id(),
             holder: ProcessId::new(1),
             selector: ResourceSelector::all(),
-            rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
+            rights: xolotl_types::GrantRights::new(
+                xolotl_types::GrantMethods::all(),
+                RightFlags::all(),
+            ),
             constraints: ConstraintSet::empty(),
             expires: Expiry::Never,
         });
@@ -1485,8 +3110,10 @@ mod tests {
             TestResourceSpec {
                 path: "state://memory",
                 kind: ResourceKind::State,
+                addressing: xolotl_types::ResourceAddressing::Prefix,
                 family: InterfaceFamily::Value,
                 method_name: "read",
+                authority: xolotl_types::MethodAuthority::Read,
                 method_id: 0,
                 purity: Purity::Pure,
                 replay: ReplayClass::Observation,
@@ -1503,8 +3130,10 @@ mod tests {
             TestResourceSpec {
                 path: "effect://chat_platform/post",
                 kind: ResourceKind::Effect,
+                addressing: xolotl_types::ResourceAddressing::Exact,
                 family: InterfaceFamily::Callable,
                 method_name: "invoke",
+                authority: xolotl_types::MethodAuthority::Perform,
                 method_id: 0,
                 purity: Purity::Effectful,
                 replay: ReplayClass::NonIdempotentEffect,
@@ -1516,16 +3145,15 @@ mod tests {
         )?;
 
         let (facts, _) = FactSink::in_memory();
-        let handles = Arc::new(RwLock::new(HandleTable::new()));
+        let handles = HandleTable::new();
         let dp = DataPlane::new(handles.clone(), facts, state);
-        let ex = Executor::new(ProcessId::new(1), dp, reg.clone());
+        let ex = Executor::new(ProcessId::new(1), IdentityRef::ROOT, dp, reg.clone())?;
 
         let read_target = ResourceName::new(secret_path.clone());
         let read_handle = {
-            let mut table = handles.write();
             open_resource(
                 &reg,
-                &mut table,
+                &handles,
                 OpenRequest {
                     process: ProcessId::new(1),
                     resource: state_resource,
@@ -1538,13 +3166,12 @@ mod tests {
             )
             .context("state read open failed")?
         };
-        ex.bind_handle(read_target.clone(), read_handle);
+        ex.bind_handle(read_target.clone(), read_handle)?;
 
         let post_handle = {
-            let mut table = handles.write();
             open_resource(
                 &reg,
-                &mut table,
+                &handles,
                 OpenRequest {
                     process: ProcessId::new(1),
                     resource: post_resource,
@@ -1557,7 +3184,7 @@ mod tests {
             )
             .context("post open failed")?
         };
-        ex.bind_handle(post_name.clone(), post_handle);
+        ex.bind_handle(post_name.clone(), post_handle)?;
 
         let post_step_target = post_name;
         let ex = ex.with_steps(StepModule::single("post", move |_, _| {

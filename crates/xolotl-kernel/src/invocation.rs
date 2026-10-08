@@ -15,10 +15,12 @@ mod execute;
 #[cfg(feature = "host")]
 pub(crate) use accounting::Reservation;
 pub use accounting::{
-    Account, AccountPermit, AccountRequest, Billing, CallContext, Charge, Settlement,
+    Account, AccountCompletion, AccountPermit, AccountRequest, Billing, CallContext, Charge,
+    Settlement,
 };
 pub use execute::{
-    FactRecorder, InvocationCall, InvocationDriver, InvocationResult, NoFacts, invoke,
+    CompletionError, FactRecorder, InvocationCall, InvocationDriver, InvocationResult, NoFacts,
+    invoke,
 };
 
 /// Host observations supplied for one invocation, independent of method rules.
@@ -26,7 +28,10 @@ pub use execute::{
 pub struct InvocationOptions {
     /// Wall clock used by policy and operation records.
     pub now_millis: i64,
-    /// Retain a Fact even for a deterministic call whose output is unconsumed.
+    /// Default identity observed by the trusted host, independently of `Operation::acting`.
+    /// `None` means the host cannot observe it; it never implies root authority.
+    pub caller_identity: Option<IdentityRef>,
+    /// Retain a Fact for this invocation, independently of its replay or output mode.
     pub record: bool,
 }
 
@@ -77,6 +82,7 @@ pub struct Invocation<'a> {
     operation: &'a Operation,
     grant: GrantedMethod,
     options: InvocationOptions,
+    taint: Option<TaintSet>,
 }
 
 impl<'a> Invocation<'a> {
@@ -110,17 +116,39 @@ impl<'a> Invocation<'a> {
                 reason: alloc::format!("unsupported output mode {:?}", operation.output),
             });
         }
-        if grant.contract.requires_unprotected_input && operation.taint.has_protected() {
+        let invocation = Self {
+            operation,
+            grant,
+            options,
+            taint: None,
+        };
+        invocation.check_input_taint()?;
+        Ok(invocation)
+    }
+
+    /// Retain sources observed while deciding whether to dispatch or deliver.
+    pub fn observe(&mut self, sources: &TaintSet) {
+        if !sources.sources().is_empty() {
+            self.taint
+                .get_or_insert_with(|| self.operation.taint.clone())
+                .union(sources);
+        }
+    }
+
+    /// Input and control sources acquired by this invocation so far.
+    pub fn taint(&self) -> &TaintSet {
+        self.taint.as_ref().unwrap_or(&self.operation.taint)
+    }
+
+    /// Check control sources before dispatching a method with input restrictions.
+    pub fn check_input_taint(&self) -> Result<(), Failure> {
+        if self.grant.contract.requires_unprotected_input && self.taint().has_protected() {
             return Err(Failure::policy(
                 "taint",
                 "method requires unprotected input",
             ));
         }
-        Ok(Self {
-            operation,
-            grant,
-            options,
-        })
+        Ok(())
     }
 
     /// Execution metadata bound to the admitted method.
@@ -128,28 +156,29 @@ impl<'a> Invocation<'a> {
         self.grant.contract
     }
 
-    /// Effects and process creation always require a write-ahead record.
+    /// Whether the host explicitly selected Fact recording for this invocation.
     pub fn records_fact(&self) -> bool {
         self.options.record
-            || matches!(
-                self.grant.contract.replay,
-                ReplayClass::IdempotentEffect | ReplayClass::NonIdempotentEffect
-            )
-            || matches!(
-                self.operation.output,
-                xolotl_types::OutputMode::AsyncProcess
-            )
     }
 
-    /// Intent record that must be committed before an external effect starts.
+    /// Intent record committed before dispatch when recording is selected.
     pub fn pending_fact(&self) -> Fact {
-        operation_fact(
+        let mut fact = operation_fact(
             self.operation,
             self.grant.resource,
             self.grant.contract.replay,
-            self.options.now_millis,
+            self.options,
             DecisionTag::Ok,
-        )
+        );
+        fact.taint = self.taint().clone();
+        fact
+    }
+
+    /// A pre-dispatch rejection retaining input and acquired control sources.
+    pub fn denied_fact(&self, decision: DecisionTag) -> Fact {
+        let mut fact = self.pending_fact();
+        fact.decision = decision;
+        fact
     }
 
     /// Record the returned value and sources, preserving the Fact's audit order:
@@ -167,6 +196,16 @@ impl<'a> Invocation<'a> {
 pub(crate) fn complete_output(mut output: DriverOutput, input_taint: &TaintSet) -> DriverOutput {
     output.taint.union(input_taint);
     output
+}
+
+pub(crate) fn sink_outcome(mut outcome: xolotl_types::Outcome) -> xolotl_types::Outcome {
+    match &mut outcome {
+        xolotl_types::Outcome::Done(value) | xolotl_types::Outcome::Short(value) => {
+            *value = xolotl_types::Value::null();
+        }
+        xolotl_types::Outcome::Fail(_) => {}
+    }
+    outcome
 }
 
 fn complete_fact(
@@ -189,19 +228,21 @@ fn complete_fact(
     fact
 }
 
-/// Record a denied invocation, including denials before a method is resolved.
+/// Construct a denied invocation Fact, including denials before method resolution.
+/// Reuse the host observations captured before admission. The host chooses
+/// whether to retain this record; construction does not commit it.
 pub fn denied_fact(
     operation: &Operation,
     resource: Option<ResourceId>,
     replay: ReplayClass,
-    now_millis: i64,
+    options: InvocationOptions,
     decision: DecisionTag,
 ) -> Fact {
     operation_fact(
         operation,
         resource.unwrap_or_else(|| ResourceId::new(0)),
         replay,
-        now_millis,
+        options,
         decision,
     )
 }
@@ -210,13 +251,14 @@ fn operation_fact(
     operation: &Operation,
     resource: ResourceId,
     replay: ReplayClass,
-    now_millis: i64,
+    options: InvocationOptions,
     decision: DecisionTag,
 ) -> Fact {
     Fact {
         id: operation.id,
         schema_version: Fact::SCHEMA_VERSION,
         caller: operation.process,
+        caller_identity: options.caller_identity,
         acting: operation.acting,
         handle: operation.handle,
         resource,
@@ -231,7 +273,7 @@ fn operation_fact(
         outcome: None,
         batch: None,
         replay,
-        timestamp: Timestamp::millis(now_millis),
+        timestamp: Timestamp::millis(options.now_millis),
     }
 }
 

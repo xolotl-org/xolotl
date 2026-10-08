@@ -39,7 +39,6 @@ pub fn run(config: &Config) -> anyhow::Result<Work> {
         entry: 0,
         bindings: 0,
         imports: 0,
-        durable: false,
     };
     let mut tasks = [Task::default()];
     let mut machine = Execution::new(
@@ -52,21 +51,20 @@ pub fn run(config: &Config) -> anyhow::Result<Work> {
             bindings_per_task: 0,
             max_steps: None,
             cleanup_steps: 64,
-            durable: false,
         },
         42,
         1,
     )?;
     let target = u64::try_from(config.work.get())?;
-    while machine.checkpoint().meta.steps < target {
-        let remaining = target - machine.checkpoint().meta.steps;
+    while machine.view().meta.steps < target {
+        let remaining = target - machine.view().meta.steps;
         let quantum = u32::try_from(remaining.min(256))?;
         ensure!(matches!(
             black_box(machine.advance(&image, &mut Scalars, quantum)),
             Advance::Yielded
         ));
     }
-    ensure!(machine.checkpoint().meta.steps == target);
+    ensure!(machine.view().meta.steps == target);
     machine.cancel();
     ensure!(matches!(
         machine.advance(&image, &mut Scalars, 64),

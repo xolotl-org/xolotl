@@ -1,0 +1,25 @@
+[package]
+name = "xolotl-federation-key"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Offline ML-DSA-65 provisioning for Xolotl federation v1"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+clap = { workspace = true, features = ["std", "help", "usage", "error-context", "suggestions"] }
+data-encoding = { workspace = true, features = ["alloc"] }
+getrandom = { workspace = true, features = ["std"] }
+rustix = { workspace = true, features = ["fs", "process", "std"] }
+sha2 = { workspace = true }
+xolotl-federation.workspace = true
+zeroize = { workspace = true, features = ["alloc"] }
+
+[dev-dependencies]
+tempfile = { workspace = true, features = ["getrandom"] }

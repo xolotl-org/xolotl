@@ -23,11 +23,13 @@ message ExternalFrame {
     InvokeResult invoke_result = 9;
     ControlFrame control = 11;
     SecureEnvelope secure_envelope = 12;
+    SourceStreamRequest source_stream_request = 13;
+    SourceStreamResult source_stream_result = 14;
   }
 }
 
-// AEAD-protected business/control frame envelope. Handshake frames remain
-// plaintext until the daemon has selected the authoritative session context.
+// AEAD-protected ready, business, and control frame envelope. Only Hello and
+// SessionContext are plaintext; RoleReady is the first encrypted client frame.
 message SecureEnvelope {
   string installation_id = 1;
   uint64 generation = 2;
@@ -49,6 +51,9 @@ message EnvelopeAad {
   uint64 credential_generation = 8;
   bytes transcript_hash = 9;
   uint64 key_epoch = 10;
+  // Required AEAD direction domain; prevents a sealed response being reflected
+  // as a valid request (or vice versa).
+  string direction = 11;
 }
 
 // Session handshake frames.
@@ -76,6 +81,13 @@ message SessionContext {
   uint64 presentation_config_generation = 9;
   uint64 alias_catalog_generation = 10;
   string session_id = 11;
+  // Storage-issued Source projection incarnation; Source must be nonzero,
+  // Provider uses zero. RoleReady echoes it to bind the ready session.
+  uint64 scope_epoch = 12;
+  // Storage-issued installation incarnation, nonzero for both roles.
+  uint64 installation_epoch = 13;
+  // Current AEAD key epoch; required to seal authenticated RoleReady.
+  uint64 key_epoch = 14;
 }
 
 // Role client acknowledgement of the daemon-selected context.
@@ -103,6 +115,88 @@ message InboundEvent {
   ObservedGenerations observed = 4;
   optional string stream_id = 5;
   optional uint64 seq = 6;
+  // Storage-issued incarnation of stream_id. Ordered events require all three
+  // of stream_id, seq, and stream_epoch; data frames never open a stream.
+  optional uint64 stream_epoch = 7;
+}
+
+// Source stream lifecycle is separate from presentation/config controls.
+// Requests run only on a ready Source session and are scoped by its context.
+message SourceStreamRequest {
+  // Correlates a result. For Open this is also the stable open_id retained by
+  // storage, so retrying after a lost response returns the same active stream.
+  string request_id = 1;
+  string stream_id = 2;
+  oneof operation {
+    SourceStreamInspect inspect = 3;
+    SourceStreamOpen open = 4;
+    SourceStreamRetire retire = 5;
+  }
+}
+
+message SourceStreamInspect {}
+
+message SourceStreamOpen {
+  // Scope-local catalog revision obtained from Inspect. This CAS prevents an
+  // old Open retry from reopening a stream after it was retired.
+  uint64 expected_revision = 1;
+}
+
+message SourceStreamRetire {
+  uint64 stream_epoch = 1;
+}
+
+message SourceStreamState {
+  uint64 stream_epoch = 1;
+  uint64 last_seq = 2;
+  string open_id = 3;
+  // Original Open CAS revision, paired with open_id for retry identity.
+  uint64 opened_at_revision = 4;
+}
+
+message SourceStreamSnapshot {
+  uint64 revision = 1;
+  optional SourceStreamState active = 2;
+}
+
+message SourceStreamRetired {
+  uint64 revision = 1;
+}
+
+enum SourceStreamRejectCode {
+  SOURCE_STREAM_REJECT_CODE_UNSPECIFIED = 0;
+  SOURCE_STREAM_REJECT_CODE_INVALID_STREAM_ID = 1;
+  SOURCE_STREAM_REJECT_CODE_INVALID_REQUEST_ID = 2;
+  SOURCE_STREAM_REJECT_CODE_INVALID_EPOCH = 3;
+  SOURCE_STREAM_REJECT_CODE_SCOPE_INACTIVE = 4;
+  SOURCE_STREAM_REJECT_CODE_REVISION_CONFLICT = 5;
+  SOURCE_STREAM_REJECT_CODE_ALREADY_OPEN = 6;
+  SOURCE_STREAM_REJECT_CODE_QUOTA_EXCEEDED = 7;
+  SOURCE_STREAM_REJECT_CODE_INACTIVE = 8;
+  SOURCE_STREAM_REJECT_CODE_STALE_EPOCH = 9;
+  SOURCE_STREAM_REJECT_CODE_STORAGE_UNAVAILABLE = 10;
+  SOURCE_STREAM_REJECT_CODE_OUTCOME_UNKNOWN = 11;
+}
+
+message SourceStreamRejected {
+  SourceStreamRejectCode code = 1;
+  // Set only for RevisionConflict or Inactive.
+  optional uint64 current_revision = 2;
+  // Set only for StaleEpoch.
+  optional uint64 active_epoch = 3;
+  // Set only for AlreadyOpen.
+  optional SourceStreamSnapshot current = 4;
+}
+
+message SourceStreamResult {
+  string request_id = 1;
+  string stream_id = 2;
+  oneof outcome {
+    SourceStreamSnapshot inspected = 3;
+    SourceStreamSnapshot opened = 4;
+    SourceStreamRetired retired = 5;
+    SourceStreamRejected rejected = 6;
+  }
 }
 
 // Daemon to Source client: execute this action through the connector.
@@ -133,6 +227,9 @@ message EventAck {
   string id = 1;
   AckStatus status = 2;
   optional string reject_reason = 3;
+  // Echo for ordered events. Together with id this disambiguates delayed
+  // acknowledgements across retirement and reopening of the same stream name.
+  optional uint64 stream_epoch = 4;
 }
 
 enum AckStatus {
@@ -140,6 +237,9 @@ enum AckStatus {
   ACK_STATUS_ACCEPTED = 1;
   ACK_STATUS_DUPLICATE = 2;
   ACK_STATUS_REJECTED = 3;
+  // Storage could not prove whether the event committed. Inspect the exact
+  // claim or retry the same event identity; do not treat this as rejection.
+  ACK_STATUS_OUTCOME_UNKNOWN = 4;
 }
 
 // Provider role frames.

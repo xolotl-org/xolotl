@@ -2,17 +2,19 @@
 
 use parking_lot::RwLock;
 use std::sync::Arc;
-use tokio::time::Instant;
+use std::time::Duration;
+use xolotl_kernel::host::{HostDeadline, HostRuntime};
 use xolotl_state::object::ObjectMetadata;
 use xolotl_state::{Backend, StateFailure};
 use xolotl_types::{Path, TaintedValue, Value};
 
 use crate::{
-    GatewayError, GatewayRuntime, GatewayRuntimeState, GatewaySession, now_millis, state_path,
-    validate_current_session,
+    GatewayError, GatewayRuntime, GatewayRuntimeState, GatewaySession, validate_current_session,
 };
 
+pub(in crate::object) mod maintenance;
 pub(super) mod record;
+pub(crate) use maintenance::ReadGrantMaintenance;
 use record::ReadGrantScope;
 
 /// Explicit delegation requested by trusted host code with object read authority.
@@ -95,9 +97,14 @@ impl StoredReadGrant {
         grant_id: &str,
     ) -> Result<Option<Self>, GatewayError> {
         let path = read_grant_path(grant_id)?;
-        let Some(envelope) = state.read_tainted(&path).await.map_err(state_error)? else {
+        let observation = state
+            .read_tainted_bounded(&path, super::maintenance::PAGE_BUDGET)
+            .await
+            .map_err(state_error)?;
+        let Some(value) = observation.value else {
             return Ok(None);
         };
+        let envelope = xolotl_types::TaintedValue::new(value, observation.taint);
         let (scope, grant) = record::decode(grant_id, &envelope)?;
         Ok(Some(Self {
             path,
@@ -112,9 +119,10 @@ impl StoredReadGrant {
 pub(super) struct ReadAuthorization {
     state: Backend,
     runtime_state: Arc<RwLock<GatewayRuntimeState>>,
+    runtime: HostRuntime,
     session: GatewaySession,
     stored: StoredReadGrant,
-    deadline: Instant,
+    deadline: HostDeadline,
 }
 
 impl ReadAuthorization {
@@ -124,23 +132,24 @@ impl ReadAuthorization {
         grant_id: &str,
     ) -> Result<Self, GatewayError> {
         validate_current_session(&runtime.profile_snapshot(), session)?;
-        let stored = StoredReadGrant::load(&runtime.boot.kernel.state, grant_id)
+        let stored = StoredReadGrant::load(runtime.boot.kernel().state(), grant_id)
             .await?
             .ok_or_else(missing_grant)?;
-        let now = Instant::now();
+        let host_runtime = runtime.boot.kernel().host_runtime().clone();
         let remaining_ms = stored
             .grant
             .expires_at_ms
-            .saturating_sub(now_millis())
+            .saturating_sub(host_runtime.now_millis())
             .max(0) as u64;
-        let deadline = now
-            .checked_add(std::time::Duration::from_millis(remaining_ms))
+        let deadline = host_runtime
+            .deadline_after(Duration::from_millis(remaining_ms))
             .ok_or_else(|| {
                 GatewayError::Rejected("object read grant expiry is out of range".into())
             })?;
         let authorization = Self {
-            state: runtime.boot.kernel.state.clone(),
+            state: runtime.boot.kernel().state().clone(),
             runtime_state: runtime.state.clone(),
+            runtime: host_runtime,
             session: session.clone(),
             stored,
             deadline,
@@ -154,9 +163,19 @@ impl ReadAuthorization {
     }
 
     pub(super) fn validate(&self) -> Result<(), GatewayError> {
-        let profile = self.runtime_state.read().profile.clone();
-        self.stored.scope.validate(&profile, &self.session)?;
-        if self.stored.grant.expires_at_ms <= now_millis() || self.deadline <= Instant::now() {
+        self.stored
+            .scope
+            .validate(&self.runtime_state.read().profile, &self.session)?;
+        if self.stored.grant.expires_at_ms <= self.runtime.now_millis()
+            || self
+                .deadline
+                .elapsed_at(self.runtime.now())
+                .map_err(|error| {
+                    GatewayError::Rejected(format!(
+                        "object read grant clock domain changed: {error}"
+                    ))
+                })?
+        {
             return Err(GatewayError::Rejected("object read grant expired".into()));
         }
         Ok(())
@@ -167,12 +186,12 @@ impl ReadAuthorization {
         self.validate()?;
         let current = self
             .state
-            .read_tainted(&self.stored.path)
+            .read_tainted_bounded(&self.stored.path, super::maintenance::PAGE_BUDGET)
             .await
             .map_err(state_error)?;
-        if current.as_ref().is_none_or(|current| {
-            current.value != self.stored.value || current.taint != self.stored.grant.metadata.taint
-        }) {
+        if current.value.as_ref() != Some(&self.stored.value)
+            || current.taint != self.stored.grant.metadata.taint
+        {
             return Err(GatewayError::Rejected(
                 "object read grant was revoked or changed".into(),
             ));
@@ -190,12 +209,20 @@ pub(super) fn read_grant_path(grant_id: &str) -> Result<Path, GatewayError> {
     {
         return Err(invalid_id());
     }
-    state_path(&["gateway", "object-read-grant", grant_id])
+    crate::paths::gateway_state_path(&["object-read-grant", grant_id])
         .map_err(|error| GatewayError::Rejected(format!("invalid object read grant path: {error}")))
 }
 
 pub(super) fn state_error(error: StateFailure) -> GatewayError {
     GatewayError::Rejected(format!("object read grant storage failed: {error}"))
+}
+
+pub(crate) async fn maintain_read_grants_step(
+    state: &Backend,
+    cursor: &mut Option<xolotl_state::StateCursor>,
+    now_ms: i64,
+) -> Result<ReadGrantMaintenance, GatewayError> {
+    maintenance::maintain_read_grants_step(state, cursor, now_ms).await
 }
 
 fn missing_grant() -> GatewayError {

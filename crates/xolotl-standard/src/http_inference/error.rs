@@ -3,6 +3,8 @@ use thiserror::Error;
 /// HTTP inference provider construction and protocol errors.
 #[derive(Debug, Error)]
 pub(crate) enum HttpInferenceError {
+    #[error("HTTP inference provider TLS initialization failed: {0}")]
+    Tls(#[from] rustls::Error),
     /// Required config field was blank.
     #[error("{field} must not be empty")]
     EmptyField {

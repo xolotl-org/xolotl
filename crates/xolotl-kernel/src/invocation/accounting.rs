@@ -2,9 +2,10 @@
 
 use super::billable_input_tokens;
 use crate::Scope;
+use core::future::Future;
 use xolotl_types::{
-    CostModel, DriverOutput, Failure, MethodContract, Outcome, ProcessId, ProcessStatus,
-    UsageDimension, Value,
+    CostModel, DriverOutput, Failure, MethodContract, OperationId, Outcome, ProcessId,
+    ProcessStatus, UsageDimension, Value,
 };
 
 /// Spending held at admission or measured after a call.
@@ -102,7 +103,7 @@ impl Settlement {
     }
 
     /// Refund before dispatch; after dispatch retain the uncertain spend while
-    /// releasing concurrency. Later recovery may reconcile the retained estimate.
+    /// releasing concurrency. The host may reconcile the retained estimate.
     pub fn cancelled(reserved: Charge, dispatched: bool) -> Self {
         Self {
             reserved: if dispatched {
@@ -111,6 +112,19 @@ impl Settlement {
                 reserved
             },
             actual: Charge::default(),
+        }
+    }
+
+    /// Release concurrency after a failed settlement without refunding uncertain
+    /// spending. Retain at least both the estimate and the reported usage in each
+    /// dimension. This decision assumes the original reservation is still held.
+    pub fn unconfirmed(reserved: Charge, actual: Charge) -> Self {
+        Self {
+            reserved: Charge::default(),
+            actual: Charge {
+                micro_usd: actual.micro_usd.saturating_sub(reserved.micro_usd),
+                tokens: actual.tokens.saturating_sub(reserved.tokens),
+            },
         }
     }
 
@@ -139,7 +153,7 @@ pub enum CallContext {
 /// Bound account admission. Only the invocation boundary constructs this token.
 #[derive(Clone, Copy, Debug)]
 pub struct AccountRequest {
-    process: ProcessId,
+    operation: OperationId,
     charge: Charge,
     context: CallContext,
     finalize_allowed: bool,
@@ -153,7 +167,7 @@ impl AccountRequest {
         contract: MethodContract,
     ) -> Self {
         Self {
-            process: operation.process,
+            operation: operation.id,
             charge,
             context,
             finalize_allowed: contract.permits_cleanup(operation.process),
@@ -162,7 +176,18 @@ impl AccountRequest {
 
     /// The operation's admitted owner.
     pub fn process(self) -> ProcessId {
-        self.process
+        self.operation.process
+    }
+
+    /// Complete admitted identity, including execution, invocation, position and
+    /// retry attempt. Persistent receipts must not be keyed by process alone.
+    pub fn operation(self) -> OperationId {
+        self.operation
+    }
+
+    /// Lifecycle context selected by the trusted request adapter.
+    pub fn context(self) -> CallContext {
+        self.context
     }
 
     /// Amount reserved in the caller and all retained ancestor accounts.
@@ -174,7 +199,7 @@ impl AccountRequest {
     /// one short exclusive access. A successful body `Finally` uses ordinary
     /// admission; cancellation cleanup requires explicit method permission.
     pub fn reserve_scope(self, scope: &mut Scope) -> Result<(), Failure> {
-        if scope.process() != self.process {
+        if scope.process() != self.process() {
             return Err(Failure::policy(
                 "account",
                 "scope owner disagrees with operation",
@@ -223,40 +248,124 @@ pub trait Account {
         Self: 'a;
 
     /// Reserve the caller and all ancestors atomically; failures must roll back
-    /// only this attempt. The returned permit is settled exactly once.
+    /// only this attempt. The permit owns the reservation until successful
+    /// settlement or abandonment. An unresolved storage commit must not permit
+    /// later admission against stale account balances.
     fn reserve(&self, request: AccountRequest) -> Result<Self::Permit<'_>, Failure>;
 }
 
 /// Trusted ownership of one successful reservation, including its ancestor chain.
 pub trait AccountPermit {
-    /// Apply a shared decision to the same accounts. This must be infallible,
-    /// release concurrency exactly once, and never retain a lock across a poll.
-    fn settle(&mut self, settlement: Settlement);
+    /// Commit failures reported at the invocation boundary. Purely local
+    /// accounts can use [`core::convert::Infallible`].
+    type Error: Into<Failure>;
+
+    /// A commit may finish immediately or suspend. It owns its commit state,
+    /// borrowing neither the permit nor the temporary completion view. It may
+    /// retain references already held by the permit. No allocation or `Send`
+    /// bound is required; local accounts can use [`core::future::Ready`].
+    type Commit: Future<Output = Result<(), Self::Error>> + Unpin;
+
+    /// Commit the evidence required to start this operation. Called once, after
+    /// any Fact intent barrier and before even constructing the driver future.
+    /// The driver cannot start until the future succeeds. Failure or cancellation
+    /// prevents dispatch and is followed by undispatched abandonment, after the
+    /// commit future has been dropped.
+    fn dispatch(&mut self) -> Self::Commit;
+
+    /// Atomically retain the completion and settle the same accounts, releasing
+    /// concurrency exactly once. Account adapters bind their result and account
+    /// changes to the completion's admitted operation identity.
+    /// Success ends permit ownership. Failure or cancellation is followed by
+    /// abandonment using [`Settlement::unconfirmed`], and prevents completion of
+    /// the pending Fact. The reservation remains owned while the commit waits.
+    /// Keep enough receipt state to reconcile an ambiguous storage commit without
+    /// applying the settlement twice or refunding unconfirmed spending.
+    /// Encode or retain any completion data needed by the future before returning.
+    fn settle(&mut self, completion: AccountCompletion<'_>) -> Self::Commit;
+
+    /// End ownership when dispatch or settlement did not complete successfully,
+    /// or the invocation was dropped. This bounded, nonpanicking cleanup releases
+    /// concurrency; it cannot await an account commit. The decision is
+    /// relative to the original reservation, so adapters must account for any
+    /// settlement already applied before an ambiguous commit failure.
+    ///
+    /// Keep unresolved account receipts for reconciliation. If cleanup cannot
+    /// commit, retain the uncertain spend and prevent admission from stale state;
+    /// returning here must never assert that an unconfirmed refund succeeded.
+    fn abandon(&mut self, settlement: Settlement);
+}
+
+/// A known invocation result and the settlement that belongs to it.
+/// Constructed only by the invocation boundary after billing and output projection.
+/// The adapter can persist the result and all affected accounts in one transaction
+/// without retaining a borrow or making the driver produce a storage-specific type.
+#[derive(Clone, Copy, Debug)]
+pub struct AccountCompletion<'a> {
+    operation: OperationId,
+    settlement: Settlement,
+    output: &'a DriverOutput,
+}
+
+impl<'a> AccountCompletion<'a> {
+    /// The exact admitted operation, including execution and explicit retry.
+    pub fn operation(self) -> OperationId {
+        self.operation
+    }
+
+    /// Reservation and actual charge computed before output projection.
+    pub fn settlement(self) -> Settlement {
+        self.settlement
+    }
+
+    /// Final invocation result, including input provenance, reported usage and
+    /// completion origin. Sink-only payloads have already been discarded; their
+    /// actual charge is still retained in the settlement.
+    pub fn output(self) -> &'a DriverOutput {
+        self.output
+    }
 }
 
 pub(crate) struct Reservation<P: AccountPermit> {
     permit: P,
+    operation: OperationId,
     charge: Charge,
-    dispatched: bool,
+    abandonment: Settlement,
     settled: bool,
 }
 
 impl<P: AccountPermit> Reservation<P> {
-    pub fn new(permit: P, charge: Charge) -> Self {
+    pub fn new(permit: P, operation: OperationId, charge: Charge) -> Self {
         Self {
             permit,
+            operation,
             charge,
-            dispatched: false,
+            abandonment: Settlement::cancelled(charge, false),
             settled: false,
         }
     }
-    pub fn dispatch(&mut self) {
-        self.dispatched = true;
+    pub fn begin_dispatch(&mut self) -> P::Commit {
+        self.permit.dispatch()
     }
-    pub fn complete(mut self, actual: Charge) {
+    pub fn confirm_dispatch(&mut self) {
+        self.abandonment = Settlement::cancelled(self.charge, true);
+    }
+
+    /// Retain known usage even if an owned settlement job is rejected before it
+    /// can begin. This only changes the Drop fallback; it performs no commit.
+    pub fn prepare_settlement(&mut self, actual: Charge) {
+        self.abandonment = Settlement::unconfirmed(self.charge, actual);
+    }
+    pub fn begin_settlement(&mut self, actual: Charge, output: &DriverOutput) -> P::Commit {
+        self.prepare_settlement(actual);
+        self.permit.settle(AccountCompletion {
+            operation: self.operation,
+            settlement: Settlement::completed(self.charge, actual),
+            output,
+        })
+    }
+    pub fn confirm_settlement(mut self) {
         self.settled = true;
-        self.permit
-            .settle(Settlement::completed(self.charge, actual));
     }
 }
 
@@ -264,8 +373,7 @@ impl<P: AccountPermit> Drop for Reservation<P> {
     fn drop(&mut self) {
         if !self.settled {
             self.settled = true;
-            self.permit
-                .settle(Settlement::cancelled(self.charge, self.dispatched));
+            self.permit.abandon(self.abandonment);
         }
     }
 }

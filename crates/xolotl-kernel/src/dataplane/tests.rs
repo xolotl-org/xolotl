@@ -1,7 +1,7 @@
 use super::*;
 use crate::driver::{Driver, DriverContext, DriverPlan, EchoDriver, FnDriver};
 use crate::fact::FactStore;
-use crate::handle::{Handle, HandleState};
+use crate::handle::Handle;
 use anyhow::{Context, bail, ensure};
 use xolotl_state::{
     Backend, InMemoryBackend, StateError, StateMutation, StateRead, StateResult, StateScan,
@@ -18,6 +18,10 @@ const SUPPORTS_STREAM: OutputModeSet = OutputModeSet::STREAM;
 const SUPPORTS_ASYNC: OutputModeSet = OutputModeSet::ASYNC_PROCESS;
 
 mod completion;
+mod fact_write;
+mod identity;
+mod reentry;
+mod request_authorization;
 
 fn test_state() -> Backend {
     InMemoryBackend::new().into_backend()
@@ -26,10 +30,10 @@ fn test_state() -> Backend {
 struct FailingWriteState;
 
 impl StateRead for FailingWriteState {
-    type Read<'a> = core::future::Ready<StateResult<Option<TaintedValue>>>;
+    type Read<'a> = core::future::Ready<StateResult<xolotl_state::StateObservation>>;
 
     fn read_tainted<'a>(&'a self, _path: &'a Path) -> Self::Read<'a> {
-        core::future::ready(Ok(None))
+        core::future::ready(Ok(xolotl_state::StateObservation::default()))
     }
 }
 
@@ -59,10 +63,11 @@ fn dataplane_with_handle(
     fast_path: FastPath,
     contract: MethodContract,
 ) -> anyhow::Result<(DataPlane, HandleId)> {
-    let mut table = HandleTable::new();
+    let table = HandleTable::new();
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
     plan.insert(MethodId::new(7), contract, Arc::new(EchoDriver));
     let id = table.insert(Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process: ProcessId::new(1),
         acting: IdentityRef::ROOT,
@@ -70,14 +75,76 @@ fn dataplane_with_handle(
         rights,
         driver_plan: plan,
         fast_path,
-        state: HandleState::Active,
         bound_path: None,
     })?;
     let (facts, _) = FactSink::in_memory();
-    Ok((
-        DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state()),
-        id,
-    ))
+    Ok((DataPlane::new(table, facts, test_state()), id))
+}
+
+struct DeadlineReportingDriver;
+
+#[async_trait::async_trait]
+impl Driver for DeadlineReportingDriver {
+    async fn call(
+        &self,
+        _method: MethodId,
+        _input: Value,
+        _output: OutputMode,
+        ctx: &DriverContext,
+    ) -> Result<DriverOutput, DriverError> {
+        Ok(DriverOutput::new(Outcome::Done(Value::integer(
+            ctx.deadline_ms.unwrap_or(-1),
+        ))))
+    }
+}
+
+#[tokio::test]
+async fn execution_deadline_reaches_driver_as_unix_millis() -> anyhow::Result<()> {
+    let handles = HandleTable::new();
+    let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+    plan.insert(
+        MethodId::new(7),
+        MethodContract::new(0, ReplayClass::Deterministic, SUPPORTS_UNARY),
+        Arc::new(DeadlineReportingDriver),
+    );
+    let handle = handles.insert(Handle {
+        open_verb: "perform".into(),
+        id: HandleId::new(0, 0),
+        process: ProcessId::new(1),
+        acting: IdentityRef::ROOT,
+        resource: ResourceId::new(5),
+        rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+        driver_plan: plan,
+        fast_path: FastPath::Unconditional,
+        bound_path: None,
+    })?;
+    let (facts, _) = FactSink::in_memory();
+    let plane = DataPlane::new(handles, facts, test_state());
+    let now = plane.host_runtime().now_millis();
+    let deadline = plane
+        .host_runtime()
+        .deadline_after(std::time::Duration::from_secs(60))
+        .context("representable deadline")?;
+    let result = plane
+        .with_deadline(deadline)?
+        .execute(
+            &op(handle, 7, Value::null()),
+            InvocationOptions {
+                caller_identity: Some(IdentityRef::ROOT),
+                now_millis: now,
+                record: false,
+            },
+        )
+        .await;
+    let observed = match result.output.outcome {
+        Outcome::Done(value) => value.as_int().context("deadline was not an integer")?,
+        other => bail!("driver did not receive deadline: {other:?}"),
+    };
+    ensure!(
+        (now + 59_000..=now + 61_000).contains(&observed),
+        "driver received unexpected deadline: {observed}"
+    );
+    Ok(())
 }
 
 struct TaintReportingStateDriver {
@@ -104,12 +171,10 @@ impl Driver for TaintReportingStateDriver {
                     .read_tainted(&path)
                     .await
                     .map_err(|e| DriverError::Other(e.to_string()))?;
-                match tv {
-                    Some(tv) => {
-                        Ok(crate::DriverOutput::new(Outcome::Done(tv.value)).with_taint(tv.taint))
-                    }
-                    None => Ok(crate::DriverOutput::new(Outcome::Done(Value::null()))),
-                }
+                Ok(
+                    crate::DriverOutput::new(Outcome::Done(tv.value.unwrap_or_else(Value::null)))
+                        .with_taint(tv.taint),
+                )
             }
             4 => {
                 let rows = self
@@ -142,7 +207,7 @@ fn dataplane_with_state_handle(
     bound_path: Path,
     replay: ReplayClass,
 ) -> anyhow::Result<(DataPlane, HandleId, Arc<crate::fact::InMemoryFactStore>)> {
-    let mut table = HandleTable::new();
+    let table = HandleTable::new();
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
     plan.insert(
         method,
@@ -152,6 +217,7 @@ fn dataplane_with_state_handle(
         }),
     );
     let id = table.insert(Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process: ProcessId::new(1),
         acting: IdentityRef::ROOT,
@@ -159,15 +225,10 @@ fn dataplane_with_state_handle(
         rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
         driver_plan: plan,
         fast_path: FastPath::Unconditional,
-        state: HandleState::Active,
         bound_path: Some(bound_path),
     })?;
     let (facts, store) = FactSink::in_memory();
-    Ok((
-        DataPlane::new(Arc::new(RwLock::new(table)), facts, state),
-        id,
-        store,
-    ))
+    Ok((DataPlane::new(table, facts, state), id, store))
 }
 
 fn op(handle: HandleId, method: u64, input: Value) -> Operation {
@@ -200,15 +261,16 @@ async fn unconditional_executes_and_records_ok() -> anyhow::Result<()> {
         .execute(
             &op(id, 7, Value::integer(9)),
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: true,
             },
         )
         .await;
     ensure!(
-        out.outcome == Outcome::Done(Value::integer(9)),
+        out.output.outcome == Outcome::Done(Value::integer(9)),
         "unexpected outcome: {:?}",
-        out.outcome
+        out.output.outcome
     );
     Ok(())
 }
@@ -230,6 +292,7 @@ async fn state_read_output_taint_uses_persisted_taint() -> anyhow::Result<()> {
         .execute(
             &op(id, 0, Value::null()),
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: true,
             },
@@ -237,7 +300,7 @@ async fn state_read_output_taint_uses_persisted_taint() -> anyhow::Result<()> {
         .await;
 
     ensure!(
-        out.taint.has_protected(),
+        out.output.taint.has_protected(),
         "output taint should be protected"
     );
     let facts = store.all_facts().context("reading facts failed")?;
@@ -298,6 +361,7 @@ async fn provider_input_admission_is_frozen_and_records_only_its_safe_projection
             Arc::new(GuardedEcho(compilations.clone())),
         );
     let options = InvocationOptions {
+        caller_identity: None,
         now_millis: 0,
         record: true,
     };
@@ -305,14 +369,14 @@ async fn provider_input_admission_is_frozen_and_records_only_its_safe_projection
         .execute(&op(id, 7, Value::string("private".into())), options)
         .await;
     ensure!(matches!(
-        rejected.outcome,
+        rejected.output.outcome,
         Outcome::Fail(Failure::InvalidInput { .. })
     ));
     let facts = dp.facts.all_facts()?;
     ensure!(facts.len() == 1);
     ensure!(facts[0].input == Value::string("redacted".into()));
     let accepted = dp.execute(&op(id, 7, Value::integer(23)), options).await;
-    ensure!(accepted.outcome == Outcome::Done(Value::integer(23)));
+    ensure!(accepted.output.outcome == Outcome::Done(Value::integer(23)));
     ensure!(compilations.load(std::sync::atomic::Ordering::SeqCst) == 1);
     Ok(())
 }
@@ -341,6 +405,7 @@ async fn state_list_output_taint_unions_persisted_taint() -> anyhow::Result<()> 
         .execute(
             &op(id, 4, Value::null()),
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: true,
             },
@@ -348,7 +413,7 @@ async fn state_list_output_taint_unions_persisted_taint() -> anyhow::Result<()> 
         .await;
 
     ensure!(
-        out.taint.has_protected(),
+        out.output.taint.has_protected(),
         "listed output taint should be protected"
     );
     let facts = store.all_facts().context("reading facts failed")?;
@@ -379,12 +444,13 @@ async fn media_descriptors_retain_types_and_metadata_in_driver_and_facts() -> an
             .execute(
                 &op(id, 7, value.clone()),
                 InvocationOptions {
+                    caller_identity: None,
                     now_millis: 0,
                     record: true,
                 },
             )
             .await;
-        ensure!(out.outcome == Outcome::Done(value.clone()));
+        ensure!(out.output.outcome == Outcome::Done(value.clone()));
         let facts = dp.facts.all_facts()?;
         let [fact] = facts.as_slice() else {
             anyhow::bail!("media invocation must record exactly one Fact");
@@ -398,12 +464,13 @@ async fn media_descriptors_retain_types_and_metadata_in_driver_and_facts() -> an
 
 #[tokio::test]
 async fn batchable_list_records_single_fact_with_batch_summary() -> anyhow::Result<()> {
-    let mut table = HandleTable::new();
+    let table = HandleTable::new();
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
     let mut contract = MethodContract::new(0, ReplayClass::Deterministic, SUPPORTS_UNARY);
     contract.batchable = true;
     plan.insert(MethodId::new(7), contract, Arc::new(EchoDriver));
     let id = table.insert(Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process: ProcessId::new(1),
         acting: IdentityRef::ROOT,
@@ -411,25 +478,25 @@ async fn batchable_list_records_single_fact_with_batch_summary() -> anyhow::Resu
         rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
         driver_plan: plan,
         fast_path: FastPath::Unconditional,
-        state: HandleState::Active,
         bound_path: None,
     })?;
     let (facts, store) = FactSink::in_memory();
-    let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
+    let dp = DataPlane::new(table, facts, test_state());
     let input = Value::list(vec![Value::string("a".into()), Value::string("b".into())]);
     let out = dp
         .execute(
             &op(id, 7, input),
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: true,
             },
         )
         .await;
     ensure!(
-        matches!(&out.outcome, Outcome::Done(value) if value.as_list().is_some()),
+        matches!(&out.output.outcome, Outcome::Done(value) if value.as_list().is_some()),
         "batchable call should return a list, got {:?}",
-        out.outcome
+        out.output.outcome
     );
     let facts = store
         .facts_of(ProcessId::new(1))
@@ -457,15 +524,19 @@ async fn missing_right_is_denied() -> anyhow::Result<()> {
         .execute(
             &op(id, 7, Value::null()),
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: true,
             },
         )
         .await;
     ensure!(
-        matches!(out.outcome, Outcome::Fail(Failure::PermissionDenied { .. })),
+        matches!(
+            out.output.outcome,
+            Outcome::Fail(Failure::PermissionDenied { .. })
+        ),
         "missing right should deny, got {:?}",
-        out.outcome
+        out.output.outcome
     );
     Ok(())
 }
@@ -483,13 +554,14 @@ async fn wrong_owner_is_denied() -> anyhow::Result<()> {
         .execute(
             &o,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: true,
             },
         )
         .await;
     ensure!(
-        matches!(out.outcome, Outcome::Fail(_)),
+        matches!(out.output.outcome, Outcome::Fail(_)),
         "wrong owner should fail"
     );
     let facts = dp.facts.all_facts()?;
@@ -545,13 +617,14 @@ async fn identity_and_operation_namespace_are_bound_to_the_opened_handle() -> an
             .execute(
                 &operation,
                 InvocationOptions {
+                    caller_identity: None,
                     now_millis: 0,
                     record: false,
                 },
             )
             .await;
         ensure!(matches!(
-            output.outcome,
+            output.output.outcome,
             Outcome::Fail(Failure::PolicyViolation { .. })
         ));
         ensure!(calls.load(std::sync::atomic::Ordering::SeqCst) == 0);
@@ -569,13 +642,14 @@ async fn frozen_contract_controls_output_and_method_rights() -> anyhow::Result<(
         .execute(
             &operation,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: false,
             },
         )
         .await;
     ensure!(matches!(
-        output.outcome,
+        output.output.outcome,
         Outcome::Fail(Failure::InvalidInput { .. })
     ));
     ensure!(calls.load(std::sync::atomic::Ordering::SeqCst) == 0);
@@ -585,12 +659,13 @@ async fn frozen_contract_controls_output_and_method_rights() -> anyhow::Result<(
         .execute(
             &operation,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: false,
             },
         )
         .await;
-    ensure!(output.outcome == Outcome::Done(Value::null()));
+    ensure!(output.output.outcome == Outcome::Done(Value::null()));
     ensure!(calls.load(std::sync::atomic::Ordering::SeqCst) == 1);
 
     let (dp, handle, calls) = counted_dataplane(contract, MethodBitmap::method(7))?;
@@ -598,13 +673,14 @@ async fn frozen_contract_controls_output_and_method_rights() -> anyhow::Result<(
         .execute(
             &op(handle, 7, Value::null()),
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: false,
             },
         )
         .await;
     ensure!(matches!(
-        output.outcome,
+        output.output.outcome,
         Outcome::Fail(Failure::PermissionDenied { .. })
     ));
     ensure!(calls.load(std::sync::atomic::Ordering::SeqCst) == 0);
@@ -630,23 +706,45 @@ async fn hosted_calls_require_a_live_running_process() -> anyhow::Result<()> {
         let processes = ProcessTable::new();
         if let Some(status) = status {
             let mut entry = ProcessEntry::new(ProcessId::new(1), None, IdentityRef::ROOT);
-            entry.scope.restore_lifecycle(
-                status,
-                (status == ProcessStatus::Finalizing).then_some(ProcessStatus::Completed),
-            )?;
+            match status {
+                ProcessStatus::Created => {}
+                ProcessStatus::Finalizing => {
+                    ensure!(entry.scope.start());
+                    ensure!(
+                        entry.scope.begin_finalizing(ProcessStatus::Completed)
+                            == crate::ScopeFinalize::Started
+                    );
+                }
+                ProcessStatus::Completed => {
+                    ensure!(entry.scope.start());
+                    ensure!(entry.scope.begin_finalizing(status) == crate::ScopeFinalize::Started);
+                    ensure!(entry.scope.mark_terminal_status(status) == status);
+                }
+                ProcessStatus::Cancelled => {
+                    ensure!(entry.scope.start());
+                    ensure!(entry.scope.cancel());
+                }
+                _ => bail!("unexpected fixture status"),
+            }
             processes.insert(entry);
         }
         let output = dp
-            .with_processes(processes)
+            .with_host_runtime(processes.host_runtime().clone())?
+            .with_processes(processes)?
             .execute(
                 &op(handle, 7, Value::null()),
                 InvocationOptions {
+                    caller_identity: None,
                     now_millis: 0,
                     record: false,
                 },
             )
             .await;
-        ensure!(matches!(output.outcome, Outcome::Fail(Failure::Cancelled)));
+        ensure!(
+            matches!(output.output.outcome, Outcome::Fail(Failure::Cancelled)),
+            "unexpected outcome for {status:?}: {:?}",
+            output.output.outcome
+        );
         ensure!(calls.load(std::sync::atomic::Ordering::SeqCst) == 0);
     }
     Ok(())
@@ -671,14 +769,20 @@ async fn direct_calls_charge_the_frozen_batch_contract() -> anyhow::Result<()> {
     let mut entry = ProcessEntry::new(process, None, IdentityRef::ROOT);
     ensure!(entry.scope.start());
     processes.insert(entry);
-    let dp = dp.with_processes(processes.clone());
-    ensure!(processes.set_budget_spec(
-        process,
-        BudgetSpec {
-            daily_micro_usd: Some(5),
-            ..BudgetSpec::default()
-        }
-    ));
+    let dp = dp
+        .with_host_runtime(processes.host_runtime().clone())?
+        .with_processes(processes.clone())?;
+    ensure!(
+        processes
+            .set_budget_spec(
+                process,
+                BudgetSpec {
+                    max_micro_usd: Some(5),
+                    ..BudgetSpec::default()
+                }
+            )
+            .is_ok()
+    );
     let mut operation = op(
         handle,
         7,
@@ -688,33 +792,39 @@ async fn direct_calls_charge_the_frozen_batch_contract() -> anyhow::Result<()> {
         .execute(
             &operation,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: false,
             },
         )
         .await;
     ensure!(
-        matches!(output.outcome, Outcome::Fail(Failure::BudgetExhausted { ref dim }) if dim == "daily_micro_usd")
+        matches!(output.output.outcome, Outcome::Fail(Failure::BudgetExhausted { ref dim }) if dim == "micro_usd")
     );
     ensure!(calls.load(std::sync::atomic::Ordering::SeqCst) == 0);
-    ensure!(processes.set_budget_spec(
-        process,
-        BudgetSpec {
-            daily_micro_usd: Some(6),
-            ..BudgetSpec::default()
-        }
-    ));
+    ensure!(
+        processes
+            .set_budget_spec(
+                process,
+                BudgetSpec {
+                    max_micro_usd: Some(6),
+                    ..BudgetSpec::default()
+                }
+            )
+            .is_ok()
+    );
     operation.id.attempt = 1;
     let output = dp
         .execute(
             &operation,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: false,
             },
         )
         .await;
-    ensure!(output.outcome == Outcome::Done(operation.input));
+    ensure!(output.output.outcome == Outcome::Done(operation.input));
     ensure!(calls.load(std::sync::atomic::Ordering::SeqCst) == 1);
     let budget = processes
         .budget_mut(process, |budget| budget.clone())
@@ -725,7 +835,7 @@ async fn direct_calls_charge_the_frozen_batch_contract() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn driver_failure_records_driver_error() -> anyhow::Result<()> {
-    let mut table = HandleTable::new();
+    let table = HandleTable::new();
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
     plan.insert(
         MethodId::new(7),
@@ -733,6 +843,7 @@ async fn driver_failure_records_driver_error() -> anyhow::Result<()> {
         Arc::new(FnDriver(|_, _| Err(DriverError::Other("boom".into())))),
     );
     let id = table.insert(Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process: ProcessId::new(1),
         acting: IdentityRef::ROOT,
@@ -740,37 +851,35 @@ async fn driver_failure_records_driver_error() -> anyhow::Result<()> {
         rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
         driver_plan: plan,
         fast_path: FastPath::Unconditional,
-        state: HandleState::Active,
         bound_path: None,
     })?;
     let (facts, store) = FactSink::in_memory();
-    let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
-    // record=false, but a NonIdempotentEffect is always recorded so
-    // the write-ahead barrier still fires.
+    let dp = DataPlane::new(table, facts, test_state());
     let out = dp
         .execute(
             &op(id, 7, Value::null()),
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: false,
             },
         )
         .await;
     ensure!(
-        matches!(out.outcome, Outcome::Fail(Failure::HandlerError { .. })),
+        matches!(
+            out.output.outcome,
+            Outcome::Fail(Failure::HandlerError { .. })
+        ),
         "driver failure should surface handler error, got {:?}",
-        out.outcome
+        out.output.outcome
     );
-    // NonIdempotentEffect ⇒ write-ahead barrier fired at begin.
-    ensure!(store.sync_count() >= 1, "write-ahead barrier should sync");
+    ensure!(store.is_empty(), "unrecorded failure retained call history");
     Ok(())
 }
 
 #[tokio::test]
 async fn unconsumed_deterministic_read_skips_fact() -> anyhow::Result<()> {
-    // With record=false and a Deterministic class, no Fact is written
-    // because recovery can recompute the read. The store stays empty.
-    let mut table = HandleTable::new();
+    let table = HandleTable::new();
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
     plan.insert(
         MethodId::new(7),
@@ -778,6 +887,7 @@ async fn unconsumed_deterministic_read_skips_fact() -> anyhow::Result<()> {
         Arc::new(EchoDriver),
     );
     let id2 = table.insert(Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process: ProcessId::new(1),
         acting: IdentityRef::ROOT,
@@ -785,24 +895,24 @@ async fn unconsumed_deterministic_read_skips_fact() -> anyhow::Result<()> {
         rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
         driver_plan: plan,
         fast_path: FastPath::Unconditional,
-        state: HandleState::Active,
         bound_path: None,
     })?;
     let (facts, store) = FactSink::in_memory();
-    let dp2 = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
+    let dp2 = DataPlane::new(table, facts, test_state());
     let out = dp2
         .execute(
             &op(id2, 7, Value::integer(1)),
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: false,
             },
         )
         .await;
     ensure!(
-        out.outcome == Outcome::Done(Value::integer(1)),
+        out.output.outcome == Outcome::Done(Value::integer(1)),
         "deterministic read outcome mismatch: {:?}",
-        out.outcome
+        out.output.outcome
     );
     ensure!(
         store.is_empty(),
@@ -812,11 +922,8 @@ async fn unconsumed_deterministic_read_skips_fact() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn unconsumed_idempotent_effect_still_records_fact() -> anyhow::Result<()> {
-    // Effectful / IdempotentEffect operations are external side effects, so
-    // recovery must know they happened even if later graph nodes do not
-    // consume the result.
-    let mut table = HandleTable::new();
+async fn unrecorded_idempotent_effect_retains_no_fact() -> anyhow::Result<()> {
+    let table = HandleTable::new();
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
     plan.insert(
         MethodId::new(7),
@@ -824,6 +931,7 @@ async fn unconsumed_idempotent_effect_still_records_fact() -> anyhow::Result<()>
         Arc::new(EchoDriver),
     );
     let id = table.insert(Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process: ProcessId::new(1),
         acting: IdentityRef::ROOT,
@@ -831,38 +939,38 @@ async fn unconsumed_idempotent_effect_still_records_fact() -> anyhow::Result<()>
         rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
         driver_plan: plan,
         fast_path: FastPath::Unconditional,
-        state: HandleState::Active,
         bound_path: None,
     })?;
     let (facts, store) = FactSink::in_memory();
-    let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
+    let dp = DataPlane::new(table, facts, test_state());
     let out = dp
         .execute(
             &op(id, 7, Value::integer(1)),
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: false,
             },
         )
         .await;
     ensure!(
-        out.outcome == Outcome::Done(Value::integer(1)),
+        out.output.outcome == Outcome::Done(Value::integer(1)),
         "idempotent effect outcome mismatch: {:?}",
-        out.outcome
+        out.output.outcome
     );
-    ensure!(store.len() == 1, "idempotent effect should write one Fact");
+    ensure!(store.is_empty(), "unrecorded effect retained call history");
     Ok(())
 }
 
 #[tokio::test]
 async fn idempotent_effect_dedupes_by_business_key() -> anyhow::Result<()> {
-    // Two IdempotentEffect ops carrying the same `_idem_key` run the driver
-    // only once; the second short-circuits to the cached outcome.
+    // Business outcomes may be shared under the same acting identity, while
+    // each invocation records the default identity of its own calling process.
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: AtomicU32 = AtomicU32::new(0);
     CALLS.store(0, Ordering::SeqCst);
 
-    let mut table = HandleTable::new();
+    let table = HandleTable::new();
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
     plan.insert(
         MethodId::new(7),
@@ -873,6 +981,7 @@ async fn idempotent_effect_dedupes_by_business_key() -> anyhow::Result<()> {
         })),
     );
     let id = table.insert(Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process: ProcessId::new(1),
         acting: IdentityRef::ROOT,
@@ -880,12 +989,26 @@ async fn idempotent_effect_dedupes_by_business_key() -> anyhow::Result<()> {
         rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
         driver_plan: plan,
         fast_path: FastPath::Unconditional,
-        state: HandleState::Active,
         bound_path: None,
     })?;
+    let mut other_handle = table.get(id).context("original handle")?;
+    other_handle.process = ProcessId::new(2);
+    let other_handle = table.insert(other_handle)?;
+    let processes = crate::ProcessTable::new();
+    for (process, identity) in [(1, 91), (2, 92)] {
+        let mut entry = crate::process::ProcessEntry::new(
+            ProcessId::new(process),
+            None,
+            IdentityRef::new(identity),
+        );
+        ensure!(entry.scope.start());
+        processes.insert(entry);
+    }
     let (facts, store) = FactSink::in_memory();
     let state = test_state();
-    let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, state.clone());
+    let dp = DataPlane::new(table, facts, state.clone())
+        .with_host_runtime(processes.host_runtime().clone())?
+        .with_processes(processes)?;
 
     let mut m = std::collections::BTreeMap::new();
     m.insert("_idem_key".to_string(), Value::string("order-1".into()));
@@ -898,8 +1021,9 @@ async fn idempotent_effect_dedupes_by_business_key() -> anyhow::Result<()> {
         .execute(
             &o,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
-                record: false,
+                record: true,
             },
         )
         .await;
@@ -907,22 +1031,42 @@ async fn idempotent_effect_dedupes_by_business_key() -> anyhow::Result<()> {
         .execute(
             &retry,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
-                record: false,
+                record: true,
             },
         )
         .await;
 
     ensure!(
-        first.outcome == Outcome::Done(Value::integer(100)),
+        first.output.outcome == Outcome::Done(Value::integer(100)),
         "first idempotent outcome mismatch: {:?}",
-        first.outcome
+        first.output.outcome
     );
     ensure!(
-        second.outcome == Outcome::Done(Value::integer(100)),
+        second.output.outcome == Outcome::Done(Value::integer(100)),
         "second idempotent outcome mismatch: {:?}",
-        second.outcome
+        second.output.outcome
     );
+    let mut other = o.clone();
+    other.process = ProcessId::new(2);
+    other.id.process = other.process;
+    other.handle = other_handle;
+    let third = dp
+        .execute(
+            &other,
+            InvocationOptions {
+                caller_identity: Some(IdentityRef::new(91)),
+                now_millis: 1,
+                record: true,
+            },
+        )
+        .await;
+    ensure!(first.completion_error.is_none());
+    ensure!(second.completion_error.is_none());
+    ensure!(third.completion_error.is_none());
+    ensure!(third.output.outcome == Outcome::Done(Value::integer(100)));
+    ensure!(third.output.origin == CompletionOrigin::CachedOutcome);
     ensure!(CALLS.load(Ordering::SeqCst) == 1, "driver should run once");
     let facts = store
         .facts_of(ProcessId::new(1))
@@ -936,6 +1080,63 @@ async fn idempotent_effect_dedupes_by_business_key() -> anyhow::Result<()> {
         facts.iter().all(|f| f.decision == DecisionTag::Ok),
         "all retry facts should be ok decisions"
     );
+    ensure!(
+        facts
+            .iter()
+            .all(|fact| fact.caller_identity == Some(IdentityRef::new(91)))
+    );
+    let other_facts = store.facts_of(other.process)?;
+    ensure!(other_facts.len() == 1);
+    ensure!(other_facts[0].caller == other.process);
+    ensure!(other_facts[0].caller_identity == Some(IdentityRef::new(92)));
+    ensure!(other_facts[0].acting == IdentityRef::ROOT);
+    Ok(())
+}
+
+#[tokio::test]
+async fn idempotent_business_key_is_scoped_to_the_bound_target() -> anyhow::Result<()> {
+    let (dp, first_handle) = dataplane_with_handle(
+        Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+        FastPath::Unconditional,
+        MethodContract::new(0, ReplayClass::IdempotentEffect, SUPPORTS_UNARY),
+    )?;
+    let second_handle = {
+        let mut handles = dp.handles.write();
+        let first = handles.get_mut(first_handle).context("first handle")?;
+        first.bound_path = Some(Path::parse("effect://jobs/first")?);
+        let mut second = first.clone();
+        second.bound_path = Some(Path::parse("effect://jobs/second")?);
+        handles.insert(second)?
+    };
+    let input = |payload| {
+        Value::map(BTreeMap::from([
+            (
+                "_idem_key".into(),
+                Value::string("same-business-request".into()),
+            ),
+            ("payload".into(), Value::integer(payload)),
+        ]))
+    };
+    let first = op(first_handle, 7, input(1));
+    let mut second = op(second_handle, 7, input(2));
+    second.id = first.id.retry().context("attempt")?;
+    let options = InvocationOptions {
+        caller_identity: None,
+        now_millis: 0,
+        record: true,
+    };
+    ensure!(dp.execute(&first, options).await.output.outcome == Outcome::Done(input(1)));
+    let distinct = dp.execute(&second, options).await;
+    ensure!(
+        distinct.output.outcome == Outcome::Done(input(2)),
+        "another bound target reused the first result"
+    );
+    ensure!(distinct.output.origin == CompletionOrigin::CurrentAttempt);
+    second.id = second.id.retry().context("retry")?;
+    second.input = input(3);
+    let cached = dp.execute(&second, options).await;
+    ensure!(cached.output.outcome == Outcome::Done(input(2)));
+    ensure!(cached.output.origin == CompletionOrigin::CachedOutcome);
     Ok(())
 }
 
@@ -966,14 +1167,15 @@ async fn idempotent_replay_preserves_original_input_and_output_provenance() -> a
         .execute(
             &original,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
-                record: false,
+                record: true,
             },
         )
         .await;
-    ensure!(first.outcome == Outcome::Done(Value::string("original".into())));
+    ensure!(first.output.outcome == Outcome::Done(Value::string("original".into())));
     let mut expected_taint = protected.merged(&original.taint);
-    ensure!(first.taint == expected_taint);
+    ensure!(first.output.taint == expected_taint);
     state
         .write_set(&path, Value::string("changed".into()))
         .await?;
@@ -988,14 +1190,15 @@ async fn idempotent_replay_preserves_original_input_and_output_provenance() -> a
         .execute(
             &retry,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
-                record: false,
+                record: true,
             },
         )
         .await;
-    ensure!(replay.outcome == Outcome::Done(Value::string("original".into())));
+    ensure!(replay.output.outcome == Outcome::Done(Value::string("original".into())));
     expected_taint.union(&retry.taint);
-    ensure!(replay.taint == expected_taint);
+    ensure!(replay.output.taint == expected_taint);
     let facts = store.facts_of(retry.process)?;
     let fact = facts
         .iter()
@@ -1017,7 +1220,7 @@ async fn idempotent_effect_preserves_known_result_when_cache_write_fails() -> an
     static CALLS: AtomicU32 = AtomicU32::new(0);
     CALLS.store(0, Ordering::SeqCst);
 
-    let mut table = HandleTable::new();
+    let table = HandleTable::new();
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
     plan.insert(
         MethodId::new(7),
@@ -1028,6 +1231,7 @@ async fn idempotent_effect_preserves_known_result_when_cache_write_fails() -> an
         })),
     );
     let id = table.insert(Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process: ProcessId::new(1),
         acting: IdentityRef::ROOT,
@@ -1035,12 +1239,11 @@ async fn idempotent_effect_preserves_known_result_when_cache_write_fails() -> an
         rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
         driver_plan: plan,
         fast_path: FastPath::Unconditional,
-        state: HandleState::Active,
         bound_path: None,
     })?;
     let (facts, store) = FactSink::in_memory();
     let dp = DataPlane::new(
-        Arc::new(RwLock::new(table)),
+        table,
         facts,
         Backend::new()
             .with_read(Arc::new(FailingWriteState))
@@ -1053,16 +1256,17 @@ async fn idempotent_effect_preserves_known_result_when_cache_write_fails() -> an
         .execute(
             &op(id, 7, Value::map(m)),
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
-                record: false,
+                record: true,
             },
         )
         .await;
 
     ensure!(CALLS.load(Ordering::SeqCst) == 1, "driver should run once");
-    ensure!(out.outcome == Outcome::Done(Value::integer(100)));
+    ensure!(out.output.outcome == Outcome::Done(Value::integer(100)));
     ensure!(
-        out.taint == TaintSet::pristine(),
+        out.output.taint == TaintSet::pristine(),
         "cache failure must not change effect provenance"
     );
 
@@ -1105,12 +1309,15 @@ async fn completed_effect_settles_and_records_before_a_pending_cache_write() -> 
     let mut entry = crate::process::ProcessEntry::new(ProcessId::new(1), None, IdentityRef::ROOT);
     ensure!(entry.scope.start());
     processes.insert(entry);
-    let dp = dp.with_processes(processes.clone());
+    let dp = dp
+        .with_host_runtime(processes.host_runtime().clone())?
+        .with_processes(processes.clone())?;
     let operation = op(handle, 7, Value::string("response-body".into()));
     {
         let mut run = core::pin::pin!(dp.execute(
             &operation,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: true
             }
@@ -1140,14 +1347,14 @@ async fn completed_effect_settles_and_records_before_a_pending_cache_write() -> 
 
 #[tokio::test]
 async fn idempotent_effect_dedupes_across_data_plane_instances() -> anyhow::Result<()> {
-    // Idempotency records live in state://idemp/*, so a restarted DataPlane
+    // Idempotency records live in state://kernel/idemp/*, so a restarted DataPlane
     // sharing the backend still dedupes the same effective key.
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: AtomicU32 = AtomicU32::new(0);
     CALLS.store(0, Ordering::SeqCst);
 
     let mk_table = || -> anyhow::Result<_> {
-        let mut table = HandleTable::new();
+        let table = HandleTable::new();
         let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
         plan.insert(
             MethodId::new(7),
@@ -1158,6 +1365,7 @@ async fn idempotent_effect_dedupes_across_data_plane_instances() -> anyhow::Resu
             })),
         );
         let id = table.insert(Handle {
+            open_verb: "perform".into(),
             id: HandleId::new(0, 0),
             process: ProcessId::new(1),
             acting: IdentityRef::ROOT,
@@ -1165,7 +1373,6 @@ async fn idempotent_effect_dedupes_across_data_plane_instances() -> anyhow::Resu
             rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
             driver_plan: plan,
             fast_path: FastPath::Unconditional,
-            state: HandleState::Active,
             bound_path: None,
         })?;
         Ok((table, id))
@@ -1174,10 +1381,10 @@ async fn idempotent_effect_dedupes_across_data_plane_instances() -> anyhow::Resu
     let state = test_state();
     let (table1, id1) = mk_table()?;
     let (facts1, _) = FactSink::in_memory();
-    let dp1 = DataPlane::new(Arc::new(RwLock::new(table1)), facts1, state.clone());
+    let dp1 = DataPlane::new(table1, facts1, state.clone());
     let (table2, id2) = mk_table()?;
     let (facts2, _) = FactSink::in_memory();
-    let dp2 = DataPlane::new(Arc::new(RwLock::new(table2)), facts2, state.clone());
+    let dp2 = DataPlane::new(table2, facts2, state.clone());
 
     let mut m = std::collections::BTreeMap::new();
     m.insert("_idem_key".to_string(), Value::string("order-1".into()));
@@ -1185,6 +1392,7 @@ async fn idempotent_effect_dedupes_across_data_plane_instances() -> anyhow::Resu
         .execute(
             &op(id1, 7, Value::map(m.clone())),
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: true,
             },
@@ -1194,6 +1402,7 @@ async fn idempotent_effect_dedupes_across_data_plane_instances() -> anyhow::Resu
         .execute(
             &op(id2, 7, Value::map(m)),
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: true,
             },
@@ -1201,17 +1410,17 @@ async fn idempotent_effect_dedupes_across_data_plane_instances() -> anyhow::Resu
         .await;
 
     ensure!(
-        first.outcome == Outcome::Done(Value::integer(100)),
+        first.output.outcome == Outcome::Done(Value::integer(100)),
         "first dataplane outcome mismatch: {:?}",
-        first.outcome
+        first.output.outcome
     );
     ensure!(
-        second.outcome == Outcome::Done(Value::integer(100)),
+        second.output.outcome == Outcome::Done(Value::integer(100)),
         "second dataplane outcome mismatch: {:?}",
-        second.outcome
+        second.output.outcome
     );
     ensure!(CALLS.load(Ordering::SeqCst) == 1, "driver should run once");
-    let prefix = Path::parse("state://idemp")?;
+    let prefix = Path::parse("state://kernel/idemp")?;
     let entries = state
         .query(&StateScan::new(prefix))
         .await
@@ -1223,8 +1432,7 @@ async fn idempotent_effect_dedupes_across_data_plane_instances() -> anyhow::Resu
     Ok(())
 }
 
-/// A FactStore whose writes always fail, exercising the fail-closed
-/// write-ahead path without needing a real disk fault.
+/// A FactStore whose writes always fail, exercising selected recording rejection.
 #[derive(Default)]
 struct FailingFactStore(crate::InMemoryExecutionIdSource);
 
@@ -1247,13 +1455,10 @@ impl crate::fact::FactStore for FailingFactStore {
         Ok(crate::FactLookupResult::Missing)
     }
     fn append(&self, _fact: Fact) -> Result<u64, crate::fact::FactError> {
-        Err(crate::fact::FactError("simulated disk failure".into()))
+        Err(crate::fact::FactError::new("simulated disk failure".into()))
     }
     fn complete(&self, _fact: Fact) -> Result<(), crate::fact::FactError> {
-        Err(crate::fact::FactError("simulated disk failure".into()))
-    }
-    fn sync(&self) -> Result<(), crate::fact::FactError> {
-        Err(crate::fact::FactError("simulated disk failure".into()))
+        Err(crate::fact::FactError::new("simulated disk failure".into()))
     }
     fn facts_of(&self, _process: ProcessId) -> Result<Vec<Fact>, crate::fact::FactError> {
         Ok(Vec::new())
@@ -1267,13 +1472,14 @@ impl crate::fact::FactStore for FailingFactStore {
 }
 
 #[tokio::test]
-async fn idempotent_dedup_denies_when_retry_fact_record_fails() -> anyhow::Result<()> {
+async fn idempotent_dedup_retains_cached_result_when_retry_fact_record_fails() -> anyhow::Result<()>
+{
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: AtomicU32 = AtomicU32::new(0);
     CALLS.store(0, Ordering::SeqCst);
 
     let mk_table = || -> anyhow::Result<_> {
-        let mut table = HandleTable::new();
+        let table = HandleTable::new();
         let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
         plan.insert(
             MethodId::new(7),
@@ -1284,6 +1490,7 @@ async fn idempotent_dedup_denies_when_retry_fact_record_fails() -> anyhow::Resul
             })),
         );
         let id = table.insert(Handle {
+            open_verb: "perform".into(),
             id: HandleId::new(0, 0),
             process: ProcessId::new(1),
             acting: IdentityRef::ROOT,
@@ -1291,7 +1498,6 @@ async fn idempotent_dedup_denies_when_retry_fact_record_fails() -> anyhow::Resul
             rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
             driver_plan: plan,
             fast_path: FastPath::Unconditional,
-            state: HandleState::Active,
             bound_path: None,
         })?;
         Ok((table, id))
@@ -1300,7 +1506,7 @@ async fn idempotent_dedup_denies_when_retry_fact_record_fails() -> anyhow::Resul
     let state = test_state();
     let (table, id) = mk_table()?;
     let (facts, _) = FactSink::in_memory();
-    let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, state.clone());
+    let dp = DataPlane::new(table, facts, state.clone());
 
     let mut m = std::collections::BTreeMap::new();
     m.insert("_idem_key".to_string(), Value::string("order-1".into()));
@@ -1309,28 +1515,30 @@ async fn idempotent_dedup_denies_when_retry_fact_record_fails() -> anyhow::Resul
         .execute(
             &op(id, 7, input.clone()),
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
-                record: false,
+                record: true,
             },
         )
         .await;
     ensure!(
-        first.outcome == Outcome::Done(Value::integer(100)),
+        first.output.outcome == Outcome::Done(Value::integer(100)),
         "first idempotent outcome mismatch: {:?}",
-        first.outcome
+        first.output.outcome
     );
 
     let (table, id) = mk_table()?;
     let failing_facts = FactSink::new(Arc::new(FailingFactStore::default()));
-    let failing_dp = DataPlane::new(Arc::new(RwLock::new(table)), failing_facts, state);
+    let failing_dp = DataPlane::new(table, failing_facts, state);
     let mut retry = op(id, 7, input);
     retry.id = retry.id.retry().context("retry exhausted")?;
     let second = failing_dp
         .execute(
             &retry,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
-                record: false,
+                record: true,
             },
         )
         .await;
@@ -1341,26 +1549,25 @@ async fn idempotent_dedup_denies_when_retry_fact_record_fails() -> anyhow::Resul
     );
     ensure!(
         matches!(
-            &second.outcome,
-            Outcome::Fail(Failure::PolicyViolation { policy, detail })
-                if policy == "durability" && detail.contains("dedup fact record failed")
+            &second.completion_error,
+            Some(CompletionError::Fact(Failure::PolicyViolation { policy, detail }))
+                if policy == "fact_recording" && detail.contains("Fact completion failed")
         ),
-        "dedup fact failure should deny the retry, got {:?}",
-        second.outcome
+        "dedup fact failure must remain separate from the cached outcome: {:?}",
+        second
     );
+    ensure!(second.output.outcome == first.output.outcome);
+    ensure!(second.output.origin == CompletionOrigin::CachedOutcome);
     Ok(())
 }
 
 #[tokio::test]
-async fn write_ahead_failure_denies_effect_fail_closed() -> anyhow::Result<()> {
-    // A NonIdempotentEffect must write ahead before the effect is issued.
-    // If that durable append fails, the op is denied and the driver is
-    // never called; no effect can happen without a record.
+async fn selected_fact_begin_failure_prevents_dispatch() -> anyhow::Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     static CALLED: AtomicBool = AtomicBool::new(false);
     CALLED.store(false, Ordering::SeqCst);
 
-    let mut table = HandleTable::new();
+    let table = HandleTable::new();
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
     plan.insert(
         MethodId::new(7),
@@ -1371,6 +1578,7 @@ async fn write_ahead_failure_denies_effect_fail_closed() -> anyhow::Result<()> {
         })),
     );
     let id = table.insert(Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process: ProcessId::new(1),
         acting: IdentityRef::ROOT,
@@ -1378,26 +1586,29 @@ async fn write_ahead_failure_denies_effect_fail_closed() -> anyhow::Result<()> {
         rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
         driver_plan: plan,
         fast_path: FastPath::Unconditional,
-        state: HandleState::Active,
         bound_path: None,
     })?;
     let facts = FactSink::new(Arc::new(FailingFactStore::default()));
-    let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
+    let dp = DataPlane::new(table, facts, test_state());
 
     let out = dp
         .execute(
             &op(id, 7, Value::integer(9)),
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: true,
             },
         )
         .await;
 
-    ensure!(matches!(out.outcome, Outcome::Fail(_)), "op must be denied");
+    ensure!(
+        matches!(out.output.outcome, Outcome::Fail(_)),
+        "op must be denied"
+    );
     ensure!(
         !CALLED.load(Ordering::SeqCst),
-        "driver must not run when the write-ahead barrier fails"
+        "driver must not run when selected invocation recording fails"
     );
     Ok(())
 }
@@ -1444,7 +1655,7 @@ impl Driver for OneChunkStreamingDriver {
 #[tokio::test]
 async fn stream_chunks_reach_explicit_sink_with_one_fact_and_no_state_retention()
 -> anyhow::Result<()> {
-    let mut table = HandleTable::new();
+    let table = HandleTable::new();
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
     plan.insert(
         MethodId::new(7),
@@ -1452,6 +1663,7 @@ async fn stream_chunks_reach_explicit_sink_with_one_fact_and_no_state_retention(
         Arc::new(StreamingDriver),
     );
     let id = table.insert(Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process: ProcessId::new(1),
         acting: IdentityRef::ROOT,
@@ -1459,12 +1671,11 @@ async fn stream_chunks_reach_explicit_sink_with_one_fact_and_no_state_retention(
         rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
         driver_plan: plan,
         fast_path: FastPath::Unconditional,
-        state: HandleState::Active,
         bound_path: None,
     })?;
     let (facts, store) = FactSink::in_memory();
     let state = test_state();
-    let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, state.clone());
+    let dp = DataPlane::new(table, facts, state.clone());
 
     let mut o = op(id, 7, Value::null());
     o.output = OutputMode::Stream;
@@ -1473,6 +1684,7 @@ async fn stream_chunks_reach_explicit_sink_with_one_fact_and_no_state_retention(
         .execute_with_stream(
             &o,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: true,
             },
@@ -1480,9 +1692,9 @@ async fn stream_chunks_reach_explicit_sink_with_one_fact_and_no_state_retention(
         )
         .await;
     ensure!(
-        out.outcome == Outcome::Done(Value::integer(2)),
+        out.output.outcome == Outcome::Done(Value::integer(2)),
         "streaming outcome mismatch: {:?}",
-        out.outcome
+        out.output.outcome
     );
 
     for expected in ["chunk-1", "chunk-2"] {
@@ -1510,7 +1722,7 @@ async fn stream_chunks_reach_explicit_sink_with_one_fact_and_no_state_retention(
 
 #[tokio::test]
 async fn closed_stream_receiver_returns_driver_error() -> anyhow::Result<()> {
-    let mut table = HandleTable::new();
+    let table = HandleTable::new();
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
     plan.insert(
         MethodId::new(7),
@@ -1518,6 +1730,7 @@ async fn closed_stream_receiver_returns_driver_error() -> anyhow::Result<()> {
         Arc::new(OneChunkStreamingDriver),
     );
     let id = table.insert(Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process: ProcessId::new(1),
         acting: IdentityRef::ROOT,
@@ -1525,11 +1738,10 @@ async fn closed_stream_receiver_returns_driver_error() -> anyhow::Result<()> {
         rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
         driver_plan: plan,
         fast_path: FastPath::Unconditional,
-        state: HandleState::Active,
         bound_path: None,
     })?;
     let (facts, _) = FactSink::in_memory();
-    let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
+    let dp = DataPlane::new(table, facts, test_state());
 
     let mut o = op(id, 7, Value::null());
     o.output = OutputMode::Stream;
@@ -1539,6 +1751,7 @@ async fn closed_stream_receiver_returns_driver_error() -> anyhow::Result<()> {
         .execute_with_stream(
             &o,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: true,
             },
@@ -1546,7 +1759,7 @@ async fn closed_stream_receiver_returns_driver_error() -> anyhow::Result<()> {
         )
         .await;
 
-    match out.outcome {
+    match out.output.outcome {
         Outcome::Fail(xolotl_types::Failure::HandlerError { message, .. }) => {
             ensure!(
                 message.contains("closed"),
@@ -1554,6 +1767,153 @@ async fn closed_stream_receiver_returns_driver_error() -> anyhow::Result<()> {
             );
         }
         other => bail!("expected stream sink failure, got {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn effectful_stream_send_rejections_preserve_unknown_identity_and_taint() -> anyhow::Result<()>
+{
+    for variant in 0..3 {
+        let rejected_taint = TaintSet::of(xolotl_types::TaintSource::ModelOutput);
+        let table = HandleTable::new();
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        let taint = rejected_taint.clone();
+        plan.insert(
+            MethodId::new(7),
+            MethodContract::new(0, ReplayClass::NonIdempotentEffect, SUPPORTS_STREAM),
+            Arc::new(FnDriver(move |_, _| {
+                let value = TaintedValue::new(Value::null(), taint.clone());
+                Err(DriverError::Stream(match variant {
+                    0 => StreamSendError::Full(value),
+                    1 => StreamSendError::Closed(value),
+                    _ => StreamSendError::Rejected {
+                        value,
+                        reason: Box::new(crate::stream::StreamRejection::Validation {
+                            message: "rejected".into(),
+                        }),
+                    },
+                }))
+            })),
+        );
+        let handle = table.insert(Handle {
+            open_verb: "perform".into(),
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            acting: IdentityRef::ROOT,
+            resource: ResourceId::new(5),
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            driver_plan: plan,
+            fast_path: FastPath::Unconditional,
+            bound_path: None,
+        })?;
+        let (facts, _) = FactSink::in_memory();
+        let dp = DataPlane::new(table, facts, test_state());
+        let mut operation = op(handle, 7, Value::null());
+        operation.output = OutputMode::Stream;
+        let (sink, _receiver) =
+            crate::host::stream::channel(crate::stream::StreamWindow::default());
+        let result = dp
+            .execute_with_stream(
+                &operation,
+                InvocationOptions {
+                    caller_identity: None,
+                    now_millis: 0,
+                    record: false,
+                },
+                sink,
+            )
+            .await;
+        ensure!(matches!(
+            &result.output.outcome,
+            Outcome::Fail(Failure::OutcomeUnknown { operation_ids, reason })
+                if operation_ids == &[operation.id.to_string()]
+                    && reason == "stream_output_rejected_after_dispatch"
+        ));
+        ensure!(result.output.taint == rejected_taint.merged(&operation.taint));
+        ensure!(result.completion_error.is_none());
+    }
+    Ok(())
+}
+
+struct PendingStreamDriver {
+    entered: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl Driver for PendingStreamDriver {
+    async fn call(
+        &self,
+        _method: MethodId,
+        _input: Value,
+        _output: OutputMode,
+        _ctx: &DriverContext,
+    ) -> Result<DriverOutput, DriverError> {
+        self.entered.notify_one();
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn receiver_close_after_driver_poll_reports_only_effectful_operations_as_unknown()
+-> anyhow::Result<()> {
+    for replay in [ReplayClass::Deterministic, ReplayClass::NonIdempotentEffect] {
+        let table = HandleTable::new();
+        let driver = Arc::new(PendingStreamDriver {
+            entered: tokio::sync::Notify::new(),
+        });
+        let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
+        plan.insert(
+            MethodId::new(7),
+            MethodContract::new(0, replay, SUPPORTS_STREAM),
+            driver.clone(),
+        );
+        let handle = table.insert(Handle {
+            open_verb: "perform".into(),
+            id: HandleId::new(0, 0),
+            process: ProcessId::new(1),
+            acting: IdentityRef::ROOT,
+            resource: ResourceId::new(5),
+            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
+            driver_plan: plan,
+            fast_path: FastPath::Unconditional,
+            bound_path: None,
+        })?;
+        let (facts, _) = FactSink::in_memory();
+        let dp = DataPlane::new(table, facts, test_state());
+        let mut operation = op(handle, 7, Value::null());
+        operation.output = OutputMode::Stream;
+        let expected_id = operation.id.to_string();
+        let (sink, receiver) = crate::host::stream::channel(crate::stream::StreamWindow::default());
+        let task = tokio::spawn(async move {
+            dp.execute_with_stream(
+                &operation,
+                InvocationOptions {
+                    caller_identity: None,
+                    now_millis: 0,
+                    record: false,
+                },
+                sink,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), driver.entered.notified()).await?;
+        drop(receiver);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task).await??;
+        if replay == ReplayClass::NonIdempotentEffect {
+            ensure!(matches!(
+                &result.output.outcome,
+                Outcome::Fail(Failure::OutcomeUnknown { operation_ids, reason })
+                    if operation_ids == &[expected_id] && reason == "stream_receiver_closed_after_dispatch"
+            ));
+            ensure!(result.effect_may_have_started);
+        } else {
+            ensure!(matches!(
+                result.output.outcome,
+                Outcome::Fail(Failure::HandlerError { .. })
+            ));
+            ensure!(!result.effect_may_have_started);
+        }
     }
     Ok(())
 }
@@ -1580,7 +1940,7 @@ impl Driver for CollectDriver {
 
 #[tokio::test]
 async fn collect_aggregates_stream_chunks_up_to_limit() -> anyhow::Result<()> {
-    let mut table = HandleTable::new();
+    let table = HandleTable::new();
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
     plan.insert(
         MethodId::new(7),
@@ -1588,6 +1948,7 @@ async fn collect_aggregates_stream_chunks_up_to_limit() -> anyhow::Result<()> {
         Arc::new(CollectDriver),
     );
     let id = table.insert(Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process: ProcessId::new(1),
         acting: IdentityRef::ROOT,
@@ -1595,11 +1956,10 @@ async fn collect_aggregates_stream_chunks_up_to_limit() -> anyhow::Result<()> {
         rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
         driver_plan: plan,
         fast_path: FastPath::Unconditional,
-        state: HandleState::Active,
         bound_path: None,
     })?;
     let (facts, store) = FactSink::in_memory();
-    let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
+    let dp = DataPlane::new(table, facts, test_state());
     let mut o = op(id, 7, Value::null());
     o.output = OutputMode::Collect { limit: 1 };
 
@@ -1607,15 +1967,16 @@ async fn collect_aggregates_stream_chunks_up_to_limit() -> anyhow::Result<()> {
         .execute(
             &o,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: true,
             },
         )
         .await;
     ensure!(
-        out.outcome == Outcome::Short(Value::list(vec![Value::string("a".into())])),
+        out.output.outcome == Outcome::Short(Value::list(vec![Value::string("a".into())])),
         "collect outcome mismatch: {:?}",
-        out.outcome
+        out.output.outcome
     );
     ensure!(store.len() == 1, "collect should record one Fact");
     Ok(())
@@ -1644,7 +2005,7 @@ async fn collect_wraps_unary_result_when_no_chunks_are_emitted() -> anyhow::Resu
         }
     }
 
-    let mut table = HandleTable::new();
+    let table = HandleTable::new();
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
     plan.insert(
         MethodId::new(7),
@@ -1652,6 +2013,7 @@ async fn collect_wraps_unary_result_when_no_chunks_are_emitted() -> anyhow::Resu
         Arc::new(UnaryOnlyCollectDriver),
     );
     let id = table.insert(Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process: ProcessId::new(1),
         acting: IdentityRef::ROOT,
@@ -1659,33 +2021,33 @@ async fn collect_wraps_unary_result_when_no_chunks_are_emitted() -> anyhow::Resu
         rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
         driver_plan: plan,
         fast_path: FastPath::Unconditional,
-        state: HandleState::Active,
         bound_path: None,
     })?;
     let (facts, _) = FactSink::in_memory();
-    let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state());
+    let dp = DataPlane::new(table, facts, test_state());
     let mut o = op(id, 7, Value::integer(9));
     o.output = OutputMode::Collect { limit: 8 };
     let out = dp
         .execute(
             &o,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: true,
             },
         )
         .await;
     ensure!(
-        out.outcome == Outcome::Done(Value::list(vec![Value::integer(9)])),
+        out.output.outcome == Outcome::Done(Value::list(vec![Value::integer(9)])),
         "collect unary wrap outcome mismatch: {:?}",
-        out.outcome
+        out.output.outcome
     );
     Ok(())
 }
 
 #[tokio::test]
 async fn sink_only_suppresses_response_body_without_erasing_usage() -> anyhow::Result<()> {
-    let mut table = HandleTable::new();
+    let table = HandleTable::new();
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
     plan.insert(
         MethodId::new(7),
@@ -1703,6 +2065,7 @@ async fn sink_only_suppresses_response_body_without_erasing_usage() -> anyhow::R
         Arc::new(EchoDriver),
     );
     let id = table.insert(Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process: ProcessId::new(1),
         acting: IdentityRef::ROOT,
@@ -1710,7 +2073,6 @@ async fn sink_only_suppresses_response_body_without_erasing_usage() -> anyhow::R
         rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
         driver_plan: plan,
         fast_path: FastPath::Unconditional,
-        state: HandleState::Active,
         bound_path: None,
     })?;
     let (facts, store) = FactSink::in_memory();
@@ -1718,23 +2080,25 @@ async fn sink_only_suppresses_response_body_without_erasing_usage() -> anyhow::R
     let mut process = crate::process::ProcessEntry::new(ProcessId::new(1), None, IdentityRef::ROOT);
     ensure!(process.scope.start());
     processes.insert(process);
-    let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, test_state())
-        .with_processes(processes.clone());
+    let dp = DataPlane::new(table, facts, test_state())
+        .with_host_runtime(processes.host_runtime().clone())?
+        .with_processes(processes.clone())?;
     let mut o = op(id, 7, Value::string("response-body".into()));
     o.output = OutputMode::SinkOnly;
     let out = dp
         .execute(
             &o,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: true,
             },
         )
         .await;
     ensure!(
-        out.outcome == Outcome::Done(Value::null()),
+        out.output.outcome == Outcome::Done(Value::null()),
         "sink-only outcome mismatch: {:?}",
-        out.outcome
+        out.output.outcome
     );
     let facts = store
         .facts_of(ProcessId::new(1))
@@ -1782,7 +2146,7 @@ type AsyncFixture = (
 );
 
 fn async_dataplane(rights: Rights) -> anyhow::Result<AsyncFixture> {
-    let mut table = HandleTable::new();
+    let table = HandleTable::new();
     let mut plan = DriverPlan::new(DriverId::new(1), None, 0);
     plan.insert(
         MethodId::new(7),
@@ -1790,6 +2154,7 @@ fn async_dataplane(rights: Rights) -> anyhow::Result<AsyncFixture> {
         Arc::new(AsyncDriver),
     );
     let id = table.insert(Handle {
+        open_verb: "perform".into(),
         id: HandleId::new(0, 0),
         process: ProcessId::new(1),
         acting: IdentityRef::ROOT,
@@ -1797,7 +2162,6 @@ fn async_dataplane(rights: Rights) -> anyhow::Result<AsyncFixture> {
         rights,
         driver_plan: plan,
         fast_path: FastPath::Unconditional,
-        state: HandleState::Active,
         bound_path: None,
     })?;
     let (facts, store) = FactSink::in_memory();
@@ -1808,8 +2172,10 @@ fn async_dataplane(rights: Rights) -> anyhow::Result<AsyncFixture> {
         parent == ProcessId::new(1),
         "unexpected parent process id: {parent:?}"
     );
-    let dp = DataPlane::new(Arc::new(RwLock::new(table)), facts, state.clone())
-        .with_processes(processes.clone());
+    let dp = DataPlane::new(table, facts, state.clone())
+        .with_host_runtime(processes.host_runtime().clone())?
+        .with_processes(processes.clone())?
+        .with_async_process_host(super::async_process::tests::state_host(state.clone()));
     Ok((dp, id, state, store, processes))
 }
 
@@ -1824,21 +2190,25 @@ async fn async_process_requires_spawn_with_right() -> anyhow::Result<()> {
         .execute(
             &o,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: true,
             },
         )
         .await;
     ensure!(
-        matches!(out.outcome, Outcome::Fail(Failure::PermissionDenied { .. })),
+        matches!(
+            out.output.outcome,
+            Outcome::Fail(Failure::PermissionDenied { .. })
+        ),
         "async process without spawn right should deny, got {:?}",
-        out.outcome
+        out.output.outcome
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn async_process_returns_pollable_resource_and_records_child_fact() -> anyhow::Result<()> {
+async fn async_process_returns_pollable_resource_without_implicit_history() -> anyhow::Result<()> {
     let (dp, id, state, store, processes) =
         async_dataplane(Rights::new(MethodBitmap::method(0), RightFlags::SPAWN_WITH))?;
     let mut o = op(id, 7, Value::string("work".into()));
@@ -1848,12 +2218,13 @@ async fn async_process_returns_pollable_resource_and_records_child_fact() -> any
         .execute(
             &o,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: false,
             },
         )
         .await;
-    let (child, status_path, outcome_path) = match out.outcome {
+    let (child, status_path, outcome_path) = match out.output.outcome {
         Outcome::Done(value) => {
             let m = value.as_map().context("expected async resource map")?;
             ensure!(
@@ -1918,8 +2289,8 @@ async fn async_process_returns_pollable_resource_and_records_child_fact() -> any
         "child status phase mismatch: {m:?}"
     );
     ensure!(
-        store.len() == 3,
-        "parent spawn, child execution and child finalization should each record one Fact"
+        store.is_empty(),
+        "unrecorded child execution retained call history"
     );
     Ok(())
 }
@@ -1935,12 +2306,13 @@ async fn async_process_completion_does_not_overwrite_cancellation() -> anyhow::R
         .execute(
             &o,
             InvocationOptions {
+                caller_identity: None,
                 now_millis: 0,
                 record: false,
             },
         )
         .await;
-    let (child, status_path) = match out.outcome {
+    let (child, status_path) = match out.output.outcome {
         Outcome::Done(value) => {
             let m = value.as_map().context("expected async resource map")?;
             let child = ProcessId::new(u64::try_from(

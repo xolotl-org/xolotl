@@ -1,9 +1,10 @@
 //! Path semantic validation.
 //!
-//! `Path::parse` only checks syntax (character set, segment count > 0).
-//! Semantic rules — minimum segment counts, reserved prefixes, scheme-
-//! specific constraints — live in `PathValidator` implementations
-//! registered in `PathRegistry`.
+//! `Path::parse` checks syntax and permits scheme roots such as `state://`.
+//! Scheme-specific minimum segment counts live in `PathValidator`
+//! implementations registered in `PathRegistry`. Built-in reserved namespace
+//! classification lives in `path::namespace`; callers enforce those rules at
+//! their admission boundaries.
 //!
 //! Validators are invoked at Op boundaries (Register, Perform, StateRead,
 //! StateWrite, Spawn), not at parse time. A path that parses successfully

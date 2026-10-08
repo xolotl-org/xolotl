@@ -16,6 +16,13 @@ pub(super) const FILE_NAME: &str = "metadata";
 const FORMAT: &[u8; 4] = b"XOF1";
 const PREFIX_BYTES: usize = 12;
 
+pub(super) fn confirm(shared: &crate::Shared, directory: &Path) -> StateResult<()> {
+    File::open(directory.join(FILE_NAME))
+        .and_then(|file| file.sync_all())
+        .map_err(io_error)?;
+    sync_directory(shared, directory)
+}
+
 pub(super) fn read(file: File, limit: usize) -> StateResult<ObjectMetadata> {
     let mut reader = BufReader::new(file);
     let mut prefix = [0; PREFIX_BYTES];
@@ -76,11 +83,27 @@ impl Write for BoundedWriter<'_> {
     }
 }
 
-pub(super) fn write(directory: &Path, metadata: &ObjectMetadata, limit: usize) -> StateResult<()> {
-    write_inner(directory, metadata, limit).map_err(|failure| failure.with_taint(&metadata.taint))
+pub(super) fn write(
+    shared: &crate::Shared,
+    directory: &Path,
+    metadata: &ObjectMetadata,
+    limit: usize,
+) -> StateResult<()> {
+    #[cfg(test)]
+    shared
+        .probe
+        .metadata_writes
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    write_inner(shared, directory, metadata, limit)
+        .map_err(|failure| failure.with_taint(&metadata.taint))
 }
 
-fn write_inner(directory: &Path, metadata: &ObjectMetadata, limit: usize) -> StateResult<()> {
+fn write_inner(
+    shared: &crate::Shared,
+    directory: &Path,
+    metadata: &ObjectMetadata,
+    limit: usize,
+) -> StateResult<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(directory).map_err(io_error)?;
     let source_bytes = {
         let mut writer = BoundedWriter {
@@ -105,7 +128,7 @@ fn write_inner(directory: &Path, metadata: &ObjectMetadata, limit: usize) -> Sta
     temporary
         .persist(directory.join(FILE_NAME))
         .map_err(|error| io_error(error.error))?;
-    sync_directory(directory)
+    sync_directory(shared, directory)
 }
 
 fn metadata_limit() -> StateFailure {

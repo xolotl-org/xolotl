@@ -25,9 +25,22 @@ RUNNER = Path(__file__).resolve()
 LOADED_RUNNER_SHA256 = hashlib.sha256(RUNNER.read_bytes()).hexdigest()
 PROTOCOL = "xolotl-runtime-measurements/v1"
 CASES = (
-    "core", "resident", "portable", "hosted", "stream", "stream-cancel",
+    "core", "resident", "executor-prepare", "portable", "hosted", "stream", "stream-cancel",
     "object-file", "state-fact", "provider-stream",
+    "source-fingerprint", "source-fingerprint-deep-reject",
+    "source-fingerprint-wide-reject", "source-fingerprint-shared-reject",
+    "plan-compile", "plan-compile-reject",
+    "memory-consolidate",
 )
+BOUNDED_DEFAULTS = {
+    "source-fingerprint": {"work": 100, "width": 64, "depth": 1, "window": 1_048_576},
+    "source-fingerprint-deep-reject": {"work": 1000, "width": 1, "depth": 65_536, "window": 1024},
+    "source-fingerprint-wide-reject": {"work": 1000, "width": 65_536, "depth": 1, "window": 1024},
+    "source-fingerprint-shared-reject": {"work": 1000, "width": 65_536, "depth": 1, "window": 1024},
+    "plan-compile": {"work": 32, "width": 64, "depth": 4},
+    "plan-compile-reject": {"work": 32, "width": 1, "depth": 129},
+    "memory-consolidate": {"work": 16, "width": 64, "depth": 8},
+}
 GROUPS = ("smoke", "time", "heap", "scaling")
 DEFAULTS = {
     "samples": 1, "warmup": 1, "work": 1_048_576, "width": 8192,
@@ -332,13 +345,18 @@ def workloads(group):
             for case in CASES:
                 yield f"smoke-{mode}-{case}", mode, case, {
                     "samples": 2, "work": 1024, "width": 128, "depth": 128,
+                    **BOUNDED_DEFAULTS.get(case, {}),
+                    **({"work": 2} if case in BOUNDED_DEFAULTS else {}),
                 }
     elif group in ("time", "heap"):
         for case in CASES:
+            overrides = {"work": 10_000, "width": 1} if case == "executor-prepare" else {}
+            overrides.update(BOUNDED_DEFAULTS.get(case, {}))
             yield f"{group}-{case}", group, case, {
                 "samples": 30 if group == "time" else 1,
                 "warmup": 2 if group == "time" else 1,
                 "work": 100_000 if case in ("stream", "stream-cancel") else 1_048_576,
+                **overrides,
             }
     else:
         for case, amounts in (
@@ -349,6 +367,11 @@ def workloads(group):
         ):
             for work in amounts:
                 yield f"scaling-{case}-{work}", "heap", case, {"work": work}
+        for case, parameters in BOUNDED_DEFAULTS.items():
+            for work in (1, 16, 256):
+                yield f"scaling-{case}-{work}", "heap", case, {
+                    **parameters, "work": work,
+                }
         for mode in ("time", "heap"):
             yield f"slow-{mode}-stream", mode, "stream", {
                 "samples": 3, "work": 10_000, "delay_micros": 1000,

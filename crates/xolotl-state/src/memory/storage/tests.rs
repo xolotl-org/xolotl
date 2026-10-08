@@ -139,6 +139,52 @@ fn prefix_snapshot_excludes_writes_until_all_shards_are_read() -> Result<()> {
 }
 
 #[test]
+fn sharded_prefix_pages_match_compact_key_order() -> Result<()> {
+    let compact = InMemoryBackend::new();
+    let sharded = InMemoryBackend::with_options(InMemoryOptions {
+        read_shards: NonZeroUsize::MIN.saturating_add(127),
+        ..InMemoryOptions::default()
+    })?;
+    let prefix = Path::parse("state://ordered")?;
+    let expected = (0..80)
+        .map(|index| Path::parse(&format!("state://ordered/k{index:03}")))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (index, path) in expected.iter().enumerate().rev() {
+        let value = Value::integer(index as i64);
+        ready(compact.write_set(path, value.clone()))??;
+        ready(sharded.write_set(path, value))??;
+    }
+    for backend in [&compact, &sharded] {
+        ready(backend.write_set(&Path::parse("state://orderedish/extra")?, Value::integer(1)))??;
+    }
+
+    let collect = |backend: &InMemoryBackend| -> Result<Vec<Path>> {
+        let mut scan = StateScan::new(prefix.clone());
+        scan.limits.entries = NonZeroUsize::new(3).context("zero page size")?;
+        let mut paths = Vec::new();
+        for _ in 0..32 {
+            let page = ready(backend.query(&scan))??;
+            ensure!(page.entries.len() <= 3, "page exceeded its entry limit");
+            paths.extend(page.entries.into_iter().map(|(path, _)| path));
+            match page.next {
+                Some(next) => {
+                    ensure!(
+                        Some(&next) != scan.cursor.as_ref(),
+                        "cursor did not advance"
+                    );
+                    scan.cursor = Some(next);
+                }
+                None => return Ok(paths),
+            }
+        }
+        bail!("prefix scan did not terminate")
+    };
+    ensure!(collect(&compact)? == expected);
+    ensure!(collect(&sharded)? == expected);
+    Ok(())
+}
+
+#[test]
 fn impossible_shard_reservation_returns_an_error() -> Result<()> {
     let result = InMemoryBackend::with_options(InMemoryOptions {
         read_shards: NonZeroUsize::MAX,

@@ -4,7 +4,8 @@ use std::hint::black_box;
 use xolotl_graph::{ActorSpec, DoNode, OperationTemplate, StepRef, compile_do, lint};
 use xolotl_types::{MethodId, OutputMode, Path, ResourceName, Value};
 
-const LINEAR_STEPS: usize = 512;
+const LINEAR_STEPS: usize = 128;
+const DEEP_LINEAR_STEPS: usize = 512;
 const PARALLEL_LEAVES: usize = 1_024;
 
 fn step(name: impl Into<String>) -> StepRef {
@@ -52,68 +53,47 @@ fn declared_spec(leaves: usize) -> ActorSpec {
     )
 }
 
-fn bench_setup_failure(c: &mut Criterion, name: &'static str, error: anyhow::Error) {
-    let message = error.to_string();
-    c.bench_function(name, |b| b.iter(|| black_box(message.as_str())));
-}
-
-fn observe<T>(result: Result<T>) {
+#[expect(
+    clippy::panic,
+    reason = "invalid benchmark fixtures must stop measurement"
+)]
+fn checked<T, Error: core::fmt::Display>(result: core::result::Result<T, Error>) -> T {
     match result {
-        Ok(value) => drop(black_box(value)),
-        Err(error) => observe_error(error),
+        Ok(value) => value,
+        Err(error) => panic!("benchmark failed: {error}"),
     }
 }
 
-fn observe_error(error: anyhow::Error) {
-    let message = error.to_string();
-    drop(black_box(message));
-}
-
 fn bench_compile(c: &mut Criterion) {
+    let linear = checked(linear_program(LINEAR_STEPS));
+    let parallel = checked(balanced_both_program(0, PARALLEL_LEAVES));
+    let deep = checked(linear_program(DEEP_LINEAR_STEPS));
+    drop(checked(compile_do(&linear)));
+    drop(checked(compile_do(&parallel)));
+    drop(checked(compile_do(&deep)));
     let mut group = c.benchmark_group("graph/compile");
     group.sample_size(10);
 
-    group.bench_function("compile_linear_and_then_512", |b| {
-        b.iter_batched(
-            || linear_program(LINEAR_STEPS),
-            |program| match program {
-                Ok(program) => observe(
-                    compile_do(black_box(&program))
-                        .map_err(|error| anyhow!("linear program compile failed: {error}")),
-                ),
-                Err(error) => observe_error(error),
-            },
-            BatchSize::SmallInput,
-        );
+    group.bench_function("compile_linear_and_then_128", |b| {
+        b.iter(|| drop(black_box(checked(compile_do(black_box(&linear))))));
     });
 
     group.bench_function("compile_balanced_both_1024_ops", |b| {
-        b.iter_batched(
-            || balanced_both_program(0, PARALLEL_LEAVES),
-            |program| match program {
-                Ok(program) => observe(
-                    compile_do(black_box(&program))
-                        .map_err(|error| anyhow!("parallel program compile failed: {error}")),
-                ),
-                Err(error) => observe_error(error),
-            },
-            BatchSize::LargeInput,
-        );
+        b.iter(|| drop(black_box(checked(compile_do(black_box(&parallel))))));
+    });
+
+    group.bench_function("compile_linear_and_then_512", |b| {
+        b.iter(|| drop(black_box(checked(compile_do(black_box(&deep))))));
     });
 
     group.finish();
 }
 
 fn bench_graph_queries(c: &mut Criterion) {
-    let graph = match balanced_both_program(0, PARALLEL_LEAVES)
-        .and_then(|program| compile_do(&program).map_err(|error| anyhow!("{error}")))
-    {
-        Ok(graph) => graph,
-        Err(error) => {
-            bench_setup_failure(c, "graph/query/setup_failed", error);
-            return;
-        }
-    };
+    let graph = checked(compile_do(&checked(balanced_both_program(
+        0,
+        PARALLEL_LEAVES,
+    ))));
     let mut group = c.benchmark_group("graph/query");
     let mut index = 0usize;
 
@@ -121,18 +101,12 @@ fn bench_graph_queries(c: &mut Criterion) {
         b.iter(|| {
             index = (index + 257) % graph.nodes.len();
             let id = graph.nodes[index].id;
-            match graph.node(black_box(id)) {
-                Some(node) => drop(black_box(node)),
-                None => drop(black_box(format!("node {id} missing"))),
-            }
-        });
-    });
-
-    group.bench_function("output_is_consumed_scan_2047_nodes", |b| {
-        b.iter(|| {
-            index = (index + 263) % graph.nodes.len();
-            let id = graph.nodes[index].id;
-            black_box(graph.output_is_consumed(black_box(id)));
+            let node = checked(
+                graph
+                    .node(black_box(id))
+                    .ok_or_else(|| anyhow!("node {id} missing")),
+            );
+            black_box(node);
         });
     });
 
@@ -148,15 +122,14 @@ fn bench_lint(c: &mut Criterion) {
             || {
                 (
                     declared_spec(PARALLEL_LEAVES),
-                    balanced_both_program(0, PARALLEL_LEAVES),
+                    checked(balanced_both_program(0, PARALLEL_LEAVES)),
                 )
             },
-            |(spec, program)| match program {
-                Ok(program) => {
-                    let findings = lint(black_box(&spec), black_box(&program));
-                    drop(black_box(findings));
-                }
-                Err(error) => observe_error(error),
+            |(spec, program)| {
+                let findings = lint(black_box(&spec), black_box(&program), |_| {
+                    Some(xolotl_types::MethodAuthority::Perform)
+                });
+                drop(black_box(findings));
             },
             BatchSize::LargeInput,
         );

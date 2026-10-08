@@ -28,15 +28,20 @@ async fn exact_object_frames_preserve_each_gateway_outcome_kind() -> anyhow::Res
     let boot = Arc::new(Bootstrap::in_memory());
     let target = boot.register_effect(
         "effect://output/test",
-        &[MethodSpec::unary_async("invoke", Purity::Pure)],
+        &[MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Pure,
+            MethodSpec::UNARY_ASYNC,
+        )],
         Arc::new(EchoDriver),
     )?;
     let profile = GatewayProfile::new("output")
         .with_bearer_identity(
             "token",
             "alice",
-            "structured-wire-test-token",
-            "process://alice",
+            "structured-wire-test-token-32-bytes",
+            "identity://alice",
         )?
         .with_surface(GatewaySurface::effect_invoke("test", target))
         .with_principal_surface_binding(GatewayPrincipalSurfaceBinding::allow(
@@ -45,11 +50,17 @@ async fn exact_object_frames_preserve_each_gateway_outcome_kind() -> anyhow::Res
             ["perform://effect/output/test"],
         ));
     let runtime = Arc::new(
-        GatewayRuntime::new(boot, profile)?
-            .with_object_store(FileObjectStore::open(directory.path())?.into_object_store()),
+        GatewayRuntime::new(
+            boot,
+            profile,
+            Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
+        )?
+        .with_object_store(FileObjectStore::open(directory.path())?.into_object_store()),
     );
     let session = runtime
-        .authenticate(PresentedCredential::bearer("structured-wire-test-token"))
+        .authenticate(PresentedCredential::bearer(
+            "structured-wire-test-token-32-bytes",
+        ))
         .await?;
     let accepted = GatewayAccepted {
         submission_id: "completed".into(),
@@ -85,11 +96,12 @@ async fn exact_object_frames_preserve_each_gateway_outcome_kind() -> anyhow::Res
             GatewayOutputKind::Fail,
         ),
     ] {
-        let result = GatewaySubmitResult {
+        let mut result = GatewaySubmitResult {
             accepted: accepted.clone(),
             output: ExecutionOutput::new(outcome, TaintSet::of(TaintSource::ModelOutput)),
             origin: CompletionOrigin::CachedOutcome,
         };
+        result.output.unresolved_operations.record("1/2/3/4/0");
         let output = encoder
             .clone()
             .externalize(
@@ -107,6 +119,14 @@ async fn exact_object_frames_preserve_each_gateway_outcome_kind() -> anyhow::Res
             anyhow::bail!("completion missing")
         };
         ensure!(completed.origin == pb::CompletionOrigin::CachedOutcome as i32);
+        ensure!(
+            completed
+                .unresolved_operations
+                .as_ref()
+                .context("reconciliation state missing")?
+                .operation_ids
+                == ["1/2/3/4/0".to_string()]
+        );
         let (kind, reference) = match completed
             .outcome
             .context("outcome missing")?

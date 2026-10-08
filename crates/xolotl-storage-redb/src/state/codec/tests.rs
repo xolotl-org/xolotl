@@ -18,6 +18,31 @@ fn framed(format: &[u8; 4], taint: &[u8], payload: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn absence_has_only_provenance_and_is_distinct_from_null() -> anyhow::Result<()> {
+    let taint = protected()?;
+    let bytes = encode_absence(&taint)?;
+    ensure!(decode_absence(&bytes)? == Some(taint.clone()));
+    ensure!(envelope_taint(&bytes)? == taint);
+    ensure!(decode_envelope(&bytes).is_err());
+    let null = encode_envelope(&Value::null(), &taint)?;
+    ensure!(decode_absence(&null)?.is_none());
+    ensure!(decode_envelope(&null)?.value == Value::null());
+    ensure!(envelope_taint_if_header_fits(&bytes, bytes.len() - 1)?.is_none());
+    ensure!(envelope_taint_if_header_fits(&bytes, bytes.len())? == Some(taint.clone()));
+    for end in 4..bytes.len() {
+        ensure!(decode_absence(&bytes[..end]).is_err());
+    }
+    let mut trailing = bytes;
+    trailing.push(0);
+    let failure = decode_absence(&trailing)
+        .err()
+        .context("absence payload accepted")?;
+    ensure!(failure.taint == taint);
+    ensure!(decode_absence(&framed(ABSENCE_FORMAT, b"invalid", b"")).is_err());
+    Ok(())
+}
+
+#[test]
 fn record_framing_requires_format_length_and_valid_provenance() -> anyhow::Result<()> {
     let taint = serde_json::to_vec(&TaintSet::pristine())?;
     let value = Value::bytes(vec![0, 255]);
@@ -100,8 +125,14 @@ fn history_requires_complete_unique_payload_fields() -> anyhow::Result<()> {
             taint: taint.clone(),
         },
         StateEvent::Append {
-            path,
+            path: path.clone(),
             item: Value::bytes(vec![2]),
+            taint: taint.clone(),
+        },
+        StateEvent::DropPrefixAppend {
+            path,
+            removed: 3,
+            item: Value::bytes(vec![3]),
             taint: taint.clone(),
         },
     ] {
@@ -138,6 +169,14 @@ fn history_requires_complete_unique_payload_fields() -> anyhow::Result<()> {
             .context("event is not an object")?
             .remove(payload_field);
         malformed.push(serde_json::to_vec(&missing_payload)?);
+        if matches!(event, StateEvent::DropPrefixAppend { .. }) {
+            let mut missing_removed = original.clone();
+            missing_removed["event"]
+                .as_object_mut()
+                .context("event is not an object")?
+                .remove("removed");
+            malformed.push(serde_json::to_vec(&missing_removed)?);
+        }
         let mut trailing = serde_json::to_vec(&original)?;
         trailing.extend_from_slice(b" null");
         malformed.push(trailing);

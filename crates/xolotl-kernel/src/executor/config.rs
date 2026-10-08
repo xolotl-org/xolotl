@@ -30,14 +30,27 @@ pub struct ExecutionConfig {
     pub max_instructions: usize,
     /// Maximum bytes for task, frame and binding containers, excluding value payloads.
     pub max_storage_bytes: usize,
-    /// Maximum encoded checkpoint bytes on both read and write. This bounds
-    /// serialization buffers, not decoded payload heap or external driver memory.
-    #[cfg(feature = "durable")]
-    pub max_checkpoint_bytes: usize,
+    /// Maximum resolved (concrete resource path, method) contracts retained
+    /// by this Executor. Existing entries stay frozen when the limit is reached.
+    pub max_method_metadata: usize,
+    /// Maximum explicit (concrete resource path, acting identity) bindings.
+    pub max_resource_bindings: usize,
+    /// Maximum (concrete path, method, acting identity) bindings, including
+    /// automatic opens and explicit bindings.
+    pub max_method_bindings: usize,
+    /// Maximum canonical UTF-8 bytes of a concrete path newly retained in an
+    /// Executor cache key. Checks use path components without formatting.
+    pub max_cache_path_bytes: usize,
+    /// Maximum UTF-8 bytes of a newly retained method name.
+    pub max_cache_method_name_bytes: usize,
+    /// Maximum interface ids in a newly retained frozen resource contract.
+    pub max_cache_interfaces: usize,
     /// Optional cumulative transition quota, separate from scheduling quantum.
     pub max_steps: Option<u64>,
     /// Additional transitions reserved for cancellation and cleanup.
     pub cleanup_steps: u64,
+    /// Host wall-time allowance for the complete registered finalizer sequence.
+    pub cleanup_timeout: std::time::Duration,
     /// Transitions between scheduler yields.
     pub quantum: u32,
 }
@@ -64,7 +77,6 @@ impl ExecutionLayout {
             bindings_per_task: self.bindings_per_task,
             max_steps: config.max_steps,
             cleanup_steps: config.cleanup_steps,
-            durable: false,
         }
     }
 }
@@ -78,10 +90,15 @@ impl Default for ExecutionConfig {
             bindings_per_task: 1024,
             max_instructions: 65_536,
             max_storage_bytes: 16 * 1024 * 1024,
-            #[cfg(feature = "durable")]
-            max_checkpoint_bytes: 64 * 1024 * 1024,
+            max_method_metadata: 4096,
+            max_resource_bindings: 4096,
+            max_method_bindings: 4096,
+            max_cache_path_bytes: 1024,
+            max_cache_method_name_bytes: 256,
+            max_cache_interfaces: 64,
             max_steps: None,
             cleanup_steps: 4096,
+            cleanup_timeout: std::time::Duration::from_secs(30),
             quantum: 256,
         }
     }
@@ -142,40 +159,6 @@ impl ExecutionConfig {
             frames.max(current.frames).min(tasks.saturating_mul(depth)),
             base.bindings_per_task.max(current.bindings_per_task),
         )
-    }
-
-    pub(super) fn restored_layout(
-        &self,
-        program: &MachineProgram,
-        checkpoint: &xolotl_core::Checkpoint<'_, TaintedValue, TaintedFailure>,
-    ) -> Result<ExecutionLayout, Failure> {
-        self.check_program(program)?;
-        let saved = checkpoint.meta.limits;
-        if checkpoint.tasks.is_empty()
-            || checkpoint.tasks.len() > self.max_tasks
-            || saved.frames_per_task > self.frames_per_task
-            || checkpoint.frames.len() > self.max_frames
-            || saved.bindings_per_task > self.bindings_per_task
-            || saved.bindings_per_task < program.bindings
-            || self
-                .max_steps
-                .is_some_and(|limit| saved.max_steps.is_none_or(|saved| saved > limit))
-            || saved.cleanup_steps > self.cleanup_steps
-        {
-            return Err(machine_error(
-                "checkpoint exceeds configured execution limits",
-            ));
-        }
-        let layout = self.storage_layout(
-            checkpoint.tasks.len(),
-            saved.frames_per_task,
-            checkpoint.frames.len(),
-            saved.bindings_per_task,
-        )?;
-        if checkpoint.bindings.len() != layout.tasks * layout.bindings_per_task {
-            return Err(machine_error("invalid checkpoint storage layout"));
-        }
-        Ok(layout)
     }
 
     fn storage_layout(

@@ -1,9 +1,9 @@
 //! Side-effect classification: `Purity` (declared) and `ReplayClass` (derived).
 //!
 //! An author declares the coarser [`Purity`] of a method / effect ("is this
-//! safe to replay?"). The kernel derives the finer [`ReplayClass`] from it,
-//! and the persistence discipline follows automatically — only
-//! [`ReplayClass::NonIdempotentEffect`] pays a write-ahead fsync barrier.
+//! safe to replay?"). The kernel derives the finer [`ReplayClass`] from it
+//! to distinguish observations and effects. Classification does not require
+//! persistent logging or authorize an automatic retry.
 
 use serde::{Deserialize, Serialize};
 
@@ -23,19 +23,18 @@ pub enum Purity {
     Effectful,
 }
 
-/// The replay semantics the kernel actually enforces, derived from
+/// The effect and retry semantics declared to the kernel, derived from
 /// [`Purity`] plus whether the operation observes external state.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplayClass {
-    /// Same input → same output; can be recomputed on recovery.
+    /// Same input yields the same output without observing external state.
     Deterministic,
-    /// Reads external state; on recovery the recorded value is reused.
+    /// Reads external state; a later observation may differ.
     Observation,
     /// External effect protected by an idempotency key; safe to retry.
     IdempotentEffect,
-    /// Repeating produces a new effect; the *only* class that takes a
-    /// write-ahead fsync barrier before the effect is issued.
+    /// Repeating produces a new effect and is unsafe after an unknown outcome.
     NonIdempotentEffect,
 }
 
@@ -50,23 +49,6 @@ impl Purity {
             Purity::Idempotent => ReplayClass::IdempotentEffect,
             Purity::Effectful => ReplayClass::NonIdempotentEffect,
         }
-    }
-}
-
-impl ReplayClass {
-    /// Whether issuing this operation requires a write-ahead fsync barrier
-    /// *before* the driver call. True only for
-    /// [`ReplayClass::NonIdempotentEffect`].
-    pub fn needs_write_ahead_barrier(self) -> bool {
-        matches!(self, ReplayClass::NonIdempotentEffect)
-    }
-
-    /// Whether the recorded outcome may be dropped from the recent tail
-    /// (treated as cache loss) because it can be safely recomputed or reread.
-    /// False once a value drives persistent control flow — that case is
-    /// handled at the call site, not here.
-    pub fn may_recompute(self) -> bool {
-        matches!(self, ReplayClass::Deterministic | ReplayClass::Observation)
     }
 }
 
@@ -86,14 +68,6 @@ mod tests {
             Purity::Effectful.replay_class(false),
             ReplayClass::NonIdempotentEffect
         );
-    }
-
-    #[test]
-    fn only_non_idempotent_takes_barrier() {
-        assert!(!ReplayClass::Deterministic.needs_write_ahead_barrier());
-        assert!(!ReplayClass::Observation.needs_write_ahead_barrier());
-        assert!(!ReplayClass::IdempotentEffect.needs_write_ahead_barrier());
-        assert!(ReplayClass::NonIdempotentEffect.needs_write_ahead_barrier());
     }
 
     #[test]

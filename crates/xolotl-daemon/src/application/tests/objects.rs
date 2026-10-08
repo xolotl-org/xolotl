@@ -1,7 +1,7 @@
 use super::*;
 use xolotl_gateway::{
     BeginObjectUploadRequest, GatewayModality, GatewayObjectKind, GatewaySubmission,
-    IssueObjectUploadTicketRequest, PresentedCredential,
+    IssueObjectUploadTicketRequest, PresentedCredential, SubmitOptions,
 };
 use xolotl_standard::{StandardConfig, StandardModule, StandardModules, install_standard};
 use xolotl_types::{DType, Outcome};
@@ -18,14 +18,14 @@ async fn selected_state_profile_uploads_tensor_consumed_by_shared_standard_blob(
             .with_object_store(objects.clone()),
     )?;
     let path = profile::profile_path("app")?;
-    let token = "daemon-application-test-token";
-    boot.kernel.state.write_set(&path, serde_json::from_value(json!({
+    let token = "daemon-application-test-token-32-bytes";
+    boot.kernel().state().write_set(&path, serde_json::from_value(json!({
         "profile_name": "app", "version": 1,
         "credentials": [{
             "credential_id": "test-key", "principal_id": "client",
             "verifier": {"kind": "bearer", "token_hash": blake3::hash(token.as_bytes()).to_hex().to_string()}
         }],
-        "identity_mappings": [{"principal_id": "client", "identity_path": "process://client"}],
+        "identity_mappings": [{"principal_id": "client", "identity_path": "identity://client"}],
         "surfaces": [{"surface_id": "read", "target": "effect://blob/read"}],
         "principal_surface_bindings": [{
             "principal_id": "client", "visible_surfaces": ["read"], "submit_surfaces": ["read"],
@@ -34,7 +34,8 @@ async fn selected_state_profile_uploads_tensor_consumed_by_shared_standard_blob(
     }))?).await?;
     let gateway = GatewayRuntime::new(
         boot.clone(),
-        profile::load_profile(&boot.kernel.state, &path, "app").await?,
+        profile::load_profile(boot.kernel().state(), &path, "app").await?,
+        Arc::new(xolotl_gateway::MemoryGatewayIdempotencyStore::default()),
     )?
     .with_object_store(objects);
     let session = gateway
@@ -52,6 +53,10 @@ async fn selected_state_profile_uploads_tensor_consumed_by_shared_standard_blob(
                 allowed_media_types: Vec::new(),
                 expires_in_ms: Some(60_000),
                 single_use: true,
+
+                max_objects: None,
+                max_total_bytes: None,
+                max_record_bytes: None,
             },
         )
         .await?;
@@ -62,6 +67,9 @@ async fn selected_state_profile_uploads_tensor_consumed_by_shared_standard_blob(
                 ticket_id: ticket.ticket_id().into(),
                 media_type: None,
                 submission_token: None,
+
+                expected_size: None,
+                expected_digest: None,
             },
         )
         .await?;
@@ -79,16 +87,30 @@ async fn selected_state_profile_uploads_tensor_consumed_by_shared_standard_blob(
         xolotl_types::ValueView::Tensor(_)
     ));
     ensure!(
-        boot.kernel
-            .state
+        boot.kernel()
+            .state()
             .read(&Path::parse(&format!("state://blob/{}", committed.digest))?)
             .await?
             .is_none()
     );
     let submission = GatewaySubmission::direct_input("read", committed.item)
-        .with_provenance(committed.provenance);
+        .with_provenance(committed.provenance)
+        .with_options(SubmitOptions {
+            expected_request_scope: Some(
+                gateway
+                    .describe(&session)?
+                    .surfaces
+                    .into_iter()
+                    .find(|surface| surface.surface_id == "read")
+                    .context("read request scope")?
+                    .request_scope,
+            ),
+            idempotency_key: Some("selected-state-profile-tensor".into()),
+            ..SubmitOptions::default()
+        });
     let result = gateway.submit(&session, submission.clone()).await?;
     ensure!(result.output.outcome == Outcome::Done(Value::bytes(bytes.to_vec())));
-    ensure!(gateway.submit(&session, submission).await.is_err());
+    let repeated = gateway.submit(&session, submission).await?;
+    ensure!(repeated.output.outcome == result.output.outcome);
     Ok(())
 }

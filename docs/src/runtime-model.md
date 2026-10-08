@@ -1,141 +1,51 @@
 # Runtime Model
 
-Xolotl has one active entity: `Process`.
-
-A Process owns compiled Handles, issues Operations against Resources, receives
-Outcomes, and records Facts. Files, terminal commands, inference, memory, state,
-remote devices, and external tools all enter through the same Resource,
-Interface, Driver, and Binding model.
+A `Process` is the active execution and authority owner. It opens Resources into Handles, issues Operations and receives Outcomes. Hosts may explicitly record Facts for observation. Model inference, tools, State, files and external systems all use this model.
 
 ## Process
 
-A Process carries:
+A Process has an identity, lifecycle status, grants, Handles, budget and optional finalizers. Parent/child links record spawned work. A child receives attenuated authority; naming the parent's identity or Resource does not grant access. An `Actor` is a named, long-lived Process, while a request Process has an owner responsible for its end-of-request cleanup.
 
-- an identity;
-- a lifecycle status;
-- grants and compiled handles;
-- budget state;
-- optional finalizers;
-- parent/child links when spawned by another Process.
+`BudgetSpec` can limit lifetime cost (`max_micro_usd`), inference tokens (`max_inference_tokens`) and concurrent reserved Operations (`max_inflight_ops`). An omitted limit adds no ceiling; zero is a real ceiling. An Operation reserves estimated usage against its Process and every ancestor before Driver dispatch. Measured usage settles the reservation and can exceed an inaccurate estimate. `restrict_budget` intersects limits without resetting spending. Process budgets have no calendar reset or account-wide billing semantics.
 
-Spawning attenuates authority. A child Process receives rights limited by the
-parent grant.
+Normal request completion finishes the request Process. Explicit tree finalization closes descendant admission, stops attached tasks, finishes descendants before parents, runs finalizers in reverse order and revokes Handles. A failed cleanup leaves work pending for a later attempt. Finalizers may use only methods marked finalizer-safe and their Process-local State subtree. Independently accepted Actors and asynchronous children can continue after the initiating body completes.
 
-`finalize_process` closes child admission throughout the tree, aborts attached
-tasks and waits for body futures to drop before cleanup. It finishes descendants before their
-parents, runs finalizers in reverse order, revokes handles, records a
-`ProcessFinalized` Fact, and writes a state marker for quick lookup. A failed
-descendant does not prevent sibling cleanup, but leaves its parent pending.
-Finished ancestors still close their descendants. Live processes without an
-existing terminal intent become cancelled.
-`finish_request_process` / `finish_process_as` finish the specified Process after
-its own program returns; the latter accepts only terminal statuses.
-Independently started Actors and async result tasks may continue. A body or
-finalizer trying to await itself, or its containing tree, receives `ProcessBusy`;
-it must request cancellation and return control to its owner.
-Finalization context includes process-table identity and the nested call chain,
-so identical local ids in separate Kernels remain independent. Finalizers can
-finish idle processes but never wait for another finalization owner, preventing
-cyclic waits across Kernels.
-If a finalizer fails, the lifecycle Fact records the failure count and details
-while cleanup continues.
-Request Processes created by SDK, Console, or Gateway entry points are finalized
-after their program returns, including failure and cancellation outcomes.
-During finalization, operations are limited to the current Process subtree
-`state://process/<process-id>/...` and methods whose interface metadata marks
-them as finalizer-safe.
+`ProcessTable::finalization_report` shares the completed live cleanup report: terminal status, provenance, unresolved operation identities, typed finalizer failures and handle-release counts. It is independent of Fact recording. Reaping releases the table's report ownership; existing observers own their retained reports separately. Reports do not restore execution or retain a full call history.
 
-An owned `RequestProcess`, created by `Bootstrap::request_under`, also handles
-abandonment. Dropping it immediately cancels its tree and revokes existing
-handles; on Tokio it schedules one cleanup attempt. Without a runtime, or if
-that attempt is interrupted or fails, `drain_cleanup` finishes pending work.
-SDK ordinary graph and prepared runs use owned requests. Bare Executor futures
-leave lifecycle ownership with their host. Durable SDK runs explicitly transfer
-ownership to checkpoint recovery and preserve interrupted requests.
+`RequestProcess::finish(&output)` returns an immutable `Arc<ProcessFinalizationReport>` before releasing the request's cleanup pin. A `RequestFinishError` retains the typed `source` and original `cleanup: CleanupTicket`; keep that ticket and use `Bootstrap::resume_cleanup` to retry cleanup, not the body. A ticket can observe a later committed report. Its report or provisional unresolved identities do not by themselves prove cleanup completion. `CleanupWaitExpired` means the caller's observation deadline expired, not that cleanup stopped or effects rolled back.
 
-Each finalization attempt has one owner. Dropping that owner releases the claim
-and wakes other callers. Unstarted finalizers remain in the process table;
-completed or interrupted attempts are not replayed, and interruptions are
-recorded as failures. Retries reuse the same lifecycle Fact. Process finalizers
-can resume independently of a dropped executor, whose lexical `Finally` bodies
-cannot run after its Future disappears. Tasks start only after attachment, and
-aborted body exit is acknowledged after captured resources drop. Normal body
-completion retains the result, intent and pending publication before releasing
-ownership. Actor directory and async result errors remain retryable through
-`drain_cleanup`, without rerunning drivers or prematurely completing cleanup.
-Retries preserve the original single-process or tree scope; a failed completion
-does not cancel independently running children.
-Finished processes release native modules, attached grants, publication objects
-and finalizer storage, but retain terminal entries,
-state markers and Facts. Hosts still need a history retention policy.
+SDK `run*` helpers return `ExecutionCompletion`: access the body through `output` and cleanup evidence through `finalization`. The latter is `None` only for preparation rejection before Process admission. A retained report does not pin the Process or keep its table entry alive.
 
-An Actor is a named long-lived Process. `ActorSpec` is the declaration shape:
-body, declared capabilities, budget, and finalizers. Spawning an actor checks
-the body and finalizers, creates a normal
-Process with attenuated grants, runs the body through the same Executor, and
-publishes a directory entry under `state://agents/<identity>/<name>` for
-discovery. Process-local native functions are supplied as a shared immutable
-`StepModule` at spawn time when the body or finalizers reference `StepRef`s.
-Ordinary requests can attach the same modules without creating an Actor. Actor declarations may use
-`state://process/self/...` in body, finalizers, and declared capabilities; the
-placeholder is bound to the concrete Process id before linting, grant planning,
-and execution. Step references themselves contain only names and arguments.
-Request grant templates also bind this placeholder before capability attenuation.
-Dynamically returned Step subgraphs bind structured operation and signal paths
-to the invoking Process before compilation, including nested recovery and cleanup.
+Common child admission automatically reclaims eligible terminal entries. Roots, cleanup still in custody, live tasks/finalizers, reserved Operations, pinned records and parents with children remain retained. Tree cleanup pins its selected members before waiting. There is no background reaper or eager reaping on pin drop; idle terminal records may remain until another admission. See [Core And Portable Programs](core-and-portable.md#resource-and-cancellation-bounds) for examination cost and capacity behavior.
 
-Directory admission also runs inside the managed task. Dropping the spawn call
-or closing its parent stops admission. Terminal CAS updates only records with
-the same process and execution owner. A cancelled admission may retain a terminal
-reservation to block late initial writes; an existing conflicting Actor is not
-modified.
+Ordinary cleanup does not write persistent lifecycle markers or require State write capability. Actor directory and asynchronous-result publication use their business data ports; failed publication retains the known result and pending publication responsibility for a live retry.
 
-`AsyncProcess` returns a pollable `proc://async/<process>/<execution>` reference.
-Status and outcome are stored at
-`state://kernel/async/<process>/<execution>/status` and `outcome`. Each async task
-owns a derived handle and shares managed task ownership, cancellation, lifecycle
-Facts and terminal publication. Initial status failure prevents driver dispatch;
-the result and taint survive terminal publication failures for later retry.
+An owned `RequestProcess` handles abandonment: dropping it cancels the tree and revokes Handles immediately, while asynchronous finalization remains the host's responsibility. `drain_cleanup` retries pending cleanup. A bare Executor future does not own Process finalization. See [Core And Portable Programs](core-and-portable.md#resource-and-cancellation-bounds) for capacity, cancellation and ownership APIs.
 
-## Resource And Interface
+The runtime owns processes within one running host lifecycle. Applications can reopen persistent data and decide subsequent work from actual data and external-effect state. Unknown effects retain their original operation identity and are not automatically redispatched.
 
-A Resource is a passive object that can be operated on, authorized, audited, and
-bound to a Driver. Its Interface describes the available methods, output modes,
-purity, cost model, modality support, and batching support.
+An `ActorSpec` declares a named body, capability ceiling, budget and finalizers. Actor admission checks those declarations, attenuates the parent's grants and publishes `state://agents/<identity>/<name>`. Process-local `StepRef` functions come from a host-installed `StepModule`. The structured `state://process/self/...` placeholder is bound to the actual Process before capability planning and execution.
 
-The data path normally uses Resource ids and Method ids.
+`AsyncProcess` needs a host-installed `AsyncProcessHost`. The host reserves child custody and returns a reference before the child Driver runs. Method rights and `SPAWN_WITH` propagation rights are checked separately. The host owns quotas, acceptance receipts, results and cleanup; a kernel method cache stores a body result, never a child Process reference. The child inherits its parent's deadline unless the host narrows it.
+
+## Resource and Interface
+
+A Resource is a passive, addressable target. Its Interface declares methods, authority, output modes and execution properties. A Binding selects the Driver implementation. Resource paths identify targets; they do not confer rights. See [Capability Model](capability-model.md) for path syntax and `open()`.
 
 ## Driver
 
-A Driver implements interface methods. It receives a restricted
-`DriverContext`, the method id, an input Value, the requested output mode, and
-returns an Outcome.
+A Driver implements declared methods. It receives the admitted method, input, output mode and a restricted `DriverContext`, then returns an Outcome with provenance and usage. The context provides permitted State, stream and provenance operations. Driver code does not choose the caller's authority.
 
-Driver authority comes through the restricted `DriverContext`. If a driver
-needs to touch state, emit streaming chunks, derive provenance, or record output
-taint, it uses the runtime APIs exposed in its context.
-
-Invocation completion preserves the driver's reported source order and appends
-input sources that are not already present, for both success and failure. Portable
-and hosted execution, cached completion and asynchronous child results use this
-same rule. A Fact maintains its audit sequence separately: input sources precede
-new output observations. Source order does not grant authority.
+Invocation completion retains the Driver's source order and appends new input sources for both success and failure. A Fact has its own audit ordering. Source order records lineage; it does not grant authority.
 
 ## Handle
 
-A Handle is the compiled product of `open()`: Resource, rights, fast-path mode,
-DriverPlan, optional residual policy, owner Process, and generation.
+A Handle is the process-owned result of `open()`: concrete Resource, permitted method rights, frozen Driver plan, residual policy and generation. Release closes local use while preserving previously derived descendants; revocation invalidates a delegation subtree. Stale generations fail before slot reuse.
 
-Revocation bumps the generation so stale Handle ids fail before reuse.
+## Operation and Fact
 
-## Operation And Fact
+An Operation names the Process, selected acting identity, Handle, method, input, output mode and full operation identity. It is the admission boundary for effects, including signal subscriptions. The Kernel checks the live Handle and policy before dispatch.
 
-An Operation is the single path through which side effects occur. It contains
-the caller, acting identity, handle id, method id, full operation identity, input
-Value, output mode, and input taint. Facts share the complete immutable input
-and successful output Values, including media metadata.
+A Fact records an Operation attempt. Its first begin assigns an append slot; repeated begins under the same `OperationId` reuse that slot, and completion updates it. Facts preserve input and outcome provenance; large media uses external references. `caller_identity` records the Process's ordinary identity at admission, separately from the selected acting identity. A cached result used by a new invocation still records that new caller. See [State And Facts](state-and-facts.md#facts) for storage, queries and v1 fields.
 
-A Fact records one operation attempt. Its first begin assigns an append slot;
-repeated begins with the same full ID reuse that slot, and completion updates it
-in place. Media payloads use external references. Inline strings, lists, bytes
-and retained Fact history need separate host limits.
+`DataPlane::execute` retains the Driver result and completion errors separately. A completion error does not undo the effect. Unconfirmed effects report `OutcomeUnknown` with their original operation identities for application reconciliation. Fact recording is an explicitly selected observation, separate from authorization and budget ownership.

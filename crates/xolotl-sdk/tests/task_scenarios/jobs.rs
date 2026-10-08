@@ -254,7 +254,12 @@ fn install(runtime: &Xolotl) -> anyhow::Result<(tempfile::TempDir, Arc<Service>,
     });
     let submit = runtime.bootstrap().register_effect(
         "effect://scenario/job/submit",
-        &[MethodSpec::unary_async("invoke", Purity::Idempotent)],
+        &[MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Idempotent,
+            MethodSpec::UNARY_ASYNC,
+        )],
         Arc::new(JobDriver {
             service: service.clone(),
             action: Action::Submit,
@@ -262,7 +267,13 @@ fn install(runtime: &Xolotl) -> anyhow::Result<(tempfile::TempDir, Arc<Service>,
     )?;
     let observe = runtime.bootstrap().register_effect(
         "effect://scenario/job/observe",
-        &[MethodSpec::stream_async("invoke", Purity::Pure).observes_external()],
+        &[MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Pure,
+            MethodSpec::STREAM_ASYNC,
+        )
+        .observes_external()],
         Arc::new(JobDriver {
             service: service.clone(),
             action: Action::Observe,
@@ -270,7 +281,13 @@ fn install(runtime: &Xolotl) -> anyhow::Result<(tempfile::TempDir, Arc<Service>,
     )?;
     let cancel = runtime.bootstrap().register_effect(
         "effect://scenario/job/cancel",
-        &[MethodSpec::unary_async("invoke", Purity::Idempotent).finalize_allowed()],
+        &[MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Idempotent,
+            MethodSpec::UNARY_ASYNC,
+        )
+        .finalize_allowed()],
         Arc::new(JobDriver {
             service: service.clone(),
             action: Action::Cancel,
@@ -288,9 +305,12 @@ fn install(runtime: &Xolotl) -> anyhow::Result<(tempfile::TempDir, Arc<Service>,
 }
 
 fn done(output: ExecutionOutput) -> anyhow::Result<TaintedValue> {
-    output
-        .into_result()
-        .map_err(|error| anyhow::anyhow!("job operation failed: {error:?}"))
+    let (result, unresolved) = output.into_parts();
+    ensure!(
+        unresolved.is_empty(),
+        "job operation requires reconciliation"
+    );
+    result.map_err(|error| anyhow::anyhow!("job operation failed: {error:?}"))
 }
 
 async fn event(
@@ -306,7 +326,7 @@ async fn event(
 #[tokio::test]
 async fn external_job_publishes_a_committed_artifact_once() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(15), async {
-        let runtime = Xolotl::new();
+        let runtime = Xolotl::new(xolotl_state::InMemoryBackend::new().into_backend());
         let (_directory, service, programs) = install(&runtime)?;
         let request = request(runtime.bootstrap(), &[SUBMIT, OBSERVE, CANCEL])?;
         let executor = request.executor();
@@ -385,7 +405,7 @@ async fn external_job_publishes_a_committed_artifact_once() -> anyhow::Result<()
 #[tokio::test]
 async fn dropping_observation_requires_explicit_remote_cancellation() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(15), async {
-        let runtime = Xolotl::new();
+        let runtime = Xolotl::new(xolotl_state::InMemoryBackend::new().into_backend());
         let (_directory, service, programs) = install(&runtime)?;
         let request = request(runtime.bootstrap(), &[SUBMIT, OBSERVE, CANCEL])?;
         let executor = request.executor();

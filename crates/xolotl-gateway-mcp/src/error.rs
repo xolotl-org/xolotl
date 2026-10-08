@@ -22,8 +22,8 @@ pub enum McpGatewayError {
     /// A Gateway result could not be rendered as an MCP result.
     #[error("bad MCP result: {0}")]
     BadResult(String),
-    /// The shared Xolotl gateway rejected authentication or execution.
-    #[error("gateway rejected MCP request")]
+    /// The shared Xolotl gateway could not complete authentication or execution.
+    #[error("gateway MCP request failed")]
     Gateway(#[from] GatewayError),
     /// JSON serialization failed while rendering an MCP response.
     #[error("MCP serialization failed: {0}")]

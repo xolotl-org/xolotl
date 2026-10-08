@@ -15,6 +15,8 @@ use xolotl_types::{
 
 type Events = Rc<RefCell<Vec<&'static str>>>;
 
+mod accounting;
+mod async_accounting;
 #[cfg(feature = "host")]
 mod hosted;
 mod runtime;
@@ -22,6 +24,13 @@ mod runtime;
 struct Accounts {
     scopes: RefCell<Vec<Scope>>,
     events: Events,
+    requests: RefCell<Vec<AccountRequest>>,
+    receipts: RefCell<Vec<(OperationId, &'static str)>>,
+    completions: RefCell<Vec<(OperationId, Settlement, DriverOutput)>>,
+    dispatch_ready: Cell<bool>,
+    settle_ready: Cell<bool>,
+    fail_dispatch: bool,
+    fail_settle: bool,
 }
 
 impl Accounts {
@@ -31,6 +40,13 @@ impl Accounts {
         Self {
             scopes: RefCell::new(vec![scope]),
             events: events.clone(),
+            requests: RefCell::default(),
+            receipts: RefCell::default(),
+            completions: RefCell::default(),
+            dispatch_ready: Cell::new(true),
+            settle_ready: Cell::new(true),
+            fail_dispatch: false,
+            fail_settle: false,
         }
     }
     fn budget(&self) -> BudgetState {
@@ -41,10 +57,26 @@ impl Accounts {
 struct Permit<'a> {
     accounts: &'a Accounts,
     count: usize,
+    operation: OperationId,
 }
 
-impl AccountPermit for Permit<'_> {
-    fn settle(&mut self, settlement: Settlement) {
+impl<'a> Permit<'a> {
+    fn commit(
+        &self,
+        completion: Option<(OperationId, Settlement, DriverOutput)>,
+    ) -> AccountCommit<'a> {
+        AccountCommit {
+            permit: Permit {
+                accounts: self.accounts,
+                count: self.count,
+                operation: self.operation,
+            },
+            completion,
+            finished: false,
+        }
+    }
+
+    fn apply(&self, settlement: Settlement) {
         for scope in self
             .accounts
             .scopes
@@ -54,7 +86,95 @@ impl AccountPermit for Permit<'_> {
         {
             settlement.apply(scope);
         }
-        self.accounts.events.borrow_mut().push("settled");
+    }
+
+    fn record(&self, event: &'static str) {
+        self.accounts.events.borrow_mut().push(event);
+        self.accounts
+            .receipts
+            .borrow_mut()
+            .push((self.operation, event));
+    }
+}
+
+impl<'a> AccountPermit for Permit<'a> {
+    type Error = Failure;
+    type Commit = AccountCommit<'a>;
+
+    fn dispatch(&mut self) -> Self::Commit {
+        self.commit(None)
+    }
+
+    fn settle(&mut self, completion: AccountCompletion<'_>) -> Self::Commit {
+        self.commit(Some((
+            completion.operation(),
+            completion.settlement(),
+            completion.output().clone(),
+        )))
+    }
+
+    fn abandon(&mut self, settlement: Settlement) {
+        self.apply(settlement);
+        self.record("abandoned");
+    }
+}
+
+struct AccountCommit<'a> {
+    permit: Permit<'a>,
+    completion: Option<(OperationId, Settlement, DriverOutput)>,
+    finished: bool,
+}
+
+impl Future for AccountCommit<'_> {
+    type Output = Result<(), Failure>;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        assert!(!this.finished, "account commit polled after completion");
+        let settling = this.completion.is_some();
+        let accounts = this.permit.accounts;
+        if !(if settling {
+            &accounts.settle_ready
+        } else {
+            &accounts.dispatch_ready
+        })
+        .get()
+        {
+            return Poll::Pending;
+        }
+        this.finished = true;
+        if settling && accounts.fail_settle {
+            this.permit.record("settlement failed");
+            return Poll::Ready(Err(Failure::policy("account", "settlement commit failed")));
+        }
+        if !settling && accounts.fail_dispatch {
+            this.permit.record("dispatch failed");
+            return Poll::Ready(Err(Failure::policy("account", "dispatch commit failed")));
+        }
+        if let Some(completion) = this.completion.take() {
+            this.permit.apply(completion.1);
+            accounts.completions.borrow_mut().push(completion);
+            this.permit.record("settled");
+        } else {
+            this.permit.record("dispatch committed");
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for AccountCommit<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.permit
+                .accounts
+                .events
+                .borrow_mut()
+                .push(if self.completion.is_some() {
+                    "settlement commit dropped"
+                } else {
+                    "dispatch commit dropped"
+                });
+        }
     }
 }
 
@@ -72,9 +192,11 @@ impl Account for Accounts {
             }
         }
         self.events.borrow_mut().push("reserved");
+        self.requests.borrow_mut().push(request);
         Ok(Permit {
             accounts: self,
             count: scopes.len(),
+            operation: request.operation(),
         })
     }
 }
@@ -127,6 +249,7 @@ struct Recorder {
     events: Events,
     facts: RefCell<Vec<Fact>>,
     begin_ready: Cell<bool>,
+    complete_ready: Cell<bool>,
     fail_begin: bool,
     fail_complete: bool,
 }
@@ -136,6 +259,7 @@ impl Recorder {
             events: events.clone(),
             facts: RefCell::default(),
             begin_ready: Cell::new(true),
+            complete_ready: Cell::new(true),
             fail_begin: false,
             fail_complete: false,
         }
@@ -150,7 +274,9 @@ impl Future for Commit<'_> {
     type Output = Result<(), Failure>;
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        if this.begin && !this.recorder.begin_ready.get() {
+        if (this.begin && !this.recorder.begin_ready.get())
+            || (!this.begin && !this.recorder.complete_ready.get())
+        {
             return Poll::Pending;
         }
         if (this.begin && this.recorder.fail_begin) || (!this.begin && this.recorder.fail_complete)
@@ -225,6 +351,7 @@ fn grant(contract: MethodContract) -> GrantedMethod {
 }
 fn options(record: bool) -> InvocationOptions {
     InvocationOptions {
+        caller_identity: None,
         now_millis: 37,
         record,
     }
@@ -250,7 +377,7 @@ fn invocation_orders_barriers_and_shares_fact_provenance() -> Result<(), Failure
     let mut op = operation();
     op.taint = TaintSet::author();
     driver.output.taint = TaintSet::of(TaintSource::ModelOutput);
-    let expected = Invocation::admit(&op, grant(contract()), options(false))?;
+    let expected = Invocation::admit(&op, grant(contract()), options(true))?;
     let mut expected_output = driver.output.clone();
     expected_output.taint.union(&op.taint);
     let expected_fact = expected.completed_fact(DecisionTag::Ok, &expected_output);
@@ -258,7 +385,7 @@ fn invocation_orders_barriers_and_shares_fact_provenance() -> Result<(), Failure
     let result = finish(&mut invoke(
         op,
         grant(contract()),
-        options(false),
+        options(true),
         CallContext::Body,
         &driver,
         &recorder,
@@ -274,6 +401,7 @@ fn invocation_orders_barriers_and_shares_fact_provenance() -> Result<(), Failure
         &[
             "reserved",
             "intent committed",
+            "dispatch committed",
             "driver started",
             "driver dropped",
             "settled",
@@ -281,6 +409,106 @@ fn invocation_orders_barriers_and_shares_fact_provenance() -> Result<(), Failure
         ]
     );
     Ok(())
+}
+
+#[test]
+fn recording_is_explicit_for_every_replay_class_and_output_mode() -> Result<(), Failure> {
+    for replay in [
+        ReplayClass::Deterministic,
+        ReplayClass::Observation,
+        ReplayClass::IdempotentEffect,
+        ReplayClass::NonIdempotentEffect,
+    ] {
+        for output in [OutputMode::Unary, OutputMode::AsyncProcess] {
+            for record in [false, true] {
+                let events = Events::default();
+                let account = Accounts::new(&events);
+                let recorder = Recorder::new(&events);
+                let driver = Driver::new(&events);
+                let mut op = operation();
+                op.output = output;
+                let mut method = contract();
+                method.replay = replay;
+                method.supports = OutputModeSet::UNARY | OutputModeSet::ASYNC_PROCESS;
+                assert_eq!(
+                    Invocation::admit(&op, grant(method), options(record))?.records_fact(),
+                    record
+                );
+                let expected = Billing::new(&op.input, method).actual(&driver.output);
+                let result = finish(&mut invoke(
+                    op,
+                    grant(method),
+                    options(record),
+                    CallContext::Body,
+                    &driver,
+                    &recorder,
+                    &account,
+                )?)?;
+                assert_eq!(result.output, driver.output);
+                assert_eq!(result.completion_error, None);
+                assert_eq!(driver.calls.get(), 1);
+                assert_eq!(recorder.facts.borrow().len(), 2 * usize::from(record));
+                assert_eq!(account.budget().spent_micro_usd, expected.micro_usd);
+                assert_eq!(account.budget().inference_tokens, expected.tokens);
+                assert_eq!(account.budget().inflight_ops, 0);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn unrecorded_effects_and_process_creation_need_no_fact_recorder() -> Result<(), Failure> {
+    for replay in [
+        ReplayClass::IdempotentEffect,
+        ReplayClass::NonIdempotentEffect,
+    ] {
+        for output in [OutputMode::Unary, OutputMode::AsyncProcess] {
+            let events = Events::default();
+            let account = Accounts::new(&events);
+            let driver = Driver::new(&events);
+            let mut op = operation();
+            op.output = output;
+            let mut method = contract();
+            method.replay = replay;
+            method.supports = OutputModeSet::UNARY | OutputModeSet::ASYNC_PROCESS;
+            let result = finish(&mut invoke(
+                op,
+                grant(method),
+                options(false),
+                CallContext::Body,
+                &driver,
+                &NoFacts,
+                &account,
+            )?)?;
+            assert_eq!(result.output, driver.output);
+            assert_eq!(result.completion_error, None);
+            assert_eq!(driver.calls.get(), 1);
+            assert_eq!(account.completions.borrow().len(), 1);
+            assert_eq!(account.budget().inflight_ops, 0);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn unconfirmed_completion_preserves_operation_identity_and_failure_stage() {
+    let operation = operation().id;
+    for error in [
+        CompletionError::Settlement(Failure::Timeout),
+        CompletionError::Output(Failure::Timeout),
+    ] {
+        assert!(error.requires_interruption());
+        assert_eq!(
+            error.outcome_unknown(operation),
+            Failure::OutcomeUnknown {
+                operation_ids: vec![alloc::format!("{operation}")],
+                reason: alloc::format!("invocation completion is unconfirmed: {error}"),
+            }
+        );
+    }
+    assert!(!CompletionError::Dispatch(Failure::Timeout).requires_interruption());
+    assert!(!CompletionError::Fact(Failure::Timeout).requires_interruption());
 }
 
 #[test]
@@ -315,7 +543,7 @@ fn incomplete_barrier_cancellation_refunds_without_dispatch() -> Result<(), Fail
     let mut call = invoke(
         operation(),
         grant(contract()),
-        options(false),
+        options(true),
         CallContext::Body,
         &driver,
         &recorder,
@@ -327,6 +555,10 @@ fn incomplete_barrier_cancellation_refunds_without_dispatch() -> Result<(), Fail
     drop(call);
     assert_eq!(account.budget(), BudgetState::default());
     assert_eq!(driver.calls.get(), 0);
+    assert_eq!(
+        &*account.receipts.borrow(),
+        &[(operation().id, "abandoned")]
+    );
     Ok(())
 }
 
@@ -342,7 +574,7 @@ fn dispatched_cancellation_releases_future_then_concurrency_and_retains_spend()
     let mut call = invoke(
         operation(),
         grant(contract()),
-        options(false),
+        options(true),
         CallContext::Body,
         &driver,
         &recorder,
@@ -361,21 +593,26 @@ fn dispatched_cancellation_releases_future_then_concurrency_and_retains_spend()
     );
     assert_eq!(
         &events.borrow()[2..],
-        &["driver started", "driver dropped", "settled"]
+        &[
+            "dispatch committed",
+            "driver started",
+            "driver dropped",
+            "abandoned"
+        ]
     );
     assert_eq!(recorder.facts.borrow().len(), 1);
     Ok(())
 }
 
 #[test]
-fn missing_or_failed_recorder_denies_effect_and_refunds() -> Result<(), Failure> {
+fn explicitly_recorded_call_requires_recorder_and_refunds_on_rejection() -> Result<(), Failure> {
     let events = Events::default();
     let account = Accounts::new(&events);
     let driver = Driver::new(&events);
     let result = finish(&mut invoke(
         operation(),
         grant(contract()),
-        options(false),
+        options(true),
         CallContext::Body,
         &driver,
         &NoFacts,
@@ -389,7 +626,7 @@ fn missing_or_failed_recorder_denies_effect_and_refunds() -> Result<(), Failure>
     let result = finish(&mut invoke(
         operation(),
         grant(contract()),
-        options(false),
+        options(true),
         CallContext::Body,
         &driver,
         &recorder,
@@ -398,6 +635,10 @@ fn missing_or_failed_recorder_denies_effect_and_refunds() -> Result<(), Failure>
     assert!(matches!(result.output.outcome, Outcome::Fail(_)));
     assert_eq!(driver.calls.get(), 0);
     assert_eq!(account.budget(), BudgetState::default());
+    assert_eq!(
+        &*account.receipts.borrow(),
+        &[(operation().id, "abandoned"), (operation().id, "abandoned")]
+    );
     Ok(())
 }
 
@@ -411,14 +652,23 @@ fn completed_effect_retains_real_result_when_completion_commit_fails() -> Result
     let result = finish(&mut invoke(
         operation(),
         grant(contract()),
-        options(false),
+        options(true),
         CallContext::Body,
         &driver,
         &recorder,
         &account,
     )?)?;
     assert_eq!(result.output, driver.output);
-    assert!(result.completion_error.is_some());
+    assert!(result.effect_may_have_started);
+    assert_eq!(
+        result.completion_error,
+        Some(CompletionError::Fact(Failure::policy(
+            "test",
+            "commit failed"
+        )))
+    );
+    assert_eq!(account.completions.borrow().len(), 1);
+    assert_eq!(account.completions.borrow()[0].2, result.output);
     assert_eq!(account.budget().inflight_ops, 0);
     assert_eq!(recorder.facts.borrow().len(), 1);
     Ok(())

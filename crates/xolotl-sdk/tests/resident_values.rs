@@ -3,9 +3,9 @@
 use anyhow::{Context, ensure};
 use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
 use xolotl_sdk::{
-    Expression, IdentityRef, InMemoryBackend, InMemoryOptions, MemoryHistory, Outcome, Path,
-    Program, Transform, Value, XolotlBuilder,
+    Expression, IdentityRef, KernelBuilder, Outcome, Path, Program, Transform, Value, Xolotl,
 };
+use xolotl_state::{InMemoryBackend, InMemoryOptions, MemoryHistory};
 use xolotl_types::{
     DecisionTag, ExecutionId, Fact, HandleId, InvocationId, MethodId, NodeId, OperationId,
     ProcessId, ReplayClass, ResourceId, TaintSet, TaintedValue, Timestamp,
@@ -62,9 +62,11 @@ async fn incremental_value_composes_through_execution_state_facts_and_release() 
         ..InMemoryOptions::default()
     })?
     .into_backend();
-    let runtime = XolotlBuilder::new()
-        .with_state_backend(state.clone())
-        .build();
+    let runtime = Xolotl::from_kernel(
+        KernelBuilder::new(state.clone())
+            .with_fact_sink(xolotl_kernel::FactSink::in_memory().0)
+            .build(),
+    );
     let program = Program::new(
         Expression::Input
             .both(Expression::Input)
@@ -85,7 +87,8 @@ async fn incremental_value_composes_through_execution_state_facts_and_release() 
             &program,
             TaintedValue::new(root, rebuilt.taint),
         )
-        .await?;
+        .await?
+        .output;
     ensure!(result.taint == TaintSet::author());
     let Outcome::Done(value) = result.outcome else {
         anyhow::bail!("expected completed value")
@@ -96,18 +99,19 @@ async fn incremental_value_composes_through_execution_state_facts_and_release() 
     state
         .write_set_tainted(&path, value.clone(), result.taint.clone())
         .await?;
-    let snapshot = state.read_tainted(&path).await?.context("state snapshot")?;
-    ensure!(snapshot.value.identity() == value.identity());
+    let snapshot = state.read_tainted(&path).await?;
+    let snapshot_value = snapshot.value.clone().context("state snapshot")?;
+    ensure!(snapshot_value.identity() == value.identity());
     let pair = Value::list(vec![value.clone(), value.clone()]);
     state
         .write_cas_tainted(
             &path,
-            Some(snapshot.value.clone()),
+            Some(snapshot_value.clone()),
             pair.clone(),
             result.taint.clone(),
         )
         .await?;
-    ensure!(snapshot.value == value);
+    ensure!(snapshot_value == value);
     let sequence = Path::parse("state://resident/sequence")?;
     state
         .write_append_tainted(&sequence, pair, result.taint.clone())
@@ -115,13 +119,10 @@ async fn incremental_value_composes_through_execution_state_facts_and_release() 
     state
         .write_append_tainted(&sequence, value.clone(), result.taint.clone())
         .await?;
-    let sequence_value = state
-        .read_tainted(&sequence)
-        .await?
-        .context("append result")?;
+    let sequence_value = state.read_tainted(&sequence).await?;
+    let sequence_value_value = sequence_value.value.clone().context("append result")?;
     ensure!(
-        sequence_value
-            .value
+        sequence_value_value
             .as_list()
             .context("appended list")?
             .len()
@@ -138,6 +139,7 @@ async fn incremental_value_composes_through_execution_state_facts_and_release() 
         ),
         schema_version: Fact::SCHEMA_VERSION,
         caller: ProcessId::new(77),
+        caller_identity: Some(IdentityRef::ROOT),
         acting: IdentityRef::ROOT,
         handle: HandleId::new(0, 1),
         resource: ResourceId::new(1),
@@ -150,11 +152,15 @@ async fn incremental_value_composes_through_execution_state_facts_and_release() 
         replay: ReplayClass::Observation,
         timestamp: Timestamp::millis(0),
     };
-    runtime.bootstrap().kernel.facts.complete(record.clone())?;
+    runtime
+        .bootstrap()
+        .kernel()
+        .facts()
+        .complete(record.clone())?;
     let retained = runtime
         .bootstrap()
-        .kernel
-        .facts
+        .kernel()
+        .facts()
         .get(record.id)?
         .context("retained fact")?;
     ensure!(retained.input.identity() == record.input.identity());

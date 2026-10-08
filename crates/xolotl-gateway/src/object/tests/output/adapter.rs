@@ -12,6 +12,7 @@ fn runtime(fixture: &Fixture) -> anyhow::Result<Arc<GatewayRuntime>> {
             echo_profile(xolotl_types::ResourceName::new(Path::parse(
                 "effect://echo/say",
             )?))?,
+            fixture.gateway.idempotency.clone(),
         )?
         .with_object_store(fixture.files.clone().into_object_store()),
     ))

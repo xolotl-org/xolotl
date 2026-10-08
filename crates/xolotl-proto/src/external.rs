@@ -9,7 +9,7 @@ pub struct ExternalFrame {
     /// The receiver rejects an envelope without a selected variant.
     #[prost(
         oneof = "external_frame::Frame",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14"
     )]
     pub frame: ::core::option::Option<external_frame::Frame>,
 }
@@ -51,6 +51,12 @@ pub mod external_frame {
         /// Authenticated and encrypted business or control frame.
         #[prost(message, tag = "12")]
         SecureEnvelope(super::SecureEnvelope),
+        /// Source-to-daemon ordered-stream lifecycle operation.
+        #[prost(message, tag = "13")]
+        SourceStreamRequest(super::SourceStreamRequest),
+        /// Daemon-to-Source result of an ordered-stream lifecycle operation.
+        #[prost(message, tag = "14")]
+        SourceStreamResult(super::SourceStreamResult),
     }
 }
 /// AEAD-protected business/control frame envelope.
@@ -109,6 +115,9 @@ pub struct EnvelopeAad {
     /// Session key epoch used to seal the frame and checked during key rotation.
     #[prost(uint64, tag = "10")]
     pub key_epoch: u64,
+    /// Required AEAD direction: `client_to_daemon` or `daemon_to_client`.
+    #[prost(string, tag = "11")]
+    pub direction: ::prost::alloc::string::String,
 }
 /// Role client hello with identity plus locally observed generations/hash.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -168,6 +177,16 @@ pub struct SessionContext {
     /// Daemon-selected identity for this role connection, distinct from a Process id.
     #[prost(string, tag = "11")]
     pub session_id: ::prost::alloc::string::String,
+    /// Storage-issued active Source scope incarnation. Source requires nonzero;
+    /// Provider uses zero. Echoed by RoleReady with the whole context.
+    #[prost(uint64, tag = "12")]
+    pub scope_epoch: u64,
+    /// Storage-issued installation incarnation, nonzero for both roles.
+    #[prost(uint64, tag = "13")]
+    pub installation_epoch: u64,
+    /// Current AEAD key epoch selected before authenticated Ready.
+    #[prost(uint64, tag = "14")]
+    pub key_epoch: u64,
 }
 /// Role client acknowledgement of the daemon-selected context.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -201,6 +220,202 @@ pub struct InboundEvent {
     /// admits only the next number, and rejects values above `i64::MAX`.
     #[prost(uint64, optional, tag = "6")]
     pub seq: ::core::option::Option<u64>,
+    /// Storage-issued stream incarnation, supplied with stream_id and seq.
+    #[prost(uint64, optional, tag = "7")]
+    pub stream_epoch: ::core::option::Option<u64>,
+}
+/// Source-to-daemon lifecycle operation for one ordered stream.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SourceStreamRequest {
+    /// Correlation id and, for Open, durable idempotency identity.
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    /// Stream identity within the ready Source scope.
+    #[prost(string, tag = "2")]
+    pub stream_id: ::prost::alloc::string::String,
+    /// Requested operation.
+    #[prost(oneof = "source_stream_request::Operation", tags = "3, 4, 5")]
+    pub operation: ::core::option::Option<source_stream_request::Operation>,
+}
+/// Nested operation variants for SourceStreamRequest.
+pub mod source_stream_request {
+    /// Inspect, open, or conditionally retire one ordered stream.
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Operation {
+        /// Read scope revision and current state.
+        #[prost(message, tag = "3")]
+        Inspect(super::SourceStreamInspect),
+        /// CAS-open a stream name.
+        #[prost(message, tag = "4")]
+        Open(super::SourceStreamOpen),
+        /// Retire one exact stream incarnation.
+        #[prost(message, tag = "5")]
+        Retire(super::SourceStreamRetire),
+    }
+}
+/// Read-only ordered stream inspection request.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct SourceStreamInspect {}
+/// Conditional ordered stream open request.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct SourceStreamOpen {
+    /// Scope-local catalog revision previously observed by the client.
+    #[prost(uint64, tag = "1")]
+    pub expected_revision: u64,
+}
+/// Conditional ordered stream retirement request.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct SourceStreamRetire {
+    /// Storage-issued stream incarnation; zero is invalid.
+    #[prost(uint64, tag = "1")]
+    pub stream_epoch: u64,
+}
+/// Current state of one active ordered stream.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SourceStreamState {
+    /// Storage-issued incarnation.
+    #[prost(uint64, tag = "1")]
+    pub stream_epoch: u64,
+    /// Last committed sequence.
+    #[prost(uint64, tag = "2")]
+    pub last_seq: u64,
+    /// Stable Open idempotency identity.
+    #[prost(string, tag = "3")]
+    pub open_id: ::prost::alloc::string::String,
+    /// Original Open CAS revision, paired with open_id for retry identity.
+    #[prost(uint64, tag = "4")]
+    pub opened_at_revision: u64,
+}
+/// Scope revision and optional active state for a named stream.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SourceStreamSnapshot {
+    /// Scope-local catalog revision.
+    #[prost(uint64, tag = "1")]
+    pub revision: u64,
+    /// Current active stream, if any.
+    #[prost(message, optional, tag = "2")]
+    pub active: ::core::option::Option<SourceStreamState>,
+}
+/// Successful retirement's new catalog revision.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct SourceStreamRetired {
+    /// Scope-local catalog revision after retirement.
+    #[prost(uint64, tag = "1")]
+    pub revision: u64,
+}
+/// Typed lifecycle rejection and recovery hints.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SourceStreamRejected {
+    /// Stable machine-readable reason.
+    #[prost(enumeration = "SourceStreamRejectCode", tag = "1")]
+    pub code: i32,
+    /// Current catalog revision for a conflict or inactive stream.
+    #[prost(uint64, optional, tag = "2")]
+    pub current_revision: ::core::option::Option<u64>,
+    /// Current incarnation when Retire targeted a previous one.
+    #[prost(uint64, optional, tag = "3")]
+    pub active_epoch: ::core::option::Option<u64>,
+    /// Current active state when another Open identity owns the name.
+    #[prost(message, optional, tag = "4")]
+    pub current: ::core::option::Option<SourceStreamSnapshot>,
+}
+/// Correlated daemon-to-Source lifecycle result.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SourceStreamResult {
+    /// Echo of request correlation id.
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    /// Echo of stream identity.
+    #[prost(string, tag = "2")]
+    pub stream_id: ::prost::alloc::string::String,
+    /// One successful result or typed refusal.
+    #[prost(oneof = "source_stream_result::Outcome", tags = "3, 4, 5, 6")]
+    pub outcome: ::core::option::Option<source_stream_result::Outcome>,
+}
+/// Nested result variants for SourceStreamResult.
+pub mod source_stream_result {
+    /// Inspection, opening, retirement, or rejection.
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Outcome {
+        /// Read-only state.
+        #[prost(message, tag = "3")]
+        Inspected(super::SourceStreamSnapshot),
+        /// Opened state or same-open-id retry.
+        #[prost(message, tag = "4")]
+        Opened(super::SourceStreamSnapshot),
+        /// Retired stream revision.
+        #[prost(message, tag = "5")]
+        Retired(super::SourceStreamRetired),
+        /// Deterministic or indeterminate refusal.
+        #[prost(message, tag = "6")]
+        Rejected(super::SourceStreamRejected),
+    }
+}
+/// Stable Source stream lifecycle refusal codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SourceStreamRejectCode {
+    /// Invalid proto3 default value.
+    Unspecified = 0,
+    /// Invalid stream path segment.
+    InvalidStreamId = 1,
+    /// Invalid correlation/Open identity.
+    InvalidRequestId = 2,
+    /// Invalid zero epoch supplied to Retire.
+    InvalidEpoch = 3,
+    /// Session's Source scope is inactive.
+    ScopeInactive = 4,
+    /// Catalog revision changed.
+    RevisionConflict = 5,
+    /// Another Open identity holds this name.
+    AlreadyOpen = 6,
+    /// No room for another active stream.
+    QuotaExceeded = 7,
+    /// Named stream is not active.
+    Inactive = 8,
+    /// Retire targeted an older incarnation.
+    StaleEpoch = 9,
+    /// Storage proved the operation aborted.
+    StorageUnavailable = 10,
+    /// Storage cannot classify the outcome; inspect or retry.
+    OutcomeUnknown = 11,
+}
+impl SourceStreamRejectCode {
+    /// Protobuf enum spelling.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SOURCE_STREAM_REJECT_CODE_UNSPECIFIED",
+            Self::InvalidStreamId => "SOURCE_STREAM_REJECT_CODE_INVALID_STREAM_ID",
+            Self::InvalidRequestId => "SOURCE_STREAM_REJECT_CODE_INVALID_REQUEST_ID",
+            Self::InvalidEpoch => "SOURCE_STREAM_REJECT_CODE_INVALID_EPOCH",
+            Self::ScopeInactive => "SOURCE_STREAM_REJECT_CODE_SCOPE_INACTIVE",
+            Self::RevisionConflict => "SOURCE_STREAM_REJECT_CODE_REVISION_CONFLICT",
+            Self::AlreadyOpen => "SOURCE_STREAM_REJECT_CODE_ALREADY_OPEN",
+            Self::QuotaExceeded => "SOURCE_STREAM_REJECT_CODE_QUOTA_EXCEEDED",
+            Self::Inactive => "SOURCE_STREAM_REJECT_CODE_INACTIVE",
+            Self::StaleEpoch => "SOURCE_STREAM_REJECT_CODE_STALE_EPOCH",
+            Self::StorageUnavailable => "SOURCE_STREAM_REJECT_CODE_STORAGE_UNAVAILABLE",
+            Self::OutcomeUnknown => "SOURCE_STREAM_REJECT_CODE_OUTCOME_UNKNOWN",
+        }
+    }
+    /// Parse the protobuf enum spelling.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        Some(match value {
+            "SOURCE_STREAM_REJECT_CODE_UNSPECIFIED" => Self::Unspecified,
+            "SOURCE_STREAM_REJECT_CODE_INVALID_STREAM_ID" => Self::InvalidStreamId,
+            "SOURCE_STREAM_REJECT_CODE_INVALID_REQUEST_ID" => Self::InvalidRequestId,
+            "SOURCE_STREAM_REJECT_CODE_INVALID_EPOCH" => Self::InvalidEpoch,
+            "SOURCE_STREAM_REJECT_CODE_SCOPE_INACTIVE" => Self::ScopeInactive,
+            "SOURCE_STREAM_REJECT_CODE_REVISION_CONFLICT" => Self::RevisionConflict,
+            "SOURCE_STREAM_REJECT_CODE_ALREADY_OPEN" => Self::AlreadyOpen,
+            "SOURCE_STREAM_REJECT_CODE_QUOTA_EXCEEDED" => Self::QuotaExceeded,
+            "SOURCE_STREAM_REJECT_CODE_INACTIVE" => Self::Inactive,
+            "SOURCE_STREAM_REJECT_CODE_STALE_EPOCH" => Self::StaleEpoch,
+            "SOURCE_STREAM_REJECT_CODE_STORAGE_UNAVAILABLE" => Self::StorageUnavailable,
+            "SOURCE_STREAM_REJECT_CODE_OUTCOME_UNKNOWN" => Self::OutcomeUnknown,
+            _ => return None,
+        })
+    }
 }
 /// Daemon to Source client: execute this action through the connector.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -258,9 +473,12 @@ pub struct EventAck {
     /// Event admission status, encoded as an `AckStatus` discriminant.
     #[prost(enumeration = "AckStatus", tag = "2")]
     pub status: i32,
-    /// Redacted explanation when the event is rejected.
+    /// Redacted explanation when the event is definitively rejected.
     #[prost(string, optional, tag = "3")]
     pub reject_reason: ::core::option::Option<::prost::alloc::string::String>,
+    /// Echo of the ordered event's stream incarnation, if any.
+    #[prost(uint64, optional, tag = "4")]
+    pub stream_epoch: ::core::option::Option<u64>,
 }
 /// Daemon to Provider client: invoke an effect.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -445,9 +663,11 @@ pub struct ErrorInfo {
     #[prost(string, tag = "2")]
     pub message: ::prost::alloc::string::String,
     /// Additional wire diagnostics; the current runtime error conversion discards them.
-    #[prost(map = "string, string", tag = "3")]
-    pub details:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    #[prost(btree_map = "string, string", tag = "3")]
+    pub details: ::std::collections::BTreeMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Role projected by an external program, orthogonal to transport and trust.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -491,6 +711,9 @@ pub enum AckStatus {
     Duplicate = 2,
     /// The event was rejected; the acknowledgement may include a redacted reason.
     Rejected = 3,
+    /// Storage could not prove whether the event committed; inspect or retry
+    /// the same identity without treating this as a definite rejection.
+    OutcomeUnknown = 4,
 }
 impl AckStatus {
     /// Return the exact acknowledgement enum name declared in the protobuf schema.
@@ -500,6 +723,7 @@ impl AckStatus {
             Self::Accepted => "ACK_STATUS_ACCEPTED",
             Self::Duplicate => "ACK_STATUS_DUPLICATE",
             Self::Rejected => "ACK_STATUS_REJECTED",
+            Self::OutcomeUnknown => "ACK_STATUS_OUTCOME_UNKNOWN",
         }
     }
     /// Parse an exact protobuf acknowledgement name, returning `None` if unknown.
@@ -509,6 +733,7 @@ impl AckStatus {
             "ACK_STATUS_ACCEPTED" => Some(Self::Accepted),
             "ACK_STATUS_DUPLICATE" => Some(Self::Duplicate),
             "ACK_STATUS_REJECTED" => Some(Self::Rejected),
+            "ACK_STATUS_OUTCOME_UNKNOWN" => Some(Self::OutcomeUnknown),
             _ => None,
         }
     }
@@ -581,6 +806,7 @@ pub enum RejectReason {
     Unsupported = 4,
 }
 /// Tonic server binding for the bidirectional external role-session RPC.
+#[cfg(feature = "grpc")]
 pub mod external_service_server {
     use tonic::codegen::*;
     /// Server implementation of the Provider/Source session protocol.
@@ -750,6 +976,7 @@ pub mod external_service_server {
     }
 }
 /// Tonic client binding for the bidirectional external role-session RPC.
+#[cfg(feature = "grpc")]
 pub mod external_service_client {
     use tonic::codegen::http::Uri;
     use tonic::codegen::*;
@@ -758,6 +985,7 @@ pub mod external_service_client {
     pub struct ExternalServiceClient<T> {
         inner: tonic::client::Grpc<T>,
     }
+    #[cfg(feature = "transport")]
     impl ExternalServiceClient<tonic::transport::Channel> {
         /// Attempt to create a new client by connecting to a given endpoint.
         pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>

@@ -338,9 +338,11 @@ impl Record {
                         .map_err(|_error| BuilderError::Invariant("path cluster"))?;
                 }
                 for segment in segments {
-                    // The validator checked every segment incrementally. Move
-                    // each owned component without reparsing a path string.
-                    path = path.push(segment);
+                    // Keep the validator's owned component without reparsing
+                    // a path string; the Path invariant is checked again.
+                    path = path
+                        .try_push_owned(segment)
+                        .map_err(|_error| BuilderError::Invariant("path segment"))?;
                 }
                 Field::Path(path)
             }

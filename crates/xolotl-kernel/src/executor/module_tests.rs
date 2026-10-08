@@ -1,7 +1,6 @@
 use super::*;
 use crate::{Bootstrap, EchoDriver, MethodSpec};
 use anyhow::{Context, ensure};
-use futures_util::FutureExt;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use xolotl_graph::portable::{Expression as E, Program, Transform};
@@ -63,8 +62,8 @@ async fn repeated_module_calls_reuse_code_and_bindings_with_bounded_storage() ->
         },
     )?;
     let executor = boot
-        .kernel
-        .executor_for(boot.root)
+        .kernel()
+        .executor_for(boot.root())
         .with_steps(steps)
         .with_execution_config(ExecutionConfig {
             max_instructions,
@@ -140,8 +139,8 @@ async fn portable_and_native_modules_nest_in_one_lexical_execution() -> anyhow::
     let decoded = Program::from_json(&serde_json::to_vec(&source)?)?;
     ensure!(decoded == source);
     let output = boot
-        .kernel
-        .executor_for(boot.root)
+        .kernel()
+        .executor_for(boot.root())
         .with_steps(steps)
         .eval_program(&decoded.compile()?, TaintedValue::pristine(Value::null()))
         .await;
@@ -157,6 +156,7 @@ async fn waiting_modules_keep_their_code_while_completed_modules_are_reused() ->
 {
     for quantum in [1, 256] {
         let boot = Bootstrap::in_memory();
+        super::signal_tests::install_signal_resource(&boot, boot.kernel().state().clone())?;
         let signal = Path::parse("state://signal/module-reuse")?;
         let waiting = prepare(E::Let {
             name: "value".into(),
@@ -192,8 +192,8 @@ async fn waiting_modules_keep_their_code_while_completed_modules_are_reused() ->
             )?,
         ])?;
         let executor = boot
-            .kernel
-            .executor_for(boot.root)
+            .kernel()
+            .executor_for(boot.root())
             .with_steps(steps)
             .with_execution_config(ExecutionConfig {
                 max_instructions,
@@ -214,8 +214,8 @@ async fn waiting_modules_keep_their_code_while_completed_modules_are_reused() ->
             Ok::<_, anyhow::Error>(())
         })
         .await??;
-        boot.kernel
-            .state
+        boot.kernel()
+            .state()
             .write_set(&signal, Value::boolean(true))
             .await?;
         let output = tokio::time::timeout(std::time::Duration::from_secs(1), run).await?;
@@ -268,8 +268,8 @@ async fn rejected_module_admission_rolls_back_and_reaches_the_next_loader() -> a
             )?,
         ])?;
         let output = boot
-            .kernel
-            .executor_for(boot.root)
+            .kernel()
+            .executor_for(boot.root())
             .with_steps(steps)
             .with_execution_config(config)
             .eval_prepared(&program, TaintedValue::pristine(Value::integer(1)))
@@ -297,7 +297,7 @@ async fn loader_failure_and_panic_are_ordinary_catchable_failures() -> anyhow::R
             |_, _| std::panic::resume_unwind(Box::new("loader panic")),
         )?,
     ])?;
-    let executor = boot.kernel.executor_for(boot.root).with_steps(steps);
+    let executor = boot.kernel().executor_for(boot.root()).with_steps(steps);
     for (name, expected) in [
         ("missing", "not found"),
         ("failed", "loader failed"),
@@ -319,48 +319,17 @@ async fn loader_failure_and_panic_are_ordinary_catchable_failures() -> anyhow::R
 }
 
 #[tokio::test]
-async fn dynamic_modules_reject_durable_images_before_dispatch() -> anyhow::Result<()> {
-    let boot = Bootstrap::in_memory();
-    let mut source = Program::new(E::literal(42));
-    source.durable = true;
-    let loaded = PreparedProgram::new(&source.compile()?)?;
-    let calls = Arc::new(AtomicUsize::new(0));
-    let observed = Arc::clone(&calls);
-    let steps = StepModule::program(
-        "durable",
-        crate::LoaderRevision::from_bytes([1; 32]),
-        move |_, _| {
-            observed.fetch_add(1, Ordering::Relaxed);
-            Ok(loaded.clone())
-        },
-    )?;
-    let executor = boot.kernel.executor_for(boot.root).with_steps(steps);
-    let mut source = Program::new(module("durable"));
-    let output = executor
-        .eval_program(&source.compile()?, TaintedValue::pristine(Value::null()))
-        .await;
-    ensure!(
-        matches!(output.outcome, Outcome::Fail(Failure::PolicyViolation { detail, .. }) if detail.contains("durable"))
-    );
-    ensure!(calls.load(Ordering::Relaxed) == 1);
-    source.durable = true;
-    let output = executor
-        .eval_program(&source.compile()?, TaintedValue::pristine(Value::null()))
-        .await;
-    ensure!(
-        matches!(output.outcome, Outcome::Fail(Failure::PolicyViolation { detail, .. }) if detail.contains("durable") || detail.contains("Durable"))
-    );
-    ensure!(calls.load(Ordering::Relaxed) == 1);
-    Ok(())
-}
-
-#[tokio::test]
 async fn module_calls_keep_input_authority_provenance_and_one_execution_namespace()
 -> anyhow::Result<()> {
-    let boot = Bootstrap::in_memory();
+    let boot = crate::fact::testing::observing_bootstrap();
     let target = boot.register_effect(
         "effect://modules/echo",
-        &[MethodSpec::unary_async("invoke", Purity::Effectful)],
+        &[MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Effectful,
+            MethodSpec::UNARY_ASYNC,
+        )],
         Arc::new(EchoDriver),
     )?;
     let effect = OperationTemplate {
@@ -385,16 +354,21 @@ async fn module_calls_keep_input_authority_provenance_and_one_execution_namespac
     let body = (0..32).fold(E::Input, |body, _| {
         body.then(module("portable")).then(module("native"))
     });
-    let identity = Path::parse("process/module-caller")?;
-    boot.kernel.registry.register_grant(xolotl_types::Grant {
-        id: boot.kernel.registry.next_grant_id(),
-        holder: boot.root,
-        selector: xolotl_types::ResourceSelector::parse("act-as://process/module-caller")?,
-        rights: Rights::new(MethodBitmap::ALL, RightFlags::DELEGATE),
-        constraints: xolotl_types::ConstraintSet::empty(),
-        expires: xolotl_types::Expiry::Never,
-    });
-    let acting = intern_identity(&identity);
+    let identity = Path::parse("identity://module-caller")?;
+    boot.kernel()
+        .registry()
+        .register_grant(xolotl_types::Grant {
+            id: boot.kernel().registry().next_grant_id(),
+            holder: boot.root(),
+            selector: xolotl_types::ResourceSelector::parse("act-as://identity/module-caller")?,
+            rights: xolotl_types::GrantRights::new(
+                xolotl_types::GrantMethods::all(),
+                RightFlags::DELEGATE,
+            ),
+            constraints: xolotl_types::ConstraintSet::empty(),
+            expires: xolotl_types::Expiry::Never,
+        });
+    let acting = boot.kernel().identities().resolve_or_register(&identity)?;
     let program = prepare(E::Acting {
         identity,
         body: Box::new(body),
@@ -403,8 +377,9 @@ async fn module_calls_keep_input_authority_provenance_and_one_execution_namespac
         path: Path::parse("state://vault/module-input")?,
     });
     let output = boot
-        .kernel
-        .executor_for(boot.root)
+        .kernel()
+        .executor_for(boot.root())
+        .with_fact_recording(true)
         .with_steps(steps)
         .eval_prepared(
             &program,
@@ -412,9 +387,10 @@ async fn module_calls_keep_input_authority_provenance_and_one_execution_namespac
         )
         .await;
     ensure!(output.outcome == Outcome::Done(Value::null()), "{output:?}");
-    let facts = boot.kernel.facts.facts_of(boot.root)?;
+    let facts = boot.kernel().facts().facts_of(boot.root())?;
     ensure!(facts.len() == 64);
-    ensure!(facts.iter().all(|fact| fact.caller == boot.root
+    ensure!(facts.iter().all(|fact| fact.caller == boot.root()
+        && fact.caller_identity == Some(IdentityRef::ROOT)
         && fact.acting == acting
         && fact.taint.has_protected()));
     ensure!(facts.first().context("missing first effect")?.input == Value::integer(17));
@@ -444,10 +420,17 @@ async fn module_calls_keep_input_authority_provenance_and_one_execution_namespac
 
 #[tokio::test]
 async fn cancelled_module_keeps_parent_code_until_loaded_cleanup_finishes() -> anyhow::Result<()> {
-    let boot = Bootstrap::in_memory();
+    let boot = crate::fact::testing::observing_bootstrap();
+    super::signal_tests::install_signal_resource(&boot, boot.kernel().state().clone())?;
     let target = boot.register_effect(
         "effect://modules/cleanup",
-        &[MethodSpec::unary_async("invoke", Purity::Effectful).finalize_allowed()],
+        &[MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Effectful,
+            MethodSpec::UNARY_ASYNC,
+        )
+        .finalize_allowed()],
         Arc::new(EchoDriver),
     )?;
     let signal = Path::parse("state://signal/module-cleanup")?;
@@ -482,23 +465,131 @@ async fn cancelled_module_keeps_parent_code_until_loaded_cleanup_finishes() -> a
         )?,
     ])?;
     let executor = boot
-        .kernel
-        .executor_for(boot.root)
+        .kernel()
+        .executor_for(boot.root())
+        .with_fact_recording(true)
         .with_steps(steps)
         .with_execution_config(ExecutionConfig {
             max_instructions,
             ..ExecutionConfig::default()
         });
     let mut run = Box::pin(executor.eval_prepared(&program, TaintedValue::pristine(Value::null())));
-    ensure!(run.as_mut().now_or_never().is_none());
-    boot.cancel_process(boot.root)?;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if !boot.kernel().facts().facts_of(boot.root())?.is_empty() {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::select! {
+                biased;
+                output = &mut run => anyhow::bail!("module wait ended before its call: {output:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await??;
+    boot.cancel_process(boot.root())?;
     let output = tokio::time::timeout(std::time::Duration::from_secs(1), run).await?;
     ensure!(
         output.outcome == Outcome::Fail(Failure::Cancelled),
         "{output:?}"
     );
-    let facts = boot.kernel.facts.facts_of(boot.root)?;
-    ensure!(facts.len() == 1);
-    ensure!(facts[0].outcome == Some(Value::integer(42)));
+    let facts = boot.kernel().facts().facts_of(boot.root())?;
+    ensure!(facts.len() == 2);
+    ensure!(
+        facts
+            .iter()
+            .any(|fact| fact.outcome == Some(Value::integer(42)))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_bracket_releases_acquired_value_and_keeps_body_result() -> anyhow::Result<()> {
+    let released = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let captured = Arc::clone(&released);
+    let steps = StepModule::compose([
+        StepModule::single("body", |value, _| {
+            if value == Value::integer(7) {
+                DoNode::pure(42)
+            } else {
+                DoNode::fail(Failure::InvalidInput {
+                    reason: "wrong body input".into(),
+                })
+            }
+        })?,
+        StepModule::single("fail", |_, _| {
+            DoNode::fail(Failure::InvalidInput {
+                reason: "body failed".into(),
+            })
+        })?,
+        StepModule::single("release", move |value, _| {
+            captured.lock().push(value);
+            DoNode::pure(Value::null())
+        })?,
+    ])?;
+    let boot = Bootstrap::in_memory();
+    let executor = boot.kernel().executor_for(boot.root()).with_steps(steps);
+    let success = DoNode::bracket(
+        DoNode::pure(7),
+        StepRef::new("body"),
+        StepRef::new("release"),
+    );
+    ensure!(executor.eval(&success).await.outcome == Outcome::Done(Value::integer(42)));
+    let failure = DoNode::bracket(
+        DoNode::pure(7),
+        StepRef::new("fail"),
+        StepRef::new("release"),
+    );
+    ensure!(
+        executor.eval(&failure).await.outcome
+            == Outcome::Fail(Failure::InvalidInput {
+                reason: "body failed".into(),
+            })
+    );
+    ensure!(*released.lock() == vec![Value::integer(7), Value::integer(7)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_bracket_releases_after_cooperative_cancellation() -> anyhow::Result<()> {
+    let boot = Bootstrap::in_memory();
+    let releases = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&releases);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let observed_entry = Arc::clone(&entered);
+    let steps = StepModule::compose([
+        StepModule::single("wait", move |_, _| {
+            observed_entry.fetch_add(1, Ordering::SeqCst);
+            DoNode::wait_deadline(i64::MAX)
+        })?,
+        StepModule::single("release", move |value, _| {
+            if value == Value::integer(7) {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+            DoNode::pure(Value::null())
+        })?,
+    ])?;
+    let program = DoNode::bracket(
+        DoNode::pure(7),
+        StepRef::new("wait"),
+        StepRef::new("release"),
+    );
+    let executor = boot.kernel().executor_for(boot.root()).with_steps(steps);
+    let mut run = Box::pin(executor.eval(&program));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while entered.load(Ordering::SeqCst) == 0 {
+            tokio::select! {
+                biased;
+                output = &mut run => anyhow::bail!("bracket wait ended before entry: {output:?}"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    boot.cancel_process(boot.root())?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(1), run).await?;
+    ensure!(output.outcome == Outcome::Fail(Failure::Cancelled));
+    ensure!(releases.load(Ordering::SeqCst) == 1);
     Ok(())
 }

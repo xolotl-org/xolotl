@@ -8,7 +8,7 @@ pub(super) struct Projection<'a> {
     pub(super) fields: Option<Fields<'a>>,
 }
 
-/// Existing failure records have at most two fields. This is fixed schema
+/// Failure records have at most two fields. This is fixed schema
 /// storage, independent of the length of strings or lists in those fields.
 pub(super) struct Fields<'a> {
     entries: [Option<(&'static str, Node<'a>)>; 2],
@@ -68,9 +68,12 @@ pub(super) fn project(failure: &Failure) -> Projection<'_> {
         ),
         Failure::Timeout => unit("Timeout"),
         Failure::Cancelled => unit("Cancelled"),
-        Failure::Quarantined { op_id, reason } => record(
-            "Quarantined",
-            ("op_id", Node::text(op_id)),
+        Failure::OutcomeUnknown {
+            operation_ids,
+            reason,
+        } => record(
+            "OutcomeUnknown",
+            ("operation_ids", Node::Strings(operation_ids)),
             Some(("reason", Node::text(reason))),
         ),
         Failure::InvalidInput { reason } => {

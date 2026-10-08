@@ -3,7 +3,8 @@
 //!
 //! The compiler's contract is **stable, deterministic [`NodeId`]s**: the same
 //! `DoNode` always compiles to the same node ids, assigned in a fixed
-//! pre-order traversal, never depending on wall clock or randomness. These are
+//! structural traversal (continuation Steps follow their source subtree), never
+//! depending on wall clock or randomness. These are
 //! source positions; execution scopes and dynamic request tickets distinguish
 //! independent evaluations and repeated visits to a node.
 //!
@@ -13,10 +14,11 @@
 //! Pure(a)                Node::Pure
 //! AndThen(d, s)          d's subgraph → Then-edge → Node::Step(s)
 //! OrElse(d, s)           d's subgraph → Node::Branch(OrElse{recover:s})
+//! Finally(body, cleanup) two arms → Node::Finally
 //! Race(a, b)             a,b subgraphs → Node::Join(Race)
 //! Both(a, b)             a,b subgraphs → Node::Join(Both)
-//! Let(id, v, body)       v subgraph tagged binding id; Use(id) → Use-edge
-//! Use(id)                Use-edge to the Let node (no new effect node)
+//! Let(id, v, body)       lexical Let with value and body arms
+//! Use(id)                Load from the enclosing lexical slot
 //! Acting(id, body)       Node::Acting wrapping body's subgraph
 //! Fail(f)                Node::Pure's failure dual
 //! Op(t)                  Node::Operation
@@ -30,7 +32,7 @@ use alloc::{
     vec::Vec,
 };
 use thiserror::Error;
-use xolotl_types::{NodeId, Value};
+use xolotl_types::NodeId;
 
 /// Errors produced while lowering a [`DoNode`] into an [`ExecutionGraph`].
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -60,11 +62,51 @@ pub enum CompileError {
 /// unbounded programs.
 const MAX_NODES: usize = 1 << 20;
 
-struct Compiler {
+/// Admit the entire source before graph allocation or payload cloning.
+/// Each native AST node emits exactly one graph node.
+pub(crate) fn preflight(program: &DoNode, base: u32) -> Result<usize, CompileError> {
+    let mut count = 0usize;
+    let mut pending = alloc::vec![program];
+    while let Some(node) = pending.pop() {
+        if count == MAX_NODES {
+            return Err(CompileError::TooLarge { max: MAX_NODES });
+        }
+        base.checked_add(count as u32)
+            .ok_or(CompileError::PositionExhausted)?;
+        count += 1;
+        match node {
+            DoNode::AndThen { d: child, .. }
+            | DoNode::OrElse { d: child, .. }
+            | DoNode::Acting { body: child, .. } => pending.push(child),
+            DoNode::Finally { body, cleanup } => {
+                pending.push(cleanup);
+                pending.push(body);
+            }
+            DoNode::Let { value, body, .. } => {
+                pending.push(body);
+                pending.push(value);
+            }
+            DoNode::Both(left, right) | DoNode::Race(left, right) => {
+                pending.push(right);
+                pending.push(left);
+            }
+            DoNode::Pure(_)
+            | DoNode::Use(_)
+            | DoNode::Fail(_)
+            | DoNode::Wait(_)
+            | DoNode::Op(_) => {}
+        }
+    }
+    Ok(count)
+}
+
+struct Compiler<'a> {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
-    /// Name → the NodeId that produces the bound value (for `Use` edges).
-    bindings: BTreeMap<String, NodeId>,
+    /// Names resolved to currently live lexical slots.
+    bindings: BTreeMap<&'a str, Option<u32>>,
+    next_binding: u32,
+    free_bindings: Vec<u32>,
     /// Explicit source id offset. Dynamic module invocations use a local base
     /// of zero; execution tickets distinguish repeated visits to their nodes.
     base: u32,
@@ -78,21 +120,18 @@ struct Span {
     exit: NodeId,
 }
 
-impl Compiler {
-    fn new() -> Self {
-        Self {
-            nodes: Vec::new(),
-            edges: Vec::new(),
-            bindings: BTreeMap::new(),
-            base: 0,
-        }
+impl<'a> Compiler<'a> {
+    fn new(nodes: usize) -> Self {
+        Self::with_base(0, nodes)
     }
 
-    fn with_base(base: u32) -> Self {
+    fn with_base(base: u32, nodes: usize) -> Self {
         Self {
-            nodes: Vec::new(),
-            edges: Vec::new(),
+            nodes: Vec::with_capacity(nodes),
+            edges: Vec::with_capacity(nodes.saturating_sub(1)),
             bindings: BTreeMap::new(),
+            next_binding: 0,
+            free_bindings: Vec::new(),
             base,
         }
     }
@@ -114,151 +153,181 @@ impl Compiler {
         self.edges.push(Edge { from, to, kind });
     }
 
-    /// Lower `node`, returning its [`Span`]. Pre-order id assignment: a node's
-    /// id is allocated before its children, so ids are stable under recompile.
-    fn lower(&mut self, node: &DoNode) -> Result<Span, CompileError> {
-        match node {
-            DoNode::Pure(v) => {
-                let id = self.push(NodeKind::Pure(v.clone()))?;
-                Ok(Span {
-                    entry: id,
-                    exit: id,
-                })
-            }
-
-            DoNode::Fail(f) => {
-                // Failure-dual of Pure: a dedicated node carrying the
-                // Failure losslessly; the Executor propagates it to the nearest
-                // enclosing Branch.
-                let id = self.push(NodeKind::Fail(f.clone()))?;
-                Ok(Span {
-                    entry: id,
-                    exit: id,
-                })
-            }
-
-            DoNode::Op(tmpl) => {
-                let id = self.push(NodeKind::Operation(tmpl.clone()))?;
-                Ok(Span {
-                    entry: id,
-                    exit: id,
-                })
-            }
-
-            DoNode::Wait(spec) => {
-                let id = self.push(NodeKind::Wait(spec.clone()))?;
-                Ok(Span {
-                    entry: id,
-                    exit: id,
-                })
-            }
-
-            DoNode::AndThen { d, then } => {
-                let inner = self.lower(d)?;
-                let step = self.push(NodeKind::Step(then.clone()))?;
-                self.edge(inner.exit, step, EdgeKind::Then);
-                Ok(Span {
-                    entry: inner.entry,
-                    exit: step,
-                })
-            }
-
-            DoNode::OrElse { d, or } => {
-                // Branch node is the entry; the guarded subgraph hangs off an
-                // Arm edge; the recover step is stored in the node. On failure
-                // of the guarded arm the Executor runs `recover`.
-                let branch = self.push(NodeKind::Branch(BranchKind::OrElse {
-                    recover: or.clone(),
-                }))?;
-                let inner = self.lower(d)?;
-                self.edge(branch, inner.entry, EdgeKind::Arm);
-                Ok(Span {
-                    entry: branch,
-                    exit: branch,
-                })
-            }
-
-            DoNode::Both(a, b) | DoNode::Race(a, b) => {
-                let join_kind = if matches!(node, DoNode::Both(..)) {
-                    JoinKind::Both
-                } else {
-                    JoinKind::Race
-                };
-                // Allocate the join node first so its id precedes its arms,
-                // keeping pre-order stability.
-                let join = self.push(NodeKind::Join(join_kind))?;
-                let la = self.lower(a)?;
-                let lb = self.lower(b)?;
-                self.edge(join, la.entry, EdgeKind::Arm);
-                self.edge(join, lb.entry, EdgeKind::Arm);
-                Ok(Span {
-                    entry: join,
-                    exit: join,
-                })
-            }
-
-            DoNode::Let { name, value, body } => {
-                let v = self.lower(value)?;
-                // Bind the name to the value's exit node for the duration of
-                // the body; restore the previous binding afterward (shadowing).
-                let prev = self.bindings.insert(name.clone(), v.exit);
-                let b = self.lower(body)?;
-                match prev {
-                    Some(p) => {
-                        self.bindings.insert(name.clone(), p);
-                    }
-                    None => {
-                        self.bindings.remove(name);
-                    }
+    fn lower(&mut self, program: &'a DoNode) -> Result<Span, CompileError> {
+        enum Frame<'node> {
+            Enter(&'node DoNode),
+            Then(&'node crate::graph::StepRef),
+            Arm(NodeId),
+            NextArm {
+                parent: NodeId,
+                right: &'node DoNode,
+            },
+            Arms {
+                parent: NodeId,
+                left: Span,
+            },
+            BindingValue {
+                index: usize,
+                name: &'node str,
+                body: &'node DoNode,
+            },
+            BindingBody {
+                index: usize,
+                name: &'node str,
+                previous: Option<Option<u32>>,
+                value: Span,
+            },
+        }
+        let mut pending = alloc::vec![Frame::Enter(program)];
+        let mut output = Span {
+            entry: NodeId::new(0),
+            exit: NodeId::new(0),
+        };
+        while let Some(frame) = pending.pop() {
+            match frame {
+                Frame::Enter(node) => {
+                    let kind = match node {
+                        DoNode::Pure(value) => NodeKind::Pure(value.clone()),
+                        DoNode::Fail(failure) => NodeKind::Fail(failure.clone()),
+                        DoNode::Op(template) => NodeKind::Operation(template.clone()),
+                        DoNode::Wait(spec) => NodeKind::Wait(spec.clone()),
+                        DoNode::Use(name) => {
+                            let binding = self
+                                .bindings
+                                .get_mut(name.as_str())
+                                .ok_or_else(|| CompileError::UnboundName(name.clone()))?;
+                            let slot = *binding.get_or_insert_with(|| {
+                                self.free_bindings.pop().unwrap_or_else(|| {
+                                    let slot = self.next_binding;
+                                    self.next_binding += 1;
+                                    slot
+                                })
+                            });
+                            NodeKind::Load { slot }
+                        }
+                        DoNode::AndThen { d: child, then } => {
+                            pending.push(Frame::Then(then));
+                            pending.push(Frame::Enter(child));
+                            continue;
+                        }
+                        DoNode::OrElse { d: child, or } => {
+                            let parent = self.push(NodeKind::Branch(BranchKind::OrElse {
+                                recover: or.clone(),
+                            }))?;
+                            pending.push(Frame::Arm(parent));
+                            pending.push(Frame::Enter(child));
+                            continue;
+                        }
+                        DoNode::Acting { identity, body } => {
+                            let parent = self.push(NodeKind::Acting(identity.clone()))?;
+                            pending.push(Frame::Arm(parent));
+                            pending.push(Frame::Enter(body));
+                            continue;
+                        }
+                        DoNode::Finally {
+                            body: left,
+                            cleanup: right,
+                        }
+                        | DoNode::Both(left, right)
+                        | DoNode::Race(left, right) => {
+                            let kind = match node {
+                                DoNode::Finally { .. } => NodeKind::Finally,
+                                DoNode::Both(..) => NodeKind::Join(JoinKind::Both),
+                                _ => NodeKind::Join(JoinKind::Race),
+                            };
+                            let parent = self.push(kind)?;
+                            pending.push(Frame::NextArm { parent, right });
+                            pending.push(Frame::Enter(left));
+                            continue;
+                        }
+                        DoNode::Let { name, value, body } => {
+                            let index = self.nodes.len();
+                            self.push(NodeKind::Sequence)?;
+                            pending.push(Frame::BindingValue { index, name, body });
+                            pending.push(Frame::Enter(value));
+                            continue;
+                        }
+                    };
+                    let id = self.push(kind)?;
+                    output = Span {
+                        entry: id,
+                        exit: id,
+                    };
                 }
-                // Value subgraph runs first, then the body; entry is the
-                // value's entry, exit is the body's exit.
-                self.edge(v.exit, b.entry, EdgeKind::Then);
-                Ok(Span {
-                    entry: v.entry,
-                    exit: b.exit,
-                })
-            }
-
-            DoNode::Use(name) => {
-                let target = self
-                    .bindings
-                    .get(name)
-                    .copied()
-                    .ok_or_else(|| CompileError::UnboundName(name.clone()))?;
-                // A Use is a pure pass-through node with a Use-edge back to the
-                // bound producer.
-                let id = self.push(NodeKind::Pure(Value::null()))?;
-                self.edge(target, id, EdgeKind::Use);
-                Ok(Span {
-                    entry: id,
-                    exit: id,
-                })
-            }
-
-            DoNode::Acting { identity, body } => {
-                // The Acting node carries the identity Path directly in the IR
-                //; the kernel interns it to an IdentityRef when binding
-                // the child Operations. Body runs as the node's single arm, and
-                // the Acting node is also the span exit so the identity scope
-                // does not leak into the continuation (the walker restores the
-                // outer identity once the arm completes).
-                let act = self.push(NodeKind::Acting(identity.clone()))?;
-                let b = self.lower(body)?;
-                self.edge(act, b.entry, EdgeKind::Arm);
-                Ok(Span {
-                    entry: act,
-                    exit: act,
-                })
+                Frame::Then(reference) => {
+                    let step = self.push(NodeKind::Step(reference.clone()))?;
+                    self.edge(output.exit, step, EdgeKind::Then);
+                    output.exit = step;
+                }
+                Frame::Arm(parent) => {
+                    self.edge(parent, output.entry, EdgeKind::Arm);
+                    output = Span {
+                        entry: parent,
+                        exit: parent,
+                    };
+                }
+                Frame::NextArm { parent, right } => {
+                    pending.push(Frame::Arms {
+                        parent,
+                        left: output,
+                    });
+                    pending.push(Frame::Enter(right));
+                }
+                Frame::Arms { parent, left } => {
+                    self.edge(parent, left.entry, EdgeKind::Arm);
+                    self.edge(parent, output.entry, EdgeKind::Arm);
+                    output = Span {
+                        entry: parent,
+                        exit: parent,
+                    };
+                }
+                Frame::BindingValue { index, name, body } => {
+                    let previous = self.bindings.insert(name, None);
+                    pending.push(Frame::BindingBody {
+                        index,
+                        name,
+                        previous,
+                        value: output,
+                    });
+                    pending.push(Frame::Enter(body));
+                }
+                Frame::BindingBody {
+                    index,
+                    name,
+                    previous,
+                    value,
+                } => {
+                    if let Some(Some(slot)) = self.bindings.remove(name) {
+                        self.nodes[index].kind = NodeKind::Let { slot };
+                        self.free_bindings.push(slot);
+                    }
+                    if let Some(previous) = previous {
+                        self.bindings.insert(name, previous);
+                    }
+                    let parent = self.nodes[index].id;
+                    self.edge(parent, value.entry, EdgeKind::Arm);
+                    self.edge(parent, output.entry, EdgeKind::Arm);
+                    output = Span {
+                        entry: parent,
+                        exit: parent,
+                    };
+                }
             }
         }
+        Ok(output)
     }
 }
 
 /// Compile a [`DoNode`] program into one [`ExecutionGraph`] with stable node
 /// ids and a content hash.
+///
+/// Admission counts every source node before copying payloads: at most 2^20
+/// nodes, each charged as one graph node. Lowering uses explicit traversal
+/// frames, not the native call stack; nesting has no independent limit.
+/// Transient frames and lexical slots are released when compilation returns.
 pub fn compile_do(program: &DoNode) -> Result<ExecutionGraph, CompileError> {
-    let mut c = Compiler::new();
+    let nodes = preflight(program, 0)?;
+    let mut c = Compiler::new(nodes);
     let span = c.lower(program)?;
     let mut graph = ExecutionGraph {
         nodes: c.nodes,
@@ -273,10 +342,12 @@ pub fn compile_do(program: &DoNode) -> Result<ExecutionGraph, CompileError> {
 /// Compile a subgraph whose source node ids start at an explicit `base`.
 /// The executor uses zero for each dynamic module; source positions are local
 /// to the module, while dynamic request tickets identify individual node visits.
+/// Node and source-position bounds are preflighted before copying payloads.
 /// The returned graph's `graph_hash` is left zeroed: native fragments are linked
-/// only for this execution and cannot be stored in portable checkpoints.
+/// only for this execution and cannot be encoded as portable program source.
 pub fn compile_do_at(program: &DoNode, base: u32) -> Result<ExecutionGraph, CompileError> {
-    let mut c = Compiler::with_base(base);
+    let nodes = preflight(program, base)?;
+    let mut c = Compiler::with_base(base, nodes);
     let span = c.lower(program)?;
     Ok(ExecutionGraph {
         nodes: c.nodes,
@@ -300,7 +371,7 @@ mod tests {
     use crate::graph::{OperationTemplate, StepRef};
     use alloc::collections::BTreeSet;
     use anyhow::{Context, anyhow, bail, ensure};
-    use xolotl_types::{OutputMode, Path, ResourceName};
+    use xolotl_types::{OutputMode, Path, ResourceName, Value};
 
     fn s(name: &str) -> StepRef {
         StepRef::new(name)
@@ -316,6 +387,142 @@ mod tests {
             compile_do_at(&body, u32::MAX),
             Err(CompileError::PositionExhausted)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn frames_preserve_node_edge_order_and_shadowed_slots() -> anyhow::Result<()> {
+        let program = DoNode::r#let(
+            "x",
+            DoNode::pure(1),
+            DoNode::both(
+                DoNode::r#let("x", DoNode::use_("x"), DoNode::use_("x")),
+                DoNode::acting(Path::parse("identity://test/inner")?, DoNode::use_("x"))
+                    .or_else(s("recover")),
+            ),
+        )
+        .and_then(s("next"));
+        let graph = compile_do(&program)?;
+        let expected = [
+            NodeKind::Let { slot: 0 },
+            NodeKind::Pure(Value::integer(1)),
+            NodeKind::Join(JoinKind::Both),
+            NodeKind::Let { slot: 1 },
+            NodeKind::Load { slot: 0 },
+            NodeKind::Load { slot: 1 },
+            NodeKind::Branch(BranchKind::OrElse {
+                recover: s("recover"),
+            }),
+            NodeKind::Acting(Path::parse("identity://test/inner")?),
+            NodeKind::Load { slot: 0 },
+            NodeKind::Step(s("next")),
+        ];
+        for (index, (node, kind)) in graph.nodes.iter().zip(&expected).enumerate() {
+            ensure!(node.id == NodeId::new(index as u32));
+            ensure!(&node.kind == kind);
+        }
+        ensure!(graph.nodes.len() == expected.len());
+        let expected_edges = [
+            (3, 4, EdgeKind::Arm),
+            (3, 5, EdgeKind::Arm),
+            (7, 8, EdgeKind::Arm),
+            (6, 7, EdgeKind::Arm),
+            (2, 3, EdgeKind::Arm),
+            (2, 6, EdgeKind::Arm),
+            (0, 1, EdgeKind::Arm),
+            (0, 2, EdgeKind::Arm),
+            (0, 9, EdgeKind::Then),
+        ];
+        ensure!(graph.edges.len() == expected_edges.len());
+        for (edge, (from, to, kind)) in graph.edges.iter().zip(expected_edges) {
+            ensure!(edge.from == NodeId::new(from));
+            ensure!(edge.to == NodeId::new(to));
+            ensure!(edge.kind == kind);
+        }
+        let offset = compile_do_at(&program, 100)?;
+        for (node, shifted) in graph.nodes.iter().zip(&offset.nodes) {
+            ensure!(shifted.id.get() == node.id.get() + 100);
+            ensure!(shifted.kind == node.kind);
+        }
+        ensure!(compile_do(&program)?.graph_hash == graph.graph_hash);
+        Ok(())
+    }
+
+    #[test]
+    fn deep_native_tree_compiles_and_clones_on_small_stack() -> anyhow::Result<()> {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let mut program = DoNode::pure(Value::null());
+                for _ in 0..10_000 {
+                    program = program.and_then(s("next"));
+                }
+                let cloned = program.clone();
+                let graph = compile_do(&cloned)?;
+                ensure!(graph.nodes.len() == 10_001);
+                ensure!(graph.edges.len() == 10_000);
+                ensure!(graph.root == NodeId::new(0));
+                ensure!(compile_do_at(&program, 17)?.nodes[10_000].id == NodeId::new(10_017));
+                ensure!(graph.graph_hash == compile_do(&program)?.graph_hash);
+                Ok::<_, anyhow::Error>(())
+            })?
+            .join()
+            .map_err(|_panic| anyhow!("small-stack compiler panicked"))??;
+        Ok(())
+    }
+
+    #[test]
+    fn node_preflight_rejects_before_lexical_lowering() -> anyhow::Result<()> {
+        let mut program = DoNode::use_("unbound");
+        for _ in 1..MAX_NODES {
+            program = program.and_then(s(""));
+        }
+        ensure!(preflight(&program, 0)? == MAX_NODES);
+        program = program.and_then(s(""));
+        ensure!(matches!(
+            compile_do(&program),
+            Err(CompileError::TooLarge { max: MAX_NODES })
+        ));
+        ensure!(matches!(
+            compile_do_at(&program, 0),
+            Err(CompileError::TooLarge { max: MAX_NODES })
+        ));
+        ensure!(matches!(
+            compile_do_at(&program, u32::MAX),
+            Err(CompileError::PositionExhausted)
+        ));
+        let actor = crate::ActorSpec {
+            finalizers: alloc::vec![program],
+            ..crate::ActorSpec::default()
+        };
+        ensure!(matches!(
+            actor.bind_process_local_refs(xolotl_types::ProcessId::new(1)),
+            Err(crate::ActorBindError::Compile(CompileError::TooLarge {
+                max: MAX_NODES
+            }))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn frames_preserve_lexical_visibility_and_first_failure() -> anyhow::Result<()> {
+        for program in [
+            DoNode::both(DoNode::use_("first"), DoNode::use_("second")),
+            DoNode::race(DoNode::use_("first"), DoNode::use_("second")),
+            DoNode::use_("first").finally(DoNode::use_("second")),
+            DoNode::r#let("first", DoNode::use_("first"), DoNode::use_("second")),
+        ] {
+            ensure!(
+                matches!(compile_do(&program), Err(CompileError::UnboundName(name)) if name == "first")
+            );
+        }
+        let siblings = DoNode::both(
+            DoNode::r#let("local", DoNode::pure(1), DoNode::use_("local")),
+            DoNode::use_("local"),
+        );
+        ensure!(
+            matches!(compile_do(&siblings), Err(CompileError::UnboundName(name)) if name == "local")
+        );
         Ok(())
     }
 
@@ -429,13 +636,18 @@ mod tests {
     }
 
     #[test]
-    fn let_use_wires_use_edge() -> anyhow::Result<()> {
+    fn let_use_preserves_lexical_arms_and_slot() -> anyhow::Result<()> {
         let prog = DoNode::r#let("x", DoNode::pure(Value::integer(5)), DoNode::use_("x"));
         let g = compile_do(&prog)?;
+        ensure!(matches!(
+            g.node(g.root).context("binding root")?.kind,
+            NodeKind::Let { slot: 0 }
+        ));
+        ensure!(g.out_edges_of(g.root, EdgeKind::Arm).count() == 2);
         ensure!(
-            g.edges.iter().any(|e| e.kind == EdgeKind::Use),
-            "missing Use edge: {:?}",
-            g.edges
+            g.nodes
+                .iter()
+                .any(|node| matches!(node.kind, NodeKind::Load { slot: 0 }))
         );
         Ok(())
     }
@@ -465,6 +677,17 @@ mod tests {
         );
         let arms = g.out_edges_of(join, EdgeKind::Arm).count();
         ensure!(arms == 2, "unexpected arm count: {arms}");
+        Ok(())
+    }
+
+    #[test]
+    fn finally_has_body_and_cleanup_arms() -> anyhow::Result<()> {
+        let program = DoNode::pure(1).finally(DoNode::pure(2));
+        let graph = compile_do(&program)?;
+        let root = graph.node(graph.root).context("missing finally node")?;
+        ensure!(matches!(&root.kind, NodeKind::Finally));
+        ensure!(graph.out_edges_of(graph.root, EdgeKind::Arm).count() == 2);
+        ensure!(graph.graph_hash != compile_do(&DoNode::pure(1))?.graph_hash);
         Ok(())
     }
 }

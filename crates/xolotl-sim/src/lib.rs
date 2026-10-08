@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! `xolotl-sim` — deterministic simulation harness for tests and replay.
+//! `xolotl-sim` — deterministic simulation harness for execution tests.
 //!
 //! - [`ScriptedDriver`]: a programmable [`Driver`] whose responses are queued
 //!   in advance, for testing programs without real effects.
@@ -13,18 +13,14 @@
 //!   simulate "crash after the Nth Operation".
 //! - [`why_not`]: a pure Fact projection explaining why an Operation
 //!   ended denied / rejected — the "why-not" debug face.
-//! - [`replay_report`]: classify a Process's recorded Facts the way recovery
-//!   would, to assert determinism / pending handling.
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use xolotl_kernel::{
-    Bootstrap, Driver, DriverContext, DriverError, DriverOutput, DynDriver, FactSink,
-};
-use xolotl_types::{MethodId, Outcome, OutputMode, ProcessId, Value};
+use xolotl_kernel::{Bootstrap, Driver, DriverContext, DriverError, DriverOutput, DynDriver};
+use xolotl_types::{MethodId, Outcome, OutputMode, Value};
 
 /// A driver whose responses are queued in advance. Each call dequeues the next
 /// scripted outcome; an empty queue yields `Failure::Cancelled`. Records every
@@ -287,7 +283,7 @@ fn sim_cron_interval_ms(m: &xolotl_types::ValueMap) -> Result<Option<i64>, Drive
 /// delegate to the inner driver; the (n+1)-th and every later call return a
 /// distinctive `DriverError` — the failure a Driver would surface when its
 /// process dies mid-effect — so a test can assert the program halts at the Nth
-/// Operation and exercise crash-recovery.
+/// Operation and exercise live failure handling.
 pub struct CrashAfter {
     inner: DynDriver,
     n: u64,
@@ -356,6 +352,8 @@ impl Default for Sim {
 
 impl Sim {
     /// Create a simulation backed by [`Bootstrap::in_memory`].
+    /// Observation storage and Fact recording are disabled by default. Supply
+    /// an explicitly configured [`Sim::boot`] for recorded simulations.
     pub fn new() -> Self {
         Self {
             boot: Bootstrap::in_memory(),
@@ -373,21 +371,13 @@ impl Sim {
             path,
             &[xolotl_kernel::MethodSpec::new(
                 "invoke",
+                xolotl_types::MethodAuthority::Perform,
                 xolotl_types::Purity::Effectful,
                 xolotl_kernel::MethodSpec::UNARY_ASYNC,
             )],
             driver,
         )
     }
-}
-
-/// Replay classification of a Process's recorded facts. Mirrors what
-/// recovery would decide; useful to assert determinism in tests.
-pub fn replay_report(
-    facts: &FactSink,
-    process: ProcessId,
-) -> Result<xolotl_kernel::RecoveryReport, xolotl_kernel::FactError> {
-    xolotl_kernel::recover_process(facts, process).map(|(report, _)| report)
 }
 
 /// The "why-not" explanation for one Operation. A pure projection over the
@@ -464,9 +454,6 @@ pub fn why_not(facts: &[xolotl_types::Fact], op: xolotl_types::OperationId) -> O
         DecisionTag::DriverError => "the driver returned an error".to_string(),
         DecisionTag::Timeout => "the operation timed out".to_string(),
         DecisionTag::Cancelled => "the operation was cancelled".to_string(),
-        DecisionTag::Quarantined => {
-            "held in quarantine as an unsafe replay, pending an operator decision".to_string()
-        }
     };
 
     let explanation = format!("operation {op}: {verdict}");
@@ -485,7 +472,7 @@ mod tests {
     use anyhow::{Context, bail, ensure};
     use xolotl_graph::{ActorSpec, DoNode, OperationTemplate, StepRef};
     use xolotl_kernel::{StepBinding, StepModule};
-    use xolotl_types::OutputMode;
+    use xolotl_types::{OutputMode, ProcessId};
 
     fn run_prog(name: xolotl_types::ResourceName) -> DoNode {
         run_prog_with(name, Value::null())
@@ -501,13 +488,23 @@ mod tests {
         })
     }
 
+    fn observed_sim() -> Sim {
+        Sim {
+            boot: Bootstrap::from_kernel(
+                xolotl_kernel::KernelBuilder::in_memory()
+                    .with_fact_sink(xolotl_kernel::FactSink::in_memory().0)
+                    .build(),
+            ),
+        }
+    }
+
     async fn wait_actor_status(
         boot: &Bootstrap,
         directory: &xolotl_types::Path,
         status: &str,
     ) -> anyhow::Result<Value> {
         for _ in 0..100 {
-            if let Some(value) = boot.kernel.state.read(directory).await?
+            if let Some(value) = boot.kernel().state().read(directory).await?
                 && value
                     .as_map()
                     .and_then(|map| map.get("status"))
@@ -521,36 +518,34 @@ mod tests {
         bail!("actor directory did not reach status {status}");
     }
 
-    fn is_process_finalized_fact(fact: &xolotl_types::Fact) -> bool {
-        fact.outcome
-            .as_ref()
-            .and_then(Value::as_map)
-            .and_then(|map| map.get("event"))
-            .and_then(Value::as_str)
-            == Some("ProcessFinalized")
-    }
-
     #[tokio::test]
     async fn scripted_driver_returns_queued_outcomes() -> anyhow::Result<()> {
-        let sim = Sim::new();
+        let sim = observed_sim();
         let driver = Arc::new(ScriptedDriver::new("model"));
         driver.enqueue_done(Value::string("first".into()));
         let name = sim.scripted_effect("effect://model/x", driver.clone())?;
-        let handle = sim.boot.open_for(sim.boot.root, &name, "perform")?;
-        let ex = sim.boot.kernel.executor_for(sim.boot.root);
-        ex.bind_handle(name.clone(), handle);
+        let handle = sim.boot.open_for(sim.boot.root(), &name, "perform")?;
+        let ex = sim.boot.kernel().executor_for(sim.boot.root());
+        ex.bind_handle(name.clone(), handle)?;
         let out = ex.eval(&run_prog(name)).await.outcome;
         ensure!(
             out == Outcome::Done(Value::string("first".into())),
             "unexpected scripted outcome: {out:?}"
         );
         ensure!(driver.calls().len() == 1, "unexpected call count");
+        ensure!(
+            sim.boot
+                .kernel()
+                .facts()
+                .facts_of(sim.boot.root())?
+                .is_empty()
+        );
         Ok(())
     }
 
     #[tokio::test]
     async fn injected_failure_routes_through_or_else_recovery_step() -> anyhow::Result<()> {
-        let sim = Sim::new();
+        let sim = observed_sim();
         let driver = Arc::new(ScriptedDriver::new("primary"));
         driver.enqueue(Outcome::Fail(xolotl_types::Failure::Cancelled));
         let name = sim.scripted_effect("effect://primary/fallible", driver.clone())?;
@@ -563,7 +558,7 @@ mod tests {
         let actor = sim
             .boot
             .spawn_actor_under_with_steps(
-                sim.boot.root,
+                sim.boot.root(),
                 xolotl_types::IdentityRef::ROOT,
                 "root",
                 &spec,
@@ -590,55 +585,26 @@ mod tests {
             "unexpected actor directory entry: {value:?}"
         );
         ensure!(driver.calls().len() == 1, "unexpected call count");
-        let facts = sim.boot.kernel.facts.facts_of(actor.process)?;
-        let operation_facts = facts
-            .iter()
-            .filter(|fact| !is_process_finalized_fact(fact))
-            .collect::<Vec<_>>();
         ensure!(
-            operation_facts.len() == 1,
-            "unexpected operation fact count: {}",
-            operation_facts.len()
-        );
-        let fact = operation_facts
-            .first()
-            .copied()
-            .context("missing operation fact")?;
-        ensure!(
-            fact.decision == xolotl_types::DecisionTag::DriverError,
-            "unexpected decision: {:?}",
-            fact.decision
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn replay_report_counts_recorded_facts() -> anyhow::Result<()> {
-        let sim = Sim::new();
-        let driver = Arc::new(ScriptedDriver::new("m"));
-        driver.enqueue_done(Value::integer(1));
-        let name = sim.scripted_effect("effect://m/x", driver)?;
-        let handle = sim.boot.open_for(sim.boot.root, &name, "perform")?;
-        let ex = sim.boot.kernel.executor_for(sim.boot.root);
-        ex.bind_handle(name.clone(), handle);
-        ex.eval(&run_prog(name)).await;
-        let report = replay_report(&sim.boot.kernel.facts, sim.boot.root)?;
-        ensure!(
-            report.skipped == 1,
-            "one completed effect should be skipped on replay"
+            sim.boot
+                .kernel()
+                .facts()
+                .facts_of(actor.process)?
+                .is_empty()
         );
         Ok(())
     }
 
     #[tokio::test]
     async fn budget_denial_records_fact_without_calling_scripted_driver() -> anyhow::Result<()> {
-        let sim = Sim::new();
+        let sim = observed_sim();
         let driver = Arc::new(ScriptedDriver::new("costly"));
         driver.enqueue_done(Value::integer(99));
         let name = sim.boot.register_effect_with_cost(
             "effect://costly/call",
             &[xolotl_kernel::MethodSpec::new(
                 "invoke",
+                xolotl_types::MethodAuthority::Perform,
                 xolotl_types::Purity::Effectful,
                 xolotl_kernel::MethodSpec::UNARY_ASYNC,
             )],
@@ -649,18 +615,26 @@ mod tests {
             },
         )?;
         ensure!(
-            sim.boot.kernel.processes.set_budget_spec(
-                sim.boot.root,
-                xolotl_types::BudgetSpec {
-                    daily_micro_usd: Some(999),
-                    ..Default::default()
-                },
-            ),
+            sim.boot
+                .kernel()
+                .processes()
+                .set_budget_spec(
+                    sim.boot.root(),
+                    xolotl_types::BudgetSpec {
+                        max_micro_usd: Some(999),
+                        ..Default::default()
+                    },
+                )
+                .is_ok(),
             "root process missing while setting test budget"
         );
-        let handle = sim.boot.open_for(sim.boot.root, &name, "perform")?;
-        let ex = sim.boot.kernel.executor_for(sim.boot.root);
-        ex.bind_handle(name.clone(), handle);
+        let handle = sim.boot.open_for(sim.boot.root(), &name, "perform")?;
+        let ex = sim
+            .boot
+            .kernel()
+            .executor_for(sim.boot.root())
+            .with_fact_recording(true);
+        ex.bind_handle(name.clone(), handle)?;
 
         let out = ex
             .eval(&run_prog_with(name, Value::string("pay".into())))
@@ -669,10 +643,7 @@ mod tests {
 
         match out {
             Outcome::Fail(xolotl_types::Failure::BudgetExhausted { dim }) => {
-                ensure!(
-                    dim == "daily_micro_usd",
-                    "unexpected budget dimension: {dim}"
-                );
+                ensure!(dim == "micro_usd", "unexpected budget dimension: {dim}");
             }
             other => bail!("expected budget denial, got {other:?}"),
         }
@@ -680,7 +651,7 @@ mod tests {
             driver.calls().is_empty(),
             "budget denial must happen before the scripted driver is invoked"
         );
-        let facts = sim.boot.kernel.facts.facts_of(sim.boot.root)?;
+        let facts = sim.boot.kernel().facts().facts_of(sim.boot.root())?;
         ensure!(facts.len() == 1, "unexpected fact count: {}", facts.len());
         ensure!(
             facts[0].decision == xolotl_types::DecisionTag::RejectedByPolicy,
@@ -703,21 +674,26 @@ mod tests {
     #[tokio::test]
     async fn idempotent_duplicate_short_circuits_driver_and_records_attempt() -> anyhow::Result<()>
     {
-        let sim = Sim::new();
+        let sim = observed_sim();
         let driver = Arc::new(ScriptedDriver::new("idempotent"));
         driver.enqueue_done(Value::string("created".into()));
         let name = sim.boot.register_effect(
             "effect://orders/create",
             &[xolotl_kernel::MethodSpec::new(
                 "invoke",
+                xolotl_types::MethodAuthority::Perform,
                 xolotl_types::Purity::Idempotent,
                 xolotl_kernel::MethodSpec::UNARY_ASYNC,
             )],
             driver.clone(),
         )?;
-        let handle = sim.boot.open_for(sim.boot.root, &name, "perform")?;
-        let ex = sim.boot.kernel.executor_for(sim.boot.root);
-        ex.bind_handle(name.clone(), handle);
+        let handle = sim.boot.open_for(sim.boot.root(), &name, "perform")?;
+        let ex = sim
+            .boot
+            .kernel()
+            .executor_for(sim.boot.root())
+            .with_fact_recording(true);
+        ex.bind_handle(name.clone(), handle)?;
         let mut input = std::collections::BTreeMap::new();
         input.insert("_idem_key".into(), Value::string("order-42".into()));
         let prog = run_prog_with(name, Value::map(input));
@@ -737,7 +713,7 @@ mod tests {
             driver.calls().len() == 1,
             "the business key must use the idempotency cache"
         );
-        let facts = sim.boot.kernel.facts.facts_of(sim.boot.root)?;
+        let facts = sim.boot.kernel().facts().facts_of(sim.boot.root())?;
         ensure!(
             facts.len() == 2,
             "independent executions retain distinct facts"
@@ -996,6 +972,7 @@ mod tests {
             id: op,
             schema_version: Fact::SCHEMA_VERSION,
             caller: ProcessId::new(7),
+            caller_identity: Some(IdentityRef::ROOT),
             acting: IdentityRef::ROOT,
             handle: HandleId::new(0, 1),
             resource: ResourceId::new(1),

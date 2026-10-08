@@ -62,14 +62,18 @@ fn admission_fixture() -> (Bootstrap, Arc<AdmissionBackend>) {
     backend.block.store(true, Ordering::SeqCst);
     let (facts, _) = crate::FactSink::in_memory();
     (
-        Bootstrap::from_kernel(Kernel::with_backends(
-            Backend::new()
-                .with_read(backend.inner.clone())
-                .with_write(backend.clone())
-                .with_query(backend.inner.clone())
-                .with_watch(backend.inner.clone()),
-            facts,
-        )),
+        Bootstrap::from_kernel(
+            crate::KernelBuilder::new(
+                Backend::new()
+                    .with_read(backend.inner.clone())
+                    .with_write(backend.clone())
+                    .with_query(backend.inner.clone())
+                    .with_watch(backend.inner.clone())
+                    .with_signal(backend.inner.clone()),
+            )
+            .with_fact_sink(facts)
+            .build(),
+        ),
         backend,
     )
 }
@@ -93,8 +97,8 @@ async fn wait_status(boot: &Bootstrap, directory: &Path, expected: &str) -> anyh
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if boot
-                .kernel
-                .state
+                .kernel()
+                .state()
                 .read(directory)
                 .await?
                 .as_ref()
@@ -115,28 +119,32 @@ async fn wait_status(boot: &Bootstrap, directory: &Path, expected: &str) -> anyh
 async fn actor_terminal_status_preserves_result_provenance_for_waiters() -> anyhow::Result<()> {
     for failed in [false, true] {
         let boot = Bootstrap::in_memory();
+        crate::executor::signal_tests::install_signal_resource(
+            &boot,
+            boot.kernel().state().clone(),
+        )?;
         let signal = Path::parse("state://signal/actor-result")?;
         let taint = TaintSet::of(xolotl_types::TaintSource::Protected {
             path: Path::parse("state://vault/actor-result")?,
         });
-        boot.kernel
-            .state
+        boot.kernel()
+            .state()
             .write_set_tainted(&signal, Value::integer(17), taint.clone())
             .await?;
         let cleanup = Path::parse("state://signal/actor-cleanup")?;
         let cleanup_taint = TaintSet::of(xolotl_types::TaintSource::Fetched {
             host: "cleanup-service".into(),
         });
-        boot.kernel
-            .state
+        boot.kernel()
+            .state()
             .write_set_tainted(&cleanup, Value::null(), cleanup_taint.clone())
             .await?;
         let failed_cleanup = Path::parse("state://signal/actor-failed-cleanup")?;
         let failure_taint = TaintSet::of(xolotl_types::TaintSource::Protected {
             path: Path::parse("state://vault/failed-cleanup")?,
         });
-        boot.kernel
-            .state
+        boot.kernel()
+            .state()
             .write_set_tainted(&failed_cleanup, Value::null(), failure_taint.clone())
             .await?;
         let mut body = DoNode::wait_signal(signal);
@@ -146,6 +154,7 @@ async fn actor_terminal_status_preserves_result_provenance_for_waiters() -> anyh
         let spec = ActorSpec {
             name: "provenance".into(),
             body,
+            declared_capabilities: vec!["subscribe://state/signal/**".into()],
             finalizers: vec![
                 DoNode::wait_signal(cleanup),
                 DoNode::wait_signal(failed_cleanup).and_then(xolotl_graph::StepRef::new("fail")),
@@ -154,7 +163,7 @@ async fn actor_terminal_status_preserves_result_provenance_for_waiters() -> anyh
         };
         let actor = boot
             .spawn_actor_under_with_steps(
-                boot.root,
+                boot.root(),
                 IdentityRef::ROOT,
                 "root",
                 &spec,
@@ -171,26 +180,24 @@ async fn actor_terminal_status_preserves_result_provenance_for_waiters() -> anyh
         )
         .await?;
         ensure!(
-            boot.kernel
-                .processes
+            boot.kernel()
+                .processes()
                 .status(actor.process)
                 .is_some_and(|status| status.is_terminal())
         );
         let output = boot
-            .kernel
-            .executor_for(boot.root)
+            .kernel()
+            .executor_for(boot.root())
             .eval(&DoNode::wait_signal(directory))
             .await;
         ensure!(matches!(output.outcome, Outcome::Done(_)));
         ensure!(output.taint == taint, "{output:?}");
-        let facts = boot.kernel.facts.facts_of(actor.process)?;
-        let finalized = facts
-            .iter()
-            .find(|fact| fact.id.position == FINALIZED_NODE)
-            .context("lifecycle fact")?;
         ensure!(
-            finalized.taint == taint.merged(&cleanup_taint).merged(&failure_taint),
-            "{finalized:?}"
+            boot.kernel()
+                .processes()
+                .finalization_report(actor.process)
+                .map(|report| report.taint.clone())
+                == Some(taint.merged(&cleanup_taint).merged(&failure_taint))
         );
     }
     Ok(())
@@ -202,7 +209,7 @@ async fn cancelled_admission_reconciles_a_committed_directory() -> anyhow::Resul
     let (spec, module, calls) = counted_actor()?;
     let directory = actor_directory_path("root", &spec.name)?;
     let mut admission = Box::pin(boot.spawn_actor_under_with_steps(
-        boot.root,
+        boot.root(),
         IdentityRef::ROOT,
         "root",
         &spec,
@@ -221,7 +228,7 @@ async fn cancelled_admission_reconciles_a_committed_directory() -> anyhow::Resul
     );
     wait_status(&boot, &directory, "cancelled").await?;
     ensure!(calls.load(Ordering::SeqCst) == 0);
-    ensure!(boot.kernel.processes.pending_cleanup().is_empty());
+    ensure!(boot.kernel().processes().pending_cleanup().is_empty());
     Ok(())
 }
 
@@ -232,7 +239,7 @@ async fn late_backend_commit_cannot_reanimate_cancelled_admission() -> anyhow::R
     let (spec, module, calls) = counted_actor()?;
     let directory = actor_directory_path("root", &spec.name)?;
     let mut admission = Box::pin(boot.spawn_actor_under_with_steps(
-        boot.root,
+        boot.root(),
         IdentityRef::ROOT,
         "root",
         &spec,
@@ -257,7 +264,7 @@ async fn late_backend_commit_cannot_reanimate_cancelled_admission() -> anyhow::R
 async fn parent_closure_stops_directory_admission_before_body_start() -> anyhow::Result<()> {
     let (boot, backend) = admission_fixture();
     let parent = boot
-        .request_under(boot.root, IdentityRef::ROOT, &[])?
+        .request_under(boot.root(), IdentityRef::ROOT, &[])?
         .detach();
     let (spec, module, calls) = counted_actor()?;
     let directory = actor_directory_path("root", &spec.name)?;
@@ -276,31 +283,33 @@ async fn parent_closure_stops_directory_admission_before_body_start() -> anyhow:
     ensure!(admission.await.is_err());
     wait_status(&boot, &directory, "cancelled").await?;
     ensure!(calls.load(Ordering::SeqCst) == 0);
-    ensure!(boot.kernel.processes.status(parent) == Some(ProcessStatus::Cancelled));
+    ensure!(boot.kernel().processes().status(parent) == Some(ProcessStatus::Cancelled));
     Ok(())
 }
 
 #[tokio::test]
 async fn failed_admission_cannot_change_another_actors_directory() -> anyhow::Result<()> {
     let boot = Bootstrap::in_memory();
+    crate::executor::signal_tests::install_signal_resource(&boot, boot.kernel().state().clone())?;
     let spec = ActorSpec {
         name: "owner".into(),
         body: DoNode::wait_signal(Path::parse("state://signal/never")?),
+        declared_capabilities: vec!["subscribe://state/signal/never".into()],
         ..ActorSpec::default()
     };
     let first = boot
-        .spawn_actor_under(boot.root, IdentityRef::ROOT, "root", &spec)
+        .spawn_actor_under(boot.root(), IdentityRef::ROOT, "root", &spec)
         .await?;
-    let expected = boot.kernel.state.read(&first.directory).await?;
+    let expected = boot.kernel().state().read(&first.directory).await?;
     ensure!(
-        boot.spawn_actor_under(boot.root, IdentityRef::ROOT, "root", &spec)
+        boot.spawn_actor_under(boot.root(), IdentityRef::ROOT, "root", &spec)
             .await
             .is_err()
     );
     let report = boot.drain_cleanup().await;
     ensure!(report.failures.is_empty());
-    ensure!(boot.kernel.state.read(&first.directory).await? == expected);
-    ensure!(boot.kernel.processes.status(first.process) == Some(ProcessStatus::Running));
+    ensure!(boot.kernel().state().read(&first.directory).await? == expected);
+    ensure!(boot.kernel().processes().status(first.process) == Some(ProcessStatus::Running));
     boot.finalize_process(first.process).await?;
     Ok(())
 }
@@ -308,11 +317,23 @@ async fn failed_admission_cannot_change_another_actors_directory() -> anyhow::Re
 #[tokio::test]
 async fn finished_ancestor_can_close_an_independently_running_actor() -> anyhow::Result<()> {
     let boot = Bootstrap::in_memory();
-    let parent = boot.request_under(boot.root, IdentityRef::ROOT, &[])?;
+    crate::executor::signal_tests::install_signal_resource(&boot, boot.kernel().state().clone())?;
+    let parent = boot.request_under(
+        boot.root(),
+        IdentityRef::ROOT,
+        &[CompiledRequestGrantTemplate {
+            selector: ResourceSelector::parse("subscribe://state/signal/never")?,
+            rights: xolotl_types::GrantRights::new(
+                xolotl_types::GrantMethods::name("subscribe"),
+                RightFlags::empty(),
+            ),
+        }],
+    )?;
     let parent_id = parent.id();
     let spec = ActorSpec {
         name: "independent".into(),
         body: DoNode::wait_signal(Path::parse("state://signal/never")?),
+        declared_capabilities: vec!["subscribe://state/signal/never".into()],
         ..ActorSpec::default()
     };
     let actor = boot
@@ -324,11 +345,11 @@ async fn finished_ancestor_can_close_an_independently_running_actor() -> anyhow:
             xolotl_types::TaintSet::pristine(),
         ))
         .await?;
-    ensure!(boot.kernel.processes.status(actor.process) == Some(ProcessStatus::Running));
+    ensure!(boot.kernel().processes().status(actor.process) == Some(ProcessStatus::Running));
     tokio::time::timeout(Duration::from_secs(2), boot.finalize_process(parent_id)).await??;
     wait_status(&boot, &actor.directory, "cancelled").await?;
-    ensure!(boot.kernel.processes.status(parent_id) == Some(ProcessStatus::Completed));
-    ensure!(!boot.kernel.processes.has_task(actor.process));
+    ensure!(boot.kernel().processes().status(parent_id) == Some(ProcessStatus::Completed));
+    ensure!(!boot.kernel().processes().has_task(actor.process));
     Ok(())
 }
 
@@ -355,7 +376,7 @@ impl crate::Driver for ReentrantDriver {
             .ok_or_else(|| crate::DriverError::Other("identity missing".into()))?
             .process;
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        let target = if call == 0 { process } else { boot.root };
+        let target = if call == 0 { process } else { boot.root() };
         match boot.finalize_process(target).await {
             Err(BootstrapError::ProcessBusy { process: blocked }) if target == blocked => {
                 Ok(crate::DriverOutput::new(Outcome::Done(Value::null())))
@@ -373,10 +394,13 @@ async fn body_and_finalizer_cannot_join_their_own_process_tree() -> anyhow::Resu
     let calls = Arc::new(AtomicUsize::new(0));
     let resource = boot.register_effect(
         "effect://lifecycle/reentrant",
-        &[
-            MethodSpec::new("invoke", Purity::Effectful, MethodSpec::UNARY_ASYNC)
-                .finalize_allowed(),
-        ],
+        &[MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Effectful,
+            MethodSpec::UNARY_ASYNC,
+        )
+        .finalize_allowed()],
         Arc::new(ReentrantDriver {
             bootstrap: Arc::downgrade(&boot),
             calls: calls.clone(),
@@ -397,21 +421,17 @@ async fn body_and_finalizer_cannot_join_their_own_process_tree() -> anyhow::Resu
         ..ActorSpec::default()
     };
     let actor = boot
-        .spawn_actor_under(boot.root, IdentityRef::ROOT, "root", &spec)
+        .spawn_actor_under(boot.root(), IdentityRef::ROOT, "root", &spec)
         .await?;
     wait_status(&boot, &actor.directory, "completed").await?;
     ensure!(calls.load(Ordering::SeqCst) == 2);
-    let facts = boot.kernel.facts.facts_of(actor.process)?;
-    let terminal = facts
-        .iter()
-        .find(|fact| fact.id.position == FINALIZED_NODE)
-        .context("missing lifecycle fact")?;
-    let record = terminal
-        .outcome
-        .as_ref()
-        .and_then(Value::as_map)
-        .context("missing lifecycle result")?;
-    ensure!(record.get("finalizer_failure_count") == Some(&Value::integer(0)));
-    ensure!(boot.kernel.processes.status(boot.root) == Some(ProcessStatus::Running));
+    ensure!(
+        boot.kernel()
+            .processes()
+            .finalizer_failures(actor.process)
+            .context("missing finalizer result")?
+            .is_empty()
+    );
+    ensure!(boot.kernel().processes().status(boot.root()) == Some(ProcessStatus::Running));
     Ok(())
 }

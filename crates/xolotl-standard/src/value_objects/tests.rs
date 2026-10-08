@@ -37,9 +37,9 @@ fn memory_options() -> MemoryKeyOptions {
 fn invoke(boot: &Bootstrap, executor: &Executor, path: &str) -> anyhow::Result<Expression> {
     let target = ResourceName::new(Path::parse(path)?);
     let handle = boot
-        .open_for(boot.root, &target, "perform")
+        .open_for(boot.root(), &target, "perform")
         .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-    executor.bind_handle(target.clone(), handle);
+    executor.bind_handle(target.clone(), handle)?;
     Ok(Expression::Invoke {
         operation: OperationTemplate {
             target,
@@ -180,10 +180,15 @@ async fn kernel_write_read_pipeline_preserves_typed_values_and_resident_sharing(
     let seen = Arc::new(parking_lot::Mutex::new(None));
     boot.register_effect(
         "effect://test/retain",
-        &[MethodSpec::unary_async("invoke", Purity::Pure)],
+        &[MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Pure,
+            MethodSpec::UNARY_ASYNC,
+        )],
         Arc::new(RetainInput { seen: seen.clone() }),
     )?;
-    let executor = boot.kernel.executor_for(boot.root);
+    let executor = boot.kernel().executor_for(boot.root());
     let program = Program::new(
         invoke(&boot, &executor, "effect://value/write")?
             .then(invoke(&boot, &executor, "effect://value/read")?)
@@ -234,7 +239,7 @@ async fn only_installed_object_capabilities_become_effects_and_creation_is_lazy(
             (write, "effect://value/write"),
         ] {
             let target = ResourceName::new(Path::parse(path)?);
-            ensure!(boot.open_for(boot.root, &target, "perform").is_ok() == enabled);
+            ensure!(boot.open_for(boot.root(), &target, "perform").is_ok() == enabled);
         }
     }
     Ok(())
@@ -251,7 +256,7 @@ async fn reference_shaped_maps_are_written_as_values_and_read_requires_an_explic
         config(31)?,
         memory_key_factory(memory_options()),
     )?;
-    let executor = boot.kernel.executor_for(boot.root);
+    let executor = boot.kernel().executor_for(boot.root());
     let descriptor = EncodedValueRef {
         blob: BlobRef {
             hash: "unresolvable-nested-reference".into(),
@@ -312,7 +317,7 @@ async fn read_materialization_policy_does_not_limit_writes_or_change_object_rete
         },
         memory_key_factory(memory_options()),
     )?;
-    let executor = boot.kernel.executor_for(boot.root);
+    let executor = boot.kernel().executor_for(boot.root());
     let write = Program::new(invoke(&boot, &executor, "effect://value/write")?).compile()?;
     let source = TaintSet::of(TaintSource::Protected {
         path: Path::parse("state://private/encoded-value")?,

@@ -45,14 +45,16 @@ fn run_effect(rt: &Runtime, boot: &Bootstrap, path: &str, input: Value) -> Outco
             return setup_failure(format!("benchmark effect path parse failed: {error}"));
         }
     };
-    let handle = match boot.open_for(boot.root, &target, "perform") {
+    let handle = match boot.open_for(boot.root(), &target, "perform") {
         Ok(handle) => handle,
         Err(error) => {
             return setup_failure(format!("benchmark effect open failed: {error}"));
         }
     };
-    let ex = boot.kernel.executor_for(boot.root);
-    ex.bind_handle(target.clone(), handle);
+    let ex = boot.kernel().executor_for(boot.root());
+    if let Err(error) = ex.bind_handle(target.clone(), handle) {
+        return setup_failure(format!("benchmark effect bind failed: {error}"));
+    }
     rt.block_on(async {
         ex.eval(&DoNode::Op(OperationTemplate {
             target,

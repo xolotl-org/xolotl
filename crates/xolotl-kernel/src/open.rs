@@ -1,20 +1,29 @@
 //! Compile open requests into executable [`Handle`] values.
 //!
-//! Open resolves a matching grant, validates static constraints and reserved
-//! paths, builds the driver plan, and installs the resulting handle in the
-//! caller's handle table.
+//! Preparation resolves authority and builds an immutable plan without borrowing
+//! the handle table. Installation checks that the control plane is unchanged and
+//! allocates a slot. Host policy callbacks run only during preparation.
 
 use crate::driver::{DriverPlan, RemoteDriver};
-use crate::handle::{FastPath, Handle, HandleState, HandleTable};
-use crate::policy::{ConstraintCheck, OpenContext, PolicyCompileError, PolicySnapshot};
+use crate::handle::{FastPath, Handle, HandleTable};
+use crate::policy::{OpenContext, PolicyCompileError};
+use crate::process::state_cleanup_owner;
 use crate::registry::{CompiledOpenPlan, OpenCacheKey, Registry, ResolveError};
 use std::sync::Arc;
 use thiserror::Error;
-use xolotl_types::{ConstraintSet, Grant, HandleId, IdentityRef, ProcessId, ResourceId, Rights};
+use xolotl_types::{Expiry, Grant, HandleId, IdentityRef, ProcessId, ResourceId, Rights};
+
+mod authority;
+mod prepared;
+use authority::compile_grant_snapshot;
+pub use prepared::PreparedOpen;
 
 /// Errors returned while compiling an open request into a handle.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum OpenError {
+    /// The acting identity is not registered in this Kernel's directory.
+    #[error("identity admission failed: {0}")]
+    Identity(#[from] crate::identity::IdentityError),
     /// The handle table cannot admit a new slot or its parent was revoked.
     #[error("handle admission failed: {0}")]
     HandleAdmission(#[from] xolotl_core::AuthorityError),
@@ -22,6 +31,9 @@ pub enum OpenError {
     /// process table.
     #[error("process {0} not found")]
     NoSuchProcess(ProcessId),
+    /// The owning process no longer accepts handles in the current execution scope.
+    #[error("process {0} no longer accepts handles")]
+    ProcessUnavailable(ProcessId),
     /// The process holds no grant whose selector matches the resource/path.
     #[error("no grant held by {process} matches resource {resource}")]
     NoMatchingGrant {
@@ -33,6 +45,24 @@ pub enum OpenError {
     /// A grant selector matched, but the requested rights exceeded it.
     #[error("requested rights exceed the granting rights (not a subset)")]
     RightsNotSubset,
+    /// Requested method bits do not belong to the requested capability category.
+    #[error("requested methods do not match capability verb {0}")]
+    MethodAuthorityMismatch(String),
+    /// The prepared method layout differs from the resource's current contract.
+    #[error("resource method contract changed; prepare a new execution")]
+    MethodContractChanged,
+    /// A live cached handle cannot be used for the requested operation.
+    #[error("bound handle {0} does not match the requested target, identity, method, or rights")]
+    BoundHandleMismatch(HandleId),
+    /// Control-plane state changed between preparation and handle installation.
+    #[error("registry changed before handle installation; prepare the open again")]
+    RegistryChanged,
+    /// The requested path resolves to another resource.
+    #[error("requested path does not resolve to resource {0}")]
+    ResourcePathMismatch(ResourceId),
+    /// A handle must bind one concrete target, never a selector pattern.
+    #[error("handle target must be a concrete path: {0}")]
+    NonConcretePath(xolotl_types::Path),
     /// Registry has no resource with this id.
     #[error("resource {0} not found")]
     NoSuchResource(ResourceId),
@@ -48,9 +78,6 @@ pub enum OpenError {
     /// Binding points at a remote endpoint that is not registered.
     #[error("endpoint {0} not found")]
     NoSuchEndpoint(xolotl_types::EndpointId),
-    /// Grant expiry or static constraints failed at open time.
-    #[error("grant expired or static constraint failed")]
-    StaticConstraintFailed,
     /// A source policy denied the open before a handle was created.
     #[error("a source policy denied the open: {0}")]
     PolicyDenied(String),
@@ -86,9 +113,11 @@ pub struct OpenRequest {
 
 /// Compile and install a Handle. On success the Handle is in the table
 /// and its [`HandleId`] is returned.
+/// Policy compilation runs outside the table lock. Use [`prepare_open`] and
+/// [`PreparedOpen::install`] separately to inspect the contract before installation.
 pub fn open_resource(
     registry: &Registry,
-    handles: &mut HandleTable,
+    handles: &HandleTable,
     req: OpenRequest,
 ) -> Result<HandleId, OpenError> {
     open_resource_with_attached(registry, handles, req, &[])
@@ -97,14 +126,56 @@ pub fn open_resource(
 /// Compile and install a Handle using process-attached grants.
 pub fn open_resource_with_attached(
     registry: &Registry,
-    handles: &mut HandleTable,
+    handles: &HandleTable,
     req: OpenRequest,
     attached_grants: &[Grant],
 ) -> Result<HandleId, OpenError> {
+    prepare_open(registry, req, attached_grants)?.install(handles)
+}
+
+/// Resolve authority and compile an immutable plan without installing a handle.
+/// Pass an empty slice when all grants live in the registry. Attached grants are
+/// supplied by the trusted host; callers manage their process lifecycle separately.
+/// Static policy observes `req.now_millis`; installation does not rerun callbacks
+/// or advance that authorization time. Prepare close to installation.
+///
+/// ```
+/// use xolotl_kernel::{HandleTable, OpenError, OpenRequest, Registry, prepare_open};
+/// use xolotl_types::{Grant, HandleId};
+///
+/// fn open_shared(
+///     registry: &Registry,
+///     handles: &HandleTable,
+///     request: OpenRequest,
+///     grants: &[Grant],
+/// ) -> Result<HandleId, OpenError> {
+///     let prepared = prepare_open(registry, request, grants)?;
+///     // Inspect prepared.policy() or method contracts before allocating a slot.
+///     prepared.install(handles)
+/// }
+/// ```
+pub fn prepare_open(
+    registry: &Registry,
+    req: OpenRequest,
+    attached_grants: &[Grant],
+) -> Result<PreparedOpen, OpenError> {
+    prepare_open_with_contract(registry, req, attached_grants, None)
+}
+
+pub(crate) fn prepare_open_with_contract(
+    registry: &Registry,
+    req: OpenRequest,
+    attached_grants: &[Grant],
+    expected: Option<&crate::registry::ResourceContract>,
+) -> Result<PreparedOpen, OpenError> {
+    let revision = registry.revision();
     // Resolve the resource descriptor before evaluating grants and policies.
     let resource = registry
         .resource(req.resource)
         .ok_or(OpenError::NoSuchResource(req.resource))?;
+    if expected.is_some_and(|contract| !contract.matches(&resource)) {
+        return Err(OpenError::MethodContractChanged);
+    }
     // The path used for grant/selector matching and as the handle's bound path
     // is the *requested* concrete path when given; otherwise it is the resolved
     // Resource's own name.
@@ -113,6 +184,14 @@ pub fn open_resource_with_attached(
         .clone()
         .unwrap_or_else(|| resource.descriptor.name.path().clone());
     let resource_name = match_path;
+    if !resource_name.is_concrete() {
+        return Err(OpenError::NonConcretePath(resource_name));
+    }
+    if registry.resolve_resource(&xolotl_types::ResourceName::new(resource_name.clone()))?
+        != req.resource
+    {
+        return Err(OpenError::ResourcePathMismatch(req.resource));
+    }
     let resource_root = resource.descriptor.name.path();
     let is_fact_projection_resource = resource_root.scheme() == "state"
         && resource_root.segments().first().map(|s| s.as_str()) == Some("fact");
@@ -123,62 +202,146 @@ pub fn open_resource_with_attached(
         return Err(OpenError::ReservedPath(resource_name.to_string()));
     }
 
-    // Select a held grant that both matches the resource selector and covers the
-    // requested rights. A process may hold several grants for the same resource
-    // with different method rights, so selector matching and rights coverage
-    // must be evaluated together.
-    let mut candidates = registry.candidate_grants(req.process, &req.verb, &resource_name);
-    candidates.extend(attached_grants.iter().cloned());
-    let matching: Vec<_> = candidates
-        .into_iter()
-        .filter(|g| g.holder == req.process)
-        .filter(|g| {
-            !g.expires.is_expired(req.now_millis) && g.selector.matches(&req.verb, &resource_name)
-        })
-        .collect();
-    let selector_matched = !matching.is_empty();
-    let grant = match matching
-        .into_iter()
-        .find(|g| req.rights.is_subset_of(&g.rights))
+    let methods = registry
+        .interface_methods(&resource.interfaces)
+        .ok_or(OpenError::NoSuchResource(req.resource))?;
+    let eligible = methods
+        .iter()
+        .enumerate()
+        .filter(|(_, method)| method.authority.verb() == req.verb)
+        .fold(xolotl_types::MethodBitmap::empty(), |bitmap, (index, _)| {
+            bitmap | xolotl_types::MethodBitmap::method(index as u32)
+        });
+    // A propagation-only handle still has an explicit admission category. Its
+    // zero method bitmap never authorizes a later derivation to add methods.
+    if req.verb.is_empty() || req.verb == "*" || !req.rights.methods.is_subset_of(eligible) {
+        return Err(OpenError::MethodAuthorityMismatch(req.verb));
+    }
+
+    // A method grant and a propagation grant may be different candidates.
+    // Select either contributor once, then compile each right domain as its own
+    // OR of grants. The two domains are conjunctive at the actual operation.
+    let (mut grants, mut selector_matched, cache_allowed) = registry.select_open_grants(
+        req.process,
+        &req.verb,
+        &resource_name,
+        req.rights,
+        &methods,
+        req.now_millis,
+    );
+    let registered_count = grants.len();
+    for grant in attached_grants {
+        if grant.holder != req.process
+            || grant.expires.is_expired(req.now_millis)
+            || !grant.selector.matches(&req.verb, &resource_name)
+        {
+            continue;
+        }
+        selector_matched = true;
+        let covers_methods = !req.rights.methods.is_empty()
+            && grant
+                .rights
+                .methods
+                .covers_bitmap(req.rights.methods, &methods);
+        let covers_flags =
+            !req.rights.flags.is_empty() && grant.rights.flags.contains(req.rights.flags);
+        if covers_methods || covers_flags || req.rights == Rights::default() {
+            grants.push(grant.clone());
+        }
+    }
+    let method_grants: Vec<_> = if req.rights.methods.is_empty() {
+        Vec::new()
+    } else {
+        grants
+            .iter()
+            .filter(|grant| {
+                grant
+                    .rights
+                    .methods
+                    .covers_bitmap(req.rights.methods, &methods)
+            })
+            .collect()
+    };
+    let propagation_grants: Vec<_> = if req.rights.flags.is_empty() {
+        Vec::new()
+    } else {
+        grants
+            .iter()
+            .filter(|grant| grant.rights.flags.contains(req.rights.flags))
+            .collect()
+    };
+    if grants.is_empty()
+        || !req.rights.methods.is_empty() && method_grants.is_empty()
+        || !req.rights.flags.is_empty() && propagation_grants.is_empty()
     {
-        Some(g) => g,
         // A selector matched but none covered the rights; without any selector
         // match, report that no grant covered the resource.
-        None if selector_matched => return Err(OpenError::RightsNotSubset),
-        None => {
+        if selector_matched {
+            return Err(OpenError::RightsNotSubset);
+        } else {
             return Err(OpenError::NoMatchingGrant {
                 process: req.process,
                 resource: req.resource,
             });
         }
-    };
+    }
 
     // Evaluate constraints that do not require per-operation input at open time.
     // The remaining residual policy is carried into the handle plan.
-    let constraints = effective_grant_constraints(&grant);
-    let cache_key = OpenCacheKey::new(
-        grant.id,
-        req.resource,
-        resource_name.clone(),
-        req.verb.clone(),
-        req.rights,
-        req.acting,
-        req.now_millis,
-    );
-    if let Some(plan) = registry.cached_open_plan(&cache_key) {
-        return Ok(handles.insert(handle_from_plan(
+    let grant_policy = if req.rights.methods.is_empty() {
+        crate::policy::PolicySnapshot::empty()
+    } else {
+        compile_grant_snapshot(&method_grants)
+    }
+    .merge(if req.rights.flags.is_empty() {
+        crate::policy::PolicySnapshot::empty()
+    } else {
+        compile_grant_snapshot(&propagation_grants)
+    });
+    // Registered grants change only with the registry revision. Attached
+    // grants are host-owned snapshots with no revision; caching them would
+    // retain arbitrarily large external authority and require deep equality.
+    let cache_key = if registered_count == 1
+        && grants.len() == 1
+        && grants[0].expires == Expiry::Never
+        && cache_allowed
+        && grants[0]
+            .rights
+            .methods
+            .covers_bitmap(req.rights.methods, &methods)
+        && grants[0].rights.flags.contains(req.rights.flags)
+    {
+        OpenCacheKey::for_cache(
+            &grants[0],
+            req.resource,
+            &resource_name,
+            &req.verb,
+            req.rights,
+            req.acting,
+        )
+    } else {
+        None
+    };
+    if let Some((plan, revision)) = cache_key
+        .as_ref()
+        .and_then(|key| registry.cached_open_plan(key, revision))
+    {
+        return Ok(PreparedOpen::new(
+            registry.clone(),
+            revision,
             req.process,
             req.acting,
-            Some(resource_name),
+            req.verb,
+            resource_name,
             plan,
-        ))?);
+        ));
     }
 
     // Compile policy into a snapshot with partial evaluation. The residual is
     // the input-dependent part of the grant constraints and registered source
     // policies that apply to this open. Open-time decidable parts are evaluated
     // and eliminated.
-    let mut snapshot = compile_policy_snapshot(&constraints);
+    let mut snapshot = grant_policy;
     let open_ctx = OpenContext {
         resource: req.resource,
         resource_path: &resource_name,
@@ -202,13 +365,14 @@ pub fn open_resource_with_attached(
     let binding = registry
         .binding(resource.binding)
         .ok_or(OpenError::NoSuchBinding(resource.binding))?;
-    let remote_endpoint = match binding.endpoint {
-        Some(endpoint_id) => Some(
-            registry
-                .remote_endpoint(endpoint_id)
-                .ok_or(OpenError::NoSuchEndpoint(endpoint_id))?,
-        ),
-        None => None,
+    let (remote_endpoint, revision) = match binding.endpoint {
+        Some(endpoint_id) => {
+            let (endpoint, revision) = registry
+                .remote_endpoint_with_revision(endpoint_id, revision)
+                .ok_or(OpenError::NoSuchEndpoint(endpoint_id))?;
+            (Some(endpoint), revision)
+        }
+        None => (None, revision),
     };
     let driver_impl = match binding.endpoint {
         Some(_) => None,
@@ -235,15 +399,9 @@ pub fn open_resource_with_attached(
         };
     let mut plan = DriverPlan::new(binding.driver.id, binding.endpoint, binding.generation);
     let cleanup_owner = state_cleanup_owner(&resource_name);
-    for iface_id in &resource.interfaces.interfaces {
-        if let Some(iface) = registry.interface(*iface_id) {
-            for (index, method) in iface.methods.iter().enumerate() {
-                let index = u32::try_from(index).map_err(|_error| OpenError::RightsNotSubset)?;
-                let mut contract = xolotl_types::MethodContract::from_method(index, method);
-                contract.cleanup_owner = cleanup_owner;
-                plan.insert(method.id, contract, dispatch_driver.clone());
-            }
-        }
+    for (index, method) in methods.into_iter().enumerate() {
+        let index = u32::try_from(index).map_err(|_error| OpenError::RightsNotSubset)?;
+        plan.insert_declared(index, method, cleanup_owner, dispatch_driver.clone());
     }
 
     // Empty residual policy permits the unconditional fast path.
@@ -258,35 +416,25 @@ pub fn open_resource_with_attached(
         driver_plan: plan,
         fast_path,
     };
-    registry.store_open_plan(cache_key, compiled.clone());
+    if !registry.publish_open_plan(cache_key, &compiled, revision) {
+        return Err(OpenError::RegistryChanged);
+    }
 
-    // Allocate and install the handle slot.
-    Ok(handles.insert(handle_from_plan(
+    Ok(PreparedOpen::new(
+        registry.clone(),
+        revision,
         req.process,
         req.acting,
-        Some(resource_name),
+        req.verb,
+        resource_name,
         compiled,
-    ))?)
-}
-
-fn state_cleanup_owner(path: &xolotl_types::Path) -> Option<ProcessId> {
-    if path.scheme() != "state"
-        || path.cluster().is_some()
-        || path.segments().first()?.as_str() != "process"
-    {
-        return None;
-    }
-    path.segments()
-        .get(1)?
-        .as_str()
-        .parse()
-        .ok()
-        .map(ProcessId::new)
+    ))
 }
 
 fn handle_from_plan(
     process: ProcessId,
     acting: IdentityRef,
+    open_verb: String,
     bound_path: Option<xolotl_types::Path>,
     plan: CompiledOpenPlan,
 ) -> Handle {
@@ -294,933 +442,16 @@ fn handle_from_plan(
         id: HandleId::new(0, 0), // patched by insert()
         process,
         acting,
+        open_verb,
         resource: plan.resource,
         rights: plan.rights,
         driver_plan: plan.driver_plan,
         fast_path: plan.fast_path,
-        state: HandleState::Active,
         // The concrete path this handle addresses, so prefix-resolved
         // Resources (state://**) reach the driver with the real path.
         bound_path,
     }
 }
 
-/// Compile a constraint set into a residual [`PolicySnapshot`]. An empty
-/// constraint set produces an empty (Unconditional) snapshot.
-fn compile_policy_snapshot(constraints: &ConstraintSet) -> PolicySnapshot {
-    if constraints.is_empty() {
-        PolicySnapshot::empty()
-    } else {
-        PolicySnapshot::new(vec![Arc::new(ConstraintCheck {
-            constraints: constraints.clone(),
-        })])
-    }
-}
-
-fn effective_grant_constraints(grant: &Grant) -> ConstraintSet {
-    let Some(predicate) = grant.selector.pattern.predicate.clone() else {
-        return grant.constraints.clone();
-    };
-    let mut predicates = Vec::with_capacity(grant.constraints.predicates.len() + 1);
-    predicates.push(predicate);
-    predicates.extend(grant.constraints.predicates.iter().cloned());
-    ConstraintSet { predicates }
-}
-
-/// Derive a child handle by attenuation: rights must be a subset and the
-/// requested derivation kind must be permitted by the parent's flags.
-pub fn derive_handle(
-    handles: &mut HandleTable,
-    parent_id: HandleId,
-    new_rights: Rights,
-    kind: xolotl_types::DeriveKind,
-    new_owner: ProcessId,
-) -> Result<HandleId, OpenError> {
-    let parent = handles.get(parent_id).ok_or(OpenError::RightsNotSubset)?;
-    if parent.state != HandleState::Active {
-        return Err(OpenError::StaticConstraintFailed);
-    }
-    if !new_rights.is_subset_of(&parent.rights) {
-        return Err(OpenError::RightsNotSubset);
-    }
-    if !parent.rights.allows_derive(kind) {
-        return Err(OpenError::RightsNotSubset);
-    }
-    let child = Handle {
-        id: HandleId::new(0, 0),
-        process: new_owner,
-        acting: parent.acting,
-        resource: parent.resource,
-        rights: new_rights,
-        driver_plan: parent.driver_plan.clone(),
-        fast_path: parent.fast_path.clone(),
-        state: HandleState::Active,
-        bound_path: parent.bound_path.clone(),
-    };
-    Ok(handles.insert_derived(child, parent_id)?)
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::driver::{
-        DriverDescriptor, DriverError, EchoDriver, FnDriver, RemoteEndpoint, RemoteInvokeDispatch,
-    };
-    use crate::handle::HandleTable;
-    use anyhow::{Context, bail, ensure};
-    use async_trait::async_trait;
-    use parking_lot::Mutex;
-    use xolotl_types::{
-        Binding, EndpointId, Expiry, Grant, Interface, InterfaceFamily, InterfaceSet, Invoke,
-        InvokeResult, Metadata, Method, MethodBitmap, ModalitySet, OutputModeSet, Path, Purity,
-        ReplayClass, Resource, ResourceDescriptor, ResourceKind, ResourceName, ResourceSelector,
-        RightFlags, Rights, SchemaId, Value,
-    };
-
-    fn setup_resource(reg: &Registry, path: &str) -> anyhow::Result<ResourceId> {
-        let iface_id = reg.next_interface_id();
-        reg.register_interface(Interface {
-            id: iface_id,
-            family: InterfaceFamily::Callable,
-            methods: vec![Method {
-                id: xolotl_types::MethodId::new(100),
-                name: "invoke".into(),
-                input: SchemaId::new(0),
-                output: SchemaId::new(0),
-                modality: ModalitySet::TEXT,
-                purity: Purity::Pure,
-                replay: ReplayClass::Deterministic,
-                supports: OutputModeSet::UNARY,
-                cost: Default::default(),
-                batchable: false,
-                finalize_allowed: false,
-                requires_unprotected_input: false,
-            }],
-            laws: Vec::new(),
-        });
-        let driver_id = reg.next_driver_id();
-        reg.register_driver(DriverDescriptor {
-            id: driver_id,
-            name: "echo".into(),
-            implements: InterfaceSet::new(vec![iface_id]),
-            transport: xolotl_types::Transport::InProcess,
-            driver: Arc::new(EchoDriver),
-        });
-        let binding_id = reg.next_binding_id();
-        reg.register_binding(Binding {
-            id: binding_id,
-            selector: ResourceSelector::parse("perform://effect/**")?,
-            interfaces: InterfaceSet::new(vec![iface_id]),
-            driver: xolotl_types::DriverRef {
-                id: driver_id,
-                name: "echo".into(),
-            },
-            endpoint: None,
-            generation: 1,
-        });
-        let rid = reg.next_resource_id();
-        reg.admit_resource(
-            Resource {
-                id: rid,
-                descriptor: ResourceDescriptor {
-                    name: ResourceName::new(Path::parse(path)?),
-                    kind: ResourceKind::Effect,
-                    metadata: Metadata::default(),
-                },
-                interfaces: InterfaceSet::new(vec![iface_id]),
-                binding: binding_id,
-            },
-            path.starts_with("effect://kernel/"),
-        )
-        .context("resource admission failed")?;
-        Ok(rid)
-    }
-
-    fn setup_remote_resource(
-        reg: &Registry,
-        path: &str,
-        endpoint: EndpointId,
-    ) -> anyhow::Result<ResourceId> {
-        let iface_id = reg.next_interface_id();
-        reg.register_interface(Interface {
-            id: iface_id,
-            family: InterfaceFamily::Callable,
-            methods: vec![Method {
-                id: xolotl_types::MethodId::new(0),
-                name: "invoke".into(),
-                input: SchemaId::new(0),
-                output: SchemaId::new(0),
-                modality: ModalitySet::TEXT,
-                purity: Purity::Effectful,
-                replay: ReplayClass::NonIdempotentEffect,
-                supports: OutputModeSet::UNARY | OutputModeSet::STREAM,
-                cost: Default::default(),
-                batchable: false,
-                finalize_allowed: false,
-                requires_unprotected_input: false,
-            }],
-            laws: Vec::new(),
-        });
-        let driver_id = reg.next_driver_id();
-        reg.register_driver(DriverDescriptor {
-            id: driver_id,
-            name: "remote-provider".into(),
-            implements: InterfaceSet::new(vec![iface_id]),
-            transport: xolotl_types::Transport::Grpc {
-                endpoint: Some("test-endpoint".into()),
-            },
-            // This local driver must not be called for endpoint bindings. The
-            // compiled plan uses RemoteDriver stubs instead.
-            driver: Arc::new(EchoDriver),
-        });
-        let binding_id = reg.next_binding_id();
-        reg.admit_binding(Binding {
-            id: binding_id,
-            selector: ResourceSelector::parse("perform://effect/external-provider/**")?,
-            interfaces: InterfaceSet::new(vec![iface_id]),
-            driver: xolotl_types::DriverRef {
-                id: driver_id,
-                name: "remote-provider".into(),
-            },
-            endpoint: Some(endpoint),
-            generation: 1,
-        })
-        .context("remote binding admission failed")?;
-        let rid = reg.next_resource_id();
-        reg.admit_resource(
-            Resource {
-                id: rid,
-                descriptor: ResourceDescriptor {
-                    name: ResourceName::new(Path::parse(path)?),
-                    kind: ResourceKind::Effect,
-                    metadata: Metadata::default(),
-                },
-                interfaces: InterfaceSet::new(vec![iface_id]),
-                binding: binding_id,
-            },
-            false,
-        )
-        .context("remote resource admission failed")?;
-        Ok(rid)
-    }
-
-    fn setup_state_subtree_resource(reg: &Registry) -> anyhow::Result<ResourceId> {
-        let iface_id = reg.next_interface_id();
-        reg.register_interface(Interface {
-            id: iface_id,
-            family: InterfaceFamily::Value,
-            methods: vec![Method {
-                id: xolotl_types::MethodId::new(0),
-                name: "read".into(),
-                input: SchemaId::new(0),
-                output: SchemaId::new(0),
-                modality: ModalitySet::TEXT,
-                purity: Purity::Pure,
-                replay: ReplayClass::Observation,
-                supports: OutputModeSet::UNARY,
-                cost: Default::default(),
-                batchable: false,
-                finalize_allowed: false,
-                requires_unprotected_input: false,
-            }],
-            laws: Vec::new(),
-        });
-        let driver_id = reg.next_driver_id();
-        reg.register_driver(DriverDescriptor {
-            id: driver_id,
-            name: "state".into(),
-            implements: InterfaceSet::new(vec![iface_id]),
-            transport: xolotl_types::Transport::InProcess,
-            driver: Arc::new(FnDriver(|_, input| Ok(input))),
-        });
-        let binding_id = reg.next_binding_id();
-        reg.register_binding(Binding {
-            id: binding_id,
-            selector: ResourceSelector::parse("*://state/**")?,
-            interfaces: InterfaceSet::new(vec![iface_id]),
-            driver: xolotl_types::DriverRef {
-                id: driver_id,
-                name: "state".into(),
-            },
-            endpoint: None,
-            generation: 1,
-        });
-        let rid = reg.next_resource_id();
-        reg.admit_resource(
-            Resource {
-                id: rid,
-                descriptor: ResourceDescriptor {
-                    name: ResourceName::new(Path::parse("state://")?),
-                    kind: ResourceKind::State,
-                    metadata: Metadata::default(),
-                },
-                interfaces: InterfaceSet::new(vec![iface_id]),
-                binding: binding_id,
-            },
-            true,
-        )
-        .context("state resource admission failed")?;
-        Ok(rid)
-    }
-
-    struct TestEndpoint {
-        seen: Arc<Mutex<Vec<Invoke>>>,
-    }
-
-    #[async_trait]
-    impl RemoteEndpoint for TestEndpoint {
-        async fn invoke(
-            &self,
-            _dispatch: RemoteInvokeDispatch,
-            invoke: Invoke,
-        ) -> Result<InvokeResult, DriverError> {
-            self.seen.lock().push(invoke.clone());
-            Ok(InvokeResult {
-                invocation_id: invoke.invocation_id,
-                outcome: Ok(xolotl_types::Value::string("remote".into())),
-            })
-        }
-    }
-
-    fn expect_open_error(result: Result<HandleId, OpenError>) -> anyhow::Result<OpenError> {
-        match result {
-            Ok(handle) => bail!("expected open error, got handle {handle:?}"),
-            Err(err) => Ok(err),
-        }
-    }
-
-    #[test]
-    fn open_unconditional_when_no_constraints() -> anyhow::Result<()> {
-        let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://x/post")?;
-        reg.register_grant(Grant {
-            id: reg.next_grant_id(),
-            holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/x/post")?,
-            rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
-            constraints: ConstraintSet::empty(),
-            expires: Expiry::Never,
-        });
-        let mut handles = HandleTable::new();
-        let id = open_resource(
-            &reg,
-            &mut handles,
-            OpenRequest {
-                process: ProcessId::new(1),
-                resource: rid,
-                verb: "perform".into(),
-                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
-                acting: IdentityRef::ROOT,
-                requested_path: None,
-                now_millis: 0,
-            },
-        )
-        .context("open_resource failed")?;
-        let h = handles.get(id).context("opened handle did not resolve")?;
-        ensure!(
-            h.is_unconditional(),
-            "no constraints should use the unconditional fast path"
-        );
-        ensure!(
-            h.driver_plan.supports(xolotl_types::MethodId::new(100)),
-            "driver plan should support method 100"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn selector_predicate_becomes_residual_constraint() -> anyhow::Result<()> {
-        let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://x/post")?;
-        reg.register_grant(Grant {
-            id: reg.next_grant_id(),
-            holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/x/post@tenant=acme")?,
-            rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
-            constraints: ConstraintSet::empty(),
-            expires: Expiry::Never,
-        });
-        let mut handles = HandleTable::new();
-        let id = open_resource(
-            &reg,
-            &mut handles,
-            OpenRequest {
-                process: ProcessId::new(1),
-                resource: rid,
-                verb: "perform".into(),
-                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
-                acting: IdentityRef::ROOT,
-                requested_path: None,
-                now_millis: 0,
-            },
-        )
-        .context("open_resource failed")?;
-        let h = handles.get(id).context("opened handle did not resolve")?;
-        let FastPath::Conditional(snapshot) = &h.fast_path else {
-            bail!("selector predicate should produce a conditional handle");
-        };
-
-        let deny = snapshot
-            .check(&crate::policy::CheckCtx {
-                input: &Value::null(),
-                acting: IdentityRef::ROOT,
-                now_millis: 0,
-                target: rid,
-            })
-            .await;
-        ensure!(
-            matches!(deny, crate::policy::PolicyDecision::Deny { .. }),
-            "missing predicate input should be denied: {deny:?}"
-        );
-
-        let input = Value::map(
-            [("tenant".into(), Value::string("acme".into()))]
-                .into_iter()
-                .collect(),
-        );
-        let allow = snapshot
-            .check(&crate::policy::CheckCtx {
-                input: &input,
-                acting: IdentityRef::ROOT,
-                now_millis: 0,
-                target: rid,
-            })
-            .await;
-        ensure!(
-            allow == crate::policy::PolicyDecision::Allow,
-            "matching predicate input should be allowed: {allow:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn endpoint_binding_requires_registered_endpoint() -> anyhow::Result<()> {
-        let reg = Registry::new();
-        let rid = setup_remote_resource(
-            &reg,
-            "effect://external-provider/acme/search",
-            EndpointId::new(99),
-        )?;
-        reg.register_grant(Grant {
-            id: reg.next_grant_id(),
-            holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/external-provider/acme/search")?,
-            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
-            constraints: ConstraintSet::empty(),
-            expires: Expiry::Never,
-        });
-        let mut handles = HandleTable::new();
-        let err = expect_open_error(open_resource(
-            &reg,
-            &mut handles,
-            OpenRequest {
-                process: ProcessId::new(1),
-                resource: rid,
-                verb: "perform".into(),
-                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
-                acting: IdentityRef::ROOT,
-                requested_path: None,
-                now_millis: 0,
-            },
-        ))?;
-        ensure!(
-            matches!(err, OpenError::NoSuchEndpoint(id) if id == EndpointId::new(99)),
-            "unexpected open error: {err:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn ordinary_effect_grant_cannot_open_kernel_effect() -> anyhow::Result<()> {
-        let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://kernel/process/inspect")?;
-        reg.register_grant(Grant {
-            id: reg.next_grant_id(),
-            holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/**")?,
-            rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
-            constraints: ConstraintSet::empty(),
-            expires: Expiry::Never,
-        });
-        let mut handles = HandleTable::new();
-        let err = expect_open_error(open_resource(
-            &reg,
-            &mut handles,
-            OpenRequest {
-                process: ProcessId::new(1),
-                resource: rid,
-                verb: "perform".into(),
-                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
-                acting: IdentityRef::ROOT,
-                requested_path: None,
-                now_millis: 0,
-            },
-        ))?;
-        ensure!(
-            matches!(err, OpenError::ReservedPath(ref p) if p == "effect://kernel/process/inspect"),
-            "unexpected open error: {err:?}"
-        );
-        ensure!(
-            handles.is_empty(),
-            "reserved open should not allocate handles"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn endpoint_binding_compiles_to_remote_driver_plan() -> anyhow::Result<()> {
-        let reg = Registry::new();
-        let endpoint = reg.next_endpoint_id();
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        reg.register_endpoint(endpoint, Arc::new(TestEndpoint { seen: seen.clone() }));
-        let rid = setup_remote_resource(&reg, "effect://external-provider/acme/search", endpoint)?;
-        reg.register_grant(Grant {
-            id: reg.next_grant_id(),
-            holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/external-provider/acme/search")?,
-            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
-            constraints: ConstraintSet::empty(),
-            expires: Expiry::Never,
-        });
-        let mut handles = HandleTable::new();
-        let id = open_resource(
-            &reg,
-            &mut handles,
-            OpenRequest {
-                process: ProcessId::new(1),
-                resource: rid,
-                verb: "perform".into(),
-                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
-                acting: IdentityRef::ROOT,
-                requested_path: None,
-                now_millis: 0,
-            },
-        )
-        .context("open_resource failed")?;
-        let h = handles.get(id).context("opened handle did not resolve")?;
-        ensure!(h.driver_plan.is_remote(), "driver plan should be remote");
-        ensure!(
-            h.driver_plan.supports(xolotl_types::MethodId::new(0)),
-            "driver plan should support method 0"
-        );
-
-        let ctx = crate::DriverContext::new(IdentityRef::ROOT, ProcessId::new(1))
-            .with_operation_id(xolotl_types::OperationId::new(
-                ProcessId::new(1),
-                xolotl_types::ExecutionId::FIRST,
-                xolotl_types::InvocationId::new(5),
-                xolotl_types::NodeId::new(4),
-                0,
-            ));
-        let out = h
-            .driver_plan
-            .call(
-                xolotl_types::MethodId::new(0),
-                xolotl_types::Value::string("q".into()),
-                xolotl_types::OutputMode::Unary,
-                &ctx,
-            )
-            .await
-            .context("remote driver call failed")?;
-        ensure!(
-            out.outcome
-                == xolotl_types::Outcome::Done(xolotl_types::Value::string("remote".into())),
-            "unexpected remote outcome: {out:?}"
-        );
-        let seen = seen.lock();
-        ensure!(
-            seen.len() == 1,
-            "unexpected remote invoke count: {}",
-            seen.len()
-        );
-        let invoke = seen.first().context("missing remote invoke")?;
-        ensure!(
-            invoke.invocation_id == "1/1/5/4/0",
-            "invocation id mismatch"
-        );
-        ensure!(
-            invoke.effect_path.to_string() == "effect://external-provider/acme/search",
-            "remote effect path mismatch"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn open_freezes_cleanup_ownership_in_cached_and_delegated_plans() -> anyhow::Result<()> {
-        let reg = Registry::new();
-        let resource = setup_state_subtree_resource(&reg)?;
-        let owner = ProcessId::new(7);
-        let other = ProcessId::new(9);
-        let rights = Rights::new(MethodBitmap::method(0), RightFlags::DELEGATE);
-        for holder in [owner, other] {
-            reg.register_grant(Grant {
-                id: reg.next_grant_id(),
-                holder,
-                selector: ResourceSelector::parse("read://state/**")?,
-                rights,
-                constraints: ConstraintSet::empty(),
-                expires: Expiry::Never,
-            });
-        }
-        let requested_path = Path::parse("state://process/7/result")?;
-        let request = |process| OpenRequest {
-            process,
-            resource,
-            verb: "read".into(),
-            rights,
-            acting: IdentityRef::ROOT,
-            requested_path: Some(requested_path.clone()),
-            now_millis: 1,
-        };
-        let mut handles = HandleTable::new();
-        let first = open_resource(&reg, &mut handles, request(owner))?;
-        let cached = open_resource(&reg, &mut handles, request(owner))?;
-        ensure!(reg.open_cache_stats() == (1, 1, 1));
-        let foreign = open_resource(&reg, &mut handles, request(other))?;
-        let delegated = derive_handle(
-            &mut handles,
-            first,
-            rights,
-            xolotl_types::DeriveKind::Delegate,
-            other,
-        )?;
-        for handle in [first, cached, foreign, delegated] {
-            let opened = handles.get(handle).context("missing opened handle")?;
-            let contract = opened
-                .driver_plan
-                .contract(xolotl_types::MethodId::new(0))
-                .context("missing contract")?;
-            ensure!(!contract.finalize_allowed && contract.cleanup_owner == Some(owner));
-            ensure!(contract.permits_cleanup(owner));
-            ensure!(!contract.permits_cleanup(other));
-            ensure!(contract.permits_cleanup(opened.process) == (opened.process == owner));
-        }
-        ensure!(handles.release(first));
-        let derived = handles
-            .get(delegated)
-            .context("derived handle lost released parent")?;
-        ensure!(
-            !derived
-                .driver_plan
-                .contract(xolotl_types::MethodId::new(0))
-                .context("missing derived contract")?
-                .permits_cleanup(other)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn only_local_numeric_process_state_compiles_implicit_cleanup_ownership() -> anyhow::Result<()>
-    {
-        for path in [
-            "state://",
-            "state://process",
-            "state://process/self/result",
-            "state://process/not-an-id/result",
-            "state://process/18446744073709551616/result",
-            "state://other/7/result",
-            "effect://process/7/result",
-            "path://remote/state/process/7/result",
-        ] {
-            ensure!(state_cleanup_owner(&Path::parse(path)?).is_none(), "{path}");
-        }
-        ensure!(
-            state_cleanup_owner(&Path::parse("state://process/18446744073709551615/result")?)
-                == Some(ProcessId::new(u64::MAX))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn repeated_open_reuses_compiled_open_plan_not_handle_slot() -> anyhow::Result<()> {
-        let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://x/post")?;
-        reg.register_grant(Grant {
-            id: reg.next_grant_id(),
-            holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/x/post")?,
-            rights: Rights::new(MethodBitmap::ALL, RightFlags::empty()),
-            constraints: ConstraintSet::empty(),
-            expires: Expiry::Never,
-        });
-        let mut handles = HandleTable::new();
-        let req = || OpenRequest {
-            process: ProcessId::new(1),
-            resource: rid,
-            verb: "perform".into(),
-            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
-            acting: IdentityRef::ROOT,
-            requested_path: None,
-            now_millis: 123,
-        };
-
-        let first = open_resource(&reg, &mut handles, req()).context("first open failed")?;
-        ensure!(
-            reg.open_cache_stats() == (0, 1, 1),
-            "first open cache stats mismatch: {:?}",
-            reg.open_cache_stats()
-        );
-        let second = open_resource(&reg, &mut handles, req()).context("second open failed")?;
-        ensure!(
-            reg.open_cache_stats() == (1, 1, 1),
-            "second open cache stats mismatch: {:?}",
-            reg.open_cache_stats()
-        );
-
-        ensure!(first != second, "each open should allocate its own handle");
-        ensure!(
-            handles.len() == 2,
-            "unexpected handle count: {}",
-            handles.len()
-        );
-        ensure!(
-            handles
-                .get(first)
-                .context("first handle did not resolve")?
-                .is_unconditional(),
-            "first handle should be unconditional"
-        );
-        ensure!(
-            handles
-                .get(second)
-                .context("second handle did not resolve")?
-                .is_unconditional(),
-            "second handle should be unconditional"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn open_fails_without_matching_grant() -> anyhow::Result<()> {
-        let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://x/post")?;
-        let mut handles = HandleTable::new();
-        let err = expect_open_error(open_resource(
-            &reg,
-            &mut handles,
-            OpenRequest {
-                process: ProcessId::new(1),
-                resource: rid,
-                verb: "perform".into(),
-                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
-                acting: IdentityRef::ROOT,
-                requested_path: None,
-                now_millis: 0,
-            },
-        ))?;
-        ensure!(
-            matches!(err, OpenError::NoMatchingGrant { .. }),
-            "unexpected open error: {err:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn ordinary_state_grant_cannot_open_vault_or_fact_projection() -> anyhow::Result<()> {
-        let reg = Registry::new();
-        let rid = setup_state_subtree_resource(&reg)?;
-        reg.register_grant(Grant {
-            id: reg.next_grant_id(),
-            holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("*://state/**")?,
-            rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
-            constraints: ConstraintSet::empty(),
-            expires: Expiry::Never,
-        });
-        let mut handles = HandleTable::new();
-        for path in [
-            "state://vault/alice/token",
-            "state://fact/1",
-            "state://kernel/bootstrap/phase",
-            "state://kernel",
-        ] {
-            let err = expect_open_error(open_resource(
-                &reg,
-                &mut handles,
-                OpenRequest {
-                    process: ProcessId::new(1),
-                    resource: rid,
-                    verb: "read".into(),
-                    rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
-                    acting: IdentityRef::ROOT,
-                    requested_path: Some(Path::parse(path)?),
-                    now_millis: 0,
-                },
-            ))?;
-            ensure!(
-                matches!(err, OpenError::ReservedPath(ref p) if p == path),
-                "unexpected reserved-path error for {path}: {err:?}"
-            );
-        }
-        ensure!(
-            handles.is_empty(),
-            "reserved opens should not allocate handles"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn open_picks_grant_covering_rights_not_first_selector_match() -> anyhow::Result<()> {
-        // A process holds TWO grants hitting the same resource: the first (by
-        // registration order) covers only derive flags but NO methods; the
-        // second covers method 0. Requesting method 0 must succeed by selecting
-        // the *covering* grant, not spuriously fail on the first match.
-        let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://x/post")?;
-        // Grant A: matches selector, but rights cover no methods.
-        reg.register_grant(Grant {
-            id: reg.next_grant_id(),
-            holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/x/post")?,
-            rights: Rights::new(MethodBitmap::empty(), RightFlags::all()),
-            constraints: ConstraintSet::empty(),
-            expires: Expiry::Never,
-        });
-        // Grant B: matches selector AND covers method 0.
-        reg.register_grant(Grant {
-            id: reg.next_grant_id(),
-            holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/x/post")?,
-            rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
-            constraints: ConstraintSet::empty(),
-            expires: Expiry::Never,
-        });
-        let mut handles = HandleTable::new();
-        let id = open_resource(
-            &reg,
-            &mut handles,
-            OpenRequest {
-                process: ProcessId::new(1),
-                resource: rid,
-                verb: "perform".into(),
-                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
-                acting: IdentityRef::ROOT,
-                requested_path: None,
-                now_millis: 0,
-            },
-        )
-        .context("open_resource should select the grant covering method 0")?;
-        let handle = handles.get(id).context("opened handle did not resolve")?;
-        ensure!(
-            handle.rights.methods.allows(0),
-            "selected handle should allow method 0"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn open_rights_not_subset_when_selector_matched_but_rights_uncovered() -> anyhow::Result<()> {
-        let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://x/post")?;
-        // Only grant: matches selector but covers no methods.
-        reg.register_grant(Grant {
-            id: reg.next_grant_id(),
-            holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/x/post")?,
-            rights: Rights::new(MethodBitmap::empty(), RightFlags::empty()),
-            constraints: ConstraintSet::empty(),
-            expires: Expiry::Never,
-        });
-        let mut handles = HandleTable::new();
-        let err = expect_open_error(open_resource(
-            &reg,
-            &mut handles,
-            OpenRequest {
-                process: ProcessId::new(1),
-                resource: rid,
-                verb: "perform".into(),
-                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
-                acting: IdentityRef::ROOT,
-                requested_path: None,
-                now_millis: 0,
-            },
-        ))?;
-        ensure!(
-            matches!(err, OpenError::RightsNotSubset),
-            "unexpected open error: {err:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn open_conditional_when_constraints_present() -> anyhow::Result<()> {
-        let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://x/post")?;
-        reg.register_grant(Grant {
-            id: reg.next_grant_id(),
-            holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/x/post")?,
-            rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
-            constraints: ConstraintSet {
-                predicates: vec![xolotl_types::cap::Predicate::parse("account=alice")?],
-            },
-            expires: Expiry::Never,
-        });
-        let mut handles = HandleTable::new();
-        let id = open_resource(
-            &reg,
-            &mut handles,
-            OpenRequest {
-                process: ProcessId::new(1),
-                resource: rid,
-                verb: "perform".into(),
-                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
-                acting: IdentityRef::ROOT,
-                requested_path: None,
-                now_millis: 0,
-            },
-        )
-        .context("open_resource failed")?;
-        let handle = handles.get(id).context("opened handle did not resolve")?;
-        ensure!(
-            !handle.is_unconditional(),
-            "constraint-bearing grant should produce a conditional handle"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn registered_policy_adds_residual_check() -> anyhow::Result<()> {
-        use crate::policy::CapabilityPolicy;
-        let reg = Registry::new();
-        let rid = setup_resource(&reg, "effect://x/post")?;
-        // Grant has no constraints (would be Unconditional)…
-        reg.register_grant(Grant {
-            id: reg.next_grant_id(),
-            holder: ProcessId::new(1),
-            selector: ResourceSelector::parse("perform://effect/x/post")?,
-            rights: Rights::new(MethodBitmap::ALL, RightFlags::all()),
-            constraints: ConstraintSet::empty(),
-            expires: Expiry::Never,
-        });
-        // …but a registered source policy attaches an input predicate, so the
-        // handle must become Conditional (a residual check exists).
-        reg.register_policy(Arc::new(CapabilityPolicy {
-            pattern: xolotl_types::Capability::parse("perform://effect/x/**")?,
-            constraints: ConstraintSet {
-                predicates: vec![xolotl_types::cap::Predicate::parse("account=alice")?],
-            },
-        }));
-        let mut handles = HandleTable::new();
-        let id = open_resource(
-            &reg,
-            &mut handles,
-            OpenRequest {
-                process: ProcessId::new(1),
-                resource: rid,
-                verb: "perform".into(),
-                rights: Rights::new(MethodBitmap::method(0), RightFlags::empty()),
-                acting: IdentityRef::ROOT,
-                requested_path: None,
-                now_millis: 0,
-            },
-        )
-        .context("open_resource failed")?;
-        let handle = handles.get(id).context("opened handle did not resolve")?;
-        ensure!(
-            !handle.is_unconditional(),
-            "matching source policy with a predicate should produce a conditional handle"
-        );
-        Ok(())
-    }
-}
+mod tests;

@@ -12,7 +12,7 @@ use alloc::{
     vec::Vec,
 };
 use serde::{Deserialize, Serialize};
-use xolotl_types::{BudgetSpec, Capability, PathError, Value};
+use xolotl_types::{BudgetSpec, Capability, MethodAuthority, PathError, Value};
 
 /// Declaration for a named long-lived `Do<()>` body.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -75,10 +75,19 @@ impl ActorSpec {
     }
 
     /// Bind declaration-time process-local references to a concrete Process.
+    /// Each body/finalizer is admitted against the native compiler's node bound
+    /// before any source is cloned. Native tree cloning and path binding use
+    /// explicit work stacks; there is no independent control-flow depth bound.
+    /// Admission is per graph, not a combined actor memory limit. Errors leave
+    /// this declaration unchanged and release temporary cursors and copies.
     pub fn bind_process_local_refs(
         &self,
         process: xolotl_types::ProcessId,
     ) -> Result<Self, ActorBindError> {
+        crate::compile::preflight(&self.body, 0)?;
+        for finalizer in &self.finalizers {
+            crate::compile::preflight(finalizer, 0)?;
+        }
         let body = self.body.clone().bind_process_local_refs(process)?;
         let finalizers = self
             .finalizers
@@ -149,6 +158,9 @@ pub enum CapabilityQueryError {
 /// Error returned while binding process-local Actor references.
 #[derive(Debug, thiserror::Error)]
 pub enum ActorBindError {
+    /// A native body or finalizer exceeded the compiler's admission bounds.
+    #[error("actor program admission failed: {0}")]
+    Compile(#[from] crate::CompileError),
     /// A path containing a process-local placeholder could not be rebound.
     #[error("process-local path binding failed: {0}")]
     Path(#[from] PathError),
@@ -199,18 +211,33 @@ pub struct LintFinding {
 /// Each distinct undeclared `(target, method)` produces one finding. Declared
 /// capabilities that the program never uses are *not* flagged here —
 /// over-declaring only widens the ceiling, a separate (advisory) concern.
-pub fn lint(spec: &ActorSpec, program: &DoNode) -> Vec<LintFinding> {
+/// The resolver supplies each method's installed authority contract. Unknown
+/// methods produce errors; no authority is inferred from operation names.
+pub fn lint(
+    spec: &ActorSpec,
+    program: &DoNode,
+    mut resolve: impl FnMut(&crate::OperationTemplate) -> Option<MethodAuthority>,
+) -> Vec<LintFinding> {
     let (declared, mut findings) = parse_declared_capabilities(&spec.declared_capabilities);
-    lint_program(program, &declared, &mut findings, None);
+    lint_program(program, &declared, &mut findings, None, &mut resolve);
     findings
 }
 
 /// Lint an actor's declared body and finalizers against its capability ceiling.
-pub fn lint_actor(spec: &ActorSpec) -> Vec<LintFinding> {
+pub fn lint_actor(
+    spec: &ActorSpec,
+    mut resolve: impl FnMut(&crate::OperationTemplate) -> Option<MethodAuthority>,
+) -> Vec<LintFinding> {
     let (declared, mut findings) = parse_declared_capabilities(&spec.declared_capabilities);
-    lint_program(&spec.body, &declared, &mut findings, None);
+    lint_program(&spec.body, &declared, &mut findings, None, &mut resolve);
     for (index, finalizer) in spec.finalizers.iter().enumerate() {
-        lint_program(finalizer, &declared, &mut findings, Some(index));
+        lint_program(
+            finalizer,
+            &declared,
+            &mut findings,
+            Some(index),
+            &mut resolve,
+        );
     }
     findings
 }
@@ -238,17 +265,34 @@ fn lint_program(
     declared: &[Capability],
     findings: &mut Vec<LintFinding>,
     finalizer_index: Option<usize>,
+    resolve: &mut impl FnMut(&crate::OperationTemplate) -> Option<MethodAuthority>,
 ) {
     let mut seen = BTreeSet::new();
     for op in program.ops() {
         let target_path = op.target.path();
         let target = target_path.to_string();
-        let verb = operation_capability_verb(&op.method);
-        if declared.iter().any(|cap| cap.covers(verb, target_path)) {
-            continue;
-        }
         let key = (target.clone(), op.method.clone());
         if !seen.insert(key) {
+            continue;
+        }
+        let Some(authority) = resolve(op) else {
+            findings.push(LintFinding {
+                severity: LintSeverity::Error,
+                target,
+                verb: String::new(),
+                method: op.method.clone(),
+                message: format!(
+                    "method `{}` has no installed authority contract{}",
+                    op.method,
+                    finalizer_index
+                        .map(|index| format!(" in finalizer[{index}]"))
+                        .unwrap_or_default()
+                ),
+            });
+            continue;
+        };
+        let verb = authority.verb();
+        if declared.iter().any(|cap| cap.covers(verb, target_path)) {
             continue;
         }
         let base_message = format!(
@@ -280,16 +324,6 @@ pub fn capability_covers(literal: &str, verb: &str, target: &str) -> bool {
         return false;
     };
     cap.covers(verb, &path)
-}
-
-/// Capability verb required by an operation method name.
-pub fn operation_capability_verb(method: &str) -> &'static str {
-    match method {
-        "read" | "list" => "read",
-        "write" | "append" | "delete" => "write",
-        "subscribe" => "subscribe",
-        _ => "perform",
-    }
 }
 
 fn capability_target(target: &str) -> String {
@@ -329,7 +363,7 @@ mod tests {
             DoNode::op(op("effect://events/emit")?),
             DoNode::op(op("effect://fetch/get")?),
         );
-        let findings = lint(&spec, &program);
+        let findings = lint(&spec, &program, |_| Some(MethodAuthority::Perform));
         ensure!(findings.len() == 1, "unexpected findings: {findings:?}");
         let finding = findings.first().context("missing finding")?;
         ensure!(
@@ -360,7 +394,7 @@ mod tests {
             Box::new(DoNode::op(op("effect://fs/read")?)),
             Box::new(DoNode::op(op("effect://events/emit")?)),
         );
-        let findings = lint(&spec, &program);
+        let findings = lint(&spec, &program, |_| Some(MethodAuthority::Perform));
         ensure!(findings.is_empty(), "unexpected findings: {findings:?}");
         Ok(())
     }
@@ -397,7 +431,7 @@ mod tests {
             Box::new(DoNode::op(op("effect://x/post")?)),
             Box::new(DoNode::op(op("effect://x/post")?)),
         );
-        let findings = lint(&spec, &program);
+        let findings = lint(&spec, &program, |_| Some(MethodAuthority::Perform));
         ensure!(findings.len() == 1, "unexpected findings: {findings:?}");
         Ok(())
     }
@@ -405,7 +439,7 @@ mod tests {
     #[test]
     fn malformed_declared_capability_is_flagged() -> anyhow::Result<()> {
         let spec = ActorSpec::with_capabilities("a", ["effect://x/post"]);
-        let findings = lint(&spec, &DoNode::pure(Value::null()));
+        let findings = lint(&spec, &DoNode::pure(Value::null()), |_| None);
 
         ensure!(findings.len() == 1, "unexpected findings: {findings:?}");
         let finding = findings.first().context("missing finding")?;
@@ -441,7 +475,7 @@ mod tests {
         let program = DoNode::op(append);
 
         let read_spec = ActorSpec::with_capabilities("reader", ["read://state/events/**"]);
-        let findings = lint(&read_spec, &program);
+        let findings = lint(&read_spec, &program, |_| Some(MethodAuthority::Write));
         ensure!(findings.len() == 1, "unexpected findings: {findings:?}");
         let finding = findings.first().context("missing finding")?;
         ensure!(finding.verb == "write", "unexpected verb: {}", finding.verb);
@@ -454,7 +488,7 @@ mod tests {
         );
 
         let write_spec = ActorSpec::with_capabilities("writer", ["write://state/events/**"]);
-        let findings = lint(&write_spec, &program);
+        let findings = lint(&write_spec, &program, |_| Some(MethodAuthority::Write));
         ensure!(findings.is_empty(), "unexpected findings: {findings:?}");
         Ok(())
     }
@@ -463,8 +497,27 @@ mod tests {
     fn pure_program_with_no_ops_is_clean() -> anyhow::Result<()> {
         let spec = ActorSpec::default();
         let program = DoNode::pure(Value::integer(1)).and_then(s("noop"));
-        let findings = lint(&spec, &program);
+        let findings = lint(&spec, &program, |_| Some(MethodAuthority::Perform));
         ensure!(findings.is_empty(), "unexpected findings: {findings:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn lint_requires_resolved_contracts_for_custom_method_names() -> anyhow::Result<()> {
+        let spec = ActorSpec::with_capabilities("reader", ["read://state/data/**"]);
+        let mut custom = op("state://data/item")?;
+        custom.method = "load".into();
+        let program = DoNode::op(custom);
+        ensure!(lint(&spec, &program, |_| Some(MethodAuthority::Read)).is_empty());
+        let wrong_authority = lint(&spec, &program, |_| Some(MethodAuthority::Write));
+        ensure!(wrong_authority.len() == 1 && wrong_authority[0].verb == "write");
+        let unknown = lint(&spec, &program, |_| None);
+        ensure!(
+            unknown.len() == 1
+                && unknown[0]
+                    .message
+                    .contains("no installed authority contract")
+        );
         Ok(())
     }
 
@@ -489,7 +542,7 @@ mod tests {
         let mut append = op("state://events/topic")?;
         append.method = "append".into();
         spec.body = DoNode::op(append);
-        let findings = lint_actor(&spec);
+        let findings = lint_actor(&spec, |_| Some(MethodAuthority::Write));
         ensure!(findings.is_empty(), "unexpected findings: {findings:?}");
         Ok(())
     }
@@ -499,7 +552,7 @@ mod tests {
         let mut spec = ActorSpec::with_capabilities("writer", ["write://state/events/**"]);
         spec.finalizers
             .push(DoNode::op(op("effect://events/emit")?));
-        let findings = lint_actor(&spec);
+        let findings = lint_actor(&spec, |_| Some(MethodAuthority::Perform));
         ensure!(findings.len() == 1, "unexpected findings: {findings:?}");
         let finding = findings.first().context("missing finding")?;
         ensure!(
@@ -514,7 +567,7 @@ mod tests {
     fn malformed_declared_capability_is_reported_once_for_actor() -> anyhow::Result<()> {
         let mut spec = ActorSpec::with_capabilities("a", ["effect://x/post"]);
         spec.finalizers.push(DoNode::pure(Value::null()));
-        let findings = lint_actor(&spec);
+        let findings = lint_actor(&spec, |_| Some(MethodAuthority::Perform));
         ensure!(findings.len() == 1, "unexpected findings: {findings:?}");
         Ok(())
     }
@@ -550,6 +603,39 @@ mod tests {
             ),
             other => bail!("unexpected finalizer: {other:?}"),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn deep_actor_body_and_finalizer_bind_on_small_stack() -> anyhow::Result<()> {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(|| {
+                let mut body = DoNode::op(op("state://process/self/scratch")?);
+                let mut finalizer = DoNode::wait_signal(Path::parse("state://process/self/stop")?);
+                for _ in 0..10_000 {
+                    body = body.and_then(StepRef::new("next"));
+                    finalizer = finalizer.or_else(StepRef::new("recover"));
+                }
+                let mut spec =
+                    ActorSpec::with_capabilities("deep", ["read://state/process/self/**"]);
+                spec.body = body;
+                spec.finalizers.push(finalizer);
+                let bound = spec.bind_process_local_refs(ProcessId::new(77))?;
+                ensure!(bound.body.size() == 10_001);
+                ensure!(bound.finalizers[0].size() == 10_001);
+                ensure!(
+                    bound.body.ops()[0].target.path().to_string() == "state://process/77/scratch"
+                );
+                ensure!(
+                    spec.body.ops()[0].target.path().to_string() == "state://process/self/scratch"
+                );
+                crate::compile_do(&bound.body)?;
+                crate::compile_do(&bound.finalizers[0])?;
+                Ok::<_, anyhow::Error>(())
+            })?
+            .join()
+            .map_err(|_panic| anyhow::anyhow!("small-stack actor binding panicked"))??;
         Ok(())
     }
 

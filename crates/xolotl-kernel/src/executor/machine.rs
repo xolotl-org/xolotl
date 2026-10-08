@@ -8,31 +8,208 @@ use futures_util::{
     stream::FuturesUnordered,
 };
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use xolotl_core::Values;
 use xolotl_core::{Advance, Execution, HostEvent};
 use xolotl_state::TaintedValue;
-use xolotl_types::{Failure, TaintedFailure};
+use xolotl_types::{Failure, ReplayClass, TaintedFailure, UnresolvedOperations};
 
 use crate::RuntimeValues as HostValues;
+use crate::runtime::Cooperate;
+
+pub(super) fn initialize_machine<'a>(
+    program: &MachineProgram,
+    buffers: &'a mut ExecutionBuffers,
+    limits: xolotl_core::ExecutionLimits,
+    input: TaintedValue,
+    acting: xolotl_types::IdentityRef,
+) -> Result<Execution<'a, TaintedValue, TaintedFailure>, Failure> {
+    Execution::new(
+        &program.image(),
+        &mut buffers.tasks,
+        &mut buffers.frames,
+        &mut buffers.bindings,
+        limits,
+        input,
+        acting.get(),
+    )
+    .map_err(|error| machine_error(format!("admission: {error:?}")))
+}
+
+// Commit failures stop the driver loop without acknowledging its pending ticket.
+// They are not program failures that Catch/Retry may turn into another effect.
+type MachineRequestCompletion =
+    Result<HostEvent<TaintedValue, TaintedFailure>, Box<MachineRequestError>>;
+
+struct MachineRequestError {
+    failure: TaintedFailure,
+    unresolved_operation: Option<OperationId>,
+}
+
+struct MachineRequestCall {
+    import: Import,
+    request: xolotl_core::Request<TaintedValue>,
+    execution: ExecutionId,
+    deadline: Option<HostDeadline>,
+    effectful: bool,
+    dispatch_witness: Option<Arc<AtomicBool>>,
+}
 
 type Pending<'a> = std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = (usize, u64, HostEvent<TaintedValue, TaintedFailure>)>
-            + Send
-            + 'a,
-    >,
+    Box<dyn std::future::Future<Output = (usize, u64, bool, MachineRequestCompletion)> + Send + 'a>,
 >;
 
+/// The host can inspect pending futures at expiry without sharing a counter or
+/// cloning an identifier on every successful call. A dispatch witness separates
+/// pending authorization from a started effect; ungated calls use host polling.
+struct PendingHostRequest<'a> {
+    future: Pending<'a>,
+    operation_id: Option<OperationId>,
+    effectful: bool,
+    polled_pending: bool,
+    dispatch_witness: Option<Arc<AtomicBool>>,
+}
+
+struct InterruptionContext<'a, 'host> {
+    pending: &'a FuturesUnordered<PendingHostRequest<'host>>,
+    unresolved: &'a UnresolvedOperations,
+}
+
+impl PendingHostRequest<'_> {
+    fn may_have_started(&self) -> bool {
+        self.effectful
+            && self
+                .dispatch_witness
+                .as_ref()
+                .map_or(self.polled_pending, |witness| {
+                    witness.load(Ordering::Relaxed)
+                })
+    }
+
+    fn in_flight_operation(&self) -> Option<OperationId> {
+        self.may_have_started()
+            .then_some(self.operation_id)
+            .flatten()
+    }
+}
+
+impl Future for PendingHostRequest<'_> {
+    type Output = (
+        usize,
+        u64,
+        Option<OperationId>,
+        bool,
+        MachineRequestCompletion,
+    );
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.future.as_mut().poll(cx) {
+            std::task::Poll::Pending => {
+                self.polled_pending = true;
+                std::task::Poll::Pending
+            }
+            std::task::Poll::Ready((task, ticket, aborted, event)) => std::task::Poll::Ready((
+                task,
+                ticket,
+                self.operation_id,
+                aborted && self.may_have_started(),
+                event,
+            )),
+        }
+    }
+}
+
+fn capture_operation_completion(
+    operation_id: Option<OperationId>,
+    aborted_after_poll: bool,
+    event: &HostEvent<TaintedValue, TaintedFailure>,
+    unresolved: &mut UnresolvedOperations,
+) {
+    let Some(operation_id) = operation_id else {
+        return;
+    };
+    if aborted_after_poll {
+        unresolved.record(&operation_id.to_string());
+    }
+    if let HostEvent::Complete(Err(error)) = event {
+        capture_unknown_failure(&error.failure, unresolved);
+    }
+}
+
+fn capture_unknown_failure(failure: &Failure, unresolved: &mut UnresolvedOperations) {
+    if let Failure::OutcomeUnknown { operation_ids, .. } = failure {
+        for id in operation_ids {
+            unresolved.record(id);
+        }
+    }
+}
+
+fn may_have_external_effect(replay: ReplayClass) -> bool {
+    matches!(
+        replay,
+        ReplayClass::IdempotentEffect | ReplayClass::NonIdempotentEffect
+    )
+}
+
 impl Executor {
-    fn complete_machine(
+    fn import_may_have_external_effect(&self, import: &Import) -> bool {
+        let Import::Operation { operation, .. } = import else {
+            return false;
+        };
+        // Normal imports use the same frozen metadata cache as dispatch. If
+        // resolution fails, keep the conservative effectful classification.
+        match self.resolve_meta(&operation.target, &operation.method) {
+            Ok(Some(meta)) => may_have_external_effect(meta.method.replay),
+            _ => true,
+        }
+    }
+
+    fn request_operation_id(
+        &self,
+        program: &MachineProgram,
+        execution: ExecutionId,
+        request: &xolotl_core::Request<TaintedValue>,
+    ) -> Option<OperationId> {
+        matches!(
+            program.imports.get(request.import as usize),
+            Some(Import::Operation { .. })
+        )
+        .then(|| {
+            self.request_id(execution, request.ticket, request.position)
+                .ok()
+        })
+        .flatten()
+    }
+
+    fn interruption_failure(
+        &self,
+        context: InterruptionContext<'_, '_>,
+        reason: &'static str,
+        otherwise: Failure,
+    ) -> Failure {
+        let mut operation_ids = Vec::new();
+        operation_ids.extend(
+            context
+                .pending
+                .iter()
+                .filter_map(PendingHostRequest::in_flight_operation),
+        );
+        interruption_failure(operation_ids, context.unresolved, reason, otherwise)
+    }
+
+    async fn complete_machine(
         &self,
         execution: &mut Execution<'_, TaintedValue, TaintedFailure>,
         program: &mut Cow<'_, MachineProgram>,
         task: usize,
         ticket: u64,
         event: HostEvent<TaintedValue, TaintedFailure>,
-        #[cfg(feature = "durable")] journal: &mut Option<&mut super::durable::JournalRun>,
     ) -> Result<(), TaintedFailure> {
         let continuation = match &event {
             HostEvent::Continue { entry, .. } => Some(*entry),
@@ -63,15 +240,6 @@ impl Executor {
                 execution.retain_control(&mut HostValues).taint,
             )
         })?;
-        #[cfg(feature = "durable")]
-        if let Some(journal) = journal {
-            journal.pending.remove(&ticket);
-            journal
-                .commit(self, program, execution, false)
-                .map_err(|error| {
-                    TaintedFailure::new(error, execution.retain_control(&mut HostValues).taint)
-                })?;
-        }
         Ok(())
     }
 
@@ -101,8 +269,6 @@ impl Executor {
             input,
             &mut ExecutionBuffers::default(),
             None,
-            #[cfg(feature = "durable")]
-            None,
         )
         .await
     }
@@ -114,15 +280,8 @@ impl Executor {
         input: TaintedValue,
         buffers: &mut ExecutionBuffers,
     ) -> ExecutionOutput {
-        self.run_machine_with_buffers(
-            Cow::Borrowed(&program.inner),
-            input,
-            buffers,
-            None,
-            #[cfg(feature = "durable")]
-            None,
-        )
-        .await
+        self.run_machine_with_buffers(Cow::Borrowed(&program.inner), input, buffers, None)
+            .await
     }
 
     pub(super) async fn run_machine(
@@ -130,15 +289,8 @@ impl Executor {
         program: Cow<'_, MachineProgram>,
         input: TaintedValue,
     ) -> ExecutionOutput {
-        self.run_machine_with_buffers(
-            program,
-            input,
-            &mut ExecutionBuffers::default(),
-            None,
-            #[cfg(feature = "durable")]
-            None,
-        )
-        .await
+        self.run_machine_with_buffers(program, input, &mut ExecutionBuffers::default(), None)
+            .await
     }
 
     pub(super) async fn run_machine_with_buffers(
@@ -147,17 +299,11 @@ impl Executor {
         input: TaintedValue,
         buffers: &mut ExecutionBuffers,
         reserved_execution: Option<ExecutionId>,
-        #[cfg(feature = "durable")] supplied_journal: Option<&mut super::durable::JournalRun>,
     ) -> ExecutionOutput {
         let entry_taint = input.taint.clone();
         let failed = |error| Self::failed(error, entry_taint.clone());
-        #[cfg(feature = "durable")]
-        let restoring = supplied_journal
-            .as_ref()
-            .is_some_and(|journal| journal.restored.is_some());
-        #[cfg(not(feature = "durable"))]
-        let restoring = false;
-        if self.deadline_elapsed() && !restoring {
+        let mut standalone_unresolved = UnresolvedOperations::default();
+        if self.deadline_elapsed() {
             return failed(Failure::Timeout);
         }
         let Some(acting) = self.default_acting() else {
@@ -166,152 +312,80 @@ impl Executor {
                 self.process.get()
             )));
         };
+        if let Err(error) = self.identities.verify(acting) {
+            return failed(machine_error(format!("execution identity: {error}")));
+        }
         if let Err(error) = self.execution_config.check_program(&program) {
             return failed(error);
         }
-        #[cfg(feature = "durable")]
-        let mut opened_journal = if supplied_journal.is_none() {
-            match super::durable::JournalRun::open(self, &program) {
-                Ok(journal) => journal,
-                Err(error) => return failed(error),
-            }
-        } else {
-            None
-        };
-        #[cfg(feature = "durable")]
-        let mut journal = supplied_journal.or(opened_journal.as_mut());
-        // A resumed execution owns the linked image saved with its continuation.
-        // The caller's preparation identifies the root program, not its current arena.
-        #[cfg(feature = "durable")]
-        let (restored, restored_finished) =
-            match journal.as_mut().and_then(|journal| journal.restored.take()) {
-                Some(saved) => {
-                    program = Cow::Owned(Arc::unwrap_or_clone(saved.program.inner));
-                    (Some(saved.machine), saved.finished)
-                }
-                None => {
-                    if journal.is_some()
-                        && program
-                            .imports
-                            .iter()
-                            .any(|import| matches!(import, Import::Step(_, None)))
-                        && let Err(error) = self.bind_durable_imports(program.to_mut())
-                    {
-                        return failed(error);
-                    }
-                    (None, false)
-                }
+        macro_rules! run_output {
+            ($output:expr) => {
+                ($output).with_unresolved_operations(standalone_unresolved)
             };
-        #[cfg(feature = "durable")]
-        let retained_execution = journal.as_ref().map(|journal| journal.execution);
-        #[cfg(not(feature = "durable"))]
-        let retained_execution = None;
-        let execution_id = match retained_execution
-            .or(reserved_execution)
-            .map_or_else(|| self.allocate_execution(), Ok)
-        {
+        }
+        let effective_deadline = self.deadline;
+        let deadline_elapsed = || {
+            effective_deadline.is_some_and(|deadline| {
+                deadline.elapsed_at(self.host_runtime.now()).unwrap_or(true)
+            })
+        };
+        let execution_id = match reserved_execution {
+            Some(execution) => Ok(execution),
+            None => self.allocate_execution_async().await,
+        };
+        let execution_id = match execution_id {
             Ok(id) => id,
-            Err(error) => return failed(error),
+            Err(error) => return run_output!(failed(error)),
         };
-        #[cfg(feature = "durable")]
-        let checkpoint = restored
-            .as_ref()
-            .map(super::durable::MachineSnapshot::checkpoint);
-        #[cfg(not(feature = "durable"))]
-        let checkpoint: Option<xolotl_core::Checkpoint<'_, TaintedValue, TaintedFailure>> = None;
-        let layout = match &checkpoint {
-            Some(checkpoint) => self.execution_config.restored_layout(&program, checkpoint),
-            None => self.execution_config.layout(&program),
-        };
+        let layout = self.execution_config.layout(&program);
         let mut layout = match layout {
             Ok(layout) => layout,
-            Err(error) => return failed(error),
+            Err(error) => return run_output!(failed(error)),
         };
         let limits = layout.limits(&self.execution_config);
-        #[cfg(feature = "durable")]
-        let limits = xolotl_core::ExecutionLimits {
-            durable: journal.is_some(),
-            ..limits
-        };
         let storage = match buffers.acquire(layout, self.execution_config.max_storage_bytes) {
             Ok(storage) => storage,
-            Err(error) => return failed(error),
+            Err(error) => return run_output!(failed(error)),
         };
-        let initialization = match checkpoint {
-            Some(checkpoint) => Execution::restore(
-                &program.image(),
-                &checkpoint,
-                &mut storage.buffers.tasks,
-                &mut storage.buffers.frames,
-                &mut storage.buffers.bindings,
-                limits.durable,
-            ),
-            None => Execution::new(
-                &program.image(),
-                &mut storage.buffers.tasks,
-                &mut storage.buffers.frames,
-                &mut storage.buffers.bindings,
-                limits,
-                input,
-                acting.get(),
-            ),
-        };
+        let initialization = initialize_machine(&program, storage.buffers, limits, input, acting);
         let mut execution = match initialization {
             Ok(execution) => execution,
-            Err(error) => return failed(machine_error(format!("admission: {error:?}"))),
+            Err(error) => return run_output!(failed(error)),
         };
-        let mut resumed: std::collections::VecDeque<_> =
-            execution.pending_requests(&program.image()).collect();
-        #[cfg(feature = "durable")]
-        if let Some(journal) = &mut journal {
-            if restored.is_some() {
-                if resumed.len() != journal.pending.len()
-                    || resumed
-                        .iter()
-                        .any(|request| !journal.pending.contains_key(&request.ticket))
-                {
-                    return self.execution_failure(
-                        &execution,
-                        machine_error("checkpoint pending requests mismatch"),
-                    );
-                }
-                for request in &resumed {
-                    if journal.pending.get(&request.ticket)
-                        == Some(&ReplayClass::NonIdempotentEffect)
-                    {
-                        let id =
-                            match self.request_id(execution_id, request.ticket, request.position) {
-                                Ok(id) => id,
-                                Err(error) => return self.execution_failure(&execution, error),
-                            };
-                        return self.execution_failure(
-                            &execution,
-                            Failure::Quarantined {
-                                op_id: id.to_string(),
-                                reason:
-                                    "non-idempotent request has no committed completion checkpoint"
-                                        .into(),
-                            },
-                        );
-                    }
-                }
-            }
-            if let Err(error) = journal.commit(self, &program, &execution, restored_finished) {
-                return self.execution_failure(&execution, error);
-            }
+        if deadline_elapsed() {
+            return run_output!(self.execution_failure(&execution, Failure::Timeout));
         }
-        #[cfg(feature = "durable")]
-        drop(restored);
         let mut values = HostValues;
-        let mut pending: FuturesUnordered<Pending<'_>> = FuturesUnordered::new();
+        let mut pending: FuturesUnordered<PendingHostRequest<'_>> = FuturesUnordered::new();
         let mut aborts = HashMap::new();
         let mut cancelling = false;
         let mut turns = 0;
-        let deadline = self.deadline.map(tokio::time::sleep_until);
+        let deadline = effective_deadline.map(|deadline| self.host_runtime.sleep_until(deadline));
         tokio::pin!(deadline);
+        if deadline_elapsed() {
+            let unresolved = &mut standalone_unresolved;
+            let failure = self.interruption_failure(
+                InterruptionContext {
+                    pending: &pending,
+                    unresolved,
+                },
+                "deadline_exceeded",
+                Failure::Timeout,
+            );
+            return self.interruption_output(&execution, failure, unresolved);
+        }
         loop {
-            if self.deadline_elapsed() {
-                return self.execution_failure(&execution, Failure::Timeout);
+            if deadline_elapsed() {
+                let unresolved = &mut standalone_unresolved;
+                let failure = self.interruption_failure(
+                    InterruptionContext {
+                        pending: &pending,
+                        unresolved,
+                    },
+                    "deadline_exceeded",
+                    Failure::Timeout,
+                );
+                return self.interruption_output(&execution, failure, unresolved);
             }
             if !cancelling && self.is_cancelled() {
                 execution.cancel();
@@ -321,47 +395,36 @@ impl Executor {
                 Advance::Yielded
             } else {
                 turns += 1;
-                resumed
-                    .pop_front()
-                    .map(|request| {
-                        if cancelling && !request.cleanup {
-                            Advance::Cancel {
-                                task: request.task,
-                                ticket: request.ticket,
-                            }
-                        } else {
-                            Advance::Request(request)
-                        }
-                    })
-                    .unwrap_or_else(|| {
-                        execution.advance(
-                            &program.image(),
-                            &mut values,
-                            self.execution_config.quantum,
-                        )
-                    })
+                execution.advance(&program.image(), &mut values, self.execution_config.quantum)
             };
-            if self.deadline_elapsed() {
-                return self.execution_failure(&execution, Failure::Timeout);
+            if deadline_elapsed() {
+                let unresolved = &mut standalone_unresolved;
+                let failure = self.interruption_failure(
+                    InterruptionContext {
+                        pending: &pending,
+                        unresolved,
+                    },
+                    "deadline_exceeded",
+                    Failure::Timeout,
+                );
+                return self.interruption_output(&execution, failure, unresolved);
             }
             if let Cow::Owned(program) = &mut program
                 && let Err(error) = program.reclaim(&mut execution)
             {
-                return self.execution_failure(&execution, error);
+                return run_output!(self.execution_failure(&execution, error));
             }
             let completion = match action {
                 Advance::Done(result) => {
-                    #[cfg(feature = "durable")]
-                    if let Some(journal) = &mut journal
-                        && let Err(error) = journal.commit(self, &program, &execution, true)
+                    let unresolved = &mut standalone_unresolved;
+                    for operation in pending
+                        .iter()
+                        .filter_map(PendingHostRequest::in_flight_operation)
                     {
-                        let taint = match result {
-                            Ok(value) => value.taint,
-                            Err(error) => error.taint,
-                        };
-                        return Self::failed(error, taint);
+                        unresolved.record(&operation.to_string());
                     }
-                    return ExecutionOutput::from_result(result);
+                    return ExecutionOutput::from_result(result)
+                        .with_unresolved_operations(standalone_unresolved);
                 }
                 Advance::Cancel { task, ticket } => {
                     if let Some(abort) = aborts.get(&(task, ticket)) {
@@ -371,13 +434,17 @@ impl Executor {
                         Some((
                             task,
                             ticket,
-                            HostEvent::Complete(Err(Failure::Cancelled.into())),
+                            None,
+                            false,
+                            Ok(HostEvent::Complete(Err(Failure::Cancelled.into()))),
                         ))
                     }
                 }
                 Advance::Request(request) => {
                     let Some(import) = program.imports.get(request.import as usize).cloned() else {
-                        return self.execution_failure(&execution, machine_error("missing import"));
+                        return run_output!(
+                            self.execution_failure(&execution, machine_error("missing import"))
+                        );
                     };
                     if let Import::Transform(transform) = &import {
                         let result = match transform.apply(request.input.value) {
@@ -391,41 +458,12 @@ impl Executor {
                             &program.image(),
                             &mut values,
                         ) {
-                            return self.execution_failure(
+                            return run_output!(self.execution_failure(
                                 &execution,
                                 machine_error(format!("transform: {error:?}")),
-                            );
+                            ));
                         }
                         continue;
-                    }
-                    #[cfg(feature = "durable")]
-                    if let Some(journal) = &mut journal {
-                        let class = self.checkpoint_replay_class(&import);
-                        if journal
-                            .pending
-                            .get(&request.ticket)
-                            .is_some_and(|saved| *saved != class)
-                        {
-                            let id = match self.request_id(
-                                execution_id,
-                                request.ticket,
-                                request.position,
-                            ) {
-                                Ok(id) => id,
-                                Err(error) => return self.execution_failure(&execution, error),
-                            };
-                            return self.execution_failure(
-                                &execution,
-                                Failure::Quarantined {
-                                    op_id: id.to_string(),
-                                    reason: "pending request replay contract changed".into(),
-                                },
-                            );
-                        }
-                        journal.pending.insert(request.ticket, class);
-                        if let Err(error) = journal.commit(self, &program, &execution, false) {
-                            return self.execution_failure(&execution, error);
-                        }
                     }
                     if let Import::Step(step, revision) = import {
                         let result = self.expand_step(
@@ -471,16 +509,15 @@ impl Executor {
                                     &mut storage.buffers.tasks,
                                     &mut storage.buffers.frames,
                                     &mut storage.buffers.bindings,
-                                    limits.durable,
                                 ) {
                                     Ok(execution) => execution,
                                     Err(error) => {
-                                        return Self::failed(
+                                        return run_output!(Self::failed(
                                             machine_error(format!(
                                                 "resuming execution storage: {error:?}"
                                             )),
                                             request.input.taint,
-                                        );
+                                        ));
                                     }
                                 };
                                 growth.map(|()| (entry, input))
@@ -498,48 +535,83 @@ impl Executor {
                                 request.input.taint,
                             ))),
                         };
-                        if let Err(error) = self.complete_machine(
-                            &mut execution,
-                            &mut program,
-                            request.task,
-                            request.ticket,
-                            event,
-                            #[cfg(feature = "durable")]
-                            &mut journal,
-                        ) {
-                            return Self::failed(error.failure, error.taint);
+                        if let Err(error) = self
+                            .complete_machine(
+                                &mut execution,
+                                &mut program,
+                                request.task,
+                                request.ticket,
+                                event,
+                            )
+                            .await
+                        {
+                            return run_output!(Self::failed(error.failure, error.taint));
                         }
                         continue;
                     }
                     let (abort, registration) = AbortHandle::new_pair();
                     aborts.insert((request.task, request.ticket), abort);
-                    pending.push(Box::pin(async move {
-                        let task = request.task;
-                        let ticket = request.ticket;
-                        let event = Abortable::new(
-                            self.machine_request(import, request, execution_id),
-                            registration,
-                        )
-                        .await
-                        .unwrap_or(HostEvent::Complete(Err(Failure::Cancelled.into())));
-                        (task, ticket, event)
-                    }));
+                    let operation_id = self.request_operation_id(&program, execution_id, &request);
+                    let effectful = self.import_may_have_external_effect(&import);
+                    let dispatch_witness = (effectful && self.data_plane.has_request_authorizer())
+                        .then(|| Arc::new(AtomicBool::new(false)));
+                    pending.push(PendingHostRequest {
+                        operation_id,
+                        effectful,
+                        polled_pending: false,
+                        dispatch_witness: dispatch_witness.clone(),
+                        future: Box::pin(async move {
+                            let task = request.task;
+                            let ticket = request.ticket;
+                            let (aborted, event) = match Abortable::new(
+                                self.machine_request(MachineRequestCall {
+                                    import,
+                                    request,
+                                    execution: execution_id,
+                                    deadline: effective_deadline,
+                                    effectful,
+                                    dispatch_witness,
+                                }),
+                                registration,
+                            )
+                            .await
+                            {
+                                Ok(event) => (false, event),
+                                Err(_) => (
+                                    true,
+                                    Ok(HostEvent::Complete(Err(Failure::Cancelled.into()))),
+                                ),
+                            };
+                            (task, ticket, aborted, event)
+                        }),
+                    });
                     None
                 }
                 Advance::Yielded => {
                     turns = 0;
-                    tokio::task::yield_now().await;
+                    crate::runtime::Cooperative.cooperate().await;
                     pending.next().now_or_never().flatten()
                 }
                 Advance::Waiting => {
                     let event = tokio::select! {
                         biased;
-                        () = async {
+                        deadline_result = async {
                             if let Some(deadline) = deadline.as_mut().as_pin_mut() {
-                                deadline.await;
+                                deadline.await
+                            } else {
+                                Ok(())
                             }
-                        }, if self.deadline.is_some() => {
-                            return self.execution_failure(&execution, Failure::Timeout);
+                        }, if effective_deadline.is_some() => {
+                            let unresolved = &mut standalone_unresolved;
+                            let failure = self.interruption_failure(
+                                InterruptionContext {
+                                    pending: &pending,
+                                    unresolved,
+                                },
+                                "deadline_exceeded",
+                                deadline_result.err().map_or(Failure::Timeout, Into::into),
+                            );
+                            return self.interruption_output(&execution, failure, unresolved);
                         }
                         event = pending.next() => event,
                         () = async {
@@ -553,28 +625,45 @@ impl Executor {
                         }
                     };
                     let Some(event) = event else {
-                        return self.execution_failure(
+                        return run_output!(self.execution_failure(
                             &execution,
                             machine_error("execution blocked without a host request"),
-                        );
+                        ));
                     };
                     Some(event)
                 }
             };
-            if let Some((task, ticket, event)) = completion {
+            if let Some((task, ticket, operation_id, aborted_after_poll, event)) = completion {
                 aborts.remove(&(task, ticket));
-                if execution.is_pending(task, ticket)
-                    && let Err(error) = self.complete_machine(
-                        &mut execution,
-                        &mut program,
-                        task,
-                        ticket,
-                        event,
-                        #[cfg(feature = "durable")]
-                        &mut journal,
-                    )
-                {
-                    return Self::failed(error.failure, error.taint);
+                let event = match event {
+                    Ok(event) => event,
+                    Err(mut error) => {
+                        if let Some(id) = error.unresolved_operation {
+                            standalone_unresolved.record(&id.to_string());
+                        }
+                        error
+                            .failure
+                            .taint
+                            .union(&execution.retain_control(&mut HostValues).taint);
+                        return run_output!(Self::failed(
+                            error.failure.failure,
+                            error.failure.taint
+                        ));
+                    }
+                };
+                if execution.is_pending(task, ticket) {
+                    capture_operation_completion(
+                        operation_id,
+                        aborted_after_poll,
+                        &event,
+                        &mut standalone_unresolved,
+                    );
+                    if let Err(error) = self
+                        .complete_machine(&mut execution, &mut program, task, ticket, event)
+                        .await
+                    {
+                        return run_output!(Self::failed(error.failure, error.taint));
+                    }
                 }
             }
         }
@@ -594,9 +683,9 @@ impl Executor {
             .ok_or_else(|| machine_error(format!("step {:?} not found", step.name)))?;
         std::panic::catch_unwind(AssertUnwindSafe(|| match continuation {
             crate::step::Continuation::Native(function) => {
-                if program.durable || revision.is_some() {
+                if revision.is_some() {
                     return Err(machine_error(
-                        "durable loader cannot be a native continuation",
+                        "revision-bound loader cannot be a native continuation",
                     ));
                 }
                 let body = function(input, step.arg)
@@ -619,14 +708,6 @@ impl Executor {
                     )));
                 }
                 let loaded = loader(&input, step.arg.as_ref())?;
-                #[cfg(feature = "durable")]
-                let loaded = if program.durable {
-                    let mut loaded = loaded;
-                    self.bind_durable_imports(Arc::make_mut(&mut loaded.inner))?;
-                    loaded
-                } else {
-                    loaded
-                };
                 program
                     .load(loaded, self.execution_config.max_instructions, max_bindings)
                     .map(|entry| (entry, input))
@@ -655,21 +736,45 @@ impl Executor {
         ))
     }
 
-    async fn machine_request(
-        &self,
-        import: Import,
-        request: xolotl_core::Request<TaintedValue>,
-        execution: ExecutionId,
-    ) -> HostEvent<TaintedValue, TaintedFailure> {
+    async fn machine_request(&self, call: MachineRequestCall) -> MachineRequestCompletion {
+        let MachineRequestCall {
+            import,
+            request,
+            execution,
+            deadline,
+            effectful,
+            dispatch_witness,
+        } = call;
+        let expired = match deadline {
+            Some(deadline) => match deadline.elapsed_at(self.host_runtime.now()) {
+                Ok(expired) => expired,
+                Err(error) => {
+                    return Ok(HostEvent::Complete(Err(TaintedFailure::new(
+                        error.into(),
+                        request.input.taint,
+                    ))));
+                }
+            },
+            None => false,
+        };
+        if expired {
+            return Ok(HostEvent::Complete(Err(TaintedFailure::new(
+                Failure::Timeout,
+                request.input.taint,
+            ))));
+        }
         let id = self.request_id(execution, request.ticket, request.position);
         let input = request.input;
         let context = request.context;
         let output = match import {
-            Import::Operation(operation, record) => {
+            Import::Operation { operation } => {
                 let id = match id {
                     Ok(id) => id,
                     Err(error) => {
-                        return HostEvent::Complete(Err(TaintedFailure::new(error, input.taint)));
+                        return Ok(HostEvent::Complete(Err(TaintedFailure::new(
+                            error,
+                            input.taint,
+                        ))));
                     }
                 };
                 let env = Env::root(IdentityRef::new(context)).with_taint(input.taint);
@@ -678,15 +783,36 @@ impl Executor {
                     input.value,
                     &env,
                     id,
-                    self.finalizer_mode || record,
+                    self.record_facts,
+                    dispatch_witness.as_deref(),
                 );
-                if request.cleanup
+                let result = if request.cleanup
                     && let Some(processes) = &self.processes
                 {
                     crate::process::scope_cleanup(processes, self.process, call).await
                 } else {
                     call.await
+                };
+                if let Some(error) = result.completion_error {
+                    match error {
+                        crate::invocation::CompletionError::Fact(error) => {
+                            tracing::warn!(operation = %id, %error, "selected invocation observation failed");
+                        }
+                        crate::invocation::CompletionError::Dispatch(_)
+                            if !result.effect_may_have_started => {}
+                        error => {
+                            return Err(Box::new(MachineRequestError {
+                                failure: TaintedFailure::new(
+                                    error.outcome_unknown(id),
+                                    result.output.taint,
+                                ),
+                                unresolved_operation: (effectful && result.effect_may_have_started)
+                                    .then_some(id),
+                            }));
+                        }
+                    }
                 }
+                result.output
             }
             Import::Wait(wait) => {
                 let mut output = self.run_wait(&wait).await;
@@ -694,33 +820,71 @@ impl Executor {
                 output
             }
             Import::Scope(identity) => {
-                return if self.authorize_act_as(&identity) {
-                    HostEvent::Enter(intern_identity(&identity).get())
+                return Ok(if self.authorize_act_as(&identity, &input.value) {
+                    match self.identities.resolve_or_register(&identity) {
+                        Ok(acting) => HostEvent::Enter(acting.get()),
+                        Err(error) => HostEvent::Complete(Err(TaintedFailure::new(
+                            Failure::policy("identity", error.to_string()),
+                            input.taint,
+                        ))),
+                    }
                 } else {
                     HostEvent::Complete(Err(TaintedFailure::new(
                         Failure::policy("act-as", "identity delegation denied"),
                         input.taint,
                     )))
-                };
-            }
-            Import::Step(..) | Import::Vacant => {
-                return HostEvent::Complete(Err(TaintedFailure::new(
-                    machine_error("continuation was not linked"),
-                    input.taint,
-                )));
-            }
-            Import::Transform(operation) => {
-                return HostEvent::Complete(match operation.apply(input.value) {
-                    Ok(value) => Ok(TaintedValue::new(value, input.taint)),
-                    Err(error) => Err(TaintedFailure::new(error, input.taint)),
                 });
             }
+            Import::Step(..) | Import::Vacant => {
+                return Ok(HostEvent::Complete(Err(TaintedFailure::new(
+                    machine_error("continuation was not linked"),
+                    input.taint,
+                ))));
+            }
+            Import::Transform(operation) => {
+                return Ok(HostEvent::Complete(match operation.apply(input.value) {
+                    Ok(value) => Ok(TaintedValue::new(value, input.taint)),
+                    Err(error) => Err(TaintedFailure::new(error, input.taint)),
+                }));
+            }
         };
-        HostEvent::Complete(output.into_result())
+        Ok(HostEvent::Complete(output.into_result()))
+    }
+}
+
+fn interruption_failure(
+    operation_ids: impl IntoIterator<Item = OperationId>,
+    unresolved: &UnresolvedOperations,
+    reason: &'static str,
+    otherwise: Failure,
+) -> Failure {
+    let mut operation_ids: Vec<String> =
+        operation_ids.into_iter().map(|id| id.to_string()).collect();
+    operation_ids.extend(unresolved.operation_ids.iter().cloned());
+    operation_ids.sort_unstable();
+    operation_ids.dedup();
+    if operation_ids.is_empty() && !unresolved.identities_incomplete {
+        otherwise
+    } else {
+        Failure::OutcomeUnknown {
+            operation_ids,
+            reason: reason.into(),
+        }
     }
 }
 
 impl Executor {
+    fn interruption_output(
+        &self,
+        execution: &Execution<'_, TaintedValue, TaintedFailure>,
+        failure: Failure,
+        unresolved: &mut UnresolvedOperations,
+    ) -> ExecutionOutput {
+        capture_unknown_failure(&failure, unresolved);
+        self.execution_failure(execution, failure)
+            .with_unresolved_operations(std::mem::take(unresolved))
+    }
+
     fn execution_failure(
         &self,
         execution: &Execution<'_, TaintedValue, TaintedFailure>,
@@ -744,13 +908,16 @@ mod tests {
         let boot = Bootstrap::in_memory();
         let target = boot.register_effect(
             "effect://arbitrary/recovery",
-            &[
-                MethodSpec::unary_async("invoke", xolotl_types::Purity::Effectful)
-                    .unprotected_input(),
-            ],
+            &[MethodSpec::new(
+                "invoke",
+                xolotl_types::MethodAuthority::Perform,
+                xolotl_types::Purity::Effectful,
+                MethodSpec::UNARY_ASYNC,
+            )
+            .unprotected_input()],
             Arc::new(crate::EchoDriver),
         )?;
-        let executor = boot.kernel.executor_for(boot.root);
+        let executor = boot.kernel().executor_for(boot.root());
         let program = PreparedProgram::new(
             &Program::new(E::Catch {
                 body: Box::new(
@@ -826,28 +993,49 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_releases_requests_and_budget_before_cleanup() -> anyhow::Result<()> {
-        let boot = Bootstrap::in_memory();
+        for allowed in [true, false] {
+            cancellation_cleanup(Bootstrap::in_memory(), allowed).await?;
+        }
+        Ok(())
+    }
+
+    async fn cancellation_cleanup(boot: Bootstrap, allowed: bool) -> anyhow::Result<()> {
         let driver = Arc::new(CleanupDriver {
             started: tokio::sync::Notify::new(),
             released: AtomicBool::new(false),
             cleaned: AtomicUsize::new(0),
         });
+        let mut method = MethodSpec::new(
+            "invoke",
+            xolotl_types::MethodAuthority::Perform,
+            Purity::Pure,
+            MethodSpec::UNARY_ASYNC,
+        );
+        if allowed {
+            method = method.finalize_allowed();
+        }
         let name = boot.register_effect_with_cost(
             "effect://cleanup/run",
-            &[MethodSpec::new("invoke", Purity::Pure, MethodSpec::UNARY_ASYNC).finalize_allowed()],
+            &[method],
             driver.clone(),
             CostModel {
                 flat_micro_usd: 100,
                 ..Default::default()
             },
         )?;
-        ensure!(boot.kernel.processes.set_budget_spec(
-            boot.root,
-            BudgetSpec {
-                max_inflight_ops: Some(1),
-                ..Default::default()
-            }
-        ));
+        let process = boot.root();
+        ensure!(
+            boot.kernel()
+                .processes()
+                .set_budget_spec(
+                    process,
+                    BudgetSpec {
+                        max_inflight_ops: Some(1),
+                        ..Default::default()
+                    }
+                )
+                .is_ok()
+        );
         let invoke = |cleanup| E::Invoke {
             operation: OperationTemplate {
                 target: name.clone(),
@@ -857,29 +1045,30 @@ mod tests {
                 literal_input: Some(Value::boolean(cleanup)),
             },
         };
-        let program = Program::new(invoke(false).finally(invoke(true))).compile()?;
-        let executor = boot.kernel.executor_for(boot.root);
+        let source = Program::new(invoke(false).finally(invoke(true)));
+        let program = source.compile()?;
+        let executor = boot.kernel().executor_for(process);
         let run = executor.eval_program(&program, TaintedValue::pristine(Value::null()));
         tokio::pin!(run);
         tokio::select! {
             output = &mut run => anyhow::bail!("operation completed before cancellation: {output:?}"),
             () = driver.started.notified() => {}
         }
-        boot.cancel_process(boot.root)?;
+        boot.cancel_process(process)?;
         let output = tokio::time::timeout(std::time::Duration::from_secs(1), run).await?;
         ensure!(output.outcome == Outcome::Fail(Failure::Cancelled));
         ensure!(
-            driver.cleaned.load(Ordering::SeqCst) == 1,
-            "cleanup ran before release or failed its budget reservation"
+            driver.cleaned.load(Ordering::SeqCst) == usize::from(allowed),
+            "cleanup did not respect release, budget or method permission: {output:?}"
         );
         let budget = boot
-            .kernel
-            .processes
-            .budget_mut(boot.root, |budget| budget.clone())
+            .kernel()
+            .processes()
+            .budget_mut(process, |budget| budget.clone())
             .context("missing budget")?;
         ensure!(budget.inflight_ops == 0);
         ensure!(
-            budget.spent_micro_usd == 200,
+            budget.spent_micro_usd == if allowed { 200 } else { 100 },
             "uncertain spending was refunded"
         );
         Ok(())
